@@ -174,8 +174,9 @@ fn prefill_matches_stepping() -> anyhow::Result<()> {
         stepped.decode.push(model.logits()?);
     }
 
-    // 512 is the default; 1024 is the largest chunk; 433 leaves a last chunk of one row.
-    for chunk in [512, 1024, 433] {
+    // 512 is the default; 433 leaves a last chunk of one row; 2048 is the largest chunk and
+    // runs the prompt as one chunk longer than the sliding window.
+    for chunk in [512, 1024, 433, 2048] {
         model.reset()?;
         let mut top1_agree = 0;
         let mut kls = Vec::new();

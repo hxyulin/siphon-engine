@@ -27,7 +27,7 @@ use inkling_cuda::{
     Gpu,
     ops::attention::{
         Attention, AttentionScratch, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData, KvFormat,
-        MAX_PREFILL_ROWS, PrefillScratch,
+        MAX_PREFILL_ROWS, PrefillScratch, REL_DIM,
     },
 };
 
@@ -322,6 +322,40 @@ fn relative_bias_matches_mlx() -> anyhow::Result<()> {
             attention.relative_bias(stream, &rel_dev, &table_dev, &mut bias_dev)?;
             let got = stream.clone_dtoh(&bias_dev)?;
             assert_bf16_close(&format!("{prefix}.bias"), &got, &want, 0);
+        }
+    }
+    Ok(())
+}
+
+/// The multi-row bias kernel gives each row exactly what the single-row kernel gives, on the
+/// fixture's tables and random relative states.
+#[test]
+fn relative_bias_rows_matches_relative_bias() -> anyhow::Result<()> {
+    let setup = Setup::new()?;
+    let stream = setup.gpu.stream();
+    let mut rng = Rng(11);
+    for case in ["sliding", "global"] {
+        let (table, shape) = setup.fixture.bf16(&format!("{case}.table"))?;
+        let extent = shape[1];
+        let table_dev = stream.clone_htod(&table)?;
+        let rows = 37;
+        let rel = rng.normals(rows * HEADS * REL_DIM, 1.0);
+        let rel_dev = stream.clone_htod(&rel)?;
+        let mut bias_dev = stream.alloc_zeros::<bf16>(rows * HEADS * extent)?;
+        setup
+            .attention
+            .relative_bias_rows(stream, &rel_dev, &table_dev, &mut bias_dev)?;
+        let got = stream.clone_dtoh(&bias_dev)?;
+        let mut want_dev = stream.alloc_zeros::<bf16>(HEADS * extent)?;
+        for row in 0..rows {
+            let rel_row =
+                stream.clone_htod(&rel[row * HEADS * REL_DIM..(row + 1) * HEADS * REL_DIM])?;
+            setup
+                .attention
+                .relative_bias(stream, &rel_row, &table_dev, &mut want_dev)?;
+            let want = stream.clone_dtoh(&want_dev)?;
+            let span = row * HEADS * extent..(row + 1) * HEADS * extent;
+            assert_bf16_close(&format!("{case} row {row}"), &got[span], &want, 0);
         }
     }
     Ok(())
@@ -981,8 +1015,8 @@ fn spread(rows: usize) -> Vec<usize> {
 }
 
 /// A chunk at 0 with an odd row count, a single row (which runs decode attention) and two
-/// rows, a full 1024-row chunk that wraps the ring, a 512-row chunk on a full ring, and more
-/// odd chunks after.
+/// rows, a full 1024-row chunk that wraps the ring, a 512-row chunk on a full ring, more odd
+/// chunks, and chunks longer than the window on a full ring.
 #[test]
 fn sliding_prefill_attention_matches_decode() -> anyhow::Result<()> {
     let chunks = [
@@ -994,11 +1028,20 @@ fn sliding_prefill_attention_matches_decode() -> anyhow::Result<()> {
         Chunk::full(1),
         Chunk::full(301),
         Chunk::sampled(1023, spread(1023)),
+        Chunk::sampled(2048, spread(2048)),
+        Chunk::sampled(1500, spread(1500)),
     ];
     check_prefill(|stream| KvCache::sliding(stream, WINDOW), &chunks, 4)
 }
 
-/// A full 1024-row chunk at 0, then odd and single-row chunks.
+/// A first chunk longer than the window, from an empty ring, then a short one.
+#[test]
+fn long_sliding_prefill_chunk_matches_decode() -> anyhow::Result<()> {
+    let chunks = [Chunk::sampled(2048, spread(2048)), Chunk::full(5)];
+    check_prefill(|stream| KvCache::sliding(stream, WINDOW), &chunks, 10)
+}
+
+/// A full 1024-row chunk at 0, then odd and single-row chunks, and a 2048-row chunk.
 #[test]
 fn global_prefill_attention_matches_decode() -> anyhow::Result<()> {
     let chunks = [
@@ -1008,8 +1051,9 @@ fn global_prefill_attention_matches_decode() -> anyhow::Result<()> {
         Chunk::full(77),
         Chunk::sampled(512, spread(512)),
         Chunk::full(3),
+        Chunk::sampled(2048, spread(2048)),
     ];
-    check_prefill(|stream| KvCache::global(stream, 2048), &chunks, 5)
+    check_prefill(|stream| KvCache::global(stream, 4096), &chunks, 5)
 }
 
 #[test]
@@ -1020,9 +1064,10 @@ fn fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
         Chunk::full(2),
         Chunk::sampled(1024, spread(1024)),
         Chunk::sampled(512, spread(512)),
+        Chunk::sampled(2048, spread(2048)),
     ];
     check_prefill(
-        |stream| KvCache::global_with_format(stream, 2048, KvFormat::Fp8),
+        |stream| KvCache::global_with_format(stream, 4096, KvFormat::Fp8),
         &chunks,
         6,
     )
@@ -1076,6 +1121,7 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
     let mut decode_scratch = AttentionScratch::new(stream)?;
     let mut start_dev = stream.alloc_zeros::<u32>(1)?;
     let mut rng = Rng(9);
+    let table = stream.clone_htod(&rng.normals(REL_DIM * EXTENT, 0.4))?;
 
     eprintln!("| case | rows | start | us/call | TFLOP/s | % of 237 | KV GB/s | % of 1.79 TB/s |");
     eprintln!("| --- | --- | --- | --- | --- | --- | --- | --- |");
@@ -1083,11 +1129,16 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
         ("sliding", None, 512, 0),
         ("sliding", None, 512, 32_768),
         ("sliding", None, 1024, 32_768),
+        ("sliding", None, 2048, 0),
+        ("sliding", None, 2048, 32_768),
         ("sliding", None, 1, 32_768),
         ("global bf16", Some(KvFormat::Bf16), 512, 0),
         ("global bf16", Some(KvFormat::Bf16), 512, 8192),
         ("global bf16", Some(KvFormat::Bf16), 512, 32_768),
         ("global bf16", Some(KvFormat::Bf16), 512, 131_072),
+        ("global bf16", Some(KvFormat::Bf16), 1024, 32_768),
+        ("global bf16", Some(KvFormat::Bf16), 2048, 32_768),
+        ("global bf16", Some(KvFormat::Bf16), 2048, 131_072),
         ("global bf16", Some(KvFormat::Bf16), 1, 32_768),
         ("global bf16", Some(KvFormat::Bf16), 1, 131_072),
         ("global fp8", Some(KvFormat::Fp8), 512, 0),
@@ -1097,7 +1148,12 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
         ("global fp8", Some(KvFormat::Fp8), 1, 32_768),
         ("global fp8", Some(KvFormat::Fp8), 1, 131_072),
     ];
+    // `INKLING_TIMING_ONLY` keeps the cases whose name starts with it.
+    let only = std::env::var("INKLING_TIMING_ONLY").ok();
     for &(name, format, rows, start) in cases {
+        if only.as_deref().is_some_and(|o| !name.starts_with(o)) {
+            continue;
+        }
         let mut cache = match format {
             None => KvCache::sliding(stream, WINDOW)?,
             Some(format) => KvCache::global_with_format(stream, start + rows, format)?,
@@ -1105,7 +1161,9 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
         let q = stream.clone_htod(&rng.normals(rows * HEADS * HEAD_DIM, 1.0))?;
         let k = stream.clone_htod(&rng.normals(rows * ROW, 1.0))?;
         let v = stream.clone_htod(&rng.normals(rows * ROW, 1.0))?;
-        let bias = stream.clone_htod(&rng.normals(rows * HEADS * EXTENT, 1.0))?;
+        let rel = stream.clone_htod(&rng.normals(rows * HEADS * REL_DIM, 1.0))?;
+        let mut bias = stream.alloc_zeros::<bf16>(rows * HEADS * EXTENT)?;
+        attention.relative_bias_rows(stream, &rel, &table, &mut bias)?;
         let sinks = stream.clone_htod(&rng.normals(rows * HEADS, 1.0))?;
         let mut out = stream.alloc_zeros::<bf16>(rows * HEADS * HEAD_DIM)?;
         stream.memcpy_htod(&[u32::try_from(start)?], &mut start_dev)?;
@@ -1167,6 +1225,27 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
             bytes / seconds * 1e-9,
             100.0 * bytes / seconds / PEAK_BYTES,
         );
+
+        if format.is_none() && start > 0 && rows > 1 {
+            // The chunk's relative bias, which runs before prefill attention: the multi-row
+            // kernel, and the single-row kernel launched over all rows at once.
+            let written = (rows * HEADS * EXTENT * 2) as f64;
+            let rows_kernel =
+                time(&mut || attention.relative_bias_rows(stream, &rel, &table, &mut bias))?;
+            let single_kernel =
+                time(&mut || attention.relative_bias(stream, &rel, &table, &mut bias))?;
+            for (label, seconds) in [
+                ("relative_bias_rows", rows_kernel),
+                ("relative_bias", single_kernel),
+            ] {
+                eprintln!(
+                    "| {label} | {rows} | | {:.1} | | | {:.0} written | {:.0}% |",
+                    seconds * 1e6,
+                    written / seconds * 1e-9,
+                    100.0 * written / seconds / PEAK_BYTES,
+                );
+            }
+        }
 
         if rows == 1 {
             let position = stream.clone_htod(&[u32::try_from(start)?])?;
