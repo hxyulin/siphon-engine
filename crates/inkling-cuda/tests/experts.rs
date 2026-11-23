@@ -21,7 +21,7 @@ use inkling_cuda::{
     Gpu,
     ops::{
         elementwise::Elementwise,
-        experts::{ExpertFormat, ExpertWeights, Experts},
+        experts::{ExpertFormat, ExpertScratch, ExpertWeights, Experts},
     },
 };
 use safetensors::{Dtype, SafeTensors};
@@ -257,6 +257,620 @@ fn expert_mlp_matches_mlx() -> anyhow::Result<()> {
         );
         let got = stream.clone_dtoh(&out)?;
         assert_bf16_close(&format!("layer {layer} out"), &got, &want, 0);
+    }
+    Ok(())
+}
+
+// `expert_matmul`, the expert-grouped product for prefill.
+//
+// It computes the same exact products as `expert_matvec` but adds them in another order, so
+// results may differ in the last BF16 bit. The checks compare it with an F64 reference on the
+// decoded weights and allow, per output, `2^-8 * |ref| + 2^-14 * sum`, where `sum` is the sum
+// of the absolute products times the output scale:
+//
+// - Each F32 addition, rounded or truncated by the tensor cores, costs at most 2^-23 of its
+//   partial sum. A product passes through at most k / 16 + 4 additions, 148 for k = 2304,
+//   which bounds the F32 error by 148 * 2^-23 * sum < 2^-15.8 * sum.
+// - Rounding the F32 result to BF16 costs at most half an ulp: 2^-8 of the F32 value, which is
+//   at most `|ref|` plus the F32 error.
+// - The total is at most 2^-8 * |ref| + (1 + 2^-8) * 2^-15.8 * sum, inside the bound with a
+//   factor of 3.5 to spare on the second term.
+//
+// `expert_matvec` must meet the same bound, which checks the reference itself.
+
+const EXPERTS: usize = 128;
+/// `expert_group` writes NaN for unknown ids and the GEMM writes every other output, so a
+/// value left over from before the call shows up as this.
+const SENTINEL: f32 = 1234.0;
+
+fn e2m1(nibble: u8) -> f64 {
+    const VALUES: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = VALUES[usize::from(nibble & 7)];
+    if nibble & 8 == 0 { v } else { -v }
+}
+
+fn e4m3(bits: u8) -> f64 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 3) & 15);
+    let mantissa = f64::from(bits & 7) / 8.0;
+    if exponent == 0 {
+        sign * mantissa * 2f64.powi(-6)
+    } else {
+        sign * (1.0 + mantissa) * 2f64.powi(exponent - 7)
+    }
+}
+
+fn e8m0(bits: u8) -> f64 {
+    if bits == 0 {
+        0.0
+    } else {
+        2f64.powi(i32::from(bits) - 127)
+    }
+}
+
+/// Host copy of a projection's bytes, for the F64 reference.
+struct HostProjection<'a> {
+    weight: &'a [u8],
+    scales: &'a [u8],
+    /// NVFP4 only.
+    global_scale: Option<Vec<f32>>,
+    n: usize,
+    k: usize,
+}
+
+impl HostProjection<'_> {
+    /// The decoded weights of `expert`, `[n, k]`, before the global scale.
+    fn decode(&self, expert: usize) -> Vec<f64> {
+        let k = self.k;
+        let mut decoded = vec![0.0; self.n * k];
+        for row in 0..self.n {
+            let flat_row = expert * self.n + row;
+            for col in 0..k {
+                decoded[row * k + col] = if self.global_scale.is_some() {
+                    let byte = self.weight[flat_row * k / 2 + col / 2];
+                    let nibble = if col % 2 == 0 { byte & 15 } else { byte >> 4 };
+                    e2m1(nibble) * e4m3(self.scales[flat_row * k / 16 + col / 16])
+                } else {
+                    e4m3(self.weight[flat_row * k + col])
+                        * e8m0(self.scales[flat_row * k / 32 + col / 32])
+                };
+            }
+        }
+        decoded
+    }
+
+    fn output_scale(&self, expert: usize) -> f64 {
+        self.global_scale
+            .as_ref()
+            .map_or(1.0, |g| f64::from(g[expert]) / (448.0 * 6.0))
+    }
+}
+
+/// Checks every output of `got` (`[pairs, n]`) against the F64 reference, and
+/// returns the largest error as a fraction of its bound.
+fn check_reference(
+    label: &str,
+    host: &HostProjection<'_>,
+    x: &[bf16],
+    indices: &[i32],
+    inputs_per_row: usize,
+    got: &[bf16],
+) -> f64 {
+    let (n, k) = (host.n, host.k);
+    let expert_of = |pair: usize| usize::try_from(indices[pair]).ok();
+    let mut experts: Vec<usize> = (0..indices.len()).filter_map(expert_of).collect();
+    experts.sort_unstable();
+    experts.dedup();
+    std::thread::scope(|scope| {
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                let experts = &experts;
+                scope.spawn(move || {
+                    let mut worst = 0.0f64;
+                    for &expert in experts.iter().skip(thread).step_by(threads) {
+                        let decoded = host.decode(expert);
+                        let scale = host.output_scale(expert);
+                        for pair in (0..indices.len()).filter(|&p| expert_of(p) == Some(expert)) {
+                            let input = if inputs_per_row == 1 {
+                                pair / SLOTS
+                            } else {
+                                pair
+                            };
+                            let xin = &x[input * k..(input + 1) * k];
+                            for col in 0..n {
+                                let (mut dot, mut sum) = (0.0f64, 0.0f64);
+                                let row = &decoded[col * k..(col + 1) * k];
+                                for (xi, wi) in xin.iter().zip(row) {
+                                    let product = f64::from(xi.to_f32()) * wi;
+                                    dot += product;
+                                    sum += product.abs();
+                                }
+                                let want = dot * scale;
+                                let bound =
+                                    2f64.powi(-8) * want.abs() + 2f64.powi(-14) * sum * scale;
+                                let value = f64::from(got[pair * n + col].to_f32());
+                                let err = (value - want).abs();
+                                assert!(
+                                    err <= bound,
+                                    "{label}: pair {pair} (expert {expert}) column {col}: got \
+                                     {value}, want {want}, bound {bound}"
+                                );
+                                if bound > 0.0 {
+                                    worst = worst.max(err / bound);
+                                }
+                            }
+                        }
+                    }
+                    worst
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("reference thread panicked"))
+            .fold(0.0, f64::max)
+    })
+}
+
+/// Deterministic pseudo-random numbers (SplitMix64).
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn byte(&mut self) -> u8 {
+        self.next().to_le_bytes()[7]
+    }
+
+    fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.byte()).collect()
+    }
+
+    /// Uniform in `[0, bound)`, for bound below 2^20.
+    fn below(&mut self, bound: usize) -> usize {
+        (usize::try_from(self.next() >> 44).expect("20 bits fit") * bound) >> 20
+    }
+}
+
+/// Random bytes and scales in the ranges real checkpoints use, on the host and the GPU.
+struct Synthetic {
+    weight: Vec<u8>,
+    scales: Vec<u8>,
+    global_scale: Option<Vec<f32>>,
+    gpu: Projection,
+}
+
+impl Synthetic {
+    fn new(s: &Setup, fp4: bool, n: usize, k: usize, seed: u32) -> anyhow::Result<Self> {
+        let mut random = SplitMix(u64::from(seed));
+        let (weight, scales, global_scale) = if fp4 {
+            let weight = random.bytes(EXPERTS * n * k / 2);
+            // Positive E4M3 scales from 2^-3 to 2^2: exponent fields 4 to 9.
+            let scales = (0..EXPERTS * n * k / 16)
+                .map(|_| 32 + random.byte() % 48)
+                .collect();
+            let global_scale = common::pseudo_random(EXPERTS, seed + 2, 1.0)
+                .into_iter()
+                .map(|v| 448.0 * 6.0 * 0.004 * (1.5 + v))
+                .collect();
+            (weight, scales, Some(global_scale))
+        } else {
+            // Any E4M3 value but NaN (0x7f, 0xff).
+            let weight = (0..EXPERTS * n * k)
+                .map(|_| {
+                    let v = random.byte();
+                    if v & 0x7f == 0x7f { v ^ 1 } else { v }
+                })
+                .collect();
+            // E8M0 scales from 2^-12 to 2^-5.
+            let scales = (0..EXPERTS * n * k / 32)
+                .map(|_| 115 + random.byte() % 8)
+                .collect();
+            (weight, scales, None)
+        };
+        let gpu = Projection {
+            weight: s.stream().clone_htod(&weight)?,
+            scales: s.stream().clone_htod(&scales)?,
+            global_scale: global_scale
+                .as_ref()
+                .map(|g| s.stream().clone_htod(g))
+                .transpose()?,
+            n,
+            k,
+        };
+        Ok(Self {
+            weight,
+            scales,
+            global_scale,
+            gpu,
+        })
+    }
+
+    fn host(&self) -> HostProjection<'_> {
+        HostProjection {
+            weight: &self.weight,
+            scales: &self.scales,
+            global_scale: self.global_scale.clone(),
+            n: self.gpu.n,
+            k: self.gpu.k,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Routing {
+    /// 8 distinct experts per row, uniform over all 128.
+    Uniform,
+    /// 8 distinct experts per row, drawn as `128 * u^3`: expert 0 takes about a fifth of the
+    /// pairs and most rows pick it.
+    Skewed,
+    /// Every row picks experts 0 to 7.
+    Same,
+    /// 8 distinct experts per row from the first 24 only; 104 experts get no pairs.
+    Subset,
+}
+
+fn routing(rows: usize, routing: Routing, seed: u32) -> Vec<i32> {
+    let mut random = SplitMix(u64::from(seed));
+    let mut indices = Vec::with_capacity(rows * SLOTS);
+    for _ in 0..rows {
+        let mut picked: Vec<usize> = Vec::with_capacity(SLOTS);
+        while picked.len() < SLOTS {
+            let expert = match routing {
+                Routing::Uniform => random.below(EXPERTS),
+                Routing::Skewed => {
+                    // 128 * u^3 for u uniform in [0, 1), from 16 random bits.
+                    let u = random.below(1 << 16);
+                    (((u * u) >> 16) * u * EXPERTS) >> 32
+                }
+                Routing::Same => picked.len(),
+                Routing::Subset => random.below(24),
+            };
+            if !picked.contains(&expert) {
+                picked.push(expert);
+            }
+        }
+        indices.extend(
+            picked
+                .into_iter()
+                .map(|e| i32::try_from(e).expect("expert ids fit in i32")),
+        );
+    }
+    indices
+}
+
+/// Runs `expert_matvec` and `expert_matmul` on the same inputs, checks both against the F64
+/// reference, checks that `expert_matmul` writes every output and repeats bit for bit, and
+/// reports how far the two kernels are apart.
+#[allow(clippy::too_many_arguments)]
+fn compare_kernels(
+    s: &Setup,
+    scratch: &mut ExpertScratch,
+    label: &str,
+    projection: &Projection,
+    host: &HostProjection<'_>,
+    x: &[bf16],
+    indices: &[i32],
+    inputs_per_row: usize,
+) -> anyhow::Result<()> {
+    let stream = s.stream();
+    let pairs = indices.len();
+    let n = projection.n;
+    let x_gpu = stream.clone_htod(x)?;
+    let indices_gpu = stream.clone_htod(indices)?;
+    let weights = projection.weights();
+
+    let mut matvec = stream.alloc_zeros::<bf16>(pairs * n)?;
+    s.experts
+        .expert_matvec(stream, &x_gpu, &indices_gpu, &weights, &mut matvec)?;
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let mut out = stream.clone_htod(&vec![bf16::from_f32(SENTINEL); pairs * n])?;
+        s.experts
+            .expert_matmul(stream, &x_gpu, &indices_gpu, &weights, &mut out, scratch)?;
+        runs.push(stream.clone_dtoh(&out)?);
+    }
+    let matvec = stream.clone_dtoh(&matvec)?;
+    let got = &runs[0];
+    assert!(
+        runs[0]
+            .iter()
+            .zip(&runs[1])
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "{label}: two runs differ"
+    );
+    assert!(
+        !got.iter().any(|v| v.to_f32() == SENTINEL),
+        "{label}: some outputs were not written"
+    );
+
+    let worst_matvec = check_reference(
+        &format!("{label} matvec"),
+        host,
+        x,
+        indices,
+        inputs_per_row,
+        &matvec,
+    );
+    let worst = check_reference(label, host, x, indices, inputs_per_row, got);
+    let mut ulps = [0usize; 4];
+    let mut max_ulps = 0;
+    for (a, b) in got.iter().zip(&matvec) {
+        let d = common::bf16_ulps(*a, *b);
+        ulps[(d as usize).min(3)] += 1;
+        max_ulps = max_ulps.max(d);
+    }
+    eprintln!(
+        "{label}: worst error {worst:.3} of bound (matvec {worst_matvec:.3}); against matvec, \
+         {} equal, {} at 1 ulp, {} at 2, {} beyond (max {max_ulps}) of {}",
+        ulps[0],
+        ulps[1],
+        ulps[2],
+        ulps[3],
+        got.len()
+    );
+    Ok(())
+}
+
+fn check_synthetic(fp4: bool) -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let mut scratch = ExpertScratch::new(s.stream(), 1024, EXPERTS)?;
+    // Two and a half column tiles: 128 + 128 + 64.
+    let n = 320;
+    let format = if fp4 { "nvfp4" } else { "mxfp8" };
+    for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
+        let projection = Synthetic::new(&s, fp4, n, k, 7 + k as u32)?;
+        let host = projection.host();
+        let cases = [
+            (1, Routing::Uniform),
+            (7, Routing::Uniform),
+            (64, Routing::Subset),
+            (512, Routing::Uniform),
+            (512, Routing::Skewed),
+            (1024, Routing::Uniform),
+            (1024, Routing::Same),
+        ];
+        for (rows, kind) in cases {
+            let indices = routing(rows, kind, rows as u32 * 31 + 5);
+            let x = common::pseudo_random_bf16(rows * inputs_per_row * k, rows as u32, 1.0, 0.0);
+            compare_kernels(
+                &s,
+                &mut scratch,
+                &format!("{format} {name} rows {rows} {kind:?}"),
+                &projection.gpu,
+                &host,
+                &x,
+                &indices,
+                inputs_per_row,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn matmul_nvfp4_matches_reference() -> anyhow::Result<()> {
+    check_synthetic(true)
+}
+
+#[test]
+fn matmul_mxfp8_matches_reference() -> anyhow::Result<()> {
+    check_synthetic(false)
+}
+
+/// The MLX fixtures hold real checkpoint slices; checks `expert_matmul` on them.
+#[test]
+fn matmul_matches_reference_on_fixtures() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    for format in ["nvfp4", "mxfp8"] {
+        let file = format!("experts_{format}");
+        let fixture = Fixture::load(&file)?;
+        let (indices, _) = fixture.i32("indices")?;
+        let mut scratch = ExpertScratch::new(s.stream(), indices.len() / SLOTS, 10)?;
+        for name in ["gate_up", "down"] {
+            let projection = Projection::load(&s, &fixture, &file, name)?;
+            let weight = fixture_bytes(&file, &format!("{name}.weight"))?;
+            let scales = fixture_bytes(&file, &format!("{name}.scales"))?;
+            let host = HostProjection {
+                weight: &weight,
+                scales: &scales,
+                global_scale: match format {
+                    "nvfp4" => Some(fixture.f32(&format!("{name}.global_scale"))?.0),
+                    _ => None,
+                },
+                n: projection.n,
+                k: projection.k,
+            };
+            let (x, x_shape) = fixture.bf16(&format!("{name}.x"))?;
+            let inputs_per_row = if x_shape.len() == 3 { SLOTS } else { 1 };
+            compare_kernels(
+                &s,
+                &mut scratch,
+                &format!("fixture {format} {name}"),
+                &projection,
+                &host,
+                &x,
+                &indices,
+                inputs_per_row,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn matmul_unknown_expert_gives_nan() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let file = "experts_nvfp4";
+    let fixture = Fixture::load(file)?;
+    let projection = Projection::load(&s, &fixture, file, "gate_up")?;
+    let mut scratch = ExpertScratch::new(s.stream(), 2, 10)?;
+    // The fixture keeps 10 experts, so ids -1, 10 and 99 are outside it.
+    let ids = [0, 1, 2, -1, 4, 5, 10, 7, 3, 99, 3, 3, 9, 8, 6, 5];
+    let indices = s.stream().clone_htod(&ids)?;
+    let (x, _) = fixture.bf16("gate_up.x")?;
+    let x = s.stream().clone_htod(&x[..2 * projection.k])?;
+    let mut out = s.stream().alloc_zeros::<bf16>(ids.len() * projection.n)?;
+    s.experts.expert_matmul(
+        s.stream(),
+        &x,
+        &indices,
+        &projection.weights(),
+        &mut out,
+        &mut scratch,
+    )?;
+    let got = s.stream().clone_dtoh(&out)?;
+    for (pair, row) in got.chunks(projection.n).enumerate() {
+        let bad = !(0..10).contains(&ids[pair]);
+        assert!(
+            row.iter().all(|v| v.is_nan() == bad),
+            "pair {pair}: expected {} values",
+            if bad { "NaN" } else { "finite" }
+        );
+    }
+    Ok(())
+}
+
+/// Full projections of layers 0 (NVFP4) and 20 (MXFP8) from the checkpoint, 512 rows.
+#[test]
+#[ignore = "reads the original checkpoint from INKLING_MODEL or ~/.local/share/inkling-mini/model"]
+fn matmul_matches_reference_on_checkpoint() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let checkpoint = Checkpoint::open(model_dir()?)?;
+    let rows = 512;
+    let mut scratch = ExpertScratch::new(s.stream(), rows, EXPERTS)?;
+    for layer in [0, 20] {
+        for (which, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
+            let projection = checkpoint_projection(s.stream(), &checkpoint, layer, which, k)?;
+            let prefix = format!("model.llm.layers.{layer}.mlp.experts.{which}_weight");
+            let bytes = |suffix: &str| {
+                let name = format!("{prefix}{suffix}");
+                let entry = checkpoint
+                    .get(&name)
+                    .with_context(|| format!("{name} missing from checkpoint"))?;
+                anyhow::Ok(checkpoint.bytes(entry))
+            };
+            let host = HostProjection {
+                weight: bytes("")?,
+                scales: bytes("_scale")?,
+                global_scale: projection
+                    .global_scale
+                    .as_ref()
+                    .map(|g| s.stream().clone_dtoh(g))
+                    .transpose()?,
+                n: HIDDEN,
+                k,
+            };
+            let indices = routing(rows, Routing::Uniform, layer as u32 + 1);
+            // Hidden states after RMS norm are about unit size; expert activations smaller.
+            let x = common::pseudo_random_bf16(rows * inputs_per_row * k, layer as u32, 2.0, 0.0);
+            compare_kernels(
+                &s,
+                &mut scratch,
+                &format!("layer {layer} {which}"),
+                &projection,
+                &host,
+                &x,
+                &indices,
+                inputs_per_row,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Times `expert_matvec` and `expert_matmul` at the model's shapes with random weights.
+#[test]
+#[ignore = "benchmark; run alone on an idle GPU with --nocapture"]
+fn bench_expert_matmul() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let mut scratch = ExpertScratch::new(stream, 1024, EXPERTS)?;
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    // Runs only the cases whose label (such as "NVFP4 w13 Uniform 512") contains this.
+    let filter = std::env::var("EXPERT_BENCH_FILTER").unwrap_or_default();
+    println!("| format | projection | routing | rows | matvec (us) | matmul (us) | speedup |");
+    println!("| --- | --- | --- | ---: | ---: | ---: | ---: |");
+    for fp4 in [true, false] {
+        for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
+            let projection = Synthetic::new(&s, fp4, HIDDEN, k, 3)?;
+            let weights = projection.gpu.weights();
+            for kind in [Routing::Uniform, Routing::Skewed] {
+                for rows in [1, 16, 64, 512, 1024] {
+                    let format = if fp4 { "NVFP4" } else { "MXFP8" };
+                    let label = format!("{format} {name} {kind:?} {rows}");
+                    if !label.contains(&filter) {
+                        continue;
+                    }
+                    let indices = stream.clone_htod(&routing(rows, kind, 11))?;
+                    let x = stream.clone_htod(&common::pseudo_random_bf16(
+                        rows * inputs_per_row * k,
+                        1,
+                        1.0,
+                        0.0,
+                    ))?;
+                    let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * HIDDEN)?;
+                    let mut time = |matmul: bool| -> anyhow::Result<f64> {
+                        let mut call = |out: &mut CudaSlice<bf16>| {
+                            if matmul {
+                                s.experts.expert_matmul(
+                                    stream,
+                                    &x,
+                                    &indices,
+                                    &weights,
+                                    out,
+                                    &mut scratch,
+                                )
+                            } else {
+                                s.experts.expert_matvec(stream, &x, &indices, &weights, out)
+                            }
+                        };
+                        // Run for about 100 ms first so the clocks settle, then report the
+                        // best of 5 repetitions.
+                        let mut iterations = 1;
+                        loop {
+                            let start = stream.record_event(timing)?;
+                            for _ in 0..iterations {
+                                call(&mut out)?;
+                            }
+                            let end = stream.record_event(timing)?;
+                            end.synchronize()?;
+                            if start.elapsed_ms(&end)? > 100.0 {
+                                break;
+                            }
+                            iterations *= 2;
+                        }
+                        let iterations = (iterations / 4).max(1);
+                        let mut best = f64::INFINITY;
+                        for _ in 0..5 {
+                            let start = stream.record_event(timing)?;
+                            for _ in 0..iterations {
+                                call(&mut out)?;
+                            }
+                            let end = stream.record_event(timing)?;
+                            end.synchronize()?;
+                            let us =
+                                f64::from(start.elapsed_ms(&end)?) * 1000.0 / f64::from(iterations);
+                            best = best.min(us);
+                        }
+                        Ok(best)
+                    };
+                    let matvec = time(false)?;
+                    let matmul = time(true)?;
+                    println!(
+                        "| {format} | {name} | {kind:?} | {rows} | {matvec:.1} | {matmul:.1} | {:.2} |",
+                        matvec / matmul
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
