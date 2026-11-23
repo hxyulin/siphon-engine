@@ -15,6 +15,21 @@ pub struct TextConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    /// Width of the per-head relative-position features.
+    pub d_rel: usize,
+    /// Distances with a learned relative bias; the bias is zero at and beyond it.
+    pub rel_extent: usize,
+    /// Global layers scale queries up past this position.
+    pub log_scaling_n_floor: usize,
+    pub log_scaling_alpha: f32,
+    pub qk_l2_clip_threshold: f32,
+    pub rel_l2_clip_threshold: f32,
+    pub sconv_kernel_size: usize,
+    /// A new block state starts at every layer index divisible by this.
+    pub n_layers_per_attn_res_block: usize,
+    pub mlp_gate_softcap: f32,
+    pub mlp_up_softcap: f32,
+    pub route_scale: f32,
     pub rms_norm_eps: f32,
     pub n_routed_experts: usize,
     pub num_experts_per_tok: usize,
@@ -33,6 +48,8 @@ pub struct LoopConfig {
     pub core_start: usize,
     pub core_end: usize,
     pub num_passes: usize,
+    /// Rank of the message gates' down projection.
+    pub gate_rank: usize,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +71,27 @@ impl TextConfig {
     /// Decoder-layer visits per token, counting each pass through the looped core.
     #[must_use]
     pub fn layer_visits(&self) -> usize {
-        let core = self.loop_config.core_end - self.loop_config.core_start;
-        self.num_hidden_layers + core * (self.loop_config.num_passes - 1)
+        self.visit_layers(self.loop_config.num_passes).len()
+    }
+
+    /// The layer index of each visit when the looped core runs `passes` times.
+    #[must_use]
+    pub fn visit_layers(&self, passes: usize) -> Vec<usize> {
+        let LoopConfig {
+            core_start,
+            core_end,
+            ..
+        } = self.loop_config;
+        let core = (0..passes).flat_map(|_| core_start..core_end);
+        (0..core_start)
+            .chain(core)
+            .chain(core_end..self.num_hidden_layers)
+            .collect()
+    }
+
+    /// Whether `layer` uses sliding-window attention.
+    #[must_use]
+    pub fn is_sliding(&self, layer: usize) -> bool {
+        self.local_layer_ids.contains(&layer)
     }
 }

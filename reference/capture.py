@@ -3,6 +3,10 @@
 The engine's parity tests read the resulting safetensors file. Keys look like
 `prefill.visit07.in.hidden` and `decode2.logits`. One prefill over the prompt
 is followed by greedy decode steps, each with its own key prefix.
+
+With `--token-by-token`, the prompt is fed one token per step as well, so every
+step takes MLX's single-row decode path. Steps are then named `step000`,
+`step001` and so on, prompt tokens first.
 """
 
 import argparse
@@ -24,6 +28,7 @@ def main() -> None:
     parser.add_argument("out", type=Path)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--decode-steps", type=int, default=8)
+    parser.add_argument("--token-by-token", action="store_true")
     args = parser.parse_args()
 
     model, tokenizer = load(str(args.model))
@@ -64,16 +69,23 @@ def main() -> None:
         mx.eval(tensors)
         return int(mx.argmax(logits[0, -1]).item())
 
-    token = step("prefill", prompt_ids)
+    if args.token_by_token:
+        for i, prompt_id in enumerate(prompt_ids):
+            token = step(f"step{i:03d}", [prompt_id])
+        names = (f"step{len(prompt_ids) + i:03d}" for i in range(args.decode_steps))
+    else:
+        token = step("prefill", prompt_ids)
+        names = (f"decode{i}" for i in range(args.decode_steps))
     generated = [token]
-    for i in range(args.decode_steps):
-        token = step(f"decode{i}", [token])
+    for name in names:
+        token = step(name, [token])
         generated.append(token)
 
     info = {
         "model": str(args.model),
         "prompt": args.prompt,
         "prompt_tokens": len(prompt_ids),
+        "token_by_token": args.token_by_token,
         "generated": generated,
         "generated_text": tokenizer.decode(generated),
         "mlx": metadata.version("mlx"),

@@ -6,6 +6,8 @@
 #![cfg(target_os = "linux")]
 
 mod gpu;
+pub mod model;
 pub mod ops;
+pub mod weights;
 
 pub use gpu::Gpu;

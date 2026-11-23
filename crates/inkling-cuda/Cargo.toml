@@ -9,8 +9,7 @@ publish.workspace = true
 anyhow.workspace = true
 cudarc.workspace = true
 half.workspace = true
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+inkling = { path = "../inkling" }
 safetensors.workspace = true
 
 [dev-dependencies]
