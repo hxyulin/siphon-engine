@@ -49,6 +49,9 @@ READ_ONLY = {
     # Depth attention: learned queries (copied from the weights at load) and the RMS
     # norm weights of the destinations.
     "queries", "weight0", "weight1", "weight2", "weight3",
+    # DSpark draft: the Markov head's state weight and the LM-head fold, computed once at
+    # load.
+    "rnn_state", "fold_weight",
     # Message gates: one weight set per slot.
     *(f"{n}{i}" for n in ("norm_weight", "forget", "gain", "down_weight", "forget_scale",
                           "gain_scale", "down_scale") for i in range(3)),
@@ -56,6 +59,8 @@ READ_ONLY = {
 READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     # The FP8 gate's down projection weights; `down` there is the output.
     "message_gate_step_fp8_2304": {"down0", "down1", "down2"},
+    # The draft's FP8 copy of the fold, its row scales and error bounds, made at load.
+    "draft_markov_bound": {"q", "scale", "err"},
     # The host uploads the position before the step; no kernel writes it.
     "decode_step_bf16": {"position"},
     "decode_step_fp8": {"position"},
@@ -268,7 +273,8 @@ def parse_params(elf_text: str) -> dict[str, tuple[int, list[Param]]]:
 # --- analysis ------------------------------------------------------------------------------
 
 REG_RE = re.compile(r"(?<![\w.])(U?R)(\d+)(\.64|\.128)?")
-CBANK_RE = re.compile(r"c\[0x0\]\[(?:U?R\d+\+)?(0x[0-9a-f]+)\]")
+CBANK_RE = re.compile(r"c\[0x0\]\[(?:(U?R\d+)\+)?(0x[0-9a-f]+)\]")
+IMM_RE = re.compile(r"^-?0x[0-9a-f]+$")
 
 
 def is_load(ins: Instr) -> bool:
@@ -444,6 +450,35 @@ class Tracer:
         self.reach_memo[key] = (found, entry)
         return found, entry
 
+    def index_values(self, pos: int, reg: str, depth: int = 0) -> set[int] | None:
+        """The immediate values reg can hold at pos, through MOV and SEL definitions, or
+        None if any definition is something else."""
+        if depth > 8 or reg.startswith("UR"):
+            return None
+        found, entry = self.reaching(pos, reg)
+        if entry or not found:
+            return None
+        values: set[int] = set()
+        for j in found:
+            d = self.k.instrs[j]
+            if d.base == "MOV" and len(d.operands) >= 2:
+                srcs = [d.operands[1]]
+            elif d.base == "SEL" and len(d.operands) >= 3:
+                srcs = d.operands[1:3]
+            else:
+                return None
+            for src in srcs:
+                if IMM_RE.match(src):
+                    values.add(int(src, 16))
+                elif (r := regs_of(src)) and len(r) >= 1 and r[0].startswith("R"):
+                    sub = self.index_values(j, r[0], depth + 1)
+                    if sub is None:
+                        return None
+                    values |= sub
+                else:
+                    return None
+        return values
+
     def regs(self, pos: int, regs: list[str]) -> Origin:
         """Origin of the values of regs at instruction pos: a walk over the definitions
         that reach them, their operands' definitions, and so on."""
@@ -477,10 +512,15 @@ class Tracer:
                     work.extend((j, r, True) for r in regs_of(address_operand(d)))
                 else:
                     for o in d.operands[1:]:
-                        for c in CBANK_RE.findall(o):
-                            off = int(c, 16) - self.k.param_base
-                            if off >= 0:
-                                (loaded if via_load else params).add(off)
+                        for index, c in CBANK_RE.findall(o):
+                            # A register-indexed load, c[0x0][R44+0x380], may pick one of
+                            # several parameters; use the index's values when they are
+                            # immediates (MOV and SEL chains), else the base offset.
+                            steps = self.index_values(j, index) if index else None
+                            for step in steps if steps else [0]:
+                                off = int(c, 16) + step - self.k.param_base
+                                if off >= 0:
+                                    (loaded if via_load else params).add(off)
                         if not o.startswith("desc["):
                             work.extend((j, r, via_load) for r in regs_of(o))
         return Origin(frozenset(params), frozenset(loaded), tuple(dict.fromkeys(unknown)))
