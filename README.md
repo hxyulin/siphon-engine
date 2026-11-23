@@ -30,6 +30,27 @@ Each `crates/inkling-cuda/src/ops/<group>.rs` launches the kernels in `kernels/<
 cd reference/fixtures && uv run --project .. python <group>.py
 ```
 
+## Benchmarks and profiling
+
+The `bench` binary times greedy decode at several context lengths. For each length it marks every cache as full to that length without computing it, runs warmup steps, then times `--steps` steps. It prints one markdown table row per context length, or JSON with `--json`, along with the time, the GPU clocks and the processes on the GPU. Numbers are comparable only on an otherwise idle GPU.
+
+```sh
+pixi run cargo build --release -p inkling-cuda --bin bench
+target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps 100] [--warmup 10] [--json]
+```
+
+Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token, plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
+
+The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` is pinned to 2025.3, the last release built for CUDA 13.0, which the pinned `nvcc` requires. A kernel trace of 20 steps:
+
+```sh
+pixi run nsys profile -t cuda --cuda-memory-usage=false -o decode \
+    target/release/bench <model-dir> --contexts 32768 --warmup 5 --steps 20
+pixi run nsys export --type sqlite -o decode.sqlite decode.nsys-rep
+```
+
+The trace marks the end of each step with a 4-byte device-to-host copy, the sampled token. `ncu` needs the GPU performance counters, which the driver limits to administrators unless the `NVreg_RestrictProfilingToAdminUsers=0` module option is set. Without it, `ncu` fails with `ERR_NVGPUCTRPERM`.
+
 ## References
 
 Targets the official checkpoint at revision [`b85c3cfa`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/b85c3cfa615fc413cc9af3379f491b963f3b586a), with its NVFP4/MXFP8 experts, BF16 dense weights and bundled DSpark draft.

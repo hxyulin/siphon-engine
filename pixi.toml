@@ -7,6 +7,10 @@ platforms = ["linux-64"]
 [dependencies]
 cuda-nvcc = "13.0.*"
 cuda-cudart-dev = "13.0.*"
+# Profilers. nsight-compute 2025.3 is the last release built for CUDA 13.0, which the
+# pinned nvcc requires. The nsys CLI has no CUDA version pin.
+nsight-compute = "2025.3.*"
+nsight-systems-cli = "2026.5.*"
 
 [activation.env]
 NVCC = "$CONDA_PREFIX/bin/nvcc"
