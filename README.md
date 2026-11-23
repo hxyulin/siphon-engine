@@ -149,4 +149,14 @@ The greedy continuation is reported but not checked: one near-tie splits it, and
 
 The gate catches a sliding window that is not enforced. Run that way, MLX alone gives a mean KL of 9.5e-3 and a max KL of 0.21 on `anyhow.txt`. It cannot see query log-scaling: at 11,186 tokens the scale is at most 1.031, and MLX with log-scaling removed differs from MLX by less than its own noise (mean |log-prob difference| 0.006). A sliding window off by one position is also below the noise. A unit test covers log-scaling (`log_scale_matches_mlx`).
 
-On the current runner every capture passes. Against `anyhow-tbt`, the engine's mean KL is 1.2e-3 and its max KL 2.4e-2. Top-1 agreement is 98.6% to 99.1% per range and the mean |log-prob difference| 0.021 to 0.026. Perplexity is 1.7358 against MLX's 1.7355, and all 32 continuation tokens match. The run takes 14 ms per token, 2.6 minutes for `anyhow.txt`.
+`capture --float32` runs MLX with F32 activations and dense weights, the packed expert weights unchanged. It is a higher-precision reference: it shows whether a path is closer to or further from the model than MLX's own BF16 paths, which a BF16 reference cannot. Against the F32 captures, over all positions of the three texts:
+
+| Path | Mean KL | \|log-prob difference\| | Top-1 |
+| --- | --- | --- | --- |
+| MLX chunked and token-by-token | 6.0e-4 to 2.3e-3 | 0.023 to 0.027 | 98.5% to 99.0% |
+| Engine stepping, BF16 cache | 7.6e-4 to 2.3e-3 | 0.023 to 0.027 | 98.6% to 99.0% |
+| Engine prefill, chunks of 512, BF16 cache | 4.6e-4 to 2.1e-3 | 0.023 to 0.027 | 98.4% to 98.8% |
+| Engine stepping, FP8 cache | 6.4e-4 to 1.7e-3 | 0.026 to 0.030 | 98.3% to 98.8% |
+| Engine prefill, chunks of 512, FP8 cache | 9.0e-4 to 2.1e-3 | 0.025 to 0.031 | 98.2% to 98.9% |
+
+So the engine is as close to the model as MLX is, in both modes. The FP8 cache adds about 0.003 to the mean |log-prob difference|. MLX's chunked path also keeps only 12 of 32 continuation tokens after `regex-readme.txt` against F32, as does the engine's BF16 stepping.

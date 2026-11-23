@@ -53,6 +53,9 @@ def sampled_positions(n: int) -> list[int]:
 def capture(args: argparse.Namespace) -> None:
     text = args.text.read_text()
     model, tokenizer = load(str(args.model))
+    if args.float32:
+        # Float parameters only: the packed expert weights and their scales stay as stored.
+        model.set_dtype(mx.float32)
     tokens = tokenizer.encode(text, add_special_tokens=False)
     n = len(tokens)
     sampled = sampled_positions(n)
@@ -115,6 +118,7 @@ def capture(args: argparse.Namespace) -> None:
         "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
         "tokens": n,
         "mode": "token-by-token" if args.token_by_token else f"chunks of {args.chunk}",
+        "dtype": "float32" if args.float32 else "checkpoint",
         "perplexity": math.exp(-float(target_logprobs.mean())),
         "seconds": round(seconds, 1),
         "continuation_text": tokenizer.decode(continuation),
@@ -195,6 +199,11 @@ def main() -> None:
     cap.add_argument("--chunk", type=int, default=512)
     cap.add_argument("--continue-tokens", type=int, default=32)
     cap.add_argument("--token-by-token", action="store_true")
+    cap.add_argument(
+        "--float32",
+        action="store_true",
+        help="run activations and dense weights in F32, a higher-precision reference",
+    )
     cap.set_defaults(run=capture)
     cmp = sub.add_parser("compare", help="compare two captures of the same text")
     cmp.add_argument("reference", type=Path)
