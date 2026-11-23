@@ -19,6 +19,7 @@
 #include <cfloat>
 #include <cstdint>
 
+#include "mlx_ops.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -35,55 +36,11 @@ __device__ __forceinline__ size_t grid_stride() {
     return size_t(gridDim.x) * blockDim.x;
 }
 
-__device__ __forceinline__ float fadd(float a, float b) {
-    float r;
-    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-__device__ __forceinline__ float fsub(float a, float b) {
-    float r;
-    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-__device__ __forceinline__ float fmul(float a, float b) {
-    float r;
-    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-__device__ __forceinline__ float fdiv(float a, float b) {
-    float r;
-    asm("div.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-// Round to nearest even, flushing subnormal inputs as MLX's cast does.
-__device__ __forceinline__ __nv_bfloat16 to_bf16(float x) {
-    return __float2bfloat16(fabsf(x) < FLT_MIN ? copysignf(0.f, x) : x);
-}
-
-// MLX's Metal sigmoid (`Sigmoid` in mlx/backend/metal/kernels/unary_ops.h):
-// y = 1 / (1 + exp(|x|)), and 1 - y for positive x. expf agrees with Metal's exp on
-// 98.0% of BF16 inputs, a correctly rounded exp on 97.4%.
-__device__ __forceinline__ float mlx_sigmoid(float x) {
-    const float y = fdiv(1.f, fadd(1.f, expf(fabsf(x))));
-    return x < 0.f ? y : fsub(1.f, y);
-}
-
 // tanh(x / cap) * cap. A correctly rounded tanh (through double) agrees with Metal's
 // on 98.4% of BF16 inputs to the logit softcap, tanhf on 98.0%. In SwiGLU outputs that
 // is 11 against 18 differing BF16 values per million, so SwiGLU uses tanhf (softcap_f32).
 __device__ __forceinline__ float softcap(float x, float cap) {
     return fmul(float(tanh(double(fdiv(x, cap)))), cap);
-}
-
-// The SwiGLU softcap with CUDA's tanhf (at most 2 ulps from the true value), which avoids
-// the FP64 tanh above. SwiGLU runs on 9216 values per layer visit; the FP64 version took
-// 2.7 us per call on an RTX 5090.
-__device__ __forceinline__ float softcap_f32(float x, float cap) {
-    return fmul(tanhf(fdiv(x, cap)), cap);
 }
 
 }  // namespace
@@ -105,7 +62,6 @@ embedding_bf16_2304(const int32_t* ids, const __nv_bfloat16* table, __nv_bfloat1
 
 // Softcapped SwiGLU on the interleaved gate/up projection: gate_up[2i] is the gate
 // and gate_up[2i + 1] the up value of output i, so rows need no special handling.
-// MLX (`_softcapped_swiglu`) multiplies left to right: (gate_capped * sigmoid) * up_capped.
 extern "C" __global__ void softcapped_swiglu_bf16(const __nv_bfloat162* gate_up,
                                                   __nv_bfloat16* out, size_t n,
                                                   float gate_softcap, float up_softcap) {
@@ -113,8 +69,7 @@ extern "C" __global__ void softcapped_swiglu_bf16(const __nv_bfloat162* gate_up,
     pdl_wait();
     for (size_t i = grid_index(); i < n; i += grid_stride()) {
         const float2 gu = __bfloat1622float2(gate_up[i]);
-        const float gate = fmul(softcap_f32(gu.x, gate_softcap), mlx_sigmoid(gu.x));
-        out[i] = to_bf16(fmul(gate, softcap_f32(gu.y, up_softcap)));
+        out[i] = softcapped_swiglu(gu.x, gu.y, gate_softcap, up_softcap);
     }
 }
 

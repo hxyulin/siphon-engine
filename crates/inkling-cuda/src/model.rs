@@ -194,9 +194,10 @@ struct MoeScratch {
     counter: CudaSlice<u32>,
     indices: CudaSlice<i32>,
     weights: CudaSlice<f32>,
-    gate_up: CudaSlice<bf16>,
     act: CudaSlice<bf16>,
     down: CudaSlice<bf16>,
+    /// The expert MLP kernel's counters.
+    mlp_sync: CudaSlice<u32>,
 }
 
 fn zeros<T: DeviceRepr + ValidAsZeroBits>(
@@ -271,9 +272,9 @@ impl Scratch {
                 counter: zeros(stream, 1)?,
                 indices: zeros(stream, top_k)?,
                 weights: zeros(stream, top_k)?,
-                gate_up: zeros(stream, top_k * 2 * width)?,
                 act: zeros(stream, top_k * width)?,
                 down: zeros(stream, top_k * hidden)?,
+                mlp_sync: zeros(stream, 1 + top_k)?,
             },
             final_hidden: zeros(stream, hidden)?,
             logits: zeros(stream, cfg.vocab_size)?,
@@ -1206,19 +1207,18 @@ impl Ctx {
         )?;
 
         let (w13, w2) = self.expert_weights(w);
-        self.kernels
-            .experts
-            .expert_matvec(&self.stream, x, &t.indices, &w13, &mut t.gate_up)?;
-        self.kernels.elementwise.softcapped_swiglu(
+        self.kernels.experts.expert_mlp(
             &self.stream,
-            &t.gate_up,
+            x,
+            &t.indices,
+            &w13,
+            &w2,
             &mut t.act,
+            &mut t.down,
+            &mut t.mlp_sync,
             cfg.mlp_gate_softcap,
             cfg.mlp_up_softcap,
-        )?;
-        self.kernels
-            .experts
-            .expert_matvec(&self.stream, &t.act, &t.indices, &w2, &mut t.down)
+        )
     }
 
     /// The layer's `w13` and `w2` expert projections as the expert kernels take them.

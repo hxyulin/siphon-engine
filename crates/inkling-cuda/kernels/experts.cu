@@ -1,29 +1,21 @@
-// NVFP4 and MXFP8 expert matrix-vector products, bit-exact with MLX 0.32.4's
-// decode path (`mx.gather_qmm` with one row per expert, which runs
-// `fp_gather_qmv` or `fp_gather_qmv_fast` from kernels/fp_quantized.h).
+// NVFP4 and MXFP8 expert matrix-vector products for decode, and the whole decode expert
+// MLP (`w13`, softcapped SwiGLU, `w2`) as one kernel.
 //
-// Each output value is one weight row dotted with one input row. MLX gives
-// each output row one simdgroup. Lane `l` reads `kValues` consecutive inputs
-// at `base + l * kValues` for each block of `32 * kValues`, and:
+// Each output value is one weight row dotted with one BF16 input row. The products run at
+// DRAM speed, so the layout serves the loads: a warp covers `kRows` whole weight rows,
+// `kChunks` 16-byte chunks per lane, and its i-th load reads chunk `lane + 32 * i` of
+// them, 512 contiguous bytes.
 //
-// - forms each product `x * w` in F32. A BF16 input times an E2M1 or E4M3
-//   weight is exact in F32;
-// - sums the products of its chunk starting from zero (`qdot`). NVFP4 adds
-//   them in fours, `acc += ((p0 + p1) + p2) + p3`; MXFP8 adds them one at a
-//   time;
-// - adds `scale * acc` to its running result, where `scale` is the chunk's
-//   group scale;
-// - after the last block, reduces the 32 results with `simd_sum`, a butterfly
-//   over lane offsets 1, 2, 4, 8 and 16.
+// Numerics: each product of a BF16 input and an E2M1 or E4M3 weight is exact in F32. A
+// lane sums the products of each scale group in F32 (16 values for NVFP4, 16 of a group
+// of 32 for MXFP8) and multiplies the sum by the group's scale; the lanes of a row then
+// add these in F32. NVFP4 multiplies by `global_scale / (448 * 6)`. The value is rounded
+// to BF16 once, as MLX's `mx.gather_qmm` does; only the summation order differs from MLX.
 //
-// NVFP4 then multiplies by `global_scale / (448 * 6)` before rounding to BF16.
-//
-// `kValues` is MLX's `values_per_thread`. It doubles in the "fast" kernel,
-// which MLX picks when the row count is a multiple of 8 and K is a multiple
-// of 512 (NVFP4) or 256 (MXFP8). The launcher applies the same rule.
-//
-// MLX flushes subnormals and does not contract into FMA, so every add and
-// multiply here is PTX `.rn.ftz`.
+// The MLP kernel takes `w13`, whose rows interleave gate (even) and up (odd) values. It
+// rounds both to BF16, as `softcapped_swiglu_bf16` reads them, and stores
+// `softcapped_swiglu(gate, up)`, so its activations equal `expert_matvec` followed by that
+// kernel bit for bit.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -31,153 +23,382 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 
+#include "mlx_ops.cuh"
+#include "pdl.cuh"
+
 namespace {
 
-// Experts each token routes to.
-constexpr int kSlots = 8;
-// Output rows per block, one warp each.
-constexpr int kWarps = 8;
+// 16-byte weight chunks per lane.
+constexpr int kChunks = 9;
+// Warps per block.
+constexpr int kWarps = 4;
 // `F8E4M3_MAX * F4E2M1_MAX` in MLX's `inv_scale_enc`.
 constexpr float kNvfp4ScaleEnc = 448.f * 6.f;
 
-__device__ float add_ftz(float a, float b) {
-    float r;
-    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
+// Expert weights are read once per token, so they stream past L1 and leave L2 first.
+__device__ __forceinline__ uint64_t evict_first_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
 }
 
-__device__ float mul_ftz(float a, float b) {
-    float r;
-    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-// Metal's `simd_sum`.
-__device__ float warp_sum(float v) {
-#pragma unroll
-    for (int offset = 1; offset < 32; offset *= 2) {
-        v = add_ftz(v, __shfl_xor_sync(0xffffffffu, v, offset));
-    }
+__device__ __forceinline__ uint4 load_stream(const void* p, uint64_t policy) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %5;"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p), "l"(policy));
     return v;
 }
 
-// Two E2M1 values, low nibble first, decoded by the hardware converter. Every
-// E2M1 value is exact in half precision, so this matches a table lookup bit for
-// bit. A `__constant__` table serializes when lanes read different entries.
-__device__ float2 e2m1x2(uint8_t bits) {
-    return __half22float2(__half2(__nv_cvt_fp4x2_to_halfraw2(bits, __NV_E2M1)));
+__device__ __forceinline__ uint32_t load_stream_u16(const void* p, uint64_t policy) {
+    uint16_t v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.u16 %0, [%1], %2;"
+                 : "=h"(v)
+                 : "l"(p), "l"(policy));
+    return v;
 }
 
-__device__ float e4m3(uint8_t bits) {
-    return __half2float(__half(__nv_cvt_fp8_to_halfraw(bits, __NV_E4M3)));
+__device__ __forceinline__ uint32_t load_stream_u8(const void* p, uint64_t policy) {
+    uint16_t v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.u8 %0, [%1], %2;"
+                 : "=h"(v)
+                 : "l"(p), "l"(policy));
+    return v;
 }
 
-// MLX's `fp8_e8m0` to float: 2^(bits - 127), with 0 mapped to 2^-127, a
-// subnormal that the flushing multiply turns into zero.
-__device__ float e8m0(uint8_t bits) {
-    return __uint_as_float(bits == 0 ? 0x400000u : uint32_t(bits) << 23);
+// The two BF16 values of a 32-bit word, low half first.
+__device__ __forceinline__ float bf16_lo(uint32_t pair) { return __uint_as_float(pair << 16); }
+__device__ __forceinline__ float bf16_hi(uint32_t pair) { return __uint_as_float(pair & 0xffff0000u); }
+
+// Two E2M1 values, low nibble first, decoded by the hardware converter. Every E2M1 value is
+// exact in half precision.
+__device__ __forceinline__ float2 e2m1x2(uint32_t bits) {
+    return __half22float2(__half2(__nv_cvt_fp4x2_to_halfraw2(uint8_t(bits), __NV_E2M1)));
 }
 
-// `qdot` for E2M1 weights: two values per byte, low nibble first.
-template <int kValues>
-__device__ float dot_e2m1(const __nv_bfloat16* x, const uint8_t* w) {
-    float acc = 0.f;
+// Two E4M3 values, low byte first.
+__device__ __forceinline__ float2 e4m3x2(uint32_t bits) {
+    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(uint16_t(bits), __NV_E4M3)));
+}
+
+__device__ __forceinline__ float e4m3(uint32_t bits) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(uint8_t(bits), __NV_E4M3)));
+}
+
+// MLX's `fp8_e8m0` to float: 2^(bits - 127), with 0 mapped to 2^-127.
+__device__ __forceinline__ float e8m0(uint32_t bits) {
+    return __uint_as_float(bits == 0 ? 0x400000u : bits << 23);
+}
+
+// Sum of 8 BF16 inputs (`x`, 4 words) times 8 E2M1 weights (`w`, 4 bytes).
+__device__ __forceinline__ float dot8_e2m1(const uint32_t* x, uint32_t w, float acc) {
 #pragma unroll
-    for (int i = 0; i < kValues / 4; ++i) {
-        const float2 w01 = e2m1x2(w[2 * i]);
-        const float2 w23 = e2m1x2(w[2 * i + 1]);
-        float t = add_ftz(mul_ftz(__bfloat162float(x[4 * i]), w01.x),
-                          mul_ftz(__bfloat162float(x[4 * i + 1]), w01.y));
-        t = add_ftz(t, mul_ftz(__bfloat162float(x[4 * i + 2]), w23.x));
-        t = add_ftz(t, mul_ftz(__bfloat162float(x[4 * i + 3]), w23.y));
-        acc = add_ftz(acc, t);
+    for (int b = 0; b < 4; ++b) {
+        const float2 wv = e2m1x2(w >> (8 * b));
+        acc = fmaf(bf16_lo(x[b]), wv.x, acc);
+        acc = fmaf(bf16_hi(x[b]), wv.y, acc);
     }
     return acc;
 }
 
-// `qdot` for E4M3 weights.
-template <int kValues>
-__device__ float dot_e4m3(const __nv_bfloat16* x, const uint8_t* w) {
-    float acc = 0.f;
+// Sum of 4 BF16 inputs (`x`, 2 words) times 4 E4M3 weights (`w`, 4 bytes).
+__device__ __forceinline__ float dot4_e4m3(const uint32_t* x, uint32_t w, float acc) {
 #pragma unroll
-    for (int i = 0; i < kValues; ++i) {
-        acc = add_ftz(acc, mul_ftz(__bfloat162float(x[i]), e4m3(w[i])));
+    for (int h = 0; h < 2; ++h) {
+        const float2 wv = e4m3x2(w >> (16 * h));
+        acc = fmaf(bf16_lo(x[h]), wv.x, acc);
+        acc = fmaf(bf16_hi(x[h]), wv.y, acc);
     }
     return acc;
 }
 
-// One output value per warp. `blockIdx.x` is `row * 8 + slot`; `blockIdx.y`
-// picks a tile of `kWarps` output rows.
-template <bool kFp4, int kValues>
-__device__ void expert_matvec(const __nv_bfloat16* x, const int32_t* indices, const uint8_t* weight,
-                              const uint8_t* scales, const float* global_scale, __nv_bfloat16* out,
-                              int n, int k, int inputs_per_row, int experts) {
-    constexpr int kGroup = kFp4 ? 16 : 32;
-    static_assert(kGroup % kValues == 0, "a chunk must not straddle two scale groups");
+__device__ __forceinline__ uint32_t word(const uint4& v, int i) {
+    return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+
+// Rows, chunks and scale groups of a projection with input width kK.
+template <bool kFp4, int kK>
+struct Geometry {
+    static constexpr int kValues = kFp4 ? 32 : 16;  // per chunk
+    static constexpr int kRowChunks = kK / kValues;
+    static constexpr int kRows = 32 * kChunks / kRowChunks;  // per warp
+    static constexpr int kBlockRows = kWarps * kRows;
+    static constexpr int kGroup = kFp4 ? 16 : 32;
+    static constexpr int kRowBytes = kFp4 ? kK / 2 : kK;
+    static constexpr int kRowScales = kK / kGroup;
+    static_assert(kRows * kRowChunks == 32 * kChunks, "a warp covers whole rows");
+};
+
+// One warp's `kRows` weight rows of one expert: chunk `lane + 32 * i` is row
+// `chunk / kRowChunks`, position `chunk % kRowChunks` in it.
+//
+// The loads are volatile asm, which nvcc keeps in order with `pdl_wait` and the flag wait
+// but interleaves with the arithmetic around them. So the kernels load only after their
+// waits: loads placed before a wait all issue at once, and issuing a warp's nine chunks
+// together took 21 us instead of 16.5 for an NVFP4 `w13` on an RTX 5090. More loads in
+// flight lower DRAM throughput here.
+template <bool kFp4, int kK>
+struct WarpRows {
+    using G = Geometry<kFp4, kK>;
+    uint4 w[kChunks];
+    uint32_t s[kChunks];
+    const uint8_t* wr;
+    const uint8_t* sr;
+    uint64_t policy;
+    bool known;
+
+    // Rows `row0 ..` of `expert`, whose rows number n. An unknown expert loads zeros.
+    __device__ __forceinline__ WarpRows(const uint8_t* weight, const uint8_t* scales, int expert,
+                                        bool known_expert, int n, int row0)
+        : known(known_expert) {
+        policy = evict_first_policy();
+        const size_t first_row = size_t(known ? expert : 0) * n + row0;
+        wr = weight + first_row * G::kRowBytes;
+        sr = scales + first_row * G::kRowScales;
+    }
+
+    __device__ __forceinline__ void load(int i, int lane) {
+        const int chunk = lane + 32 * i;
+        const int p = chunk % G::kRowChunks;
+        const uint8_t* sp = sr + chunk / G::kRowChunks * G::kRowScales + (kFp4 ? 2 * p : p / 2);
+        w[i] = known ? load_stream(wr + 16 * chunk, policy) : make_uint4(0, 0, 0, 0);
+        s[i] = !known ? 0 : kFp4 ? load_stream_u16(sp, policy) : load_stream_u8(sp, policy);
+    }
+
+    // The rows' dot products with the BF16 input `x` (kK values), before the global scale:
+    // lane r < kRows returns row r.
+    __device__ __forceinline__ float dot(const __nv_bfloat16* x, int lane) const {
+        const uint4* xr = reinterpret_cast<const uint4*>(x);
+        float acc[G::kRows];
+#pragma unroll
+        for (int r = 0; r < G::kRows; ++r) {
+            acc[r] = 0.f;
+        }
+#pragma unroll
+        for (int i = 0; i < kChunks; ++i) {
+            const int chunk = lane + 32 * i;
+            const int p = chunk % G::kRowChunks;
+            float sum = 0.f;
+#pragma unroll
+            for (int g = 0; g < (kFp4 ? 2 : 1); ++g) {
+                // 16 inputs: one NVFP4 scale group (8 weight bytes), half an MXFP8 group
+                // (16 weight bytes).
+                const uint4 xa = xr[p * (kFp4 ? 4 : 2) + 2 * g];
+                const uint4 xb = xr[p * (kFp4 ? 4 : 2) + 2 * g + 1];
+                const uint32_t xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+                float group = 0.f;
+                if constexpr (kFp4) {
+                    group = dot8_e2m1(xv, word(w[i], 2 * g), group);
+                    group = dot8_e2m1(xv + 4, word(w[i], 2 * g + 1), group);
+                    sum = fmaf(e4m3(s[i] >> (8 * g)), group, sum);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        group = dot4_e4m3(xv + 2 * j, word(w[i], j), group);
+                    }
+                    sum = e8m0(s[i] & 0xff) * group;
+                }
+            }
+            // Only the rows some lane reaches at step i.
+#pragma unroll
+            for (int r = 32 * i / G::kRowChunks; r <= (32 * i + 31) / G::kRowChunks; ++r) {
+                acc[r] += chunk / G::kRowChunks == r ? sum : 0.f;
+            }
+        }
+        float result = 0.f;
+#pragma unroll
+        for (int r = 0; r < G::kRows; ++r) {
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], offset);
+            }
+            result = lane == r ? acc[r] : result;
+        }
+        return result;
+    }
+};
+
+__device__ __forceinline__ float output_scale(bool fp4, const float* global_scale, int expert) {
+    return fp4 ? __fdiv_rn(global_scale[expert], kNvfp4ScaleEnc) : 1.f;
+}
+
+__device__ __forceinline__ uint32_t load_relaxed(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+constexpr float kNan = __builtin_nanf("");
+
+// One block covers `kBlockRows` output rows of one (row, slot) pair, `blockIdx.y`.
+template <bool kFp4, int kK>
+__device__ __forceinline__ void expert_matvec(const __nv_bfloat16* x, const int32_t* indices,
+                                              const uint8_t* weight, const uint8_t* scales,
+                                              const float* global_scale, __nv_bfloat16* out, int n,
+                                              int inputs_per_row, int experts) {
+    using G = Geometry<kFp4, kK>;
     const int lane = threadIdx.x % 32;
-    const int col = blockIdx.y * kWarps + threadIdx.x / 32;
-    if (col >= n) {
-        return;
+    const int row0 = blockIdx.x * G::kBlockRows + threadIdx.x / 32 * G::kRows;
+    const unsigned pair = blockIdx.y;
+    pdl_wait();
+    pdl_trigger();
+    const int expert = indices[pair];
+    const bool known = expert >= 0 && expert < experts;
+    WarpRows<kFp4, kK> rows(weight, scales, expert, known, n, row0);
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+        rows.load(i, lane);
     }
-    const unsigned slot_row = blockIdx.x;
-    __nv_bfloat16* y = out + size_t(slot_row) * n + col;
-    const int expert = indices[slot_row];
-    if (expert < 0 || expert >= experts) {
-        if (lane == 0) {
-            *y = __float2bfloat16(__int_as_float(0x7fc00000));
-        }
-        return;
+    const unsigned input = inputs_per_row == 1 ? pair / 8 : pair;
+    float result = rows.dot(x + size_t(input) * kK, lane);
+    if (lane < G::kRows) {
+        result = known ? result * output_scale(kFp4, global_scale, expert) : kNan;
+        out[size_t(pair) * n + row0 + lane] = __float2bfloat16(result);
     }
-    const unsigned row = slot_row / kSlots;
-    const unsigned input = row * inputs_per_row + (inputs_per_row == 1 ? 0 : slot_row % kSlots);
-    const __nv_bfloat16* xr = x + size_t(input) * k;
-    const size_t weight_row = size_t(expert) * n + col;
-    const uint8_t* wr = weight + weight_row * (kFp4 ? k / 2 : k);
-    const uint8_t* sr = scales + weight_row * (k / kGroup);
+}
 
-    float result = 0.f;
-    for (int base = lane * kValues; base < k; base += 32 * kValues) {
-        float acc;
-        float scale;
-        if constexpr (kFp4) {
-            acc = dot_e2m1<kValues>(xr + base, wr + base / 2);
-            scale = e4m3(sr[base / kGroup]);
+// The decode expert MLP in one kernel: act = softcapped_swiglu(x @ w13) per pair, then
+// out = act @ w2. Tasks `0 .. pairs * kTiles13` are `w13` row tiles and the rest `w2` row
+// tiles, both ordered by pair, and block b runs tasks b, b + gridDim.x, and so on. A
+// `w13` task adds 1 to its pair's count `sync[1 + pair]` after storing its activations;
+// a `w2` task waits until the count reaches kTiles13, then streams its weights and reads
+// the activations. With fewer blocks than tasks, the first pairs' `w13` tiles end
+// early and their `w2` tiles stream while later `w13` tiles still run.
+//
+// A block reaches each of its `w13` tasks without waiting, since all its earlier tasks
+// are `w13` tasks too. So as long as every block of the grid can be resident at once,
+// which the launcher ensures, every count completes. The last block to finish zeroes
+// `sync` for the next launch.
+template <bool kFp4, int kK13, int kK2>
+__device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t* indices,
+                                           const uint8_t* w13, const uint8_t* s13,
+                                           const float* g13, const uint8_t* w2, const uint8_t* s2,
+                                           const float* g2, __nv_bfloat16* act,
+                                           __nv_bfloat16* out, int n2, int pairs, int experts,
+                                           float gate_softcap, float up_softcap, uint32_t* sync) {
+    using G13 = Geometry<kFp4, kK13>;
+    using G2 = Geometry<kFp4, kK2>;
+    constexpr int kN13 = 2 * kK2;
+    constexpr int kTiles13 = kN13 / G13::kBlockRows;
+    static_assert(kN13 % G13::kBlockRows == 0 && G13::kRows % 2 == 0,
+                  "gate and up rows share a warp");
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int tiles2 = n2 / G2::kBlockRows;
+    const unsigned tasks13 = unsigned(pairs) * kTiles13;
+    const unsigned tasks = tasks13 + unsigned(pairs) * tiles2;
+
+    pdl_wait();
+    pdl_trigger();
+    for (unsigned task = blockIdx.x; task < tasks; task += gridDim.x) {
+        if (task < tasks13) {
+            const unsigned pair = task / kTiles13;
+            const int row0 = task % kTiles13 * G13::kBlockRows + warp * G13::kRows;
+            const int expert = indices[pair];
+            const bool known = expert >= 0 && expert < experts;
+            WarpRows<kFp4, kK13> rows(w13, s13, expert, known, kN13, row0);
+#pragma unroll
+            for (int i = 0; i < kChunks; ++i) {
+                rows.load(i, lane);
+            }
+            float result = rows.dot(x + size_t(pair / 8) * kK13, lane);
+            if (known) {
+                result *= output_scale(kFp4, g13, expert);
+            }
+            const float up = __shfl_down_sync(0xffffffffu, result, 1);
+            if (lane < G13::kRows && lane % 2 == 0) {
+                const float gate_bf16 = __bfloat162float(__float2bfloat16(result));
+                const float up_bf16 = __bfloat162float(__float2bfloat16(up));
+                act[size_t(pair) * kK2 + (row0 + lane) / 2] =
+                    known ? softcapped_swiglu(gate_bf16, up_bf16, gate_softcap, up_softcap)
+                          : __float2bfloat16(kNan);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence();
+                atomicAdd(&sync[1 + pair], 1u);
+            }
         } else {
-            acc = dot_e4m3<kValues>(xr + base, wr + base);
-            scale = e8m0(sr[base / kGroup]);
+            const unsigned pair = (task - tasks13) / tiles2;
+            const int row0 = (task - tasks13) % tiles2 * G2::kBlockRows + warp * G2::kRows;
+            const int expert = indices[pair];
+            const bool known = expert >= 0 && expert < experts;
+            if (threadIdx.x == 0) {
+                while (load_relaxed(&sync[1 + pair]) < kTiles13) {
+                    __nanosleep(64);
+                }
+                // With the barrier below, orders the block's activation loads after the
+                // count, and so after the stores the count covers.
+                __threadfence();
+            }
+            __syncthreads();
+            // Loading weights before the wait was slower: 27.0 us instead of 24.6 per NVFP4
+            // layer visit with all nine chunks.
+            WarpRows<kFp4, kK2> rows(w2, s2, expert, known, n2, row0);
+#pragma unroll
+            for (int i = 0; i < kChunks; ++i) {
+                rows.load(i, lane);
+            }
+            float result = rows.dot(act + size_t(pair) * kK2, lane);
+            if (lane < G2::kRows) {
+                result = known ? result * output_scale(kFp4, g2, expert) : kNan;
+                out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(result);
+            }
         }
-        result = add_ftz(result, mul_ftz(scale, acc));
     }
-    result = warp_sum(result);
-    if constexpr (kFp4) {
-        result = mul_ftz(result, __fdiv_rn(global_scale[expert], kNvfp4ScaleEnc));
-    }
-    if (lane == 0) {
-        *y = __float2bfloat16(result);
+    if (threadIdx.x == 0 && atomicAdd(&sync[0], 1u) == gridDim.x - 1) {
+        // Every block has finished with the counts.
+        for (int p = 0; p < pairs; ++p) {
+            sync[1 + p] = 0;
+        }
+        sync[0] = 0;
     }
 }
 
 }  // namespace
 
-// Arguments, shared by all four kernels:
-// - `x`: BF16 `[rows, inputs_per_row, k]`, where `inputs_per_row` is 1 (one
-//   input for all 8 slots) or 8 (one per slot);
+// `expert_matvec_<format>_<k>`:
+// - `x`: BF16 `[rows, inputs_per_row, k]`, where `inputs_per_row` is 1 (one input for all
+//   8 slots) or 8 (one per slot);
 // - `indices`: `[rows, 8]` expert ids;
 // - `weight`, `scales`: raw checkpoint bytes, `[experts, n, k / 2]` E2M1 and
-//   `[experts, n, k / 16]` E4M3 for NVFP4, `[experts, n, k]` E4M3 and
-//   `[experts, n, k / 32]` E8M0 for MXFP8;
+//   `[experts, n, k / 16]` E4M3 for NVFP4, `[experts, n, k]` E4M3 and `[experts, n, k / 32]`
+//   E8M0 for MXFP8;
 // - `global_scale`: F32 `[experts]` for NVFP4, unused by MXFP8;
 // - `out`: BF16 `[rows, 8, n]`. An expert id outside `[0, experts)` gives NaN.
-#define EXPERT_MATVEC(name, fp4, values)                                                           \
-    extern "C" __global__ void __launch_bounds__(kWarps * 32)                                      \
+// The grid is (n / kBlockRows, rows * 8) blocks of `kWarps` warps; n must be a multiple
+// of kBlockRows.
+#define EXPERT_MATVEC(name, fp4, k)                                                                \
+    extern "C" __global__ void __launch_bounds__(kWarps * 32, 7)                                    \
         name(const __nv_bfloat16* x, const int32_t* indices, const uint8_t* weight,                \
-             const uint8_t* scales, const float* global_scale, __nv_bfloat16* out, int n, int k,   \
+             const uint8_t* scales, const float* global_scale, __nv_bfloat16* out, int n,          \
              int inputs_per_row, int experts) {                                                    \
-        expert_matvec<fp4, values>(x, indices, weight, scales, global_scale, out, n, k,            \
-                                   inputs_per_row, experts);                                       \
+        expert_matvec<fp4, k>(x, indices, weight, scales, global_scale, out, n, inputs_per_row,    \
+                              experts);                                                            \
     }
 
-EXPERT_MATVEC(expert_matvec_nvfp4_8, true, 8)
-EXPERT_MATVEC(expert_matvec_nvfp4_16, true, 16)
-EXPERT_MATVEC(expert_matvec_mxfp8_4, false, 4)
-EXPERT_MATVEC(expert_matvec_mxfp8_8, false, 8)
+EXPERT_MATVEC(expert_matvec_nvfp4_2304, true, 2304)
+EXPERT_MATVEC(expert_matvec_nvfp4_1152, true, 1152)
+EXPERT_MATVEC(expert_matvec_mxfp8_2304, false, 2304)
+EXPERT_MATVEC(expert_matvec_mxfp8_1152, false, 1152)
+
+// `expert_mlp_<format>`, for `w13` of 2304 interleaved rows and input width 2304, and `w2`
+// of n2 rows and input width 1152, with the weights as for `expert_matvec`:
+// - `x`: BF16 `[pairs / 8, 2304]`; `indices`: `[pairs / 8, 8]`;
+// - `act`: BF16 `[pairs, 1152]`, written; `out`: BF16 `[pairs, n2]`;
+// - `sync`: `1 + pairs` zeros, left zero.
+// Blocks have `kWarps` warps. The grid may have any size up to the number of tasks,
+// `pairs * (2304 / kBlockRows of w13 + n2 / kBlockRows of w2)`, but all its blocks must
+// fit on the GPU at once.
+#define EXPERT_MLP(name, fp4)                                                                      \
+    extern "C" __global__ void __launch_bounds__(kWarps * 32, 7)                                    \
+        name(const __nv_bfloat16* x, const int32_t* indices, const uint8_t* w13,                   \
+             const uint8_t* s13, const float* g13, const uint8_t* w2, const uint8_t* s2,           \
+             const float* g2, __nv_bfloat16* act, __nv_bfloat16* out, int n2, int pairs,           \
+             int experts, float gate_softcap, float up_softcap, uint32_t* sync) {                  \
+        expert_mlp<fp4, 2304, 1152>(x, indices, w13, s13, g13, w2, s2, g2, act, out, n2, pairs,    \
+                                    experts, gate_softcap, up_softcap, sync);                      \
+    }
+
+EXPERT_MLP(expert_mlp_nvfp4, true)
+EXPERT_MLP(expert_mlp_mxfp8, false)

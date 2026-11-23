@@ -6,16 +6,31 @@ use std::sync::Arc;
 use anyhow::{Context as _, bail, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
-    sys::CUfunction_attribute,
+    sys::{CUdevice_attribute, CUfunction_attribute},
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 
 /// Experts each token routes to.
 const SLOTS: usize = 8;
-/// Output rows per block, one warp each.
-const WARPS: u32 = 8;
+/// `expert_matvec` and `expert_mlp`: warps per block, and 16-byte weight chunks per lane.
+const MATVEC_WARPS: usize = 4;
+const MATVEC_CHUNKS: usize = 9;
+/// Input widths the `expert_matvec` kernels support, in the order of [`MATVEC_KERNELS`].
+const MATVEC_K: [usize; 2] = [2304, 1152];
+/// `expert_matvec` kernels by format and input width.
+const MATVEC_KERNELS: [&str; 4] = [
+    "expert_matvec_nvfp4_2304",
+    "expert_matvec_nvfp4_1152",
+    "expert_matvec_mxfp8_2304",
+    "expert_matvec_mxfp8_1152",
+];
+/// `expert_mlp`: the input widths of `w13` and `w2`, and the blocks it runs per SM for
+/// NVFP4 and MXFP8, the fastest measured on an RTX 5090.
+const MLP_K13: usize = 2304;
+const MLP_K2: usize = 1152;
+const MLP_BLOCKS_PER_SM: [usize; 2] = [4, 7];
 /// `expert_matmul`: output columns per block, pairs per tile, input values per pipeline stage,
 /// and threads per block.
 const GEMM_COLUMNS: usize = 128;
@@ -45,6 +60,23 @@ impl ExpertFormat<'_> {
         match self {
             Self::Nvfp4 { .. } => 16,
             Self::Mxfp8 => 32,
+        }
+    }
+
+    /// Output rows one `expert_matvec` or `expert_mlp` block covers for input width k:
+    /// `MATVEC_WARPS` warps, each with whole rows of `MATVEC_CHUNKS` 16-byte chunks per lane.
+    fn matvec_block_rows(self, k: usize) -> usize {
+        let chunk_values = match self {
+            Self::Nvfp4 { .. } => 32,
+            Self::Mxfp8 => 16,
+        };
+        MATVEC_WARPS * 32 * MATVEC_CHUNKS * chunk_values / k
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Nvfp4 { .. } => 0,
+            Self::Mxfp8 => 1,
         }
     }
 
@@ -210,10 +242,12 @@ fn max_tiles(pairs: usize, experts: usize) -> usize {
 
 #[derive(Debug)]
 pub struct Experts {
-    nvfp4_8: CudaFunction,
-    nvfp4_16: CudaFunction,
-    mxfp8_4: CudaFunction,
-    mxfp8_8: CudaFunction,
+    /// The kernels of [`MATVEC_KERNELS`], in its order.
+    matvec: Vec<CudaFunction>,
+    /// `expert_mlp` for NVFP4 and MXFP8, and the blocks each runs: all must fit on the GPU
+    /// at once.
+    mlp: [CudaFunction; 2],
+    mlp_blocks: [usize; 2],
     group: CudaFunction,
     gemm_nvfp4: CudaFunction,
     gemm_mxfp8: CudaFunction,
@@ -234,11 +268,20 @@ impl Experts {
                 shared,
             )?;
         }
+        let mlp = [
+            module.load_function("expert_mlp_nvfp4")?,
+            module.load_function("expert_mlp_mxfp8")?,
+        ];
         Ok(Self {
-            nvfp4_8: module.load_function("expert_matvec_nvfp4_8")?,
-            nvfp4_16: module.load_function("expert_matvec_nvfp4_16")?,
-            mxfp8_4: module.load_function("expert_matvec_mxfp8_4")?,
-            mxfp8_8: module.load_function("expert_matvec_mxfp8_8")?,
+            matvec: MATVEC_KERNELS
+                .iter()
+                .map(|name| module.load_function(name))
+                .collect::<Result<_, _>>()?,
+            mlp_blocks: [
+                mlp_blocks(ctx, &mlp[0], MLP_BLOCKS_PER_SM[0])?,
+                mlp_blocks(ctx, &mlp[1], MLP_BLOCKS_PER_SM[1])?,
+            ],
+            mlp,
             group: matmul.load_function("expert_group")?,
             gemm_nvfp4,
             gemm_mxfp8,
@@ -250,9 +293,10 @@ impl Experts {
     ///
     /// `indices` is `[rows, 8]`. `x` is BF16 `[rows, 1, k]`, one input shared by all 8 slots
     /// (`w13`), or `[rows, 8, k]`, one input per slot (`w2`). Each id must be below the expert
-    /// count of `weights`; an id outside it gives a NaN row.
+    /// count of `weights`; an id outside it gives a NaN row. k must be 2304 or 1152, and n a
+    /// multiple of 16 (NVFP4, k = 2304) to 32 (NVFP4, k = 1152).
     ///
-    /// Equals MLX's `mx.gather_qmm` on one row per expert, bit for bit.
+    /// Equals MLX's `mx.gather_qmm` up to F32 summation order.
     pub fn expert_matvec(
         &self,
         stream: &CudaStream,
@@ -265,11 +309,8 @@ impl Experts {
         let Shape {
             experts,
             rows,
-            inputs_per_row: inputs_arg,
+            inputs_per_row,
         } = weights.check(x.len(), indices.len(), out.len())?;
-        if rows == 0 {
-            return Ok(());
-        }
         let &ExpertWeights {
             format,
             weight,
@@ -277,46 +318,147 @@ impl Experts {
             n,
             k,
         } = weights;
-
-        // MLX's rule for its fast kernel, which gives each lane twice as many values.
-        let (fast_k, function_fast, function) = match format {
-            ExpertFormat::Nvfp4 { .. } => (512, &self.nvfp4_16, &self.nvfp4_8),
-            ExpertFormat::Mxfp8 => (256, &self.mxfp8_8, &self.mxfp8_4),
-        };
-        let fast = n.is_multiple_of(WARPS as usize) && k.is_multiple_of(fast_k);
-        let function = if fast { function_fast } else { function };
-
-        let slot_rows = u32::try_from(rows * SLOTS).context("too many rows")?;
-        let tiles = u32::try_from(n.div_ceil(WARPS as usize)).context("n is too large")?;
-        let n_arg = i32::try_from(n).context("n is too large")?;
-        let k_arg = i32::try_from(k).context("k is too large")?;
-        let experts_arg = i32::try_from(experts).context("too many experts")?;
-        // A null pointer stands in for MXFP8's missing global scale.
-        let null: u64 = 0;
+        let k_index = MATVEC_K
+            .iter()
+            .position(|&supported| supported == k)
+            .with_context(|| format!("expert_matvec supports k in {MATVEC_K:?}, got {k}"))?;
+        let block_rows = format.matvec_block_rows(k);
+        ensure!(
+            n.is_multiple_of(block_rows),
+            "expert_matvec needs n a multiple of {block_rows} for k = {k}, got {n}"
+        );
+        if rows == 0 {
+            return Ok(());
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(&indices, stream)
+            .ptr(weight, stream)
+            .ptr(scales, stream);
+        global_scale_arg(&mut args, format, stream);
+        args.ptr_mut(&mut out, stream)
+            .i32(i32::try_from(n).context("n is too large")?)
+            .i32(inputs_per_row)
+            .i32(i32::try_from(experts).context("too many experts")?);
         let config = LaunchConfig {
-            grid_dim: (slot_rows, tiles, 1),
-            block_dim: (WARPS * 32, 1, 1),
+            grid_dim: (
+                u32::try_from(n / block_rows).context("n is too large")?,
+                u32::try_from(rows * SLOTS).context("too many rows")?,
+                1,
+            ),
+            block_dim: (u32::try_from(MATVEC_WARPS * 32)?, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(function);
-        launch.arg(&x).arg(&indices).arg(weight).arg(scales);
-        match format {
-            ExpertFormat::Nvfp4 { global_scale } => launch.arg(global_scale),
-            ExpertFormat::Mxfp8 => launch.arg(&null),
-        };
-        launch
-            .arg(&mut out)
-            .arg(&n_arg)
-            .arg(&k_arg)
-            .arg(&inputs_arg)
-            .arg(&experts_arg);
+        let function = &self.matvec[2 * format.index() + k_index];
         // SAFETY: the arguments match `expert_matvec_*(const bf16*, const int*, const u8*,
-        // const u8*, const float*, bf16*, int, int, int, int)`. The checks above keep every input
-        // row inside `x`, every output inside `out`, and every weight and scale row of an expert
-        // below `experts` inside `weight` and `scales`; the kernel skips other expert ids. Only
-        // the NVFP4 kernels read `global_scale`, which then holds `experts` values.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // const u8*, const float*, bf16*, int, int, int)`, and the kernel's k is the weights'
+        // k. `check` kept every input row inside `x`, every output inside `out`, and every
+        // weight and scale row of an expert below `experts` inside `weight` and `scales`; the
+        // kernel skips other ids, and the grid covers exactly n rows. Only the NVFP4 kernels
+        // read `global_scale`, which then holds `experts` values. The kernel reads nothing
+        // before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// The decode expert MLP: `act = softcapped_swiglu(x @ w13)` for each row and slot, then
+    /// `out = act @ w2`, in one kernel.
+    ///
+    /// `x` is BF16 `[rows, 2304]`, `indices` `[rows, 8]`, `act` `[rows, 8, 1152]` and `out`
+    /// `[rows, 8, w2.n]`. `w13` has 2304 rows of input width 2304, interleaving gate (even)
+    /// and up (odd) rows; `w2` has input width 1152 and n a multiple of 32 (NVFP4) or 16
+    /// (MXFP8). Both use the same format and expert count. `sync` holds at least
+    /// `1 + rows * 8` zeros, which the kernel leaves zero. Unknown ids give NaN rows in `act`
+    /// and `out`.
+    ///
+    /// Equals [`Self::expert_matvec`], `Elementwise::softcapped_swiglu` and
+    /// [`Self::expert_matvec`] again, bit for bit. The `w2` products of each slot start as
+    /// soon as its activations are ready, so DRAM streams both projections without a gap.
+    #[expect(clippy::too_many_arguments, reason = "two projections and two caps")]
+    pub fn expert_mlp(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        indices: &impl DeviceIn<i32>,
+        w13: &ExpertWeights<'_>,
+        w2: &ExpertWeights<'_>,
+        act: &mut impl DeviceOut<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        sync: &mut impl DeviceOut<u32>,
+        gate_softcap: f32,
+        up_softcap: f32,
+    ) -> anyhow::Result<()> {
+        let (x, indices, mut act, mut out, mut sync) = (
+            x.view(),
+            indices.view(),
+            act.view_mut(),
+            out.view_mut(),
+            sync.view_mut(),
+        );
+        ensure!(
+            w13.k == MLP_K13 && w13.n == 2 * MLP_K2 && w2.k == MLP_K2,
+            "expert_mlp needs w13 of {} x {MLP_K13} and w2 of input width {MLP_K2}, got {} x {} \
+             and {}",
+            2 * MLP_K2,
+            w13.n,
+            w13.k,
+            w2.k
+        );
+        let gate_up = w13.check(x.len(), indices.len(), 2 * act.len())?;
+        ensure!(gate_up.inputs_per_row == 1, "x must hold one input per row");
+        let down = w2.check(act.len(), indices.len(), out.len())?;
+        ensure!(
+            w13.format.index() == w2.format.index() && gate_up.experts == down.experts,
+            "w13 and w2 must share format and expert count"
+        );
+        let pairs = gate_up.rows * SLOTS;
+        ensure!(
+            sync.len() > pairs,
+            "sync has {} elements, expected at least {}",
+            sync.len(),
+            1 + pairs
+        );
+        let block_rows2 = w2.format.matvec_block_rows(MLP_K2);
+        ensure!(
+            w2.n.is_multiple_of(block_rows2),
+            "expert_mlp needs w2's n a multiple of {block_rows2}, got {}",
+            w2.n
+        );
+        if pairs == 0 {
+            return Ok(());
+        }
+        let tasks = pairs * (w13.n / w13.format.matvec_block_rows(MLP_K13) + w2.n / block_rows2);
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(&indices, stream)
+            .ptr(w13.weight, stream)
+            .ptr(w13.scales, stream);
+        global_scale_arg(&mut args, w13.format, stream);
+        args.ptr(w2.weight, stream).ptr(w2.scales, stream);
+        global_scale_arg(&mut args, w2.format, stream);
+        args.ptr_mut(&mut act, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(w2.n).context("n is too large")?)
+            .i32(i32::try_from(pairs).context("too many rows")?)
+            .i32(i32::try_from(gate_up.experts).context("too many experts")?)
+            .f32(gate_softcap)
+            .f32(up_softcap)
+            .ptr_mut(&mut sync, stream);
+        let blocks = tasks.min(self.mlp_blocks[w13.format.index()]);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks)?, 1, 1),
+            block_dim: (u32::try_from(MATVEC_WARPS * 32)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `expert_mlp_*(const bf16*, const int*, const u8*,
+        // const u8*, const float*, const u8*, const u8*, const float*, bf16*, bf16*, int, int,
+        // int, float, float, unsigned*)`. The checks above give `x` one 2304-wide input per
+        // row, `act` 1152 values and `out` w2.n values per pair, the weights the kernel's
+        // shapes and `experts` experts each, and `sync` room for its 1 + pairs counters,
+        // zero as the kernel leaves them. The grid has at most one block per task, and all
+        // its blocks fit on the GPU at once (`mlp_blocks`), which the kernel's waits
+        // need. Only the NVFP4 kernel reads the global scales, which then hold `experts`
+        // values. The kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.mlp[w13.format.index()], config) }
     }
 
     /// [`Self::expert_matvec`] for many rows: the same arguments, shapes and results, up to
@@ -494,6 +636,33 @@ impl Experts {
         unsafe { launch.launch(config) }?;
         Ok(())
     }
+}
+
+/// The blocks an `expert_mlp` kernel runs: `per_sm` per SM, and never more than fit on the
+/// GPU at once.
+fn mlp_blocks(
+    ctx: &Arc<CudaContext>,
+    kernel: &CudaFunction,
+    per_sm: usize,
+) -> anyhow::Result<usize> {
+    let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+    let resident = kernel.occupancy_max_active_blocks_per_multiprocessor(
+        u32::try_from(MATVEC_WARPS * 32)?,
+        0,
+        None,
+    )?;
+    let per_sm = per_sm.min(usize::try_from(resident)?);
+    ensure!(per_sm > 0, "expert_mlp does not fit on an SM");
+    Ok(per_sm * usize::try_from(sms)?)
+}
+
+/// The global scale argument of an expert kernel: the NVFP4 scales, or a null pointer for
+/// MXFP8, which has none.
+fn global_scale_arg(args: &mut KernelArgs, format: ExpertFormat<'_>, stream: &CudaStream) {
+    match format {
+        ExpertFormat::Nvfp4 { global_scale } => args.ptr(global_scale, stream),
+        ExpertFormat::Mxfp8 => args.u64(0),
+    };
 }
 
 /// Identifies a stream for [`Grouping`].

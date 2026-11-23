@@ -1,10 +1,11 @@
-//! Expert matrix-vector products against MLX outputs from `reference/fixtures/experts.py`.
+//! Expert products against MLX outputs from `reference/fixtures/experts.py` and an F64
+//! reference.
 //!
-//! The kernels copy the reduction order of MLX's `fp_gather_qmv`, so every projection must
-//! match bit for bit. The whole-MLP test also runs the softcapped SwiGLU, whose tanh and
-//! exp can put a BF16 result 1 ulp from Metal's. A differing activation would pass through
-//! the down projection, but none differs in this fixture, so the test also requires
-//! bit-exact output.
+//! The kernels add the exact products in another order than MLX's `fp_gather_qmv`, so
+//! outputs may differ from MLX in the last BF16 bit. Every output must stay within the F64
+//! bound described above `check_reference`, and the tests print how many differ from MLX.
+//! `expert_mlp` must equal `expert_matvec`, the softcapped SwiGLU and `expert_matvec`
+//! again bit for bit.
 
 #![cfg(target_os = "linux")]
 
@@ -13,7 +14,7 @@ mod common;
 use std::{fs, path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, ensure};
-use common::{Fixture, assert_bf16_close};
+use common::Fixture;
 use cudarc::driver::{CudaSlice, CudaStream};
 use half::bf16;
 use inkling::Checkpoint;
@@ -112,25 +113,69 @@ impl Projection {
     }
 }
 
-/// Runs both projections of `experts_<format>` and requires bit-exact output.
+/// Runs both projections of `experts_<format>`, checks them against the F64 reference and
+/// prints how far they are from MLX.
 fn check_fixture(format: &str) -> anyhow::Result<()> {
     let s = Setup::new()?;
     let file = format!("experts_{format}");
     let fixture = Fixture::load(&file)?;
     let (indices, _) = fixture.i32("indices")?;
-    let indices = s.stream().clone_htod(&indices)?;
+    let indices_gpu = s.stream().clone_htod(&indices)?;
     for name in ["gate_up", "down"] {
         let projection = Projection::load(&s, &fixture, &file, name)?;
-        let (x, _) = fixture.bf16(&format!("{name}.x"))?;
+        let (x, x_shape) = fixture.bf16(&format!("{name}.x"))?;
         let (want, _) = fixture.bf16(&format!("{name}.out"))?;
-        let x = s.stream().clone_htod(&x)?;
+        let x_gpu = s.stream().clone_htod(&x)?;
         let mut out = s.stream().alloc_zeros::<bf16>(want.len())?;
-        s.experts
-            .expert_matvec(s.stream(), &x, &indices, &projection.weights(), &mut out)?;
+        s.experts.expert_matvec(
+            s.stream(),
+            &x_gpu,
+            &indices_gpu,
+            &projection.weights(),
+            &mut out,
+        )?;
         let got = s.stream().clone_dtoh(&out)?;
-        assert_bf16_close(&format!("{format} {name}"), &got, &want, 0);
+        let weight = fixture_bytes(&file, &format!("{name}.weight"))?;
+        let scales = fixture_bytes(&file, &format!("{name}.scales"))?;
+        let host = HostProjection {
+            weight: &weight,
+            scales: &scales,
+            global_scale: match format {
+                "nvfp4" => Some(fixture.f32(&format!("{name}.global_scale"))?.0),
+                _ => None,
+            },
+            n: projection.n,
+            k: projection.k,
+        };
+        let inputs_per_row = if x_shape.len() == 3 { SLOTS } else { 1 };
+        let label = format!("{format} {name}");
+        let worst = check_reference(&label, &host, &x, &indices, inputs_per_row, &got);
+        report_ulps(
+            &format!("{label}: worst error {worst:.3} of bound; against MLX"),
+            &got,
+            &want,
+        );
     }
     Ok(())
+}
+
+/// Prints how many values of `got` differ from `want` by 0, 1, 2 or more BF16 ulps.
+fn report_ulps(label: &str, got: &[bf16], want: &[bf16]) {
+    let mut ulps = [0usize; 4];
+    let mut max_ulps = 0;
+    for (a, b) in got.iter().zip(want) {
+        let d = common::bf16_ulps(*a, *b);
+        ulps[(d as usize).min(3)] += 1;
+        max_ulps = max_ulps.max(d);
+    }
+    eprintln!(
+        "{label}: {} equal, {} at 1 ulp, {} at 2, {} beyond (max {max_ulps}) of {}",
+        ulps[0],
+        ulps[1],
+        ulps[2],
+        ulps[3],
+        got.len()
+    );
 }
 
 #[test]
@@ -221,6 +266,8 @@ fn checkpoint_projection(
     })
 }
 
+/// Layers 0 (NVFP4) and 20 (MXFP8) of the checkpoint on MLX's inputs: prints how far the
+/// separate kernels are from MLX, and requires `expert_mlp` to equal them.
 #[test]
 #[ignore = "reads the original checkpoint from INKLING_MODEL or ~/.local/share/inkling-mini/model"]
 fn expert_mlp_matches_mlx() -> anyhow::Result<()> {
@@ -239,24 +286,150 @@ fn expert_mlp_matches_mlx() -> anyhow::Result<()> {
 
         let x = stream.clone_htod(&x)?;
         let indices = stream.clone_htod(&indices)?;
-        let mut gate_up = stream.alloc_zeros::<bf16>(SLOTS * 2 * INTERMEDIATE)?;
-        s.experts
-            .expert_matvec(stream, &x, &indices, &w13.weights(), &mut gate_up)?;
-        let mut act = stream.alloc_zeros::<bf16>(SLOTS * INTERMEDIATE)?;
-        elementwise.softcapped_swiglu(stream, &gate_up, &mut act, GATE_SOFTCAP, UP_SOFTCAP)?;
-        let mut out = stream.alloc_zeros::<bf16>(SLOTS * HIDDEN)?;
-        s.experts
-            .expert_matvec(stream, &act, &indices, &w2.weights(), &mut out)?;
+        let (gate_up, act, out) = separate_mlp(
+            &s,
+            &elementwise,
+            &x,
+            &indices,
+            &w13.weights(),
+            &w2.weights(),
+        )?;
+        report_ulps(&format!("layer {layer} gate_up"), &gate_up, &want_gate_up);
+        report_ulps(&format!("layer {layer} out"), &out, &want);
+        check_mlp(&s, &x, &indices, &w13.weights(), &w2.weights(), &act, &out)?;
+    }
+    Ok(())
+}
 
-        let got_gate_up = stream.clone_dtoh(&gate_up)?;
-        assert_bf16_close(
-            &format!("layer {layer} gate_up"),
-            &got_gate_up,
-            &want_gate_up,
-            0,
+/// `expert_matvec` on `w13`, the softcapped SwiGLU and `expert_matvec` on `w2`: the gate/up
+/// projection, the activations and the output.
+fn separate_mlp(
+    s: &Setup,
+    elementwise: &Elementwise,
+    x: &CudaSlice<bf16>,
+    indices: &CudaSlice<i32>,
+    w13: &ExpertWeights<'_>,
+    w2: &ExpertWeights<'_>,
+) -> anyhow::Result<(Vec<bf16>, Vec<bf16>, Vec<bf16>)> {
+    let stream = s.stream();
+    let pairs = indices.len();
+    let mut gate_up = stream.alloc_zeros::<bf16>(pairs * w13.n)?;
+    s.experts
+        .expert_matvec(stream, x, indices, w13, &mut gate_up)?;
+    let mut act = stream.alloc_zeros::<bf16>(pairs * w2.k)?;
+    elementwise.softcapped_swiglu(stream, &gate_up, &mut act, GATE_SOFTCAP, UP_SOFTCAP)?;
+    let mut out = stream.alloc_zeros::<bf16>(pairs * w2.n)?;
+    s.experts
+        .expert_matvec(stream, &act, indices, w2, &mut out)?;
+    Ok((
+        stream.clone_dtoh(&gate_up)?,
+        stream.clone_dtoh(&act)?,
+        stream.clone_dtoh(&out)?,
+    ))
+}
+
+/// Runs `expert_mlp` twice, so the second run starts from the counters the first left, and
+/// requires both to give `want_act` and `want_out` bit for bit.
+fn check_mlp(
+    s: &Setup,
+    x: &CudaSlice<bf16>,
+    indices: &CudaSlice<i32>,
+    w13: &ExpertWeights<'_>,
+    w2: &ExpertWeights<'_>,
+    want_act: &[bf16],
+    want_out: &[bf16],
+) -> anyhow::Result<()> {
+    let stream = s.stream();
+    let pairs = indices.len();
+    let mut sync = stream.alloc_zeros::<u32>(1 + pairs)?;
+    for run in 0..2 {
+        let mut act = stream.alloc_zeros::<bf16>(pairs * w2.k)?;
+        let mut out = stream.alloc_zeros::<bf16>(pairs * w2.n)?;
+        s.experts.expert_mlp(
+            stream,
+            x,
+            indices,
+            w13,
+            w2,
+            &mut act,
+            &mut out,
+            &mut sync,
+            GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        let same = |got: &[bf16], want: &[bf16]| {
+            got.iter()
+                .zip(want)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        assert!(
+            same(&stream.clone_dtoh(&act)?, want_act),
+            "run {run}: act differs"
         );
-        let got = stream.clone_dtoh(&out)?;
-        assert_bf16_close(&format!("layer {layer} out"), &got, &want, 0);
+        assert!(
+            same(&stream.clone_dtoh(&out)?, want_out),
+            "run {run}: out differs"
+        );
+        assert!(
+            stream.clone_dtoh(&sync)?.iter().all(|&v| v == 0),
+            "run {run}: sync not reset"
+        );
+    }
+    Ok(())
+}
+
+/// `expert_mlp` equals the separate kernels on random weights, with unknown ids.
+#[test]
+fn expert_mlp_matches_separate_kernels() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let elementwise = Elementwise::load(s.gpu.context())?;
+    let stream = s.stream();
+    let experts = 10;
+    for fp4 in [true, false] {
+        // 256 output rows: a multiple of both formats' w2 block heights.
+        let w13 = Synthetic::with_experts(&s, experts, fp4, 2 * INTERMEDIATE, HIDDEN, 41)?;
+        let w2 = Synthetic::with_experts(&s, experts, fp4, 256, INTERMEDIATE, 43)?;
+        for rows in [1, 3] {
+            let mut ids: Vec<i32> = (0..rows * SLOTS)
+                .map(|i| i32::try_from(i * 7 % experts).expect("ids fit in i32"))
+                .collect();
+            if rows == 3 {
+                ids[4] = -1;
+                ids[13] = 10;
+            }
+            let indices = stream.clone_htod(&ids)?;
+            let x = stream.clone_htod(&common::pseudo_random_bf16(
+                rows * HIDDEN,
+                rows as u32,
+                1.0,
+                0.0,
+            ))?;
+            let (_, act, out) = separate_mlp(
+                &s,
+                &elementwise,
+                &x,
+                &indices,
+                &w13.gpu.weights(),
+                &w2.gpu.weights(),
+            )?;
+            for (pair, &id) in ids.iter().enumerate() {
+                let bad = !usize::try_from(id).is_ok_and(|id| id < experts);
+                assert!(
+                    act[pair * INTERMEDIATE..(pair + 1) * INTERMEDIATE]
+                        .iter()
+                        .all(|v| v.is_nan() == bad)
+                );
+            }
+            check_mlp(
+                &s,
+                &x,
+                &indices,
+                &w13.gpu.weights(),
+                &w2.gpu.weights(),
+                &act,
+                &out,
+            )?;
+        }
     }
     Ok(())
 }
@@ -449,28 +622,39 @@ struct Synthetic {
 
 impl Synthetic {
     fn new(s: &Setup, fp4: bool, n: usize, k: usize, seed: u32) -> anyhow::Result<Self> {
+        Self::with_experts(s, EXPERTS, fp4, n, k, seed)
+    }
+
+    fn with_experts(
+        s: &Setup,
+        experts: usize,
+        fp4: bool,
+        n: usize,
+        k: usize,
+        seed: u32,
+    ) -> anyhow::Result<Self> {
         let mut random = SplitMix(u64::from(seed));
         let (weight, scales, global_scale) = if fp4 {
-            let weight = random.bytes(EXPERTS * n * k / 2);
+            let weight = random.bytes(experts * n * k / 2);
             // Positive E4M3 scales from 2^-3 to 2^2: exponent fields 4 to 9.
-            let scales = (0..EXPERTS * n * k / 16)
+            let scales = (0..experts * n * k / 16)
                 .map(|_| 32 + random.byte() % 48)
                 .collect();
-            let global_scale = common::pseudo_random(EXPERTS, seed + 2, 1.0)
+            let global_scale = common::pseudo_random(experts, seed + 2, 1.0)
                 .into_iter()
                 .map(|v| 448.0 * 6.0 * 0.004 * (1.5 + v))
                 .collect();
             (weight, scales, Some(global_scale))
         } else {
             // Any E4M3 value but NaN (0x7f, 0xff).
-            let weight = (0..EXPERTS * n * k)
+            let weight = (0..experts * n * k)
                 .map(|_| {
                     let v = random.byte();
                     if v & 0x7f == 0x7f { v ^ 1 } else { v }
                 })
                 .collect();
             // E8M0 scales from 2^-12 to 2^-5.
-            let scales = (0..EXPERTS * n * k / 32)
+            let scales = (0..experts * n * k / 32)
                 .map(|_| 115 + random.byte() % 8)
                 .collect();
             (weight, scales, None)
