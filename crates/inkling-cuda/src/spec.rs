@@ -250,12 +250,15 @@ impl Speculator {
         let started = Instant::now();
         let mut out = Vec::with_capacity(n + self.k + 1);
         if drafts == Drafts::Dspark {
-            self.draft.round(
+            // Prefill committed the prompt, so the first round commits no rows.
+            self.draft.set_round_inputs(
                 &stream,
-                &self.linear,
-                model.draft_shared(),
+                &self.tail.slice(..0),
+                model.position(),
                 model.verify_anchor()?,
             )?;
+            self.draft
+                .replay_round(&stream, &self.linear, model.draft_shared(), self.k)?;
         }
         while out.len() < n {
             let before = timing_event(&stream)?;
@@ -289,13 +292,10 @@ impl Speculator {
             if drafts == Drafts::Dspark {
                 let taps = model.verify_taps()?;
                 let kept = taps.slice(..(a + 1) * TAPS * HIDDEN);
-                self.draft.commit(&stream, &self.linear, &kept, start)?;
-                self.draft.round(
-                    &stream,
-                    &self.linear,
-                    model.draft_shared(),
-                    model.verify_anchor()?,
-                )?;
+                self.draft
+                    .set_round_inputs(&stream, &kept, start, model.verify_anchor()?)?;
+                self.draft
+                    .replay_round(&stream, &self.linear, model.draft_shared(), self.k)?;
             }
             drafted.record(&stream)?;
             timings.push([before, verified, drafted]);
