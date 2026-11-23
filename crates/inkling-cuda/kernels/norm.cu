@@ -326,13 +326,13 @@ namespace {
 
 template <bool kRows>
 __device__ __forceinline__ void
-attention_post_row(const __nv_bfloat16* __restrict__ k_raw, const __nv_bfloat16* __restrict__ v_raw,
+attention_post_row(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                    const __nv_bfloat16* __restrict__ k_weight, const __nv_bfloat16* __restrict__ v_weight,
-                   const __nv_bfloat16* __restrict__ k_dynamic, const __nv_bfloat16* __restrict__ v_dynamic,
+                   const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
                    const float* __restrict__ k_static, const float* __restrict__ v_static,
-                   float* __restrict__ k_state, float* __restrict__ v_state,
-                   const __nv_bfloat16* __restrict__ q_raw, const __nv_bfloat16* __restrict__ q_scale,
-                   const __nv_bfloat16* __restrict__ r_raw, const __nv_bfloat16* __restrict__ r_scale,
+                   float* k_state, float* v_state,
+                   const __nv_bfloat16* q_raw, const __nv_bfloat16* __restrict__ q_scale,
+                   const __nv_bfloat16* r_raw, const __nv_bfloat16* __restrict__ r_scale,
                    __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
                    __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ r, int row,
                    uint32_t position, int log_scale, float alpha, float n_floor, float qk_threshold,
@@ -464,16 +464,16 @@ attention_post_row(const __nv_bfloat16* __restrict__ k_raw, const __nv_bfloat16*
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(kPostThreads)
-attention_post_bf16(const __nv_bfloat16* __restrict__ k_raw, const __nv_bfloat16* __restrict__ v_raw,
+attention_post_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                     const __nv_bfloat16* __restrict__ k_weight, const __nv_bfloat16* __restrict__ v_weight,
-                    const __nv_bfloat16* __restrict__ k_dynamic, const __nv_bfloat16* __restrict__ v_dynamic,
+                    const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
                     const float* __restrict__ k_static, const float* __restrict__ v_static,
-                    float* __restrict__ k_state, float* __restrict__ v_state,
-                    const __nv_bfloat16* __restrict__ q_raw, const __nv_bfloat16* __restrict__ q_scale,
-                    const __nv_bfloat16* __restrict__ r_raw, const __nv_bfloat16* __restrict__ r_scale,
+                    float* k_state, float* v_state,
+                    const __nv_bfloat16* q_raw, const __nv_bfloat16* __restrict__ q_scale,
+                    const __nv_bfloat16* r_raw, const __nv_bfloat16* __restrict__ r_scale,
                     __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
                     __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ r,
-                    const uint32_t* __restrict__ position, int log_scale, float alpha, float n_floor,
+                    const uint32_t* position, int log_scale, float alpha, float n_floor,
                     float qk_threshold, float rel_threshold, float eps) {
     pdl_trigger();
     pdl_wait();

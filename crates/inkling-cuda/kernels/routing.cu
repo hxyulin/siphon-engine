@@ -378,7 +378,7 @@ __device__ void store4(__nv_bfloat16* p, const float (&v)[4]) {
 namespace {
 
 __device__ __forceinline__ void
-depth_attention_fused_row(const float* __restrict__ blocks, int block_stride, int nb, const float* partial_f32,
+depth_attention_fused_row(const float* blocks, int block_stride, int nb, const float* partial_f32,
                           const __nv_bfloat16* partial_bf16, int normalize_partial, float* normed_partial,
                           const float* __restrict__ queries, int nq, float* out, __nv_bfloat16* dst0,
                           __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
@@ -609,7 +609,7 @@ depth_attention_fused_row(const float* __restrict__ blocks, int block_stride, in
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(kDepthThreads)
-depth_attention_fused_2304(const float* __restrict__ blocks, int nb, const float* partial_f32,
+depth_attention_fused_2304(const float* blocks, int nb, const float* partial_f32,
                            const __nv_bfloat16* partial_bf16, int normalize_partial, float* normed_partial,
                            const float* __restrict__ queries, int nq, float* out, __nv_bfloat16* dst0,
                            __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
@@ -688,7 +688,7 @@ __device__ __forceinline__ void route_top8(const float* logits, const float* __r
 namespace {
 
 __device__ __forceinline__ void
-moe_router_row(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
+moe_router_row(const float* x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
                const float* __restrict__ router, const float* __restrict__ bias,
                __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
                unsigned* counter, float route_scale) {
@@ -794,7 +794,7 @@ moe_router_row(const float* __restrict__ x, const __nv_bfloat16* __restrict__ no
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(kRouterThreads)
-moe_router_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
+moe_router_2304(const float* x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
                 const float* __restrict__ router, const float* __restrict__ bias,
                 __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
                 unsigned* counter, float route_scale) {
@@ -1053,7 +1053,7 @@ __device__ __forceinline__ void prefetch_l2(const void* p) {
 // normed_partial, residual and conv_state. Destination k receives output row
 // min(k, nq - 1) after an RMS norm, times weight_k if that is not null, as BF16.
 extern "C" __global__ void __launch_bounds__(kStepThreads)
-depth_attention_step_2304(const float* __restrict__ blocks, int nb, const float* partial_f32,
+depth_attention_step_2304(const float* blocks, int nb, const float* partial_f32,
                           const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,
                           float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,
                           float* normed_partial, const float* __restrict__ queries, int nq, int query_stride,

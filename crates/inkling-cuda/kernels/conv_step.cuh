@@ -19,7 +19,7 @@ __device__ __forceinline__ float round_bf16(float v) {
 // ShortConvolution: weight [dims, 4] BF16 (tap 3 on the newest row), state [3, dims] F32
 // with row 0 the oldest. Shifts x into the state and returns the BF16 output.
 __device__ __forceinline__ __nv_bfloat16 short_conv(float x, const __nv_bfloat16* __restrict__ weight,
-                                                    float* __restrict__ state, int c, int dims) {
+                                                    float* state, int c, int dims) {
     float win[kKernel];
 #pragma unroll
     for (int k = 0; k < kKernel - 1; ++k) {
@@ -41,9 +41,9 @@ __device__ __forceinline__ __nv_bfloat16 short_conv(float x, const __nv_bfloat16
 
 // DynamicShortConvolution: dynamic [4] BF16 (this head's taps for the row), static_weight
 // [4 lags, dims] F32, state [3, dims] F32 with row 2 one step back.
-__device__ __forceinline__ __nv_bfloat16 dynamic_conv(float x, const __nv_bfloat16* __restrict__ dynamic,
+__device__ __forceinline__ __nv_bfloat16 dynamic_conv(float x, const __nv_bfloat16* dynamic,
                                                       const float* __restrict__ static_weight,
-                                                      float* __restrict__ state, int c, int dims) {
+                                                      float* state, int c, int dims) {
     float win[kKernel];
     win[0] = x;
 #pragma unroll
@@ -70,8 +70,7 @@ __device__ __forceinline__ __nv_bfloat16 dynamic_conv(float x, const __nv_bfloat
 
 // The window of row t for channel c, oldest first: x [rows, dims] BF16 rows t - 3 .. t,
 // with the rows before 0 taken from state [3, dims].
-__device__ __forceinline__ void load_window(const __nv_bfloat16* __restrict__ x,
-                                            const float* __restrict__ state, int c, int dims, int t,
+__device__ __forceinline__ void load_window(const __nv_bfloat16* x, const float* state, int c, int dims, int t,
                                             float (&win)[kKernel]) {
 #pragma unroll
     for (int k = 0; k < kKernel; ++k) {
@@ -96,7 +95,7 @@ __device__ __forceinline__ __nv_bfloat16 short_conv_window(const float (&win)[kK
 
 // dynamic_conv over a given window, oldest row first; win[3] is the current row.
 __device__ __forceinline__ __nv_bfloat16 dynamic_conv_window(const float (&win)[kKernel],
-                                                             const __nv_bfloat16* __restrict__ dynamic,
+                                                             const __nv_bfloat16* dynamic,
                                                              const float* __restrict__ static_weight,
                                                              int c, int dims) {
     float acc = 0.f;

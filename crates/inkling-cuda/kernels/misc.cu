@@ -279,7 +279,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 namespace {
 
 __device__ __forceinline__ void
-message_gate_out_row(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
+message_gate_out_row(const __nv_bfloat16* down, const __nv_bfloat16* __restrict__ forget,
                      const __nv_bfloat16* __restrict__ gain, const float* h, const float* m, float* out,
                      const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
                      unsigned* counter, float eps) {
@@ -406,7 +406,7 @@ message_gate_out_row(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16
 // forget_s, gain_s, h + s * h_stride, m + 2304 s, out + 2304 s, norm_weight_s,
 // normed_s and counter + s. A null normed_s skips that slot's norm.
 extern "C" __global__ void __launch_bounds__(kGateThreads)
-message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget0,
+message_gate_out_2304(const __nv_bfloat16* down, const __nv_bfloat16* __restrict__ forget0,
                       const __nv_bfloat16* __restrict__ forget1, const __nv_bfloat16* __restrict__ forget2,
                       const __nv_bfloat16* __restrict__ gain0, const __nv_bfloat16* __restrict__ gain1,
                       const __nv_bfloat16* __restrict__ gain2, const float* h, int h_stride, const float* m,

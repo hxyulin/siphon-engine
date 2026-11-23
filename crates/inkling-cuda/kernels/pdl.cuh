@@ -8,6 +8,13 @@
 // ptxas may move ld.global.nc loads across an unconditional pdl_wait(), and has placed
 // the wait before every weight load. A kernel that must issue its loads first calls
 // pdl_wait() inside a runtime branch, as the GEMVs in linear.cu do.
+//
+// The same freedom applies in the other direction: ptxas may move a non-coherent load
+// of an earlier kernel's output above the wait, where it reads stale data. nvcc emits
+// such loads for any `const T* __restrict__` pointer the kernel only reads, including
+// parameters of inlined helpers. In a kernel launched with PDL, mark only weights and
+// other data no kernel writes `__restrict__`; never activations, scratch, caches, conv
+// states or counters. scripts/pdl_audit.py checks the compiled SASS for both rules.
 
 #pragma once
 

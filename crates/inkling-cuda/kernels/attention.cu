@@ -1280,7 +1280,8 @@ decode_step_fp8(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __
 // range) at a time. A segment that covers its whole unit writes `out`
 // directly. Otherwise it writes its unnormalized output, max and sum (log2
 // domain) to a partial slot, and the last segment of the unit to finish,
-// counted in counters, adds the others to its own and writes `out`. Nothing
+// counted in counters, reads back all of the unit's partials, its own
+// included, combines them in block order and writes `out`. Nothing
 // waits for another block, so the schedule cannot deadlock when fewer blocks
 // fit. Block b holds items begin(b)..begin(b + 1) - 1, and item x lies in block
 // max{b : begin(b) <= x}. Only the first and last segment of a block can be
@@ -1947,10 +1948,27 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
             __syncthreads();
             const bool combine = sm.last;
             if (combine) {
-                for (unsigned b = first_block; b <= last_block; ++b) {
-                    if (b == blockIdx.x) {
-                        continue;
+                // Fold the unit's partials in block order, this block's own read back
+                // like the others, so that the sum order does not depend on which
+                // block finishes last.
+                {
+                    const float* first = partials + size_t(2 * first_block + (seg.unit_begin > begin_of(first_block))) * kSlot;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        m[i] = __ldcg(first + kRows * kHeadDim + local[i]);
+                        l[i] = __ldcg(first + kRows * kHeadDim + kRows + local[i]);
                     }
+                    const float4* first_o = reinterpret_cast<const float4*>(first) + warp * (kHeadDim / 8) * 32 + lane;
+#pragma unroll
+                    for (int n = 0; n < kHeadDim / 8; ++n) {
+                        const float4 p = __ldcg(first_o + n * 32);
+                        o[n][0] = p.x;
+                        o[n][1] = p.y;
+                        o[n][2] = p.z;
+                        o[n][3] = p.w;
+                    }
+                }
+                for (unsigned b = first_block + 1; b <= last_block; ++b) {
                     const float* other = partials + size_t(2 * b + (seg.unit_begin > begin_of(b))) * kSlot;
                     float own[2];
                     float theirs[2];

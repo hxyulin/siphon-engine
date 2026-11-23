@@ -139,10 +139,9 @@ constexpr int kTopK = 8;
 // residual = f32(hidden) + f32(short_conv(x)), or f32(short_conv(x)) when hidden is
 // null (a block start). Equals short_conv_bf16 followed by add_bf16_bf16_f32 or
 // cast_bf16_to_f32 bit for bit, except that subnormal sums are not flushed to zero.
-extern "C" __global__ void short_conv_residual_2304(const __nv_bfloat16* __restrict__ x,
+extern "C" __global__ void short_conv_residual_2304(const __nv_bfloat16* x,
                                                     const __nv_bfloat16* __restrict__ weight,
-                                                    float* __restrict__ state,
-                                                    const __nv_bfloat16* __restrict__ hidden,
+                                                    float* state, const __nv_bfloat16* hidden,
                                                     float* __restrict__ residual) {
     pdl_trigger();
     pdl_wait();
@@ -159,11 +158,9 @@ extern "C" __global__ void short_conv_residual_2304(const __nv_bfloat16* __restr
 // and out = bf16(residual + conv). Equals moe_combine_bf16, short_conv_bf16 and
 // add_f32_bf16_bf16 in sequence bit for bit, except that subnormals are not flushed
 // to zero.
-extern "C" __global__ void moe_conv_residual_2304(const __nv_bfloat16* __restrict__ experts,
-                                                  const float* __restrict__ weights,
+extern "C" __global__ void moe_conv_residual_2304(const __nv_bfloat16* experts, const float* weights,
                                                   const __nv_bfloat16* __restrict__ weight,
-                                                  float* __restrict__ state,
-                                                  const float* __restrict__ residual,
+                                                  float* state, const float* residual,
                                                   __nv_bfloat16* __restrict__ out) {
     pdl_trigger();
     pdl_wait();
@@ -190,10 +187,9 @@ extern "C" __global__ void moe_conv_residual_2304(const __nv_bfloat16* __restric
 // ---------------------------------------------------------------------------
 
 // short_conv_residual_2304 for rows [rows, 2304] of x, hidden and residual.
-extern "C" __global__ void short_conv_residual_rows_2304(const __nv_bfloat16* __restrict__ x,
+extern "C" __global__ void short_conv_residual_rows_2304(const __nv_bfloat16* x,
                                                          const __nv_bfloat16* __restrict__ weight,
-                                                         const float* __restrict__ state,
-                                                         const __nv_bfloat16* __restrict__ hidden,
+                                                         const float* state, const __nv_bfloat16* hidden,
                                                          float* __restrict__ residual) {
     pdl_trigger();
     pdl_wait();
