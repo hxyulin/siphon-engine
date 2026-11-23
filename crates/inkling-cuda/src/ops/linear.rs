@@ -30,7 +30,7 @@ const K_ALIGN: usize = 8;
 /// Products one launch accepts, `kMaxSegments` in the kernel.
 pub const MAX_PRODUCTS: usize = 8;
 /// Weights one prefetch accepts, `kMaxRanges` in the kernel.
-pub const MAX_PREFETCH: usize = 24;
+pub const MAX_PREFETCH: usize = 32;
 /// Threads per block, `kThreads` in the kernel.
 const THREADS: u32 = 256;
 /// Largest `k * size_of::<T>()`: the input is staged in shared memory.

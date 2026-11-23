@@ -761,14 +761,20 @@ struct AttentionInputs<'a> {
 
 impl Ctx {
     /// The weights a visit of `layer` reads first: the attention projections and, with
-    /// `messages`, the message gates that build their inputs.
+    /// `messages`, the message gates that build their inputs, then the fused attention
+    /// step's small weights, which nothing has read since the previous step.
     fn visit_prefetch(&self, layer: usize, messages: bool) -> Vec<&CudaSlice<bf16>> {
         let w = &self.weights.layers[layer];
         let mut weights = Vec::new();
         if let Some(gates) = w.message_gates.as_ref().filter(|_| messages) {
             weights.extend(gates[..3].iter().flat_map(MessageGateWeights::matrices));
         }
-        weights.extend(w.attention.input_projections());
+        let a = &w.attention;
+        weights.extend(a.input_projections());
+        weights.extend([&a.q_clip_scale, &a.rel_clip_scale, &a.rel_table]);
+        if let KvConv::Static { k, v } = &a.kv_conv {
+            weights.extend([k, v]);
+        }
         weights
     }
 
@@ -1052,14 +1058,6 @@ impl Ctx {
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let a = &w.attention;
-
-        // The fused step's small BF16 weights stream into L2 while the projections run;
-        // nothing has read them since the previous step, so the step would wait on DRAM.
-        let mut small = vec![&a.q_clip_scale, &a.rel_clip_scale, &a.rel_table];
-        if let KvConv::Static { k, v } = &a.kv_conv {
-            small.extend([k, v]);
-        }
-        self.kernels.linear.prefetch(&self.stream, &small)?;
 
         // Every projection of the three inputs in one launch.
         let mut products = vec![

@@ -194,7 +194,7 @@ GEMV_ENTRY(gemv_f32_l8_v1, float, float, 8, 1, 1)
 GEMV_ENTRY(gemv_f32_l32_v8, float, float, 32, 1, 8)
 GEMV_ENTRY(gemv_f32_l32_s8_v4, float, float, 32, 8, 4)
 
-constexpr int kMaxRanges = 24;
+constexpr int kMaxRanges = 32;
 
 // Up to kMaxRanges weights for prefetch_l2, each as 16-byte vectors.
 struct Ranges {
