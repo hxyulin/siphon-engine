@@ -27,6 +27,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cstdint>
 
@@ -60,10 +61,12 @@ __device__ float warp_sum(float v) {
     return v;
 }
 
-__constant__ float kE2M1[16] = {
-    0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
-    -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f,
-};
+// Two E2M1 values, low nibble first, decoded by the hardware converter. Every
+// E2M1 value is exact in half precision, so this matches a table lookup bit for
+// bit. A `__constant__` table serializes when lanes read different entries.
+__device__ float2 e2m1x2(uint8_t bits) {
+    return __half22float2(__half2(__nv_cvt_fp4x2_to_halfraw2(bits, __NV_E2M1)));
+}
 
 __device__ float e4m3(uint8_t bits) {
     return __half2float(__half(__nv_cvt_fp8_to_halfraw(bits, __NV_E4M3)));
@@ -81,12 +84,12 @@ __device__ float dot_e2m1(const __nv_bfloat16* x, const uint8_t* w) {
     float acc = 0.f;
 #pragma unroll
     for (int i = 0; i < kValues / 4; ++i) {
-        const uint8_t b0 = w[2 * i];
-        const uint8_t b1 = w[2 * i + 1];
-        float t = add_ftz(mul_ftz(__bfloat162float(x[4 * i]), kE2M1[b0 & 15]),
-                          mul_ftz(__bfloat162float(x[4 * i + 1]), kE2M1[b0 >> 4]));
-        t = add_ftz(t, mul_ftz(__bfloat162float(x[4 * i + 2]), kE2M1[b1 & 15]));
-        t = add_ftz(t, mul_ftz(__bfloat162float(x[4 * i + 3]), kE2M1[b1 >> 4]));
+        const float2 w01 = e2m1x2(w[2 * i]);
+        const float2 w23 = e2m1x2(w[2 * i + 1]);
+        float t = add_ftz(mul_ftz(__bfloat162float(x[4 * i]), w01.x),
+                          mul_ftz(__bfloat162float(x[4 * i + 1]), w01.y));
+        t = add_ftz(t, mul_ftz(__bfloat162float(x[4 * i + 2]), w23.x));
+        t = add_ftz(t, mul_ftz(__bfloat162float(x[4 * i + 3]), w23.y));
         acc = add_ftz(acc, t);
     }
     return acc;
