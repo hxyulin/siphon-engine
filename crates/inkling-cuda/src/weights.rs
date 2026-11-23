@@ -24,6 +24,8 @@ use safetensors::Dtype;
 
 use crate::ops::linear_fp8::{Fp8Matrix, LinearFp8};
 
+pub mod draft;
+
 /// Largest E2M1 value, from MLX-LM's `sanitize`.
 const NVFP4_E2M1_MAX: f32 = 6.0;
 /// Largest E4M3 value, from MLX-LM's `sanitize`.

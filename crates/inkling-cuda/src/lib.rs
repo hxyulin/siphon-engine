@@ -5,6 +5,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod draft;
 mod gpu;
 pub mod model;
 pub mod ops;

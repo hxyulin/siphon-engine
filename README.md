@@ -44,6 +44,25 @@ The small kernels have multi-row forms that give the single-row results bit for 
 INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill -- --ignored --nocapture
 ```
 
+## DSpark draft
+
+`draft::Draft` runs the speculative draft bundled in the checkpoint (`mtp.safetensors`): a 3-layer dense transformer over one block of 8 rows, then a recurrent Markov head that turns the 7 mask rows into 7 greedy draft tokens. It reads the target's embedding, `embed_norm` and LM head, and folds `hidden_out` into the LM head at load in F64. Its kernels are in `kernels/draft.cu`; the products run through `ops::linear`.
+
+- `Draft::commit(taps, start)` writes the draft cache entries of target positions `start..` from their four feature taps, BF16 `[rows, 4, 2304]`: the partial block entering visits 5, 23 and 41, and the final normed hidden state.
+- `Draft::round(anchor)` runs the block at the next uncommitted position, with the anchor token read from device memory, and leaves the 7 ids in `Draft::draft_ids`.
+- Layers 0 and 2 keep rings of 1032 slots, the window of 1024 and the block. Layer 1 keeps every position up to the capacity, 4 KiB each.
+
+The draft follows the rounding points of vLLM's draft rather than MLX's kernels. `reference/dspark.py` implements the same draft in MLX, in BF16 or F32, and reports teacher-forced acceptance on a text. `tests/draft.rs` checks each kernel against `reference/fixtures/dspark.py`. `tests/draft_round.rs` feeds the engine draft the MLX taps of `reference/prompts/regex-readme.txt` and compares it at every anchor with the MLX draft, within the MLX draft's own BF16 against F32 difference:
+
+```sh
+uv run --project reference python -I reference/capture.py <model-dir> reference/out/regex-readme-taps.safetensors --text reference/prompts/regex-readme.txt --taps
+uv run --project reference python -I reference/dspark.py run <model-dir> reference/out/regex-readme-taps.safetensors reference/out/regex-readme-dspark-bf16.safetensors
+uv run --project reference python -I reference/dspark.py run <model-dir> reference/out/regex-readme-taps.safetensors reference/out/regex-readme-dspark-f32.safetensors --float32
+INKLING_MODEL=<model-dir> INKLING_DSPARK_REF=reference/out cargo test --release -p inkling-cuda --test draft_round -- --ignored --nocapture
+```
+
+`reference/dspark.py routing` reads captures made with `capture.py --routing` and reports the distinct experts that m consecutive positions route to at each visit, which sets the expert bytes of a verify of m rows.
+
 ## Benchmarks and profiling
 
 The `bench` binary times greedy decode at several context lengths. For each length it marks every cache as full to that length without computing it, runs warmup steps, then times `--steps` steps. It prints one markdown table row per context length, or JSON with `--json`, along with the time, the GPU clocks and the processes on the GPU. Numbers are comparable only on an otherwise idle GPU.

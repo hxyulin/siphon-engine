@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod conv;
+pub mod draft;
 pub mod elementwise;
 pub mod experts;
 pub mod linear;
