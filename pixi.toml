@@ -5,11 +5,12 @@ channels = ["conda-forge"]
 platforms = ["linux-64"]
 
 [dependencies]
-cuda-nvcc = "13.0.*"
-cuda-cudart-dev = "13.0.*"
-# Profilers. nsight-compute 2025.3 is the last release built for CUDA 13.0, which the
-# pinned nvcc requires. The nsys CLI has no CUDA version pin.
-nsight-compute = "2025.3.*"
+# CUDA 13.5 matches the host driver's CUDA version. From 13.3 on, the driver runs an sm_120
+# cubin's SASS as compiled; with 13.0 it recompiled each kernel from the cubin's capmerc section.
+cuda-nvcc = "13.5.*"
+cuda-cudart-dev = "13.5.*"
+# Profilers. nsight-compute releases follow the CUDA version; the nsys CLI has no CUDA pin.
+nsight-compute = "2026.4.*"
 nsight-systems-cli = "2026.5.*"
 
 [activation.env]
