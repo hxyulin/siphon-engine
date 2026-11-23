@@ -32,7 +32,7 @@ use crate::{
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
-        linear::{Gemv, Linear},
+        linear::{Gemm, Gemv, Linear},
         misc::Misc,
         norm::{AttentionPost, KvConvWeights, Norm},
         routing::{NormDest, Partial, Routing},
@@ -1174,14 +1174,13 @@ impl Ctx {
         (w13, w2)
     }
 
-    // The three heavy multi-row operations of prefill. Each runs its fallback, built from
-    // the decode kernels; a fast multi-row kernel replaces the body in one place.
+    // The three heavy multi-row operations of prefill. Each is one place to swap a fallback
+    // built from the decode kernels for a fast multi-row kernel.
 
     /// `out [m, n] = x [m, k] @ weight [n, k]^T` for every product, all with the same `m`
     /// and `k`, as one batch.
     ///
-    /// Fallback: one batched decode GEMV per row, on row views. The fast version is
-    /// `Linear::gemm_bf16(stream, &mut [Gemm::new(weight, x, out)], m)`.
+    /// Runs the tensor-core GEMM, which hands `m = 1` to the batched GEMV.
     fn gemm_rows(&self, products: &mut [RowProduct<'_>], m: usize) -> anyhow::Result<()> {
         ensure!(m > 0, "no rows");
         for (i, p) in products.iter().enumerate() {
@@ -1192,30 +1191,11 @@ impl Ctx {
                 p.out.len()
             );
         }
-        let weights: Vec<&CudaSlice<bf16>> = products.iter().map(|p| p.weight).collect();
-        for row in 0..m {
-            let xs: Vec<CudaView<'_, bf16>> = products
-                .iter()
-                .map(|p| {
-                    let k = p.x.len() / m;
-                    p.x.slice(row * k..(row + 1) * k)
-                })
-                .collect();
-            let mut outs: Vec<CudaViewMut<'_, bf16>> = products
-                .iter_mut()
-                .map(|p| {
-                    let n = p.out.len() / m;
-                    p.out.slice_mut(row * n..(row + 1) * n)
-                })
-                .collect();
-            let mut gemvs: Vec<Gemv<'_, bf16>> = weights
-                .iter()
-                .zip(&xs)
-                .zip(&mut outs)
-                .map(|((w, x), out)| Gemv::new(*w, x, out))
-                .collect();
-            self.kernels.linear.gemv_bf16(&self.stream, &mut gemvs)?;
-        }
+        let mut gemms: Vec<Gemm<'_, bf16>> = products
+            .iter_mut()
+            .map(|p| Gemm::new(p.weight, &p.x, &mut p.out))
+            .collect();
+        self.kernels.linear.gemm_bf16(&self.stream, &mut gemms, m)?;
         Ok(())
     }
 

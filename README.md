@@ -38,7 +38,7 @@ cd reference/fixtures && uv run --project .. python <group>.py
 - `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
 - `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
 
-The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. Until fast multi-row kernels replace them, these run the decode kernels row by row, so prefill takes about as long as stepping. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024 and 433. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
+The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. The other two still run the decode kernels row by row. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024 and 433. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
 
 ```sh
 INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill -- --ignored --nocapture
