@@ -10,5 +10,8 @@ anyhow.workspace = true
 cudarc.workspace = true
 half.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+safetensors.workspace = true
+
 [lints]
 workspace = true

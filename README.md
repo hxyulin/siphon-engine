@@ -20,6 +20,16 @@ pixi run cargo run --release -p inkling -- inspect <model-dir>
 
 Set `NVCC` or `CUDA_HOME` to use another toolkit, and `INKLING_CUDA_ARCH` to target another GPU.
 
+From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment.
+
+## Kernel tests
+
+Each `crates/inkling-cuda/src/ops/<group>.rs` launches the kernels in `kernels/<group>.cu` and is tested by `tests/<group>.rs`. The tests compare GPU output with MLX output saved in `tests/fixtures/<group>.safetensors`, which `reference/fixtures/<group>.py` regenerates:
+
+```sh
+cd reference/fixtures && uv run --project .. python <group>.py
+```
+
 ## References
 
 Targets the official checkpoint at revision [`b85c3cfa`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/b85c3cfa615fc413cc9af3379f491b963f3b586a), with its NVFP4/MXFP8 experts, BF16 dense weights and bundled DSpark draft.
