@@ -46,11 +46,50 @@ INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill --
 
 ## DSpark draft
 
-`draft::Draft` runs the speculative draft bundled in the checkpoint (`mtp.safetensors`): a 3-layer dense transformer over one block of 8 rows, then a recurrent Markov head that turns the 7 mask rows into 7 greedy draft tokens. It reads the target's embedding, `embed_norm` and LM head, and folds `hidden_out` into the LM head at load in F64. Its kernels are in `kernels/draft.cu`; the products run through `ops::linear`.
+`draft::Draft` runs the speculative draft bundled in the checkpoint (`mtp.safetensors`): a 3-layer dense transformer over one block of 8 rows, then a recurrent Markov head that turns the 7 mask rows into 7 greedy draft tokens. It reads the target's embedding, `embed_norm` and LM head, and folds `hidden_out` into the LM head at load in F64. Its kernels are in `kernels/draft.cu`; the BF16 products run through `ops::linear`.
 
 - `Draft::commit(taps, start)` writes the draft cache entries of target positions `start..` from their four feature taps, BF16 `[rows, 4, 2304]`: the partial block entering visits 5, 23 and 41, and the final normed hidden state.
 - `Draft::round(anchor)` runs the block at the next uncommitted position, with the anchor token read from device memory, and leaves the 7 ids in `Draft::draft_ids`.
+- `Draft::round_inputs()` holds a round's inputs in device memory: the taps of up to 8 positions to commit, BF16 `[8, 4, 2304]`, and `control`, I32 `[start, rows, anchor]`. `Draft::run_round(steps)` commits those positions, runs the block right after them, and runs the base logits and Markov head for `steps` drafts (1 to 7). `Draft::replay_round(steps)` replays the same work as a CUDA graph, captured once per `steps`. A verify pass can write the inputs on the device and launch the draft graph right after its own; no position goes through the host. `Draft::set_round_inputs` fills the inputs from the host.
 - Layers 0 and 2 keep rings of 1032 slots, the window of 1024 and the block. Layer 1 keeps every position up to the capacity, 4 KiB each.
+
+The block attention takes its split count from the key count on the device: one warp per block row, one lane per key of each chunk of 32, chunks staged with `cp.async`. The Markov head picks each step's argmax without summing every fold row. An E4M3 copy of the fold bounds each row's logit with the L1 norm of its quantization residual, and only the rows whose upper bound reaches the best lower bound get the BF16 product. The draft ids stay the same as with the full sum. Rounds that record the Markov logits (`Draft::record_logits`) still sum every row. `tests/draft_exact.rs` checks the draft ids and hashes of Y, the base logits and the Markov logits at every anchor of `regex-readme` against a golden file that the draft wrote before these changes, for `commit` and `round`, for device inputs, and for the graphs of 7, 3 and 1 drafts.
+
+Round times at position 2790 (one committed position plus the round, graph replay, RTX 5090):
+
+| Change | 3 drafts | 7 drafts |
+| --- | ---: | ---: |
+| Before: `commit` of one position, then `round` | 1.726 ms | 1.726 ms |
+| Device inputs as a graph, rewritten attention, 2 kernels per Markov step, only the verified drafts | 1.272 ms | 1.512 ms |
+| Fewer shared-memory loads in the attention | 1.249 ms | 1.490 ms |
+| Pruned argmax over an E4M3 copy of the fold | 1.186 ms | 1.348 ms |
+| Weight loads without branches, coalesced bound pass | 1.175 ms | 1.316 ms |
+
+At position 32768, where layer 1 attends over every position, the same steps take 2.169, 1.420, 1.354, 1.288 and 1.277 ms for 3 drafts, and 2.169, 1.660, 1.593, 1.450 and 1.419 ms for 7.
+
+`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond:
+
+- `fp8_backbone`: E4M3 copies of the block's and the commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`).
+- `fp8_head`: base logits from an E4M3 copy of the LM head.
+- `fp8_fold`: the Markov logits from the E4M3 fold, without the exact correction.
+- `shortlist`: Ingine's shortlist head. The base and Markov logits cover only the 32,768 highest-ranked tokens of a ranking file, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The ranking is 65,536 little-endian u32 token ids, as Ingine's `draft_shortlist.bin`.
+
+`dspark accept` measures each variant's teacher-forced acceptance on the stage 0 taps against MLX's top-1 tokens, as `reference/dspark.py accept` counts it, and times its round. Over all three texts (16,745 anchors), with the verify-time model of the design (5.7 ms with BF16 weights and 5.0 ms with FP8 at 3 drafts):
+
+| Variant | Acceptance, drafts 1 to 3 | Tokens per round, k = 3 | Round, k = 3 | Tokens per ms, BF16 verify | Tokens per ms, FP8 verify |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Exact | 79.2, 58.7, 45.2% | 2.832 | 1.175 ms | 0.412 | 0.459 |
+| FP8 backbone | 79.2, 58.7, 45.2% | 2.832 | 1.077 ms | 0.418 | 0.466 |
+| FP8 head | 79.3, 58.7, 45.2% | 2.832 | 0.916 ms | 0.428 | 0.479 |
+| Shortlist | 79.2, 58.7, 45.2% | 2.830 | 0.650 ms | 0.446 | 0.501 |
+| Shortlist, FP8 backbone, head and fold | 79.2, 58.5, 45.0% | 2.827 | 0.460 ms | 0.459 | 0.518 |
+
+```sh
+cargo run --release -p inkling-cuda --bin dspark -- accept <model-dir> <taps-dir> --shortlist <ranking> \
+    --variants exact,shortlist+fp8-backbone+fp8-head+fp8-fold
+cargo run --release -p inkling-cuda --bin dspark -- time <model-dir> <taps-dir>/regex-readme-taps.safetensors
+INKLING_MODEL=<model-dir> INKLING_DSPARK_REF=<dir> cargo test --release -p inkling-cuda --test draft_exact -- --ignored --nocapture
+```
 
 The draft follows the rounding points of vLLM's draft rather than MLX's kernels. `reference/dspark.py` implements the same draft in MLX, in BF16 or F32, and reports teacher-forced acceptance on a text. `tests/draft.rs` checks each kernel against `reference/fixtures/dspark.py`. `tests/draft_round.rs` feeds the engine draft the MLX taps of `reference/prompts/regex-readme.txt` and compares it at every anchor with the MLX draft, within the MLX draft's own BF16 against F32 difference:
 

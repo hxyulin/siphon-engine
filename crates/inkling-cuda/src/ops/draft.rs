@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
-    PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
+    DevicePtrMut as _, LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::ops::linear::launch_by_value;
 use crate::weights::draft::{HEAD_DIM, HIDDEN, KV_HEADS, RANK, TAPS};
 
 /// Rows of a draft block: the anchor and 7 mask rows.
@@ -24,8 +25,26 @@ const GROUP: usize = 3;
 pub const MAX_ATTENTION_SPLITS: usize = 128;
 /// Fewest keys one attention split takes, a multiple of the kernel's chunk of 32.
 const MIN_KEYS_PER_SPLIT: usize = 128;
-/// Blocks of the first argmax pass over the vocabulary.
+/// Blocks of the first argmax pass over the vocabulary in [`DraftKernels::markov_logits`].
 pub const LOGIT_BLOCKS: usize = 148;
+/// Blocks of [`DraftKernels::markov_fold`]: two per SM of the RTX 5090.
+pub const FOLD_BLOCKS: usize = 340;
+/// Partials an [`ArgmaxPartials`] holds.
+const MAX_PARTIALS: usize = 512;
+/// Dynamic shared memory of `draft_attention`, `kAttentionSmem` in the kernel.
+const ATTENTION_SMEM: u32 = 50176;
+/// Products one [`DraftKernels::gemm_fp8`] launch takes, `kF8MaxSegments` in the kernel.
+pub const F8_MAX_PRODUCTS: usize = 3;
+/// Input rows of [`DraftKernels::gemm_fp8`], `kF8MaxM` in the kernel.
+const F8_MAX_M: usize = 8;
+/// Weight rows per group of `draft_gemm_fp8`: 8 warps of `kF8Rows`.
+const F8_ROWS_PER_BLOCK: usize = 16;
+/// Dynamic shared memory of `draft_gemm_fp8`, `kF8Smem` in the kernel.
+const F8_SMEM: u32 = 49152;
+/// Blocks of `draft_gemm_fp8` at most: two per SM of the RTX 5090.
+const F8_BLOCKS: usize = 340;
+/// Blocks of [`DraftKernels::markov_step`], `kStepBlocks` in the kernel.
+const STEP_BLOCKS: u32 = 32;
 /// Rows the fold kernel covers per block, `kFoldRows` in the kernel.
 const FOLD_ROWS: usize = 16;
 /// Threads of the row kernels, `kRowThreads` in the kernel.
@@ -48,6 +67,107 @@ pub struct DraftKernels {
     markov_pick: CudaFunction,
     fold_weight: CudaFunction,
     fold_bias: CudaFunction,
+    set_control: CudaFunction,
+    set_control_kept: CudaFunction,
+    commit_mix: CudaFunction,
+    commit_rope_store: CudaFunction,
+    block_rope_store: CudaFunction,
+    markov_step: CudaFunction,
+    markov_fold: CudaFunction,
+    quantize_rows: CudaFunction,
+    gather_rows: CudaFunction,
+    set_i32: CudaFunction,
+    fold_error: CudaFunction,
+    markov_bound: CudaFunction,
+    markov_exact: CudaFunction,
+    gemm_fp8: CudaFunction,
+    markov_fold_any: CudaFunction,
+}
+
+/// A matrix `[rows, k]` of E4M3 values with one F32 scale per row, `amax / 448`, as
+/// [`crate::ops::linear_fp8::Fp8Matrix`] holds them, in two buffers.
+pub struct Fp8Rows {
+    pub values: CudaSlice<u8>,
+    pub scales: CudaSlice<f32>,
+    pub k: usize,
+}
+
+impl Fp8Rows {
+    /// Zeroed room for `rows` rows of `k` values.
+    pub fn new(stream: &Arc<CudaStream>, rows: usize, k: usize) -> anyhow::Result<Self> {
+        ensure!(k.is_multiple_of(16), "k = {k} is not a multiple of 16");
+        Ok(Self {
+            values: stream.alloc_zeros(rows * k)?,
+            scales: stream.alloc_zeros(rows)?,
+            k,
+        })
+    }
+
+    /// Rows the buffers hold.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.scales.len()
+    }
+
+    /// Device bytes the matrix takes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.values.len() + 4 * self.scales.len()
+    }
+}
+
+/// One product of [`DraftKernels::gemm_fp8`]: `out[i, n] = scale[n] * x[i] · w[n]` for the
+/// first `rows` rows of `w`, with output rows `ld` elements apart.
+pub struct Fp8Product<'a> {
+    pub w: &'a Fp8Rows,
+    pub rows: usize,
+    pub out: CudaViewMut<'a, bf16>,
+    pub ld: usize,
+}
+
+/// The fold weights [`DraftKernels::markov_fold_any`] reads.
+#[derive(Clone, Copy)]
+pub enum FoldRows<'a> {
+    Bf16(&'a CudaSlice<bf16>),
+    Fp8(&'a Fp8Rows),
+}
+
+/// Kernel parameter: one product of `draft_gemm_fp8`, as `F8Segment` in the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct F8Segment {
+    w: u64,
+    scale: u64,
+    out: u64,
+    rows: i32,
+    ld: i32,
+    block_end: i32,
+}
+
+/// Kernel parameter of `draft_gemm_fp8`, as `F8Batch` in the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct F8Batch {
+    seg: [F8Segment; F8_MAX_PRODUCTS],
+    x: u64,
+    count: i32,
+    m: i32,
+    k: i32,
+}
+
+/// Where a block attention takes its keys from.
+#[derive(Clone, Copy)]
+pub enum AttentionKeys<'a> {
+    /// Positions `first..first + keys`.
+    Host { first: usize, keys: usize },
+    /// The block of the round whose inputs `control` holds (see
+    /// [`DraftKernels::set_control`]), after `window` positions (0: every position).
+    /// `max_keys` bounds the key count, which sizes the grid.
+    Device {
+        control: &'a CudaSlice<i32>,
+        window: usize,
+        max_keys: usize,
+    },
 }
 
 /// The split outputs of [`DraftKernels::attention`].
@@ -66,6 +186,23 @@ impl AttentionScratch {
     }
 }
 
+/// The bounds of the pruned exact Markov argmax (see [`DraftKernels::markov_bound`]).
+pub struct LogitBounds {
+    /// Each row's upper bound, F32 `[vocab]`.
+    upper: CudaSlice<f32>,
+    /// Each block's largest lower bound, F32 `[FOLD_BLOCKS]`.
+    lower: CudaSlice<f32>,
+}
+
+impl LogitBounds {
+    pub fn new(stream: &Arc<CudaStream>, vocab: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            upper: stream.alloc_zeros(vocab)?,
+            lower: stream.alloc_zeros(FOLD_BLOCKS)?,
+        })
+    }
+}
+
 /// The first-pass results of the Markov argmax.
 pub struct ArgmaxPartials {
     value: CudaSlice<f32>,
@@ -75,8 +212,8 @@ pub struct ArgmaxPartials {
 impl ArgmaxPartials {
     pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
         Ok(Self {
-            value: stream.alloc_zeros(LOGIT_BLOCKS)?,
-            index: stream.alloc_zeros(LOGIT_BLOCKS)?,
+            value: stream.alloc_zeros(MAX_PARTIALS)?,
+            index: stream.alloc_zeros(MAX_PARTIALS)?,
         })
     }
 }
@@ -140,6 +277,10 @@ fn start_arg(start: usize, rows: usize) -> anyhow::Result<i32> {
     i32_arg("start", start)
 }
 
+/// Elements of a round's control buffer: the first position the round commits, the
+/// number of positions it commits and the anchor token.
+pub const CONTROL: usize = 3;
+
 /// Splits of the block attention over `keys` keys, and the keys of each split.
 #[must_use]
 pub fn attention_splits(keys: usize) -> (usize, usize) {
@@ -154,13 +295,20 @@ impl DraftKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "draft", cubin!("draft"))?;
         let f = |name: &str| module.load_function(name);
+        let attention = f("draft_attention")?;
+        attention
+            .set_attribute(
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(ATTENTION_SMEM)?,
+            )
+            .context("raising the shared memory of draft_attention")?;
         Ok(Self {
             mix_rms_norm: f("draft_mix_rms_norm")?,
             add_rms_norm: f("draft_add_rms_norm")?,
             block_input: f("draft_block_input")?,
             head_norm_rope: f("draft_head_norm_rope")?,
             store_kv: f("draft_store_kv")?,
-            attention: f("draft_attention")?,
+            attention,
             attention_combine: f("draft_attention_combine")?,
             silu_mul: f("draft_silu_mul")?,
             markov_context_input: f("draft_markov_context_input")?,
@@ -170,6 +318,21 @@ impl DraftKernels {
             markov_pick: f("draft_markov_pick")?,
             fold_weight: f("draft_fold_weight")?,
             fold_bias: f("draft_fold_bias")?,
+            set_control: f("draft_set_control")?,
+            set_control_kept: f("draft_set_control_kept")?,
+            commit_mix: f("draft_commit_mix")?,
+            commit_rope_store: f("draft_commit_rope_store")?,
+            block_rope_store: f("draft_block_rope_store")?,
+            markov_step: f("draft_markov_step")?,
+            markov_fold: f("draft_markov_fold")?,
+            quantize_rows: f("draft_quantize_rows")?,
+            set_i32: f("draft_set_i32")?,
+            fold_error: f("draft_fold_error")?,
+            markov_bound: f("draft_markov_bound")?,
+            markov_exact: f("draft_markov_exact")?,
+            gather_rows: f("draft_gather_rows")?,
+            gemm_fp8: f("draft_gemm_fp8")?,
+            markov_fold_any: f("draft_markov_fold_any")?,
         })
     }
 
@@ -401,57 +564,105 @@ impl DraftKernels {
         scratch: &mut AttentionScratch,
         out: &mut CudaSlice<bf16>,
     ) -> anyhow::Result<()> {
+        self.attention_from(
+            stream,
+            q,
+            cache,
+            AttentionKeys::Host { first, keys },
+            scratch,
+            out,
+        )
+    }
+
+    /// [`Self::attention`] with the keys from `keys`. The split count depends only on the
+    /// number of keys, so the result does not depend on where that number comes from.
+    pub fn attention_from(
+        &self,
+        stream: &CudaStream,
+        q: &CudaSlice<bf16>,
+        cache: &KvCache,
+        keys: AttentionKeys<'_>,
+        scratch: &mut AttentionScratch,
+        out: &mut CudaSlice<bf16>,
+    ) -> anyhow::Result<()> {
         let width = KV_HEADS * GROUP * HEAD_DIM;
         check_len("q", q.len(), BLOCK * width)?;
         check_len("out", out.len(), BLOCK * width)?;
-        ensure!(keys > 0, "attention needs at least one key");
-        ensure!(
-            keys <= cache.slots,
-            "{keys} keys do not fit {} slots",
-            cache.slots
-        );
-        let (splits, per_split) = attention_splits(keys);
         let slots = i32_arg("slots", cache.slots)?;
-        let first_arg = start_arg(first, keys)?;
-        let keys_arg = i32_arg("keys", keys)?;
-        let per_split = i32_arg("keys per split", per_split)?;
-        let splits_arg = i32_arg("splits", splits)?;
-        let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, u32::try_from(splits)?, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+        let (control, window, first, count, max_keys) = match keys {
+            AttentionKeys::Host { first, keys } => {
+                ensure!(keys > 0, "attention needs at least one key");
+                ensure!(
+                    keys <= cache.slots,
+                    "{keys} keys do not fit {} slots",
+                    cache.slots
+                );
+                (
+                    None,
+                    0,
+                    start_arg(first, keys)?,
+                    i32_arg("keys", keys)?,
+                    keys,
+                )
+            }
+            AttentionKeys::Device {
+                control,
+                window,
+                max_keys,
+            } => {
+                check_len("control", control.len(), CONTROL)?;
+                ensure!(
+                    max_keys <= cache.slots,
+                    "{max_keys} keys do not fit {} slots",
+                    cache.slots
+                );
+                (Some(control), i32_arg("window", window)?, 0, 0, max_keys)
+            }
         };
-        let mut launch = stream.launch_builder(&self.attention);
-        launch
-            .arg(q)
-            .arg(&cache.k)
-            .arg(&cache.v)
-            .arg(&slots)
-            .arg(&first_arg)
-            .arg(&keys_arg)
-            .arg(&per_split)
-            .arg(&mut scratch.out)
-            .arg(&mut scratch.stats);
+        // The splits of the largest key count bound the splits of every smaller one.
+        let grid_splits = max_keys
+            .div_ceil(MIN_KEYS_PER_SPLIT)
+            .clamp(1, MAX_ATTENTION_SPLITS);
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, u32::try_from(grid_splits)?, 1),
+            block_dim: ((BLOCK * 32) as u32, 1, 1),
+            shared_mem_bytes: ATTENTION_SMEM,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(q, stream)
+            .ptr(&cache.k, stream)
+            .ptr(&cache.v, stream)
+            .i32(slots)
+            .opt(control, stream)
+            .i32(window)
+            .i32(first)
+            .i32(count)
+            .ptr_mut(&mut scratch.out, stream)
+            .ptr_mut(&mut scratch.stats, stream);
         // SAFETY: the arguments match `draft_attention(const bf16*, const bf16*, const bf16*,
-        // int, int, int, int, float*, float*)`. Every key position maps to a slot below
-        // `slots`, and the scratch holds MAX_ATTENTION_SPLITS splits, at least `splits`.
-        unsafe { launch.launch(config) }?;
+        // int, const int*, int, int, int, float*, float*)`. Every key position maps to a slot
+        // below `slots`; the grid covers the splits of `max_keys` keys, at most
+        // MAX_ATTENTION_SPLITS, which the scratch holds, and blocks past the split count of
+        // the actual keys exit. The kernel reads earlier outputs only after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.attention, config) }?;
 
         let config = LaunchConfig {
             grid_dim: (KV_HEADS as u32, (BLOCK * GROUP) as u32, 1),
             block_dim: (HEAD_DIM as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.attention_combine);
-        launch
-            .arg(&scratch.out)
-            .arg(&scratch.stats)
-            .arg(&splits_arg)
-            .arg(out);
+        let mut args = KernelArgs::default();
+        args.ptr(&scratch.out, stream)
+            .ptr(&scratch.stats, stream)
+            .opt(control, stream)
+            .i32(window)
+            .i32(first)
+            .i32(count)
+            .ptr_mut(out, stream);
         // SAFETY: the arguments match `draft_attention_combine(const float*, const float*,
-        // int, bf16*)`; the first launch wrote all `splits` partials, and `out` holds the
-        // 8 rows of 24 heads.
-        unsafe { launch.launch(config) }?;
+        // const int*, int, int, int, bf16*)`; the first launch wrote all the splits the
+        // combine reads, and `out` holds the 8 rows of 24 heads.
+        unsafe { args.launch_pdl(stream, &self.attention_combine, config) }?;
         Ok(())
     }
 
@@ -683,6 +894,641 @@ impl DraftKernels {
         // SAFETY: the arguments match `draft_fold_bias(const bf16*, int, const bf16*, bf16*)`;
         // one warp per row, skipping rows at or past `rows`.
         unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Writes a round's inputs to `control` (I32 `[3]`): `[start, rows, anchor]`, with the
+    /// anchor read from `anchor` (one I32 on the device).
+    pub fn set_control(
+        &self,
+        stream: &CudaStream,
+        control: &mut CudaSlice<i32>,
+        start: usize,
+        rows: usize,
+        anchor: &impl DeviceIn<i32>,
+    ) -> anyhow::Result<()> {
+        let anchor = anchor.view();
+        check_len("control", control.len(), CONTROL)?;
+        check_len("anchor", anchor.len(), 1)?;
+        ensure!(rows <= BLOCK, "{rows} rows exceed a block");
+        let start = start_arg(start, rows + BLOCK)?;
+        let rows = i32_arg("rows", rows)?;
+        let mut launch = stream.launch_builder(&self.set_control);
+        launch.arg(control).arg(&start).arg(&rows).arg(&anchor);
+        // SAFETY: the arguments match `draft_set_control(int*, int, int, const int*)`; one
+        // thread writes the three elements.
+        unsafe { launch.launch(one_block(1)) }?;
+        Ok(())
+    }
+
+    /// Writes a round's inputs to `control` after a verify of `max_rows` rows that kept
+    /// `kept[0]` drafts: `[start, min(kept + 1, max_rows), anchor]`, with `kept` and the
+    /// anchor read from the device.
+    pub fn set_control_kept(
+        &self,
+        stream: &CudaStream,
+        control: &mut CudaSlice<i32>,
+        start: usize,
+        kept: &CudaView<'_, i32>,
+        max_rows: usize,
+        anchor: &impl DeviceIn<i32>,
+    ) -> anyhow::Result<()> {
+        let anchor = anchor.view();
+        check_len("control", control.len(), CONTROL)?;
+        check_len("kept", kept.len(), 1)?;
+        check_len("anchor", anchor.len(), 1)?;
+        ensure!(
+            (1..=BLOCK).contains(&max_rows),
+            "{max_rows} rows, expected 1 to {BLOCK}"
+        );
+        let start = start_arg(start, max_rows + BLOCK)?;
+        let max_rows = i32_arg("rows", max_rows)?;
+        let mut args = KernelArgs::default();
+        args.ptr_mut(control, stream)
+            .i32(start)
+            .ptr(kept, stream)
+            .i32(max_rows)
+            .ptr(&anchor, stream);
+        // SAFETY: the arguments match `draft_set_control_kept(int*, int, const int*, int,
+        // const int*)`; one thread reads the two inputs after `pdl_wait` and writes the three
+        // elements.
+        unsafe { args.launch_pdl(stream, &self.set_control_kept, one_block(1)) }?;
+        Ok(())
+    }
+
+    /// The tap mixes of a round's committed rows (see `draft_commit_mix`): for each of the
+    /// first `control[1]` rows of `taps` (BF16 `[8, 4, 2304]`), the mixes of the 3 layers
+    /// into `mixed` (BF16 `[3, 8, 2304]`), and the last row's Markov mix into `f`. `alpha`
+    /// is F32 `[4, 4]` and `norms` the 4 RMSNorm weights.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn commit_mix(
+        &self,
+        stream: &CudaStream,
+        taps: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        alpha: &CudaSlice<f32>,
+        norms: [&CudaSlice<bf16>; TAPS],
+        mixed: &mut CudaSlice<bf16>,
+        f: &mut CudaSlice<bf16>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        check_len("taps", taps.len(), BLOCK * TAPS * HIDDEN)?;
+        check_len("control", control.len(), CONTROL)?;
+        check_len("alpha", alpha.len(), TAPS * TAPS)?;
+        for norm in norms {
+            check_len("norm", norm.len(), HIDDEN)?;
+        }
+        check_len("mixed", mixed.len(), 3 * BLOCK * HIDDEN)?;
+        check_len("f", f.len(), HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(taps, stream)
+            .ptr(control, stream)
+            .ptr(alpha, stream);
+        for norm in norms {
+            args.ptr(norm, stream);
+        }
+        args.ptr_mut(mixed, stream).ptr_mut(f, stream).f32(eps);
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, TAPS as u32, 1),
+            block_dim: (ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_commit_mix(const bf16*, const int*, const
+        // float*, const bf16* x4, bf16*, bf16*, float)`; the buffers have the checked sizes,
+        // and the kernel clamps the row count to 8.
+        unsafe { args.launch_pdl(stream, &self.commit_mix, config) }?;
+        Ok(())
+    }
+
+    /// Norm, RoPE and cache stores of a round's context keys and values (see
+    /// `draft_commit_rope_store`): `ctx_k` and `ctx_v` are BF16 `[3, 8, 1024]`, the
+    /// projections of `mixed` by each layer's `k_proj_ctx` and `v_proj_ctx`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn commit_rope_store(
+        &self,
+        stream: &CudaStream,
+        ctx_k: &CudaSlice<bf16>,
+        ctx_v: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        inv_freq: &CudaSlice<f32>,
+        eps: f32,
+        k_norms: [&CudaSlice<bf16>; 3],
+        caches: &mut [KvCache],
+    ) -> anyhow::Result<()> {
+        check_len("ctx_k", ctx_k.len(), 3 * BLOCK * KV_WIDTH)?;
+        check_len("ctx_v", ctx_v.len(), 3 * BLOCK * KV_WIDTH)?;
+        check_len("control", control.len(), CONTROL)?;
+        check_len("inv_freq", inv_freq.len(), HEAD_DIM / 2)?;
+        for norm in k_norms {
+            check_len("k_norm", norm.len(), HEAD_DIM)?;
+        }
+        ensure!(caches.len() == 3, "{} caches, expected 3", caches.len());
+        let mut args = KernelArgs::default();
+        args.ptr(ctx_k, stream)
+            .ptr(ctx_v, stream)
+            .ptr(control, stream)
+            .ptr(inv_freq, stream)
+            .f32(eps);
+        for norm in k_norms {
+            args.ptr(norm, stream);
+        }
+        for cache in caches.iter_mut() {
+            let slots = i32_arg("slots", cache.slots)?;
+            args.ptr_mut(&mut cache.k, stream)
+                .ptr_mut(&mut cache.v, stream)
+                .i32(slots);
+        }
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, KV_HEADS as u32, 3),
+            block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_commit_rope_store`'s parameters in order. The
+        // kernel writes cache slots `position mod slots` of each cache, inside it, and skips
+        // positions past layer 1's slots and below zero.
+        unsafe { args.launch_pdl(stream, &self.commit_rope_store, config) }?;
+        Ok(())
+    }
+
+    /// Norm and RoPE of the block's queries `q` (BF16 `[8, 3072]`, in place) and keys `k`
+    /// (BF16 `[8, 1024]`) at the round's position, and the cache stores of the keys and
+    /// the values `v` (see `draft_block_rope_store`). With `limit`, positions at or past
+    /// the cache's slots are skipped, for a cache that is not a ring.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn block_rope_store(
+        &self,
+        stream: &CudaStream,
+        q: &mut CudaSlice<bf16>,
+        k: &CudaSlice<bf16>,
+        v: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        inv_freq: &CudaSlice<f32>,
+        eps: f32,
+        q_norm: &CudaSlice<bf16>,
+        k_norm: &CudaSlice<bf16>,
+        cache: &mut KvCache,
+        limit: bool,
+    ) -> anyhow::Result<()> {
+        check_len("q", q.len(), BLOCK * KV_HEADS * GROUP * HEAD_DIM)?;
+        check_len("k", k.len(), BLOCK * KV_WIDTH)?;
+        check_len("v", v.len(), BLOCK * KV_WIDTH)?;
+        check_len("control", control.len(), CONTROL)?;
+        check_len("inv_freq", inv_freq.len(), HEAD_DIM / 2)?;
+        check_len("q_norm", q_norm.len(), HEAD_DIM)?;
+        check_len("k_norm", k_norm.len(), HEAD_DIM)?;
+        let slots = i32_arg("slots", cache.slots)?;
+        let mut args = KernelArgs::default();
+        args.ptr_mut(q, stream)
+            .ptr(k, stream)
+            .ptr(v, stream)
+            .ptr(control, stream)
+            .ptr(inv_freq, stream)
+            .f32(eps)
+            .ptr(q_norm, stream)
+            .ptr(k_norm, stream)
+            .ptr_mut(&mut cache.k, stream)
+            .ptr_mut(&mut cache.v, stream)
+            .i32(slots)
+            .i32(i32::from(limit));
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, (KV_HEADS * (GROUP + 1)) as u32, 1),
+            block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_block_rope_store(bf16*, const bf16*, const
+        // bf16*, const int*, const float*, float, const bf16*, const bf16*, bf16*, bf16*, int,
+        // int)`. The buffers have the checked sizes and every cache slot index is below
+        // `slots`.
+        unsafe { args.launch_pdl(stream, &self.block_rope_store, config) }?;
+        Ok(())
+    }
+
+    /// One Markov step of a round of `steps` (see `draft_markov_step`), or with
+    /// `step == steps` only the pick of the last step's id. `context` is the step's row of
+    /// the `[y; f]` product, F32 `[768]`. `state_in` and `state_out` are F32 `[256]`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn markov_step(
+        &self,
+        stream: &CudaStream,
+        step: usize,
+        steps: usize,
+        partials: &ArgmaxPartials,
+        control: &CudaSlice<i32>,
+        ids: &mut CudaSlice<i32>,
+        w1: &CudaSlice<bf16>,
+        rnn_state: &CudaSlice<bf16>,
+        context: &CudaView<'_, f32>,
+        bias: &CudaSlice<f32>,
+        state_in: &CudaSlice<f32>,
+        state_out: &mut CudaSlice<f32>,
+        latent: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            step <= steps && steps <= ids.len(),
+            "step {step} of {steps} with {} ids",
+            ids.len()
+        );
+        check_len("control", control.len(), CONTROL)?;
+        let vocab = i32_arg("vocab", rows_of("w1", w1.len(), RANK)?)?;
+        check_len("rnn_state", rnn_state.len(), 3 * RANK * 2 * RANK)?;
+        check_len("context", context.len(), 3 * RANK)?;
+        check_len("bias", bias.len(), 3 * RANK)?;
+        check_len("state_in", state_in.len(), RANK)?;
+        check_len("state_out", state_out.len(), RANK)?;
+        check_len("latent", latent.len(), RANK)?;
+        let mut args = KernelArgs::default();
+        args.i32(1)
+            .i32(i32_arg("step", step)?)
+            .i32(i32_arg("steps", steps)?)
+            .ptr(&partials.value, stream)
+            .ptr(&partials.index, stream)
+            .i32(i32_arg("partials", FOLD_BLOCKS)?)
+            .ptr(control, stream)
+            .ptr_mut(ids, stream)
+            .ptr(w1, stream)
+            .i32(vocab)
+            .ptr(rnn_state, stream)
+            .ptr(context, stream)
+            .ptr(bias, stream)
+            .ptr(state_in, stream)
+            .ptr_mut(state_out, stream)
+            .ptr_mut(latent, stream);
+        let config = LaunchConfig {
+            grid_dim: (STEP_BLOCKS, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_markov_step(int, int, int, const float*, const
+        // int*, int, const int*, int*, const bf16*, int, const bf16*, const float*, const
+        // float*, const float*, float*, float*)`. Before `pdl_wait` it reads only
+        // `rnn_state`, which no kernel writes. At step 0 the anchor is bounds-checked; later
+        // tokens are argmax columns below the vocabulary. It writes ids below `steps`.
+        unsafe { args.launch_pdl(stream, &self.markov_step, config) }?;
+        Ok(())
+    }
+
+    /// One Markov step's logits and the first pass of their argmax, fused with the product
+    /// `fold_weight · latent` (see `draft_markov_fold`). `base` and `fold_bias` hold at least
+    /// `vocab` elements, `fold_weight` at least `vocab` rows of 256. With `reverse`, the
+    /// kernel reads the rows from the end. Writes the logits to `logits` if given.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn markov_fold(
+        &self,
+        stream: &CudaStream,
+        reverse: bool,
+        fold_weight: &CudaSlice<bf16>,
+        fold_bias: &CudaSlice<bf16>,
+        base: &CudaView<'_, bf16>,
+        latent: &CudaSlice<f32>,
+        vocab: usize,
+        softcap: f32,
+        logits: Option<CudaViewMut<'_, bf16>>,
+        partials: &mut ArgmaxPartials,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            base.len() >= vocab && fold_bias.len() >= vocab && fold_weight.len() >= vocab * RANK,
+            "base, fold_bias and fold_weight are too short for {vocab} columns"
+        );
+        check_len("latent", latent.len(), RANK)?;
+        let mut logits = logits;
+        if let Some(logits) = logits.as_ref() {
+            check_len("logits", logits.len(), vocab)?;
+        }
+        let mut args = KernelArgs::default();
+        args.i32(1)
+            .i32(i32::from(reverse))
+            .ptr(fold_weight, stream)
+            .ptr(fold_bias, stream)
+            .ptr(base, stream)
+            .ptr(latent, stream)
+            .i32(i32_arg("vocab", vocab)?)
+            .f32(softcap)
+            .opt_mut(logits.as_mut(), stream)
+            .ptr_mut(&mut partials.value, stream)
+            .ptr_mut(&mut partials.index, stream);
+        let config = LaunchConfig {
+            grid_dim: (FOLD_BLOCKS as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_markov_fold(int, int, const bf16*, const bf16*,
+        // const bf16*, const float*, int, float, bf16*, float*, int*)`. Before `pdl_wait` it
+        // reads only `fold_weight`. It reads rows and columns below `vocab` and writes one
+        // partial per block, FOLD_BLOCKS of them, which the partials hold.
+        unsafe { args.launch_pdl(stream, &self.markov_fold, config) }?;
+        Ok(())
+    }
+
+    /// Quantizes `rows` rows of `src` (BF16 `[*, k]`) into rows `first..` of `dst`: row
+    /// `r` comes from source row `ids[r]`, or `r` without `ids`.
+    pub fn quantize_rows(
+        &self,
+        stream: &CudaStream,
+        src: &CudaSlice<bf16>,
+        ids: Option<&CudaView<'_, i32>>,
+        rows: usize,
+        first: usize,
+        dst: &mut Fp8Rows,
+    ) -> anyhow::Result<()> {
+        let k = dst.k;
+        let src_rows = rows_of("src", src.len(), k)?;
+        ensure!(first + rows <= dst.rows(), "rows past the destination");
+        match ids {
+            Some(ids) => check_len("ids", ids.len(), rows)?,
+            None => ensure!(rows <= src_rows, "rows past the source"),
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let null = 0u64;
+        let k_arg = i32_arg("k", k)?;
+        let first = i32_arg("first", first)?;
+        let mut launch = stream.launch_builder(&self.quantize_rows);
+        launch.arg(src).arg(&k_arg);
+        match ids {
+            Some(ids) => launch.arg(ids),
+            None => launch.arg(&null),
+        };
+        launch.arg(&first).arg(&mut dst.values).arg(&mut dst.scales);
+        // SAFETY: the arguments match `draft_quantize_rows(const bf16*, int, const int*, int,
+        // uint8_t*, float*)`. One block per row writes destination rows below `first + rows`,
+        // inside `dst`; the caller's ids are source rows (checked without ids).
+        unsafe { launch.launch(row_config(rows)?) }?;
+        Ok(())
+    }
+
+    /// `dst[first + r] = src[ids[r]]` for rows of `k` BF16 elements.
+    pub fn gather_rows(
+        &self,
+        stream: &CudaStream,
+        src: &CudaSlice<bf16>,
+        k: usize,
+        ids: &CudaView<'_, i32>,
+        first: usize,
+        dst: &mut CudaSlice<bf16>,
+    ) -> anyhow::Result<()> {
+        let rows = ids.len();
+        rows_of("src", src.len(), k)?;
+        ensure!((first + rows) * k <= dst.len(), "rows past the destination");
+        if rows == 0 {
+            return Ok(());
+        }
+        let k_arg = i32_arg("k", k)?;
+        let first = i32_arg("first", first)?;
+        let mut launch = stream.launch_builder(&self.gather_rows);
+        launch.arg(src).arg(&k_arg).arg(ids).arg(&first).arg(dst);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows)?, 1, 1),
+            block_dim: (u32::try_from(k.clamp(1, 256))?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_gather_rows(const bf16*, int, const int*, int,
+        // bf16*)`; destination rows stay inside `dst`, and the caller's ids are rows of `src`.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Up to 3 products with E4M3 weights that share the input `x` (BF16 `[m, k]`, `m` up
+    /// to 8) in one launch: BF16 outputs, F32 accumulation, each row's scale applied to
+    /// its sum (see `draft_gemm_fp8`).
+    pub fn gemm_fp8(
+        &self,
+        stream: &CudaStream,
+        x: &CudaView<'_, bf16>,
+        m: usize,
+        products: &mut [Fp8Product<'_>],
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..=F8_MAX_PRODUCTS).contains(&products.len()),
+            "{} products, expected 1 to {F8_MAX_PRODUCTS}",
+            products.len()
+        );
+        ensure!(
+            (1..=F8_MAX_M).contains(&m),
+            "m = {m}, expected 1 to {F8_MAX_M}"
+        );
+        let k = products[0].w.k;
+        check_len("x", x.len(), m * k)?;
+        let mut batch = F8Batch {
+            x: x.device_ptr(stream).0,
+            count: i32::try_from(products.len())?,
+            m: i32::try_from(m)?,
+            k: i32_arg("k", k)?,
+            ..F8Batch::default()
+        };
+        let mut blocks = 0;
+        for (i, p) in products.iter_mut().enumerate() {
+            ensure!(p.w.k == k, "product {i} has k = {}, expected {k}", p.w.k);
+            ensure!(
+                p.rows > 0 && p.rows <= p.w.rows(),
+                "product {i}: bad row count"
+            );
+            ensure!(
+                p.ld >= p.rows && p.out.len() >= (m - 1) * p.ld + p.rows,
+                "product {i}: output too short"
+            );
+            blocks += p.rows.div_ceil(F8_ROWS_PER_BLOCK);
+            batch.seg[i] = F8Segment {
+                w: p.w.values.device_ptr(stream).0,
+                scale: p.w.scales.device_ptr(stream).0,
+                out: p.out.device_ptr_mut(stream).0,
+                rows: i32_arg("rows", p.rows)?,
+                ld: i32_arg("ld", p.ld)?,
+                block_end: i32_arg("blocks", blocks)?,
+            };
+        }
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks.min(F8_BLOCKS))?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: F8_SMEM,
+        };
+        // SAFETY: `batch` has the kernel's `F8Batch` layout. The checks above size each
+        // weight as at least [rows, k], x as [m, k] and each output for m rows `ld` apart;
+        // the kernel reads only weight rows below `rows` and writes only rows below `rows`
+        // of the first m output rows. It reads x only after `pdl_wait`.
+        unsafe { launch_by_value(stream, &self.gemm_fp8, config, &batch, true) }?;
+        Ok(())
+    }
+
+    /// One Markov step's logits and the first pass of their argmax over FP8 or shortlist
+    /// head rows (see `draft_markov_fold_any`): `rows` rows, or `*count` with `count`, row
+    /// `n` standing for token `map[n]` with `map`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn markov_fold_any(
+        &self,
+        stream: &CudaStream,
+        weight: FoldRows<'_>,
+        fold_bias: &CudaSlice<bf16>,
+        base: &CudaView<'_, bf16>,
+        latent: &CudaSlice<f32>,
+        rows: usize,
+        count: Option<&CudaSlice<i32>>,
+        map: Option<&CudaSlice<i32>>,
+        softcap: f32,
+        partials: &mut ArgmaxPartials,
+    ) -> anyhow::Result<()> {
+        let capacity = match weight {
+            FoldRows::Bf16(w) => rows_of("fold weight", w.len(), RANK)?,
+            FoldRows::Fp8(w) => {
+                ensure!(w.k == RANK, "FP8 fold rows have k = {}", w.k);
+                w.rows()
+            }
+        };
+        ensure!(
+            rows <= capacity && rows <= fold_bias.len() && rows <= base.len(),
+            "{rows} rows exceed the fold, its bias or the base logits"
+        );
+        if let Some(map) = map {
+            ensure!(map.len() >= rows, "the map is too short");
+        }
+        let mut args = KernelArgs::default();
+        match weight {
+            FoldRows::Bf16(w) => args.ptr(w, stream).u64(0),
+            FoldRows::Fp8(w) => args.ptr(&w.values, stream).ptr(&w.scales, stream),
+        };
+        args.ptr(fold_bias, stream)
+            .ptr(base, stream)
+            .ptr(latent, stream)
+            .i32(i32_arg("rows", rows)?)
+            .opt(count, stream)
+            .opt(map, stream)
+            .f32(softcap)
+            .ptr_mut(&mut partials.value, stream)
+            .ptr_mut(&mut partials.index, stream);
+        let config = LaunchConfig {
+            grid_dim: (FOLD_BLOCKS as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_markov_fold_any(const void*, const float*, const
+        // bf16*, const bf16*, const float*, int, const int*, const int*, float, float*,
+        // int*)`. With `count`, the caller keeps *count at most `rows`, which the buffers
+        // hold; the kernel writes FOLD_BLOCKS partials.
+        unsafe { args.launch_pdl(stream, &self.markov_fold_any, config) }?;
+        Ok(())
+    }
+
+    /// Writes `value` to the one element of `dst`.
+    pub fn set_i32(
+        &self,
+        stream: &CudaStream,
+        dst: &mut CudaSlice<i32>,
+        value: i32,
+    ) -> anyhow::Result<()> {
+        check_len("dst", dst.len(), 1)?;
+        let mut launch = stream.launch_builder(&self.set_i32);
+        launch.arg(dst).arg(&value);
+        // SAFETY: the arguments match `draft_set_i32(int*, int)`; one thread writes the
+        // element.
+        unsafe { launch.launch(one_block(1)) }?;
+        Ok(())
+    }
+
+    /// `err[c]`, the bound on `|fold_weight[c] · z - fp8[c] · z|` for any latent with
+    /// `|z_k| <= 1`, including the F32 rounding of both products (see `draft_fold_error`).
+    pub fn fold_error(
+        &self,
+        stream: &CudaStream,
+        fold_weight: &CudaSlice<bf16>,
+        fp8: &Fp8Rows,
+        err: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        let rows = err.len();
+        ensure!(
+            fp8.k == RANK && fp8.rows() >= rows && fold_weight.len() >= rows * RANK,
+            "the fold copies are too short for {rows} rows"
+        );
+        let rows_arg = i32_arg("rows", rows)?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows.div_ceil(8))?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = stream.launch_builder(&self.fold_error);
+        launch
+            .arg(fold_weight)
+            .arg(&fp8.values)
+            .arg(&fp8.scales)
+            .arg(&rows_arg)
+            .arg(err);
+        // SAFETY: the arguments match `draft_fold_error(const bf16*, const uint8_t*, const
+        // float*, int, float*)`; one warp per row below `rows`, which every buffer holds.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// One step's exact Markov argmax, pruned: bounds from the E4M3 fold `fp8` and `err`
+    /// (`draft_markov_bound`), then the BF16 product for the rows the bounds leave in the
+    /// running (`draft_markov_exact`). Writes the same argmax partials as
+    /// [`Self::markov_fold`] without logits. With `reverse`, the bounds read the rows from
+    /// the end.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn markov_pruned(
+        &self,
+        stream: &CudaStream,
+        reverse: bool,
+        fold_weight: &CudaSlice<bf16>,
+        fp8: &Fp8Rows,
+        err: &CudaSlice<f32>,
+        fold_bias: &CudaSlice<bf16>,
+        base: &CudaView<'_, bf16>,
+        latent: &CudaSlice<f32>,
+        vocab: usize,
+        softcap: f32,
+        bounds: &mut LogitBounds,
+        partials: &mut ArgmaxPartials,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            fp8.k == RANK
+                && fp8.rows() >= vocab
+                && err.len() >= vocab
+                && fold_weight.len() >= vocab * RANK
+                && fold_bias.len() >= vocab
+                && base.len() >= vocab
+                && bounds.upper.len() >= vocab,
+            "a buffer is too short for {vocab} rows"
+        );
+        check_len("latent", latent.len(), RANK)?;
+        let vocab = i32_arg("vocab", vocab)?;
+        let config = LaunchConfig {
+            grid_dim: (FOLD_BLOCKS as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.i32(i32::from(reverse))
+            .ptr(&fp8.values, stream)
+            .ptr(&fp8.scales, stream)
+            .ptr(err, stream)
+            .ptr(fold_bias, stream)
+            .ptr(base, stream)
+            .ptr(latent, stream)
+            .i32(vocab)
+            .f32(softcap)
+            .ptr_mut(&mut bounds.upper, stream)
+            .ptr_mut(&mut bounds.lower, stream);
+        // SAFETY: the arguments match `draft_markov_bound(int, const uint8_t*, const float*,
+        // const float*, const bf16*, const bf16*, const float*, int, float, float*, float*)`.
+        // Before `pdl_wait` it reads only the E4M3 fold. It reads rows below `vocab`, writes
+        // `upper` below `vocab` and one lower bound per block, FOLD_BLOCKS of them.
+        unsafe { args.launch_pdl(stream, &self.markov_bound, config) }?;
+        let mut args = KernelArgs::default();
+        args.ptr(fold_weight, stream)
+            .ptr(fold_bias, stream)
+            .ptr(base, stream)
+            .ptr(latent, stream)
+            .ptr(&bounds.upper, stream)
+            .ptr(&bounds.lower, stream)
+            .i32(i32_arg("bounds", FOLD_BLOCKS)?)
+            .i32(vocab)
+            .f32(softcap)
+            .ptr_mut(&mut partials.value, stream)
+            .ptr_mut(&mut partials.index, stream);
+        // SAFETY: the arguments match `draft_markov_exact(const bf16*, const bf16*, const
+        // bf16*, const float*, const float*, const float*, int, int, float, float*, int*)`.
+        // It reads rows below `vocab` and FOLD_BLOCKS lower bounds, and writes FOLD_BLOCKS
+        // partials.
+        unsafe { args.launch_pdl(stream, &self.markov_exact, config) }?;
         Ok(())
     }
 }
