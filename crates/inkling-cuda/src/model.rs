@@ -163,6 +163,16 @@ impl Model {
         self.position
     }
 
+    /// Moves every cache to `position` without computing the skipped tokens, for decode
+    /// benchmarks at long contexts. Outputs after this are not meaningful.
+    pub fn skip_to_for_benchmark(&mut self, position: usize) -> anyhow::Result<()> {
+        for visit in &mut self.visits {
+            visit.kv.skip_to(position)?;
+        }
+        self.position = position;
+        Ok(())
+    }
+
     /// Runs one token and returns the greedy next token. Fills `trace` if given.
     #[expect(
         clippy::too_many_lines,

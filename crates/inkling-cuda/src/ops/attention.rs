@@ -88,6 +88,21 @@ impl KvCache {
         self.len == 0
     }
 
+    /// Marks `len` tokens as appended without writing them, so a benchmark can measure
+    /// decode at a long context without running the prefill. The skipped slots keep
+    /// whatever they held, so attention outputs are meaningless afterwards.
+    pub fn skip_to(&mut self, len: usize) -> anyhow::Result<()> {
+        if self.window.is_none() {
+            ensure!(
+                len <= self.slots,
+                "global cache holds {} tokens, asked to skip to {len}",
+                self.slots
+            );
+        }
+        self.len = len;
+        Ok(())
+    }
+
     #[must_use]
     pub fn slots(&self) -> usize {
         self.slots
