@@ -27,11 +27,7 @@ mod linux {
 
     use anyhow::{Context as _, ensure};
     use inkling::{Checkpoint, TextConfig};
-    use inkling_cuda::{
-        Gpu,
-        model::{Model, Trace},
-        weights::Weights,
-    };
+    use inkling_cuda::{Gpu, model::Model, weights::Weights};
     use safetensors::{Dtype, SafeTensors};
 
     // Thresholds, from MLX's disagreement with itself between its chunked (multi-row)
@@ -289,15 +285,14 @@ mod linux {
         let capacity = n + capture.continuation.len();
         let mut model = Model::new(&gpu, config, weights, passes, capacity)?;
 
-        let mut trace = Trace::default();
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)
         let mut kls: Vec<(usize, f64, u32, u32)> = Vec::new();
         let mut next = 0;
         let started = Instant::now();
         for (i, &token) in capture.tokens.iter().enumerate() {
-            next = model.step(token, Some(&mut trace))?;
-            let logits = &trace.logits;
+            next = model.step(token, None)?;
+            let logits = &model.logits()?;
             ensure!(
                 logits.len() == vocab,
                 "the engine returned {} logits",
@@ -385,7 +380,7 @@ mod linux {
             capture.continuation.len()
         );
         println!(
-            "runtime {seconds:.0} s: {:.1} ms per teacher-forced token, with a trace each step",
+            "runtime {seconds:.0} s: {:.1} ms per teacher-forced token, logits read back each step",
             forced_seconds * 1e3 / n as f64
         );
 
