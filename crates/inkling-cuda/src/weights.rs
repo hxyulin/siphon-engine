@@ -2,8 +2,9 @@
 //!
 //! Tensor names are the checkpoint's own (`model.llm.*`). The conversions mirror
 //! MLX-LM's `sanitize` in `models/inkling2/checkpoint.py`:
-//! - the router weight, the message gates' forget and gain weights and the dynamic
-//!   convolutions' static weights are widened from BF16 to F32;
+//! - the router weight and the dynamic convolutions' static weights are widened from
+//!   BF16 to F32. The message gates' forget and gain weights stay BF16: MLX widens them
+//!   too, but the kernel widens each weight exactly as it reads it, which halves the bytes;
 //! - the NVFP4 global scale of each expert is `amax * 6 * 448 / denominator`;
 //! - the loop-message queries are reordered to query, key, value, MLP per looped layer.
 //!
@@ -135,10 +136,10 @@ pub enum ExpertFormat {
 pub struct MessageGateWeights {
     /// `[rank, 2 * hidden]`.
     pub down: CudaSlice<bf16>,
-    /// F32 `[hidden, rank]`.
-    pub forget: CudaSlice<f32>,
-    /// F32 `[hidden, rank]`.
-    pub gain: CudaSlice<f32>,
+    /// `[hidden, rank]`, multiplied with an F32 input.
+    pub forget: CudaSlice<bf16>,
+    /// `[hidden, rank]`, multiplied with an F32 input.
+    pub gain: CudaSlice<bf16>,
 }
 
 /// Reads tensors from the checkpoint and uploads them.
@@ -326,6 +327,16 @@ impl LayerWeights {
 }
 
 impl AttentionWeights {
+    /// The projections of the attention inputs, in the runner's launch order.
+    #[must_use]
+    pub fn input_projections(&self) -> Vec<&CudaSlice<bf16>> {
+        let mut weights = vec![&self.q, &self.r, &self.gate, &self.sink, &self.k, &self.v];
+        if let KvConv::Dynamic { k_proj, v_proj, .. } = &self.kv_conv {
+            weights.extend([k_proj, v_proj]);
+        }
+        weights
+    }
+
     fn load(
         loader: &Loader<'_>,
         config: &TextConfig,
@@ -447,13 +458,19 @@ impl ExpertWeights {
 }
 
 impl MessageGateWeights {
+    /// The down, forget and gain weights, in the order the gate reads them.
+    #[must_use]
+    pub fn matrices(&self) -> [&CudaSlice<bf16>; 3] {
+        [&self.down, &self.forget, &self.gain]
+    }
+
     fn load(loader: &Loader<'_>, config: &TextConfig, p: &str) -> anyhow::Result<Self> {
         let hidden = config.hidden_size;
         let rank = config.loop_config.gate_rank;
         Ok(Self {
             down: loader.bf16(&format!("{p}.down_weight"), &[rank, 2 * hidden])?,
-            forget: loader.f32(&format!("{p}.forget_weight"), &[hidden, rank])?,
-            gain: loader.f32(&format!("{p}.gain_weight"), &[hidden, rank])?,
+            forget: loader.bf16(&format!("{p}.forget_weight"), &[hidden, rank])?,
+            gain: loader.bf16(&format!("{p}.gain_weight"), &[hidden, rank])?,
         })
     }
 }

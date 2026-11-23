@@ -26,7 +26,7 @@ use crate::{
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
-        linear::Linear,
+        linear::{Gemv, Linear},
         misc::Misc,
         norm::Norm,
         routing::{RouterMatmul, Routing},
@@ -548,11 +548,11 @@ impl Model {
         )?;
         ctx.kernels.linear.gemv_bf16(
             &ctx.stream,
-            &ctx.weights.lm_head,
-            &s.final_hidden,
-            &mut s.logits,
-            cfg.vocab_size,
-            cfg.hidden_size,
+            &mut [Gemv::new(
+                &ctx.weights.lm_head,
+                &s.final_hidden,
+                &mut s.logits,
+            )],
         )?;
         ctx.kernels.elementwise.logit_softcap(
             &ctx.stream,
@@ -610,6 +610,14 @@ impl Ctx {
         let w = &self.weights.layers[layer];
         let sliding = self.config.is_sliding(layer);
         let hidden = self.hidden();
+        // The weights of the attention projections, and of the message gates that build
+        // their inputs, stream into L2 while those inputs are built.
+        let mut prefetch = Vec::new();
+        if let (true, Some(gates)) = (messages, &w.message_gates) {
+            prefetch.extend(gates[..3].iter().flat_map(MessageGateWeights::matrices));
+        }
+        prefetch.extend(w.attention.input_projections());
+        self.kernels.linear.prefetch(&self.stream, &prefetch)?;
         self.normed_f32(&s.hidden, &mut s.wide, &mut s.normed_residual)?;
 
         let has_inputs = match &w.attention_query {
@@ -641,6 +649,11 @@ impl Ctx {
             sliding,
             [q_in, k_in, v_in],
         )?;
+        if let (true, Some(gates)) = (messages, &w.message_gates) {
+            self.kernels
+                .linear
+                .prefetch(&self.stream, &gates[3].matrices())?;
+        }
 
         self.kernels.conv.short_conv(
             &self.stream,
@@ -686,6 +699,7 @@ impl Ctx {
         )?;
         let mlp_input = match (messages, &w.message_gates) {
             (true, Some(gates)) => {
+                self.kernels.linear.join_prefetch(&self.stream)?;
                 self.message_gate(
                     &gates[3],
                     &mut s.gate,
@@ -800,8 +814,24 @@ impl Ctx {
         let kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
 
-        self.gemv(&a.k, k_in, &mut t.k_raw)?;
-        self.gemv(&a.v, v_in, &mut t.v_raw)?;
+        // Every projection of the three inputs in one launch.
+        let mut products = vec![
+            Gemv::new(&a.q, q_in, &mut t.q_raw),
+            Gemv::new(&a.r, q_in, &mut t.r_raw),
+            Gemv::new(&a.gate, q_in, &mut t.gate),
+            Gemv::new(&a.sink, q_in, &mut t.sinks),
+            Gemv::new(&a.k, k_in, &mut t.k_raw),
+            Gemv::new(&a.v, v_in, &mut t.v_raw),
+        ];
+        if let KvConv::Dynamic { k_proj, v_proj, .. } = &a.kv_conv {
+            products.push(Gemv::new(k_proj, k_in, &mut t.k_dynamic));
+            products.push(Gemv::new(v_proj, v_in, &mut t.v_dynamic));
+        }
+        self.kernels.linear.gemv_bf16(&self.stream, &mut products)?;
+        drop(products);
+        // The output projection's weight streams into L2 while attention runs.
+        self.kernels.linear.prefetch(&self.stream, &[&a.o])?;
+
         let [k_state, v_state, ..] = &mut state.conv;
         match &a.kv_conv {
             KvConv::Static { k, v } => {
@@ -813,13 +843,8 @@ impl Ctx {
                     .short_conv(&self.stream, &t.v_raw, v, v_state, &mut t.v_conv)?;
             }
             KvConv::Dynamic {
-                k_static,
-                k_proj,
-                v_static,
-                v_proj,
+                k_static, v_static, ..
             } => {
-                self.gemv(k_proj, k_in, &mut t.k_dynamic)?;
-                self.gemv(v_proj, v_in, &mut t.v_dynamic)?;
                 self.kernels.conv.dynamic_short_conv(
                     &self.stream,
                     &t.k_raw,
@@ -838,11 +863,6 @@ impl Ctx {
                 )?;
             }
         }
-
-        self.gemv(&a.q, q_in, &mut t.q_raw)?;
-        self.gemv(&a.r, q_in, &mut t.r_raw)?;
-        self.gemv(&a.gate, q_in, &mut t.gate)?;
-        self.gemv(&a.sink, q_in, &mut t.sinks)?;
 
         let threshold = cfg.qk_l2_clip_threshold;
         self.kernels.norm.l2_clip(
@@ -918,7 +938,10 @@ impl Ctx {
         self.kernels
             .elementwise
             .attention_gate(&self.stream, &t.out, &t.gate, &mut t.gated)?;
-        self.gemv(&a.o, &t.gated, &mut t.proj)
+        self.kernels.linear.join_prefetch(&self.stream)?;
+        self.kernels
+            .linear
+            .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])
     }
 
     /// MLX-LM's `MessageGate`: mixes `message` into the F32 state `h`, into `out`.
@@ -931,7 +954,6 @@ impl Ctx {
         out: &mut CudaSlice<f32>,
     ) -> anyhow::Result<()> {
         let hidden = self.hidden();
-        let rank = self.config.loop_config.gate_rank;
         self.kernels.norm.unweighted_rms_norm(
             &self.stream,
             h,
@@ -947,25 +969,19 @@ impl Ctx {
         self.kernels
             .misc
             .cast_f32_to_bf16(&self.stream, &t.both, &mut t.both_bf16)?;
-        self.gemv(&g.down, &t.both_bf16, &mut t.down)?;
+        self.kernels.linear.gemv_bf16(
+            &self.stream,
+            &mut [Gemv::new(&g.down, &t.both_bf16, &mut t.down)],
+        )?;
         self.kernels
             .misc
             .cast_bf16_to_f32(&self.stream, &t.down, &mut t.down_f32)?;
         self.kernels.linear.gemv_f32(
             &self.stream,
-            &g.forget,
-            &t.down_f32,
-            &mut t.forget,
-            hidden,
-            rank,
-        )?;
-        self.kernels.linear.gemv_f32(
-            &self.stream,
-            &g.gain,
-            &t.down_f32,
-            &mut t.gain,
-            hidden,
-            rank,
+            &mut [
+                Gemv::new(&g.forget, &t.down_f32, &mut t.forget),
+                Gemv::new(&g.gain, &t.down_f32, &mut t.gain),
+            ],
         )?;
         self.kernels
             .misc
@@ -1052,19 +1068,6 @@ impl Ctx {
         self.kernels
             .norm
             .unweighted_rms_norm(&self.stream, wide, out, self.eps())
-    }
-
-    /// `out = weight @ x` for a BF16 weight `[out.len(), x.len()]`.
-    fn gemv(
-        &self,
-        weight: &CudaSlice<bf16>,
-        x: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
-    ) -> anyhow::Result<()> {
-        let (n, k) = (out.len(), x.len());
-        self.kernels
-            .linear
-            .gemv_bf16(&self.stream, weight, x, out, n, k)
     }
 
     fn hidden(&self) -> usize {

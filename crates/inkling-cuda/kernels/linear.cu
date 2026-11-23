@@ -1,150 +1,239 @@
-// Dense matrix-vector products, bit-exact with MLX 0.32.4's M = 1 path.
+// Matrix-vector products `out = W @ x` with BF16 weights and F32 accumulation.
 //
-// For one input row, `x @ W.T` with W stored [n, k] row-major runs MLX's
-// GEMVKernel (kernels/gemv.h) with W as the matrix. Each kernel here computes
-// every input row as its own M = 1 product with the same sums. MLX picks the
-// blocking in matmul.cpp; TN is always 4, and SN and BN depend on the shape:
+// One launch runs a batch of up to kMaxSegments products that share k. Each segment has
+// its own weight [rows, k] (row-major), input x [k] and output [rows], so the projections
+// that read one layer input run as one launch, and the launch streams enough bytes to
+// approach DRAM bandwidth.
 //
-//   k <= 64       SN = 4,  BN = 1   8 rows per simdgroup, 4 lanes per row
-//   k >= 16 * n   SN = 32, BN = 8   8 simdgroups split k for one row
-//   otherwise     SN = 32, BN = 1   one simdgroup per row
-//
-// BM and TM only decide which rows a threadgroup owns, so they change no sum.
-// For each output row:
-// 1. Lane `l` of k-slice `s` owns columns i * BN*SN*4 + (s*SN + l)*4 + t, for
-//    i ascending and t = 0..3, and accumulates `acc += w * x` from zero. Metal
-//    contracts that into an FMA: the F32 path matches MLX only with FMA. For
-//    BF16 the product is exact, so FMA and multiply-add agree. Columns past k
-//    add fma(0, 0, acc), as MLX's zero-filled `load_safe` does.
-// 2. The SN lanes of a row reduce with `simd_shuffle_down` by SN/2, ..., 1. That
-//    is a tree with descending offsets, not `simd_sum`'s butterfly.
-// 3. With BN = 8, slice 0 adds slices 1 to 7 in order.
-// A NumPy emulation of these steps matched MLX bit for bit on every shape the
-// model uses, for both BF16 and F32.
+// Each block of kWarps warps owns consecutive rows of one segment. A row is split over
+// L lanes (32, or fewer when k is short, so a warp holds 32 / L rows), and over S warps
+// when the batch has too few rows to fill the GPU. Each lane first issues V 16-byte
+// weight loads, then stages x in shared memory, then accumulates `acc += w * x` over its
+// loads in order. A row's lanes reduce with a butterfly shuffle, and its S warps through
+// shared memory. The sum order therefore differs from MLX's; tests/linear.rs bounds the
+// error.
 
 #include <cuda_bf16.h>
-#include <cfloat>
 #include <cstdint>
 
 namespace {
 
-constexpr int kTN = 4;
+constexpr int kMaxSegments = 8;
+constexpr int kWarps = 8;
+constexpr int kThreads = kWarps * 32;
 
-// Metal flushes F32 subnormals to zero, so these use the PTX .ftz forms.
-__device__ __forceinline__ float ffma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
+struct Segment {
+    const __nv_bfloat16* w;
+    const void* x;
+    void* out;
+    int rows;
+    // Blocks of this segment and every segment before it.
+    int block_end;
+};
+
+struct Batch {
+    Segment seg[kMaxSegments];
+    int count;
+    int k;
+};
+
+// Streams weights past L1: each byte is read once per step.
+__device__ __forceinline__ uint4 load_weight(const uint4* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
 }
 
-__device__ __forceinline__ float fadd(float a, float b) {
-    float r;
-    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
+__device__ __forceinline__ float lo(uint32_t pair) { return __uint_as_float(pair << 16); }
+__device__ __forceinline__ float hi(uint32_t pair) { return __uint_as_float(pair & 0xffff0000u); }
+
+// acc + dot(8 BF16 weights, 8 inputs at x[8 * i]).
+__device__ __forceinline__ float dot8(uint4 w, const __nv_bfloat16* x, int i, float acc) {
+    const uint4 v = reinterpret_cast<const uint4*>(x)[i];
+    acc = fmaf(lo(w.x), lo(v.x), acc);
+    acc = fmaf(hi(w.x), hi(v.x), acc);
+    acc = fmaf(lo(w.y), lo(v.y), acc);
+    acc = fmaf(hi(w.y), hi(v.y), acc);
+    acc = fmaf(lo(w.z), lo(v.z), acc);
+    acc = fmaf(hi(w.z), hi(v.z), acc);
+    acc = fmaf(lo(w.w), lo(v.w), acc);
+    acc = fmaf(hi(w.w), hi(v.w), acc);
+    return acc;
 }
 
-__device__ __forceinline__ void load4(const __nv_bfloat16* p, float (&v)[kTN]) {
-    const uint2 packed = *reinterpret_cast<const uint2*>(p);
-    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
-#pragma unroll
-    for (int t = 0; t < kTN; ++t) {
-        v[t] = __bfloat162float(vals[t]);
+__device__ __forceinline__ float dot8(uint4 w, const float* x, int i, float acc) {
+    const float4 a = reinterpret_cast<const float4*>(x)[2 * i];
+    const float4 b = reinterpret_cast<const float4*>(x)[2 * i + 1];
+    acc = fmaf(lo(w.x), a.x, acc);
+    acc = fmaf(hi(w.x), a.y, acc);
+    acc = fmaf(lo(w.y), a.z, acc);
+    acc = fmaf(hi(w.y), a.w, acc);
+    acc = fmaf(lo(w.z), b.x, acc);
+    acc = fmaf(hi(w.z), b.y, acc);
+    acc = fmaf(lo(w.w), b.z, acc);
+    acc = fmaf(hi(w.w), b.w, acc);
+    return acc;
+}
+
+__device__ __forceinline__ void store(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+__device__ __forceinline__ void store(float* p, float v) { *p = v; }
+
+// Tx and To are the input and output element types; L lanes of S warps share a row and
+// each lane keeps V weight loads in flight. `x_smem` holds k elements of Tx.
+template <typename Tx, typename To, int L, int S, int V>
+__device__ void gemv(const Batch& b, Tx* x_smem) {
+    static_assert(kWarps % S == 0, "a block holds whole rows");
+    constexpr int kRowsPerWarp = 32 / L;
+    constexpr int kRowsPerBlock = kWarps / S * kRowsPerWarp;
+    // Consecutive 16-byte vectors of a row go to one warp's L lanes, then the next warp's.
+    constexpr int kStride = S * L;
+
+    int s = 0;
+    int block_begin = 0;
+    while (s + 1 < b.count && int(blockIdx.x) >= b.seg[s].block_end) {
+        block_begin = b.seg[s].block_end;
+        ++s;
     }
-}
-
-__device__ __forceinline__ void load4(const float* p, float (&v)[kTN]) {
-    const float4 packed = *reinterpret_cast<const float4*>(p);
-    v[0] = packed.x;
-    v[1] = packed.y;
-    v[2] = packed.z;
-    v[3] = packed.w;
-}
-
-// Round to nearest even, flushing subnormals as MLX's cast does.
-__device__ __forceinline__ void store(__nv_bfloat16* p, float v) {
-    *p = __float2bfloat16(fabsf(v) < FLT_MIN ? copysignf(0.f, v) : v);
-}
-
-__device__ __forceinline__ void store(float* p, float v) {
-    *p = v;
-}
-
-// out[r, row] = sum_c w[row, c] * x[r, c] for input row r = blockIdx.y. A block
-// holds `BN == 1 ? 4 : 1` warps along the output rows times BN warps along k.
-// Every thread stays to the end because the shuffles and barrier need the
-// whole warp and block; threads past n compute on row 0 and store nothing.
-template <typename T, int SN, int BN>
-__device__ void gemv(const T* w, const T* x, T* out, int n, int k) {
-    constexpr int kRowsPerWarp = 32 / SN;
-    constexpr int kWarpsM = BN == 1 ? 4 : 1;
-    constexpr int kRowsPerBlock = kWarpsM * kRowsPerWarp;
-    constexpr int kBlockK = BN * SN * kTN;
-
+    const Segment& seg = b.seg[s];
+    const int k = b.k;
+    const int vecs = k / 8;  // 16-byte weight vectors per row
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
-    const int thr_n = lane % SN;
-    const int slice = warp % BN;
-    const int row = blockIdx.x * kRowsPerBlock + (warp / BN) * kRowsPerWarp + lane / SN;
-    const bool live = row < n;
+    const int sub = (warp % S) * L + lane % L;
+    const int row = (int(blockIdx.x) - block_begin) * kRowsPerBlock +
+                    warp / S * kRowsPerWarp + lane / L;
+    const bool live = row < seg.rows;
+    const auto* w_row = reinterpret_cast<const uint4*>(seg.w + size_t(live ? row : 0) * k);
 
-    const T* w_row = w + size_t(live ? row : 0) * k;
-    x += size_t(blockIdx.y) * k;
-    out += size_t(blockIdx.y) * n;
+    // Weight loads go out first, so x staging hides under their latency.
+    uint4 wv[V];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        const int i = v * kStride + sub;
+        wv[v] = live && i < vecs ? load_weight(w_row + i) : make_uint4(0, 0, 0, 0);
+    }
+
+    // k is a multiple of 8, so x is whole 16-byte vectors.
+    const auto* x = static_cast<const uint4*>(seg.x);
+    constexpr int kXPerVec = 16 / sizeof(Tx);
+    for (int i = threadIdx.x; i < k / kXPerVec; i += kThreads) {
+        reinterpret_cast<uint4*>(x_smem)[i] = __ldg(x + i);
+    }
+    __syncthreads();
 
     float acc = 0.f;
-    for (int base = 0; base < k; base += kBlockK) {
-        const int col = base + (slice * SN + thr_n) * kTN;
-        float wv[kTN] = {0.f, 0.f, 0.f, 0.f};
-        float xv[kTN] = {0.f, 0.f, 0.f, 0.f};
-        // k is a multiple of 4, so a group of 4 columns is wholly in or out.
-        if (col < k) {
-            load4(w_row + col, wv);
-            load4(x + col, xv);
-        }
 #pragma unroll
-        for (int t = 0; t < kTN; ++t) {
-            acc = ffma(wv[t], xv[t], acc);
+    for (int v = 0; v < V; ++v) {
+        const int i = v * kStride + sub;
+        if (i < vecs) {
+            acc = dot8(wv[v], x_smem, i, acc);
         }
     }
-
+    // Rows longer than one batch of loads.
+    for (int base = V * kStride; base < vecs; base += V * kStride) {
 #pragma unroll
-    for (int offset = SN / 2; offset >= 1; offset /= 2) {
-        acc = fadd(acc, __shfl_down_sync(0xffffffffu, acc, offset));
-    }
-
-    if constexpr (BN > 1) {
-        static_assert(kWarpsM == 1, "a split-k block owns one warp of rows");
-        __shared__ float partial[BN][kRowsPerWarp];
-        if (thr_n == 0) {
-            partial[slice][lane / SN] = acc;
+        for (int v = 0; v < V; ++v) {
+            const int i = base + v * kStride + sub;
+            wv[v] = live && i < vecs ? load_weight(w_row + i) : make_uint4(0, 0, 0, 0);
         }
-        __syncthreads();
-        if (slice == 0 && thr_n == 0) {
 #pragma unroll
-            for (int s = 1; s < BN; ++s) {
-                acc = fadd(acc, partial[s][lane / SN]);
+        for (int v = 0; v < V; ++v) {
+            const int i = base + v * kStride + sub;
+            if (i < vecs) {
+                acc = dot8(wv[v], x_smem, i, acc);
             }
         }
     }
 
-    if (live && slice == 0 && thr_n == 0) {
-        store(out + row, acc);
+#pragma unroll
+    for (int offset = L / 2; offset >= 1; offset /= 2) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if constexpr (S > 1) {
+        __shared__ float partial[kWarps][kRowsPerWarp];
+        if (lane % L == 0) {
+            partial[warp][lane / L] = acc;
+        }
+        __syncthreads();
+        if (warp % S == 0) {
+#pragma unroll
+            for (int w = 1; w < S; ++w) {
+                acc += partial[warp + w][lane / L];
+            }
+        }
+    }
+    if (live && sub == 0) {
+        store(static_cast<To*>(seg.out) + row, acc);
     }
 }
 
 }  // namespace
 
-// One entry point per dtype and MLX blocking. Names give SN and BN; the launcher
-// picks one with MLX's rule above. Grid: (ceil(n / rows per block), input rows).
-#define GEMV_ENTRY(name, T, SN, BN)                                                         \
-    extern "C" __global__ void __launch_bounds__(32 * BN * (BN == 1 ? 4 : 1))               \
-    name(const T* w, const T* x, T* out, int n, int k) {                                    \
-        gemv<T, SN, BN>(w, x, out, n, k);                                                   \
+// Entry points by input and output type, lanes per row L, warps per row S and loads per
+// lane V. The launcher picks them from k and the row count. Dynamic shared memory:
+// k * sizeof(Tx) bytes.
+#define GEMV_ENTRY(name, Tx, To, L, S, V)                                                  \
+    extern "C" __global__ void __launch_bounds__(kThreads)                                 \
+    name(const __grid_constant__ Batch batch) {                                            \
+        extern __shared__ uint4 x_smem[];                                                  \
+        gemv<Tx, To, L, S, V>(batch, reinterpret_cast<Tx*>(x_smem));                       \
     }
 
-GEMV_ENTRY(gemv_bf16_sn4_bn1, __nv_bfloat16, 4, 1)
-GEMV_ENTRY(gemv_bf16_sn32_bn1, __nv_bfloat16, 32, 1)
-GEMV_ENTRY(gemv_bf16_sn32_bn8, __nv_bfloat16, 32, 8)
-GEMV_ENTRY(gemv_f32_sn4_bn1, float, 4, 1)
-GEMV_ENTRY(gemv_f32_sn32_bn1, float, 32, 1)
-GEMV_ENTRY(gemv_f32_sn32_bn8, float, 32, 8)
+// k = 2304 and 3072 fill one batch of loads exactly; v8 serves every other k.
+GEMV_ENTRY(gemv_bf16_l32_v9, __nv_bfloat16, __nv_bfloat16, 32, 1, 9)
+GEMV_ENTRY(gemv_bf16_l32_v12, __nv_bfloat16, __nv_bfloat16, 32, 1, 12)
+GEMV_ENTRY(gemv_bf16_l32_v8, __nv_bfloat16, __nv_bfloat16, 32, 1, 8)
+// Few rows: 8 warps per row, 4 loads per lane.
+GEMV_ENTRY(gemv_bf16_l32_s8_v4, __nv_bfloat16, __nv_bfloat16, 32, 8, 4)
+// k <= 64: 8 lanes per row, 4 rows per warp.
+GEMV_ENTRY(gemv_bf16_l8_v1, __nv_bfloat16, __nv_bfloat16, 8, 1, 1)
+// F32 input and output with BF16 weights: the message gates' forget and gain projections.
+GEMV_ENTRY(gemv_f32_l8_v1, float, float, 8, 1, 1)
+GEMV_ENTRY(gemv_f32_l32_v8, float, float, 32, 1, 8)
+GEMV_ENTRY(gemv_f32_l32_s8_v4, float, float, 32, 8, 4)
+
+constexpr int kMaxRanges = 24;
+
+// Up to kMaxRanges weights for prefetch_l2, each as 16-byte vectors.
+struct Ranges {
+    const uint4* p[kMaxRanges];
+    long long vecs[kMaxRanges];
+    int count;
+};
+
+// Pulls the ranges into L2, in order, for later kernels. Runs on a side stream beside
+// latency-bound kernels. Prefetch instructions are hints the memory system drops under
+// load, so this issues real 16-byte loads, 8 per thread at a time. The trap that uses
+// their values never fires, since count is never negative; it keeps the loads alive.
+extern "C" __global__ void __launch_bounds__(kThreads)
+prefetch_l2(const __grid_constant__ Ranges r) {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    const long long stride = (long long)gridDim.x * kThreads;
+    uint32_t seen = 0;
+    for (int s = 0; s < r.count; ++s) {
+        const uint4* p = r.p[s];
+        const long long vecs = r.vecs[s];
+        for (long long base = blockIdx.x * kThreads + threadIdx.x; base < vecs;
+             base += 8 * stride) {
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const long long i = base + u * stride;
+                if (i < vecs) {
+                    uint32_t a, b, c, d;
+                    asm volatile(
+                        "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, "
+                        "[%4], %5;"
+                        : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+                        : "l"(p + i), "l"(policy));
+                    seen ^= a ^ b ^ c ^ d;
+                }
+            }
+        }
+    }
+    if (r.count < 0 && seen == 0) {
+        __trap();
+    }
+}

@@ -8,12 +8,16 @@
 
 mod common;
 
-use common::{Fixture, assert_bf16_close};
+use common::{Fixture, assert_bf16_close, assert_f32_close};
 use cudarc::driver::{CudaSlice, CudaStream};
 use half::bf16;
 use inkling_cuda::{
     Gpu,
-    ops::{linear::Linear, misc::Misc, norm::Norm},
+    ops::{
+        linear::{Gemv, Linear},
+        misc::Misc,
+        norm::Norm,
+    },
 };
 
 const HIDDEN: usize = 2304;
@@ -183,40 +187,34 @@ fn message_gate_chain_matches_mlx() -> anyhow::Result<()> {
     s.misc.cast_f32_to_bf16(stream, &states, &mut states_bf16)?;
     let (down_weight, _) = fixture.bf16("gate.down_weight")?;
     let mut down = stream.alloc_zeros::<bf16>(GATE_RANK)?;
+    let down_weight = stream.clone_htod(&down_weight)?;
     linear.gemv_bf16(
         stream,
-        &stream.clone_htod(&down_weight)?,
-        &states_bf16,
-        &mut down,
-        GATE_RANK,
-        2 * HIDDEN,
+        &mut [Gemv::new(&down_weight, &states_bf16, &mut down)],
     )?;
+    // The linear kernels sum in another order than MLX; tests/linear.rs bounds the error.
     let (want, _) = fixture.bf16("gate.down")?;
-    assert_bf16_close("gate.down", &stream.clone_dtoh(&down)?, &want, 0);
+    assert_bf16_close("gate.down", &stream.clone_dtoh(&down)?, &want, 1);
     let mut down_f32 = stream.alloc_zeros::<f32>(GATE_RANK)?;
     s.misc.cast_bf16_to_f32(stream, &down, &mut down_f32)?;
 
-    // 4. Forget and gain projections, with the BF16 weights widened to F32 as the loader does.
-    let project = |key: &str| -> anyhow::Result<CudaSlice<f32>> {
-        let (weight, _) = fixture.bf16(&format!("gate.{key}_weight"))?;
-        let weight: Vec<f32> = weight.iter().map(|w| w.to_f32()).collect();
-        let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
-        linear.gemv_f32(
-            stream,
-            &stream.clone_htod(&weight)?,
-            &down_f32,
-            &mut out,
-            HIDDEN,
-            GATE_RANK,
-        )?;
-        Ok(out)
-    };
-    let f_pre = project("forget")?;
-    let g_pre = project("gain")?;
+    // 4. Forget and gain projections in one launch, with the BF16 weights MLX widens to F32.
+    let (forget, _) = fixture.bf16("gate.forget_weight")?;
+    let (gain, _) = fixture.bf16("gate.gain_weight")?;
+    let (forget, gain) = (stream.clone_htod(&forget)?, stream.clone_htod(&gain)?);
+    let mut f_pre = stream.alloc_zeros::<f32>(HIDDEN)?;
+    let mut g_pre = stream.alloc_zeros::<f32>(HIDDEN)?;
+    linear.gemv_f32(
+        stream,
+        &mut [
+            Gemv::new(&forget, &down_f32, &mut f_pre),
+            Gemv::new(&gain, &down_f32, &mut g_pre),
+        ],
+    )?;
     let (want, _) = fixture.f32("gate.f_pre")?;
-    assert_f32_exact("gate.f_pre", &stream.clone_dtoh(&f_pre)?, &want);
+    assert_f32_close("gate.f_pre", &stream.clone_dtoh(&f_pre)?, &want, 1e-5, 1e-6);
     let (want, _) = fixture.f32("gate.g_pre")?;
-    assert_f32_exact("gate.g_pre", &stream.clone_dtoh(&g_pre)?, &want);
+    assert_f32_close("gate.g_pre", &stream.clone_dtoh(&g_pre)?, &want, 1e-5, 1e-6);
 
     // 5. Combine.
     let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
