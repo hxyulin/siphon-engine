@@ -1,0 +1,10 @@
+/target
+.pixi/
+__pycache__/
+
+# Local experiment notes, scripts and agent config.
+/.claude/
+/experiments/
+/releases/
+/BENCHMARKS.md
+/EXPERIMENT_LOG.md

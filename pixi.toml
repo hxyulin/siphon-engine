@@ -1,0 +1,12 @@
+# CUDA toolkit for building crates/inkling-cuda on Linux. The NVIDIA driver comes from the host.
+[workspace]
+name = "inkling-2-mini"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+cuda-nvcc = "13.0.*"
+cuda-cudart-dev = "13.0.*"
+
+[activation.env]
+NVCC = "$CONDA_PREFIX/bin/nvcc"
