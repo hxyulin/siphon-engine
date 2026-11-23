@@ -20,14 +20,21 @@ mod common;
 
 use std::sync::{Arc, OnceLock};
 
-use common::{Fixture, assert_bf16_close, bf16_ulps};
-use cudarc::driver::CudaStream;
+use common::{
+    Fixture, assert_bf16_close, assert_f32_within_ulps, bf16_ulps, pseudo_random,
+    pseudo_random_bf16,
+};
+use cudarc::driver::{CudaSlice, CudaStream};
 use half::bf16;
 use inkling_cuda::{
     Gpu,
-    ops::attention::{
-        Attention, AttentionScratch, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData, KvFormat,
-        MAX_PREFILL_ROWS, PrefillScratch, REL_DIM,
+    ops::{
+        attention::{
+            Attention, AttentionScratch, DecodeStep, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData,
+            KvFormat, MAX_PREFILL_ROWS, PrefillScratch, REL_DIM,
+        },
+        elementwise::Elementwise,
+        norm::{AttentionPost, KvConvWeights, Norm},
     },
 };
 
@@ -732,6 +739,260 @@ fn global_cache_holds_its_capacity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Relative-state norm limit of the model's L2 clip.
+const REL_THRESHOLD: f32 = 8.0;
+/// The model's RMS norm epsilon.
+const EPS: f32 = 1e-6;
+/// The model's query log scaling: alpha and n_floor.
+const LOG_SCALE: (f32, f32) = (0.1, 8192.0);
+
+/// The conv weights of one decode step: the static weights, or the step's dynamic taps with
+/// the F32 static weights.
+fn conv_weights<'a>(
+    dynamic: bool,
+    weights: &'a [CudaSlice<bf16>; 2],
+    taps: &'a [CudaSlice<bf16>; 2],
+    statics: &'a [CudaSlice<f32>; 2],
+) -> KvConvWeights<'a> {
+    if dynamic {
+        KvConvWeights::Dynamic {
+            k_dynamic: taps[0].as_view(),
+            v_dynamic: taps[1].as_view(),
+            k_static: &statics[0],
+            v_static: &statics[1],
+        }
+    } else {
+        KvConvWeights::Static {
+            k: &weights[0],
+            v: &weights[1],
+        }
+    }
+}
+
+/// The key and value row in `slot` of `cache`, as bits.
+fn cache_row(
+    stream: &Arc<CudaStream>,
+    cache: &KvCache,
+    slot: usize,
+) -> anyhow::Result<[Vec<u16>; 2]> {
+    let row = slot * ROW..(slot + 1) * ROW;
+    let [k, v] = match cache.data() {
+        KvData::Bf16 { keys, values } => [keys, values].map(|x| {
+            stream
+                .clone_dtoh(&x.slice(row.clone()))
+                .map(|v| v.iter().map(|b| b.to_bits()).collect())
+        }),
+        KvData::Fp8 { keys, values } => [keys, values].map(|x| {
+            stream
+                .clone_dtoh(&x.slice(row.clone()))
+                .map(|v| v.iter().map(|&b| u16::from(b)).collect())
+        }),
+    };
+    Ok([k?, v?])
+}
+
+/// `Attention::decode_step` against the kernels it replaces (`Norm::attention_post`,
+/// relative bias, append, decode attention and the output gate), on random inputs at each
+/// position in `checks`, alternating static and dynamic convs. Positions between checks get
+/// random keys and values through `append`. The output, the conv states and the appended
+/// cache row must match bit for bit.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the separate kernels and the fused one, per position"
+)]
+fn check_decode_step(
+    new_cache: fn(&Arc<CudaStream>) -> anyhow::Result<KvCache>,
+    checks: &[usize],
+) -> anyhow::Result<()> {
+    /// Filler tokens, cycled.
+    const FILL: usize = 2048;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let norm = Norm::load(gpu.context())?;
+    let elementwise = Elementwise::load(gpu.context())?;
+    let (mut cache_ref, mut cache) = (new_cache(stream)?, new_cache(stream)?);
+    let log_scale = cache.window().is_none();
+    let slots = cache.slots();
+    let mut rng = Rng(11);
+    let topics: Vec<Vec<f32>> = (0..4)
+        .map(|_| (0..HEAD_DIM).map(|_| 1.5 * rng.normal()).collect())
+        .collect();
+    let fill_k = stream.clone_htod(&rng.heads(FILL * KV_HEADS, &topics))?;
+    let fill_v = stream.clone_htod(&rng.normals(FILL * ROW, 1.0))?;
+    let table = stream.clone_htod(&rng.normals(REL_DIM * EXTENT, 0.4))?;
+    let q_scale = stream.clone_htod(&pseudo_random_bf16(HEADS * HEAD_DIM, 60, 0.5, 1.0))?;
+    let r_scale = stream.clone_htod(&pseudo_random_bf16(HEADS * REL_DIM, 61, 0.5, 1.0))?;
+    let weights = [
+        stream.clone_htod(&pseudo_random_bf16(ROW * 4, 62, 0.5, 0.0))?,
+        stream.clone_htod(&pseudo_random_bf16(ROW * 4, 63, 0.5, 0.0))?,
+    ];
+    let statics = [
+        stream.clone_htod(&pseudo_random(4 * ROW, 64, 0.5))?,
+        stream.clone_htod(&pseudo_random(4 * ROW, 65, 0.5))?,
+    ];
+    let start = [
+        pseudo_random(3 * ROW, 66, 2.0),
+        pseudo_random(3 * ROW, 67, 2.0),
+    ];
+    let mut states_ref = [stream.clone_htod(&start[0])?, stream.clone_htod(&start[1])?];
+    let mut states = [stream.clone_htod(&start[0])?, stream.clone_htod(&start[1])?];
+    let (mut scratch_ref, mut scratch) = (
+        AttentionScratch::new(stream)?,
+        AttentionScratch::new(stream)?,
+    );
+    let mut position_dev = stream.alloc_zeros::<u32>(1)?;
+    let zeros = |n: usize| -> anyhow::Result<CudaSlice<bf16>> { Ok(stream.alloc_zeros(n)?) };
+    let (mut k, mut v) = (zeros(ROW)?, zeros(ROW)?);
+    let (mut q, mut r) = (zeros(HEADS * HEAD_DIM)?, zeros(HEADS * REL_DIM)?);
+    let mut bias = zeros(HEADS * EXTENT)?;
+    let mut out = zeros(HEADS * HEAD_DIM)?;
+    let (mut gated_ref, mut gated) = (zeros(HEADS * HEAD_DIM)?, zeros(HEADS * HEAD_DIM)?);
+
+    let mut filled = 0;
+    for (index, &position) in checks.iter().enumerate() {
+        assert!(cache.holds(position));
+        for p in filled..position {
+            stream.memcpy_htod(&[u32::try_from(p)?], &mut position_dev)?;
+            let row = (p % FILL) * ROW..(p % FILL + 1) * ROW;
+            for c in [&mut cache_ref, &mut cache] {
+                attention.append(
+                    stream,
+                    c,
+                    &position_dev,
+                    &fill_k.slice(row.clone()),
+                    &fill_v.slice(row.clone()),
+                )?;
+            }
+        }
+        filled = position + 1;
+        stream.memcpy_htod(&[u32::try_from(position)?], &mut position_dev)?;
+        let dynamic = index % 2 == 1;
+        // Scales chosen so some heads exceed the clip thresholds and some do not.
+        let k_raw = stream.clone_htod(&rng.normals(ROW, 3.0))?;
+        let v_raw = stream.clone_htod(&rng.normals(ROW, 3.0))?;
+        let taps = [
+            stream.clone_htod(&rng.normals(KV_HEADS * 4, 0.3))?,
+            stream.clone_htod(&rng.normals(KV_HEADS * 4, 0.3))?,
+        ];
+        let q_raw = stream.clone_htod(&rng.normals(HEADS * HEAD_DIM, 2.0))?;
+        let r_raw = stream.clone_htod(&rng.normals(HEADS * REL_DIM, 2.0))?;
+        let gate = stream.clone_htod(&rng.normals(HEADS * HEAD_DIM, 2.0))?;
+        let sinks = stream.clone_htod(&rng.normals(HEADS, 2.0))?;
+
+        let [k_state, v_state] = &mut states_ref;
+        norm.attention_post(
+            stream,
+            AttentionPost {
+                k_raw: &k_raw,
+                v_raw: &v_raw,
+                conv: conv_weights(dynamic, &weights, &taps, &statics),
+                k_state,
+                v_state,
+                q_raw: &q_raw,
+                q_scale: &q_scale,
+                r_raw: &r_raw,
+                r_scale: &r_scale,
+                k: &mut k,
+                v: &mut v,
+                q: &mut q,
+                r: &mut r,
+                log_scale: log_scale.then_some((&position_dev, LOG_SCALE.0, LOG_SCALE.1)),
+                qk_threshold: QK_THRESHOLD,
+                rel_threshold: REL_THRESHOLD,
+                eps: EPS,
+            },
+        )?;
+        attention.relative_bias(stream, &r, &table, &mut bias)?;
+        attention.append(stream, &mut cache_ref, &position_dev, &k, &v)?;
+        attention.decode_attention(
+            stream,
+            &q,
+            &cache_ref,
+            &position_dev,
+            &bias,
+            &sinks,
+            &mut scratch_ref,
+            &mut out,
+        )?;
+        elementwise.attention_gate(stream, &out, &gate, &mut gated_ref)?;
+
+        let [k_state, v_state] = &mut states;
+        attention.decode_step(
+            stream,
+            &mut cache,
+            &position_dev,
+            &mut scratch,
+            DecodeStep {
+                k_raw: &k_raw,
+                v_raw: &v_raw,
+                conv: conv_weights(dynamic, &weights, &taps, &statics),
+                k_state,
+                v_state,
+                q_raw: &q_raw,
+                q_scale: &q_scale,
+                r_raw: &r_raw,
+                r_scale: &r_scale,
+                table: &table,
+                sinks: &sinks,
+                gate: &gate,
+                log_scale: log_scale.then_some(LOG_SCALE),
+                qk_threshold: QK_THRESHOLD,
+                rel_threshold: REL_THRESHOLD,
+                eps: EPS,
+                out: &mut gated,
+            },
+        )?;
+
+        let label = format!("position {position}, dynamic {dynamic}");
+        let want = stream.clone_dtoh(&gated_ref)?;
+        assert!(
+            want.iter().any(|x| x.to_f32() != 0.0),
+            "{label}: output is all zero"
+        );
+        assert_bf16_close(&label, &stream.clone_dtoh(&gated)?, &want, 0);
+        for (i, name) in ["k state", "v state"].into_iter().enumerate() {
+            assert_f32_within_ulps(
+                &format!("{label}: {name}"),
+                &stream.clone_dtoh(&states[i])?,
+                &stream.clone_dtoh(&states_ref[i])?,
+                0,
+            );
+        }
+        let slot = position % slots;
+        assert!(
+            cache_row(stream, &cache, slot)? == cache_row(stream, &cache_ref, slot)?,
+            "{label}: appended row differs"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn sliding_decode_step_matches_separate_kernels() -> anyhow::Result<()> {
+    let checks = [
+        0, 1, 31, 32, 33, 63, 64, 65, 500, 1023, 1024, 1025, 1500, 2047, 2048, 3001,
+    ];
+    check_decode_step(|stream| KvCache::sliding(stream, WINDOW), &checks)
+}
+
+#[test]
+fn global_decode_step_matches_separate_kernels() -> anyhow::Result<()> {
+    let checks = [0, 1, 31, 32, 33, 1023, 1024, 1025, 2561, 8191, 8192, 20_000];
+    check_decode_step(|stream| KvCache::global(stream, 20_480), &checks)
+}
+
+#[test]
+fn fp8_global_decode_step_matches_separate_kernels() -> anyhow::Result<()> {
+    let checks = [
+        0, 1, 31, 32, 63, 64, 65, 1023, 1024, 1025, 2561, 8191, 8192, 20_000,
+    ];
+    check_decode_step(
+        |stream| KvCache::global_with_format(stream, 20_480, KvFormat::Fp8),
+        &checks,
+    )
+}
+
 /// One chunk of a prefill test: `rows` tokens, whether to also run decode attention on each
 /// row and compare, and the rows to check against the F64 reference (all when `None`).
 struct Chunk {
@@ -1271,6 +1532,174 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
                 100.0 * bytes / seconds / PEAK_BYTES,
             );
         }
+    }
+    Ok(())
+}
+
+/// Time per layer of the decode step between the projections and the output projection:
+/// the separate kernels and `Attention::decode_step`, each captured 20 times in a CUDA graph
+/// as the model replays them. Run with `--ignored --nocapture` on an idle GPU; each case
+/// reports the fastest of several graph launches.
+#[test]
+#[ignore = "timing, not a check"]
+#[expect(clippy::too_many_lines, reason = "one table of cases")]
+fn decode_step_timing() -> anyhow::Result<()> {
+    use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};
+
+    const CALLS: usize = 20;
+    const LAUNCHES: usize = 20;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let norm = Norm::load(gpu.context())?;
+    let elementwise = Elementwise::load(gpu.context())?;
+    let mut rng = Rng(5);
+    let mut upload = |len: usize, scale: f32| stream.clone_htod(&rng.normals(len, scale));
+    let table = upload(REL_DIM * EXTENT, 0.4)?;
+    let q_scale = upload(HEADS * HEAD_DIM, 0.5)?;
+    let r_scale = upload(HEADS * REL_DIM, 0.5)?;
+    let weights = [upload(ROW * 4, 0.5)?, upload(ROW * 4, 0.5)?];
+    let taps = [upload(KV_HEADS * 4, 0.3)?, upload(KV_HEADS * 4, 0.3)?];
+    let k_raw = upload(ROW, 3.0)?;
+    let v_raw = upload(ROW, 3.0)?;
+    let q_raw = upload(HEADS * HEAD_DIM, 2.0)?;
+    let r_raw = upload(HEADS * REL_DIM, 2.0)?;
+    let gate = upload(HEADS * HEAD_DIM, 2.0)?;
+    let sinks = upload(HEADS, 2.0)?;
+    let statics = [
+        stream.clone_htod(&pseudo_random(4 * ROW, 64, 0.5))?,
+        stream.clone_htod(&pseudo_random(4 * ROW, 65, 0.5))?,
+    ];
+    let mut states = [
+        stream.alloc_zeros::<f32>(3 * ROW)?,
+        stream.alloc_zeros::<f32>(3 * ROW)?,
+    ];
+    let mut scratch = AttentionScratch::new(stream)?;
+    let zeros = |n: usize| -> anyhow::Result<CudaSlice<bf16>> { Ok(stream.alloc_zeros(n)?) };
+    let (mut k, mut v) = (zeros(ROW)?, zeros(ROW)?);
+    let (mut q, mut r) = (zeros(HEADS * HEAD_DIM)?, zeros(HEADS * REL_DIM)?);
+    let mut bias = zeros(HEADS * EXTENT)?;
+    let mut out = zeros(HEADS * HEAD_DIM)?;
+    let mut gated = zeros(HEADS * HEAD_DIM)?;
+    let begin = gpu
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    let end = gpu
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+
+    eprintln!("| case | position | separate us | fused us |");
+    eprintln!("| --- | --- | --- | --- |");
+    let cases: &[(&str, Option<KvFormat>, usize)] = &[
+        ("sliding", None, 400),
+        ("sliding", None, 40_000),
+        ("global bf16", Some(KvFormat::Bf16), 400),
+        ("global bf16", Some(KvFormat::Bf16), 32_768),
+        ("global bf16", Some(KvFormat::Bf16), 131_072),
+        ("global fp8", Some(KvFormat::Fp8), 400),
+        ("global fp8", Some(KvFormat::Fp8), 32_768),
+        ("global fp8", Some(KvFormat::Fp8), 131_072),
+    ];
+    for &(name, format, position) in cases {
+        let mut cache = match format {
+            None => KvCache::sliding(stream, WINDOW)?,
+            Some(format) => KvCache::global_with_format(stream, position + 1, format)?,
+        };
+        let log_scale = format.is_some();
+        let position_dev = stream.clone_htod(&[u32::try_from(position)?])?;
+        let mut time = |fused: bool| -> anyhow::Result<f64> {
+            stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let mut enqueue = || -> anyhow::Result<()> {
+                for _ in 0..CALLS {
+                    let [k_state, v_state] = &mut states;
+                    if fused {
+                        attention.decode_step(
+                            stream,
+                            &mut cache,
+                            &position_dev,
+                            &mut scratch,
+                            DecodeStep {
+                                k_raw: &k_raw,
+                                v_raw: &v_raw,
+                                conv: conv_weights(log_scale, &weights, &taps, &statics),
+                                k_state,
+                                v_state,
+                                q_raw: &q_raw,
+                                q_scale: &q_scale,
+                                r_raw: &r_raw,
+                                r_scale: &r_scale,
+                                table: &table,
+                                sinks: &sinks,
+                                gate: &gate,
+                                log_scale: log_scale.then_some(LOG_SCALE),
+                                qk_threshold: QK_THRESHOLD,
+                                rel_threshold: REL_THRESHOLD,
+                                eps: EPS,
+                                out: &mut gated,
+                            },
+                        )?;
+                    } else {
+                        norm.attention_post(
+                            stream,
+                            AttentionPost {
+                                k_raw: &k_raw,
+                                v_raw: &v_raw,
+                                conv: conv_weights(log_scale, &weights, &taps, &statics),
+                                k_state,
+                                v_state,
+                                q_raw: &q_raw,
+                                q_scale: &q_scale,
+                                r_raw: &r_raw,
+                                r_scale: &r_scale,
+                                k: &mut k,
+                                v: &mut v,
+                                q: &mut q,
+                                r: &mut r,
+                                log_scale: log_scale.then_some((
+                                    &position_dev,
+                                    LOG_SCALE.0,
+                                    LOG_SCALE.1,
+                                )),
+                                qk_threshold: QK_THRESHOLD,
+                                rel_threshold: REL_THRESHOLD,
+                                eps: EPS,
+                            },
+                        )?;
+                        attention.relative_bias(stream, &r, &table, &mut bias)?;
+                        attention.append(stream, &mut cache, &position_dev, &k, &v)?;
+                        attention.decode_attention(
+                            stream,
+                            &q,
+                            &cache,
+                            &position_dev,
+                            &bias,
+                            &sinks,
+                            &mut scratch,
+                            &mut out,
+                        )?;
+                        elementwise.attention_gate(stream, &out, &gate, &mut gated)?;
+                    }
+                }
+                Ok(())
+            };
+            let enqueued = enqueue();
+            let graph = stream.end_capture(CUgraphInstantiate_flags(0));
+            enqueued?;
+            let graph = graph?.expect("the capture recorded work");
+            graph.upload()?;
+            graph.launch()?;
+            let mut best = f64::INFINITY;
+            for _ in 0..LAUNCHES {
+                begin.record(stream)?;
+                graph.launch()?;
+                end.record(stream)?;
+                best = best.min(f64::from(begin.elapsed_ms(&end)?) * 1e3 / CALLS as f64);
+            }
+            Ok(best)
+        };
+        let separate = time(false)?;
+        let fused = time(true)?;
+        eprintln!("| {name} | {position} | {separate:.2} | {fused:.2} |");
     }
     Ok(())
 }

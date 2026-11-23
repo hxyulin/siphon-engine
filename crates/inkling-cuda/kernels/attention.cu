@@ -30,6 +30,12 @@
 // Only the summation order differs from MLX's sdpa_vector; every sum is F32.
 // The FP8 variant runs the same arithmetic on the cache values decoded exactly
 // to F32, over tiles of 64 keys so that a tile holds the same 16 KiB.
+//
+// `decode_step_bf16` and `decode_step_fp8` run one layer's whole decode step
+// between its projections and its output projection in one launch, with the
+// results of the separate kernels: attention_post_bf16 (norm.cu),
+// relative_bias_bf16, kv_append_*, decode_attention_* and attention_gate_bf16
+// (elementwise.cu).
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -37,6 +43,9 @@
 #include <cfloat>
 #include <climits>
 #include <cstdint>
+
+#include "conv_step.cuh"
+#include "pdl.cuh"
 
 namespace {
 
@@ -155,6 +164,13 @@ struct Bf16Format {
     __device__ static void unpack4(const Elem* p, float (&v)[4]) {
         unpack_bf16x4(*reinterpret_cast<const uint2*>(p), v);
     }
+    // Stores 4 values that are already BF16 values.
+    __device__ static void store4(Elem* p, const float (&v)[4]) {
+        const __nv_bfloat162 lo = __floats2bfloat162_rn(v[0], v[1]);
+        const __nv_bfloat162 hi = __floats2bfloat162_rn(v[2], v[3]);
+        *reinterpret_cast<uint2*>(p) =
+            make_uint2(*reinterpret_cast<const uint32_t*>(&lo), *reinterpret_cast<const uint32_t*>(&hi));
+    }
 };
 
 struct Fp8Format {
@@ -165,7 +181,18 @@ struct Fp8Format {
     __device__ static void unpack4(const Elem* p, float (&v)[4]) {
         unpack_e4m3x4(*reinterpret_cast<const uint32_t*>(p), v);
     }
+    // Stores 4 BF16 values rounded to E4M3 as kv_append_fp8 does.
+    __device__ static void store4(Elem* p, const float (&v)[4]) {
+        *reinterpret_cast<uint32_t*>(p) = pack_e4m3x4(v[0], v[1], v[2], v[3]);
+    }
 };
+
+// atomicAdd with acquire and release semantics at GPU scope.
+__device__ __forceinline__ unsigned atomic_add_acq_rel(unsigned* p, unsigned v) {
+    unsigned old;
+    asm volatile("atom.add.acq_rel.gpu.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
+}
 
 // Copies 16 bytes from global to shared memory without blocking, or writes 16
 // zero bytes when `valid` is false.
@@ -201,6 +228,12 @@ struct alignas(16) DecodeShared {
     float factor[kGroup];
     // Combined softmax denominator of each head, in the combining block.
     float total[kGroup];
+    // Fused step only: the 3 scaled queries, the 3 relative states, and the
+    // new key and value of the block's KV head in the cache format.
+    float q[kGroup][kHeadDim];
+    float rel[kGroup][kRelDim];
+    alignas(16) typename F::Elem new_k[kHeadDim];
+    alignas(16) typename F::Elem new_v[kHeadDim];
     bool last;
 };
 
@@ -349,13 +382,190 @@ kv_append_fp8(const __nv_bfloat16* k, const __nv_bfloat16* v, uint8_t* k_cache, 
 
 namespace {
 
+// The helpers below repeat those of the same names in norm.cu and
+// elementwise.cu, so that the fused decode step rounds exactly as
+// attention_post_bf16 and attention_gate_bf16 do.
+
+// Metal's `simd_sum`: a butterfly over lane offsets 1, 2, 4, 8, 16.
+__device__ __forceinline__ float warp_sum_metal(float v) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+// `states * min(threshold / (norm + 1e-6), 1)` with MLX's F32 constants.
+__device__ __forceinline__ float l2_clip_factor(float sum_squares, float threshold) {
+    const float norm = __fsqrt_rn(sum_squares);
+    return fminf(__fdiv_rn(threshold, __fadd_rn(norm, 1e-6f)), 1.f);
+}
+
+// The L2 clip's sum for one 128-wide head: each lane adds its 4 rounded
+// squares, then a warp sum.
+__device__ __forceinline__ float l2_sum_128(const float (&v)[4]) {
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        acc = __fadd_rn(acc, __fmul_rn(v[i], v[i]));
+    }
+    return warp_sum_metal(acc);
+}
+
+__device__ __forceinline__ float fma_sum_squares(const float (&v)[4]) {
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        acc = fmaf(v[i], v[i], acc);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float inv_rms_f32(float sum_squares, int n, float eps) {
+    return 1.f / sqrtf(sum_squares / static_cast<float>(n) + eps);
+}
+
+// The `FullAttention` query scale at `position`.
+__device__ __forceinline__ float log_scale_tau(uint32_t position, float alpha, float n_floor) {
+    const float pos = float(position);
+    const float ratio = fmaxf(__fdiv_rn(__fadd_rn(pos, 1.f), n_floor), 1.f);
+    return __fadd_rn(1.f, __fmul_rn(alpha, __logf(ratio)));
+}
+
+__device__ __forceinline__ float fsub(float a, float b) {
+    float r;
+    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__ float fdiv(float a, float b) {
+    float r;
+    asm("div.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+// MLX's Metal sigmoid: y = 1 / (1 + exp(|x|)), and 1 - y for positive x.
+__device__ __forceinline__ float mlx_sigmoid(float x) {
+    const float y = fdiv(1.f, fadd(1.f, expf(fabsf(x))));
+    return x < 0.f ? y : fsub(1.f, y);
+}
+
+// Round to nearest even, flushing subnormal inputs as MLX's cast does.
+__device__ __forceinline__ __nv_bfloat16 to_bf16_ftz(float x) {
+    return __float2bfloat16(fabsf(x) < FLT_MIN ? copysignf(0.f, x) : x);
+}
+
+// conv_step::short_conv_window with the channel's 4 taps in registers: the
+// BF16 output as F32.
+__device__ __forceinline__ float short_conv_taps(const float (&win)[conv_step::kKernel],
+                                                 const float (&taps)[conv_step::kKernel]) {
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < conv_step::kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(conv_step::round_bf16(win[k]), taps[k]));
+    }
+    const float conv = conv_step::round_bf16(acc);
+    return conv_step::round_bf16(
+        __fdiv_rn(__fadd_rn(conv, win[conv_step::kKernel - 1]), conv_step::kShortDivisor));
+}
+
+// conv_step::dynamic_conv_window with the channel's F32 static weights and the
+// row's BF16 dynamic taps, per lag, in registers: the BF16 output as F32.
+__device__ __forceinline__ float dynamic_conv_taps(const float (&win)[conv_step::kKernel],
+                                                   const float (&statics)[conv_step::kKernel],
+                                                   const float (&dynamic)[conv_step::kKernel]) {
+    float acc = 0.f;
+#pragma unroll
+    for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+        const float w = __fadd_rn(statics[lag], dynamic[lag]);
+        acc = __fadd_rn(acc, __fmul_rn(win[conv_step::kKernel - 1 - lag], w));
+    }
+    return conv_step::round_bf16(
+        __fdiv_rn(__fadd_rn(acc, win[conv_step::kKernel - 1]), conv_step::kDynamicDivisor));
+}
+
+// Inputs of the fused decode step (`decode_step_bf16`) beyond those of decode
+// attention: those of attention_post_bf16, the bias table, the gate and the
+// caches to append to.
+template <class F>
+struct StepInputs {
+    const __nv_bfloat16* k_raw;
+    const __nv_bfloat16* v_raw;
+    const __nv_bfloat16* k_weight;
+    const __nv_bfloat16* v_weight;
+    const __nv_bfloat16* k_dynamic;
+    const __nv_bfloat16* v_dynamic;
+    const float* k_static;
+    const float* v_static;
+    float* k_state;
+    float* v_state;
+    const __nv_bfloat16* q_raw;
+    const __nv_bfloat16* q_scale;
+    const __nv_bfloat16* r_raw;
+    const __nv_bfloat16* r_scale;
+    const __nv_bfloat16* table;
+    const __nv_bfloat16* gate;
+    typename F::Elem* k_cache;
+    typename F::Elem* v_cache;
+    int log_scale;
+    float alpha;
+    float n_floor;
+    float qk_threshold;
+    float rel_threshold;
+    float eps;
+};
+
+// Table columns [16] of this lane's keys in the tile that starts at slot
+// `first`, as BF16 bits: key lane + 32 j at distance d < extent gets
+// table[:, d]. Other entries are left alone; the score phase skips their
+// bias. The bits stay unconverted so that nothing waits for the loads until
+// the score phase.
+template <int kLaneKeys>
+__device__ __forceinline__ void load_columns(unsigned short (&columns)[kLaneKeys][kRelDim], const __nv_bfloat16* table,
+                                             unsigned extent, unsigned first, unsigned end, unsigned newest,
+                                             unsigned slots, int lane) {
+#pragma unroll
+    for (int j = 0; j < kLaneKeys; ++j) {
+        const unsigned slot = first + lane + 32 * j;
+        const unsigned distance = (newest + slots - slot) % slots;
+        if (slot < end && distance < extent) {
+#pragma unroll
+            for (int k = 0; k < kRelDim; ++k) {
+                columns[j][k] = __bfloat16_as_ushort(table[size_t(k) * extent + distance]);
+            }
+        }
+    }
+}
+
+// Writes the step's new key and value row of this block's KV head over row
+// `row` of the tile in `stage`. Each thread rewrites the chunks it copied in
+// load_tile, after its own copies have landed, so the barrier that follows
+// publishes them with the rest of the tile.
+template <class F>
+__device__ __forceinline__ void patch_tile(DecodeShared<F>& sm, int stage, int row) {
+    constexpr int kChunks = DecodeShared<F>::kChunks;
+    constexpr int kElems = F::kChunkElems;
+#pragma unroll
+    for (int k = 0; k < F::kTile * kChunks / kThreads; ++k) {
+        const int i = threadIdx.x + k * kThreads;
+        if (i / kChunks == row) {
+            const int chunk = i % kChunks;
+            *reinterpret_cast<uint4*>(&sm.k[stage][row * kHeadDim + (chunk ^ (row % kChunks)) * kElems]) =
+                *reinterpret_cast<const uint4*>(&sm.new_k[chunk * kElems]);
+            *reinterpret_cast<uint4*>(&sm.v[stage][row * kHeadDim + chunk * kElems]) =
+                *reinterpret_cast<const uint4*>(&sm.new_v[chunk * kElems]);
+        }
+    }
+}
+
 // Decode attention of one token over a KV cache, for all 24 query heads.
 //
 // Block (g, j) handles KV head g = blockIdx.x and its query heads 3g..3g+2
 // over split j = blockIdx.y of the cache slots. The n = min(p + 1, slots) live
 // slots are cut into gridDim.y contiguous splits of whole tiles; splits past
-// the last live slot hold no keys. The launch therefore stays the same at every
-// position p = *position_ptr, and a captured graph serves them all.
+// the last live slot hold no keys, and their blocks exit at once. The launch
+// therefore stays the same at every position p = *position_ptr, and a captured
+// graph serves them all.
 //
 // Within a block, for each tile of T = 32 (BF16) or 64 (E4M3) keys:
 // 1. Warp w multiplies dims 32w..32w+31 of the 3 queries with the T keys,
@@ -377,13 +587,16 @@ namespace {
 //
 // `slots` is the cache size, `window` the sliding window (0 for none) and
 // `extent` the bias table width.
-template <class F>
+//
+// With kStep, the block also does the work of the kernels around attention in
+// a decode step (see decode_step_bf16), from `step`: q and bias are unused.
+template <class F, bool kStep>
 __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const typename F::Elem* k_cache,
                                                  const typename F::Elem* v_cache, const __nv_bfloat16* bias,
                                                  const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
                                                  float* partial_sum, unsigned* counters, __nv_bfloat16* out,
                                                  const unsigned* position_ptr, unsigned slots, unsigned window,
-                                                 unsigned extent, float scale) {
+                                                 unsigned extent, float scale, const StepInputs<F>& step) {
     constexpr int kTile = F::kTile;
     // Keys of a tile each lane scores, and each warp accumulates in the value
     // phase.
@@ -392,31 +605,265 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
     constexpr int kElems = F::kChunkElems;
     constexpr int kChunks = DecodeShared<F>::kChunks;
     __shared__ DecodeShared<F> sm;
-    const unsigned position = *position_ptr;
     const int kv_head = blockIdx.x;
     const int split = blockIdx.y;
     const int splits = gridDim.y;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
+    // The 3 query heads of this block are rows head0..head0+2.
+    const int head0 = kv_head * kGroup;
+    // Score and softmax state of head h = warp, for warps 0..2.
+    const int head = head0 + min(warp, kGroup - 1);
+    // With kStep: the relative head of lane l < 3 of warp 2, and the key and
+    // value channels c0..c0+3 that each lane of warp 3 computes in the
+    // appending block. Index kv is 0 for the key, 1 for the value.
+    const int rel_head = head0 + min(lane, kGroup - 1);
+    const int c0 = kv_head * kHeadDim + lane * 4;
+    const bool is_kv_warp = warp == kWarps - 1;
+    const bool is_rel_warp = warp == kGroup - 1;
+
+    // With kStep, the weights load first, since they do not depend on the
+    // position. Warp 3 loads the conv weights in case this block appends: 16
+    // BF16 taps [channel, tap] for a static conv, the F32 static weights
+    // [lag, channel] for a dynamic one.
+    const bool dynamic = step.k_dynamic != nullptr;
+    uint2 q_scale_raw;
+    uint2 r_scale_raw[kRelDim / 4];
+    uint4 taps_raw[2][2];
+    float4 statics[2][conv_step::kKernel];
+    if constexpr (kStep) {
+        q_scale_raw = *reinterpret_cast<const uint2*>(step.q_scale + head * kHeadDim + lane * 4);
+#pragma unroll
+        for (int i = 0; i < kRelDim / 4; ++i) {
+            r_scale_raw[i] = *reinterpret_cast<const uint2*>(step.r_scale + rel_head * kRelDim + 4 * i);
+        }
+        if (is_kv_warp) {
+#pragma unroll
+            for (int kv = 0; kv < 2; ++kv) {
+                if (dynamic) {
+                    const float* weights = kv == 0 ? step.k_static : step.v_static;
+#pragma unroll
+                    for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+                        statics[kv][lag] = *reinterpret_cast<const float4*>(weights + lag * kKvRow + c0);
+                    }
+                } else {
+                    const __nv_bfloat16* weights = kv == 0 ? step.k_weight : step.v_weight;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        taps_raw[kv][i] = *reinterpret_cast<const uint4*>(weights + c0 * conv_step::kKernel + 8 * i);
+                    }
+                }
+            }
+        }
+    }
+
+    const unsigned position = *position_ptr;
+
+    // With kStep, the loads from the projections issue before the position
+    // arrives, so that the two latencies overlap. Warp 3 loads the raw
+    // inputs, conv states [3 rows] and dynamic taps of its key (index 0) and
+    // value (1) channels in every block; only the appending block uses them.
+    uint16_t gate_raw[kGroup];
+    uint2 q_raw;
+    uint2 r_raw[kRelDim / 4];
+    uint2 x_raw[2];
+    float4 state[2][conv_step::kKernel - 1];
+    uint2 dynamic_raw[2];
+    if constexpr (kStep) {
+        pdl_wait();
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+            gate_raw[h] = __bfloat16_as_ushort(step.gate[(head0 + h) * kHeadDim + threadIdx.x]);
+        }
+        q_raw = *reinterpret_cast<const uint2*>(step.q_raw + head * kHeadDim + lane * 4);
+        if (is_rel_warp) {
+#pragma unroll
+            for (int i = 0; i < kRelDim / 4; ++i) {
+                r_raw[i] = *reinterpret_cast<const uint2*>(step.r_raw + rel_head * kRelDim + 4 * i);
+            }
+        }
+        if (is_kv_warp) {
+#pragma unroll
+            for (int kv = 0; kv < 2; ++kv) {
+                x_raw[kv] = *reinterpret_cast<const uint2*>((kv == 0 ? step.k_raw : step.v_raw) + c0);
+#pragma unroll
+                for (int k = 0; k < conv_step::kKernel - 1; ++k) {
+                    state[kv][k] =
+                        *reinterpret_cast<const float4*>((kv == 0 ? step.k_state : step.v_state) + k * kKvRow + c0);
+                }
+                if (dynamic) {
+                    dynamic_raw[kv] = *reinterpret_cast<const uint2*>((kv == 0 ? step.k_dynamic : step.v_dynamic) +
+                                                                      kv_head * conv_step::kKernel);
+                }
+            }
+        }
+    }
+
     const unsigned n = min(position + 1, slots);
     const unsigned newest = position % slots;
     // Slots per split: an even share of n, rounded up to whole tiles.
     const unsigned share = (n + splits - 1) / splits;
     const unsigned chunk = (share + kTile - 1) / kTile * kTile;
     const int used = (n + chunk - 1) / chunk;
-    // The 3 query heads of this block are rows head0..head0+2.
-    const int head0 = kv_head * kGroup;
-    // Score and softmax state of head h = warp, for warps 0..2.
-    const int head = head0 + min(warp, kGroup - 1);
+    if (split >= used) {
+        return;
+    }
+    const unsigned begin = split * chunk;
+    const unsigned end = min(begin + chunk, n);
+    const int tiles = (end - begin + kTile - 1) / kTile;
+    // With kStep, the block whose split holds the newest slot appends.
+    const bool appends = kStep && newest - begin < end - begin;
+    load_tile(sm, 0, k_cache, v_cache, kv_head, begin, end);
 
-    if (split < used) {
-        const unsigned begin = split * chunk;
-        const unsigned end = min(begin + chunk, n);
-        const int tiles = (end - begin + kTile - 1) / kTile;
-        load_tile(sm, 0, k_cache, v_cache, kv_head, begin, end);
-
-        // This warp's quarter of the 3 scaled queries.
-        float qs[kGroup][kWarpDims];
+    // This warp's quarter of the 3 scaled queries.
+    float qs[kGroup][kWarpDims];
+    // With kStep: head `head`'s relative state, the table columns of this
+    // lane's keys in the current tile, and the output gates (the sigmoids)
+    // of this thread's dims.
+    float rel[kRelDim];
+    unsigned short columns[kLaneKeys][kRelDim];
+    float gate[kGroup];
+    if constexpr (kStep) {
+        if (warp < kGroup) {
+            load_columns(columns, step.table, extent, begin, end, newest, slots, lane);
+        }
+        const float tau = step.log_scale ? log_scale_tau(position, step.alpha, step.n_floor) : 1.f;
+        // bf16(x * tau) as log_scale_bf16 does it, or x unchanged.
+        const auto scaled = [&](float x) {
+            return step.log_scale ? conv_step::round_bf16(__fmul_rn(x, tau)) : x;
+        };
+        if (warp < kGroup) {
+            // The query of head `head`: scaled L2 clip and log scale.
+            float s[4];
+            float sc[4];
+            unpack_bf16x4(q_raw, s);
+            unpack_bf16x4(q_scale_raw, sc);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[i] = __fmul_rn(s[i], sc[i]);
+            }
+            const float factor = l2_clip_factor(l2_sum_128(s), step.qk_threshold);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sm.q[warp][lane * 4 + i] = scale * scaled(conv_step::round_bf16(__fmul_rn(s[i], factor)));
+            }
+        }
+        if (is_rel_warp && lane < kGroup) {
+            // The relative state of head head0 + lane, summed in order as
+            // l2_clip_bf16_16 does.
+            float s[kRelDim];
+#pragma unroll
+            for (int i = 0; i < kRelDim / 4; ++i) {
+                float part[4];
+                float sc[4];
+                unpack_bf16x4(r_raw[i], part);
+                unpack_bf16x4(r_scale_raw[i], sc);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    s[4 * i + j] = __fmul_rn(part[j], sc[j]);
+                }
+            }
+            float acc = 0.f;
+#pragma unroll
+            for (int i = 0; i < kRelDim; ++i) {
+                acc = __fadd_rn(acc, __fmul_rn(s[i], s[i]));
+            }
+            const float factor = l2_clip_factor(acc, step.rel_threshold);
+#pragma unroll
+            for (int i = 0; i < kRelDim; ++i) {
+                sm.rel[lane][i] = scaled(conv_step::round_bf16(__fmul_rn(s[i], factor)));
+            }
+        }
+        if (appends && is_kv_warp) {
+            // The convs, then the L2 clip of the key and the RMS norm of the
+            // value, rounded to BF16, then stored in the cache format.
+            // win[kv][i]: channel c0 + i's window, oldest row first.
+            float win[2][4][conv_step::kKernel];
+            float y[2][4];
+#pragma unroll
+            for (int kv = 0; kv < 2; ++kv) {
+                float x[4];
+                unpack_bf16x4(x_raw[kv], x);
+                float taps[16];
+                float lag_taps[conv_step::kKernel];
+                if (dynamic) {
+                    unpack_bf16x4(dynamic_raw[kv], lag_taps);
+                } else {
+                    float half[8];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        unpack_bf16x8(taps_raw[kv][i], half);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            taps[8 * i + j] = half[j];
+                        }
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const auto element = [i](float4 v) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; };
+#pragma unroll
+                    for (int k = 0; k < conv_step::kKernel - 1; ++k) {
+                        win[kv][i][k] = element(state[kv][k]);
+                    }
+                    win[kv][i][conv_step::kKernel - 1] = x[i];
+                    if (dynamic) {
+                        float lag_statics[conv_step::kKernel];
+#pragma unroll
+                        for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+                            lag_statics[lag] = element(statics[kv][lag]);
+                        }
+                        y[kv][i] = dynamic_conv_taps(win[kv][i], lag_statics, lag_taps);
+                    } else {
+                        const float channel_taps[conv_step::kKernel] = {taps[4 * i], taps[4 * i + 1],
+                                                                        taps[4 * i + 2], taps[4 * i + 3]};
+                        y[kv][i] = short_conv_taps(win[kv][i], channel_taps);
+                    }
+                }
+            }
+            const float factor = l2_clip_factor(l2_sum_128(y[0]), step.qk_threshold);
+            const float norm = inv_rms_f32(warp_sum_metal(fma_sum_squares(y[1])), kHeadDim, step.eps);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                y[0][i] = conv_step::round_bf16(__fmul_rn(y[0][i], factor));
+                y[1][i] = conv_step::round_bf16(y[1][i] * norm);
+            }
+            const size_t row = size_t(newest) * kKvRow + c0;
+            F::store4(step.k_cache + row, y[0]);
+            F::store4(step.v_cache + row, y[1]);
+            F::store4(sm.new_k + lane * 4, y[0]);
+            F::store4(sm.new_v + lane * 4, y[1]);
+            // Shift the raw inputs into the conv states.
+#pragma unroll
+            for (int kv = 0; kv < 2; ++kv) {
+#pragma unroll
+                for (int k = 0; k < conv_step::kKernel - 1; ++k) {
+                    *reinterpret_cast<float4*>((kv == 0 ? step.k_state : step.v_state) + k * kKvRow + c0) =
+                        make_float4(win[kv][0][k + 1], win[kv][1][k + 1], win[kv][2][k + 1], win[kv][3][k + 1]);
+                }
+            }
+        }
+        // Warp 3 takes its gates in the softmax phase of the first tile, where
+        // it waits anyway.
+        if (!is_kv_warp) {
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                gate[h] = mlx_sigmoid(__uint_as_float(unsigned(gate_raw[h]) << 16));
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+#pragma unroll
+            for (int c = 0; c < kWarpDims; ++c) {
+                qs[h][c] = sm.q[h][warp * kWarpDims + c];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < kRelDim; ++k) {
+            rel[k] = sm.rel[min(warp, kGroup - 1)][k];
+        }
+    } else {
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) {
 #pragma unroll
@@ -431,149 +878,191 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                 }
             }
         }
+    }
 
-        float m = -FLT_MAX;
-        float sum = 0.f;
-        if (split == 0) {
-            m = __bfloat162float(sinks[head]);
-            sum = lane == 0 ? 1.f : 0.f;
+    float m = -FLT_MAX;
+    float sum = 0.f;
+    if (split == 0) {
+        m = __bfloat162float(sinks[head]);
+        sum = lane == 0 ? 1.f : 0.f;
+    }
+    float o[kGroup][4] = {};
+
+    for (int t = 0; t < tiles; ++t) {
+        const int stage = t % 2;
+        const unsigned first = begin + t * kTile;
+        copy_async_wait_all();
+        if (appends && newest - first < unsigned(kTile)) {
+            patch_tile(sm, stage, int(newest - first));
         }
-        float o[kGroup][4] = {};
+        __syncthreads();
+        if (t + 1 < tiles) {
+            load_tile(sm, 1 - stage, k_cache, v_cache, kv_head, first + kTile, end);
+        }
 
-        for (int t = 0; t < tiles; ++t) {
-            const int stage = t % 2;
-            copy_async_wait_all();
-            __syncthreads();
-            if (t + 1 < tiles) {
-                load_tile(sm, 1 - stage, k_cache, v_cache, kv_head, begin + (t + 1) * kTile, end);
+        // 1. Partial scores of keys `lane + 32 j` over this warp's dims.
+#pragma unroll
+        for (int j = 0; j < kLaneKeys; ++j) {
+            const int row = lane + 32 * j;
+            const typename F::Elem* keys = sm.k[stage] + row * kHeadDim;
+            float acc[kGroup] = {};
+#pragma unroll
+            for (int c = 0; c < kWarpDims / kElems; ++c) {
+                const int chunk_index = warp * (kWarpDims / kElems) + c;
+                const uint4 raw = *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (row % kChunks)) * kElems);
+                float kv[kElems];
+                F::unpack_chunk(raw, kv);
+#pragma unroll
+                for (int i = 0; i < kElems; ++i) {
+#pragma unroll
+                    for (int h = 0; h < kGroup; ++h) {
+                        acc[h] = fmaf(qs[h][c * kElems + i], kv[i], acc[h]);
+                    }
+                }
             }
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                sm.scores[warp][h][row] = acc[h];
+            }
+        }
+        __syncthreads();
 
-            // 1. Partial scores of keys `lane + 32 j` over this warp's dims.
+        // 2. Softmax weights of head `warp`.
+        if (warp < kGroup) {
+            float score[kLaneKeys];
 #pragma unroll
             for (int j = 0; j < kLaneKeys; ++j) {
                 const int row = lane + 32 * j;
-                const typename F::Elem* keys = sm.k[stage] + row * kHeadDim;
-                float acc[kGroup] = {};
+                const unsigned slot = first + row;
+                const unsigned distance = (newest + slots - slot) % slots;
+                score[j] = -INFINITY;
+                if (slot < end && (window == 0 || distance < window)) {
+                    score[j] = (sm.scores[0][warp][row] + sm.scores[1][warp][row]) +
+                               (sm.scores[2][warp][row] + sm.scores[3][warp][row]);
+                    if (distance < extent) {
+                        if constexpr (kStep) {
+                            float column[kRelDim];
 #pragma unroll
-                for (int c = 0; c < kWarpDims / kElems; ++c) {
-                    const int chunk_index = warp * (kWarpDims / kElems) + c;
-                    const uint4 raw = *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (row % kChunks)) * kElems);
-                    float kv[kElems];
-                    F::unpack_chunk(raw, kv);
-#pragma unroll
-                    for (int i = 0; i < kElems; ++i) {
-#pragma unroll
-                        for (int h = 0; h < kGroup; ++h) {
-                            acc[h] = fmaf(qs[h][c * kElems + i], kv[i], acc[h]);
-                        }
-                    }
-                }
-#pragma unroll
-                for (int h = 0; h < kGroup; ++h) {
-                    sm.scores[warp][h][row] = acc[h];
-                }
-            }
-            __syncthreads();
-
-            // 2. Softmax weights of head `warp`.
-            if (warp < kGroup) {
-                float score[kLaneKeys];
-#pragma unroll
-                for (int j = 0; j < kLaneKeys; ++j) {
-                    const int row = lane + 32 * j;
-                    const unsigned slot = begin + t * kTile + row;
-                    const unsigned distance = (newest + slots - slot) % slots;
-                    score[j] = -INFINITY;
-                    if (slot < end && (window == 0 || distance < window)) {
-                        score[j] = (sm.scores[0][warp][row] + sm.scores[1][warp][row]) +
-                                   (sm.scores[2][warp][row] + sm.scores[3][warp][row]);
-                        if (distance < extent) {
+                            for (int k = 0; k < kRelDim; ++k) {
+                                column[k] = __uint_as_float(unsigned(columns[j][k]) << 16);
+                            }
+                            score[j] += conv_step::round_bf16(relative_bias_dot(rel, column));
+                        } else {
                             score[j] += __bfloat162float(bias[head * extent + distance]);
                         }
                     }
                 }
-                float tile_max = score[0];
-#pragma unroll
-                for (int j = 1; j < kLaneKeys; ++j) {
-                    tile_max = fmaxf(tile_max, score[j]);
-                }
-                const float new_m = fmaxf(m, warp_max(tile_max));
-                const float factor = fast_exp(m - new_m);
-#pragma unroll
-                for (int j = 0; j < kLaneKeys; ++j) {
-                    const float weight = fast_exp(score[j] - new_m);
-                    sum = j == 0 ? fmaf(sum, factor, weight) : sum + weight;
-                    reinterpret_cast<float*>(&sm.weights[lane + 32 * j])[warp] = weight;
-                }
-                m = new_m;
-                if (lane == 0) {
-                    sm.factor[warp] = factor;
+            }
+            if constexpr (kStep) {
+                if (t + 1 < tiles) {
+                    load_columns(columns, step.table, extent, first + kTile, end, newest, slots, lane);
                 }
             }
-            __syncthreads();
-
-            // 3. Weighted values of keys 8w..8w+7, dims 4l..4l+3.
+            float tile_max = score[0];
+#pragma unroll
+            for (int j = 1; j < kLaneKeys; ++j) {
+                tile_max = fmaxf(tile_max, score[j]);
+            }
+            const float new_m = fmaxf(m, warp_max(tile_max));
+            const float factor = fast_exp(m - new_m);
+#pragma unroll
+            for (int j = 0; j < kLaneKeys; ++j) {
+                const float weight = fast_exp(score[j] - new_m);
+                sum = j == 0 ? fmaf(sum, factor, weight) : sum + weight;
+                reinterpret_cast<float*>(&sm.weights[lane + 32 * j])[warp] = weight;
+            }
+            m = new_m;
+            if (lane == 0) {
+                sm.factor[warp] = factor;
+            }
+        } else if (kStep && t == 0) {
 #pragma unroll
             for (int h = 0; h < kGroup; ++h) {
-                const float factor = sm.factor[h];
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    o[h][i] *= factor;
-                }
-            }
-            const typename F::Elem* values = sm.v[stage];
-#pragma unroll
-            for (int r = warp * kWarpKeys; r < (warp + 1) * kWarpKeys; ++r) {
-                float v[4];
-                F::unpack4(values + r * kHeadDim + lane * 4, v);
-                const float4 w = sm.weights[r];
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    o[0][i] = fmaf(w.x, v[i], o[0][i]);
-                    o[1][i] = fmaf(w.y, v[i], o[1][i]);
-                    o[2][i] = fmaf(w.z, v[i], o[2][i]);
-                }
+                gate[h] = mlx_sigmoid(__uint_as_float(unsigned(gate_raw[h]) << 16));
             }
         }
-
-        // Sum the 4 warps' accumulators and write this split's partials.
         __syncthreads();
-        static_assert(sizeof(sm.k[0]) >= kWarps * kGroup * kHeadDim * sizeof(float));
-        auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
+
+        // 3. Weighted values of keys 8w..8w+7, dims 4l..4l+3.
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) {
+            const float factor = sm.factor[h];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                reduce[warp][h][lane * 4 + i] = o[h][i];
+                o[h][i] *= factor;
             }
         }
-        __syncthreads();
+        const typename F::Elem* values = sm.v[stage];
 #pragma unroll
-        for (int h = 0; h < kGroup; ++h) {
-            const float* r = &reduce[0][h][threadIdx.x];
-            const float value = (r[0] + r[kGroup * kHeadDim]) + (r[2 * kGroup * kHeadDim] + r[3 * kGroup * kHeadDim]);
-            partial_out[(size_t(head0 + h) * kMaxSplits + split) * kHeadDim + threadIdx.x] = value;
-        }
-        if (warp < kGroup) {
-            sum = warp_sum(sum);
-            if (lane == 0) {
-                partial_max[head * kMaxSplits + split] = m;
-                partial_sum[head * kMaxSplits + split] = sum;
+        for (int r = warp * kWarpKeys; r < (warp + 1) * kWarpKeys; ++r) {
+            float v[4];
+            F::unpack4(values + r * kHeadDim + lane * 4, v);
+            const float4 w = sm.weights[r];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                o[0][i] = fmaf(w.x, v[i], o[0][i]);
+                o[1][i] = fmaf(w.y, v[i], o[1][i]);
+                o[2][i] = fmaf(w.z, v[i], o[2][i]);
             }
         }
     }
 
-    // Count finished blocks; the last one of this KV head combines.
-    __threadfence();
+    // Sum the 4 warps' accumulators and write this split's partials.
+    __syncthreads();
+    static_assert(sizeof(sm.k[0]) >= kWarps * kGroup * kHeadDim * sizeof(float));
+    auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
+#pragma unroll
+    for (int h = 0; h < kGroup; ++h) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            reduce[warp][h][lane * 4 + i] = o[h][i];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < kGroup; ++h) {
+        const float* r = &reduce[0][h][threadIdx.x];
+        const float value = (r[0] + r[kGroup * kHeadDim]) + (r[2 * kGroup * kHeadDim] + r[3 * kGroup * kHeadDim]);
+        partial_out[(size_t(head0 + h) * kMaxSplits + split) * kHeadDim + threadIdx.x] = value;
+    }
+    if (warp < kGroup) {
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            partial_max[head * kMaxSplits + split] = m;
+            partial_sum[head * kMaxSplits + split] = sum;
+        }
+    }
+
+    // Count finished blocks; the last one of this KV head combines. The
+    // barrier orders the block's partial stores before thread 0's release,
+    // and its acquire before the other threads' loads after the second
+    // barrier.
     __syncthreads();
     if (threadIdx.x == 0) {
-        sm.last = atomicAdd(&counters[kv_head], 1u) == unsigned(splits - 1);
+        sm.last = atomic_add_acq_rel(&counters[kv_head], 1u) == unsigned(used - 1);
     }
     __syncthreads();
     if (!sm.last) {
         return;
     }
-    __threadfence();
+
+    // Up to kFastSplits splits, the partial outputs load together with the
+    // maxes and sums: warp w takes splits w, w + 4, ... for dims 4l..4l+3.
+    constexpr int kFastSplits = 16;
+    float4 parts[kFastSplits / kWarps][kGroup];
+    if (used <= kFastSplits) {
+#pragma unroll
+        for (int i = 0; i < kFastSplits / kWarps; ++i) {
+            const int j = warp + kWarps * i;
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                parts[i][h] = j < used ? __ldcg(reinterpret_cast<const float4*>(
+                                             partial_out + (size_t(head0 + h) * kMaxSplits + j) * kHeadDim) +
+                                         lane)
+                                       : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        }
+    }
 
     // Rescale factors of the used splits, per head, and the combined sums.
     auto* factors = reinterpret_cast<float(*)[kMaxSplits]>(sm.v[0]);
@@ -602,26 +1091,40 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
     __syncthreads();
 
     // Warp w sums splits w, w + 4, ... for dims 4l..4l+3 of each head.
-    float o[kGroup][4] = {};
-    for (int j = warp; j < used; j += kWarps) {
+    float c[kGroup][4] = {};
+    const auto accumulate = [&](int h, int j, float4 p) {
+        const float factor = factors[h][j];
+        c[h][0] = fmaf(factor, p.x, c[h][0]);
+        c[h][1] = fmaf(factor, p.y, c[h][1]);
+        c[h][2] = fmaf(factor, p.z, c[h][2]);
+        c[h][3] = fmaf(factor, p.w, c[h][3]);
+    };
+    if (used <= kFastSplits) {
 #pragma unroll
-        for (int h = 0; h < kGroup; ++h) {
-            const float4 p =
-                __ldcg(reinterpret_cast<const float4*>(partial_out + (size_t(head0 + h) * kMaxSplits + j) * kHeadDim) +
-                       lane);
-            const float factor = factors[h][j];
-            o[h][0] = fmaf(factor, p.x, o[h][0]);
-            o[h][1] = fmaf(factor, p.y, o[h][1]);
-            o[h][2] = fmaf(factor, p.z, o[h][2]);
-            o[h][3] = fmaf(factor, p.w, o[h][3]);
+        for (int i = 0; i < kFastSplits / kWarps; ++i) {
+            const int j = warp + kWarps * i;
+            if (j < used) {
+#pragma unroll
+                for (int h = 0; h < kGroup; ++h) {
+                    accumulate(h, j, parts[i][h]);
+                }
+            }
+        }
+    } else {
+        for (int j = warp; j < used; j += kWarps) {
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                accumulate(h, j, __ldcg(reinterpret_cast<const float4*>(
+                                            partial_out + (size_t(head0 + h) * kMaxSplits + j) * kHeadDim) +
+                                        lane));
+            }
         }
     }
-    auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
 #pragma unroll
     for (int h = 0; h < kGroup; ++h) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            reduce[warp][h][lane * 4 + i] = o[h][i];
+            reduce[warp][h][lane * 4 + i] = c[h][i];
         }
     }
     __syncthreads();
@@ -630,11 +1133,36 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
         const float* r = &reduce[0][h][threadIdx.x];
         const float value = (r[0] + r[kGroup * kHeadDim]) + (r[2 * kGroup * kHeadDim] + r[3 * kGroup * kHeadDim]);
         const float total = sm.total[h];
-        out[(head0 + h) * kHeadDim + threadIdx.x] = __float2bfloat16(total == 0.f ? value : value / total);
+        const __nv_bfloat16 attn = __float2bfloat16(total == 0.f ? value : value / total);
+        if constexpr (kStep) {
+            // attention_gate_bf16.
+            out[(head0 + h) * kHeadDim + threadIdx.x] = to_bf16_ftz(fmul(__bfloat162float(attn), gate[h]));
+        } else {
+            out[(head0 + h) * kHeadDim + threadIdx.x] = attn;
+        }
     }
     if (threadIdx.x == 0) {
         counters[kv_head] = 0;
     }
+}
+
+// The fused decode step of one layer; see decode_step_bf16.
+template <class F>
+__device__ __forceinline__ void decode_step(
+    const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __nv_bfloat16* k_weight,
+    const __nv_bfloat16* v_weight, const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
+    const float* k_static, const float* v_static, float* k_state, float* v_state, const __nv_bfloat16* q_raw,
+    const __nv_bfloat16* q_scale, const __nv_bfloat16* r_raw, const __nv_bfloat16* r_scale,
+    const __nv_bfloat16* table, const __nv_bfloat16* sinks, const __nv_bfloat16* gate, typename F::Elem* k_cache,
+    typename F::Elem* v_cache, float* partial_out, float* partial_max, float* partial_sum, unsigned* counters,
+    __nv_bfloat16* out, const unsigned* position, unsigned slots, unsigned window, unsigned extent, int log_scale,
+    float alpha, float n_floor, float qk_threshold, float rel_threshold, float eps, float scale) {
+    const StepInputs<F> step{k_raw,   v_raw,   k_weight, v_weight, k_dynamic, v_dynamic, k_static,
+                             v_static, k_state, v_state,  q_raw,    q_scale,   r_raw,     r_scale,
+                             table,   gate,    k_cache,  v_cache,  log_scale, alpha,     n_floor,
+                             qk_threshold, rel_threshold, eps};
+    decode_attention<F, true>(nullptr, k_cache, v_cache, nullptr, sinks, partial_out, partial_max, partial_sum,
+                              counters, out, position, slots, window, extent, scale, step);
 }
 
 }  // namespace
@@ -644,8 +1172,8 @@ decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, cons
                       const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
                       float* partial_sum, unsigned* counters, __nv_bfloat16* out, const unsigned* position_ptr,
                       unsigned slots, unsigned window, unsigned extent, float scale) {
-    decode_attention<Bf16Format>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, counters,
-                                 out, position_ptr, slots, window, extent, scale);
+    decode_attention<Bf16Format, false>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum,
+                                        counters, out, position_ptr, slots, window, extent, scale, {});
 }
 
 // `decode_attention_bf16` over E4M3 caches written by `kv_append_fp8`.
@@ -654,8 +1182,57 @@ decode_attention_fp8(const __nv_bfloat16* q, const uint8_t* k_cache, const uint8
                      const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
                      float* partial_sum, unsigned* counters, __nv_bfloat16* out, const unsigned* position_ptr,
                      unsigned slots, unsigned window, unsigned extent, float scale) {
-    decode_attention<Fp8Format>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, counters,
-                                out, position_ptr, slots, window, extent, scale);
+    decode_attention<Fp8Format, false>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum,
+                                       counters, out, position_ptr, slots, window, extent, scale, {});
+}
+
+// One layer's decode step from its projections to the input of the output
+// projection, in one launch: attention_post_bf16, relative_bias_bf16,
+// kv_append_bf16, decode_attention_bf16 and attention_gate_bf16 in sequence,
+// with the same results bit for bit.
+//
+// None of them needs a grid-wide barrier: each attention block recomputes the
+// post-processed query and relative state of its 3 heads (a few hundred
+// values), computes the bias of its keys from the table, and the block whose
+// split holds the newest slot computes KV head g's new key and value, updates
+// the conv states of their channels, writes them to the cache and patches its
+// shared copy of that tile. No other block reads the newest slot. The
+// combining block applies the gate.
+//
+// Launched with PDL after the projections. Before pdl_wait a block reads only
+// weights and the position, so the previous kernel must not write the
+// position.
+extern "C" __global__ void __launch_bounds__(kThreads)
+decode_step_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __nv_bfloat16* k_weight,
+                 const __nv_bfloat16* v_weight, const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
+                 const float* k_static, const float* v_static, float* k_state, float* v_state,
+                 const __nv_bfloat16* q_raw, const __nv_bfloat16* q_scale, const __nv_bfloat16* r_raw,
+                 const __nv_bfloat16* r_scale, const __nv_bfloat16* table, const __nv_bfloat16* sinks,
+                 const __nv_bfloat16* gate, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, float* partial_out,
+                 float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out,
+                 const unsigned* position, unsigned slots, unsigned window, unsigned extent, int log_scale,
+                 float alpha, float n_floor, float qk_threshold, float rel_threshold, float eps, float scale) {
+    decode_step<Bf16Format>(k_raw, v_raw, k_weight, v_weight, k_dynamic, v_dynamic, k_static, v_static, k_state,
+                            v_state, q_raw, q_scale, r_raw, r_scale, table, sinks, gate, k_cache, v_cache,
+                            partial_out, partial_max, partial_sum, counters, out, position, slots, window, extent,
+                            log_scale, alpha, n_floor, qk_threshold, rel_threshold, eps, scale);
+}
+
+// `decode_step_bf16` with an E4M3 cache, appending as `kv_append_fp8`.
+extern "C" __global__ void __launch_bounds__(kThreads)
+decode_step_fp8(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __nv_bfloat16* k_weight,
+                const __nv_bfloat16* v_weight, const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
+                const float* k_static, const float* v_static, float* k_state, float* v_state,
+                const __nv_bfloat16* q_raw, const __nv_bfloat16* q_scale, const __nv_bfloat16* r_raw,
+                const __nv_bfloat16* r_scale, const __nv_bfloat16* table, const __nv_bfloat16* sinks,
+                const __nv_bfloat16* gate, uint8_t* k_cache, uint8_t* v_cache, float* partial_out,
+                float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out,
+                const unsigned* position, unsigned slots, unsigned window, unsigned extent, int log_scale,
+                float alpha, float n_floor, float qk_threshold, float rel_threshold, float eps, float scale) {
+    decode_step<Fp8Format>(k_raw, v_raw, k_weight, v_weight, k_dynamic, v_dynamic, k_static, v_static, k_state,
+                           v_state, q_raw, q_scale, r_raw, r_scale, table, sinks, gate, k_cache, v_cache,
+                           partial_out, partial_max, partial_sum, counters, out, position, slots, window, extent,
+                           log_scale, alpha, n_floor, qk_threshold, rel_threshold, eps, scale);
 }
 
 // Chunked prefill: attention of m consecutive query rows, at positions

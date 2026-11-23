@@ -28,13 +28,13 @@ use inkling::TextConfig;
 use crate::{
     DeviceIn, Gpu,
     ops::{
-        attention::{self, Attention, AttentionScratch, KvCache, KvData, KvFormat},
+        attention::{self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat},
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
         linear::{Gemm, Gemv, Linear},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
-        norm::{AttentionPost, KvConvWeights, Norm},
+        norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
     },
     weights::{ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, Weights},
@@ -175,13 +175,7 @@ struct AttentionTemps {
     r_raw: CudaSlice<bf16>,
     gate: CudaSlice<bf16>,
     sinks: CudaSlice<bf16>,
-    q: CudaSlice<bf16>,
-    k: CudaSlice<bf16>,
-    v: CudaSlice<bf16>,
-    r: CudaSlice<bf16>,
-    bias: CudaSlice<bf16>,
     partials: AttentionScratch,
-    out: CudaSlice<bf16>,
     gated: CudaSlice<bf16>,
     /// The output projection, BF16 `[hidden]`.
     proj: CudaSlice<bf16>,
@@ -254,13 +248,7 @@ impl Scratch {
                 r_raw: zeros(stream, heads * cfg.d_rel)?,
                 gate: zeros(stream, heads * head_dim)?,
                 sinks: zeros(stream, heads)?,
-                q: zeros(stream, heads * head_dim)?,
-                k: zeros(stream, kv_dims)?,
-                v: zeros(stream, kv_dims)?,
-                r: zeros(stream, heads * cfg.d_rel)?,
-                bias: zeros(stream, heads * cfg.rel_extent)?,
                 partials: AttentionScratch::new(stream)?,
-                out: zeros(stream, heads * head_dim)?,
                 gated: zeros(stream, heads * head_dim)?,
                 proj: zeros(stream, hidden)?,
             },
@@ -1065,6 +1053,14 @@ impl Ctx {
         let cfg = &self.config;
         let a = &w.attention;
 
+        // The fused step's small BF16 weights stream into L2 while the projections run;
+        // nothing has read them since the previous step, so the step would wait on DRAM.
+        let mut small = vec![&a.q_clip_scale, &a.rel_clip_scale, &a.rel_table];
+        if let KvConv::Static { k, v } = &a.kv_conv {
+            small.extend([k, v]);
+        }
+        self.kernels.linear.prefetch(&self.stream, &small)?;
+
         // Every projection of the three inputs in one launch.
         let mut products = vec![
             Gemv::new(&a.q, q_in, &mut t.q_raw),
@@ -1092,10 +1088,15 @@ impl Ctx {
                 v_static,
             },
         };
+        // Post-processing, relative bias, KV append, attention and output gate in one
+        // launch.
         let [k_state, v_state, ..] = &mut state.conv;
-        self.kernels.norm.attention_post(
+        self.kernels.attention.decode_step(
             &self.stream,
-            AttentionPost {
+            &mut state.kv,
+            position,
+            &mut t.partials,
+            DecodeStep {
                 k_raw: &t.k_raw,
                 v_raw: &t.v_raw,
                 conv,
@@ -1105,40 +1106,17 @@ impl Ctx {
                 q_scale: &a.q_clip_scale,
                 r_raw: &t.r_raw,
                 r_scale: &a.rel_clip_scale,
-                k: &mut t.k,
-                v: &mut t.v,
-                q: &mut t.q,
-                r: &mut t.r,
-                log_scale: (!sliding).then_some((
-                    position,
-                    cfg.log_scaling_alpha,
-                    cfg.log_scaling_n_floor as f32,
-                )),
+                table: &a.rel_table,
+                sinks: &t.sinks,
+                gate: &t.gate,
+                log_scale: (!sliding)
+                    .then_some((cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32)),
                 qk_threshold: cfg.qk_l2_clip_threshold,
                 rel_threshold: cfg.rel_l2_clip_threshold,
                 eps: self.eps(),
+                out: &mut t.gated,
             },
         )?;
-        self.kernels
-            .attention
-            .relative_bias(&self.stream, &t.r, &a.rel_table, &mut t.bias)?;
-
-        self.kernels
-            .attention
-            .append(&self.stream, &mut state.kv, position, &t.k, &t.v)?;
-        self.kernels.attention.decode_attention(
-            &self.stream,
-            &t.q,
-            &state.kv,
-            position,
-            &t.bias,
-            &t.sinks,
-            &mut t.partials,
-            &mut t.out,
-        )?;
-        self.kernels
-            .elementwise
-            .attention_gate(&self.stream, &t.out, &t.gate, &mut t.gated)?;
         self.kernels
             .linear
             .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])

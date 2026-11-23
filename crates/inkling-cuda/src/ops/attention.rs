@@ -8,6 +8,9 @@
 //! 2. [`Attention::append`] writes the token's key and value into the layer's [`KvCache`].
 //! 3. [`Attention::decode_attention`] attends from the token's query over the cache.
 //!
+//! [`Attention::decode_step`] runs a layer's whole decode step from its projections in one
+//! launch: the post-processing of `Norm::attention_post`, steps 1 to 3, and the output gate.
+//!
 //! [`Attention::prefill_attention`] does steps 2 and 3 for a chunk of up to
 //! [`MAX_PREFILL_ROWS`] consecutive tokens with tensor cores, after
 //! [`Attention::relative_bias_rows`] has done step 1 for all of them.
@@ -29,7 +32,10 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
+use crate::{
+    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    ops::norm::KvConvWeights,
+};
 
 /// Query heads.
 pub const HEADS: usize = 24;
@@ -41,6 +47,8 @@ pub const HEAD_DIM: usize = 128;
 pub const REL_DIM: usize = 16;
 /// `HEAD_DIM^-0.5`, the softmax scale, rounded to F32 as MLX passes it.
 const SCALE: f32 = 0.088_388_346;
+/// Conv taps of the key and value convolutions.
+const CONV_TAPS: usize = 4;
 /// Keys per cache slot row: one token's `[KV_HEADS, HEAD_DIM]`.
 const KV_ROW: usize = KV_HEADS * HEAD_DIM;
 /// Split rows the partial buffers hold per query head, `kMaxSplits` in the kernel.
@@ -259,6 +267,36 @@ impl AttentionScratch {
     }
 }
 
+/// What [`Attention::decode_step`] reads and writes besides the cache, the position and the
+/// scratch.
+pub struct DecodeStep<'a> {
+    /// Key and value projections, BF16 `[1024]`.
+    pub k_raw: &'a CudaSlice<bf16>,
+    pub v_raw: &'a CudaSlice<bf16>,
+    pub conv: KvConvWeights<'a>,
+    /// Conv states, F32 `[3, 1024]`.
+    pub k_state: &'a mut CudaSlice<f32>,
+    pub v_state: &'a mut CudaSlice<f32>,
+    /// Query projection `[24 * 128]` and relative-position projection `[24 * 16]`, with
+    /// their L2-clip scales of the same shapes.
+    pub q_raw: &'a CudaSlice<bf16>,
+    pub q_scale: &'a CudaSlice<bf16>,
+    pub r_raw: &'a CudaSlice<bf16>,
+    pub r_scale: &'a CudaSlice<bf16>,
+    /// The relative bias table `[16, extent]`.
+    pub table: &'a CudaSlice<bf16>,
+    /// Sink logits `[24]` and output gate projection `[24 * 128]`.
+    pub sinks: &'a CudaSlice<bf16>,
+    pub gate: &'a CudaSlice<bf16>,
+    /// For full attention, alpha and n_floor of the query log scaling.
+    pub log_scale: Option<(f32, f32)>,
+    pub qk_threshold: f32,
+    pub rel_threshold: f32,
+    pub eps: f32,
+    /// Receives the gated attention output `[24 * 128]`.
+    pub out: &'a mut CudaSlice<bf16>,
+}
+
 /// Splits of the cache slots that [`Attention::decode_attention`] launches for a cache of
 /// `slots`: [`SPLITS`], or fewer so that each covers at least [`MIN_SPLIT_SLOTS`].
 fn splits(slots: usize) -> u32 {
@@ -324,6 +362,8 @@ pub struct Attention {
     kv_append_rows_fp8: CudaFunction,
     decode: CudaFunction,
     decode_fp8: CudaFunction,
+    decode_step: CudaFunction,
+    decode_step_fp8: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
 }
@@ -362,6 +402,8 @@ impl Attention {
             kv_append_rows_fp8: module.load_function("kv_append_rows_fp8")?,
             decode: module.load_function("decode_attention_bf16")?,
             decode_fp8: module.load_function("decode_attention_fp8")?,
+            decode_step: module.load_function("decode_step_bf16")?,
+            decode_step_fp8: module.load_function("decode_step_fp8")?,
             prefill,
             prefill_fp8,
         })
@@ -566,6 +608,133 @@ impl Attention {
         // counters, which the scratch holds, and `out`, checked to hold 24 x 128 values.
         unsafe { launch.launch(config) }?;
         Ok(())
+    }
+
+    /// One layer's decode step from its projections to the input of its output projection,
+    /// in one launch, with the results of these calls in sequence, bit for bit:
+    /// `Norm::attention_post` (writing `k`, `v`, `q` and `r`), [`Attention::relative_bias`]
+    /// of `r` with `s.table`, [`Attention::append`] of `k` and `v`,
+    /// [`Attention::decode_attention`] with `q` and `s.sinks`, and
+    /// `Elementwise::attention_gate` with `s.gate` into `s.out`. It updates the conv states
+    /// and appends to `cache` as they do.
+    ///
+    /// The kernel launches with programmatic dependent launch and reads `position` before it
+    /// waits for the previous kernel, so that kernel must not write it. The caller
+    /// checks [`KvCache::holds`] for the position first.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the struct only bundles borrows for this call"
+    )]
+    pub fn decode_step(
+        &self,
+        stream: &CudaStream,
+        cache: &mut KvCache,
+        position: &CudaSlice<u32>,
+        scratch: &mut AttentionScratch,
+        s: DecodeStep<'_>,
+    ) -> anyhow::Result<()> {
+        check_len("k_raw", s.k_raw.len(), KV_ROW)?;
+        check_len("v_raw", s.v_raw.len(), KV_ROW)?;
+        check_len("k_state", s.k_state.len(), (CONV_TAPS - 1) * KV_ROW)?;
+        check_len("v_state", s.v_state.len(), (CONV_TAPS - 1) * KV_ROW)?;
+        for (name, x) in [("q_raw", s.q_raw), ("q_scale", s.q_scale), ("gate", s.gate)] {
+            check_len(name, x.len(), HEADS * HEAD_DIM)?;
+        }
+        for (name, x) in [("r_raw", s.r_raw), ("r_scale", s.r_scale)] {
+            check_len(name, x.len(), HEADS * REL_DIM)?;
+        }
+        check_len("sinks", s.sinks.len(), HEADS)?;
+        check_len("out", s.out.len(), HEADS * HEAD_DIM)?;
+        check_len("position", position.len(), 1)?;
+        let extent = extent("table", s.table.len(), REL_DIM)?;
+        let slots = u32::try_from(cache.slots)?;
+        let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
+
+        let mut args = KernelArgs::default();
+        args.ptr(s.k_raw, stream).ptr(s.v_raw, stream);
+        match &s.conv {
+            KvConvWeights::Static { k, v } => {
+                check_len("k conv weight", k.len(), KV_ROW * CONV_TAPS)?;
+                check_len("v conv weight", v.len(), KV_ROW * CONV_TAPS)?;
+                args.ptr(*k, stream)
+                    .ptr(*v, stream)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0);
+            }
+            KvConvWeights::Dynamic {
+                k_dynamic,
+                v_dynamic,
+                k_static,
+                v_static,
+            } => {
+                check_len("k_dynamic", k_dynamic.len(), KV_HEADS * CONV_TAPS)?;
+                check_len("v_dynamic", v_dynamic.len(), KV_HEADS * CONV_TAPS)?;
+                check_len("k_static", k_static.len(), CONV_TAPS * KV_ROW)?;
+                check_len("v_static", v_static.len(), CONV_TAPS * KV_ROW)?;
+                args.u64(0)
+                    .u64(0)
+                    .ptr(k_dynamic, stream)
+                    .ptr(v_dynamic, stream)
+                    .ptr(*k_static, stream)
+                    .ptr(*v_static, stream);
+            }
+        }
+        args.ptr_mut(s.k_state, stream)
+            .ptr_mut(s.v_state, stream)
+            .ptr(s.q_raw, stream)
+            .ptr(s.q_scale, stream)
+            .ptr(s.r_raw, stream)
+            .ptr(s.r_scale, stream)
+            .ptr(s.table, stream)
+            .ptr(s.sinks, stream)
+            .ptr(s.gate, stream);
+        let function = match &mut cache.data {
+            KvData::Bf16 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream);
+                &self.decode_step
+            }
+            KvData::Fp8 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream);
+                &self.decode_step_fp8
+            }
+        };
+        let (log_scale, alpha, n_floor) = match s.log_scale {
+            Some((alpha, n_floor)) => (1, alpha, n_floor),
+            None => (0, 0.0, 1.0),
+        };
+        args.ptr_mut(&mut scratch.out, stream)
+            .ptr_mut(&mut scratch.max, stream)
+            .ptr_mut(&mut scratch.sum, stream)
+            .ptr_mut(&mut scratch.counters, stream)
+            .ptr_mut(s.out, stream)
+            .ptr(position, stream)
+            .i32(slots.cast_signed())
+            .i32(window.cast_signed())
+            .i32(extent.cast_signed())
+            .i32(log_scale)
+            .f32(alpha)
+            .f32(n_floor)
+            .f32(s.qk_threshold)
+            .f32(s.rel_threshold)
+            .f32(s.eps)
+            .f32(SCALE);
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, splits(cache.slots), 1),
+            block_dim: (DECODE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `decode_step_bf16`'s signature, or `decode_step_fp8`'s
+        // with `uint8_t*` caches for an FP8 cache; the unsigned scalars pass as their bits.
+        // Every buffer has the length checked above, and the kernel reads no null pointer
+        // (the static conv weights only without dynamic taps). It reads slots below
+        // min(position + 1, slots) of the caches and writes slot position % slots, reads
+        // table columns below `extent`, and writes partial rows for 24 heads x at most
+        // `MAX_SPLITS` splits and 8 counters, which the scratch holds. Before `pdl_wait` it
+        // reads only weights and the position, which the doc above keeps the previous kernel
+        // from writing.
+        unsafe { args.launch_pdl(stream, function, config) }
     }
 
     /// Writes `rows` tokens' keys `k` and values `v` (`[rows, 8, 128]` each) into `cache` at
