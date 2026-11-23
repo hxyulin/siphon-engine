@@ -34,11 +34,11 @@ cd reference/fixtures && uv run --project .. python <group>.py
 
 `Model::step` runs one token. `Model::prefill(tokens, chunk, logits)` runs a whole prompt from the current position in chunks of up to `chunk` rows: every layer visit for a chunk, then the next chunk. It fills every KV cache and conv state as stepping the tokens would, advances the position by `tokens.len()`, and returns the greedy next token, so `step` continues from there.
 
-- `chunk` is 1 to 1024 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 512, the chunk MLX's chunked captures use. The first call allocates about 0.5 GB of buffers for 1024 rows, less for smaller chunks.
+- `chunk` is 1 to 2048 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 512, the chunk MLX's chunked captures use. The first call allocates buffers for its chunk size: about 0.28 GB at 512 rows, 0.5 GB at 1024 and 0.95 GB at 2048.
 - `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
 - `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
 
-The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024 and 433. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
+The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024, 433 and 2048. At 2048 the whole prompt is one chunk wider than the sliding window. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
 
 ```sh
 INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill -- --ignored --nocapture
