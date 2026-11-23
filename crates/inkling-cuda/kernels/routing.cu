@@ -1153,3 +1153,471 @@ moe_router_route_rows_2304(const float* __restrict__ partials, const float* __re
     // route_top8 reads each logit back in the thread that wrote it.
     route_top8(logits + row * kExperts, bias, indices + row * kTopK, weights + row * kTopK, route_scale);
 }
+
+// ---------------------------------------------------------------------------
+// Decode kernels with their own summation order. They keep F32 accumulation and round
+// to BF16 where the kernels above do, but sum in an order chosen for latency, so their
+// results differ from the kernels above by F32 rounding.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kStepThreads = 288;
+constexpr int kStepWarps = kStepThreads / 32;
+constexpr int kStepBlocks = 5;
+constexpr int kStepQueries = 4;
+// Slot of the partial among the candidates, after the block states.
+constexpr int kStepPartial = kStepBlocks;
+// Index of the partial's sum of squares among the values of the first reduction; the
+// dot of candidate i and query j is value 4 i + j.
+constexpr int kStepSquares = (kStepPartial + 1) * kStepQueries;
+static_assert(kStepSquares < 32, "the first reduction fits a warp");
+static_assert(kStepThreads * 8 == kHidden, "two runs of 4 per thread cover the row");
+
+// How depth_attention_step_2304 gets its partial candidate.
+enum StepPartial : int {
+    // An F32 row, already normalized.
+    kPartialNormalized = 0,
+    // An F32 row that gets an unweighted RMS norm.
+    kPartialF32 = 1,
+    // A BF16 row, widened, that gets an unweighted RMS norm.
+    kPartialBf16 = 2,
+    // The post-attention conv and residual add of short_conv_residual_2304, then an
+    // unweighted RMS norm.
+    kPartialConvResidual = 3,
+};
+
+constexpr float kShortConvDivisor = static_cast<float>(2.23606797749979);  // sqrt(K + 1)
+
+// x / kShortConvDivisor, correctly rounded, without the slow-path call of a general
+// division: the product with the rounded reciprocal, corrected once by its exact
+// remainder. It equals __fdiv_rn(x, kShortConvDivisor) for every x of every binade
+// checked exhaustively, 2^-100 to 2^99; the division scales exactly by powers of two
+// between them. copysignf keeps the sign of a zero x.
+__device__ __forceinline__ float div_short_conv(float x) {
+    const float r = 1.f / kShortConvDivisor;
+    const float q = __fmul_rn(x, r);
+    return copysignf(fmaf(fmaf(-q, kShortConvDivisor, x), r, q), x);
+}
+
+// Each lane passes 32 values; lane l gets the warp's sum of value l, in 31 shuffles.
+__device__ __forceinline__ float warp_transpose_sum(float (&v)[32]) {
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int half = 16; half >= 1; half /= 2) {
+        const bool upper = (lane & half) != 0;
+#pragma unroll
+        for (int k = 0; k < half; ++k) {
+            const float send = upper ? v[k] : v[k + half];
+            const float keep = upper ? v[k + half] : v[k];
+            v[k] = keep + __shfl_xor_sync(0xffffffffu, send, half);
+        }
+    }
+    return v[0];
+}
+
+__device__ __forceinline__ void load8(const float* p, int ca, int cb, float (&v)[8]) {
+    const float4 a = *reinterpret_cast<const float4*>(p + ca);
+    const float4 b = *reinterpret_cast<const float4*>(p + cb);
+    v[0] = a.x;
+    v[1] = a.y;
+    v[2] = a.z;
+    v[3] = a.w;
+    v[4] = b.x;
+    v[5] = b.y;
+    v[6] = b.z;
+    v[7] = b.w;
+}
+
+__device__ __forceinline__ void store8(float* p, int ca, int cb, const float (&v)[8]) {
+    *reinterpret_cast<float4*>(p + ca) = make_float4(v[0], v[1], v[2], v[3]);
+    *reinterpret_cast<float4*>(p + cb) = make_float4(v[4], v[5], v[6], v[7]);
+}
+
+__device__ __forceinline__ void unpack_bf16x4(uint2 packed, float* v) {
+    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = __bfloat162float(vals[i]);
+    }
+}
+
+__device__ __forceinline__ float round_to_bf16(float v) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+
+// Pulls the line holding p into L2. L2 is coherent, so this is safe before pdl_wait even
+// for data an earlier kernel is still writing: it only turns a later load's DRAM access
+// into an L2 hit.
+__device__ __forceinline__ void prefetch_l2(const void* p) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+}
+
+}  // namespace
+
+// Depth attention for one row with the norms around it, as depth_attention_fused_2304,
+// for decode. Thread t holds elements 4t.. and 4(t + 288).. of every row, loaded as
+// vectors. The dot products, the partial's sum of squares and the output norms are
+// summed per thread, then across each warp, then across the 9 warps in order; the
+// partial's scale multiplies its dot products instead of its elements. Every warp
+// computes the softmax itself, so the kernel has two block barriers.
+//
+// `mode` picks the partial (see StepPartial). With kPartialConvResidual, `partial_bf16`
+// is the attention output x, and the kernel computes residual = f32(conv_hidden) +
+// f32(short_conv(x)) (or f32(short_conv(x)) for a null conv_hidden) with conv_weight
+// ([2304, 4] BF16) and conv_state ([3, 2304] F32, updated in place), as
+// short_conv_residual_2304 does, and writes it to `residual`.
+//
+// Block b of the grid takes queries + b * query_stride and writes out + b * out_stride
+// and dst_k + b * dst_stride, over the same candidates; only block 0 writes
+// normed_partial, residual and conv_state. Destination k receives output row
+// min(k, nq - 1) after an RMS norm, times weight_k if that is not null, as BF16.
+extern "C" __global__ void __launch_bounds__(kStepThreads)
+depth_attention_step_2304(const float* __restrict__ blocks, int nb, const float* partial_f32,
+                          const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,
+                          float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,
+                          float* normed_partial, const float* __restrict__ queries, int nq, int query_stride,
+                          float* out, int out_stride, __nv_bfloat16* dst0, __nv_bfloat16* dst1,
+                          __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,
+                          const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,
+                          const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3,
+                          float eps, float scale) {
+    __shared__ float red[kStepWarps][32];
+    __shared__ float red_norm[kStepQueries][kStepWarps];
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kStepThreads);
+    const size_t b = blockIdx.x;
+    __nv_bfloat16* const dst[kDests] = {dst0, dst1, dst2, dst3};
+    const __nv_bfloat16* const weight[kDests] = {weight0, weight1, weight2, weight3};
+
+    // Weights first: they do not depend on earlier kernels.
+    float q[kStepQueries][8];
+#pragma unroll
+    for (int j = 0; j < kStepQueries; ++j) {
+        if (j < nq) {
+            load8(queries + b * query_stride + size_t(j) * kHidden, ca, cb, q[j]);
+        } else {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                q[j][e] = 0.f;
+            }
+        }
+    }
+    uint2 wpack[kDests][2];
+#pragma unroll
+    for (int k = 0; k < kDests; ++k) {
+        if (dst[k] != nullptr && weight[k] != nullptr) {
+            wpack[k][0] = *reinterpret_cast<const uint2*>(weight[k] + ca);
+            wpack[k][1] = *reinterpret_cast<const uint2*>(weight[k] + cb);
+        }
+    }
+    // The conv taps of this thread's 8 channels, 4 per channel.
+    uint4 taps[4];
+    if (mode == kPartialConvResidual) {
+        const uint4* wa = reinterpret_cast<const uint4*>(conv_weight + 4 * ca);
+        const uint4* wb = reinterpret_cast<const uint4*>(conv_weight + 4 * cb);
+        taps[0] = wa[0];
+        taps[1] = wa[1];
+        taps[2] = wb[0];
+        taps[3] = wb[1];
+    }
+    // The inputs that earlier kernels write may have left L2 since; one thread per line.
+    if (t % 8 == 0) {
+        for (int i = 0; i < nb; ++i) {
+            prefetch_l2(blocks + size_t(i) * kHidden + ca);
+            prefetch_l2(blocks + size_t(i) * kHidden + cb);
+        }
+        if (mode == kPartialConvResidual) {
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                prefetch_l2(conv_state + size_t(k) * kHidden + ca);
+                prefetch_l2(conv_state + size_t(k) * kHidden + cb);
+            }
+        }
+        if (partial_f32 != nullptr) {
+            prefetch_l2(partial_f32 + ca);
+            prefetch_l2(partial_f32 + cb);
+        }
+    }
+    if (t % 16 == 0) {
+        if (partial_bf16 != nullptr) {
+            prefetch_l2(partial_bf16 + ca);
+            prefetch_l2(partial_bf16 + cb);
+        }
+        if (conv_hidden != nullptr) {
+            prefetch_l2(conv_hidden + ca);
+            prefetch_l2(conv_hidden + cb);
+        }
+    }
+    pdl_trigger();
+    pdl_wait();
+
+    // Every load before any store, so that none waits for another.
+    float s[kStepBlocks][8];
+#pragma unroll
+    for (int i = 0; i < kStepBlocks; ++i) {
+        if (i < nb) {
+            load8(blocks + size_t(i) * kHidden, ca, cb, s[i]);
+        }
+    }
+    float p[8];
+    // The conv's new state rows, stored at the end.
+    float x[8];
+    float win[3][8];
+    if (mode == kPartialConvResidual) {
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + ca), x);
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + cb), x + 4);
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            load8(conv_state + size_t(k) * kHidden, ca, cb, win[k]);
+        }
+        float hid[8];
+        if (conv_hidden != nullptr) {
+            unpack_bf16x4(*reinterpret_cast<const uint2*>(conv_hidden + ca), hid);
+            unpack_bf16x4(*reinterpret_cast<const uint2*>(conv_hidden + cb), hid + 4);
+        }
+        const auto* w = reinterpret_cast<const __nv_bfloat16*>(taps);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            // short_conv in conv_step.cuh: taps in order, oldest row first, each product
+            // and sum rounded on its own.
+            float acc = 0.f;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(win[k][e]), __bfloat162float(w[4 * e + k])));
+            }
+            acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(x[e]), __bfloat162float(w[4 * e + 3])));
+            const float y = round_to_bf16(div_short_conv(__fadd_rn(round_to_bf16(acc), x[e])));
+            p[e] = conv_hidden != nullptr ? __fadd_rn(hid[e], y) : y;
+        }
+    } else if (mode == kPartialBf16) {
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + ca), p);
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + cb), p + 4);
+    } else {
+        load8(partial_f32, ca, cb, p);
+    }
+
+    // First reduction: every dot product, and the partial's sum of squares.
+    float v[32];
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        v[k] = 0.f;
+    }
+#pragma unroll
+    for (int j = 0; j < kStepQueries; ++j) {
+        if (j >= nq) {
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < kStepBlocks; ++i) {
+            if (i < nb) {
+                float acc = 0.f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    acc = fmaf(s[i][e], q[j][e], acc);
+                }
+                v[4 * i + j] = acc;
+            }
+        }
+        float acc = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            acc = fmaf(p[e], q[j][e], acc);
+        }
+        v[4 * kStepPartial + j] = acc;
+    }
+    if (mode != kPartialNormalized) {
+        float acc = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            acc = fmaf(p[e], p[e], acc);
+        }
+        v[kStepSquares] = acc;
+    }
+    red[warp][lane] = warp_transpose_sum(v);
+    __syncthreads();
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kStepWarps; ++w) {
+        total += red[w][lane];
+    }
+    const float squares = __shfl_sync(0xffffffffu, total, kStepSquares);
+    const float inv_p = mode == kPartialNormalized ? 1.f : inv_rms_f32(squares, eps);
+
+    // Softmax over the candidates of each query: lane 4 i + j holds candidate i of query j.
+    const int ci = lane / 4;
+    const int qj = lane % 4;
+    const bool valid = qj < nq && (ci < nb || ci == kStepPartial);
+    const float logit = valid ? (ci == kStepPartial ? total * inv_p : total) * scale : -INFINITY;
+    float mx = logit;
+#pragma unroll
+    for (int offset = 4; offset < 32; offset *= 2) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, offset));
+    }
+    const float ex = valid ? fast_exp(logit - mx) : 0.f;
+    float z = ex;
+#pragma unroll
+    for (int offset = 4; offset < 32; offset *= 2) {
+        z += __shfl_xor_sync(0xffffffffu, z, offset);
+    }
+    const float prob = valid ? ex / z : 0.f;
+
+    // Output rows. The partial's scale folds into its weights.
+    float o[kStepQueries][8];
+#pragma unroll
+    for (int j = 0; j < kStepQueries; ++j) {
+        float pr[kStepBlocks + 1];
+#pragma unroll
+        for (int i = 0; i <= kStepBlocks; ++i) {
+            pr[i] = __shfl_sync(0xffffffffu, prob, 4 * i + j);
+        }
+        const float pp = pr[kStepPartial] * inv_p;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float acc = 0.f;
+#pragma unroll
+            for (int i = 0; i < kStepBlocks; ++i) {
+                if (i < nb) {
+                    acc = fmaf(pr[i], s[i][e], acc);
+                }
+            }
+            o[j][e] = fmaf(pp, p[e], acc);
+        }
+        if (j < nq && out != nullptr) {
+            store8(out + b * out_stride + size_t(j) * kHidden, ca, cb, o[j]);
+        }
+    }
+    if (mode == kPartialConvResidual && b == 0) {
+        store8(residual, ca, cb, p);
+        store8(conv_state, ca, cb, win[1]);
+        store8(conv_state + kHidden, ca, cb, win[2]);
+        store8(conv_state + 2 * kHidden, ca, cb, x);
+    }
+    if (normed_partial != nullptr && b == 0) {
+        float np[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            np[e] = p[e] * inv_p;
+        }
+        store8(normed_partial, ca, cb, np);
+    }
+
+    unsigned normed_rows = 0;
+#pragma unroll
+    for (int k = 0; k < kDests; ++k) {
+        if (dst[k] != nullptr) {
+            normed_rows |= 1u << min(k, nq - 1);
+        }
+    }
+    if (normed_rows == 0) {
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < kStepQueries; ++j) {
+        if (normed_rows & (1u << j)) {
+            float acc = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                acc = fmaf(o[j][e], o[j][e], acc);
+            }
+            acc = warp_sum(acc);
+            if (lane == 0) {
+                red_norm[j][warp] = acc;
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < kStepQueries; ++j) {
+        if (!(normed_rows & (1u << j))) {
+            continue;
+        }
+        float sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < kStepWarps; ++w) {
+            sum += red_norm[j][w];
+        }
+        const float inv = inv_rms_f32(sum, eps);
+#pragma unroll
+        for (int k = 0; k < kDests; ++k) {
+            if (dst[k] == nullptr || min(k, nq - 1) != j) {
+                continue;
+            }
+            float y[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                y[e] = o[j][e] * inv;
+            }
+            if (weight[k] != nullptr) {
+                float w[8];
+                unpack_bf16x4(wpack[k][0], w);
+                unpack_bf16x4(wpack[k][1], w + 4);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    y[e] *= w[e];
+                }
+            }
+            __nv_bfloat16* d = dst[k] + b * dst_stride;
+            const float ya[4] = {y[0], y[1], y[2], y[3]};
+            const float yb[4] = {y[4], y[5], y[6], y[7]};
+            store4(d + ca, ya);
+            store4(d + cb, yb);
+        }
+    }
+}
+
+// The router for one BF16 row x that is already normalized: logits = F32(x) @ router.T,
+// then the top-8 routing of moe_router_2304. One block per expert; each thread sums
+// elements 4t.. and 4(t + 288).., then the warps add in order. The last block to finish,
+// found with `counter`, routes. `counter` must start at 0; the last block resets it.
+extern "C" __global__ void __launch_bounds__(kStepThreads)
+moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, const float* __restrict__ bias,
+                     float* logits, int32_t* indices, float* weights, unsigned* counter, float route_scale) {
+    __shared__ float warp_dots[kStepWarps];
+    __shared__ bool last;
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kStepThreads);
+    const int e = blockIdx.x;
+    float w[8];
+    load8(router + size_t(e) * kHidden, ca, cb, w);
+    pdl_trigger();
+    pdl_wait();
+    float xv[8];
+    unpack_bf16x4(*reinterpret_cast<const uint2*>(x + ca), xv);
+    unpack_bf16x4(*reinterpret_cast<const uint2*>(x + cb), xv + 4);
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc = fmaf(w[i], xv[i], acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        warp_dots[warp] = acc;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float total = 0.f;
+#pragma unroll
+        for (int s = 0; s < kStepWarps; ++s) {
+            total += warp_dots[s];
+        }
+        logits[e] = total;
+        __threadfence();
+        last = atomicAdd(counter, 1u) == kExperts - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    route_top8(logits, bias, indices, weights, route_scale);
+    if (t == 0) {
+        *counter = 0;
+    }
+}

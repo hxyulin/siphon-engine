@@ -22,6 +22,7 @@
 namespace {
 
 constexpr int kArgmaxThreads = 1024;
+constexpr int kArgmaxWideThreads = 256;
 
 __device__ __forceinline__ size_t grid_index() {
     return size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -150,6 +151,84 @@ argmax_f32(const float* x, int* out, int n) {
     }
 }
 
+// The index of the largest of the n values of one long row x, over many blocks: each
+// block reduces a range of x to partial_vals and partial_idxs at blockIdx.x, and the
+// last block to finish, found with `counter`, reduces those into out[0]. `counter` must
+// start at 0; the last block resets it. x must be 16-byte aligned.
+extern "C" __global__ void __launch_bounds__(kArgmaxWideThreads)
+argmax_wide_f32(const float* x, int n, float* partial_vals, int* partial_idxs, unsigned* counter, int* out) {
+    __shared__ float warp_vals[kArgmaxWideThreads / 32];
+    __shared__ int warp_idxs[kArgmaxWideThreads / 32];
+    __shared__ bool last;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    float best = -INFINITY;
+    int best_idx = INT_MAX;
+    const auto take = [&](float v, int i) {
+        if (argmax_better(v, i, best, best_idx)) {
+            best = v;
+            best_idx = i;
+        }
+    };
+    const auto block_reduce = [&] {
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            take(__shfl_xor_sync(0xffffffffu, best, offset), __shfl_xor_sync(0xffffffffu, best_idx, offset));
+        }
+        if (lane == 0) {
+            warp_vals[warp] = best;
+            warp_idxs[warp] = best_idx;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            best = lane < kArgmaxWideThreads / 32 ? warp_vals[lane] : -INFINITY;
+            best_idx = lane < kArgmaxWideThreads / 32 ? warp_idxs[lane] : INT_MAX;
+#pragma unroll
+            for (int offset = 16; offset >= 1; offset /= 2) {
+                take(__shfl_xor_sync(0xffffffffu, best, offset), __shfl_xor_sync(0xffffffffu, best_idx, offset));
+            }
+        }
+    };
+    pdl_trigger();
+    pdl_wait();
+    const int vectors = n / 4;
+    const int stride = gridDim.x * kArgmaxWideThreads;
+    for (int v = blockIdx.x * kArgmaxWideThreads + threadIdx.x; v < vectors; v += stride) {
+        const float4 q = __ldcg(reinterpret_cast<const float4*>(x) + v);
+        take(q.x, 4 * v);
+        take(q.y, 4 * v + 1);
+        take(q.z, 4 * v + 2);
+        take(q.w, 4 * v + 3);
+    }
+    const int tail = 4 * vectors + blockIdx.x * kArgmaxWideThreads + threadIdx.x;
+    if (blockIdx.x == 0 && tail < n) {
+        take(x[tail], tail);
+    }
+    block_reduce();
+    if (threadIdx.x == 0) {
+        partial_vals[blockIdx.x] = best;
+        partial_idxs[blockIdx.x] = best_idx;
+        __threadfence();
+        last = atomicAdd(counter, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    best = -INFINITY;
+    best_idx = INT_MAX;
+    for (int i = threadIdx.x; i < int(gridDim.x); i += kArgmaxWideThreads) {
+        take(__ldcg(partial_vals + i), __ldcg(partial_idxs + i));
+    }
+    __syncthreads();
+    block_reduce();
+    if (threadIdx.x == 0) {
+        out[0] = best_idx;
+        *counter = 0;
+    }
+}
+
 namespace {
 
 constexpr int kHidden = 2304;
@@ -217,6 +296,24 @@ message_gate_out_row(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16
         fw[i] = *reinterpret_cast<const uint2*>(forget + size_t(row) * kGateRank + col);
         gw[i] = *reinterpret_cast<const uint2*>(gain + size_t(row) * kGateRank + col);
     }
+    // The norm weights, for the block that turns out to be last.
+    const int ca = 4 * threadIdx.x;
+    const int cb = 4 * (threadIdx.x + kGateThreads);
+    float wa[4];
+    float wb[4];
+    if (normed != nullptr) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            wa[i] = __bfloat162float(norm_weight[ca + i]);
+            wb[i] = __bfloat162float(norm_weight[cb + i]);
+        }
+    }
+    // The gate's inputs, which earlier kernels write and which may have left L2 since:
+    // the messages were written at the start of the pass.
+    if (sub == 0) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(h + row));
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(m + row));
+    }
     pdl_trigger();
     pdl_wait();
 #pragma unroll
@@ -266,18 +363,12 @@ message_gate_out_row(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16
         return;
     }
     __threadfence();
-    const int ca = 4 * threadIdx.x;
-    const int cb = 4 * (threadIdx.x + kGateThreads);
     float a[4];
     float b[4];
-    float wa[4];
-    float wb[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         a[i] = __ldcg(out + ca + i);
         b[i] = __ldcg(out + cb + i);
-        wa[i] = __bfloat162float(norm_weight[ca + i]);
-        wb[i] = __bfloat162float(norm_weight[cb + i]);
     }
     float pa = 0.f;
     float pb = 0.f;
@@ -308,12 +399,259 @@ message_gate_out_row(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16
 
 }  // namespace
 
+// Up to three gates in one launch, one per blockIdx.y (the slot s): down + 64 s,
+// forget_s, gain_s, h + s * h_stride, m + 2304 s, out + 2304 s, norm_weight_s,
+// normed_s and counter + s. A null normed_s skips that slot's norm.
 extern "C" __global__ void __launch_bounds__(kGateThreads)
-message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
-                      const __nv_bfloat16* __restrict__ gain, const float* h, const float* m, float* out,
-                      const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
-                      unsigned* counter, float eps) {
-    message_gate_out_row(down, forget, gain, h, m, out, norm_weight, normed, counter, eps);
+message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget0,
+                      const __nv_bfloat16* __restrict__ forget1, const __nv_bfloat16* __restrict__ forget2,
+                      const __nv_bfloat16* __restrict__ gain0, const __nv_bfloat16* __restrict__ gain1,
+                      const __nv_bfloat16* __restrict__ gain2, const float* h, int h_stride, const float* m,
+                      float* out, const __nv_bfloat16* __restrict__ norm_weight0,
+                      const __nv_bfloat16* __restrict__ norm_weight1,
+                      const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
+                      __nv_bfloat16* normed1, __nv_bfloat16* normed2, unsigned* counter, float eps) {
+    // An explicit branch: nvcc 13.0 miscompiled the same selection written as a generic
+    // lambda in message_gate_step_2304, giving the third gate a garbage pointer.
+    const int s = blockIdx.y;
+    const __nv_bfloat16* forget = s == 0 ? forget0 : forget1;
+    const __nv_bfloat16* gain = s == 0 ? gain0 : gain1;
+    const __nv_bfloat16* norm_weight = s == 0 ? norm_weight0 : norm_weight1;
+    __nv_bfloat16* normed = s == 0 ? normed0 : normed1;
+    if (s == 2) {
+        forget = forget2;
+        gain = gain2;
+        norm_weight = norm_weight2;
+        normed = normed2;
+    }
+    message_gate_out_row(down + s * kGateRank, forget, gain, h + size_t(s) * h_stride, m + size_t(s) * kHidden,
+                         out + size_t(s) * kHidden, norm_weight, normed, counter + s, eps);
+}
+
+// ---------------------------------------------------------------------------
+// The whole MessageGate for decode in one launch: the down projection and the end of
+// message_gate_out_2304, for up to three gates (blockIdx.y). The 32 blocks of a gate
+// each sum a slice of the down projection's inner dimension, meet at a barrier, then
+// compute their 72 output rows from the BF16 down projection. With a norm, a second
+// barrier shares the sums of squares and each block normalizes its own rows.
+//
+// The barriers spin on `counters` (one per gate, a multiple of 32 between launches,
+// starting at 0). Spinning is safe because every block of the grid is resident: the
+// grid is at most 96 small blocks, the blocks spin only after pdl_wait, when no earlier
+// kernel of the stream runs, and no later kernel starts before all of them have.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kDownCols = 2 * kHidden / kGateBlocks;          // 144 inner columns per block
+constexpr int kDownChunks = kDownCols / 8;                    // of 8 BF16 each
+constexpr int kDownItems = kGateRank * kDownChunks;           // 1152 (row, chunk) pairs
+constexpr int kDownPerThread = kDownItems / kGateThreads;     // 4
+static_assert(kDownItems % kGateThreads == 0, "threads cover the down items");
+
+__device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// Waits until all `blocks` blocks sharing `counter` have arrived. Every thread of the
+// block must call it; writes before it are visible to every block after it.
+__device__ __forceinline__ void grid_barrier(unsigned* counter, unsigned blocks) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned old = atomicAdd(counter, 1u);
+        const unsigned target = old - old % blocks + blocks;
+        while (static_cast<int>(ld_acquire(counter) - target) < 0) {
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ float dot8_bf16(uint4 w, uint4 x) {
+    const auto* wv = reinterpret_cast<const __nv_bfloat16*>(&w);
+    const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&x);
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc = fmaf(__bfloat162float(wv[i]), __bfloat162float(xv[i]), acc);
+    }
+    return acc;
+}
+
+}  // namespace
+
+// Gate s reads down_weight_s ([64, 4608] BF16), input_s ([4608] BF16: the normalized
+// state and message), forget_s and gain_s, h + s * h_stride and m + 2304 s, and writes
+// out + 2304 s and, with a norm weight, normed_s = bf16(rms_norm(out) * norm_weight_s).
+// `down`, if not null, receives each gate's BF16 down projection ([slots, 64]).
+// `partials` holds 32 * 65 floats per gate.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __nv_bfloat16* __restrict__ down_weight1,
+                       const __nv_bfloat16* __restrict__ down_weight2, const __nv_bfloat16* input0,
+                       const __nv_bfloat16* input1, const __nv_bfloat16* input2,
+                       const __nv_bfloat16* __restrict__ forget0, const __nv_bfloat16* __restrict__ forget1,
+                       const __nv_bfloat16* __restrict__ forget2, const __nv_bfloat16* __restrict__ gain0,
+                       const __nv_bfloat16* __restrict__ gain1, const __nv_bfloat16* __restrict__ gain2,
+                       const float* h, int h_stride, const float* m, float* out,
+                       const __nv_bfloat16* __restrict__ norm_weight0, const __nv_bfloat16* __restrict__ norm_weight1,
+                       const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
+                       __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float* partials,
+                       unsigned* counters, float eps) {
+    __shared__ float item_sums[kDownItems];
+    __shared__ __align__(16) __nv_bfloat16 down_s[kGateRank];
+    __shared__ float warp_ss[kGateWarps];
+    const int g = blockIdx.y;
+    const int blk = blockIdx.x;
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    // An explicit branch rather than a generic lambda, which nvcc 13.0 miscompiled here.
+    const __nv_bfloat16* down_weight = down_weight0;
+    const __nv_bfloat16* input = input0;
+    const __nv_bfloat16* forget = forget0;
+    const __nv_bfloat16* gain = gain0;
+    const __nv_bfloat16* norm_weight = norm_weight0;
+    __nv_bfloat16* normed = normed0;
+    if (g == 1) {
+        down_weight = down_weight1;
+        input = input1;
+        forget = forget1;
+        gain = gain1;
+        norm_weight = norm_weight1;
+        normed = normed1;
+    } else if (g == 2) {
+        down_weight = down_weight2;
+        input = input2;
+        forget = forget2;
+        gain = gain2;
+        norm_weight = norm_weight2;
+        normed = normed2;
+    }
+    float* part = partials + size_t(g) * kGateBlocks * (kGateRank + 1);
+    unsigned* counter = counters + g;
+    h += size_t(g) * h_stride;
+    m += size_t(g) * kHidden;
+    out += size_t(g) * kHidden;
+
+    // Weights first: this block's slice of the down projection, its gate rows and their
+    // norm weights.
+    const int col0 = blk * kDownCols;
+    uint4 dw[kDownPerThread];
+#pragma unroll
+    for (int i = 0; i < kDownPerThread; ++i) {
+        const int item = t + i * kGateThreads;
+        const int k = item / kDownChunks;
+        const int c = item % kDownChunks;
+        dw[i] = *reinterpret_cast<const uint4*>(down_weight + size_t(k) * 2 * kHidden + col0 + 8 * c);
+    }
+    const int sub = lane % kLanesPerRow;
+    const int row = blk * kGateRowsPerBlock + warp * kRowsPerWarp + lane / kLanesPerRow;
+    uint2 fw[kGateSteps];
+    uint2 gw[kGateSteps];
+#pragma unroll
+    for (int i = 0; i < kGateSteps; ++i) {
+        const int col = i * 4 * kLanesPerRow + sub * 4;
+        fw[i] = *reinterpret_cast<const uint2*>(forget + size_t(row) * kGateRank + col);
+        gw[i] = *reinterpret_cast<const uint2*>(gain + size_t(row) * kGateRank + col);
+    }
+    const float nw = norm_weight != nullptr ? __bfloat162float(norm_weight[row]) : 0.f;
+    pdl_trigger();
+    pdl_wait();
+
+    // The down projection's partial sums over this block's columns.
+    float hv = 0.f;
+    float mv = 0.f;
+    if (sub == 0) {
+        hv = h[row];
+        mv = m[row];
+    }
+#pragma unroll
+    for (int i = 0; i < kDownPerThread; ++i) {
+        const int item = t + i * kGateThreads;
+        const int c = item % kDownChunks;
+        const uint4 x = *reinterpret_cast<const uint4*>(input + col0 + 8 * c);
+        item_sums[item] = dot8_bf16(dw[i], x);
+    }
+    __syncthreads();
+    if (t < kGateRank) {
+        float acc = 0.f;
+#pragma unroll
+        for (int c = 0; c < kDownChunks; ++c) {
+            acc += item_sums[t * kDownChunks + c];
+        }
+        part[blk * (kGateRank + 1) + t] = acc;
+    }
+    grid_barrier(counter, kGateBlocks);
+    if (t < kGateRank) {
+        float acc = 0.f;
+#pragma unroll 8
+        for (int b = 0; b < kGateBlocks; ++b) {
+            acc += __ldcg(part + b * (kGateRank + 1) + t);
+        }
+        down_s[t] = __float2bfloat16(acc);
+        if (down != nullptr && blk == 0) {
+            down[g * kGateRank + t] = down_s[t];
+        }
+    }
+    __syncthreads();
+
+    // The end of message_gate_out_row, from the shared down projection.
+    float f = 0.f;
+    float gg = 0.f;
+#pragma unroll
+    for (int i = 0; i < kGateSteps; ++i) {
+        const int col = i * 4 * kLanesPerRow + sub * 4;
+        const uint2 packed = *reinterpret_cast<const uint2*>(down_s + col);
+        const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&packed);
+        const auto* fv = reinterpret_cast<const __nv_bfloat16*>(&fw[i]);
+        const auto* gv = reinterpret_cast<const __nv_bfloat16*>(&gw[i]);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float x = __bfloat162float(xv[k]);
+            f = ffma(__bfloat162float(fv[k]), x, f);
+            gg = ffma(__bfloat162float(gv[k]), x, gg);
+        }
+    }
+#pragma unroll
+    for (int offset = kLanesPerRow / 2; offset > 0; offset /= 2) {
+        f = fadd(f, __shfl_down_sync(0xffffffffu, f, offset));
+        gg = fadd(gg, __shfl_down_sync(0xffffffffu, gg, offset));
+    }
+    float o = 0.f;
+    if (sub == 0) {
+        o = fadd(fmul(fsub(1.f, tanhf(f)), hv), fmul(tanhf(gg), mv));
+        out[row] = o;
+    }
+    if (normed == nullptr) {
+        return;
+    }
+    // The norm: this block's sum of squares, shared through the barrier.
+    float ss = warp_sum(o * o);
+    if (lane == 0) {
+        warp_ss[warp] = ss;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float acc = 0.f;
+#pragma unroll
+        for (int w = 0; w < kGateWarps; ++w) {
+            acc += warp_ss[w];
+        }
+        part[blk * (kGateRank + 1) + kGateRank] = acc;
+    }
+    grid_barrier(counter, kGateBlocks);
+    float total = 0.f;
+    if (lane < kGateBlocks) {
+        total = __ldcg(part + lane * (kGateRank + 1) + kGateRank);
+    }
+    total = warp_sum(total);
+    const float inv = 1.f / sqrtf(total / static_cast<float>(kHidden) + eps);
+    if (sub == 0) {
+        normed[row] = __float2bfloat16((o * inv) * nw);
+    }
 }
 
 // ---------------------------------------------------------------------------

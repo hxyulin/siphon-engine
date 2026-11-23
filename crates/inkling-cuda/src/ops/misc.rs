@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg as _,
 };
 use half::bf16;
 
@@ -27,6 +28,68 @@ const GATE_TILE_ROWS: usize = 32;
 const GATE_TILE_COLS: usize = 64;
 const GATE_TILE_THREADS: u32 = 256;
 
+/// Gates [`Misc::message_gate_out`] runs in one launch.
+pub const GATE_SLOTS: usize = 3;
+/// Threads, values per thread and most blocks of `argmax_wide_f32`.
+const ARGMAX_WIDE_THREADS: u32 = 256;
+const ARGMAX_WIDE_PER_THREAD: usize = 2;
+const ARGMAX_WIDE_BLOCKS: usize = 256;
+
+/// One gate of [`Misc::message_gate_out`]: its forget and gain weights, and optionally the
+/// weight of the norm after it and the normalized output.
+pub struct GateSlot<'a> {
+    pub forget: &'a CudaSlice<bf16>,
+    pub gain: &'a CudaSlice<bf16>,
+    pub norm: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
+}
+
+/// One gate of [`Misc::message_gate_step`]: its weights, its down projection's input, and
+/// optionally the weight of the norm after it and the normalized output.
+pub struct GateStep<'a> {
+    /// `[64, 4608]`.
+    pub down_weight: &'a CudaSlice<bf16>,
+    /// The normalized state and message side by side, BF16 `[4608]`.
+    pub input: CudaView<'a, bf16>,
+    pub forget: &'a CudaSlice<bf16>,
+    pub gain: &'a CudaSlice<bf16>,
+    pub norm: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
+}
+
+/// The cross-block sums and barrier counters of [`Misc::message_gate_step`].
+pub struct GateStepScratch {
+    partials: CudaSlice<f32>,
+    /// One per gate, a multiple of the blocks per gate between launches.
+    counters: CudaSlice<u32>,
+}
+
+impl GateStepScratch {
+    pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        Ok(Self {
+            partials: stream
+                .alloc_zeros(GATE_SLOTS * GATE_OUT_BLOCKS as usize * (GATE_RANK + 1))?,
+            counters: stream.alloc_zeros(GATE_SLOTS)?,
+        })
+    }
+}
+
+/// The partial results of [`Misc::argmax_wide_f32`].
+pub struct ArgmaxScratch {
+    vals: CudaSlice<f32>,
+    idxs: CudaSlice<i32>,
+    /// The kernel's block counter, 0 between launches.
+    counter: CudaSlice<u32>,
+}
+
+impl ArgmaxScratch {
+    pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        Ok(Self {
+            vals: stream.alloc_zeros(ARGMAX_WIDE_BLOCKS)?,
+            idxs: stream.alloc_zeros(ARGMAX_WIDE_BLOCKS)?,
+            counter: stream.alloc_zeros(1)?,
+        })
+    }
+}
+
 /// The norm of [`Misc::message_gate_out_rows`]: its weight and the normalized rows.
 pub type GateNorm<'a> = (&'a CudaSlice<bf16>, &'a mut dyn DeviceOut<bf16>);
 
@@ -39,6 +102,8 @@ pub struct Misc {
     message_gate_out_2304: CudaFunction,
     message_gate_out_rows_2304: CudaFunction,
     message_gate_norm_rows_2304: CudaFunction,
+    argmax_wide_f32: CudaFunction,
+    message_gate_step_2304: CudaFunction,
 }
 
 /// Launch shape for a grid-stride loop over `n` elements.
@@ -67,6 +132,8 @@ impl Misc {
             message_gate_out_2304: module.load_function("message_gate_out_2304")?,
             message_gate_out_rows_2304: module.load_function("message_gate_out_rows_2304")?,
             message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
+            argmax_wide_f32: module.load_function("argmax_wide_f32")?,
+            message_gate_step_2304: module.load_function("message_gate_step_2304")?,
         })
     }
 
@@ -170,64 +237,224 @@ impl Misc {
         Ok(())
     }
 
-    /// The end of `MessageGate` for one row from its BF16 down projection `down` (`[64]`):
-    /// the forget and gain projections (BF16 weights `[2304, 64]` with an F32 input) and
-    /// the combine into `out`, as [`Misc::message_gate_combine`] after the F32 GEMVs. Each
-    /// row sums in the order of MLX's GEMV for k = 64; tanh is CUDA's `tanhf`.
+    /// The end of `MessageGate` for one row from its BF16 down projection: the forget and
+    /// gain projections (BF16 weights `[2304, 64]` with an F32 input) and the combine into
+    /// `out`, as [`Misc::message_gate_combine`] after the F32 GEMVs. Each row sums in the
+    /// order of MLX's GEMV for k = 64; tanh is CUDA's `tanhf`.
     ///
-    /// With `norm` set to `(weight, normed, counter)`, also writes `normed =
-    /// bf16(rms_norm(out) * weight)`. `counter` must hold 0; the kernel leaves it at 0.
+    /// Runs up to three gates in one launch, one per entry of `slots`. Gate `s` reads
+    /// `down[64 s..]`, `h[s * h_stride..]` and `m[2304 s..]`, and writes `out[2304 s..]`.
+    /// With a norm, it also writes `normed = bf16(rms_norm(out) * weight)`, using
+    /// `counter[s]`, which must hold 0; the kernel leaves it at 0.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
     pub fn message_gate_out(
         &self,
         stream: &CudaStream,
-        down: &CudaSlice<bf16>,
-        forget: &CudaSlice<bf16>,
-        gain: &CudaSlice<bf16>,
+        down: &impl DeviceIn<bf16>,
+        slots: &mut [GateSlot<'_>],
         h: &impl DeviceIn<f32>,
+        h_stride: usize,
         m: &impl DeviceIn<f32>,
-        out: &mut CudaSlice<f32>,
-        norm: Option<(&CudaSlice<bf16>, &mut CudaSlice<bf16>, &mut CudaSlice<u32>)>,
+        out: &mut impl DeviceOut<f32>,
+        counter: &mut CudaSlice<u32>,
         eps: f32,
     ) -> anyhow::Result<()> {
-        let (h, m) = (h.view(), m.view());
-        check_len("down", down.len(), GATE_RANK)?;
-        check_len("forget", forget.len(), HIDDEN * GATE_RANK)?;
-        check_len("gain", gain.len(), HIDDEN * GATE_RANK)?;
-        check_len("h", h.len(), HIDDEN)?;
-        check_len("m", m.len(), HIDDEN)?;
-        check_len("out", out.len(), HIDDEN)?;
+        let (down, h, m, mut out) = (down.view(), h.view(), m.view(), out.view_mut());
+        let n = slots.len();
+        ensure!(
+            (1..=GATE_SLOTS).contains(&n),
+            "{n} gates; one launch takes 1 to {GATE_SLOTS}"
+        );
+        check_len("down", down.len(), n * GATE_RANK)?;
+        ensure!(
+            h.len() >= (n - 1) * h_stride + HIDDEN,
+            "h has {} elements, too few for {n} rows {h_stride} apart",
+            h.len()
+        );
+        check_len("m", m.len(), n * HIDDEN)?;
+        check_len("out", out.len(), n * HIDDEN)?;
+        ensure!(counter.len() >= n, "counter needs {n} elements");
+        for slot in &*slots {
+            check_len("forget", slot.forget.len(), HIDDEN * GATE_RANK)?;
+            check_len("gain", slot.gain.len(), HIDDEN * GATE_RANK)?;
+            if let Some((weight, normed)) = &slot.norm {
+                check_len("norm weight", weight.len(), HIDDEN)?;
+                check_len("normed", normed.len(), HIDDEN)?;
+            }
+        }
         let config = LaunchConfig {
-            grid_dim: (GATE_OUT_BLOCKS, 1, 1),
+            grid_dim: (GATE_OUT_BLOCKS, u32::try_from(n)?, 1),
             block_dim: (GATE_OUT_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
-        args.ptr(down, stream)
-            .ptr(forget, stream)
-            .ptr(gain, stream)
-            .ptr(&h, stream)
+        args.ptr(&down, stream);
+        for k in 0..GATE_SLOTS {
+            args.ptr(slots[k.min(n - 1)].forget, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(slots[k.min(n - 1)].gain, stream);
+        }
+        args.ptr(&h, stream)
+            .i32(i32::try_from(h_stride).context("h_stride too large")?)
             .ptr(&m, stream)
-            .ptr_mut(out, stream);
-        match norm {
-            Some((weight, normed, counter)) => {
+            .ptr_mut(&mut out, stream);
+        for k in 0..GATE_SLOTS {
+            args.opt(
+                slots.get(k).and_then(|s| s.norm.as_ref()).map(|n| n.0),
+                stream,
+            );
+        }
+        for k in 0..GATE_SLOTS {
+            args.opt_mut(
+                slots
+                    .get_mut(k)
+                    .and_then(|s| s.norm.as_mut())
+                    .map(|n| &mut n.1),
+                stream,
+            );
+        }
+        args.ptr_mut(counter, stream).f32(eps);
+        // SAFETY: the arguments match `message_gate_out_2304`'s signature, every buffer has
+        // the length checked above for the `n` gates of the grid's y dimension, a null
+        // `normed` makes a gate skip the norm, and the kernel reads only weights before
+        // `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.message_gate_out_2304, config) }
+    }
+
+    /// The whole `MessageGate` for one row and up to three gates in one launch: the down
+    /// projection of each gate's input, rounded to BF16, then the end of
+    /// [`Misc::message_gate_out`] from it. The down projection sums in another order than
+    /// [`crate::ops::linear::Linear::gemv_bf16`], and the norm's sum of squares in another
+    /// order than [`Misc::message_gate_out`]'s.
+    ///
+    /// Gate `k` reads `h[k * h_stride..]` and `m[2304 k..]` and writes `out[2304 k..]`.
+    /// `down`, if given, receives the BF16 down projections, `[gates, 64]`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn message_gate_step(
+        &self,
+        stream: &CudaStream,
+        gates: &mut [GateStep<'_>],
+        h: &impl DeviceIn<f32>,
+        h_stride: usize,
+        m: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<f32>,
+        down: Option<&mut CudaSlice<bf16>>,
+        scratch: &mut GateStepScratch,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let (h, m, mut out) = (h.view(), m.view(), out.view_mut());
+        let n = gates.len();
+        ensure!(
+            (1..=GATE_SLOTS).contains(&n),
+            "{n} gates; one launch takes 1 to {GATE_SLOTS}"
+        );
+        ensure!(
+            h.len() >= (n - 1) * h_stride + HIDDEN,
+            "h has {} elements, too few for {n} rows {h_stride} apart",
+            h.len()
+        );
+        check_len("m", m.len(), n * HIDDEN)?;
+        check_len("out", out.len(), n * HIDDEN)?;
+        if let Some(down) = &down {
+            check_len("down", down.len(), n * GATE_RANK)?;
+        }
+        for gate in &*gates {
+            check_len(
+                "down weight",
+                gate.down_weight.len(),
+                GATE_RANK * 2 * HIDDEN,
+            )?;
+            check_len("input", gate.input.len(), 2 * HIDDEN)?;
+            check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
+            check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
+            if let Some((weight, normed)) = &gate.norm {
                 check_len("norm weight", weight.len(), HIDDEN)?;
                 check_len("normed", normed.len(), HIDDEN)?;
-                ensure!(!counter.is_empty(), "counter is empty");
-                args.ptr(weight, stream)
-                    .ptr_mut(normed, stream)
-                    .ptr_mut(counter, stream);
-            }
-            None => {
-                args.u64(0).u64(0).u64(0);
             }
         }
-        args.f32(eps);
-        // SAFETY: the arguments match `message_gate_out_2304(const bf16*, const bf16*,
-        // const bf16*, const float*, const float*, float*, const bf16*, bf16*, unsigned*,
-        // float)`, every buffer has the length checked above, a null `normed` makes the
-        // kernel skip the norm and its buffers, and it reads only weights before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.message_gate_out_2304, config) }
+        let config = LaunchConfig {
+            grid_dim: (GATE_OUT_BLOCKS, u32::try_from(n)?, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        for k in 0..GATE_SLOTS {
+            args.ptr(gates[k.min(n - 1)].down_weight, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(&gates[k.min(n - 1)].input, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(gates[k.min(n - 1)].forget, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(gates[k.min(n - 1)].gain, stream);
+        }
+        args.ptr(&h, stream)
+            .i32(i32::try_from(h_stride).context("h_stride too large")?)
+            .ptr(&m, stream)
+            .ptr_mut(&mut out, stream);
+        for k in 0..GATE_SLOTS {
+            args.opt(
+                gates.get(k).and_then(|g| g.norm.as_ref()).map(|n| n.0),
+                stream,
+            );
+        }
+        for k in 0..GATE_SLOTS {
+            args.opt_mut(
+                gates
+                    .get_mut(k)
+                    .and_then(|g| g.norm.as_mut())
+                    .map(|n| &mut n.1),
+                stream,
+            );
+        }
+        args.opt_mut(down, stream)
+            .ptr_mut(&mut scratch.partials, stream)
+            .ptr_mut(&mut scratch.counters, stream)
+            .f32(eps);
+        // SAFETY: the arguments match `message_gate_step_2304`'s signature, every buffer has
+        // the length checked above for the `n` gates of the grid's y dimension, the scratch
+        // holds 32 x 65 partial sums and a barrier counter per gate, a null `normed` makes a
+        // gate skip the norm, and the kernel reads only weights before `pdl_wait`. Its
+        // barriers need every block resident, which 32 blocks of 288 threads per gate are.
+        unsafe { args.launch_pdl(stream, &self.message_gate_step_2304, config) }
+    }
+
+    /// The index of the largest of the values of one long F32 row `x`, as
+    /// [`Misc::argmax_f32`] with one row, over many blocks.
+    pub fn argmax_wide_f32(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<i32>,
+        scratch: &mut ArgmaxScratch,
+    ) -> anyhow::Result<()> {
+        let (x, mut out) = (x.view(), out.view_mut());
+        ensure!(!x.is_empty(), "x is empty");
+        check_len("out", out.len(), 1)?;
+        let n = i32::try_from(x.len()).context("x too long")?;
+        let blocks = x
+            .len()
+            .div_ceil(4 * ARGMAX_WIDE_PER_THREAD * ARGMAX_WIDE_THREADS as usize)
+            .min(ARGMAX_WIDE_BLOCKS);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks)?, 1, 1),
+            block_dim: (ARGMAX_WIDE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .i32(n)
+            .ptr_mut(&mut scratch.vals, stream)
+            .ptr_mut(&mut scratch.idxs, stream)
+            .ptr_mut(&mut scratch.counter, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: the arguments match `argmax_wide_f32(const float*, int, float*, int*,
+        // unsigned*, int*)`, the scratch holds a partial for each of the at most 256 blocks,
+        // a fresh buffer is 256-byte aligned, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.argmax_wide_f32, config) }
     }
 
     /// [`Misc::message_gate_out`] for each of the `rows` rows of a chunk: `down`

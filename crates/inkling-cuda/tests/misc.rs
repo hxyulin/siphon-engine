@@ -15,7 +15,7 @@ use inkling_cuda::{
     Gpu,
     ops::{
         linear::{Gemv, Linear},
-        misc::Misc,
+        misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, GateStepScratch, Misc},
         norm::Norm,
     },
 };
@@ -247,9 +247,22 @@ fn message_gate_out_matches_mlx() -> anyhow::Result<()> {
     let down = stream.clone_htod(&down)?;
     let (forget, gain) = (stream.clone_htod(&forget)?, stream.clone_htod(&gain)?);
 
+    let mut counter = stream.alloc_zeros::<u32>(GATE_SLOTS)?;
     let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
     s.misc.message_gate_out(
-        stream, &down, &forget, &gain, &h_dev, &m_dev, &mut out, None, EPS,
+        stream,
+        &down,
+        &mut [GateSlot {
+            forget: &forget,
+            gain: &gain,
+            norm: None,
+        }],
+        &h_dev,
+        0,
+        &m_dev,
+        &mut out,
+        &mut counter,
+        EPS,
     )?;
     assert_combine_close("gate.out", &stream.clone_dtoh(&out)?, &want, &h, &m);
 
@@ -257,7 +270,6 @@ fn message_gate_out_matches_mlx() -> anyhow::Result<()> {
         .map(|i| bf16::from_f32(0.5 + (i % 97) as f32 / 97.0))
         .collect();
     let weight = stream.clone_htod(&weight)?;
-    let mut counter = stream.alloc_zeros::<u32>(1)?;
     // Twice, so the second run relies on the first resetting the counter.
     for run in 0..2 {
         let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
@@ -265,12 +277,16 @@ fn message_gate_out_matches_mlx() -> anyhow::Result<()> {
         s.misc.message_gate_out(
             stream,
             &down,
-            &forget,
-            &gain,
+            &mut [GateSlot {
+                forget: &forget,
+                gain: &gain,
+                norm: Some((&weight, normed.as_view_mut())),
+            }],
             &h_dev,
+            0,
             &m_dev,
             &mut out,
-            Some((&weight, &mut normed, &mut counter)),
+            &mut counter,
             EPS,
         )?;
         let mut normed_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
@@ -283,9 +299,159 @@ fn message_gate_out_matches_mlx() -> anyhow::Result<()> {
         );
         assert_eq!(
             stream.clone_dtoh(&counter)?,
-            [0],
+            [0; GATE_SLOTS],
             "the kernel resets its counter"
         );
+    }
+    Ok(())
+}
+
+/// Three gates in one launch against one launch each, bit for bit: different weights,
+/// inputs and norms per gate, the last without a norm, and h rows given once and shared.
+#[test]
+fn message_gate_out_slots_match_single_slots() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let upload = |seed: u32, scale: f32| -> anyhow::Result<CudaSlice<bf16>> {
+        Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, seed, scale, 0.0))?)
+    };
+    let forgets = [upload(900, 0.3)?, upload(901, 0.3)?, upload(902, 0.3)?];
+    let gains = [upload(903, 0.3)?, upload(904, 0.3)?, upload(905, 0.3)?];
+    let norm_weights: Vec<CudaSlice<bf16>> = (0..2)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN, 906 + k, 0.5, 1.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let h_host = pseudo_random(GATE_SLOTS * HIDDEN, 910, 3.0);
+    let m_host = pseudo_random(GATE_SLOTS * HIDDEN, 911, 3.0);
+    let down_host = pseudo_random_bf16(GATE_SLOTS * GATE_RANK, 912, 2.0, 0.0);
+    let (h, m) = (stream.clone_htod(&h_host)?, stream.clone_htod(&m_host)?);
+    let down = stream.clone_htod(&down_host)?;
+    let mut counter = stream.alloc_zeros::<u32>(GATE_SLOTS)?;
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    let bf_bits = |v: &[bf16]| -> Vec<u16> { v.iter().map(|x| x.to_bits()).collect() };
+
+    for h_stride in [HIDDEN, 0] {
+        let mut out = stream.alloc_zeros::<f32>(GATE_SLOTS * HIDDEN)?;
+        let mut normed: Vec<CudaSlice<bf16>> = (0..2)
+            .map(|_| Ok(stream.alloc_zeros::<bf16>(HIDDEN)?))
+            .collect::<anyhow::Result<_>>()?;
+        let [n0, n1] = &mut normed[..] else {
+            unreachable!()
+        };
+        s.misc.message_gate_out(
+            stream,
+            &down,
+            &mut [
+                GateSlot {
+                    forget: &forgets[0],
+                    gain: &gains[0],
+                    norm: Some((&norm_weights[0], n0.as_view_mut())),
+                },
+                GateSlot {
+                    forget: &forgets[1],
+                    gain: &gains[1],
+                    norm: Some((&norm_weights[1], n1.as_view_mut())),
+                },
+                GateSlot {
+                    forget: &forgets[2],
+                    gain: &gains[2],
+                    norm: None,
+                },
+            ],
+            &h,
+            h_stride,
+            &m,
+            &mut out,
+            &mut counter,
+            EPS,
+        )?;
+        let out = stream.clone_dtoh(&out)?;
+        for k in 0..GATE_SLOTS {
+            let label = format!("h stride {h_stride}, gate {k}");
+            let h_row = stream.clone_htod(&h_host[k * h_stride..k * h_stride + HIDDEN])?;
+            let m_row = stream.clone_htod(&m_host[k * HIDDEN..(k + 1) * HIDDEN])?;
+            let down_row = stream.clone_htod(&down_host[k * GATE_RANK..(k + 1) * GATE_RANK])?;
+            let mut out_want = stream.alloc_zeros::<f32>(HIDDEN)?;
+            let mut normed_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+            s.misc.message_gate_out(
+                stream,
+                &down_row,
+                &mut [GateSlot {
+                    forget: &forgets[k],
+                    gain: &gains[k],
+                    norm: norm_weights.get(k).map(|w| (w, normed_want.as_view_mut())),
+                }],
+                &h_row,
+                0,
+                &m_row,
+                &mut out_want,
+                &mut counter,
+                EPS,
+            )?;
+            assert_eq!(
+                bits(&out[k * HIDDEN..(k + 1) * HIDDEN]),
+                bits(&stream.clone_dtoh(&out_want)?),
+                "{label}: out"
+            );
+            if k < 2 {
+                assert_eq!(
+                    bf_bits(&stream.clone_dtoh(&normed[k])?),
+                    bf_bits(&stream.clone_dtoh(&normed_want)?),
+                    "{label}: normed"
+                );
+            }
+        }
+        assert_eq!(
+            stream.clone_dtoh(&counter)?,
+            [0; GATE_SLOTS],
+            "the kernel resets its counters"
+        );
+    }
+    Ok(())
+}
+
+/// The many-block argmax against the one-block kernel on long rows: the fixture's rows,
+/// a row whose maximum repeats (the first wins), one with NaNs (the first NaN wins), and
+/// lengths that leave a scalar tail.
+#[test]
+fn argmax_wide_matches_argmax() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let mut scratch = ArgmaxScratch::new(stream)?;
+    let mut rows: Vec<(String, Vec<f32>)> = Vec::new();
+    for name in ["argmax.vocab", "argmax.special"] {
+        let (x, shape) = s.fixture.f32(&format!("{name}.x"))?;
+        for (r, row) in x.chunks(shape[1]).enumerate() {
+            rows.push((format!("{name} row {r}"), row.to_vec()));
+        }
+    }
+    for n in [201_024, 201_027, 5, 1] {
+        let mut x = pseudo_random(n, 920 + n as u32, 10.0);
+        rows.push((format!("random {n}"), x.clone()));
+        if n > 1000 {
+            x[777] = 50.0;
+            x[n - 2] = 50.0;
+            x[150_000] = 50.0;
+            rows.push((format!("repeated maximum {n}"), x.clone()));
+            x[160_000] = f32::NAN;
+            x[90_000] = f32::NAN;
+            rows.push((format!("NaN {n}"), x));
+        }
+    }
+    for (label, x) in rows {
+        let x_dev = stream.clone_htod(&x)?;
+        let mut want = stream.alloc_zeros::<i32>(1)?;
+        s.misc.argmax_f32(stream, &x_dev, &mut want, x.len())?;
+        // Twice, so the second run relies on the first resetting the counter.
+        for run in 0..2 {
+            let mut got = stream.alloc_zeros::<i32>(1)?;
+            s.misc
+                .argmax_wide_f32(stream, &x_dev, &mut got, &mut scratch)?;
+            assert_eq!(
+                stream.clone_dtoh(&got)?,
+                stream.clone_dtoh(&want)?,
+                "{label}, run {run}"
+            );
+        }
     }
     Ok(())
 }
@@ -344,7 +510,7 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
     let out_plain = stream.clone_dtoh(&out_plain)?;
 
     let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
-    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    let mut counter = stream.alloc_zeros::<u32>(GATE_SLOTS)?;
     for row in 0..ROWS {
         let h_row = stream.clone_htod(&h_host[row * STRIDE..row * STRIDE + HIDDEN])?;
         let m_row = stream.clone_htod(&m_host[row * STRIDE..row * STRIDE + HIDDEN])?;
@@ -354,12 +520,16 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
         s.misc.message_gate_out(
             stream,
             &down_row,
-            &forget,
-            &gain,
+            &mut [GateSlot {
+                forget: &forget,
+                gain: &gain,
+                norm: Some((&weight, normed_want.as_view_mut())),
+            }],
             &h_row,
+            0,
             &m_row,
             &mut out_want,
-            Some((&weight, &mut normed_want, &mut counter)),
+            &mut counter,
             EPS,
         )?;
         let out_want = bits(&stream.clone_dtoh(&out_want)?);
@@ -377,6 +547,147 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
             .map(|x| x.to_bits())
             .collect();
         assert_eq!(normed_bits, want_bits, "row {row}: normed");
+    }
+    Ok(())
+}
+
+/// The one-launch gate against the down-projection GEMV and `message_gate_out`, for three
+/// gates (the last without a norm) with h rows given apart and shared, three runs each so
+/// the barrier counters cycle. The down projection sums in another order than the GEMV, so
+/// each BF16 value may differ by one ulp. From the kernel's own down projection,
+/// `message_gate_out` must give the same output bit for bit and the same normalized output
+/// within one BF16 ulp (the sum of squares adds in another order).
+#[test]
+#[expect(clippy::too_many_lines, reason = "three gates, two references")]
+fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let linear = Linear::load(s.gpu.context())?;
+    let upload = |len: usize, seed: u32, scale: f32| -> anyhow::Result<CudaSlice<bf16>> {
+        Ok(stream.clone_htod(&pseudo_random_bf16(len, seed, scale, 0.0))?)
+    };
+    let downs = [
+        upload(GATE_RANK * 2 * HIDDEN, 930, 0.05)?,
+        upload(GATE_RANK * 2 * HIDDEN, 931, 0.05)?,
+        upload(GATE_RANK * 2 * HIDDEN, 932, 0.05)?,
+    ];
+    let inputs = [
+        upload(2 * HIDDEN, 933, 2.0)?,
+        upload(2 * HIDDEN, 934, 2.0)?,
+        upload(2 * HIDDEN, 935, 2.0)?,
+    ];
+    let forgets = [
+        upload(HIDDEN * GATE_RANK, 936, 0.3)?,
+        upload(HIDDEN * GATE_RANK, 937, 0.3)?,
+        upload(HIDDEN * GATE_RANK, 938, 0.3)?,
+    ];
+    let gains = [
+        upload(HIDDEN * GATE_RANK, 939, 0.3)?,
+        upload(HIDDEN * GATE_RANK, 940, 0.3)?,
+        upload(HIDDEN * GATE_RANK, 941, 0.3)?,
+    ];
+    let norm_weights: Vec<CudaSlice<bf16>> = (0..2)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN, 942 + k, 0.5, 1.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let h_host = pseudo_random(GATE_SLOTS * HIDDEN, 944, 3.0);
+    let m_host = pseudo_random(GATE_SLOTS * HIDDEN, 945, 3.0);
+    let (h, m) = (stream.clone_htod(&h_host)?, stream.clone_htod(&m_host)?);
+    let mut scratch = GateStepScratch::new(stream)?;
+    let mut counter = stream.alloc_zeros::<u32>(GATE_SLOTS)?;
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+
+    for (run, h_stride) in [HIDDEN, 0, HIDDEN].into_iter().enumerate() {
+        let mut out = stream.alloc_zeros::<f32>(GATE_SLOTS * HIDDEN)?;
+        let mut down = stream.alloc_zeros::<bf16>(GATE_SLOTS * GATE_RANK)?;
+        let mut normed: Vec<CudaSlice<bf16>> = (0..2)
+            .map(|_| Ok(stream.alloc_zeros::<bf16>(HIDDEN)?))
+            .collect::<anyhow::Result<_>>()?;
+        let [n0, n1] = &mut normed[..] else {
+            unreachable!()
+        };
+        let mut gates = [
+            GateStep {
+                down_weight: &downs[0],
+                input: inputs[0].as_view(),
+                forget: &forgets[0],
+                gain: &gains[0],
+                norm: Some((&norm_weights[0], n0.as_view_mut())),
+            },
+            GateStep {
+                down_weight: &downs[1],
+                input: inputs[1].as_view(),
+                forget: &forgets[1],
+                gain: &gains[1],
+                norm: Some((&norm_weights[1], n1.as_view_mut())),
+            },
+            GateStep {
+                down_weight: &downs[2],
+                input: inputs[2].as_view(),
+                forget: &forgets[2],
+                gain: &gains[2],
+                norm: None,
+            },
+        ];
+        s.misc.message_gate_step(
+            stream,
+            &mut gates,
+            &h,
+            h_stride,
+            &m,
+            &mut out,
+            Some(&mut down),
+            &mut scratch,
+            EPS,
+        )?;
+        let out = stream.clone_dtoh(&out)?;
+        let down = stream.clone_dtoh(&down)?;
+        for k in 0..GATE_SLOTS {
+            let label = format!("run {run}, gate {k}");
+            let mut down_want = stream.alloc_zeros::<bf16>(GATE_RANK)?;
+            linear.gemv_bf16(
+                stream,
+                &mut [Gemv::new(&downs[k], &inputs[k], &mut down_want)],
+            )?;
+            let own_down = &down[k * GATE_RANK..(k + 1) * GATE_RANK];
+            assert_bf16_close(
+                &format!("{label}: down"),
+                own_down,
+                &stream.clone_dtoh(&down_want)?,
+                1,
+            );
+            let h_row = stream.clone_htod(&h_host[k * h_stride..k * h_stride + HIDDEN])?;
+            let m_row = stream.clone_htod(&m_host[k * HIDDEN..(k + 1) * HIDDEN])?;
+            let mut out_want = stream.alloc_zeros::<f32>(HIDDEN)?;
+            let mut normed_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+            s.misc.message_gate_out(
+                stream,
+                &stream.clone_htod(own_down)?,
+                &mut [GateSlot {
+                    forget: &forgets[k],
+                    gain: &gains[k],
+                    norm: norm_weights.get(k).map(|w| (w, normed_want.as_view_mut())),
+                }],
+                &h_row,
+                0,
+                &m_row,
+                &mut out_want,
+                &mut counter,
+                EPS,
+            )?;
+            assert_eq!(
+                bits(&out[k * HIDDEN..(k + 1) * HIDDEN]),
+                bits(&stream.clone_dtoh(&out_want)?),
+                "{label}: out"
+            );
+            if k < 2 {
+                assert_bf16_close(
+                    &format!("{label}: normed"),
+                    &stream.clone_dtoh(&normed[k])?,
+                    &stream.clone_dtoh(&normed_want)?,
+                    1,
+                );
+            }
+        }
     }
     Ok(())
 }

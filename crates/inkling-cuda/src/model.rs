@@ -33,9 +33,9 @@ use crate::{
         elementwise::Elementwise,
         experts::{self, Experts},
         linear::{Gemm, Gemv, Linear},
-        misc::Misc,
+        misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
         norm::{AttentionPost, KvConvWeights, Norm},
-        routing::{NormDest, Partial, Routing},
+        routing::{DepthStep, NormDest, Routing, StepPartial},
     },
     weights::{ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, Weights},
 };
@@ -128,18 +128,17 @@ struct Scratch {
     /// Block states for depth attention, F32 `[max_blocks, hidden]`: the normalized residual
     /// at each block boundary. The host counts the rows in use.
     blocks: CudaSlice<f32>,
-    /// The message bank, F32 `[max_blocks, hidden]`: the block states the previous pass
-    /// added after its first one. The host counts the rows in use.
-    bank: CudaSlice<f32>,
-    /// The normalized hidden state at the end of the previous pass.
-    bank_normed: CudaSlice<f32>,
-    /// Depth attention over the bank, F32 `[4, hidden]`.
+    /// Every looped layer's message queries, F32 `[core layers, 4, hidden]`, copied from
+    /// the weights so one launch can run them all.
+    message_queries: CudaSlice<f32>,
+    /// Depth attention over the bank for every looped layer, F32 `[core layers, 4, hidden]`.
     messages: CudaSlice<f32>,
     /// The normalized visit input, when it does not start a block state.
     normed_residual: CudaSlice<f32>,
     /// Depth attention for the attention inputs, F32 `[1 or 3, hidden]`.
     attention_inputs: CudaSlice<f32>,
-    /// A message gate's output.
+    /// The message gates' outputs, F32 `[3, hidden]`: the attention gates', then the MLP
+    /// gate's in the first row.
     gated: CudaSlice<f32>,
     gate: GateScratch,
     /// Normalized query, key and value inputs of attention. Layer 0 uses only the first.
@@ -153,16 +152,17 @@ struct Scratch {
     logits: CudaSlice<bf16>,
     /// F32 logits after the softcap, `[unpadded_vocab]`.
     capped: CudaSlice<f32>,
+    argmax: ArgmaxScratch,
 }
 
 /// Intermediates of `MessageGate`.
 struct GateScratch {
-    /// For each message slot, the normalized state and message side by side, BF16
-    /// `[2 * hidden]`: the down projection's input. Depth attention writes both halves.
+    /// For each message slot, every looped layer's normalized state and message side by
+    /// side, BF16 `[core layers, 2 * hidden]`: the down projections' inputs. Depth
+    /// attention writes both halves, the messages for all layers at the start of a pass.
     inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
-    down: CudaSlice<bf16>,
-    /// The block counter of the gate kernel's norm.
-    counter: CudaSlice<u32>,
+    /// The gate kernel's cross-block sums and barrier counters.
+    step: GateStepScratch,
 }
 
 /// Intermediates of `SlidingAttention` and `FullAttention`.
@@ -213,9 +213,9 @@ impl Scratch {
         let head_dim = cfg.head_dim;
         let kv_dims = cfg.num_key_value_heads * head_dim;
         let dynamic = cfg.num_key_value_heads * cfg.sconv_kernel_size;
-        let rank = cfg.loop_config.gate_rank;
         let top_k = cfg.num_experts_per_tok;
         let width = cfg.intermediate_size;
+        let looped = cfg.loop_config.core_end - cfg.loop_config.core_start;
         Ok(Self {
             token: zeros(stream, 1)?,
             position: zeros(stream, 1)?,
@@ -225,21 +225,19 @@ impl Scratch {
             out: zeros(stream, hidden)?,
             prelude_hidden: zeros(stream, hidden)?,
             blocks: zeros(stream, max_blocks * hidden)?,
-            bank: zeros(stream, max_blocks * hidden)?,
-            bank_normed: zeros(stream, hidden)?,
-            messages: zeros(stream, MESSAGE_SLOTS * hidden)?,
+            message_queries: zeros(stream, looped * MESSAGE_SLOTS * hidden)?,
+            messages: zeros(stream, looped * MESSAGE_SLOTS * hidden)?,
             normed_residual: zeros(stream, hidden)?,
             attention_inputs: zeros(stream, 3 * hidden)?,
-            gated: zeros(stream, hidden)?,
+            gated: zeros(stream, GATE_SLOTS * hidden)?,
             gate: GateScratch {
                 inputs: [
-                    zeros(stream, 2 * hidden)?,
-                    zeros(stream, 2 * hidden)?,
-                    zeros(stream, 2 * hidden)?,
-                    zeros(stream, 2 * hidden)?,
+                    zeros(stream, looped * 2 * hidden)?,
+                    zeros(stream, looped * 2 * hidden)?,
+                    zeros(stream, looped * 2 * hidden)?,
+                    zeros(stream, looped * 2 * hidden)?,
                 ],
-                down: zeros(stream, rank)?,
-                counter: zeros(stream, 1)?,
+                step: GateStepScratch::new(stream)?,
             },
             qkv_in: [
                 zeros(stream, hidden)?,
@@ -280,6 +278,7 @@ impl Scratch {
             final_hidden: zeros(stream, hidden)?,
             logits: zeros(stream, cfg.vocab_size)?,
             capped: zeros(stream, cfg.unpadded_vocab_size)?,
+            argmax: ArgmaxScratch::new(stream)?,
         })
     }
 }
@@ -393,7 +392,19 @@ impl Model {
         let max_blocks = block_starts(&config, 0..loops.core_start)
             + block_starts(&config, loops.core_start..loops.core_end)
             + block_starts(&config, loops.core_end..config.num_hidden_layers);
-        let scratch = Scratch::new(&stream, &config, max_blocks)?;
+        let mut scratch = Scratch::new(&stream, &config, max_blocks)?;
+        ensure!(
+            weights.message_queries.len() == loops.core_end - loops.core_start,
+            "one set of message queries per looped layer"
+        );
+        for (i, queries) in weights.message_queries.iter().enumerate() {
+            let len = MESSAGE_SLOTS * hidden;
+            ensure!(queries.len() == len, "message queries of layer {i}");
+            stream.memcpy_dtod(
+                queries,
+                &mut scratch.message_queries.slice_mut(i * len..(i + 1) * len),
+            )?;
+        }
         Ok(Self {
             ctx: Ctx {
                 config,
@@ -540,6 +551,22 @@ impl Model {
         let hidden = ctx.hidden();
         let mut visits = self.visits.iter_mut();
         let mut next_visit = || visits.next().context("fewer visit caches than visits");
+        // Each visit's layer and whether it takes messages: the next visit's weights stream
+        // into L2 during the MoE half of the current one.
+        let looped = core_end - core_start;
+        let plan: Vec<(usize, bool)> = cfg
+            .visit_layers(self.passes)
+            .into_iter()
+            .enumerate()
+            .map(|(v, layer)| {
+                (
+                    layer,
+                    v >= core_start + looped && v < core_start + self.passes * looped,
+                )
+            })
+            .collect();
+        let mut upcoming = plan.iter().skip(1).map(|&p| Some(p)).chain([None]);
+        let mut next_plan = || upcoming.next().flatten();
 
         ctx.kernels.elementwise.embedding(
             &ctx.stream,
@@ -559,65 +586,67 @@ impl Model {
             len: 0,
             max: self.max_blocks,
         };
+        ctx.kernels
+            .linear
+            .prefetch(&ctx.stream, &ctx.visit_prefetch(plan[0].0, plan[0].1))?;
         for layer in 0..core_start {
             ctx.visit(
                 s,
                 next_visit()?,
-                layer,
+                VisitPlan {
+                    layer,
+                    looped: None,
+                    next: next_plan(),
+                },
                 &mut blocks,
-                false,
                 trace.as_deref_mut(),
             )?;
         }
         ctx.stream.memcpy_dtod(&s.hidden, &mut s.prelude_hidden)?;
         let prelude_blocks = blocks.len;
-        let mut bank_rows = 0;
         for pass in 0..self.passes {
             if pass > 0 {
-                // The message bank: block states the pass added after its first one, and
-                // the normalized hidden state at the end of the pass.
-                ctx.kernels.norm.unweighted_rms_norm_bf16(
-                    &ctx.stream,
-                    &s.hidden,
-                    &mut s.bank_normed,
-                    ctx.eps(),
-                )?;
-                bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
+                // Every looped layer's messages, and their normalized halves of the gate
+                // inputs, in one launch. They attend over the message bank: the block
+                // states the previous pass added after its first one, and the normalized
+                // hidden state at its end.
+                let bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
                 ensure!(bank_rows > 0, "the message bank needs a block state");
-                ctx.stream.memcpy_dtod(
-                    &s.blocks
-                        .slice((prelude_blocks + 1) * hidden..blocks.len * hidden),
-                    &mut s.bank.slice_mut(..bank_rows * hidden),
+                let dests = s.gate.inputs.each_mut().map(|x| {
+                    Some(NormDest {
+                        out: x.slice_mut(hidden..),
+                        weight: None,
+                    })
+                });
+                ctx.kernels.routing.depth_attention_step(
+                    &ctx.stream,
+                    DepthStep {
+                        blocks: s
+                            .blocks
+                            .slice((prelude_blocks + 1) * hidden..blocks.len * hidden),
+                        partial: StepPartial::Bf16(s.hidden.as_view()),
+                        normed_partial: None,
+                        queries: s.message_queries.as_view(),
+                        batch: core_end - core_start,
+                        out: Some(s.messages.as_view_mut()),
+                        dests,
+                        dst_stride: 2 * hidden,
+                    },
+                    ctx.eps(),
                 )?;
                 ctx.stream.memcpy_dtod(&s.prelude_hidden, &mut s.hidden)?;
                 blocks.len = prelude_blocks;
             }
             for (i, layer) in (core_start..core_end).enumerate() {
-                if pass > 0 {
-                    // The messages, and their normalized halves of the gate inputs.
-                    let dests = s.gate.inputs.each_mut().map(|x| {
-                        Some(NormDest {
-                            out: x.slice_mut(hidden..),
-                            weight: None,
-                        })
-                    });
-                    ctx.kernels.routing.depth_attention_fused(
-                        &ctx.stream,
-                        &s.bank.slice(..bank_rows * hidden),
-                        Partial::Normalized(s.bank_normed.as_view()),
-                        None,
-                        &ctx.weights.message_queries[i],
-                        Some(s.messages.as_view_mut()),
-                        dests,
-                        ctx.eps(),
-                    )?;
-                }
                 ctx.visit(
                     s,
                     next_visit()?,
-                    layer,
+                    VisitPlan {
+                        layer,
+                        looped: (pass > 0).then_some(i),
+                        next: next_plan(),
+                    },
                     &mut blocks,
-                    pass > 0,
                     trace.as_deref_mut(),
                 )?;
             }
@@ -626,29 +655,37 @@ impl Model {
             ctx.visit(
                 s,
                 next_visit()?,
-                layer,
+                VisitPlan {
+                    layer,
+                    looped: None,
+                    next: next_plan(),
+                },
                 &mut blocks,
-                false,
                 trace.as_deref_mut(),
             )?;
         }
 
-        ctx.kernels.routing.depth_attention_fused(
+        ctx.kernels.linear.join_prefetch(&ctx.stream)?;
+        ctx.kernels.routing.depth_attention_step(
             &ctx.stream,
-            &blocks.rows(&s.blocks, hidden)?,
-            Partial::Bf16(s.hidden.as_view()),
-            None,
-            &ctx.weights.final_query,
-            None,
-            [
-                Some(NormDest {
-                    out: s.final_hidden.as_view_mut(),
-                    weight: Some(&ctx.weights.norm),
-                }),
-                None,
-                None,
-                None,
-            ],
+            DepthStep {
+                blocks: blocks.rows(&s.blocks, hidden)?,
+                partial: StepPartial::Bf16(s.hidden.as_view()),
+                normed_partial: None,
+                queries: ctx.weights.final_query.as_view(),
+                batch: 1,
+                out: None,
+                dests: [
+                    Some(NormDest {
+                        out: s.final_hidden.as_view_mut(),
+                        weight: Some(&ctx.weights.norm),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                dst_stride: 0,
+            },
             ctx.eps(),
         )?;
         ctx.kernels.linear.gemv_bf16(
@@ -665,17 +702,25 @@ impl Model {
             &mut s.capped,
             cfg.final_logit_softcapping,
         )?;
-        ctx.kernels.misc.argmax_f32(
-            &ctx.stream,
-            &s.capped,
-            &mut s.next,
-            cfg.unpadded_vocab_size,
-        )?;
+        ctx.kernels
+            .misc
+            .argmax_wide_f32(&ctx.stream, &s.capped, &mut s.next, &mut s.argmax)?;
         if let Some(t) = trace {
             t.logits = ctx.stream.clone_dtoh(&s.capped)?;
         }
         Ok(())
     }
+}
+
+/// Which layer a visit runs, and whose weights it prefetches next.
+#[derive(Clone, Copy)]
+struct VisitPlan {
+    layer: usize,
+    /// The layer's index among the looped layers, on passes after the first, which take
+    /// messages.
+    looped: Option<usize>,
+    /// The next visit's layer and whether it takes messages.
+    next: Option<(usize, bool)>,
 }
 
 /// The count of block states in use, the leading rows of `Scratch::blocks`.
@@ -716,11 +761,28 @@ struct AttentionInputs<'a> {
     qkv_in: &'a mut [CudaSlice<bf16>; 3],
     gate: &'a mut GateScratch,
     gated: &'a mut CudaSlice<f32>,
-    /// The layer's message gates and the messages, on looped passes after the first.
-    messages: Option<(&'a [MessageGateWeights; MESSAGE_SLOTS], &'a CudaSlice<f32>)>,
+    /// On looped passes after the first: the layer's message gates, its index among the
+    /// looped layers, and every looped layer's messages.
+    messages: Option<(
+        &'a [MessageGateWeights; MESSAGE_SLOTS],
+        usize,
+        &'a CudaSlice<f32>,
+    )>,
 }
 
 impl Ctx {
+    /// The weights a visit of `layer` reads first: the attention projections and, with
+    /// `messages`, the message gates that build their inputs.
+    fn visit_prefetch(&self, layer: usize, messages: bool) -> Vec<&CudaSlice<bf16>> {
+        let w = &self.weights.layers[layer];
+        let mut weights = Vec::new();
+        if let Some(gates) = w.message_gates.as_ref().filter(|_| messages) {
+            weights.extend(gates[..3].iter().flat_map(MessageGateWeights::matrices));
+        }
+        weights.extend(w.attention.input_projections());
+        weights
+    }
+
     /// One decoder-layer visit, as MLX-LM's `DecoderLayer.__call__`, from `s.hidden` to
     /// `s.out`; the two then swap.
     #[expect(
@@ -731,11 +793,15 @@ impl Ctx {
         &self,
         s: &mut Scratch,
         state: &mut VisitState,
-        layer: usize,
+        plan: VisitPlan,
         blocks: &mut Blocks,
-        messages: bool,
         trace: Option<&mut Trace>,
     ) -> anyhow::Result<()> {
+        let VisitPlan {
+            layer,
+            looped,
+            next,
+        } = plan;
         let w = &self.weights.layers[layer];
         let sliding = self.config.is_sliding(layer);
         let hidden = self.hidden();
@@ -744,18 +810,22 @@ impl Ctx {
             !block_start || blocks.len < blocks.max,
             "more block states than planned"
         );
-        let gates = if messages {
-            w.message_gates.as_ref()
-        } else {
-            None
-        };
-        // The weights of the attention projections, and of the message gates that build
-        // their inputs, stream into L2 while those inputs are built.
-        let mut prefetch = Vec::new();
-        if let Some(gates) = gates {
-            prefetch.extend(gates[..3].iter().flat_map(MessageGateWeights::matrices));
+        let gates = w.message_gates.as_ref().zip(looped);
+        // The previous visit (or the step, for the first) started prefetching this visit's
+        // projection weights. The output projection's and the MLP gate's weights follow,
+        // then the next visit's projection weights, which stream during the MoE half of
+        // this visit while its experts leave DRAM bandwidth to spare. The first visit does
+        // not wait for its prefetch: its projections read from DRAM alongside it.
+        if layer > 0 {
+            self.kernels.linear.join_prefetch(&self.stream)?;
         }
-        prefetch.extend(w.attention.input_projections());
+        let mut prefetch = vec![&w.attention.o];
+        if let Some((gates, _)) = gates {
+            prefetch.extend(gates[3].matrices());
+        }
+        if let Some((layer, messages)) = next {
+            prefetch.extend(self.visit_prefetch(layer, messages));
+        }
         self.kernels.linear.prefetch(&self.stream, &prefetch)?;
 
         // The normalized visit input goes straight into the new block state at a block start.
@@ -775,7 +845,7 @@ impl Ctx {
                 qkv_in: &mut s.qkv_in,
                 gate: &mut s.gate,
                 gated: &mut s.gated,
-                messages: gates.map(|g| (g, &s.messages)),
+                messages: gates.map(|(g, i)| (g, i, &s.messages)),
             },
             sliding,
         )?;
@@ -796,52 +866,55 @@ impl Ctx {
             sliding,
             [q_in, k_in, v_in],
         )?;
-        if let Some(gates) = gates {
-            self.kernels
-                .linear
-                .prefetch(&self.stream, &gates[3].matrices())?;
-        }
-
-        self.kernels.conv.short_conv_residual(
+        // The post-attention conv and residual add, then depth attention for the MLP input.
+        // Without a gate, the kernel also applies the MoE input norm. With one, it writes
+        // the MLP state's normalized half of the gate input, and the gate applies the norm.
+        let gate_row = gates.map(|(_, i)| i * 2 * hidden..i * 2 * hidden + hidden);
+        let mlp_dest = match &gate_row {
+            Some(row) => NormDest {
+                out: s.gate.inputs[3].slice_mut(row.clone()),
+                weight: None,
+            },
+            None => NormDest {
+                out: s.mlp_x.as_view_mut(),
+                weight: Some(&w.mlp_norm),
+            },
+        };
+        let [.., conv_state, _] = &mut state.conv;
+        self.kernels.routing.depth_attention_step(
             &self.stream,
-            &s.attention.proj,
-            &w.post_attention_conv,
-            &mut state.conv[2],
-            (!block_start).then_some(&s.hidden),
-            &mut s.residual,
-        )?;
-
-        // With a gate, the MLP state's normalized half of the gate input.
-        let gate_dest = gates.map(|_| NormDest {
-            out: s.gate.inputs[3].slice_mut(..hidden),
-            weight: None,
-        });
-        self.kernels.routing.depth_attention_fused(
-            &self.stream,
-            &blocks.rows(&s.blocks, hidden)?,
-            Partial::F32(s.residual.as_view()),
-            None,
-            &w.mlp_query,
-            Some(s.mlp_input.as_view_mut()),
-            [None, None, None, gate_dest],
+            DepthStep {
+                blocks: blocks.rows(&s.blocks, hidden)?,
+                partial: StepPartial::ConvResidual {
+                    x: s.attention.proj.as_view(),
+                    weight: &w.post_attention_conv,
+                    state: conv_state.as_view_mut(),
+                    hidden: (!block_start).then(|| s.hidden.as_view()),
+                    residual: s.residual.as_view_mut(),
+                },
+                normed_partial: None,
+                queries: w.mlp_query.as_view(),
+                batch: 1,
+                out: gates.is_some().then(|| s.mlp_input.as_view_mut()),
+                dests: [None, None, None, Some(mlp_dest)],
+                dst_stride: 0,
+            },
             self.eps(),
         )?;
-        let mlp_input = match gates {
-            Some(gates) => {
-                self.message_gate(
-                    &gates[3],
-                    &mut s.gate,
-                    3,
-                    &s.mlp_input,
-                    &s.messages.slice(3 * hidden..4 * hidden),
-                    &mut s.gated,
-                    None,
-                )?;
-                &s.gated
-            }
-            None => &s.mlp_input,
-        };
-        self.moe(w, &mut s.moe, mlp_input, &mut s.mlp_x)?;
+        if let Some((gates, i)) = gates {
+            let message = (i * MESSAGE_SLOTS + 3) * hidden;
+            self.message_gates(
+                &gates[3..],
+                &mut s.gate,
+                3,
+                i,
+                (&s.mlp_input, 0),
+                &s.messages.slice(message..message + hidden),
+                &mut s.gated,
+                vec![Some((&w.mlp_norm, s.mlp_x.as_view_mut()))],
+            )?;
+        }
+        self.moe(w, &mut s.moe, &s.mlp_x)?;
 
         self.kernels.conv.moe_conv_residual(
             &self.stream,
@@ -853,9 +926,6 @@ impl Ctx {
             &mut s.out,
         )?;
 
-        // Join the L2 prefetches once per visit. Joining before the output projection and
-        // the MLP gate made the main stream wait for prefetches still running.
-        self.kernels.linear.join_prefetch(&self.stream)?;
         if let Some(t) = trace {
             t.visits.push(VisitTrace {
                 input: self.stream.clone_dtoh(&s.hidden)?,
@@ -914,10 +984,11 @@ impl Ctx {
         let [q0, q1, q2] = &mut *a.qkv_in;
         // Without messages, the depth-attention kernel applies the input norms. With them, it
         // writes the normalized states into the gate inputs, and each gate applies its norm.
-        let dests = if a.messages.is_some() {
+        let dests = if let Some((_, looped, _)) = a.messages {
+            let row = looped * 2 * hidden;
             [g0, g1, g2].map(|g| {
                 Some(NormDest {
-                    out: g.slice_mut(..hidden),
+                    out: g.slice_mut(row..row + hidden),
                     weight: None,
                 })
             })
@@ -939,33 +1010,43 @@ impl Ctx {
             })
         };
         let [d0, d1, d2] = dests;
-        self.kernels.routing.depth_attention_fused(
+        self.kernels.routing.depth_attention_step(
             &self.stream,
-            &a.states,
-            Partial::Bf16(a.x.as_view()),
-            Some(a.normed),
-            query,
-            a.messages
-                .is_some()
-                .then(|| a.inputs.slice_mut(..count * hidden)),
-            [d0, d1, d2, None],
+            DepthStep {
+                blocks: a.states,
+                partial: StepPartial::Bf16(a.x.as_view()),
+                normed_partial: Some(a.normed),
+                queries: query.as_view(),
+                batch: 1,
+                out: a
+                    .messages
+                    .is_some()
+                    .then(|| a.inputs.slice_mut(..count * hidden)),
+                dests: [d0, d1, d2, None],
+                dst_stride: 0,
+            },
             self.eps(),
         )?;
-        let Some((gates, messages)) = a.messages else {
+        let Some((gates, looped, messages)) = a.messages else {
             return Ok(shared);
         };
-        for (i, norm) in norms.into_iter().enumerate() {
-            let row = if shared { 0 } else { i };
-            self.message_gate(
-                &gates[i],
-                &mut *a.gate,
-                i,
-                &a.inputs.slice(row * hidden..(row + 1) * hidden),
-                &messages.slice(i * hidden..(i + 1) * hidden),
-                &mut *a.gated,
-                Some((norm, &mut a.qkv_in[i])),
-            )?;
-        }
+        // The three gates in one launch; with a shared input they all read its one row.
+        let message = looped * MESSAGE_SLOTS * hidden;
+        let [q0, q1, q2] = &mut *a.qkv_in;
+        self.message_gates(
+            &gates[..3],
+            &mut *a.gate,
+            0,
+            looped,
+            (&*a.inputs, if shared { 0 } else { hidden }),
+            &messages.slice(message..message + 3 * hidden),
+            &mut *a.gated,
+            [q0, q1, q2]
+                .into_iter()
+                .zip(norms)
+                .map(|(q, norm)| Some((norm, q.as_view_mut())))
+                .collect(),
+        )?;
         Ok(false)
     }
 
@@ -1062,55 +1143,61 @@ impl Ctx {
             .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])
     }
 
-    /// MLX-LM's `MessageGate` for message slot `slot`: mixes `message` into the F32 state
-    /// `h`, into `out`. Depth attention has already written the normalized state and message
-    /// into `t.inputs[slot]`. With `norm`, also writes `bf16(rms_norm(out) * weight)`.
-    #[expect(clippy::too_many_arguments, reason = "the gate's inputs and outputs")]
-    fn message_gate(
+    /// MLX-LM's `MessageGate` for the gates `gates` of message slots `first_slot..`, in one
+    /// launch. Depth attention has already written each slot's normalized state and
+    /// message into row `looped` of `t.inputs[slot]`. Gate `k` mixes `messages[k]` into the
+    /// F32 state `h[k * h_stride..]`, into `out[k]`; with `norms[k]`, it also writes
+    /// `bf16(rms_norm(out[k]) * weight)`.
+    #[expect(clippy::too_many_arguments, reason = "the gates' inputs and outputs")]
+    fn message_gates(
         &self,
-        g: &MessageGateWeights,
+        gates: &[MessageGateWeights],
         t: &mut GateScratch,
-        slot: usize,
-        h: &impl DeviceIn<f32>,
-        message: &impl DeviceIn<f32>,
+        first_slot: usize,
+        looped: usize,
+        (h, h_stride): (&impl DeviceIn<f32>, usize),
+        messages: &impl DeviceIn<f32>,
         out: &mut CudaSlice<f32>,
-        norm: Option<(&CudaSlice<bf16>, &mut CudaSlice<bf16>)>,
+        norms: Vec<Option<(&CudaSlice<bf16>, CudaViewMut<'_, bf16>)>>,
     ) -> anyhow::Result<()> {
-        self.kernels.linear.gemv_bf16(
+        let n = gates.len();
+        let hidden = self.hidden();
+        ensure!(norms.len() == n, "one norm entry per gate");
+        let row = looped * 2 * hidden..(looped + 1) * 2 * hidden;
+        let mut steps: Vec<GateStep<'_>> = gates
+            .iter()
+            .zip(&t.inputs[first_slot..first_slot + n])
+            .zip(norms)
+            .map(|((g, input), norm)| GateStep {
+                down_weight: &g.down,
+                input: input.slice(row.clone()),
+                forget: &g.forget,
+                gain: &g.gain,
+                norm,
+            })
+            .collect();
+        self.kernels.misc.message_gate_step(
             &self.stream,
-            &mut [Gemv::new(&g.down, &t.inputs[slot], &mut t.down)],
-        )?;
-        self.kernels.misc.message_gate_out(
-            &self.stream,
-            &t.down,
-            &g.forget,
-            &g.gain,
+            &mut steps,
             h,
-            message,
-            out,
-            norm.map(|(weight, normed)| (weight, normed, &mut t.counter)),
+            h_stride,
+            messages,
+            &mut out.slice_mut(..n * hidden),
+            None,
+            &mut t.step,
             self.eps(),
         )
     }
 
-    /// MLX-LM's `SparseMoeBlock` for one F32 row before its norm, up to the expert outputs in
-    /// `t.down` and their weights in `t.weights`. The normalized BF16 input goes to `x`.
-    fn moe(
-        &self,
-        w: &LayerWeights,
-        t: &mut MoeScratch,
-        input: &CudaSlice<f32>,
-        x: &mut CudaSlice<bf16>,
-    ) -> anyhow::Result<()> {
+    /// MLX-LM's `SparseMoeBlock` for one row from its normalized BF16 input `x`, up to the
+    /// expert outputs in `t.down` and their weights in `t.weights`.
+    fn moe(&self, w: &LayerWeights, t: &mut MoeScratch, x: &CudaSlice<bf16>) -> anyhow::Result<()> {
         let cfg = &self.config;
-        self.kernels.routing.moe_router(
+        self.kernels.routing.moe_router_step(
             &self.stream,
-            input,
-            &w.mlp_norm,
-            self.eps(),
+            x,
             &w.router,
             &w.router_bias,
-            x,
             &mut t.logits,
             &mut t.indices,
             &mut t.weights,

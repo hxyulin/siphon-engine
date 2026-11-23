@@ -51,6 +51,48 @@ pub enum Partial<'a> {
     Bf16(CudaView<'a, bf16>),
 }
 
+/// The partial candidate of [`Routing::depth_attention_step`].
+pub enum StepPartial<'a> {
+    /// An F32 row that is already normalized.
+    Normalized(CudaView<'a, f32>),
+    /// An F32 row that gets an unweighted RMS norm first.
+    F32(CudaView<'a, f32>),
+    /// A BF16 row that is widened and gets an unweighted RMS norm first.
+    Bf16(CudaView<'a, bf16>),
+    /// The post-attention conv and residual add of [`crate::ops::conv::Conv::short_conv_residual`],
+    /// computed in the kernel and written to `residual`, then an unweighted RMS norm.
+    ConvResidual {
+        /// The attention output, BF16 `[2304]`.
+        x: CudaView<'a, bf16>,
+        /// The conv weight, BF16 `[2304, 4]`.
+        weight: &'a CudaSlice<bf16>,
+        /// The conv state, F32 `[3, 2304]`, updated in place.
+        state: CudaViewMut<'a, f32>,
+        /// The visit input added to the conv output, or `None` at a block start.
+        hidden: Option<CudaView<'a, bf16>>,
+        /// Receives the residual, F32 `[2304]`.
+        residual: CudaViewMut<'a, f32>,
+    },
+}
+
+/// What [`Routing::depth_attention_step`] reads and writes.
+pub struct DepthStep<'a> {
+    /// The block states, F32 `[nb, 2304]`.
+    pub blocks: CudaView<'a, f32>,
+    pub partial: StepPartial<'a>,
+    /// Receives the partial as used, F32 `[2304]`.
+    pub normed_partial: Option<CudaViewMut<'a, f32>>,
+    /// `batch` sets of `nq` queries, F32 `[batch, nq, 2304]`.
+    pub queries: CudaView<'a, f32>,
+    pub batch: usize,
+    /// Receives the output rows, F32 `[batch, nq, 2304]`.
+    pub out: Option<CudaViewMut<'a, f32>>,
+    /// Destination `k` receives output row `min(k, nq - 1)` of each set after an RMS norm,
+    /// the sets `dst_stride` elements apart.
+    pub dests: [Option<NormDest<'a>>; FUSED_DESTS],
+    pub dst_stride: usize,
+}
+
 /// A BF16 copy of one depth-attention output row after an RMS norm.
 pub struct NormDest<'a> {
     pub out: CudaViewMut<'a, bf16>,
@@ -103,6 +145,8 @@ pub struct Routing {
     moe_router_norm_rows_2304: CudaFunction,
     moe_router_logits_rows_2304: CudaFunction,
     moe_router_route_rows_2304: CudaFunction,
+    depth_attention_step_2304: CudaFunction,
+    moe_router_step_2304: CudaFunction,
 }
 
 impl Routing {
@@ -119,6 +163,8 @@ impl Routing {
             moe_router_norm_rows_2304: module.load_function("moe_router_norm_rows_2304")?,
             moe_router_logits_rows_2304: module.load_function("moe_router_logits_rows_2304")?,
             moe_router_route_rows_2304: module.load_function("moe_router_route_rows_2304")?,
+            depth_attention_step_2304: module.load_function("depth_attention_step_2304")?,
+            moe_router_step_2304: module.load_function("moe_router_step_2304")?,
         })
     }
 
@@ -562,6 +608,155 @@ impl Routing {
         unsafe { args.launch_pdl(stream, &self.depth_attention_fused_rows_2304, config) }
     }
 
+    /// Depth attention for decode, as [`Routing::depth_attention_fused`], summed in the
+    /// order of `depth_attention_step_2304` rather than the separate kernels'. `d.batch`
+    /// sets of queries attend over the same candidates in one launch. A
+    /// [`StepPartial::ConvResidual`] partial needs a batch of 1.
+    pub fn depth_attention_step(
+        &self,
+        stream: &CudaStream,
+        d: DepthStep<'_>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let DepthStep {
+            blocks,
+            partial,
+            mut normed_partial,
+            queries,
+            batch,
+            mut out,
+            mut dests,
+            dst_stride,
+        } = d;
+        ensure!(
+            blocks.len().is_multiple_of(HIDDEN),
+            "blocks has {} elements, not a multiple of {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / HIDDEN;
+        ensure!(
+            nb < FUSED_MAX_CANDIDATES,
+            "{nb} blocks; at most {} fit",
+            FUSED_MAX_CANDIDATES - 1
+        );
+        ensure!(batch > 0, "empty batch");
+        ensure!(
+            !queries.is_empty() && queries.len().is_multiple_of(batch * HIDDEN),
+            "queries has {} elements, not a positive multiple of {batch} x {HIDDEN}",
+            queries.len()
+        );
+        let nq = queries.len() / (batch * HIDDEN);
+        ensure!(
+            nq <= FUSED_MAX_QUERIES,
+            "{nq} queries; at most {FUSED_MAX_QUERIES} fit"
+        );
+        ensure!(
+            normed_partial.as_ref().is_none_or(|x| x.len() == HIDDEN),
+            "normed_partial must hold {HIDDEN} elements"
+        );
+        ensure!(
+            out.as_ref().is_none_or(|x| x.len() == batch * nq * HIDDEN),
+            "out must hold {batch} x {nq} x {HIDDEN} elements"
+        );
+        ensure!(
+            batch == 1 || dst_stride >= HIDDEN,
+            "dst_stride is below {HIDDEN}"
+        );
+        let dest_len = (batch - 1) * dst_stride + HIDDEN;
+        for dest in dests.iter().flatten() {
+            ensure!(
+                dest.out.len() >= dest_len && dest.weight.is_none_or(|w| w.len() == HIDDEN),
+                "destinations must reach {dest_len} elements and norm weights hold {HIDDEN}"
+            );
+        }
+
+        let mut args = KernelArgs::default();
+        args.ptr(&blocks, stream).i32(i32::try_from(nb)?);
+        push_step_partial(&mut args, partial, batch, stream)?;
+        args.opt_mut(normed_partial.as_mut(), stream)
+            .ptr(&queries, stream)
+            .i32(i32::try_from(nq)?)
+            .i32(i32::try_from(nq * HIDDEN)?)
+            .opt_mut(out.as_mut(), stream)
+            .i32(i32::try_from(nq * HIDDEN)?);
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().map(|d| &mut d.out), stream);
+        }
+        args.i32(i32::try_from(dst_stride).context("dst_stride too large")?);
+        for dest in &dests {
+            args.opt(dest.as_ref().and_then(|d| d.weight), stream);
+        }
+        args.f32(eps).f32((HIDDEN as f32).sqrt().recip());
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(batch).context("batch too large")?, 1, 1),
+            block_dim: (DEPTH_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `depth_attention_step_2304`'s signature, every non-null
+        // pointer comes from a live buffer of the length checked above, the grid has one
+        // block per query set, only block 0 touches the conv state, and the kernel reads
+        // only weights (queries, norm weights, conv taps) before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.depth_attention_step_2304, config) }
+    }
+
+    /// The router for one BF16 row `x` that is already normalized: logits from `x`, then the
+    /// top-8 routing of [`Routing::moe_router`], in one launch. The logits sum in the order
+    /// of `moe_router_step_2304`.
+    ///
+    /// `counter` must hold 0; the kernel leaves it at 0.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router_step(
+        &self,
+        stream: &CudaStream,
+        x: &CudaSlice<bf16>,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        logits: &mut CudaSlice<f32>,
+        indices: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        counter: &mut CudaSlice<u32>,
+        route_scale: f32,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            x.len() == HIDDEN,
+            "x has {} elements, expected {HIDDEN}",
+            x.len()
+        );
+        ensure!(
+            router.len() == EXPERTS * HIDDEN,
+            "router has {} elements",
+            router.len()
+        );
+        ensure!(
+            bias.len() == EXPERTS && logits.len() == EXPERTS,
+            "bias or logits length"
+        );
+        ensure!(
+            indices.len() == TOP_K && weights.len() == TOP_K,
+            "indices or weights length"
+        );
+        ensure!(!counter.is_empty(), "counter is empty");
+        let config = LaunchConfig {
+            grid_dim: (EXPERTS as u32, 1, 1),
+            block_dim: (ROUTER_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(x, stream)
+            .ptr(router, stream)
+            .ptr(bias, stream)
+            .ptr_mut(logits, stream)
+            .ptr_mut(indices, stream)
+            .ptr_mut(weights, stream)
+            .ptr_mut(counter, stream)
+            .f32(route_scale);
+        // SAFETY: the arguments match `moe_router_step_2304(const bf16*, const float*, const
+        // float*, float*, int32_t*, float*, unsigned*, float)`, every buffer has the length
+        // the kernel reads or writes, the grid has one block per expert, and the kernel reads
+        // only the router before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_step_2304, config) }
+    }
+
     /// [`Routing::moe_router`] for each of the `rows` rows of a chunk: `x` and `x_out`
     /// `[rows, 2304]`, `logits` `[rows, 128]`, `indices` and `weights` `[rows, 8]`, and
     /// `scratch` for at least `rows` rows. Each row's results equal a single-row call's bit
@@ -676,4 +871,71 @@ impl Routing {
         // before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_route_rows_2304, config) }
     }
+}
+
+/// The partial's arguments of `depth_attention_step_2304`: its F32 and BF16 pointers, its
+/// mode, and the conv's weight, state, hidden state and residual.
+fn push_step_partial(
+    args: &mut KernelArgs,
+    partial: StepPartial<'_>,
+    batch: usize,
+    stream: &CudaStream,
+) -> anyhow::Result<()> {
+    match partial {
+        StepPartial::Normalized(x) => {
+            ensure!(x.len() == HIDDEN, "partial must hold {HIDDEN} elements");
+            args.ptr(&x, stream)
+                .u64(0)
+                .i32(0)
+                .u64(0)
+                .u64(0)
+                .u64(0)
+                .u64(0);
+        }
+        StepPartial::F32(x) => {
+            ensure!(x.len() == HIDDEN, "partial must hold {HIDDEN} elements");
+            args.ptr(&x, stream)
+                .u64(0)
+                .i32(1)
+                .u64(0)
+                .u64(0)
+                .u64(0)
+                .u64(0);
+        }
+        StepPartial::Bf16(x) => {
+            ensure!(x.len() == HIDDEN, "partial must hold {HIDDEN} elements");
+            args.u64(0)
+                .ptr(&x, stream)
+                .i32(2)
+                .u64(0)
+                .u64(0)
+                .u64(0)
+                .u64(0);
+        }
+        StepPartial::ConvResidual {
+            x,
+            weight,
+            mut state,
+            hidden,
+            mut residual,
+        } => {
+            ensure!(batch == 1, "the conv partial needs a batch of 1");
+            ensure!(
+                x.len() == HIDDEN
+                    && weight.len() == 4 * HIDDEN
+                    && state.len() == 3 * HIDDEN
+                    && residual.len() == HIDDEN
+                    && hidden.as_ref().is_none_or(|h| h.len() == HIDDEN),
+                "conv partial lengths"
+            );
+            args.u64(0)
+                .ptr(&x, stream)
+                .i32(3)
+                .ptr(weight, stream)
+                .ptr_mut(&mut state, stream)
+                .opt(hidden.as_ref(), stream)
+                .ptr_mut(&mut residual, stream);
+        }
+    }
+    Ok(())
 }
