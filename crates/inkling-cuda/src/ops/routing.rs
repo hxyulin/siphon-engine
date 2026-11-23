@@ -4,11 +4,12 @@ use std::{mem::size_of, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg as _,
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -22,6 +23,31 @@ const LOGITS_THREADS: u32 = 256;
 const ROUTING_THREADS: u32 = 256;
 /// Threads per row of `depth_attention_2304`, which fixes its summation order.
 const DEPTH_THREADS: u32 = 288;
+/// Candidates and queries `depth_attention_fused_2304` holds in registers.
+pub const FUSED_MAX_CANDIDATES: usize = 6;
+pub const FUSED_MAX_QUERIES: usize = 4;
+/// Normalized copies `depth_attention_fused_2304` can write.
+pub const FUSED_DESTS: usize = 4;
+/// Blocks and threads of `moe_router_2304`.
+const ROUTER_BLOCKS: u32 = 64;
+const ROUTER_THREADS: u32 = 288;
+
+/// The partial candidate of [`Routing::depth_attention_fused`].
+pub enum Partial<'a> {
+    /// An F32 row that is already normalized.
+    Normalized(CudaView<'a, f32>),
+    /// An F32 row that gets an unweighted RMS norm first.
+    F32(CudaView<'a, f32>),
+    /// A BF16 row that is widened and gets an unweighted RMS norm first.
+    Bf16(&'a CudaSlice<bf16>),
+}
+
+/// A BF16 copy of one depth-attention output row after an RMS norm.
+pub struct NormDest<'a> {
+    pub out: CudaViewMut<'a, bf16>,
+    /// The weight of a weighted RMS norm, or `None` for an unweighted one.
+    pub weight: Option<&'a CudaSlice<bf16>>,
+}
 
 /// How `Routing::router_logits` treats the F32 router weight.
 ///
@@ -43,6 +69,8 @@ pub struct Routing {
     router_logits_2304: CudaFunction,
     expert_routing_128_top8: CudaFunction,
     depth_attention_2304: CudaFunction,
+    depth_attention_fused_2304: CudaFunction,
+    moe_router_2304: CudaFunction,
 }
 
 impl Routing {
@@ -52,6 +80,8 @@ impl Routing {
             router_logits_2304: module.load_function("router_logits_2304")?,
             expert_routing_128_top8: module.load_function("expert_routing_128_top8")?,
             depth_attention_2304: module.load_function("depth_attention_2304")?,
+            depth_attention_fused_2304: module.load_function("depth_attention_fused_2304")?,
+            moe_router_2304: module.load_function("moe_router_2304")?,
         })
     }
 
@@ -217,5 +247,173 @@ impl Routing {
         // kernel uses.
         unsafe { launch.launch(config) }?;
         Ok(())
+    }
+
+    /// Depth attention for one row, as [`Routing::depth_attention`] with `rows = 1`, with the
+    /// RMS norms around it fused in. Sums in the order of the separate kernels; the softmax
+    /// uses CUDA's `exp2f`.
+    ///
+    /// The `nb` rows of `blocks` (`[nb, 2304]`) and the `partial` row are the candidates;
+    /// `normed_partial` receives the partial as used. `out` receives the `nq` output rows
+    /// (`[nq, 2304]`). Each `dests[k]` receives output row `min(k, nq - 1)` after an RMS
+    /// norm, rounded to BF16.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn depth_attention_fused(
+        &self,
+        stream: &CudaStream,
+        blocks: &impl DeviceIn<f32>,
+        partial: Partial<'_>,
+        mut normed_partial: Option<CudaViewMut<'_, f32>>,
+        queries: &CudaSlice<f32>,
+        mut out: Option<CudaViewMut<'_, f32>>,
+        mut dests: [Option<NormDest<'_>>; FUSED_DESTS],
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let blocks = blocks.view();
+        ensure!(
+            blocks.len().is_multiple_of(HIDDEN),
+            "blocks has {} elements, not a multiple of {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / HIDDEN;
+        ensure!(
+            nb < FUSED_MAX_CANDIDATES,
+            "{nb} blocks; at most {} fit",
+            FUSED_MAX_CANDIDATES - 1
+        );
+        ensure!(
+            !queries.is_empty() && queries.len().is_multiple_of(HIDDEN),
+            "queries has {} elements, not a positive multiple of {HIDDEN}",
+            queries.len()
+        );
+        let nq = queries.len() / HIDDEN;
+        ensure!(
+            nq <= FUSED_MAX_QUERIES,
+            "{nq} queries; at most {FUSED_MAX_QUERIES} fit"
+        );
+        let (partial_f32, partial_bf16, normalize) = match partial {
+            Partial::Normalized(x) => (Some(x), None, 0i32),
+            Partial::F32(x) => (Some(x), None, 1),
+            Partial::Bf16(x) => (None, Some(x), 1),
+        };
+        let partial_len = partial_f32
+            .as_ref()
+            .map_or_else(|| partial_bf16.map_or(0, CudaSlice::len), CudaView::len);
+        ensure!(
+            partial_len == HIDDEN,
+            "partial has {partial_len} elements, expected {HIDDEN}"
+        );
+        ensure!(
+            normed_partial.as_ref().is_none_or(|x| x.len() == HIDDEN),
+            "normed_partial must hold {HIDDEN} elements"
+        );
+        ensure!(
+            out.as_ref().is_none_or(|x| x.len() == nq * HIDDEN),
+            "out must hold {nq} x {HIDDEN} elements"
+        );
+        for dest in dests.iter().flatten() {
+            ensure!(
+                dest.out.len() == HIDDEN && dest.weight.is_none_or(|w| w.len() == HIDDEN),
+                "destinations and norm weights must hold {HIDDEN} elements"
+            );
+        }
+
+        let scale = (HIDDEN as f32).sqrt().recip();
+        let mut args = KernelArgs::default();
+        args.ptr(&blocks, stream)
+            .i32(i32::try_from(nb)?)
+            .opt(partial_f32.as_ref(), stream)
+            .opt(partial_bf16, stream)
+            .i32(normalize)
+            .opt_mut(normed_partial.as_mut(), stream)
+            .ptr(queries, stream)
+            .i32(i32::try_from(nq)?)
+            .opt_mut(out.as_mut(), stream);
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().map(|d| &mut d.out), stream);
+        }
+        for dest in &dests {
+            args.opt(dest.as_ref().and_then(|d| d.weight), stream);
+        }
+        args.f32(eps).f32(scale);
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (DEPTH_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `depth_attention_fused_2304`'s signature, every non-null
+        // pointer comes from a live buffer of the length checked above, the kernel reads `nb`
+        // block rows and `nq` query rows, and it reads only the queries before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.depth_attention_fused_2304, config) }
+    }
+
+    /// The MoE input norm and router for one row: `x_out = bf16(rms_norm(x) * norm_weight)`,
+    /// router logits from `x_out`, then the top-8 routing of [`Routing::expert_routing`].
+    /// The norm and logits sum in the order of the separate kernels; the scores use CUDA's
+    /// `expf` rather than an emulation of Apple's exp.
+    ///
+    /// `counter` must hold 0; the kernel leaves it at 0.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<f32>,
+        norm_weight: &CudaSlice<bf16>,
+        eps: f32,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        x_out: &mut CudaSlice<bf16>,
+        logits: &mut CudaSlice<f32>,
+        indices: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        counter: &mut CudaSlice<u32>,
+        route_scale: f32,
+    ) -> anyhow::Result<()> {
+        let x = x.view();
+        ensure!(
+            x.len() == HIDDEN,
+            "x has {} elements, expected {HIDDEN}",
+            x.len()
+        );
+        ensure!(
+            norm_weight.len() == HIDDEN && x_out.len() == HIDDEN,
+            "norm weight or x_out length"
+        );
+        ensure!(
+            router.len() == EXPERTS * HIDDEN,
+            "router has {} elements",
+            router.len()
+        );
+        ensure!(
+            bias.len() == EXPERTS && logits.len() == EXPERTS,
+            "bias or logits length"
+        );
+        ensure!(
+            indices.len() == TOP_K && weights.len() == TOP_K,
+            "indices or weights length"
+        );
+        ensure!(!counter.is_empty(), "counter is empty");
+        let config = LaunchConfig {
+            grid_dim: (ROUTER_BLOCKS, 1, 1),
+            block_dim: (ROUTER_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(norm_weight, stream)
+            .f32(eps)
+            .ptr(router, stream)
+            .ptr(bias, stream)
+            .ptr_mut(x_out, stream)
+            .ptr_mut(logits, stream)
+            .ptr_mut(indices, stream)
+            .ptr_mut(weights, stream)
+            .ptr_mut(counter, stream)
+            .f32(route_scale);
+        // SAFETY: the arguments match `moe_router_2304(const float*, const bf16*, float,
+        // const float*, const float*, bf16*, float*, int32_t*, float*, unsigned*, float)`,
+        // every buffer has the length the kernel reads or writes, and it reads only weights
+        // before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_2304, config) }
     }
 }

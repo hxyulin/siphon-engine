@@ -124,3 +124,59 @@ extern "C" __global__ void dynamic_short_conv_bf16(const __nv_bfloat16* __restri
         state[size_t(kKernel - 1 - lag) * kDynamicDims + c] = win[lag];
     }
 }
+
+#include "conv_step.cuh"
+#include "pdl.cuh"
+
+namespace {
+
+constexpr int kHidden = 2304;
+constexpr int kTopK = 8;
+
+}  // namespace
+
+// The post-attention conv and residual add of DecoderLayer for one row:
+// residual = f32(hidden) + f32(short_conv(x)), or f32(short_conv(x)) when hidden is
+// null (a block start). Equals short_conv_bf16 followed by add_bf16_bf16_f32 or
+// cast_bf16_to_f32 bit for bit, except that subnormal sums are not flushed to zero.
+extern "C" __global__ void short_conv_residual_2304(const __nv_bfloat16* __restrict__ x,
+                                                    const __nv_bfloat16* __restrict__ weight,
+                                                    float* __restrict__ state,
+                                                    const __nv_bfloat16* __restrict__ hidden,
+                                                    float* __restrict__ residual) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kHidden) {
+        return;
+    }
+    const float y = __bfloat162float(conv_step::short_conv(__bfloat162float(x[c]), weight, state, c, kHidden));
+    residual[c] = hidden != nullptr ? __fadd_rn(__bfloat162float(hidden[c]), y) : y;
+}
+
+// The end of SparseMoeBlock and DecoderLayer for one row: the MoE combine of the 8
+// expert outputs (`experts` [8, 2304] BF16, `weights` [8] F32), the post-MLP conv,
+// and out = bf16(residual + conv). Equals moe_combine_bf16, short_conv_bf16 and
+// add_f32_bf16_bf16 in sequence bit for bit, except that subnormals are not flushed
+// to zero.
+extern "C" __global__ void moe_conv_residual_2304(const __nv_bfloat16* __restrict__ experts,
+                                                  const float* __restrict__ weights,
+                                                  const __nv_bfloat16* __restrict__ weight,
+                                                  float* __restrict__ state,
+                                                  const float* __restrict__ residual,
+                                                  __nv_bfloat16* __restrict__ out) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kHidden) {
+        return;
+    }
+    float total = 0.f;
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+        total = __fadd_rn(total, __fmul_rn(__bfloat162float(experts[size_t(k) * kHidden + c]), weights[k]));
+    }
+    const float x = round_bf16(total);
+    const float y = __bfloat162float(conv_step::short_conv(x, weight, state, c, kHidden));
+    out[c] = __float2bfloat16(__fadd_rn(residual[c], y));
+}

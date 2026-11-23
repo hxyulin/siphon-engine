@@ -9,7 +9,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{KernelArgs, cubin, load_module};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -128,17 +128,16 @@ impl Elementwise {
             out.len()
         );
         let n = out.len();
-        let mut launch = stream.launch_builder(&self.softcapped_swiglu_bf16);
-        launch
-            .arg(gate_up)
-            .arg(out)
-            .arg(&n)
-            .arg(&gate_softcap)
-            .arg(&up_softcap);
+        let mut args = KernelArgs::default();
+        args.ptr(gate_up, stream)
+            .ptr_mut(out, stream)
+            .u64(n as u64)
+            .f32(gate_softcap)
+            .f32(up_softcap);
         // SAFETY: the arguments match `softcapped_swiglu_bf16(const bf162*, bf16*, size_t,
-        // float, float)`, and `gate_up` holds `n` BF16 pairs for the `n` outputs.
-        unsafe { launch.launch(grid_stride(n)) }?;
-        Ok(())
+        // float, float)`, `gate_up` holds `n` BF16 pairs for the `n` outputs, and the kernel
+        // reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.softcapped_swiglu_bf16, grid_stride(n)) }
     }
 
     /// `out = attn * sigmoid(gate)` over `[rows, 24 * 128]` BF16 matrices.

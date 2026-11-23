@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{ffi::c_void, ptr, sync::Arc};
 
 use anyhow::Context as _;
 use cudarc::{
-    driver::{CudaContext, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut},
+    driver::{
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
+        DevicePtr, DevicePtrMut, LaunchConfig, sys,
+    },
     nvrtc::Ptx,
 };
 
@@ -88,4 +91,109 @@ pub(crate) fn load_module(
 ) -> anyhow::Result<Arc<CudaModule>> {
     ctx.load_module(Ptx::from_binary(cubin.to_vec()))
         .with_context(|| format!("loading {name}.cubin"))
+}
+
+/// Arguments for [`KernelArgs::launch_pdl`], one 8-byte slot each. Every parameter of the
+/// kernels launched this way is a pointer or a 4-byte scalar, and the driver reads a
+/// parameter from the start of its slot, which on a little-endian host holds the value.
+#[derive(Default)]
+pub(crate) struct KernelArgs(Vec<u64>);
+
+impl KernelArgs {
+    /// A device buffer. Event tracking is off (see [`Gpu`]), so the guard `device_ptr`
+    /// returns does nothing and is dropped at once.
+    pub fn ptr<T>(&mut self, x: &impl DevicePtr<T>, stream: &CudaStream) -> &mut Self {
+        self.0.push(x.device_ptr(stream).0);
+        self
+    }
+
+    pub fn ptr_mut<T>(&mut self, x: &mut impl DevicePtrMut<T>, stream: &CudaStream) -> &mut Self {
+        self.0.push(x.device_ptr_mut(stream).0);
+        self
+    }
+
+    /// A device buffer, or a null pointer for `None`.
+    pub fn opt<T>(&mut self, x: Option<&impl DevicePtr<T>>, stream: &CudaStream) -> &mut Self {
+        self.0.push(x.map_or(0, |x| x.device_ptr(stream).0));
+        self
+    }
+
+    pub fn opt_mut<T>(
+        &mut self,
+        x: Option<&mut impl DevicePtrMut<T>>,
+        stream: &CudaStream,
+    ) -> &mut Self {
+        self.0.push(x.map_or(0, |x| x.device_ptr_mut(stream).0));
+        self
+    }
+
+    pub fn i32(&mut self, v: i32) -> &mut Self {
+        self.0.push(u64::from(v.cast_unsigned()));
+        self
+    }
+
+    pub fn f32(&mut self, v: f32) -> &mut Self {
+        self.0.push(u64::from(v.to_bits()));
+        self
+    }
+
+    pub fn u64(&mut self, v: u64) -> &mut Self {
+        self.0.push(v);
+        self
+    }
+
+    /// Launches `func` with programmatic stream serialization, so it may start before the
+    /// previous kernel on `stream` finishes. The kernel must call `pdl_wait()` from
+    /// `kernels/pdl.cuh` before it reads anything an earlier kernel writes.
+    ///
+    /// # Safety
+    ///
+    /// The arguments must match the kernel's parameters in number, order and type, every
+    /// pointer must stay valid until the kernel finishes, and the kernel must keep to the
+    /// rule above.
+    pub unsafe fn launch_pdl(
+        &self,
+        stream: &CudaStream,
+        func: &CudaFunction,
+        cfg: LaunchConfig,
+    ) -> anyhow::Result<()> {
+        let mut params: Vec<*mut c_void> = self
+            .0
+            .iter()
+            .map(|slot| ptr::from_ref(slot).cast_mut().cast())
+            .collect();
+        // SAFETY: zero is a valid bit pattern for the attribute value union.
+        let mut value: sys::CUlaunchAttributeValue = unsafe { std::mem::zeroed() };
+        value.programmaticStreamSerializationAllowed = 1;
+        let mut attr = sys::CUlaunchAttribute {
+            id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+            pad: [0; 4],
+            value,
+        };
+        let config = sys::CUlaunchConfig {
+            gridDimX: cfg.grid_dim.0,
+            gridDimY: cfg.grid_dim.1,
+            gridDimZ: cfg.grid_dim.2,
+            blockDimX: cfg.block_dim.0,
+            blockDimY: cfg.block_dim.1,
+            blockDimZ: cfg.block_dim.2,
+            sharedMemBytes: cfg.shared_mem_bytes,
+            hStream: stream.cu_stream(),
+            attrs: &raw mut attr,
+            numAttrs: 1,
+        };
+        stream.context().bind_to_thread()?;
+        // SAFETY: `params` points at one slot per kernel parameter, which outlive the call;
+        // the caller vouches for their types and for the kernel.
+        unsafe {
+            sys::cuLaunchKernelEx(
+                &raw const config,
+                func.cu_function(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        }
+        .result()?;
+        Ok(())
+    }
 }

@@ -224,3 +224,68 @@ fn message_gate_chain_matches_mlx() -> anyhow::Result<()> {
     assert_combine_close("gate.out", &stream.clone_dtoh(&out)?, &want, &h, &m);
     Ok(())
 }
+
+/// The fused end of `MessageGate`, from MLX's own BF16 down projection, against MLX's gate
+/// output. The forget and gain projections sum in MLX's GEMV order, so only tanh differs,
+/// within the combine bound above. With the norm, its output is checked against
+/// `rms_norm_f32` of the gate output: the same sums, with 1 / sqrt in float rather than a
+/// rounded double rsqrt, so BF16 values differ by at most one ulp.
+#[test]
+fn message_gate_out_matches_mlx() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let norm = Norm::load(s.gpu.context())?;
+    let fixture = &s.fixture;
+    let (h, _) = fixture.f32("gate.h")?;
+    let (m, _) = fixture.f32("gate.m")?;
+    let (down, _) = fixture.bf16("gate.down")?;
+    let (forget, _) = fixture.bf16("gate.forget_weight")?;
+    let (gain, _) = fixture.bf16("gate.gain_weight")?;
+    let (want, _) = fixture.f32("gate.out")?;
+    let h_dev = stream.clone_htod(&h)?;
+    let m_dev = stream.clone_htod(&m)?;
+    let down = stream.clone_htod(&down)?;
+    let (forget, gain) = (stream.clone_htod(&forget)?, stream.clone_htod(&gain)?);
+
+    let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
+    s.misc.message_gate_out(
+        stream, &down, &forget, &gain, &h_dev, &m_dev, &mut out, None, EPS,
+    )?;
+    assert_combine_close("gate.out", &stream.clone_dtoh(&out)?, &want, &h, &m);
+
+    let weight: Vec<bf16> = (0..HIDDEN)
+        .map(|i| bf16::from_f32(0.5 + (i % 97) as f32 / 97.0))
+        .collect();
+    let weight = stream.clone_htod(&weight)?;
+    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    // Twice, so the second run relies on the first resetting the counter.
+    for run in 0..2 {
+        let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut normed = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        s.misc.message_gate_out(
+            stream,
+            &down,
+            &forget,
+            &gain,
+            &h_dev,
+            &m_dev,
+            &mut out,
+            Some((&weight, &mut normed, &mut counter)),
+            EPS,
+        )?;
+        let mut normed_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        norm.rms_norm_f32(stream, &out, &weight, &mut normed_want, EPS)?;
+        assert_bf16_close(
+            &format!("gate.normed, run {run}"),
+            &stream.clone_dtoh(&normed)?,
+            &stream.clone_dtoh(&normed_want)?,
+            1,
+        );
+        assert_eq!(
+            stream.clone_dtoh(&counter)?,
+            [0],
+            "the kernel resets its counter"
+        );
+    }
+    Ok(())
+}

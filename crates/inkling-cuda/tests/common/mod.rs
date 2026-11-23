@@ -116,3 +116,58 @@ pub fn assert_f32_close(label: &str, got: &[f32], want: &[f32], rtol: f32, atol:
     }
     eprintln!("{label}: max abs error {worst:e}");
 }
+
+/// `len` deterministic values uniform in `[-scale, scale)`, different for each `seed`.
+pub fn pseudo_random(len: usize, seed: u32, scale: f32) -> Vec<f32> {
+    (0..len as u32)
+        .map(|i| {
+            let mut h = i.wrapping_mul(0x9E37_79B1) ^ seed.wrapping_mul(0x85EB_CA77);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x2C1B_3C6D);
+            h ^= h >> 12;
+            h = h.wrapping_mul(0x297A_2D39);
+            h ^= h >> 15;
+            let unit = (h >> 8) as f32 * 2f32.powi(-24);
+            (2.0 * unit - 1.0) * scale
+        })
+        .collect()
+}
+
+/// [`pseudo_random`] rounded to BF16, offset by `offset`.
+pub fn pseudo_random_bf16(len: usize, seed: u32, scale: f32, offset: f32) -> Vec<bf16> {
+    pseudo_random(len, seed, scale)
+        .into_iter()
+        .map(|v| bf16::from_f32(v + offset))
+        .collect()
+}
+
+/// Distance between two finite F32 values in units in the last place.
+pub fn f32_ulp_distance(a: f32, b: f32) -> u64 {
+    let key = |v: f32| {
+        let bits = i64::from(v.to_bits());
+        if bits & 0x8000_0000 == 0 {
+            bits
+        } else {
+            0x8000_0000 - bits
+        }
+    };
+    key(a).abs_diff(key(b))
+}
+
+/// Fails if any element differs by more than `max_ulps`, and reports how many differ at all.
+pub fn assert_f32_within_ulps(label: &str, got: &[f32], want: &[f32], max_ulps: u64) {
+    assert_eq!(got.len(), want.len(), "{label}: length");
+    let mut differing = 0;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let ulps = f32_ulp_distance(g, w);
+        assert!(
+            ulps <= max_ulps,
+            "{label}[{i}]: got {g}, want {w} ({ulps} ulps)"
+        );
+        differing += usize::from(ulps > 0);
+    }
+    eprintln!(
+        "{label}: {differing} of {} elements differ by at most {max_ulps} ulp",
+        want.len()
+    );
+}

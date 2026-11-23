@@ -13,11 +13,18 @@
 
 mod common;
 
-use common::Fixture;
+use common::{
+    Fixture, assert_bf16_close, assert_f32_within_ulps, pseudo_random, pseudo_random_bf16,
+};
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use inkling_cuda::{
     Gpu,
-    ops::routing::{EXPERTS, RouterMatmul, Routing, TOP_K},
+    ops::{
+        misc::Misc,
+        norm::Norm,
+        routing::{EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul, Routing, TOP_K},
+    },
 };
 
 const HIDDEN: usize = 2304;
@@ -244,6 +251,278 @@ fn depth_attention_matches_mlx() -> anyhow::Result<()> {
         )?;
         let got = stream.clone_dtoh(&out_dev)?;
         assert_f32_within(case, &got, &want, 1e-6);
+    }
+    Ok(())
+}
+
+const EPS: f32 = 1e-6;
+
+fn norm_dest<'a>(
+    out: &'a mut CudaSlice<bf16>,
+    weight: Option<&'a CudaSlice<bf16>>,
+) -> NormDest<'a> {
+    NormDest {
+        out: out.as_view_mut(),
+        weight,
+    }
+}
+
+/// The fused single-row depth attention against the separate kernels on the fixture cases,
+/// row 0 of each, with at most the 5 block states the kernel holds:
+/// - with the fixture's partial as given, its output against MLX's within the old kernel's
+///   1e-6;
+/// - with a partial that needs normalizing (F32, and BF16 for the first case), against
+///   `unweighted_rms_norm` then `depth_attention`, then `rms_norm_f32` (weighted copies) or
+///   `unweighted_rms_norm` and a cast (unweighted copies) of each output row.
+///
+/// The sums are the separate kernels'. The softmax uses CUDA's exp2f where the old kernel
+/// emulates Apple's exp2; both are within an ulp of exp2, so outputs move by a few F32 ulps
+/// of the largest candidate, under 1e-6 here. The norms compute 1 / sqrt in float where the
+/// norm kernels round a double rsqrt once: at most one F32 ulp, so the normalized partial
+/// is within one ulp and the BF16 copies within one BF16 ulp.
+#[test]
+#[expect(clippy::too_many_lines, reason = "three comparisons per fixture case")]
+fn depth_attention_fused_matches_separate_kernels() -> anyhow::Result<()> {
+    let fixture = Fixture::load("routing")?;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let norm = Norm::load(gpu.context())?;
+    let misc = Misc::load(gpu.context())?;
+    let weights: Vec<CudaSlice<bf16>> = (0..4)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN, 200 + k, 0.5, 1.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    for (case, inputs) in [
+        ("depth_a", "depth_a"),
+        ("depth_b", "depth_b"),
+        ("depth_c", "depth_c"),
+        ("depth_d", "depth_c"),
+    ] {
+        let (blocks, _) = fixture.f32(&format!("{inputs}.blocks"))?;
+        let (partial, _) = fixture.f32(&format!("{inputs}.partial"))?;
+        let (queries, _) = fixture.f32(&format!("{case}.queries"))?;
+        let (mlx, _) = fixture.f32(&format!("{case}.out"))?;
+        let rows = partial.len() / HIDDEN;
+        let all_blocks = blocks.len() / partial.len();
+        // Cases c and d have more block states than the model's 4; they use the first ones
+        // against the separate kernels only.
+        let nb = all_blocks.min(FUSED_MAX_CANDIDATES - 1);
+        let nq = queries.len() / HIDDEN;
+        let row_blocks: Vec<f32> = (0..nb)
+            .flat_map(|i| {
+                blocks[i * rows * HIDDEN..(i * rows + 1) * HIDDEN]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let blocks_dev = stream.clone_htod(&row_blocks)?;
+        let queries_dev = stream.clone_htod(&queries)?;
+
+        // The fixture's partial as given, against MLX.
+        if nb == all_blocks {
+            let partial_dev = stream.clone_htod(&partial[..HIDDEN])?;
+            let mut out = stream.alloc_zeros::<f32>(nq * HIDDEN)?;
+            routing.depth_attention_fused(
+                stream,
+                &blocks_dev,
+                Partial::Normalized(partial_dev.as_view()),
+                None,
+                &queries_dev,
+                Some(out.as_view_mut()),
+                [None, None, None, None],
+                EPS,
+            )?;
+            // MLX's out is [rows, nq, hidden]; row 0 is its first nq * hidden values.
+            assert_f32_within(case, &stream.clone_dtoh(&out)?, &mlx[..nq * HIDDEN], 1e-6);
+        }
+
+        // A partial that needs normalizing.
+        let raw: Vec<f32> = partial[..HIDDEN]
+            .iter()
+            .zip(pseudo_random(HIDDEN, 300, 0.5))
+            .map(|(p, r)| 3.0 * p + r)
+            .collect();
+        let raw_bf16: Vec<bf16> = raw.iter().map(|&v| bf16::from_f32(v)).collect();
+        let as_bf16 = case == "depth_a";
+        let wide: Vec<f32> = if as_bf16 {
+            raw_bf16.iter().map(|v| v.to_f32()).collect()
+        } else {
+            raw.clone()
+        };
+        let wide_dev = stream.clone_htod(&wide)?;
+        let mut normed_want = stream.alloc_zeros::<f32>(HIDDEN)?;
+        norm.unweighted_rms_norm(stream, &wide_dev, &mut normed_want, EPS)?;
+        let mut out_want = stream.alloc_zeros::<f32>(nq * HIDDEN)?;
+        routing.depth_attention(
+            stream,
+            &blocks_dev,
+            &normed_want,
+            &queries_dev,
+            &mut out_want,
+        )?;
+        // Destination k takes row min(k, nq - 1); the last one is unweighted.
+        let weighted = |k: usize| k < 3;
+        let mut dest_want = Vec::new();
+        for (k, weight) in weights.iter().enumerate() {
+            let row = out_want.slice(k.min(nq - 1) * HIDDEN..(k.min(nq - 1) + 1) * HIDDEN);
+            let mut bf = stream.alloc_zeros::<bf16>(HIDDEN)?;
+            if weighted(k) {
+                norm.rms_norm_f32(stream, &row, weight, &mut bf, EPS)?;
+            } else {
+                let mut f = stream.alloc_zeros::<f32>(HIDDEN)?;
+                norm.unweighted_rms_norm(stream, &row, &mut f, EPS)?;
+                misc.cast_f32_to_bf16(stream, &f, &mut bf)?;
+            }
+            dest_want.push(stream.clone_dtoh(&bf)?);
+        }
+
+        let raw_dev = stream.clone_htod(&raw)?;
+        let raw_bf16_dev = stream.clone_htod(&raw_bf16)?;
+        let mut normed = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut out = stream.alloc_zeros::<f32>(nq * HIDDEN)?;
+        let mut dests: Vec<CudaSlice<bf16>> = (0..4)
+            .map(|_| Ok(stream.alloc_zeros::<bf16>(HIDDEN)?))
+            .collect::<anyhow::Result<_>>()?;
+        let [d0, d1, d2, d3] = &mut dests[..] else {
+            unreachable!()
+        };
+        let weight = |k: usize| weighted(k).then(|| &weights[k]);
+        routing.depth_attention_fused(
+            stream,
+            &blocks_dev,
+            if as_bf16 {
+                Partial::Bf16(&raw_bf16_dev)
+            } else {
+                Partial::F32(raw_dev.as_view())
+            },
+            Some(normed.as_view_mut()),
+            &queries_dev,
+            Some(out.as_view_mut()),
+            [
+                Some(norm_dest(d0, weight(0))),
+                Some(norm_dest(d1, weight(1))),
+                Some(norm_dest(d2, weight(2))),
+                Some(norm_dest(d3, weight(3))),
+            ],
+            EPS,
+        )?;
+        assert_f32_within_ulps(
+            &format!("{case}: normed partial"),
+            &stream.clone_dtoh(&normed)?,
+            &stream.clone_dtoh(&normed_want)?,
+            1,
+        );
+        assert_f32_within(
+            &format!("{case}: out"),
+            &stream.clone_dtoh(&out)?,
+            &stream.clone_dtoh(&out_want)?,
+            1e-6,
+        );
+        for (k, want) in dest_want.iter().enumerate() {
+            assert_bf16_close(
+                &format!("{case}: destination {k}"),
+                &stream.clone_dtoh(&dests[k])?,
+                want,
+                1,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The fused MoE norm and router against `rms_norm_f32`, `router_logits` (F32) and
+/// `expert_routing` for several rows, run one at a time.
+///
+/// The norm and logits sum in the separate kernels' order. The norm computes 1 / sqrt in
+/// float rather than a rounded double rsqrt, at most one F32 ulp, so the BF16 input may
+/// differ by one ulp and the logits slightly. The scores use CUDA's expf where
+/// `expert_routing` emulates Apple's exp, so weights move by a few ulps, within the 2e-6
+/// the router test above allows. The experts must be the same set.
+#[test]
+fn moe_router_matches_separate_kernels() -> anyhow::Result<()> {
+    let fixture = Fixture::load("routing")?;
+    let (bias, _) = fixture.f32("router.bias")?;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let norm = Norm::load(gpu.context())?;
+    let router = stream.clone_htod(&router_weight())?;
+    let bias_dev = stream.clone_htod(&bias)?;
+    let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 400, 0.5, 1.0))?;
+    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    for row in 0..6u32 {
+        let x = stream.clone_htod(&pseudo_random(HIDDEN, 500 + row, 4.0))?;
+        let mut x_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        norm.rms_norm_f32(stream, &x, &weight, &mut x_want, EPS)?;
+        let mut logits_want = stream.alloc_zeros::<f32>(EXPERTS)?;
+        routing.router_logits(
+            stream,
+            &x_want,
+            &router,
+            &mut logits_want,
+            RouterMatmul::F32,
+        )?;
+        let mut indices_want = stream.alloc_zeros::<i32>(TOP_K)?;
+        let mut weights_want = stream.alloc_zeros::<f32>(TOP_K)?;
+        routing.expert_routing(
+            stream,
+            &logits_want,
+            &bias_dev,
+            &mut indices_want,
+            &mut weights_want,
+            ROUTE_SCALE,
+        )?;
+
+        let mut x_out = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut logits = stream.alloc_zeros::<f32>(EXPERTS)?;
+        let mut indices = stream.alloc_zeros::<i32>(TOP_K)?;
+        let mut weights = stream.alloc_zeros::<f32>(TOP_K)?;
+        routing.moe_router(
+            stream,
+            &x,
+            &weight,
+            EPS,
+            &router,
+            &bias_dev,
+            &mut x_out,
+            &mut logits,
+            &mut indices,
+            &mut weights,
+            &mut counter,
+            ROUTE_SCALE,
+        )?;
+        let label = format!("row {row}");
+        assert_bf16_close(
+            &format!("{label}: input"),
+            &stream.clone_dtoh(&x_out)?,
+            &stream.clone_dtoh(&x_want)?,
+            1,
+        );
+        assert_f32_within(
+            &format!("{label}: logits"),
+            &stream.clone_dtoh(&logits)?,
+            &stream.clone_dtoh(&logits_want)?,
+            1e-5,
+        );
+        let got = pairs_by_expert(&stream.clone_dtoh(&indices)?, &stream.clone_dtoh(&weights)?);
+        let want = pairs_by_expert(
+            &stream.clone_dtoh(&indices_want)?,
+            &stream.clone_dtoh(&weights_want)?,
+        );
+        let experts = |p: &[Vec<(i32, f32)>]| -> Vec<i32> { p[0].iter().map(|e| e.0).collect() };
+        assert_eq!(experts(&got), experts(&want), "{label}: experts");
+        let weights_of = |p: &[Vec<(i32, f32)>]| -> Vec<f32> { p[0].iter().map(|e| e.1).collect() };
+        assert_f32_within(
+            &format!("{label}: weights"),
+            &weights_of(&got),
+            &weights_of(&want),
+            2e-6,
+        );
+        assert_eq!(
+            stream.clone_dtoh(&counter)?,
+            [0],
+            "the kernel resets its counter"
+        );
     }
     Ok(())
 }

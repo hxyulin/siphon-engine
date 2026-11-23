@@ -13,7 +13,7 @@ use std::{ops::Range, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaGraph, CudaSlice, CudaStream, CudaView, DeviceRepr, ValidAsZeroBits,
+    CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceRepr, ValidAsZeroBits,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
@@ -28,8 +28,8 @@ use crate::{
         experts::{self, Experts},
         linear::{Gemv, Linear},
         misc::Misc,
-        norm::Norm,
-        routing::{RouterMatmul, Routing},
+        norm::{AttentionPost, KvConvWeights, Norm},
+        routing::{NormDest, Partial, Routing},
     },
     weights::{ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, Weights},
 };
@@ -99,8 +99,7 @@ struct Scratch {
     bank_normed: CudaSlice<f32>,
     /// Depth attention over the bank, F32 `[4, hidden]`.
     messages: CudaSlice<f32>,
-    /// F32 copy of a BF16 row, before normalization.
-    wide: CudaSlice<f32>,
+    /// The normalized visit input, when it does not start a block state.
     normed_residual: CudaSlice<f32>,
     /// Depth attention for the attention inputs, F32 `[1 or 3, hidden]`.
     attention_inputs: CudaSlice<f32>,
@@ -110,15 +109,10 @@ struct Scratch {
     /// Normalized query, key and value inputs of attention. Layer 0 uses only the first.
     qkv_in: [CudaSlice<bf16>; 3],
     attention: AttentionTemps,
-    attn_conv: CudaSlice<bf16>,
     residual: CudaSlice<f32>,
-    normed: CudaSlice<f32>,
     mlp_input: CudaSlice<f32>,
     mlp_x: CudaSlice<bf16>,
     moe: MoeScratch,
-    mlp_conv: CudaSlice<bf16>,
-    final_normed: CudaSlice<f32>,
-    final_input: CudaSlice<f32>,
     final_hidden: CudaSlice<bf16>,
     logits: CudaSlice<bf16>,
     /// F32 logits after the softcap, `[unpadded_vocab]`.
@@ -127,13 +121,12 @@ struct Scratch {
 
 /// Intermediates of `MessageGate`.
 struct GateScratch {
-    /// The normalized state and message side by side, F32 `[2 * hidden]`.
-    both: CudaSlice<f32>,
-    both_bf16: CudaSlice<bf16>,
+    /// For each message slot, the normalized state and message side by side, BF16
+    /// `[2 * hidden]`: the down projection's input. Depth attention writes both halves.
+    inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
     down: CudaSlice<bf16>,
-    down_f32: CudaSlice<f32>,
-    forget: CudaSlice<f32>,
-    gain: CudaSlice<f32>,
+    /// The block counter of the gate kernel's norm.
+    counter: CudaSlice<u32>,
 }
 
 /// Intermediates of `SlidingAttention` and `FullAttention`.
@@ -142,8 +135,6 @@ struct AttentionTemps {
     v_raw: CudaSlice<bf16>,
     k_dynamic: CudaSlice<bf16>,
     v_dynamic: CudaSlice<bf16>,
-    k_conv: CudaSlice<bf16>,
-    v_conv: CudaSlice<bf16>,
     q_raw: CudaSlice<bf16>,
     r_raw: CudaSlice<bf16>,
     gate: CudaSlice<bf16>,
@@ -163,12 +154,13 @@ struct AttentionTemps {
 /// Intermediates of `SparseMoeBlock`.
 struct MoeScratch {
     logits: CudaSlice<f32>,
+    /// The router kernel's block counter.
+    counter: CudaSlice<u32>,
     indices: CudaSlice<i32>,
     weights: CudaSlice<f32>,
     gate_up: CudaSlice<bf16>,
     act: CudaSlice<bf16>,
     down: CudaSlice<bf16>,
-    out: CudaSlice<bf16>,
 }
 
 fn zeros<T: DeviceRepr + ValidAsZeroBits>(
@@ -200,17 +192,18 @@ impl Scratch {
             bank: zeros(stream, max_blocks * hidden)?,
             bank_normed: zeros(stream, hidden)?,
             messages: zeros(stream, MESSAGE_SLOTS * hidden)?,
-            wide: zeros(stream, hidden)?,
             normed_residual: zeros(stream, hidden)?,
             attention_inputs: zeros(stream, 3 * hidden)?,
             gated: zeros(stream, hidden)?,
             gate: GateScratch {
-                both: zeros(stream, 2 * hidden)?,
-                both_bf16: zeros(stream, 2 * hidden)?,
+                inputs: [
+                    zeros(stream, 2 * hidden)?,
+                    zeros(stream, 2 * hidden)?,
+                    zeros(stream, 2 * hidden)?,
+                    zeros(stream, 2 * hidden)?,
+                ],
                 down: zeros(stream, rank)?,
-                down_f32: zeros(stream, rank)?,
-                forget: zeros(stream, hidden)?,
-                gain: zeros(stream, hidden)?,
+                counter: zeros(stream, 1)?,
             },
             qkv_in: [
                 zeros(stream, hidden)?,
@@ -222,8 +215,6 @@ impl Scratch {
                 v_raw: zeros(stream, kv_dims)?,
                 k_dynamic: zeros(stream, dynamic)?,
                 v_dynamic: zeros(stream, dynamic)?,
-                k_conv: zeros(stream, kv_dims)?,
-                v_conv: zeros(stream, kv_dims)?,
                 q_raw: zeros(stream, heads * head_dim)?,
                 r_raw: zeros(stream, heads * cfg.d_rel)?,
                 gate: zeros(stream, heads * head_dim)?,
@@ -238,23 +229,18 @@ impl Scratch {
                 gated: zeros(stream, heads * head_dim)?,
                 proj: zeros(stream, hidden)?,
             },
-            attn_conv: zeros(stream, hidden)?,
             residual: zeros(stream, hidden)?,
-            normed: zeros(stream, hidden)?,
             mlp_input: zeros(stream, hidden)?,
             mlp_x: zeros(stream, hidden)?,
             moe: MoeScratch {
                 logits: zeros(stream, cfg.n_routed_experts)?,
+                counter: zeros(stream, 1)?,
                 indices: zeros(stream, top_k)?,
                 weights: zeros(stream, top_k)?,
                 gate_up: zeros(stream, top_k * 2 * width)?,
                 act: zeros(stream, top_k * width)?,
                 down: zeros(stream, top_k * hidden)?,
-                out: zeros(stream, hidden)?,
             },
-            mlp_conv: zeros(stream, hidden)?,
-            final_normed: zeros(stream, hidden)?,
-            final_input: zeros(stream, hidden)?,
             final_hidden: zeros(stream, hidden)?,
             logits: zeros(stream, cfg.vocab_size)?,
             capped: zeros(stream, cfg.unpadded_vocab_size)?,
@@ -501,7 +487,12 @@ impl Model {
             if pass > 0 {
                 // The message bank: block states the pass added after its first one, and
                 // the normalized hidden state at the end of the pass.
-                ctx.normed_f32(&s.hidden, &mut s.wide, &mut s.bank_normed)?;
+                ctx.kernels.norm.unweighted_rms_norm_bf16(
+                    &ctx.stream,
+                    &s.hidden,
+                    &mut s.bank_normed,
+                    ctx.eps(),
+                )?;
                 bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
                 ensure!(bank_rows > 0, "the message bank needs a block state");
                 ctx.stream.memcpy_dtod(
@@ -514,12 +505,22 @@ impl Model {
             }
             for (i, layer) in (core_start..core_end).enumerate() {
                 if pass > 0 {
-                    ctx.kernels.routing.depth_attention(
+                    // The messages, and their normalized halves of the gate inputs.
+                    let dests = s.gate.inputs.each_mut().map(|x| {
+                        Some(NormDest {
+                            out: x.slice_mut(hidden..),
+                            weight: None,
+                        })
+                    });
+                    ctx.kernels.routing.depth_attention_fused(
                         &ctx.stream,
                         &s.bank.slice(..bank_rows * hidden),
-                        &s.bank_normed,
+                        Partial::Normalized(s.bank_normed.as_view()),
+                        None,
                         &ctx.weights.message_queries[i],
-                        &mut s.messages,
+                        Some(s.messages.as_view_mut()),
+                        dests,
+                        ctx.eps(),
                     )?;
                 }
                 ctx.visit(
@@ -543,19 +544,22 @@ impl Model {
             )?;
         }
 
-        ctx.normed_f32(&s.hidden, &mut s.wide, &mut s.final_normed)?;
-        ctx.kernels.routing.depth_attention(
+        ctx.kernels.routing.depth_attention_fused(
             &ctx.stream,
             &blocks.rows(&s.blocks, hidden)?,
-            &s.final_normed,
+            Partial::Bf16(&s.hidden),
+            None,
             &ctx.weights.final_query,
-            &mut s.final_input,
-        )?;
-        ctx.kernels.norm.rms_norm_f32(
-            &ctx.stream,
-            &s.final_input,
-            &ctx.weights.norm,
-            &mut s.final_hidden,
+            None,
+            [
+                Some(NormDest {
+                    out: s.final_hidden.as_view_mut(),
+                    weight: Some(&ctx.weights.norm),
+                }),
+                None,
+                None,
+                None,
+            ],
             ctx.eps(),
         )?;
         ctx.kernels.linear.gemv_bf16(
@@ -603,6 +607,23 @@ impl Blocks {
     }
 }
 
+/// What [`Ctx::attention_inputs`] reads and writes.
+struct AttentionInputs<'a> {
+    /// The visit input.
+    x: &'a CudaSlice<bf16>,
+    /// The block states so far, F32 `[blocks, hidden]`.
+    states: CudaView<'a, f32>,
+    /// Receives the normalized visit input.
+    normed: CudaViewMut<'a, f32>,
+    /// Depth attention's output rows, F32 `[1 or 3, hidden]`, written only for the gates.
+    inputs: &'a mut CudaSlice<f32>,
+    qkv_in: &'a mut [CudaSlice<bf16>; 3],
+    gate: &'a mut GateScratch,
+    gated: &'a mut CudaSlice<f32>,
+    /// The layer's message gates and the messages, on looped passes after the first.
+    messages: Option<(&'a [MessageGateWeights; MESSAGE_SLOTS], &'a CudaSlice<f32>)>,
+}
+
 impl Ctx {
     /// One decoder-layer visit, as MLX-LM's `DecoderLayer.__call__`, from `s.hidden` to
     /// `s.out`; the two then swap.
@@ -622,31 +643,49 @@ impl Ctx {
         let w = &self.weights.layers[layer];
         let sliding = self.config.is_sliding(layer);
         let hidden = self.hidden();
+        let block_start = layer.is_multiple_of(self.config.n_layers_per_attn_res_block);
+        ensure!(
+            !block_start || blocks.len < blocks.max,
+            "more block states than planned"
+        );
+        let gates = if messages {
+            w.message_gates.as_ref()
+        } else {
+            None
+        };
         // The weights of the attention projections, and of the message gates that build
         // their inputs, stream into L2 while those inputs are built.
         let mut prefetch = Vec::new();
-        if let (true, Some(gates)) = (messages, &w.message_gates) {
+        if let Some(gates) = gates {
             prefetch.extend(gates[..3].iter().flat_map(MessageGateWeights::matrices));
         }
         prefetch.extend(w.attention.input_projections());
         self.kernels.linear.prefetch(&self.stream, &prefetch)?;
-        self.normed_f32(&s.hidden, &mut s.wide, &mut s.normed_residual)?;
 
-        let has_inputs = match &w.attention_query {
-            Some(query) => {
-                let count = if sliding { 1 } else { 3 };
-                self.kernels.routing.depth_attention(
-                    &self.stream,
-                    &blocks.rows(&s.blocks, hidden)?,
-                    &s.normed_residual,
-                    query,
-                    &mut s.attention_inputs.slice_mut(..count * hidden),
-                )?;
-                true
-            }
-            None => false,
+        // The normalized visit input goes straight into the new block state at a block start.
+        let (states, mut rest) = s.blocks.split_at_mut(blocks.len * hidden);
+        let normed = if block_start {
+            rest.slice_mut(..hidden)
+        } else {
+            s.normed_residual.as_view_mut()
         };
-        let one_input = self.attention_inputs(w, s, has_inputs, messages)?;
+        let one_input = self.attention_inputs(
+            w,
+            AttentionInputs {
+                x: &s.hidden,
+                states: states.slice(..),
+                normed,
+                inputs: &mut s.attention_inputs,
+                qkv_in: &mut s.qkv_in,
+                gate: &mut s.gate,
+                gated: &mut s.gated,
+                messages: gates.map(|g| (g, &s.messages)),
+            },
+            sliding,
+        )?;
+        if block_start {
+            blocks.len += 1;
+        }
         let [q_in, k_in, v_in] = &s.qkv_in;
         let (k_in, v_in) = if one_input {
             (q_in, q_in)
@@ -661,88 +700,66 @@ impl Ctx {
             sliding,
             [q_in, k_in, v_in],
         )?;
-        if let (true, Some(gates)) = (messages, &w.message_gates) {
+        if let Some(gates) = gates {
             self.kernels
                 .linear
                 .prefetch(&self.stream, &gates[3].matrices())?;
         }
 
-        self.kernels.conv.short_conv(
+        self.kernels.conv.short_conv_residual(
             &self.stream,
             &s.attention.proj,
             &w.post_attention_conv,
             &mut state.conv[2],
-            &mut s.attn_conv,
+            (!block_start).then_some(&s.hidden),
+            &mut s.residual,
         )?;
 
-        if layer.is_multiple_of(self.config.n_layers_per_attn_res_block) {
-            ensure!(blocks.len < blocks.max, "more block states than planned");
-            self.stream.memcpy_dtod(
-                &s.normed_residual,
-                &mut s
-                    .blocks
-                    .slice_mut(blocks.len * hidden..(blocks.len + 1) * hidden),
-            )?;
-            blocks.len += 1;
-            self.kernels
-                .misc
-                .cast_bf16_to_f32(&self.stream, &s.attn_conv, &mut s.residual)?;
-        } else {
-            self.kernels.elementwise.add_bf16_to_f32(
-                &self.stream,
-                &s.hidden,
-                &s.attn_conv,
-                &mut s.residual,
-            )?;
-        }
-
-        self.kernels.norm.unweighted_rms_norm(
-            &self.stream,
-            &s.residual,
-            &mut s.normed,
-            self.eps(),
-        )?;
-        self.kernels.routing.depth_attention(
+        // With a gate, the MLP state's normalized half of the gate input.
+        let gate_dest = gates.map(|_| NormDest {
+            out: s.gate.inputs[3].slice_mut(..hidden),
+            weight: None,
+        });
+        self.kernels.routing.depth_attention_fused(
             &self.stream,
             &blocks.rows(&s.blocks, hidden)?,
-            &s.normed,
+            Partial::F32(s.residual.as_view()),
+            None,
             &w.mlp_query,
-            &mut s.mlp_input,
+            Some(s.mlp_input.as_view_mut()),
+            [None, None, None, gate_dest],
+            self.eps(),
         )?;
-        let mlp_input = match (messages, &w.message_gates) {
-            (true, Some(gates)) => {
-                self.kernels.linear.join_prefetch(&self.stream)?;
+        let mlp_input = match gates {
+            Some(gates) => {
                 self.message_gate(
                     &gates[3],
                     &mut s.gate,
+                    3,
                     &s.mlp_input,
                     &s.messages.slice(3 * hidden..4 * hidden),
                     &mut s.gated,
+                    None,
                 )?;
                 &s.gated
             }
-            _ => &s.mlp_input,
+            None => &s.mlp_input,
         };
-        self.kernels.norm.rms_norm_f32(
-            &self.stream,
-            mlp_input,
-            &w.mlp_norm,
-            &mut s.mlp_x,
-            self.eps(),
-        )?;
-        self.moe(w, &mut s.moe, &s.mlp_x)?;
+        self.moe(w, &mut s.moe, mlp_input, &mut s.mlp_x)?;
 
-        self.kernels.conv.short_conv(
+        self.kernels.conv.moe_conv_residual(
             &self.stream,
-            &s.moe.out,
+            &s.moe.down,
+            &s.moe.weights,
             &w.post_mlp_conv,
             &mut state.conv[3],
-            &mut s.mlp_conv,
+            &s.residual,
+            &mut s.out,
         )?;
-        self.kernels
-            .elementwise
-            .add_to_bf16(&self.stream, &s.residual, &s.mlp_conv, &mut s.out)?;
 
+        // Join the L2 prefetches once per visit. Joining before the output projection and
+        // the MLP gate made the main stream wait for prefetches still running.
+        self.kernels.linear.join_prefetch(&self.stream)?;
         if let Some(t) = trace {
             t.visits.push(VisitTrace {
                 input: self.stream.clone_dtoh(&s.hidden)?,
@@ -754,63 +771,110 @@ impl Ctx {
         Ok(())
     }
 
-    /// The normalized query, key and value inputs of attention into `s.qkv_in`, as
-    /// `_self_attention` in MLX-LM's sliding and full decoder layers. Returns whether the
-    /// layer has one shared input, in `s.qkv_in[0]`.
+    /// The normalized query, key and value inputs of attention into `a.qkv_in`, as
+    /// `_self_attention` in MLX-LM's sliding and full decoder layers, and the normalized
+    /// visit input into `a.normed`. Returns whether the layer has one shared input, in
+    /// `a.qkv_in[0]`.
     fn attention_inputs(
         &self,
         w: &LayerWeights,
-        s: &mut Scratch,
-        has_inputs: bool,
-        messages: bool,
+        a: AttentionInputs<'_>,
+        sliding: bool,
     ) -> anyhow::Result<bool> {
         let hidden = self.hidden();
         let norms: [&CudaSlice<bf16>; 3] = match &w.input_norms {
             InputNorms::Shared(norm) => [norm; 3],
             InputNorms::Separate { q, k, v } => [q, k, v],
         };
-        if !has_inputs {
+        let shared = matches!(w.input_norms, InputNorms::Shared(_));
+        let Some(query) = &w.attention_query else {
             // Layer 0: no depth attention and no messages, one shared BF16 input.
-            ensure!(!messages, "layer without depth attention got messages");
+            ensure!(
+                a.messages.is_none(),
+                "layer without depth attention got messages"
+            );
+            let mut normed = a.normed;
+            self.kernels.norm.unweighted_rms_norm_bf16(
+                &self.stream,
+                a.x,
+                &mut normed,
+                self.eps(),
+            )?;
             self.kernels.norm.rms_norm(
                 &self.stream,
-                &s.hidden,
+                a.x,
                 norms[0],
-                &mut s.qkv_in[0],
+                &mut a.qkv_in[0],
                 self.eps(),
             )?;
             return Ok(true);
-        }
-        let shared = matches!(w.input_norms, InputNorms::Shared(_));
+        };
+        let count = if sliding { 1 } else { 3 };
+        ensure!(
+            shared == (count == 1),
+            "shared input norms must go with one depth-attention query"
+        );
+        let [g0, g1, g2, _] = &mut a.gate.inputs;
+        let [q0, q1, q2] = &mut *a.qkv_in;
+        // Without messages, the depth-attention kernel applies the input norms. With them, it
+        // writes the normalized states into the gate inputs, and each gate applies its norm.
+        let dests = if a.messages.is_some() {
+            [g0, g1, g2].map(|g| {
+                Some(NormDest {
+                    out: g.slice_mut(..hidden),
+                    weight: None,
+                })
+            })
+        } else if shared {
+            [
+                Some(NormDest {
+                    out: q0.as_view_mut(),
+                    weight: Some(norms[0]),
+                }),
+                None,
+                None,
+            ]
+        } else {
+            [(q0, norms[0]), (q1, norms[1]), (q2, norms[2])].map(|(q, norm)| {
+                Some(NormDest {
+                    out: q.as_view_mut(),
+                    weight: Some(norm),
+                })
+            })
+        };
+        let [d0, d1, d2] = dests;
+        self.kernels.routing.depth_attention_fused(
+            &self.stream,
+            &a.states,
+            Partial::Bf16(a.x),
+            Some(a.normed),
+            query,
+            a.messages
+                .is_some()
+                .then(|| a.inputs.slice_mut(..count * hidden)),
+            [d0, d1, d2, None],
+            self.eps(),
+        )?;
+        let Some((gates, messages)) = a.messages else {
+            return Ok(shared);
+        };
         for (i, norm) in norms.into_iter().enumerate() {
             let row = if shared { 0 } else { i };
-            let state = s.attention_inputs.slice(row * hidden..(row + 1) * hidden);
-            let x = &mut s.qkv_in[i];
-            match (messages, &w.message_gates) {
-                (true, Some(gates)) => {
-                    self.message_gate(
-                        &gates[i],
-                        &mut s.gate,
-                        &state,
-                        &s.messages.slice(i * hidden..(i + 1) * hidden),
-                        &mut s.gated,
-                    )?;
-                    self.kernels
-                        .norm
-                        .rms_norm_f32(&self.stream, &s.gated, norm, x, self.eps())?;
-                }
-                _ => self
-                    .kernels
-                    .norm
-                    .rms_norm_f32(&self.stream, &state, norm, x, self.eps())?,
-            }
+            self.message_gate(
+                &gates[i],
+                &mut *a.gate,
+                i,
+                &a.inputs.slice(row * hidden..(row + 1) * hidden),
+                &messages.slice(i * hidden..(i + 1) * hidden),
+                &mut *a.gated,
+                Some((norm, &mut a.qkv_in[i])),
+            )?;
         }
         Ok(false)
     }
 
     /// Attention from the normalized query, key and value inputs to the output projection
     /// in `t.proj`, as MLX-LM's `SlidingAttention` and `FullAttention`.
-    #[expect(clippy::too_many_lines, reason = "follows Attention._attend op by op")]
     fn attention(
         &self,
         state: &mut VisitState,
@@ -822,9 +886,6 @@ impl Ctx {
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let a = &w.attention;
-        let heads = cfg.num_attention_heads;
-        let kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
 
         // Every projection of the three inputs in one launch.
         let mut products = vec![
@@ -844,92 +905,44 @@ impl Ctx {
         // The output projection's weight streams into L2 while attention runs.
         self.kernels.linear.prefetch(&self.stream, &[&a.o])?;
 
-        let [k_state, v_state, ..] = &mut state.conv;
-        match &a.kv_conv {
-            KvConv::Static { k, v } => {
-                self.kernels
-                    .conv
-                    .short_conv(&self.stream, &t.k_raw, k, k_state, &mut t.k_conv)?;
-                self.kernels
-                    .conv
-                    .short_conv(&self.stream, &t.v_raw, v, v_state, &mut t.v_conv)?;
-            }
+        let conv = match &a.kv_conv {
+            KvConv::Static { k, v } => KvConvWeights::Static { k, v },
             KvConv::Dynamic {
                 k_static, v_static, ..
-            } => {
-                self.kernels.conv.dynamic_short_conv(
-                    &self.stream,
-                    &t.k_raw,
-                    &t.k_dynamic,
-                    k_static,
-                    k_state,
-                    &mut t.k_conv,
-                )?;
-                self.kernels.conv.dynamic_short_conv(
-                    &self.stream,
-                    &t.v_raw,
-                    &t.v_dynamic,
-                    v_static,
-                    v_state,
-                    &mut t.v_conv,
-                )?;
-            }
-        }
-
-        let threshold = cfg.qk_l2_clip_threshold;
-        self.kernels.norm.l2_clip(
+            } => KvConvWeights::Dynamic {
+                k_dynamic: &t.k_dynamic,
+                v_dynamic: &t.v_dynamic,
+                k_static,
+                v_static,
+            },
+        };
+        let [k_state, v_state, ..] = &mut state.conv;
+        self.kernels.norm.attention_post(
             &self.stream,
-            &t.q_raw,
-            Some(&a.q_clip_scale),
-            &mut t.q,
-            heads,
-            head_dim,
-            threshold,
+            AttentionPost {
+                k_raw: &t.k_raw,
+                v_raw: &t.v_raw,
+                conv,
+                k_state,
+                v_state,
+                q_raw: &t.q_raw,
+                q_scale: &a.q_clip_scale,
+                r_raw: &t.r_raw,
+                r_scale: &a.rel_clip_scale,
+                k: &mut t.k,
+                v: &mut t.v,
+                q: &mut t.q,
+                r: &mut t.r,
+                log_scale: (!sliding).then_some((
+                    position,
+                    cfg.log_scaling_alpha,
+                    cfg.log_scaling_n_floor as f32,
+                )),
+                qk_threshold: cfg.qk_l2_clip_threshold,
+                rel_threshold: cfg.rel_l2_clip_threshold,
+                eps: self.eps(),
+            },
         )?;
-        self.kernels.norm.l2_clip(
-            &self.stream,
-            &t.k_conv,
-            None,
-            &mut t.k,
-            kv_heads,
-            head_dim,
-            threshold,
-        )?;
-        self.kernels.norm.unweighted_rms_norm_heads(
-            &self.stream,
-            &t.v_conv,
-            &mut t.v,
-            self.eps(),
-        )?;
-        self.kernels.norm.l2_clip(
-            &self.stream,
-            &t.r_raw,
-            Some(&a.rel_clip_scale),
-            &mut t.r,
-            heads,
-            cfg.d_rel,
-            cfg.rel_l2_clip_threshold,
-        )?;
-        if !sliding {
-            let alpha = cfg.log_scaling_alpha;
-            let floor = cfg.log_scaling_n_floor as f32;
-            self.kernels.elementwise.log_scale(
-                &self.stream,
-                &mut t.q,
-                heads * head_dim,
-                position,
-                alpha,
-                floor,
-            )?;
-            self.kernels.elementwise.log_scale(
-                &self.stream,
-                &mut t.r,
-                heads * cfg.d_rel,
-                position,
-                alpha,
-                floor,
-            )?;
-        }
         self.kernels
             .attention
             .relative_bias(&self.stream, &t.r, &a.rel_table, &mut t.bias)?;
@@ -950,75 +963,67 @@ impl Ctx {
         self.kernels
             .elementwise
             .attention_gate(&self.stream, &t.out, &t.gate, &mut t.gated)?;
-        self.kernels.linear.join_prefetch(&self.stream)?;
         self.kernels
             .linear
             .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])
     }
 
-    /// MLX-LM's `MessageGate`: mixes `message` into the F32 state `h`, into `out`.
+    /// MLX-LM's `MessageGate` for message slot `slot`: mixes `message` into the F32 state
+    /// `h`, into `out`. Depth attention has already written the normalized state and message
+    /// into `t.inputs[slot]`. With `norm`, also writes `bf16(rms_norm(out) * weight)`.
+    #[expect(clippy::too_many_arguments, reason = "the gate's inputs and outputs")]
     fn message_gate(
         &self,
         g: &MessageGateWeights,
         t: &mut GateScratch,
+        slot: usize,
         h: &impl DeviceIn<f32>,
         message: &impl DeviceIn<f32>,
         out: &mut CudaSlice<f32>,
+        norm: Option<(&CudaSlice<bf16>, &mut CudaSlice<bf16>)>,
     ) -> anyhow::Result<()> {
-        let hidden = self.hidden();
-        self.kernels.norm.unweighted_rms_norm(
-            &self.stream,
-            h,
-            &mut t.both.slice_mut(..hidden),
-            self.eps(),
-        )?;
-        self.kernels.norm.unweighted_rms_norm(
-            &self.stream,
-            message,
-            &mut t.both.slice_mut(hidden..),
-            self.eps(),
-        )?;
-        self.kernels
-            .misc
-            .cast_f32_to_bf16(&self.stream, &t.both, &mut t.both_bf16)?;
         self.kernels.linear.gemv_bf16(
             &self.stream,
-            &mut [Gemv::new(&g.down, &t.both_bf16, &mut t.down)],
+            &mut [Gemv::new(&g.down, &t.inputs[slot], &mut t.down)],
         )?;
-        self.kernels
-            .misc
-            .cast_bf16_to_f32(&self.stream, &t.down, &mut t.down_f32)?;
-        self.kernels.linear.gemv_f32(
+        self.kernels.misc.message_gate_out(
             &self.stream,
-            &mut [
-                Gemv::new(&g.forget, &t.down_f32, &mut t.forget),
-                Gemv::new(&g.gain, &t.down_f32, &mut t.gain),
-            ],
-        )?;
-        self.kernels
-            .misc
-            .message_gate_combine(&self.stream, h, message, &t.forget, &t.gain, out)
+            &t.down,
+            &g.forget,
+            &g.gain,
+            h,
+            message,
+            out,
+            norm.map(|(weight, normed)| (weight, normed, &mut t.counter)),
+            self.eps(),
+        )
     }
 
-    /// MLX-LM's `SparseMoeBlock` for one BF16 row, into `t.out`.
-    fn moe(&self, w: &LayerWeights, t: &mut MoeScratch, x: &CudaSlice<bf16>) -> anyhow::Result<()> {
+    /// MLX-LM's `SparseMoeBlock` for one F32 row before its norm, up to the expert outputs in
+    /// `t.down` and their weights in `t.weights`. The normalized BF16 input goes to `x`.
+    fn moe(
+        &self,
+        w: &LayerWeights,
+        t: &mut MoeScratch,
+        input: &CudaSlice<f32>,
+        x: &mut CudaSlice<bf16>,
+    ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
         let width = cfg.intermediate_size;
 
-        self.kernels.routing.router_logits(
+        self.kernels.routing.moe_router(
             &self.stream,
-            x,
+            input,
+            &w.mlp_norm,
+            self.eps(),
             &w.router,
-            &mut t.logits,
-            RouterMatmul::F32,
-        )?;
-        self.kernels.routing.expert_routing(
-            &self.stream,
-            &t.logits,
             &w.router_bias,
+            x,
+            &mut t.logits,
             &mut t.indices,
             &mut t.weights,
+            &mut t.counter,
             cfg.route_scale,
         )?;
 
@@ -1063,23 +1068,7 @@ impl Ctx {
         )?;
         self.kernels
             .experts
-            .expert_matvec(&self.stream, &t.act, &t.indices, &w2, &mut t.down)?;
-        self.kernels
-            .elementwise
-            .moe_combine(&self.stream, &t.down, &t.weights, &mut t.out)
-    }
-
-    /// `unweighted_rms_norm(x.astype(mx.float32))` for a BF16 row, through `wide`.
-    fn normed_f32(
-        &self,
-        x: &CudaSlice<bf16>,
-        wide: &mut CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
-    ) -> anyhow::Result<()> {
-        self.kernels.misc.cast_bf16_to_f32(&self.stream, x, wide)?;
-        self.kernels
-            .norm
-            .unweighted_rms_norm(&self.stream, wide, out, self.eps())
+            .expert_matvec(&self.stream, &t.act, &t.indices, &w2, &mut t.down)
     }
 
     fn hidden(&self) -> usize {

@@ -6,9 +6,20 @@
 
 mod common;
 
-use common::{Fixture, assert_bf16_close};
+use common::{
+    Fixture, assert_bf16_close, assert_f32_within_ulps, pseudo_random, pseudo_random_bf16,
+};
+use cudarc::driver::CudaSlice;
 use half::bf16;
-use inkling_cuda::{Gpu, ops::norm::Norm};
+use inkling_cuda::{
+    Gpu,
+    ops::{
+        conv::Conv,
+        elementwise::Elementwise,
+        misc::Misc,
+        norm::{AttentionPost, KvConvWeights, Norm},
+    },
+};
 
 const EPS: f32 = 1e-6;
 const QK_THRESHOLD: f32 = 22.627_417;
@@ -172,6 +183,216 @@ fn l2_clip_matches_mlx() -> anyhow::Result<()> {
             true,
             REL_THRESHOLD,
         )?;
+    }
+    Ok(())
+}
+
+const HIDDEN: usize = 2304;
+const KV: usize = 8 * 128;
+const Q_HEADS: usize = 24;
+
+/// The BF16-input unweighted norm against a cast followed by the F32 norm. Widening is
+/// exact and the sums are the same, so the outputs must match bit for bit.
+#[test]
+fn unweighted_rms_norm_bf16_matches_cast_then_norm() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let norm = Norm::load(gpu.context())?;
+    let misc = Misc::load(gpu.context())?;
+    let x = stream.clone_htod(&pseudo_random_bf16(3 * HIDDEN, 7, 4.0, 0.0))?;
+    let mut wide = stream.alloc_zeros::<f32>(3 * HIDDEN)?;
+    let mut want = stream.alloc_zeros::<f32>(3 * HIDDEN)?;
+    misc.cast_bf16_to_f32(stream, &x, &mut wide)?;
+    norm.unweighted_rms_norm(stream, &wide, &mut want, EPS)?;
+    let mut got = stream.alloc_zeros::<f32>(3 * HIDDEN)?;
+    norm.unweighted_rms_norm_bf16(stream, &x, &mut got, EPS)?;
+    assert_f32_within_ulps(
+        "rows",
+        &stream.clone_dtoh(&got)?,
+        &stream.clone_dtoh(&want)?,
+        0,
+    );
+    Ok(())
+}
+
+/// The fused attention post-processing against the separate kernels, for static and
+/// dynamic convs, with and without log scaling, over two steps so the conv states carry.
+///
+/// The fused kernel repeats every rounded operation in order, so keys, queries,
+/// relative-position states and conv states match bit for bit. The value norm computes
+/// 1 / sqrt in float where `unweighted_rms_norm_heads` rounds a double rsqrt once; the two
+/// differ by at most one F32 ulp, which moves a BF16 value by at most one ulp.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the separate kernels and the fused one, per case"
+)]
+fn attention_post_matches_separate_kernels() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let norm = Norm::load(gpu.context())?;
+    let conv = Conv::load(gpu.context())?;
+    let elementwise = Elementwise::load(gpu.context())?;
+    let position = stream.clone_htod(&[20_000u32])?;
+    let (alpha, n_floor) = (0.1, 8192.0);
+    let q_scale = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 128, 60, 0.5, 1.0))?;
+    let r_scale = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 16, 61, 0.5, 1.0))?;
+    let k_weight = stream.clone_htod(&pseudo_random_bf16(KV * 4, 62, 0.5, 0.0))?;
+    let v_weight = stream.clone_htod(&pseudo_random_bf16(KV * 4, 63, 0.5, 0.0))?;
+    let k_static = stream.clone_htod(&pseudo_random(4 * KV, 64, 0.5))?;
+    let v_static = stream.clone_htod(&pseudo_random(4 * KV, 65, 0.5))?;
+    for (dynamic, log_scale) in [(false, false), (false, true), (true, false), (true, true)] {
+        let label = format!("dynamic {dynamic}, log scale {log_scale}");
+        let start_k = pseudo_random(3 * KV, 66, 2.0);
+        let start_v = pseudo_random(3 * KV, 67, 2.0);
+        let (mut k_state, mut v_state) =
+            (stream.clone_htod(&start_k)?, stream.clone_htod(&start_v)?);
+        let (mut k_state_ref, mut v_state_ref) =
+            (stream.clone_htod(&start_k)?, stream.clone_htod(&start_v)?);
+        for step in 0..2u32 {
+            let seed = 100 * step;
+            // Scales chosen so some heads exceed the clip thresholds and some do not.
+            let k_raw = stream.clone_htod(&pseudo_random_bf16(KV, seed + 1, 6.0, 0.0))?;
+            let v_raw = stream.clone_htod(&pseudo_random_bf16(KV, seed + 2, 6.0, 0.0))?;
+            let k_dyn = stream.clone_htod(&pseudo_random_bf16(32, seed + 3, 0.5, 0.0))?;
+            let v_dyn = stream.clone_htod(&pseudo_random_bf16(32, seed + 4, 0.5, 0.0))?;
+            let q_raw =
+                stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 128, seed + 5, 3.0, 0.0))?;
+            let r_raw = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 16, seed + 6, 3.0, 0.0))?;
+
+            let zeros =
+                |n: usize| -> anyhow::Result<CudaSlice<bf16>> { Ok(stream.alloc_zeros(n)?) };
+            let (mut k_conv, mut v_conv) = (zeros(KV)?, zeros(KV)?);
+            if dynamic {
+                conv.dynamic_short_conv(
+                    stream,
+                    &k_raw,
+                    &k_dyn,
+                    &k_static,
+                    &mut k_state_ref,
+                    &mut k_conv,
+                )?;
+                conv.dynamic_short_conv(
+                    stream,
+                    &v_raw,
+                    &v_dyn,
+                    &v_static,
+                    &mut v_state_ref,
+                    &mut v_conv,
+                )?;
+            } else {
+                conv.short_conv(stream, &k_raw, &k_weight, &mut k_state_ref, &mut k_conv)?;
+                conv.short_conv(stream, &v_raw, &v_weight, &mut v_state_ref, &mut v_conv)?;
+            }
+            let (mut k_want, mut v_want) = (zeros(KV)?, zeros(KV)?);
+            let (mut q_want, mut r_want) = (zeros(Q_HEADS * 128)?, zeros(Q_HEADS * 16)?);
+            norm.l2_clip(stream, &k_conv, None, &mut k_want, 8, 128, QK_THRESHOLD)?;
+            norm.unweighted_rms_norm_heads(stream, &v_conv, &mut v_want, EPS)?;
+            norm.l2_clip(
+                stream,
+                &q_raw,
+                Some(&q_scale),
+                &mut q_want,
+                Q_HEADS,
+                128,
+                QK_THRESHOLD,
+            )?;
+            norm.l2_clip(
+                stream,
+                &r_raw,
+                Some(&r_scale),
+                &mut r_want,
+                Q_HEADS,
+                16,
+                REL_THRESHOLD,
+            )?;
+            if log_scale {
+                elementwise.log_scale(
+                    stream,
+                    &mut q_want,
+                    Q_HEADS * 128,
+                    &position,
+                    alpha,
+                    n_floor,
+                )?;
+                elementwise.log_scale(
+                    stream,
+                    &mut r_want,
+                    Q_HEADS * 16,
+                    &position,
+                    alpha,
+                    n_floor,
+                )?;
+            }
+
+            let (mut k, mut v) = (zeros(KV)?, zeros(KV)?);
+            let (mut q, mut r) = (zeros(Q_HEADS * 128)?, zeros(Q_HEADS * 16)?);
+            let conv_weights = if dynamic {
+                KvConvWeights::Dynamic {
+                    k_dynamic: &k_dyn,
+                    v_dynamic: &v_dyn,
+                    k_static: &k_static,
+                    v_static: &v_static,
+                }
+            } else {
+                KvConvWeights::Static {
+                    k: &k_weight,
+                    v: &v_weight,
+                }
+            };
+            norm.attention_post(
+                stream,
+                AttentionPost {
+                    k_raw: &k_raw,
+                    v_raw: &v_raw,
+                    conv: conv_weights,
+                    k_state: &mut k_state,
+                    v_state: &mut v_state,
+                    q_raw: &q_raw,
+                    q_scale: &q_scale,
+                    r_raw: &r_raw,
+                    r_scale: &r_scale,
+                    k: &mut k,
+                    v: &mut v,
+                    q: &mut q,
+                    r: &mut r,
+                    log_scale: log_scale.then_some((&position, alpha, n_floor)),
+                    qk_threshold: QK_THRESHOLD,
+                    rel_threshold: REL_THRESHOLD,
+                    eps: EPS,
+                },
+            )?;
+            let label = format!("{label}, step {step}");
+            for (name, got, want, ulps) in [
+                ("k", &k, &k_want, 0),
+                ("v", &v, &v_want, 1),
+                ("q", &q, &q_want, 0),
+                ("r", &r, &r_want, 0),
+            ] {
+                let got = stream.clone_dtoh(got)?;
+                assert!(
+                    got.iter().any(|v| v.to_f32() != 0.0),
+                    "{label}: {name} is all zero"
+                );
+                assert_bf16_close(
+                    &format!("{label}: {name}"),
+                    &got,
+                    &stream.clone_dtoh(want)?,
+                    ulps,
+                );
+            }
+            for (name, got, want) in [
+                ("k state", &k_state, &k_state_ref),
+                ("v state", &v_state, &v_state_ref),
+            ] {
+                assert_f32_within_ulps(
+                    &format!("{label}: {name}"),
+                    &stream.clone_dtoh(got)?,
+                    &stream.clone_dtoh(want)?,
+                    0,
+                );
+            }
+        }
     }
     Ok(())
 }

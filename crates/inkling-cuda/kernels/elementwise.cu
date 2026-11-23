@@ -19,6 +19,8 @@
 #include <cfloat>
 #include <cstdint>
 
+#include "pdl.cuh"
+
 namespace {
 
 constexpr int kHidden = 2304;
@@ -72,10 +74,16 @@ __device__ __forceinline__ float mlx_sigmoid(float x) {
 
 // tanh(x / cap) * cap. A correctly rounded tanh (through double) agrees with Metal's
 // on 98.4% of BF16 inputs to the logit softcap, tanhf on 98.0%. In SwiGLU outputs that
-// is 11 against 18 differing BF16 values per million. FP64 runs at 1/64 rate on
-// consumer GPUs, so revisit this when SwiGLU speed matters.
+// is 11 against 18 differing BF16 values per million, so SwiGLU uses tanhf (softcap_f32).
 __device__ __forceinline__ float softcap(float x, float cap) {
     return fmul(float(tanh(double(fdiv(x, cap)))), cap);
+}
+
+// The SwiGLU softcap with CUDA's tanhf (at most 2 ulps from the true value), which avoids
+// the FP64 tanh above. SwiGLU runs on 9216 values per layer visit; the FP64 version took
+// 2.7 us per call on an RTX 5090.
+__device__ __forceinline__ float softcap_f32(float x, float cap) {
+    return fmul(tanhf(fdiv(x, cap)), cap);
 }
 
 }  // namespace
@@ -101,10 +109,12 @@ embedding_bf16_2304(const int32_t* ids, const __nv_bfloat16* table, __nv_bfloat1
 extern "C" __global__ void softcapped_swiglu_bf16(const __nv_bfloat162* gate_up,
                                                   __nv_bfloat16* out, size_t n,
                                                   float gate_softcap, float up_softcap) {
+    pdl_trigger();
+    pdl_wait();
     for (size_t i = grid_index(); i < n; i += grid_stride()) {
         const float2 gu = __bfloat1622float2(gate_up[i]);
-        const float gate = fmul(softcap(gu.x, gate_softcap), mlx_sigmoid(gu.x));
-        out[i] = to_bf16(fmul(gate, softcap(gu.y, up_softcap)));
+        const float gate = fmul(softcap_f32(gu.x, gate_softcap), mlx_sigmoid(gu.x));
+        out[i] = to_bf16(fmul(gate, softcap_f32(gu.y, up_softcap)));
     }
 }
 

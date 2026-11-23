@@ -17,6 +17,8 @@
 #include <climits>
 #include <cstdint>
 
+#include "pdl.cuh"
+
 namespace {
 
 constexpr int kArgmaxThreads = 1024;
@@ -145,5 +147,159 @@ argmax_f32(const float* x, int* out, int n) {
         if (lane == 0) {
             out[blockIdx.x] = best_idx;
         }
+    }
+}
+
+namespace {
+
+constexpr int kHidden = 2304;
+constexpr int kGateRank = 64;
+constexpr int kGateThreads = 288;
+constexpr int kGateWarps = kGateThreads / 32;
+// gemv_f32_sn4_bn1's layout: 4 lanes per output row, 8 rows per warp. Lane l of a row
+// sums columns 16 i + 4 l + 0..3 for i = 0..3.
+constexpr int kLanesPerRow = 4;
+constexpr int kRowsPerWarp = 32 / kLanesPerRow;
+constexpr int kGateRowsPerBlock = kGateWarps * kRowsPerWarp;
+constexpr int kGateBlocks = kHidden / kGateRowsPerBlock;
+constexpr int kGateSteps = kGateRank / (4 * kLanesPerRow);
+static_assert(kHidden % kGateRowsPerBlock == 0, "blocks cover the row");
+// The last block repeats the 576-thread sums of rms_norm_f32_2304 as virtual threads
+// t and t + 288.
+constexpr int kNormVirtualWarps = 2 * kGateWarps;
+static_assert(kGateThreads * 8 == kHidden, "two runs of 4 per thread cover the row");
+
+__device__ __forceinline__ float ffma(float a, float b, float c) {
+    float r;
+    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+}  // namespace
+
+// The end of MessageGate for one row, from the BF16 down projection `down` ([64]):
+// f_pre = forget @ down, g_pre = gain @ down (BF16 weights [2304, 64], widened to F32
+// as they are read), then out = (1 - tanh(f_pre)) * h + tanh(g_pre) * m. Each output
+// row sums in the order of MLX's GEMV for k = 64; tanh is CUDA's tanhf.
+//
+// With `normed` not null, also writes normed = bf16(rms_norm(out) * norm_weight), the
+// RMSNorm after every query, key and value gate, summed as rms_norm_f32_2304 does.
+// The last block to finish, found with `counter`, applies it. `counter` must start
+// at 0 and is reset by that block.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
+                      const __nv_bfloat16* __restrict__ gain, const float* h, const float* m, float* out,
+                      const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
+                      unsigned* counter, float eps) {
+    __shared__ float vw[kNormVirtualWarps];
+    __shared__ bool last;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int sub = lane % kLanesPerRow;
+    const int row = blockIdx.x * kGateRowsPerBlock + warp * kRowsPerWarp + lane / kLanesPerRow;
+
+    uint2 fw[kGateSteps];
+    uint2 gw[kGateSteps];
+    float x[kGateSteps][4];
+#pragma unroll
+    for (int i = 0; i < kGateSteps; ++i) {
+        const int col = i * 4 * kLanesPerRow + sub * 4;
+        fw[i] = *reinterpret_cast<const uint2*>(forget + size_t(row) * kGateRank + col);
+        gw[i] = *reinterpret_cast<const uint2*>(gain + size_t(row) * kGateRank + col);
+    }
+    pdl_trigger();
+    pdl_wait();
+#pragma unroll
+    for (int i = 0; i < kGateSteps; ++i) {
+        const int col = i * 4 * kLanesPerRow + sub * 4;
+        const uint2 packed = *reinterpret_cast<const uint2*>(down + col);
+        const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            x[i][k] = __bfloat162float(vals[k]);
+        }
+    }
+    float f = 0.f;
+    float g = 0.f;
+#pragma unroll
+    for (int i = 0; i < kGateSteps; ++i) {
+        const auto* fv = reinterpret_cast<const __nv_bfloat16*>(&fw[i]);
+        const auto* gv = reinterpret_cast<const __nv_bfloat16*>(&gw[i]);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            f = ffma(__bfloat162float(fv[k]), x[i][k], f);
+            g = ffma(__bfloat162float(gv[k]), x[i][k], g);
+        }
+    }
+    // MLX's simd_shuffle_down tree over the row's 4 lanes; lane 0 of the row ends with it.
+#pragma unroll
+    for (int offset = kLanesPerRow / 2; offset > 0; offset /= 2) {
+        f = fadd(f, __shfl_down_sync(0xffffffffu, f, offset));
+        g = fadd(g, __shfl_down_sync(0xffffffffu, g, offset));
+    }
+    if (sub == 0) {
+        const float forget_t = tanhf(f);
+        const float gain_t = tanhf(g);
+        out[row] = fadd(fmul(fsub(1.f, forget_t), h[row]), fmul(gain_t, m[row]));
+    }
+    if (normed == nullptr) {
+        return;
+    }
+    // Make this block's outputs visible to the last block before counting it as done.
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(counter, 1u) == kGateBlocks - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    const int ca = 4 * threadIdx.x;
+    const int cb = 4 * (threadIdx.x + kGateThreads);
+    float a[4];
+    float b[4];
+    float wa[4];
+    float wb[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        a[i] = __ldcg(out + ca + i);
+        b[i] = __ldcg(out + cb + i);
+        wa[i] = __bfloat162float(norm_weight[ca + i]);
+        wb[i] = __bfloat162float(norm_weight[cb + i]);
+    }
+    float pa = 0.f;
+    float pb = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        pa = fmaf(a[i], a[i], pa);
+        pb = fmaf(b[i], b[i], pb);
+    }
+    pa = warp_sum(pa);
+    pb = warp_sum(pb);
+    if (lane == 0) {
+        vw[warp] = pa;
+        vw[warp + kGateWarps] = pb;
+    }
+    __syncthreads();
+    const float ss = warp_sum(lane < kNormVirtualWarps ? vw[lane] : 0.f);
+    // Two correctly rounded float operations; rms_norm_f32_2304 rounds a double rsqrt once.
+    const float inv = 1.f / sqrtf(ss / static_cast<float>(kHidden) + eps);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        normed[ca + i] = __float2bfloat16((a[i] * inv) * wa[i]);
+        normed[cb + i] = __float2bfloat16((b[i] * inv) * wb[i]);
+    }
+    if (threadIdx.x == 0) {
+        *counter = 0;
     }
 }

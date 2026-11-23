@@ -8,7 +8,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, cubin, load_module};
+use crate::gpu::{DeviceIn, KernelArgs, cubin, load_module};
 
 /// Threads per block for the elementwise kernels.
 const BLOCK: u32 = 256;
@@ -16,6 +16,12 @@ const BLOCK: u32 = 256;
 const MAX_BLOCKS: usize = 1 << 16;
 /// Threads per block of the argmax kernel, one block per row.
 const ARGMAX_THREADS: u32 = 1024;
+/// Hidden width and message-gate rank of the model.
+const HIDDEN: usize = 2304;
+const GATE_RANK: usize = 64;
+/// Blocks and threads of `message_gate_out_2304`: 72 output rows per block.
+const GATE_OUT_BLOCKS: u32 = (HIDDEN / 72) as u32;
+const GATE_OUT_THREADS: u32 = 288;
 
 #[derive(Debug)]
 pub struct Misc {
@@ -23,6 +29,7 @@ pub struct Misc {
     cast_f32_to_bf16: CudaFunction,
     cast_bf16_to_f32: CudaFunction,
     argmax_f32: CudaFunction,
+    message_gate_out_2304: CudaFunction,
 }
 
 /// Launch shape for a grid-stride loop over `n` elements.
@@ -48,6 +55,7 @@ impl Misc {
             cast_f32_to_bf16: module.load_function("cast_f32_to_bf16")?,
             cast_bf16_to_f32: module.load_function("cast_bf16_to_f32")?,
             argmax_f32: module.load_function("argmax_f32")?,
+            message_gate_out_2304: module.load_function("message_gate_out_2304")?,
         })
     }
 
@@ -148,5 +156,65 @@ impl Misc {
         // rows of `n` and `out` holds `rows` elements, one per block.
         unsafe { launch.launch(config) }?;
         Ok(())
+    }
+
+    /// The end of `MessageGate` for one row from its BF16 down projection `down` (`[64]`):
+    /// the forget and gain projections (BF16 weights `[2304, 64]` with an F32 input) and
+    /// the combine into `out`, as [`Misc::message_gate_combine`] after the F32 GEMVs. Each
+    /// row sums in the order of MLX's GEMV for k = 64; tanh is CUDA's `tanhf`.
+    ///
+    /// With `norm` set to `(weight, normed, counter)`, also writes `normed =
+    /// bf16(rms_norm(out) * weight)`. `counter` must hold 0; the kernel leaves it at 0.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn message_gate_out(
+        &self,
+        stream: &CudaStream,
+        down: &CudaSlice<bf16>,
+        forget: &CudaSlice<bf16>,
+        gain: &CudaSlice<bf16>,
+        h: &impl DeviceIn<f32>,
+        m: &impl DeviceIn<f32>,
+        out: &mut CudaSlice<f32>,
+        norm: Option<(&CudaSlice<bf16>, &mut CudaSlice<bf16>, &mut CudaSlice<u32>)>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let (h, m) = (h.view(), m.view());
+        check_len("down", down.len(), GATE_RANK)?;
+        check_len("forget", forget.len(), HIDDEN * GATE_RANK)?;
+        check_len("gain", gain.len(), HIDDEN * GATE_RANK)?;
+        check_len("h", h.len(), HIDDEN)?;
+        check_len("m", m.len(), HIDDEN)?;
+        check_len("out", out.len(), HIDDEN)?;
+        let config = LaunchConfig {
+            grid_dim: (GATE_OUT_BLOCKS, 1, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(down, stream)
+            .ptr(forget, stream)
+            .ptr(gain, stream)
+            .ptr(&h, stream)
+            .ptr(&m, stream)
+            .ptr_mut(out, stream);
+        match norm {
+            Some((weight, normed, counter)) => {
+                check_len("norm weight", weight.len(), HIDDEN)?;
+                check_len("normed", normed.len(), HIDDEN)?;
+                ensure!(!counter.is_empty(), "counter is empty");
+                args.ptr(weight, stream)
+                    .ptr_mut(normed, stream)
+                    .ptr_mut(counter, stream);
+            }
+            None => {
+                args.u64(0).u64(0).u64(0);
+            }
+        }
+        args.f32(eps);
+        // SAFETY: the arguments match `message_gate_out_2304(const bf16*, const bf16*,
+        // const bf16*, const float*, const float*, float*, const bf16*, bf16*, unsigned*,
+        // float)`, every buffer has the length checked above, a null `normed` makes the
+        // kernel skip the norm and its buffers, and it reads only weights before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.message_gate_out_2304, config) }
     }
 }

@@ -12,7 +12,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{KernelArgs, cubin, load_module};
 
 /// Taps per channel.
 const KERNEL: usize = 4;
@@ -24,11 +24,36 @@ const DYNAMIC_DIMS: usize = 1024;
 const DYNAMIC_HEADS: usize = 8;
 /// Threads per block; each thread owns one channel.
 const BLOCK: u32 = 256;
+/// Hidden width, the channels of the post-attention and post-MLP convs.
+const HIDDEN: usize = 2304;
+/// Experts per token in the MoE combine.
+const TOP_K: usize = 8;
+
+/// One thread per hidden channel.
+fn hidden_config() -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((HIDDEN as u32).div_ceil(BLOCK), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn check_hidden_conv(weight: &CudaSlice<bf16>, state: &CudaSlice<f32>) -> anyhow::Result<()> {
+    ensure!(
+        weight.len() == HIDDEN * KERNEL && state.len() == STATE_ROWS * HIDDEN,
+        "weight has {} and state {} elements, expected [{HIDDEN}, {KERNEL}] and [{STATE_ROWS}, {HIDDEN}]",
+        weight.len(),
+        state.len()
+    );
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct Conv {
     short_conv_bf16: CudaFunction,
     dynamic_short_conv_bf16: CudaFunction,
+    short_conv_residual_2304: CudaFunction,
+    moe_conv_residual_2304: CudaFunction,
 }
 
 impl Conv {
@@ -37,6 +62,8 @@ impl Conv {
         Ok(Self {
             short_conv_bf16: module.load_function("short_conv_bf16")?,
             dynamic_short_conv_bf16: module.load_function("dynamic_short_conv_bf16")?,
+            short_conv_residual_2304: module.load_function("short_conv_residual_2304")?,
+            moe_conv_residual_2304: module.load_function("moe_conv_residual_2304")?,
         })
     }
 
@@ -125,6 +152,75 @@ impl Conv {
         // `dynamic` and `out`; the kernel's channel count is fixed at 1024.
         unsafe { launch.launch(channel_config(DYNAMIC_DIMS)?) }?;
         Ok(())
+    }
+
+    /// The post-attention conv and residual add for one row: `residual = f32(hidden) +
+    /// f32(short_conv(x))`, or `f32(short_conv(x))` without `hidden`. Equals
+    /// [`Conv::short_conv`] followed by the elementwise add or cast.
+    pub fn short_conv_residual(
+        &self,
+        stream: &CudaStream,
+        x: &CudaSlice<bf16>,
+        weight: &CudaSlice<bf16>,
+        state: &mut CudaSlice<f32>,
+        hidden: Option<&CudaSlice<bf16>>,
+        residual: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        check_hidden_conv(weight, state)?;
+        ensure!(
+            x.len() == HIDDEN
+                && residual.len() == HIDDEN
+                && hidden.is_none_or(|h| h.len() == HIDDEN),
+            "x, hidden and residual must hold {HIDDEN} elements"
+        );
+        let mut args = KernelArgs::default();
+        args.ptr(x, stream)
+            .ptr(weight, stream)
+            .ptr_mut(state, stream)
+            .opt(hidden, stream)
+            .ptr_mut(residual, stream);
+        // SAFETY: the arguments match `short_conv_residual_2304(const bf16*, const bf16*, float*,
+        // const bf16*, float*)`; every buffer has the length checked above, a null `hidden` is
+        // never read, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.short_conv_residual_2304, hidden_config()) }
+    }
+
+    /// The end of the MoE block and the layer for one row: the combine of the expert outputs
+    /// `experts` (`[8, 2304]`) with `weights` (`[8]`), the post-MLP conv, and `out =
+    /// bf16(residual + conv)`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_conv_residual(
+        &self,
+        stream: &CudaStream,
+        experts: &CudaSlice<bf16>,
+        weights: &CudaSlice<f32>,
+        weight: &CudaSlice<bf16>,
+        state: &mut CudaSlice<f32>,
+        residual: &CudaSlice<f32>,
+        out: &mut CudaSlice<bf16>,
+    ) -> anyhow::Result<()> {
+        check_hidden_conv(weight, state)?;
+        ensure!(
+            experts.len() == TOP_K * HIDDEN && weights.len() == TOP_K,
+            "experts has {} and weights {} elements",
+            experts.len(),
+            weights.len()
+        );
+        ensure!(
+            residual.len() == HIDDEN && out.len() == HIDDEN,
+            "residual and out must hold {HIDDEN} elements"
+        );
+        let mut args = KernelArgs::default();
+        args.ptr(experts, stream)
+            .ptr(weights, stream)
+            .ptr(weight, stream)
+            .ptr_mut(state, stream)
+            .ptr(residual, stream)
+            .ptr_mut(out, stream);
+        // SAFETY: the arguments match `moe_conv_residual_2304(const bf16*, const float*,
+        // const bf16*, float*, const float*, bf16*)`, every buffer has the length checked
+        // above, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_2304, hidden_config()) }
     }
 }
 
