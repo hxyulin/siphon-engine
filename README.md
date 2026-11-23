@@ -102,10 +102,10 @@ Engine stepping with the BF16 cache, against the F32 captures of `anyhow`, `half
 
 | Dense weights | Mean KL | \|log-prob difference\| | Top-1 | Decode at context 0 |
 | --- | --- | --- | --- | --- |
-| `bf16` | 2.0e-3, 7.1e-4, 1.6e-3 | 0.023, 0.028, 0.027 | 98.9%, 98.5%, 98.4% | 4.09 ms |
-| `fp8` | 2.8e-3, 1.1e-3, 2.5e-3 | 0.030, 0.036, 0.039 | 98.7%, 98.1%, 98.0% | 3.05 ms |
+| `bf16` | 1.5e-3, 9.4e-4, 1.1e-3 | 0.023, 0.028, 0.028 | 99.0%, 98.6%, 98.5% | 4.09 ms |
+| `fp8` | 2.3e-3, 1.5e-3, 2.2e-3 | 0.029, 0.038, 0.040 | 98.7%, 98.2%, 98.0% | 3.05 ms |
 
-The FP8 path still passes the gate against MLX's BF16 captures.
+The FP8 path's mean KL is 1.5 to 2.0 times the BF16 path's, and its \|log-prob difference\| 1.3 to 1.4 times. It still passes the gate against MLX's BF16 captures.
 
 The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` is pinned to 2025.3, the last release built for CUDA 13.0, which the pinned `nvcc` requires. A kernel trace of 20 steps:
 
@@ -220,14 +220,16 @@ The greedy continuation is reported but not checked: one near-tie splits it, and
 
 The gate catches a sliding window that is not enforced. Run that way, MLX alone gives a mean KL of 9.5e-3 and a max KL of 0.21 on `anyhow.txt`. It cannot see query log-scaling: at 11,186 tokens the scale is at most 1.031, and MLX with log-scaling removed differs from MLX by less than its own noise (mean |log-prob difference| 0.006). A sliding window off by one position is also below the noise. A unit test covers log-scaling (`log_scale_matches_mlx`).
 
-`capture --float32` runs MLX with F32 activations and dense weights, the packed expert weights unchanged. It is a higher-precision reference: it shows whether a path is closer to or further from the model than MLX's own BF16 paths, which a BF16 reference cannot. Against the F32 captures, over all positions of the three texts:
+`capture --float32` runs MLX with F32 activations and dense weights, the packed expert weights unchanged, and every product at full F32 precision. MLX's F32 matmul on an M5 Max keeps only about 11 bits of inputs that are not BF16 values, so `reference/exact_products.py` splits those operands into three BF16 parts; run as a script, it checks each operation against F64. Captures made before that ran their chunked products at about TF32 precision, the NVFP4 expert products at one BF16 rounding, and differ from the exact ones by a mean |log-prob difference| of 0.020 to 0.022. A token-by-token F32 capture now matches the chunked one within 2e-5.
+
+The F32 capture is a higher-precision reference: it shows whether a path is closer to or further from the model than MLX's own BF16 paths, which a BF16 reference cannot. Against the F32 captures, over all positions of the three texts:
 
 | Path | Mean KL | \|log-prob difference\| | Top-1 |
 | --- | --- | --- | --- |
-| MLX chunked and token-by-token | 6.0e-4 to 2.3e-3 | 0.023 to 0.027 | 98.5% to 99.0% |
-| Engine stepping, BF16 cache | 7.6e-4 to 2.3e-3 | 0.023 to 0.027 | 98.6% to 99.0% |
-| Engine prefill, chunks of 512, BF16 cache | 4.6e-4 to 2.1e-3 | 0.023 to 0.027 | 98.4% to 98.8% |
-| Engine stepping, FP8 cache | 6.4e-4 to 1.7e-3 | 0.026 to 0.030 | 98.3% to 98.8% |
-| Engine prefill, chunks of 512, FP8 cache | 9.0e-4 to 2.1e-3 | 0.025 to 0.031 | 98.2% to 98.9% |
+| MLX chunked and token-by-token | 5.3e-4 to 1.8e-3 | 0.023 to 0.027 | 98.5% to 99.0% |
+| Engine stepping, BF16 cache | 9.4e-4 to 1.5e-3 | 0.023 to 0.028 | 98.5% to 99.0% |
+| Engine prefill, chunks of 2048, BF16 cache | 7.7e-4 to 1.4e-3 | 0.024 to 0.029 | 98.5% to 99.0% |
+| Engine stepping, FP8 cache | 9.4e-4 to 1.5e-3 | 0.025 to 0.031 | 98.3% to 98.9% |
+| Engine prefill, chunks of 2048, FP8 cache | 6.7e-4 to 1.3e-3 | 0.026 to 0.030 | 98.4% to 99.0% |
 
-So the engine is as close to the model as MLX is, in both modes. The FP8 cache adds about 0.003 to the mean |log-prob difference|. MLX's chunked path also keeps only 12 of 32 continuation tokens after `regex-readme.txt` against F32, as does the engine's BF16 stepping.
+So the engine is as close to the model as MLX is, in both modes: its mean KL lies inside MLX's range, and its |log-prob difference| is at most 0.002 above the larger of MLX's two on the same text. The FP8 cache adds 0.001 to 0.003 to the mean |log-prob difference| when stepping and at most 0.002 in prefill. After `regex-readme.txt` the continuation splits at near-ties: against F32, MLX's chunked path keeps 12 of 32 tokens and its token-by-token path 26, the engine's BF16 stepping 0 and its prefill 32.

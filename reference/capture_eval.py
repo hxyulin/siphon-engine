@@ -12,7 +12,8 @@
 
 By default the text goes through MLX in chunks, which takes MLX's multi-row path. With
 `--token-by-token`, every token is its own step, the single-row decode path the
-engine follows.
+engine follows. With `--float32`, activations and dense weights are F32 and every
+product runs at full F32 precision (`exact_products.py`).
 
 `compare` reports how far one capture is from another of the same text with the
 metrics the engine's `eval` binary uses. Comparing the two MLX modes gives the noise
@@ -24,7 +25,9 @@ import hashlib
 import json
 import math
 import platform
+import sys
 import time
+from contextlib import nullcontext
 from importlib import metadata
 from pathlib import Path
 
@@ -32,6 +35,9 @@ import mlx.core as mx
 import numpy as np
 from mlx_lm import load
 from safetensors.numpy import load_file
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exact_products import exact_products  # noqa: E402
 
 # The sliding window wraps at position 1024, and global layers scale queries from
 # position 8192 on (`sliding_window_size` and `log_scaling_n_floor` in the config).
@@ -92,17 +98,18 @@ def capture(args: argparse.Namespace) -> None:
 
     started = time.perf_counter()
     step = 1 if args.token_by_token else args.chunk
-    for start in range(0, n, step):
-        chunk = mx.array([tokens[start : start + step]], dtype=mx.int32)
-        keep(start, model(chunk, cache=cache))
-        if (start + step) % 2048 < step:
-            print(f"{start + chunk.shape[1]}/{n} tokens", flush=True)
-    seconds = time.perf_counter() - started
+    with exact_products(model) if args.float32 else nullcontext():
+        for start in range(0, n, step):
+            chunk = mx.array([tokens[start : start + step]], dtype=mx.int32)
+            keep(start, model(chunk, cache=cache))
+            if (start + step) % 2048 < step:
+                print(f"{start + chunk.shape[1]}/{n} tokens", flush=True)
+        seconds = time.perf_counter() - started
 
-    continuation = [int(argmax[-1])]
-    for _ in range(args.continue_tokens - 1):
-        logits = model(mx.array([[continuation[-1]]], dtype=mx.int32), cache=cache)
-        continuation.append(int(mx.argmax(logits[0, -1]).item()))
+        continuation = [int(argmax[-1])]
+        for _ in range(args.continue_tokens - 1):
+            logits = model(mx.array([[continuation[-1]]], dtype=mx.int32), cache=cache)
+            continuation.append(int(mx.argmax(logits[0, -1]).item()))
 
     tensors = {
         "tokens": np.array(tokens, np.int32),
@@ -119,6 +126,7 @@ def capture(args: argparse.Namespace) -> None:
         "tokens": n,
         "mode": "token-by-token" if args.token_by_token else f"chunks of {args.chunk}",
         "dtype": "float32" if args.float32 else "checkpoint",
+        **({"products": "exact"} if args.float32 else {}),
         "perplexity": math.exp(-float(target_logprobs.mean())),
         "seconds": round(seconds, 1),
         "continuation_text": tokenizer.decode(continuation),
@@ -202,7 +210,8 @@ def main() -> None:
     cap.add_argument(
         "--float32",
         action="store_true",
-        help="run activations and dense weights in F32, a higher-precision reference",
+        help="run activations and dense weights in F32 with full-precision products, "
+        "a higher-precision reference",
     )
     cap.set_defaults(run=capture)
     cmp = sub.add_parser("compare", help="compare two captures of the same text")
