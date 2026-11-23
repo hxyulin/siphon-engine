@@ -2,7 +2,7 @@
 //! still computes the same model as MLX-LM, within a multiple of MLX's own noise.
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
-//!        [--prefill CHUNK]
+//!        [--weights bf16|fp8] [--prefill CHUNK]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -11,7 +11,9 @@
 //! reports, per range of positions, top-1 agreement with MLX, the mean difference in
 //! the log-probability of the actual next token, and perplexity. It also reports
 //! KL(MLX || engine) at the captured positions and how many greedy tokens after the
-//! text match MLX. It exits with status 1 if a check fails.
+//! text match MLX. It exits with status 1 if a check fails. `--weights fp8` makes the
+//! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
+//! the BF16 weights.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -34,7 +36,7 @@ mod linux {
         Gpu,
         model::{MAX_PREFILL_CHUNK, Model, PrefillLogits},
         ops::attention::KvFormat,
-        weights::Weights,
+        weights::{WeightFormat, Weights},
     };
     use safetensors::{Dtype, SafeTensors};
 
@@ -61,6 +63,7 @@ mod linux {
         capture: PathBuf,
         passes: Option<usize>,
         kv: KvFormat,
+        weights: WeightFormat,
         /// Chunk size for `Model::prefill`, or `None` to step token by token.
         prefill: Option<usize>,
     }
@@ -69,6 +72,7 @@ mod linux {
         let mut positional = Vec::new();
         let mut passes = None;
         let mut kv = KvFormat::Bf16;
+        let mut weights = WeightFormat::Bf16;
         let mut prefill = None;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -76,6 +80,8 @@ mod linux {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
             } else if arg == "--kv" {
                 kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
+            } else if arg == "--weights" {
+                weights = it.next().context("--weights needs bf16 or fp8")?.parse()?;
             } else if arg == "--prefill" {
                 let chunk: usize = it.next().context("--prefill needs a chunk size")?.parse()?;
                 ensure!(
@@ -89,13 +95,14 @@ mod linux {
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
-             [--prefill CHUNK]",
+             [--weights bf16|fp8] [--prefill CHUNK]",
         )?;
         Ok(Args {
             model,
             capture,
             passes,
             kv,
+            weights,
             prefill,
         })
     }
@@ -321,7 +328,15 @@ mod linux {
         gpu.stream().synchronize()?;
         eprintln!("loaded weights in {:.1} s", start.elapsed().as_secs_f64());
         let capacity = n + capture.continuation.len();
-        let mut model = Model::with_kv_format(&gpu, config, weights, passes, capacity, args.kv)?;
+        let mut model = Model::with_formats(
+            &gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            args.kv,
+            args.weights,
+        )?;
 
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)

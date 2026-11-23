@@ -5,6 +5,7 @@ pub mod conv;
 pub mod elementwise;
 pub mod experts;
 pub mod linear;
+pub mod linear_fp8;
 pub mod misc;
 pub mod norm;
 pub mod routing;

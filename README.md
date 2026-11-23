@@ -50,10 +50,10 @@ The `bench` binary times greedy decode at several context lengths. For each leng
 
 ```sh
 pixi run cargo build --release -p inkling-cuda --bin bench
-target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps 100] [--warmup 10] [--kv bf16|fp8] [--json]
+target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps 100] [--warmup 10] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 ```
 
-Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token, 16 KiB with `--kv fp8`) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token, plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
+Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token, 16 KiB with `--kv fp8`) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token (3.75 GB with `--weights fp8`), plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
 
 With `--prefill`, `bench` times `Model::prefill` instead, once per prompt length from an empty cache, after one warmup chunk. It reports the time to the first token. The prompt is arbitrary token ids, so expert routing differs from real text:
 
@@ -69,6 +69,24 @@ The global layers (5, 11, 17 and 23, 8 of the 48 layer visits) keep every earlie
 - `fp8` stores the global caches as E4M3, which halves the bytes global attention reads. The sliding-window caches stay BF16.
 
 The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RMS-normed per head, so no element exceeds 22.7, far inside E4M3's ±448. The append kernel rounds each BF16 value to the nearest E4M3 value, ties to even. Attention decodes E4M3 exactly with the hardware converter, so it differs from BF16 only by that rounding. Ingine stores its FP8 global caches the same way.
+
+## Dense weight format
+
+Decode reads 3.51 GB of BF16 dense weights per token: every visit's attention input and output projections, and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
+
+- `bf16`, the default, reads the checkpoint's weights.
+- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.76 GB for them. Prefill keeps the BF16 weights, since its GEMMs are compute-bound. The copies take 1.11 GB of device memory: one per layer, since the looped layers' three visits share theirs.
+
+The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The message gates, the router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
+
+Engine stepping with the BF16 cache, against the F32 captures of `anyhow`, `half` and `regex-readme`, over all positions:
+
+| Dense weights | Mean KL | \|log-prob difference\| | Top-1 | Decode at context 0 |
+| --- | --- | --- | --- | --- |
+| `bf16` | 2.0e-3, 7.1e-4, 1.6e-3 | 0.023, 0.028, 0.027 | 98.9%, 98.5%, 98.4% | 4.09 ms |
+| `fp8` | 2.8e-3, 1.1e-3, 2.5e-3 | 0.030, 0.036, 0.039 | 98.7%, 98.1%, 98.0% | 3.05 ms |
+
+The FP8 path still passes the gate against MLX's BF16 captures.
 
 The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` is pinned to 2025.3, the last release built for CUDA 13.0, which the pinned `nvcc` requires. A kernel trace of 20 steps:
 

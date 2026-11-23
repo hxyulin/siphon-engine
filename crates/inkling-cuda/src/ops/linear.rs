@@ -372,6 +372,19 @@ impl GemmKernels {
     }
 }
 
+/// A device buffer [`Linear::prefetch`] pulls into L2.
+pub trait Prefetch {
+    /// The buffer's device address and length in bytes. Event tracking is off (see
+    /// [`crate::Gpu`]), so the address needs no guard.
+    fn device_bytes(&self, stream: &CudaStream) -> (u64, usize);
+}
+
+impl<T: DeviceRepr> Prefetch for CudaSlice<T> {
+    fn device_bytes(&self, stream: &CudaStream) -> (u64, usize) {
+        (self.device_ptr(stream).0, self.len() * size_of::<T>())
+    }
+}
+
 /// Blocks of the L2 prefetch kernel. In the decode step 64 beat 32, 48, 80, 96, 128 and 170:
 /// fewer fetch too slowly, more take SMs and bandwidth from the main stream.
 const PREFETCH_BLOCKS: u32 = 64;
@@ -424,11 +437,7 @@ impl Linear {
     /// on `stream` so far is done. Prefetches run one after another; a later
     /// [`Self::join_prefetch`] must rejoin them, also inside a graph capture. They only read,
     /// so they race with nothing.
-    pub fn prefetch(
-        &self,
-        stream: &CudaStream,
-        weights: &[&CudaSlice<bf16>],
-    ) -> anyhow::Result<()> {
+    pub fn prefetch(&self, stream: &CudaStream, weights: &[&dyn Prefetch]) -> anyhow::Result<()> {
         ensure!(
             (1..=MAX_PREFETCH).contains(&weights.len()),
             "{} weights to prefetch, expected 1 to {MAX_PREFETCH}",
@@ -438,14 +447,12 @@ impl Linear {
             count: i32::try_from(weights.len())?,
             ..Ranges::default()
         };
-        let mut guards = Vec::with_capacity(weights.len());
         for (i, w) in weights.iter().enumerate() {
-            let (ptr, guard) = w.device_ptr(&self.side);
-            guards.push(guard);
+            let (ptr, bytes) = w.device_bytes(&self.side);
             ensure!(ptr.is_multiple_of(16), "weight {i} is not 16-byte aligned");
             ranges.p[i] = ptr;
             // A trailing partial vector stays out of L2, which costs one load later.
-            ranges.vecs[i] = i64::try_from(w.len() * size_of::<bf16>() / 16)?;
+            ranges.vecs[i] = i64::try_from(bytes / 16)?;
         }
         self.fork.record(stream)?;
         self.side.wait(&self.fork)?;
@@ -459,7 +466,6 @@ impl Linear {
         // SAFETY: `ranges` has the kernel's `Ranges` layout, and the kernel reads only the
         // whole 16-byte vectors inside each weight.
         unsafe { launch.launch(config) }?;
-        drop(guards);
         self.join.record(&self.side)?;
         Ok(())
     }

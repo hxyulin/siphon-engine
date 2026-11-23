@@ -32,12 +32,15 @@ use crate::{
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
-        linear::{Gemm, Gemv, Linear},
+        linear::{Gemm, Gemv, Linear, Prefetch},
+        linear_fp8::{Fp8Gemv, LinearFp8},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
         norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
     },
-    weights::{ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, Weights},
+    weights::{
+        ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, WeightFormat, Weights,
+    },
 };
 
 /// Queries, keys, values and the MLP each get a message on looped layers.
@@ -50,6 +53,7 @@ struct Kernels {
     elementwise: Elementwise,
     experts: Experts,
     linear: Linear,
+    linear_fp8: LinearFp8,
     misc: Misc,
     norm: Norm,
     routing: Routing,
@@ -341,6 +345,29 @@ impl Model {
         capacity: usize,
         kv_format: KvFormat,
     ) -> anyhow::Result<Self> {
+        Self::with_formats(
+            gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            kv_format,
+            WeightFormat::Bf16,
+        )
+    }
+
+    /// [`Model::with_kv_format`] with decode reading the attention projections and the LM
+    /// head in `weight_format`. [`WeightFormat::Fp8`] quantizes them first, keeping the
+    /// BF16 weights for prefill.
+    pub fn with_formats(
+        gpu: &Gpu,
+        config: TextConfig,
+        mut weights: Weights,
+        passes: usize,
+        capacity: usize,
+        kv_format: KvFormat,
+        weight_format: WeightFormat,
+    ) -> anyhow::Result<Self> {
         let ctx = gpu.context();
         let stream = Arc::clone(gpu.stream());
         let kernels = Kernels {
@@ -349,10 +376,14 @@ impl Model {
             elementwise: Elementwise::load(ctx)?,
             experts: Experts::load(ctx)?,
             linear: Linear::load(ctx)?,
+            linear_fp8: LinearFp8::load(ctx)?,
             misc: Misc::load(ctx)?,
             norm: Norm::load(ctx)?,
             routing: Routing::load(ctx)?,
         };
+        if weight_format == WeightFormat::Fp8 {
+            weights.quantize_fp8(&kernels.linear_fp8, &stream)?;
+        }
         let history = config.sconv_kernel_size - 1;
         let kv_dims = config.num_key_value_heads * config.head_dim;
         let hidden = config.hidden_size;
@@ -677,14 +708,21 @@ impl Model {
             },
             ctx.eps(),
         )?;
-        ctx.kernels.linear.gemv_bf16(
-            &ctx.stream,
-            &mut [Gemv::new(
-                &ctx.weights.lm_head,
-                &s.final_hidden,
-                &mut s.logits,
-            )],
-        )?;
+        if let Some(lm_head) = &ctx.weights.lm_head_fp8 {
+            ctx.kernels.linear_fp8.gemv(
+                &ctx.stream,
+                &mut [Fp8Gemv::new(lm_head, &s.final_hidden, &mut s.logits)],
+            )?;
+        } else {
+            ctx.kernels.linear.gemv_bf16(
+                &ctx.stream,
+                &mut [Gemv::new(
+                    &ctx.weights.lm_head,
+                    &s.final_hidden,
+                    &mut s.logits,
+                )],
+            )?;
+        }
         ctx.kernels.elementwise.logit_softcap(
             &ctx.stream,
             &s.logits,
@@ -762,18 +800,30 @@ struct AttentionInputs<'a> {
 impl Ctx {
     /// The weights a visit of `layer` reads first: the attention projections and, with
     /// `messages`, the message gates that build their inputs, then the fused attention
-    /// step's small weights, which nothing has read since the previous step.
-    fn visit_prefetch(&self, layer: usize, messages: bool) -> Vec<&CudaSlice<bf16>> {
+    /// step's small weights, which nothing has read since the previous step. The
+    /// projections are their FP8 copies when the layer has them.
+    fn visit_prefetch(&self, layer: usize, messages: bool) -> Vec<&dyn Prefetch> {
         let w = &self.weights.layers[layer];
-        let mut weights = Vec::new();
+        let mut weights: Vec<&dyn Prefetch> = Vec::new();
         if let Some(gates) = w.message_gates.as_ref().filter(|_| messages) {
-            weights.extend(gates[..3].iter().flat_map(MessageGateWeights::matrices));
+            for g in &gates[..3] {
+                weights.extend(g.matrices().map(|m| m as &dyn Prefetch));
+            }
         }
         let a = &w.attention;
-        weights.extend(a.input_projections());
-        weights.extend([&a.q_clip_scale, &a.rel_clip_scale, &a.rel_table]);
+        if let Some(fp8) = &w.fp8 {
+            weights.extend(fp8.inputs.iter().map(|m| m as &dyn Prefetch));
+        } else {
+            weights.extend(
+                a.input_projections()
+                    .into_iter()
+                    .map(|m| m as &dyn Prefetch),
+            );
+        }
+        weights
+            .extend([&a.q_clip_scale, &a.rel_clip_scale, &a.rel_table].map(|m| m as &dyn Prefetch));
         if let KvConv::Static { k, v } = &a.kv_conv {
-            weights.extend([k, v]);
+            weights.extend([k as &dyn Prefetch, v]);
         }
         weights
     }
@@ -814,9 +864,12 @@ impl Ctx {
         if layer > 0 {
             self.kernels.linear.join_prefetch(&self.stream)?;
         }
-        let mut prefetch = vec![&w.attention.o];
+        let mut prefetch: Vec<&dyn Prefetch> = match &w.fp8 {
+            Some(fp8) => vec![&fp8.o],
+            None => vec![&w.attention.o],
+        };
         if let Some((gates, _)) = gates {
-            prefetch.extend(gates[3].matrices());
+            prefetch.extend(gates[3].matrices().map(|m| m as &dyn Prefetch));
         }
         if let Some((layer, messages)) = next {
             prefetch.extend(self.visit_prefetch(layer, messages));
@@ -1059,21 +1112,38 @@ impl Ctx {
         let cfg = &self.config;
         let a = &w.attention;
 
-        // Every projection of the three inputs in one launch.
-        let mut products = vec![
-            Gemv::new(&a.q, q_in, &mut t.q_raw),
-            Gemv::new(&a.r, q_in, &mut t.r_raw),
-            Gemv::new(&a.gate, q_in, &mut t.gate),
-            Gemv::new(&a.sink, q_in, &mut t.sinks),
-            Gemv::new(&a.k, k_in, &mut t.k_raw),
-            Gemv::new(&a.v, v_in, &mut t.v_raw),
+        // Every projection of the three inputs in one launch, in the order of
+        // `input_projections`.
+        let mut outs = vec![
+            (q_in, &mut t.q_raw),
+            (q_in, &mut t.r_raw),
+            (q_in, &mut t.gate),
+            (q_in, &mut t.sinks),
+            (k_in, &mut t.k_raw),
+            (v_in, &mut t.v_raw),
         ];
-        if let KvConv::Dynamic { k_proj, v_proj, .. } = &a.kv_conv {
-            products.push(Gemv::new(k_proj, k_in, &mut t.k_dynamic));
-            products.push(Gemv::new(v_proj, v_in, &mut t.v_dynamic));
+        if matches!(a.kv_conv, KvConv::Dynamic { .. }) {
+            outs.push((k_in, &mut t.k_dynamic));
+            outs.push((v_in, &mut t.v_dynamic));
         }
-        self.kernels.linear.gemv_bf16(&self.stream, &mut products)?;
-        drop(products);
+        if let Some(fp8) = &w.fp8 {
+            let mut products: Vec<_> = fp8
+                .inputs
+                .iter()
+                .zip(&mut outs)
+                .map(|(weight, (x, out))| Fp8Gemv::new(weight, *x, *out))
+                .collect();
+            self.kernels.linear_fp8.gemv(&self.stream, &mut products)?;
+        } else {
+            let mut products: Vec<_> = a
+                .input_projections()
+                .into_iter()
+                .zip(&mut outs)
+                .map(|(weight, (x, out))| Gemv::new(weight, *x, *out))
+                .collect();
+            self.kernels.linear.gemv_bf16(&self.stream, &mut products)?;
+        }
+        drop(outs);
 
         let conv = match &a.kv_conv {
             KvConv::Static { k, v } => KvConvWeights::Static { k, v },
@@ -1115,9 +1185,16 @@ impl Ctx {
                 out: &mut t.gated,
             },
         )?;
-        self.kernels
-            .linear
-            .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])
+        if let Some(fp8) = &w.fp8 {
+            self.kernels.linear_fp8.gemv(
+                &self.stream,
+                &mut [Fp8Gemv::new(&fp8.o, &t.gated, &mut t.proj)],
+            )
+        } else {
+            self.kernels
+                .linear
+                .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])
+        }
     }
 
     /// MLX-LM's `MessageGate` for the gates `gates` of message slots `first_slot..`, in one

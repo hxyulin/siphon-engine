@@ -10,14 +10,19 @@
 //!
 //! The depthwise convolution weights need no transpose: the checkpoint's `[dims, 1, 4]`
 //! and MLX's `[dims, 4, 1]` have the same bytes.
+//!
+//! [`Weights::quantize_fp8`] adds FP8 copies of the large matrices decode reads, for
+//! [`WeightFormat::Fp8`]; the BF16 originals stay for prefill.
 
-use std::sync::Arc;
+use std::{fmt, str::FromStr, sync::Arc};
 
 use anyhow::{Context as _, bail, ensure};
 use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
 use half::bf16;
 use inkling::{Checkpoint, TextConfig};
 use safetensors::Dtype;
+
+use crate::ops::linear_fp8::{Fp8Matrix, LinearFp8};
 
 /// Largest E2M1 value, from MLX-LM's `sanitize`.
 const NVFP4_E2M1_MAX: f32 = 6.0;
@@ -37,6 +42,41 @@ pub struct Weights {
     pub lm_head: CudaSlice<bf16>,
     /// Per looped layer, F32 `[4, hidden]`: the query, key, value and MLP message queries.
     pub message_queries: Vec<CudaSlice<f32>>,
+    /// FP8 copy of `lm_head` for decode, after [`Weights::quantize_fp8`].
+    pub lm_head_fp8: Option<Fp8Matrix>,
+}
+
+/// The format of the large BF16 matrices decode reads: the attention input and output
+/// projections and the LM head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightFormat {
+    /// The checkpoint's BF16 weights.
+    #[default]
+    Bf16,
+    /// E4M3 copies with one F32 scale per row, made at load time. Decode reads half the
+    /// bytes; prefill keeps the BF16 weights.
+    Fp8,
+}
+
+impl FromStr for WeightFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "bf16" => Ok(Self::Bf16),
+            "fp8" => Ok(Self::Fp8),
+            _ => bail!("unknown weight format {s:?}; expected bf16 or fp8"),
+        }
+    }
+}
+
+impl fmt::Display for WeightFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -59,6 +99,17 @@ pub struct LayerWeights {
     pub experts: ExpertWeights,
     /// Query, key, value and MLP gates, present on looped layers.
     pub message_gates: Option<[MessageGateWeights; 4]>,
+    /// FP8 copies of the attention projections for decode, after
+    /// [`Weights::quantize_fp8`].
+    pub fp8: Option<Fp8Projections>,
+}
+
+/// FP8 copies of one layer's attention projections.
+#[derive(Debug)]
+pub struct Fp8Projections {
+    /// The input projections, in the order of [`AttentionWeights::input_projections`].
+    pub inputs: Vec<Fp8Matrix>,
+    pub o: Fp8Matrix,
 }
 
 #[derive(Debug)]
@@ -236,7 +287,39 @@ impl Weights {
             norm: loader.bf16("model.llm.norm.weight", &[hidden])?,
             lm_head: loader.bf16("model.llm.unembed.weight", &[vocab, hidden])?,
             message_queries: load_message_queries(&loader, config)?,
+            lm_head_fp8: None,
         })
+    }
+
+    /// Quantizes every layer's attention input and output projections and the LM head to
+    /// FP8 copies, which decode then reads. Returns the bytes the copies take.
+    pub fn quantize_fp8(
+        &mut self,
+        linear: &LinearFp8,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<usize> {
+        let quantize = |w: &CudaSlice<bf16>, k: usize| {
+            ensure!(w.len().is_multiple_of(k), "weight is not [rows, {k}]");
+            linear.quantize(stream, w, w.len() / k, k)
+        };
+        let hidden = self.embed_norm.len();
+        let mut bytes = 0;
+        for layer in &mut self.layers {
+            let a = &layer.attention;
+            let inputs = a
+                .input_projections()
+                .into_iter()
+                .map(|w| quantize(w, hidden))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let o = quantize(&a.o, a.o.len() / hidden)?;
+            bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>() + o.bytes();
+            layer.fp8 = Some(Fp8Projections { inputs, o });
+        }
+        let lm_head = quantize(&self.lm_head, hidden)?;
+        bytes += lm_head.bytes();
+        self.lm_head_fp8 = Some(lm_head);
+        stream.synchronize()?;
+        Ok(bytes)
     }
 }
 
@@ -322,6 +405,7 @@ impl LayerWeights {
             router_bias: loader.f32(&format!("{p}.mlp.gate.bias"), &[config.n_routed_experts])?,
             experts: ExpertWeights::load(loader, config, &format!("{p}.mlp.experts"))?,
             message_gates,
+            fp8: None,
         })
     }
 }

@@ -1,7 +1,7 @@
 //! Times greedy decode at several context lengths, or prefill at several prompt lengths.
 //!
 //! usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps N]
-//!        [--warmup N] [--kv bf16|fp8] [--json]
+//!        [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 //!        bench <model-dir> --prefill 512,4096,32768 [--chunk N] [--passes N]
 //!        [--kv bf16|fp8] [--json]
 //!
@@ -14,7 +14,8 @@
 //! the skipped tokens, runs `--warmup` steps, then times `--steps` steps. The tokens it
 //! produces are meaningless, but each step does the same work as a real one. Without
 //! `--contexts`, it runs 0, 4096 and 32768, and 131072 if the cache fits in free memory.
-//! `--kv fp8` stores the global-layer KV caches as E4M3 instead of BF16.
+//! `--kv fp8` stores the global-layer KV caches as E4M3 instead of BF16. `--weights fp8`
+//! makes decode read FP8 copies of the attention projections and the LM head.
 //!
 //! Results are comparable only on an otherwise idle GPU, so the output records the GPU
 //! clocks, the processes on the GPU and the time.
@@ -40,11 +41,16 @@ mod linux {
         Gpu,
         model::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits},
         ops::attention::KvFormat,
-        weights::Weights,
+        weights::{WeightFormat, Weights},
     };
 
     /// Bytes of weights one decode step reads.
     const WEIGHT_BYTES_PER_TOKEN: f64 = 5.5e9;
+    /// Bytes `--weights fp8` saves per step: the 3.51 GB of BF16 attention projections
+    /// and LM head read as 1.76 GB of E4M3 values and scales.
+    const FP8_SAVED_BYTES_PER_TOKEN: f64 = 1.75e9;
+    /// Device memory the FP8 copies take: one per layer, 1.11 GB.
+    const FP8_COPY_BYTES: usize = 1_120_000_000;
     /// RTX 5090 DRAM bandwidth.
     const PEAK_BANDWIDTH: f64 = 1.79e12;
     const DEFAULT_CONTEXTS: [usize; 3] = [0, 4096, 32768];
@@ -53,7 +59,8 @@ mod linux {
     /// Free memory to leave for the runner's per-step buffers.
     const HEADROOM: usize = 2 << 30;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
-                         [--steps N] [--warmup N] [--kv bf16|fp8] [--json]\n       \
+                         [--steps N] [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] \
+                         [--json]\n       \
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--json]";
 
@@ -64,6 +71,7 @@ mod linux {
         steps: usize,
         warmup: usize,
         kv: KvFormat,
+        weights: WeightFormat,
         json: bool,
         /// Prompt lengths to time prefill at, instead of timing decode.
         prefill: Option<Vec<usize>>,
@@ -85,6 +93,7 @@ mod linux {
         let mut steps = 100;
         let mut warmup = 10;
         let mut kv = KvFormat::Bf16;
+        let mut weights = WeightFormat::Bf16;
         let mut json = false;
         let mut prefill = None;
         let mut chunk = DEFAULT_PREFILL_CHUNK;
@@ -99,6 +108,7 @@ mod linux {
                 "--steps" => steps = value()?.parse()?,
                 "--warmup" => warmup = value()?.parse()?,
                 "--kv" => kv = value()?.parse()?,
+                "--weights" => weights = value()?.parse()?,
                 "--json" => json = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
@@ -123,6 +133,7 @@ mod linux {
             steps,
             warmup,
             kv,
+            weights,
             json,
             prefill,
             chunk,
@@ -204,6 +215,8 @@ mod linux {
         /// Seconds between the synchronized ends of the timed run.
         total: f64,
         kv_bytes: f64,
+        /// Weight bytes one step reads.
+        weight_bytes: f64,
         /// Clocks read right after the timed run, while the GPU is still at speed.
         sm_mhz: String,
         mem_mhz: String,
@@ -223,11 +236,11 @@ mod linux {
         }
 
         fn weight_fraction(&self) -> f64 {
-            WEIGHT_BYTES_PER_TOKEN / self.mean() / PEAK_BANDWIDTH
+            self.weight_bytes / self.mean() / PEAK_BANDWIDTH
         }
 
         fn total_fraction(&self) -> f64 {
-            (WEIGHT_BYTES_PER_TOKEN + self.kv_bytes) / self.mean() / PEAK_BANDWIDTH
+            (self.weight_bytes + self.kv_bytes) / self.mean() / PEAK_BANDWIDTH
         }
     }
 
@@ -372,7 +385,10 @@ mod linux {
         } else {
             let mut c = DEFAULT_CONTEXTS.to_vec();
             let (free, _) = gpu.context().mem_get_info()?;
-            let need = (LONG_CONTEXT + tail) * kv_bytes_per_token + HEADROOM;
+            let mut need = (LONG_CONTEXT + tail) * kv_bytes_per_token + HEADROOM;
+            if args.weights == WeightFormat::Fp8 {
+                need += FP8_COPY_BYTES;
+            }
             if need <= free {
                 c.push(LONG_CONTEXT);
             } else {
@@ -385,7 +401,19 @@ mod linux {
             c
         };
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
-        let mut model = Model::with_kv_format(&gpu, config, weights, passes, capacity, args.kv)?;
+        let mut model = Model::with_formats(
+            &gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            args.kv,
+            args.weights,
+        )?;
+        let weight_bytes = match args.weights {
+            WeightFormat::Bf16 => WEIGHT_BYTES_PER_TOKEN,
+            WeightFormat::Fp8 => WEIGHT_BYTES_PER_TOKEN - FP8_SAVED_BYTES_PER_TOKEN,
+        };
 
         let mut rows = Vec::new();
         let mut token = 1;
@@ -412,6 +440,7 @@ mod linux {
                 steps,
                 total,
                 kv_bytes: (mean_context * kv_bytes_per_token) as f64,
+                weight_bytes,
                 sm_mhz: after.sm_mhz,
                 mem_mhz: after.mem_mhz,
             });
@@ -449,8 +478,9 @@ mod linux {
         );
         let _ = writeln!(
             s,
-            "passes {passes}, {} global KV cache, {} warmup steps, {} timed steps\n",
-            args.kv, args.warmup, args.steps
+            "passes {passes}, {} global KV cache, {} dense weights, {} warmup steps, {} timed \
+             steps\n",
+            args.kv, args.weights, args.warmup, args.steps
         );
         let _ = writeln!(
             s,
@@ -504,7 +534,7 @@ mod linux {
         format!(
             "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"max_sm_mhz\":{},\"max_mem_mhz\":{},\
              \"temperature_c_before_load\":{},\"power_w_before_load\":{},\"processes_before_load\":[{}],\
-             \"passes\":{passes},\"kv\":{},\"warmup\":{},\"steps\":{},\"rows\":[{}]}}",
+             \"passes\":{passes},\"kv\":{},\"weights\":{},\"warmup\":{},\"steps\":{},\"rows\":[{}]}}",
             quote(&gpu.timestamp),
             quote(&gpu.name),
             quote(&gpu.driver),
@@ -514,6 +544,7 @@ mod linux {
             quote(&gpu.power_w),
             processes.join(","),
             quote(&args.kv.to_string()),
+            quote(&args.weights.to_string()),
             args.warmup,
             args.steps,
             rows.join(","),
