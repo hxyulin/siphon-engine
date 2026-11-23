@@ -22,9 +22,12 @@ const GEMM_COLUMNS: usize = 128;
 const GEMM_PAIRS: usize = 64;
 const GEMM_K: usize = 64;
 const GEMM_THREADS: u32 = 256;
+/// `expert_matmul` needs k a multiple of this: two pipeline stages, so that each scale copy is
+/// 4 or 8 aligned bytes.
+const GEMM_K_MULTIPLE: usize = 2 * GEMM_K;
 /// `expert_group`: threads, and the largest row and expert counts it supports.
 const GROUP_THREADS: u32 = 1024;
-const GROUP_MAX_ROWS: usize = 1024;
+const GROUP_MAX_ROWS: usize = 2048;
 const GROUP_MAX_EXPERTS: usize = 1024;
 
 /// Quantization format of one expert projection.
@@ -53,13 +56,13 @@ impl ExpertFormat<'_> {
     }
 
     /// Dynamic shared memory of an `expert_gemm_*` block: per pipeline stage, the weight bytes
-    /// and the BF16 inputs. NVFP4 runs 4 stages and MXFP8 3, so that two blocks fit in an SM.
+    /// and the BF16 inputs, then 2 slots of scales for a pair of stages. Both formats run 3
+    /// stages, so that two blocks fit in an SM.
     fn gemm_shared_bytes(self) -> usize {
-        let stages = match self {
-            Self::Nvfp4 { .. } => 4,
-            Self::Mxfp8 => 3,
-        };
+        let stages = 3;
+        let scale_slots = 2;
         stages * (GEMM_COLUMNS * self.row_bytes(GEMM_K) + GEMM_PAIRS * GEMM_K * 2)
+            + scale_slots * GEMM_COLUMNS * 2 * GEMM_K / self.group()
     }
 }
 
@@ -149,19 +152,30 @@ impl ExpertWeights<'_> {
 /// the list of tiles. Create it once for the largest call.
 #[derive(Debug)]
 pub struct ExpertScratch {
-    /// Flat pair index `row * 8 + slot` of each pair, in expert order.
+    /// Flat pair index `row * 8 + slot` of each pair, in expert order, then the pairs with
+    /// unknown ids.
     perm: CudaSlice<i32>,
     /// `{expert, first position in perm, pairs, 0}` per tile of at most 64 pairs.
     tiles: CudaSlice<i32>,
-    /// Number of tiles in `tiles`.
-    tile_count: CudaSlice<i32>,
+    /// The number of tiles, of pairs with known ids, and of all pairs.
+    group_counts: CudaSlice<i32>,
     max_rows: usize,
     max_experts: usize,
+    /// The grouping that [`Experts::expert_group`] last queued.
+    grouping: Option<Grouping>,
+}
+
+/// What [`Experts::expert_group`] grouped: the row and expert counts, and the stream it ran on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grouping {
+    rows: usize,
+    experts: usize,
+    stream: usize,
 }
 
 impl ExpertScratch {
-    /// Scratch for calls with up to `max_rows` rows and `max_experts` experts, each at most
-    /// 1024.
+    /// Scratch for calls with up to `max_rows` rows and `max_experts` experts, at most 2048
+    /// and 1024.
     pub fn new(
         stream: &Arc<CudaStream>,
         max_rows: usize,
@@ -180,9 +194,10 @@ impl ExpertScratch {
         Ok(Self {
             perm: stream.alloc_zeros(pairs)?,
             tiles: stream.alloc_zeros(4 * max_tiles(pairs, max_experts))?,
-            tile_count: stream.alloc_zeros(1)?,
+            group_counts: stream.alloc_zeros(3)?,
             max_rows,
             max_experts,
+            grouping: None,
         })
     }
 }
@@ -210,7 +225,8 @@ impl Experts {
         let matmul = load_module(ctx, "expert_matmul", cubin!("expert_matmul"))?;
         let gemm_nvfp4 = matmul.load_function("expert_gemm_nvfp4")?;
         let gemm_mxfp8 = matmul.load_function("expert_gemm_mxfp8")?;
-        // MXFP8 needs the most: 3 stages of 16 KiB against NVFP4's 4 of 12 KiB.
+        // MXFP8 needs the most: 3 stages of 16 KiB and 1 KiB of scales against NVFP4's 3 of
+        // 12 KiB and 2 KiB of scales.
         let shared = i32::try_from(ExpertFormat::Mxfp8.gemm_shared_bytes())?;
         for function in [&gemm_nvfp4, &gemm_mxfp8] {
             function.set_attribute(
@@ -306,12 +322,8 @@ impl Experts {
     /// [`Self::expert_matvec`] for many rows: the same arguments, shapes and results, up to
     /// F32 summation order.
     ///
-    /// Groups the (row, slot) pairs by expert on the GPU, then multiplies each expert's pairs
-    /// as one matrix product, so each expert's weights are read once per 64 pairs instead of
-    /// once per pair. `scratch` must have room for `rows` rows and the expert count of
-    /// `weights`. The call allocates nothing and does not wait for the GPU.
-    ///
-    /// Needs n a multiple of 16 and k a multiple of 64.
+    /// Runs [`Self::expert_group`], then [`Self::expert_matmul_grouped`]. To multiply several
+    /// projections with the same `indices`, group once and call the latter for each.
     pub fn expert_matmul(
         &self,
         stream: &CudaStream,
@@ -321,12 +333,107 @@ impl Experts {
         out: &mut impl DeviceOut<bf16>,
         scratch: &mut ExpertScratch,
     ) -> anyhow::Result<()> {
-        let (x, indices, mut out) = (x.view(), indices.view(), out.view_mut());
+        let Shape { experts, .. } =
+            weights.check(x.view().len(), indices.view().len(), out.view_mut().len())?;
+        self.expert_group(stream, indices, experts, scratch)?;
+        self.expert_matmul_grouped(stream, x, weights, out, scratch)
+    }
+
+    /// Groups the (row, slot) pairs of `indices` (`[rows, 8]`) by expert into `scratch`, for
+    /// [`Self::expert_matmul_grouped`] calls on the same stream. Ids at or above `experts`
+    /// give NaN rows there. The grouping depends only on `indices`, so one serves every
+    /// projection routed by them.
+    ///
+    /// `scratch` must have room for `rows` rows and `experts` experts. The call allocates
+    /// nothing and does not wait for the GPU.
+    pub fn expert_group(
+        &self,
+        stream: &CudaStream,
+        indices: &impl DeviceIn<i32>,
+        experts: usize,
+        scratch: &mut ExpertScratch,
+    ) -> anyhow::Result<()> {
+        let indices = indices.view();
+        ensure!(
+            indices.len().is_multiple_of(SLOTS),
+            "indices has {} elements, not a multiple of {SLOTS}",
+            indices.len()
+        );
+        let rows = indices.len() / SLOTS;
+        ensure!(experts > 0, "experts must be positive");
+        ensure!(
+            rows <= scratch.max_rows && experts <= scratch.max_experts,
+            "scratch holds {} rows and {} experts, the call has {rows} and {experts}",
+            scratch.max_rows,
+            scratch.max_experts
+        );
+        scratch.grouping = None;
+        if rows > 0 {
+            let pairs_arg = i32::try_from(rows * SLOTS).context("too many rows")?;
+            let experts_arg = i32::try_from(experts).context("too many experts")?;
+            let mut launch = stream.launch_builder(&self.group);
+            launch
+                .arg(&indices)
+                .arg(&pairs_arg)
+                .arg(&experts_arg)
+                .arg(&mut scratch.perm)
+                .arg(&mut scratch.tiles)
+                .arg(&mut scratch.group_counts);
+            let config = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (GROUP_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the arguments match `expert_group(const int*, int, int, int*, int4*,
+            // int*)`. `indices` holds `pairs` ids. The scratch was sized for at least `rows`
+            // rows and `experts` experts, at most 2048 and 1024 as the kernel needs, so `perm`
+            // holds `pairs` entries, `tiles` every tile the kernel can write, and
+            // `group_counts` 3 values.
+            unsafe { launch.launch(config) }?;
+        }
+        scratch.grouping = Some(Grouping {
+            rows,
+            experts,
+            stream: stream_id(stream),
+        });
+        Ok(())
+    }
+
+    /// [`Self::expert_matmul`] with the grouping that the last [`Self::expert_group`] call on
+    /// `scratch` queued on this stream: `weights` must have that call's expert count, and `x`
+    /// and `out` its row count.
+    ///
+    /// Multiplies each expert's pairs as one matrix product, so each expert's weights are read
+    /// once per 64 pairs instead of once per pair. The call allocates nothing and does not
+    /// wait for the GPU.
+    ///
+    /// Needs n a multiple of 16 and k a multiple of 128.
+    pub fn expert_matmul_grouped(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        weights: &ExpertWeights<'_>,
+        out: &mut impl DeviceOut<bf16>,
+        scratch: &ExpertScratch,
+    ) -> anyhow::Result<()> {
+        let (x, mut out) = (x.view(), out.view_mut());
+        let grouping = scratch
+            .grouping
+            .context("expert_matmul_grouped needs a grouping from expert_group")?;
         let Shape {
             experts,
             rows,
             inputs_per_row,
-        } = weights.check(x.len(), indices.len(), out.len())?;
+        } = weights.check(x.len(), grouping.rows * SLOTS, out.len())?;
+        ensure!(
+            experts == grouping.experts,
+            "weights have {experts} experts, the grouping {}",
+            grouping.experts
+        );
+        ensure!(
+            grouping.stream == stream_id(stream),
+            "the grouping was queued on another stream"
+        );
         if rows == 0 {
             return Ok(());
         }
@@ -338,53 +445,24 @@ impl Experts {
             k,
         } = weights;
         ensure!(
-            n.is_multiple_of(16) && k.is_multiple_of(GEMM_K),
-            "expert_matmul needs n a multiple of 16 and k of {GEMM_K}, got n = {n}, k = {k}"
-        );
-        ensure!(
-            rows <= scratch.max_rows && experts <= scratch.max_experts,
-            "scratch holds {} rows and {} experts, the call has {rows} and {experts}",
-            scratch.max_rows,
-            scratch.max_experts
+            n.is_multiple_of(16) && k.is_multiple_of(GEMM_K_MULTIPLE),
+            "expert_matmul needs n a multiple of 16 and k of {GEMM_K_MULTIPLE}, got n = {n}, \
+             k = {k}"
         );
 
         let pairs = rows * SLOTS;
-        let pairs_arg = i32::try_from(pairs).context("too many rows")?;
-        let experts_arg = i32::try_from(experts).context("too many experts")?;
         let n_arg = i32::try_from(n).context("n is too large")?;
         let k_arg = i32::try_from(k).context("k is too large")?;
-        let mut launch = stream.launch_builder(&self.group);
-        launch
-            .arg(&indices)
-            .arg(&pairs_arg)
-            .arg(&experts_arg)
-            .arg(&n_arg)
-            .arg(&mut out)
-            .arg(&mut scratch.perm)
-            .arg(&mut scratch.tiles)
-            .arg(&mut scratch.tile_count);
-        let config = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (GROUP_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: the arguments match `expert_group(const int*, int, int, int, bf16*, int*,
-        // int4*, int*)`. `indices` holds `pairs` ids and `out` `pairs` rows of n. The scratch
-        // was sized for at least `rows` rows and `experts` experts, both at most 1024 as the
-        // kernel needs, so `perm` holds `pairs` entries and `tiles` every tile the kernel can
-        // write.
-        unsafe { launch.launch(config) }?;
-
         let function = match format {
             ExpertFormat::Nvfp4 { .. } => &self.gemm_nvfp4,
             ExpertFormat::Mxfp8 => &self.gemm_mxfp8,
         };
-        let inputs_arg = inputs_per_row;
         let null: u64 = 0;
+        // One more row of blocks than tiles: the row at the tile count writes the NaN rows.
         let config = LaunchConfig {
             grid_dim: (
                 u32::try_from(n.div_ceil(GEMM_COLUMNS))?,
-                u32::try_from(max_tiles(pairs, experts))?,
+                u32::try_from(max_tiles(pairs, experts) + 1)?,
                 1,
             ),
             block_dim: (GEMM_THREADS, 1, 1),
@@ -400,19 +478,25 @@ impl Experts {
             .arg(&mut out)
             .arg(&scratch.perm)
             .arg(&scratch.tiles)
-            .arg(&scratch.tile_count)
+            .arg(&scratch.group_counts)
             .arg(&n_arg)
             .arg(&k_arg)
-            .arg(&inputs_arg);
+            .arg(&inputs_per_row);
         // SAFETY: the arguments match `expert_gemm_*(const bf16*, const u8*, const u8*,
         // const float*, bf16*, const int*, const int4*, const int*, int, int, int)`.
-        // `expert_group` ran first on this stream and left in `perm` only pair indices below
-        // `pairs` whose expert is below `experts`, and in `tiles` at most the grid's y extent
-        // of tiles. So every input row is inside `x`, every output row inside `out`, and every
-        // weight and scale row inside `weight` and `scales`; the kernel reads weight rows only
-        // below n. n and k meet the kernel's alignment needs, checked above. Only the NVFP4
-        // kernel reads `global_scale`, which then holds `experts` values.
+        // `expert_group` ran earlier on this stream for `rows` rows and `experts` experts, so
+        // `perm` holds a permutation of the `pairs` pair indices, its first `group_counts[1]`
+        // with ids below `experts`, and `tiles` holds at most `max_tiles` tiles of those. So
+        // every input row is inside `x`, every output row inside `out`, and every weight and
+        // scale row inside `weight` and `scales`; the kernel reads weight rows only below n.
+        // n and k meet the kernel's alignment needs, checked above. Only the NVFP4 kernel
+        // reads `global_scale`, which then holds `experts` values.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
+}
+
+/// Identifies a stream for [`Grouping`].
+fn stream_id(stream: &CudaStream) -> usize {
+    stream.cu_stream().addr()
 }

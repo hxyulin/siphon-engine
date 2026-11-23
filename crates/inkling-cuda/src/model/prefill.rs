@@ -31,10 +31,6 @@ use crate::{
 pub const MAX_PREFILL_CHUNK: usize = attention::MAX_PREFILL_ROWS;
 /// The chunk size MLX's chunked captures use.
 pub const DEFAULT_PREFILL_CHUNK: usize = 512;
-/// Most rows one expert product takes, the expert grouping's limit (`GROUP_MAX_ROWS` in
-/// `ops/experts.rs`). Longer chunks run their expert products in pieces of this many rows;
-/// each row's products depend only on that row.
-const EXPERT_ROWS: usize = 1024;
 /// Rows the LM head runs at once when every row's logits are wanted: 32 rows of 201,024
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
@@ -198,7 +194,7 @@ impl PrefillScratch {
                 act: zeros(stream, rows * top_k * width)?,
                 down: zeros(stream, rows * top_k * hidden)?,
                 combined: zeros(stream, rows * hidden)?,
-                experts: ExpertScratch::new(stream, rows.min(EXPERT_ROWS), cfg.n_routed_experts)?,
+                experts: ExpertScratch::new(stream, rows, cfg.n_routed_experts)?,
             },
             final_hidden: zeros(stream, rows * hidden)?,
             head_logits: zeros(stream, HEAD_ROWS * cfg.vocab_size)?,
@@ -982,20 +978,13 @@ impl Ctx {
             m,
         )?;
         let (w13, w2) = self.expert_weights(w);
-        for first in (0..m).step_by(EXPERT_ROWS) {
-            let count = EXPERT_ROWS.min(m - first);
-            let gate_up = top_k * 2 * width;
-            self.moe_rows(
-                &x.slice(first * hidden..(first + count) * hidden),
-                &t.indices.slice(first * top_k..(first + count) * top_k),
-                &w13,
-                &mut t
-                    .gate_up
-                    .slice_mut(first * gate_up..(first + count) * gate_up),
-                &mut t.experts,
-                count,
-            )?;
-        }
+        self.group_rows(&rows(&t.indices, m, top_k), &mut t.experts, m)?;
+        self.moe_rows(
+            &rows(x, m, hidden),
+            &w13,
+            &mut rows_mut(&mut t.gate_up, m, top_k * 2 * width),
+            &t.experts,
+        )?;
         self.kernels.elementwise.softcapped_swiglu(
             &self.stream,
             &rows(&t.gate_up, m, top_k * 2 * width),
@@ -1003,20 +992,11 @@ impl Ctx {
             cfg.mlp_gate_softcap,
             cfg.mlp_up_softcap,
         )?;
-        for first in (0..m).step_by(EXPERT_ROWS) {
-            let count = EXPERT_ROWS.min(m - first);
-            self.moe_rows(
-                &t.act
-                    .slice(first * top_k * width..(first + count) * top_k * width),
-                &t.indices.slice(first * top_k..(first + count) * top_k),
-                &w2,
-                &mut t
-                    .down
-                    .slice_mut(first * top_k * hidden..(first + count) * top_k * hidden),
-                &mut t.experts,
-                count,
-            )?;
-        }
-        Ok(())
+        self.moe_rows(
+            &rows(&t.act, m, top_k * width),
+            &w2,
+            &mut rows_mut(&mut t.down, m, top_k * hidden),
+            &t.experts,
+        )
     }
 }

@@ -621,7 +621,7 @@ fn compare_kernels(
 
 fn check_synthetic(fp4: bool) -> anyhow::Result<()> {
     let s = Setup::new()?;
-    let mut scratch = ExpertScratch::new(s.stream(), 1024, EXPERTS)?;
+    let mut scratch = ExpertScratch::new(s.stream(), 2048, EXPERTS)?;
     // Two and a half column tiles: 128 + 128 + 64.
     let n = 320;
     let format = if fp4 { "nvfp4" } else { "mxfp8" };
@@ -636,6 +636,7 @@ fn check_synthetic(fp4: bool) -> anyhow::Result<()> {
             (512, Routing::Skewed),
             (1024, Routing::Uniform),
             (1024, Routing::Same),
+            (2048, Routing::Skewed),
         ];
         for (rows, kind) in cases {
             let indices = routing(rows, kind, rows as u32 * 31 + 5);
@@ -738,6 +739,103 @@ fn matmul_unknown_expert_gives_nan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One grouping serves both projections: `expert_matmul_grouped` after one `expert_group`
+/// matches `expert_matmul` bit for bit on each.
+#[test]
+fn matmul_grouped_reuses_grouping() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let rows = 300;
+    let n = 192;
+    let mut scratch = ExpertScratch::new(stream, rows, EXPERTS)?;
+    let mut ids = routing(rows, Routing::Skewed, 17);
+    // Unknown ids still give NaN rows in each projection.
+    ids[5] = -3;
+    ids[700] = 128;
+    let indices = stream.clone_htod(&ids)?;
+    for fp4 in [true, false] {
+        let w13 = Synthetic::new(&s, fp4, n, HIDDEN, 23)?;
+        let w2 = Synthetic::new(&s, fp4, n, INTERMEDIATE, 29)?;
+        let x13 = stream.clone_htod(&common::pseudo_random_bf16(rows * HIDDEN, 3, 1.0, 0.0))?;
+        let x2 = stream.clone_htod(&common::pseudo_random_bf16(
+            rows * SLOTS * INTERMEDIATE,
+            4,
+            1.0,
+            0.0,
+        ))?;
+        let mut separate = Vec::new();
+        for (projection, x) in [(&w13, &x13), (&w2, &x2)] {
+            let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * n)?;
+            s.experts.expert_matmul(
+                stream,
+                x,
+                &indices,
+                &projection.gpu.weights(),
+                &mut out,
+                &mut scratch,
+            )?;
+            separate.push(stream.clone_dtoh(&out)?);
+        }
+        s.experts
+            .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
+        for ((projection, x), expected) in [(&w13, &x13), (&w2, &x2)].into_iter().zip(&separate) {
+            let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * n)?;
+            s.experts.expert_matmul_grouped(
+                stream,
+                x,
+                &projection.gpu.weights(),
+                &mut out,
+                &scratch,
+            )?;
+            let got = stream.clone_dtoh(&out)?;
+            assert!(
+                got.iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "grouped and separate results differ"
+            );
+            assert!(got[5 * n..6 * n].iter().all(|v| v.is_nan()));
+            assert!(got[700 * n..701 * n].iter().all(|v| v.is_nan()));
+            assert!(!got[6 * n..700 * n].iter().any(|v| v.is_nan()));
+        }
+    }
+    Ok(())
+}
+
+/// `expert_matmul_grouped` refuses a scratch without a grouping and weights whose expert
+/// count differs from the grouping's.
+#[test]
+fn matmul_grouped_checks_grouping() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let file = "experts_nvfp4";
+    let fixture = Fixture::load(file)?;
+    let projection = Projection::load(&s, &fixture, file, "gate_up")?;
+    let mut scratch = ExpertScratch::new(stream, 2, EXPERTS)?;
+    let (x, _) = fixture.bf16("gate_up.x")?;
+    let x = stream.clone_htod(&x[..2 * projection.k])?;
+    let mut out = stream.alloc_zeros::<bf16>(2 * SLOTS * projection.n)?;
+    let weights = projection.weights();
+    assert!(
+        s.experts
+            .expert_matmul_grouped(stream, &x, &weights, &mut out, &scratch)
+            .is_err()
+    );
+    // The fixture keeps 10 experts; group for 128.
+    let indices = stream.clone_htod(&[0i32; 2 * SLOTS])?;
+    s.experts
+        .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
+    assert!(
+        s.experts
+            .expert_matmul_grouped(stream, &x, &weights, &mut out, &scratch)
+            .is_err()
+    );
+    s.experts.expert_group(stream, &indices, 10, &mut scratch)?;
+    s.experts
+        .expert_matmul_grouped(stream, &x, &weights, &mut out, &scratch)?;
+    Ok(())
+}
+
 /// Full projections of layers 0 (NVFP4) and 20 (MXFP8) from the checkpoint, 512 rows.
 #[test]
 #[ignore = "reads the original checkpoint from INKLING_MODEL or ~/.local/share/inkling-mini/model"]
@@ -792,7 +890,7 @@ fn matmul_matches_reference_on_checkpoint() -> anyhow::Result<()> {
 fn bench_expert_matmul() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
-    let mut scratch = ExpertScratch::new(stream, 1024, EXPERTS)?;
+    let mut scratch = ExpertScratch::new(stream, 2048, EXPERTS)?;
     let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
     // Runs only the cases whose label (such as "NVFP4 w13 Uniform 512") contains this.
     let filter = std::env::var("EXPERT_BENCH_FILTER").unwrap_or_default();
@@ -803,7 +901,7 @@ fn bench_expert_matmul() -> anyhow::Result<()> {
             let projection = Synthetic::new(&s, fp4, HIDDEN, k, 3)?;
             let weights = projection.gpu.weights();
             for kind in [Routing::Uniform, Routing::Skewed] {
-                for rows in [1, 16, 64, 512, 1024] {
+                for rows in [1, 16, 64, 512, 1024, 2048] {
                     let format = if fp4 { "NVFP4" } else { "MXFP8" };
                     let label = format!("{format} {name} {kind:?} {rows}");
                     if !label.contains(&filter) {

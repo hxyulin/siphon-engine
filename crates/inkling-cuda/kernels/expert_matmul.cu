@@ -8,14 +8,15 @@
 //
 // 1. `expert_group` counts the pairs per expert, takes a prefix sum, writes
 //    the pairs sorted by expert (`perm`) and a list of tiles of at most 64
-//    pairs of one expert. It also fills the output rows of ids outside
-//    `[0, experts)` with NaN.
+//    pairs of one expert. The grouping depends only on the ids, so one serves
+//    both projections of a layer.
 // 2. `expert_gemm_*` runs one CTA per (tile, 128 output columns). It streams
 //    its weight and scale tile into L2 ahead of use. Then, 64 input values
-//    at a time, it copies the raw weight bytes and the tile's BF16 inputs to
-//    shared memory with `cp.async`, decodes the weights to BF16 with the scales
-//    held in registers, and multiplies with BF16 `mma.sync.m16n8k16` into F32
-//    accumulators.
+//    at a time, it copies the raw weight bytes, their scales and the tile's
+//    BF16 inputs to shared memory with `cp.async`, decodes the weights to BF16,
+//    and multiplies with BF16 `mma.sync.m16n8k16` into F32 accumulators. One
+//    more row of CTAs fills the output rows of ids outside `[0, experts)` with
+//    NaN.
 //
 // The weights are the MMA's A operand (16 output columns per fragment) and the
 // inputs the B operand (8 pairs per fragment), so a tile with few pairs skips
@@ -48,14 +49,21 @@ constexpr int kThreads = kWarps * 32;
 // Largest expert count `expert_group` supports.
 constexpr int kMaxExperts = 1024;
 constexpr int kGroupThreads = 1024;
-// Largest pair count `expert_group` supports: 1024 rows of 8 slots.
-constexpr int kMaxPairs = 8192;
+// Largest pair count `expert_group` supports: 2048 rows of 8 slots.
+constexpr int kMaxPairs = 16384;
 constexpr int kGroupRounds = kMaxPairs / kGroupThreads;
 // `F8E4M3_MAX * F4E2M1_MAX`, as in experts.cu.
 constexpr float kNvfp4ScaleEnc = 448.f * 6.f;
 
 __device__ uint32_t smem_addr(const void* p) {
     return uint32_t(__cvta_generic_to_shared(p));
+}
+
+// Copies 4 or 8 bytes.
+template <int kBytes>
+__device__ void cp_async_small(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" ::"r"(smem_addr(dst)), "l"(src),
+                 "n"(kBytes));
 }
 
 // Copies `src_bytes` (0 or 16) and zero-fills the rest of 16 bytes.
@@ -146,7 +154,25 @@ struct Stage {
     // on odd pairs so that the B-fragment loads are free of bank conflicts.
     static constexpr int kInput = kTileT * kTileK * 2;
     static constexpr int kBytes = kWeight + kInput;
+    // Scale bytes of one weight row for an aligned pair of chunks: 8 NVFP4
+    // groups or 4 MXFP8 groups. They load with every even chunk into a ring
+    // of their own after the stages.
+    static constexpr int kScaleRow = kFp4 ? 8 : 4;
+    static constexpr int kScaleSlot = kTileN * kScaleRow;
 };
+
+// Slots in the scale ring: a pair of chunks holds its slot until its second
+// chunk is used, while up to `kStages - 1` later chunks load.
+template <int kStages>
+__host__ __device__ constexpr int scale_slots() {
+    return (kStages + 2) / 2;
+}
+
+template <bool kFp4, int kStages>
+__host__ __device__ constexpr int gemm_shared_bytes() {
+    using S = Stage<kFp4>;
+    return kStages * S::kBytes + scale_slots<kStages>() * S::kScaleSlot;
+}
 
 // One CTA: 128 output columns of one tile of pairs. Each warp owns 16 output
 // columns and all 64 pairs.
@@ -160,39 +186,47 @@ struct Stage {
 // inputs use the same permutation, so the dot products are unchanged. Those
 // 16 values also share one scale.
 //
-// Shared memory is `kStages * Stage::kBytes` dynamic bytes plus 256 static;
-// two CTAs fit in an SM's 100 KiB when that is at most 49,920 dynamic bytes.
+// Shared memory is `gemm_shared_bytes` dynamic bytes and no static ones; two
+// CTAs fit in an SM's 100 KiB when that is at most 50,176 bytes, since the
+// driver reserves 1 KiB per CTA.
 template <bool kFp4, int kStages>
 __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ weight,
                             const uint8_t* __restrict__ scales, const float* __restrict__ global_scale,
                             __nv_bfloat16* __restrict__ out, const int* __restrict__ perm,
-                            const int4* __restrict__ tiles, const int* __restrict__ tile_count,
+                            const int4* __restrict__ tiles, const int* __restrict__ group_counts,
                             int n, int k, int inputs_per_row) {
     using S = Stage<kFp4>;
-    if (int(blockIdx.y) >= *tile_count) {
+    const int tile_count = group_counts[0];
+    const int n0 = blockIdx.x * kTileN;
+    const int tid = threadIdx.x;
+    if (int(blockIdx.y) == tile_count) {
+        // NaN rows for the pairs with unknown ids, which `expert_group` put
+        // last in `perm`.
+        const __nv_bfloat16 nan = __float2bfloat16(__int_as_float(0x7fc00000));
+        const int valid = group_counts[1];
+        const int columns = min(kTileN, n - n0);
+        for (int i = valid * kTileN + tid; i < group_counts[2] * kTileN; i += kThreads) {
+            if (i % kTileN < columns) {
+                out[size_t(perm[i / kTileN]) * n + n0 + i % kTileN] = nan;
+            }
+        }
+        return;
+    }
+    if (int(blockIdx.y) > tile_count) {
         return;
     }
     const int4 tile = tiles[blockIdx.y];
     const int expert = tile.x;
     const int start = tile.y;
     const int count = tile.z;
-    const int n0 = blockIdx.x * kTileN;
 
     extern __shared__ __align__(16) uint8_t smem[];
-    // Flat pair index of each pair. Pairs past `count` reuse the first pair's;
-    // their inputs load as zeros and their results are dropped.
-    __shared__ int pair_entry[kTileT];
+    uint8_t* const scale_ring = smem + kStages * S::kBytes;
 
-    const int tid = threadIdx.x;
     const int lane = tid % 32;
     const int warp = tid / 32;
     const int g = lane / 4;
     const int t = lane % 4;
-
-    if (tid < kTileT) {
-        pair_entry[tid] = perm[start + (tid < count ? tid : 0)];
-    }
-    __syncthreads();
 
     // Source rows for this thread's cp.async units, fixed across stages.
     constexpr int kWeightUnits = S::kWeight / 16 / kThreads;
@@ -225,7 +259,9 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
         const int unit = tid + i * kThreads;
         const int pair = unit / 8;
         const int part = unit % 8;
-        const int entry = pair_entry[pair];
+        // Pairs past `count` reuse the first pair's row; their inputs load as
+        // zeros and their results are dropped.
+        const int entry = perm[start + (pair < count ? pair : 0)];
         const int input = inputs_per_row == 1 ? entry / kSlots : entry;
         input_src[i] = x + size_t(input) * k + part * 8;
         input_dst[i] = S::kWeight + pair * 128 + (part ^ (pair & 1)) * 16;
@@ -233,10 +269,19 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
         input_load[i] = pair < fragments * 8;
     }
     const size_t scale_row_bytes = k / (kFp4 ? 16 : 32);
+    // Threads below kTileN copy the scales of weight row `tid`.
+    const bool scale_load = tid < kTileN && n0 + tid < n;
+    const uint8_t* scale_src =
+        scales + (size_t(expert) * n + n0 + min(tid, kTileN - 1)) * scale_row_bytes;
 
     auto load_stage = [&](int chunk, int stage) {
         uint8_t* base = smem + stage * S::kBytes;
         const int k0 = chunk * kTileK;
+        if (chunk % 2 == 0 && scale_load) {
+            const int slot = chunk / 2 % scale_slots<kStages>();
+            cp_async_small<S::kScaleRow>(scale_ring + slot * S::kScaleSlot + tid * S::kScaleRow,
+                                         scale_src + chunk / 2 * S::kScaleRow);
+        }
 #pragma unroll
         for (int i = 0; i < kWeightUnits; ++i) {
             cp_async16(base + weight_dst[i], weight_src[i] + (kFp4 ? k0 / 2 : k0),
@@ -250,14 +295,14 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
         }
     };
 
-    // Weights stream into L2 ahead of the pipeline, 512 bytes of each row at
+    // Weights stream into L2 ahead of the pipeline, 256 bytes of each row at
     // a time, one segment ahead of the one in use, so the copies to shared
     // memory wait on L2 rather than DRAM. The whole tile at once would not
     // fit: 340 resident MXFP8 blocks would ask for 100 MB of the 96 MB L2.
     // Lane 0 of each warp prefetches its 16 rows. (The bulk prefetch takes
     // uniform operands, so per-lane addresses would serialize.) The scales,
     // an eighth of the weight bytes or less, are prefetched whole.
-    constexpr int kSegmentBytes = 512;
+    constexpr int kSegmentBytes = 256;
     constexpr int kSegmentChunks = kSegmentBytes / S::kWeightRow;
     const bool warp_active = n0 + warp * 16 < n;
     const size_t warp_first_row = size_t(expert) * n + n0 + warp * 16;
@@ -296,27 +341,25 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
     }
 
     const int row0 = warp * 16 + g;
-    // The lane's scale bytes for rows `row0` and `row0 + 8` in one chunk,
-    // packed low and high. Its 16 values are NVFP4 group 4c + t or MXFP8 group
-    // 2c + t / 2.
-    const uint8_t* scale_lo = scales + (size_t(expert) * n + n0 + row0) * scale_row_bytes;
-    const uint8_t* scale_hi = scale_lo + 8 * scale_row_bytes;
-    auto load_scales = [&](int chunk) -> uint32_t {
-        const int group = kFp4 ? 4 * chunk + t : 2 * chunk + t / 2;
-        return uint32_t(__ldg(scale_lo + group)) | uint32_t(__ldg(scale_hi + group)) << 8;
-    };
 
     // One chunk's MMAs over the first `kFragments` pair fragments.
-    auto compute = [&]<int kFragments>(int stage, uint32_t scale_bytes) {
+    auto compute = [&]<int kFragments>(int chunk, int stage) {
         const uint8_t* base = smem + stage * S::kBytes;
+        // The lane's 16 values of rows `row0` and `row0 + 8` share one scale:
+        // NVFP4 group 4c + t or MXFP8 group 2c + t / 2 of chunk c.
+        const uint8_t* scale_slot =
+            scale_ring + chunk / 2 % scale_slots<kStages>() * S::kScaleSlot +
+            (kFp4 ? 4 * (chunk % 2) + t : 2 * (chunk % 2) + t / 2);
+        const uint32_t scale_lo = scale_slot[row0 * S::kScaleRow];
+        const uint32_t scale_hi = scale_slot[(row0 + 8) * S::kScaleRow];
 
         // A fragments for the four 16-value steps: [step][register].
         uint32_t a[4][4];
         if constexpr (kFp4) {
             const __half2 s_lo =
-                __half2half2(__half(__nv_cvt_fp8_to_halfraw(scale_bytes & 0xff, __NV_E4M3)));
+                __half2half2(__half(__nv_cvt_fp8_to_halfraw(scale_lo, __NV_E4M3)));
             const __half2 s_hi =
-                __half2half2(__half(__nv_cvt_fp8_to_halfraw(scale_bytes >> 8, __NV_E4M3)));
+                __half2half2(__half(__nv_cvt_fp8_to_halfraw(scale_hi, __NV_E4M3)));
             const uint2 w_lo = *reinterpret_cast<const uint2*>(base + row0 * S::kWeightRow + 8 * t);
             const uint2 w_hi =
                 *reinterpret_cast<const uint2*>(base + (row0 + 8) * S::kWeightRow + 8 * t);
@@ -331,8 +374,8 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
                 a[s][3] = decode_e2m1x2(hi >> (shift + 8), s_hi);
             }
         } else {
-            const float s_lo = e8m0(scale_bytes & 0xff);
-            const float s_hi = e8m0(scale_bytes >> 8);
+            const float s_lo = e8m0(scale_lo);
+            const float s_hi = e8m0(scale_hi);
             const uint4 w_lo = *reinterpret_cast<const uint4*>(base + row0 * S::kWeightRow + 16 * t);
             const uint4 w_hi =
                 *reinterpret_cast<const uint4*>(base + (row0 + 8) * S::kWeightRow + 16 * t);
@@ -365,13 +408,6 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
     // constants, and compiled once per fragment count so that the MMAs of
     // different fragments interleave without branches between them.
     auto main_loop = [&]<int kFragments>() {
-        // Scale bytes for the chunks in the pipeline: `ring[stage]` holds those
-        // of the chunk in that stage, loaded when its copies start.
-        uint32_t ring[kStages];
-#pragma unroll
-        for (int s = 0; s < kStages - 1; ++s) {
-            ring[s] = warp_active && s < chunks ? load_scales(s) : 0;
-        }
         for (int chunk0 = 0; chunk0 < chunks; chunk0 += kStages) {
 #pragma unroll
             for (int stage = 0; stage < kStages; ++stage) {
@@ -382,16 +418,13 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
                     const int next = chunk + kStages - 1;
                     if (next < chunks) {
                         load_stage(next, (stage + kStages - 1) % kStages);
-                        if (warp_active) {
-                            ring[(stage + kStages - 1) % kStages] = load_scales(next);
-                        }
                     }
                     cp_async_commit();
                     if (chunk % kSegmentChunks == 0 && chunk > 0) {
                         prefetch_segment(chunk / kSegmentChunks + 1);
                     }
                     if (warp_active) {
-                        compute.template operator()<kFragments>(stage, ring[stage]);
+                        compute.template operator()<kFragments>(chunk, stage);
                     }
                 }
             }
@@ -435,7 +468,7 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
         const int part = unit % (kTileN / 8);
         if (part * 8 < columns) {
             const uint4 v = *reinterpret_cast<const uint4*>(staged + pair * kOutStride + part * 8);
-            *reinterpret_cast<uint4*>(out + size_t(pair_entry[pair]) * n + n0 + part * 8) = v;
+            *reinterpret_cast<uint4*>(out + size_t(perm[start + pair]) * n + n0 + part * 8) = v;
         }
     }
 }
@@ -446,21 +479,21 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
 //
 // Writes `perm[i]`, the flat index `row * 8 + slot` of the i-th pair in expert
 // order, and `tiles[i] = {expert, first position in perm, pairs, 0}` for each
-// run of at most 64 pairs of one expert, ordered by expert, with their number
-// in `tile_count[0]`. Pairs with an id outside `[0, experts)` are left out and
-// their `n` outputs in `out` are set to NaN. One block of 1024 threads; at
-// most 8192 pairs and 1024 experts.
+// run of at most 64 pairs of one expert, ordered by expert. Pairs with an id
+// outside `[0, experts)` come last in `perm`, in no particular order, and get
+// no tile. `group_counts` receives the number of tiles, the number of pairs
+// with known ids, and `entries`. One block of 1024 threads; at most 16,384
+// pairs and 1024 experts.
 extern "C" __global__ void __launch_bounds__(kGroupThreads)
-    expert_group(const int32_t* __restrict__ indices, int entries, int experts, int n,
-                 __nv_bfloat16* __restrict__ out, int32_t* __restrict__ perm,
-                 int4* __restrict__ tiles, int32_t* __restrict__ tile_count) {
+    expert_group(const int32_t* __restrict__ indices, int entries, int experts,
+                 int32_t* __restrict__ perm, int4* __restrict__ tiles,
+                 int32_t* __restrict__ group_counts) {
     __shared__ int count[kMaxExperts];
     __shared__ int first[kMaxExperts];
     __shared__ int warp_sums[32];
     __shared__ int invalid_count;
-    __shared__ int invalid[kMaxPairs];
+    __shared__ int valid_count;
     const int tid = threadIdx.x;
-    const int lane = tid % 32;
 
     // Each thread keeps its pairs' ids in registers; -1 marks no pair.
     int ids[kGroupRounds];
@@ -477,17 +510,18 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
     }
     __syncthreads();
 
-    // Count. Each pair's rank among its expert's pairs is the count before
-    // its own atomic; the order of ranks varies between runs, but each output
-    // depends only on its own pair.
+    // Count. Each pair's rank among its expert's pairs, or among the pairs
+    // with unknown ids, is the count before its own atomic; the order of ranks
+    // varies between runs, but each output depends only on its own pair.
     int rank[kGroupRounds];
 #pragma unroll
     for (int r = 0; r < kGroupRounds; ++r) {
         const int i = r * kGroupThreads + tid;
         const bool valid = ids[r] >= 0 && ids[r] < experts;
-        rank[r] = valid ? atomicAdd(&count[ids[r]], 1) : 0;
-        if (i < entries && !valid) {
-            invalid[atomicAdd(&invalid_count, 1)] = i;
+        if (valid) {
+            rank[r] = atomicAdd(&count[ids[r]], 1);
+        } else if (i < entries) {
+            rank[r] = atomicAdd(&invalid_count, 1);
         }
     }
     __syncthreads();
@@ -500,6 +534,9 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
         expert_tiles = (pairs + kTileT - 1) / kTileT;
     }
     const int pair_end = block_scan(pairs, warp_sums);
+    if (tid == kGroupThreads - 1) {
+        valid_count = pair_end;
+    }
     __syncthreads();
     const int tile_end = block_scan(expert_tiles, warp_sums);
     const int pair_start = pair_end - pairs;
@@ -512,23 +549,20 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
         }
     }
     if (tid == kGroupThreads - 1) {
-        tile_count[0] = tile_end;
+        group_counts[0] = tile_end;
+        group_counts[1] = pair_end;
+        group_counts[2] = entries;
     }
     __syncthreads();
 
     // Scatter.
 #pragma unroll
     for (int r = 0; r < kGroupRounds; ++r) {
+        const int i = r * kGroupThreads + tid;
         if (ids[r] >= 0 && ids[r] < experts) {
-            perm[first[ids[r]] + rank[r]] = r * kGroupThreads + tid;
-        }
-    }
-
-    // NaN rows for unknown ids, one warp per pair.
-    const __nv_bfloat16 nan = __float2bfloat16(__int_as_float(0x7fc00000));
-    for (int b = tid / 32; b < invalid_count; b += kGroupThreads / 32) {
-        for (int c = lane; c < n; c += 32) {
-            out[size_t(invalid[b]) * n + c] = nan;
+            perm[first[ids[r]] + rank[r]] = i;
+        } else if (i < entries) {
+            perm[valid_count + rank[r]] = i;
         }
     }
 }
@@ -536,19 +570,20 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
 // Arguments, shared by the GEMM kernels:
 // - `x`, `weight`, `scales`, `global_scale`, `out`, `inputs_per_row`: as for
 //   `expert_matvec_*` in experts.cu;
-// - `perm`, `tiles`, `tile_count`: written by `expert_group`.
-// Grid: (ceil(n / 128), an upper bound on the tile count); blocks past
-// `tile_count[0]` exit. Needs `Stage::kBytes * kStages` bytes of dynamic shared
-// memory: 4 * 12,288 for NVFP4 and 3 * 16,384 for MXFP8. n must be a multiple
-// of 16 and k of 64.
+// - `perm`, `tiles`, `group_counts`: written by `expert_group`.
+// Grid: (ceil(n / 128), an upper bound on the tile count plus one); the row
+// of blocks at the tile count writes the NaN rows, and later rows exit. Needs
+// `gemm_shared_bytes` of dynamic shared memory: 38,912 bytes for NVFP4 and
+// 50,176 for MXFP8. n must be a multiple of 16 and k of 128.
 #define EXPERT_GEMM(name, fp4, stages)                                                            \
+    static_assert(gemm_shared_bytes<fp4, stages>() <= 50176);                                     \
     extern "C" __global__ void __launch_bounds__(kThreads, 2)                                     \
         name(const __nv_bfloat16* x, const uint8_t* weight, const uint8_t* scales,                \
              const float* global_scale, __nv_bfloat16* out, const int* perm, const int4* tiles,   \
-             const int* tile_count, int n, int k, int inputs_per_row) {                           \
-        expert_gemm<fp4, stages>(x, weight, scales, global_scale, out, perm, tiles, tile_count,   \
-                                 n, k, inputs_per_row);                                           \
+             const int* group_counts, int n, int k, int inputs_per_row) {                         \
+        expert_gemm<fp4, stages>(x, weight, scales, global_scale, out, perm, tiles,               \
+                                 group_counts, n, k, inputs_per_row);                             \
     }
 
-EXPERT_GEMM(expert_gemm_nvfp4, true, 4)
+EXPERT_GEMM(expert_gemm_nvfp4, true, 3)
 EXPERT_GEMM(expert_gemm_mxfp8, false, 3)

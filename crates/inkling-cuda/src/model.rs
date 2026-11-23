@@ -1197,25 +1197,39 @@ impl Ctx {
         Ok(())
     }
 
-    /// The expert products of `m` rows: `out` `[m, 8, n]` from `x` `[m, 1, k]` (one input
-    /// for all 8 experts) or `[m, 8, k]` (one per expert) and the routed `indices`
-    /// `[m, 8]`.
-    ///
-    /// Runs [`Experts::expert_matmul`], which groups the pairs by expert so each expert's
-    /// weights are read once per call.
-    fn moe_rows(
+    /// Groups the routed `indices` `[m, 8]` of `m` rows by expert into `scratch`, for the
+    /// [`Ctx::moe_rows`] calls that follow.
+    fn group_rows(
         &self,
-        x: &CudaView<'_, bf16>,
         indices: &CudaView<'_, i32>,
-        weights: &experts::ExpertWeights<'_>,
-        out: &mut CudaViewMut<'_, bf16>,
         scratch: &mut experts::ExpertScratch,
         m: usize,
     ) -> anyhow::Result<()> {
         ensure!(indices.len() == m * 8, "indices must hold {m} x 8 ids");
+        self.kernels.experts.expert_group(
+            &self.stream,
+            indices,
+            self.config.n_routed_experts,
+            scratch,
+        )
+    }
+
+    /// The expert products of `m` rows: `out` `[m, 8, n]` from `x` `[m, 1, k]` (one input
+    /// for all 8 experts) or `[m, 8, k]` (one per expert), routed by the indices that
+    /// [`Ctx::group_rows`] grouped into `scratch`.
+    ///
+    /// Runs [`Experts::expert_matmul_grouped`], which multiplies each expert's pairs as one
+    /// matrix product so each expert's weights are read once per call.
+    fn moe_rows(
+        &self,
+        x: &CudaView<'_, bf16>,
+        weights: &experts::ExpertWeights<'_>,
+        out: &mut CudaViewMut<'_, bf16>,
+        scratch: &experts::ExpertScratch,
+    ) -> anyhow::Result<()> {
         self.kernels
             .experts
-            .expert_matmul(&self.stream, x, indices, weights, out, scratch)
+            .expert_matmul_grouped(&self.stream, x, weights, out, scratch)
     }
 
     /// Appends the keys `k` and values `v` (`[m, 8, 128]`) of `m` rows to `cache` and
