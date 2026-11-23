@@ -6,6 +6,9 @@
 //! host reference covers what the fixture is too short for: a global cache of 40,000 keys cut
 //! into the full number of splits, and a sliding ring that has wrapped several times.
 //!
+//! Chunked prefill is checked against the same F64 reference and against append plus decode
+//! attention run row by row, including the cache contents both leave behind.
+//!
 //! FP8 global caches are checked against the same F64 reference applied to the E4M3 values
 //! the cache holds, with the BF16 tolerance: decoding E4M3 is exact, so only the rounding of
 //! the cache differs. The tests also print the error against the reference on the BF16
@@ -15,14 +18,16 @@
 
 mod common;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use common::{Fixture, assert_bf16_close, bf16_ulps};
+use cudarc::driver::CudaStream;
 use half::bf16;
 use inkling_cuda::{
     Gpu,
     ops::attention::{
         Attention, AttentionScratch, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData, KvFormat,
+        MAX_PREFILL_ROWS, PrefillScratch,
     },
 };
 
@@ -139,28 +144,97 @@ const F32_ERROR: f64 = 1.0 / 4096.0;
 /// partials' absolute values add up to the magnitude.
 const MLX_PARTIAL_ERROR: f64 = 1.0 / 256.0;
 
-/// Fails unless every output is within 1 BF16 ulp of `want` (the output rounding) plus
-/// `relative` times its magnitude from [`reference`] (the arithmetic before it).
-fn assert_within(label: &str, got: &[bf16], want: &[f64], magnitude: &[f64], relative: f64) {
-    let mut worst = 0.0f64;
-    let mut differing = 0;
+/// Additional error allowed for prefill attention per unit of magnitude: it rounds each
+/// softmax weight to F16 for the tensor-core product with the values, a relative error of
+/// at most 2^-11 per weight (down to weights 2^-29 of the largest, below which the error
+/// is under 2^-40 of the largest), so at most 2^-11 of the weighted sum of absolute values.
+const PREFILL_P_ERROR: f64 = 1.0 / 2048.0;
+/// Absolute error allowed for prefill attention: BF16 values below 2^-14 lose bits when
+/// they convert to F16, at most 2^-25 each, and the weights sum to at most 1.
+const PREFILL_V_ERROR: f64 = 1.0 / 33_554_432.0;
+
+/// How far one comparison came from its tolerance.
+#[derive(Clone, Copy, Debug, Default)]
+struct Closeness {
+    /// Elements that differ from `want` rounded to BF16.
+    differing: usize,
+    /// The largest share of its tolerance an element uses.
+    worst: f64,
+    /// The largest error over the element's magnitude, after taking off half an ulp for the
+    /// output rounding, among elements with magnitude at least 2^-10.
+    relative: f64,
+}
+
+impl Closeness {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            differing: self.differing + other.differing,
+            worst: self.worst.max(other.worst),
+            relative: self.relative.max(other.relative),
+        }
+    }
+}
+
+/// How much error [`check_within`] allows.
+#[derive(Clone, Copy, Debug)]
+struct Tolerance {
+    /// BF16 ulps of `want`: 1 for the output rounding, 2 when `want` is itself a rounded
+    /// output.
+    ulps: f64,
+    /// Error per unit of magnitude from [`reference`].
+    relative: f64,
+    /// Error regardless of magnitude.
+    absolute: f64,
+}
+
+impl Tolerance {
+    /// Against the F64 reference: 1 ulp plus `relative` times the magnitude.
+    fn reference(relative: f64) -> Self {
+        Self {
+            ulps: 1.0,
+            relative,
+            absolute: 0.0,
+        }
+    }
+}
+
+/// Fails unless every output is within the tolerance of `want`: some BF16 ulps (the output
+/// rounding) plus a share of its magnitude from [`reference`] (the arithmetic before it).
+fn check_within(
+    label: &str,
+    got: &[bf16],
+    want: &[f64],
+    magnitude: &[f64],
+    tolerance: Tolerance,
+) -> Closeness {
+    let mut closeness = Closeness::default();
     for (i, ((&g, &w), &a)) in got.iter().zip(want).zip(magnitude).enumerate() {
         let rounded = bf16::from_f64(w);
         let ulp = (bf16::from_bits(rounded.to_bits() + 1).to_f64() - rounded.to_f64()).abs();
-        let allowed = ulp + relative * a;
+        let allowed = tolerance.ulps * ulp + tolerance.relative * a + tolerance.absolute;
         let err = (g.to_f64() - w).abs();
         assert!(
             err <= allowed,
             "{label}[{i}]: got {g}, want {w} (magnitude {a})"
         );
-        worst = worst.max(err / allowed);
-        differing += usize::from(bf16_ulps(g, rounded) > 0);
+        closeness.worst = closeness.worst.max(err / allowed);
+        if a >= 1.0 / 1024.0 {
+            closeness.relative = closeness.relative.max((err - ulp / 2.0).max(0.0) / a);
+        }
+        closeness.differing += usize::from(bf16_ulps(g, rounded) > 0);
     }
+    closeness
+}
+
+/// [`check_within`], printing the result.
+fn assert_within(label: &str, got: &[bf16], want: &[f64], magnitude: &[f64], relative: f64) {
+    let closeness = check_within(label, got, want, magnitude, Tolerance::reference(relative));
     eprintln!(
-        "{label}: {differing} of {} elements differ from the rounded value; the worst uses \
-         {:.0}% of its tolerance",
+        "{label}: {} of {} elements differ from the rounded value; the worst uses {:.0}% of \
+         its tolerance",
+        closeness.differing,
         want.len(),
-        100.0 * worst
+        100.0 * closeness.worst
     );
 }
 
@@ -621,5 +695,503 @@ fn global_cache_holds_its_capacity() -> anyhow::Result<()> {
     assert!(!global.holds(2));
     let sliding = KvCache::sliding(gpu.stream(), 2)?;
     assert!(sliding.holds(2) && sliding.holds(1 << 20));
+    Ok(())
+}
+
+/// One chunk of a prefill test: `rows` tokens, whether to also run decode attention on each
+/// row and compare, and the rows to check against the F64 reference (all when `None`).
+struct Chunk {
+    rows: usize,
+    decode: bool,
+    checks: Option<Vec<usize>>,
+}
+
+impl Chunk {
+    /// A chunk checked in full, against decode and the F64 reference.
+    fn full(rows: usize) -> Self {
+        Self {
+            rows,
+            decode: true,
+            checks: None,
+        }
+    }
+
+    /// A chunk that only fills the cache.
+    fn fill(rows: usize) -> Self {
+        Self {
+            rows,
+            decode: false,
+            checks: Some(Vec::new()),
+        }
+    }
+
+    /// A chunk compared with decode in full and with the F64 reference at `checks`.
+    fn sampled(rows: usize, checks: Vec<usize>) -> Self {
+        Self {
+            rows,
+            decode: true,
+            checks: Some(checks),
+        }
+    }
+}
+
+/// Fails unless two caches hold the same bytes.
+fn assert_same_cache(stream: &Arc<CudaStream>, a: &KvCache, b: &KvCache) -> anyhow::Result<()> {
+    let same = match (a.data(), b.data()) {
+        (
+            KvData::Bf16 { keys, values },
+            KvData::Bf16 {
+                keys: keys_b,
+                values: values_b,
+            },
+        ) => {
+            stream.clone_dtoh(keys)? == stream.clone_dtoh(keys_b)?
+                && stream.clone_dtoh(values)? == stream.clone_dtoh(values_b)?
+        }
+        (
+            KvData::Fp8 { keys, values },
+            KvData::Fp8 {
+                keys: keys_b,
+                values: values_b,
+            },
+        ) => {
+            stream.clone_dtoh(keys)? == stream.clone_dtoh(keys_b)?
+                && stream.clone_dtoh(values)? == stream.clone_dtoh(values_b)?
+        }
+        _ => false,
+    };
+    assert!(same, "prefill and decode left different caches");
+    Ok(())
+}
+
+/// Runs `chunks` of random tokens through prefill attention on one cache and through
+/// append plus decode attention, row by row, on another made the same way. Checks the
+/// prefill rows against the F64 reference, against decode, and the two caches' contents
+/// after every chunk compared with decode.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the chunks keeps the two caches in step"
+)]
+fn check_prefill(
+    make_cache: impl Fn(&Arc<CudaStream>) -> anyhow::Result<KvCache>,
+    chunks: &[Chunk],
+    seed: u64,
+) -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let mut prefill_cache = make_cache(stream)?;
+    let mut decode_cache = make_cache(stream)?;
+    let window = prefill_cache.window();
+    let format = prefill_cache.format();
+    let label = match (window, format) {
+        (Some(_), _) => "sliding",
+        (None, KvFormat::Bf16) => "global",
+        (None, KvFormat::Fp8) => "fp8 global",
+    };
+
+    let tokens: usize = chunks.iter().map(|c| c.rows).sum();
+    let mut rng = Rng(seed);
+    let topics: Vec<Vec<f32>> = (0..4)
+        .map(|_| (0..HEAD_DIM).map(|_| 1.5 * rng.normal()).collect())
+        .collect();
+    let k = rng.heads(tokens * KV_HEADS, &topics);
+    let v = rng.normals(tokens * ROW, 1.0);
+    let stored_k: Vec<f32> = k.iter().map(|&x| stored(format, x)).collect();
+    let stored_v: Vec<f32> = v.iter().map(|&x| stored(format, x)).collect();
+    let exact_k: Vec<f32> = k.iter().map(|x| x.to_f32()).collect();
+    let exact_v: Vec<f32> = v.iter().map(|x| x.to_f32()).collect();
+    let k_dev = stream.clone_htod(&k)?;
+    let v_dev = stream.clone_htod(&v)?;
+
+    let mut scratch = PrefillScratch::new(stream, MAX_PREFILL_ROWS)?;
+    let mut decode_scratch = AttentionScratch::new(stream)?;
+    let mut start_dev = stream.alloc_zeros::<u32>(1)?;
+    let mut position_dev = stream.alloc_zeros::<u32>(1)?;
+    let mut decode_out = stream.alloc_zeros::<bf16>(HEADS * HEAD_DIM)?;
+    let head_len = HEADS * HEAD_DIM;
+    let bias_len = HEADS * EXTENT;
+
+    let mut start = 0;
+    for chunk in chunks {
+        let m = chunk.rows;
+        let checks = chunk.checks.clone().unwrap_or_else(|| (0..m).collect());
+        let inputs_needed = chunk.decode || !checks.is_empty();
+        let (q, bias, sinks) = if inputs_needed {
+            (
+                rng.heads(m * HEADS, &topics),
+                rng.normals(m * bias_len, 1.5),
+                rng.normals(m * HEADS, 2.0),
+            )
+        } else {
+            (
+                rng.heads(m * HEADS, &topics),
+                vec![bf16::ZERO; m * bias_len],
+                vec![bf16::ZERO; m * HEADS],
+            )
+        };
+        let q_dev = stream.clone_htod(&q)?;
+        let bias_dev = stream.clone_htod(&bias)?;
+        let sinks_dev = stream.clone_htod(&sinks)?;
+        let mut out_dev = stream.alloc_zeros::<bf16>(m * head_len)?;
+        stream.memcpy_htod(&[u32::try_from(start)?], &mut start_dev)?;
+        let rows = start * ROW..(start + m) * ROW;
+        attention.prefill_attention(
+            stream,
+            &q_dev,
+            &k_dev.slice(rows.clone()),
+            &v_dev.slice(rows),
+            &mut prefill_cache,
+            &start_dev,
+            m,
+            &bias_dev,
+            &sinks_dev,
+            &mut scratch,
+            &mut out_dev,
+        )?;
+        let got = stream.clone_dtoh(&out_dev)?;
+
+        let mut decoded = Vec::new();
+        for i in 0..m {
+            let position = start + i;
+            let token = position * ROW..(position + 1) * ROW;
+            stream.memcpy_htod(&[u32::try_from(position)?], &mut position_dev)?;
+            attention.append(
+                stream,
+                &mut decode_cache,
+                &position_dev,
+                &k_dev.slice(token.clone()),
+                &v_dev.slice(token),
+            )?;
+            if chunk.decode {
+                let q_row = stream.clone_htod(&q[i * head_len..(i + 1) * head_len])?;
+                let bias_row = stream.clone_htod(&bias[i * bias_len..(i + 1) * bias_len])?;
+                let sinks_row = stream.clone_htod(&sinks[i * HEADS..(i + 1) * HEADS])?;
+                attention.decode_attention(
+                    stream,
+                    &q_row,
+                    &decode_cache,
+                    &position_dev,
+                    &bias_row,
+                    &sinks_row,
+                    &mut decode_scratch,
+                    &mut decode_out,
+                )?;
+                decoded.extend(stream.clone_dtoh(&decode_out)?);
+            }
+        }
+
+        let mut vs_reference = Closeness::default();
+        let mut vs_decode = Closeness::default();
+        for &i in &checks {
+            let position = start + i;
+            let query = Query {
+                q: q[i * head_len..(i + 1) * head_len].to_vec(),
+                bias: bias[i * bias_len..(i + 1) * bias_len].to_vec(),
+                sinks: sinks[i * HEADS..(i + 1) * HEADS].to_vec(),
+            };
+            let history = ..(position + 1) * ROW;
+            let (want, magnitude) = reference(
+                &query,
+                &stored_k[history],
+                &stored_v[history],
+                window,
+                position,
+            );
+            let row = &got[i * head_len..(i + 1) * head_len];
+            let row_label = format!("{label} prefill {position}");
+            vs_reference = vs_reference.merge(check_within(
+                &format!("{row_label} vs F64"),
+                row,
+                &want,
+                &magnitude,
+                Tolerance {
+                    absolute: PREFILL_V_ERROR,
+                    ..Tolerance::reference(F32_ERROR + PREFILL_P_ERROR)
+                },
+            ));
+            if chunk.decode {
+                let decoded_row = &decoded[i * head_len..(i + 1) * head_len];
+                check_within(
+                    &format!("{label} decode {position} vs F64"),
+                    decoded_row,
+                    &want,
+                    &magnitude,
+                    Tolerance::reference(F32_ERROR),
+                );
+                let decoded_row: Vec<f64> = decoded_row.iter().map(|x| x.to_f64()).collect();
+                vs_decode = vs_decode.merge(check_within(
+                    &format!("{row_label} vs decode"),
+                    row,
+                    &decoded_row,
+                    &magnitude,
+                    Tolerance {
+                        ulps: 2.0,
+                        relative: 2.0 * F32_ERROR + PREFILL_P_ERROR,
+                        absolute: PREFILL_V_ERROR,
+                    },
+                ));
+            }
+            if format == KvFormat::Fp8 && i == checks[0] {
+                let (exact, _) = reference(
+                    &query,
+                    &exact_k[history],
+                    &exact_v[history],
+                    window,
+                    position,
+                );
+                report_quantization_error(&row_label, row, &exact);
+            }
+        }
+        if !checks.is_empty() {
+            eprintln!(
+                "{label} chunk {start}+{m}: {} rows vs F64: {} of {} elements differ from the \
+                 rounded value, worst {:.0}% of tolerance, largest error {:.2e} of magnitude",
+                checks.len(),
+                vs_reference.differing,
+                checks.len() * head_len,
+                100.0 * vs_reference.worst,
+                vs_reference.relative,
+            );
+        }
+        if chunk.decode {
+            eprintln!(
+                "{label} chunk {start}+{m}: vs decode: {} of {} elements differ, worst {:.0}% of \
+                 tolerance, largest difference {:.2e} of magnitude",
+                vs_decode.differing,
+                checks.len() * head_len,
+                100.0 * vs_decode.worst,
+                vs_decode.relative,
+            );
+            assert_same_cache(stream, &prefill_cache, &decode_cache)?;
+        }
+        start += m;
+    }
+    assert_same_cache(stream, &prefill_cache, &decode_cache)
+}
+
+/// Rows spread over a chunk of `rows`: both ends and every 61st row.
+fn spread(rows: usize) -> Vec<usize> {
+    let mut checks: Vec<usize> = (0..rows).step_by(61).collect();
+    checks.extend([1, rows / 2, rows - 2, rows - 1]);
+    checks.sort_unstable();
+    checks.dedup();
+    checks.retain(|&r| r < rows);
+    checks
+}
+
+/// A chunk at 0 with an odd row count, a single row (which runs decode attention) and two
+/// rows, a full 1024-row chunk that wraps the ring, a 512-row chunk on a full ring, and more
+/// odd chunks after.
+#[test]
+fn sliding_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    let chunks = [
+        Chunk::full(77),
+        Chunk::full(1),
+        Chunk::full(2),
+        Chunk::sampled(1024, spread(1024)),
+        Chunk::sampled(512, spread(512)),
+        Chunk::full(1),
+        Chunk::full(301),
+        Chunk::sampled(1023, spread(1023)),
+    ];
+    check_prefill(|stream| KvCache::sliding(stream, WINDOW), &chunks, 4)
+}
+
+/// A full 1024-row chunk at 0, then odd and single-row chunks.
+#[test]
+fn global_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    let chunks = [
+        Chunk::sampled(1024, spread(1024)),
+        Chunk::full(1),
+        Chunk::full(5),
+        Chunk::full(77),
+        Chunk::sampled(512, spread(512)),
+        Chunk::full(3),
+    ];
+    check_prefill(|stream| KvCache::global(stream, 2048), &chunks, 5)
+}
+
+#[test]
+fn fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    let chunks = [
+        Chunk::full(77),
+        Chunk::full(1),
+        Chunk::full(2),
+        Chunk::sampled(1024, spread(1024)),
+        Chunk::sampled(512, spread(512)),
+    ];
+    check_prefill(
+        |stream| KvCache::global_with_format(stream, 2048, KvFormat::Fp8),
+        &chunks,
+        6,
+    )
+}
+
+/// Chunks past 39,000 tokens, beyond the bias table and the decode kernel's split sizes.
+fn long_chunks() -> Vec<Chunk> {
+    let mut chunks: Vec<Chunk> = (0..38).map(|_| Chunk::fill(1024)).collect();
+    chunks.push(Chunk::fill(1000));
+    chunks.push(Chunk::sampled(512, vec![0, 1, 255, 510, 511]));
+    chunks.push(Chunk::sampled(1, vec![0]));
+    chunks.push(Chunk::sampled(2, vec![0, 1]));
+    chunks.push(Chunk::sampled(333, vec![0, 332]));
+    chunks
+}
+
+#[test]
+fn long_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    check_prefill(|stream| KvCache::global(stream, 40_960), &long_chunks(), 7)
+}
+
+#[test]
+fn long_fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    check_prefill(
+        |stream| KvCache::global_with_format(stream, 40_960, KvFormat::Fp8),
+        &long_chunks(),
+        8,
+    )
+}
+
+/// Time per prefill call (append included) for the cases in the report. Run with
+/// `--ignored --nocapture` on an idle GPU. Each case reports the fastest of several short
+/// batches, which drops batches that shared the GPU with another process.
+#[test]
+#[ignore = "timing, not a check"]
+#[expect(clippy::too_many_lines, reason = "one table of cases")]
+fn prefill_attention_timing() -> anyhow::Result<()> {
+    use cudarc::driver::sys::CUevent_flags;
+
+    /// BF16 dense tensor-core rate of the RTX 5090, FLOP/s.
+    const PEAK_FLOPS: f64 = 237e12;
+    /// DRAM bandwidth of the RTX 5090, bytes/s.
+    const PEAK_BYTES: f64 = 1.79e12;
+    const CALLS: usize = 5;
+    const BATCHES: usize = 8;
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let mut scratch = PrefillScratch::new(stream, MAX_PREFILL_ROWS)?;
+    let mut decode_scratch = AttentionScratch::new(stream)?;
+    let mut start_dev = stream.alloc_zeros::<u32>(1)?;
+    let mut rng = Rng(9);
+
+    eprintln!("| case | rows | start | us/call | TFLOP/s | % of 237 | KV GB/s | % of 1.79 TB/s |");
+    eprintln!("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    let cases: &[(&str, Option<KvFormat>, usize, usize)] = &[
+        ("sliding", None, 512, 0),
+        ("sliding", None, 512, 32_768),
+        ("sliding", None, 1024, 32_768),
+        ("sliding", None, 1, 32_768),
+        ("global bf16", Some(KvFormat::Bf16), 512, 0),
+        ("global bf16", Some(KvFormat::Bf16), 512, 8192),
+        ("global bf16", Some(KvFormat::Bf16), 512, 32_768),
+        ("global bf16", Some(KvFormat::Bf16), 512, 131_072),
+        ("global bf16", Some(KvFormat::Bf16), 1, 32_768),
+        ("global bf16", Some(KvFormat::Bf16), 1, 131_072),
+        ("global fp8", Some(KvFormat::Fp8), 512, 0),
+        ("global fp8", Some(KvFormat::Fp8), 512, 8192),
+        ("global fp8", Some(KvFormat::Fp8), 512, 32_768),
+        ("global fp8", Some(KvFormat::Fp8), 512, 131_072),
+        ("global fp8", Some(KvFormat::Fp8), 1, 32_768),
+        ("global fp8", Some(KvFormat::Fp8), 1, 131_072),
+    ];
+    for &(name, format, rows, start) in cases {
+        let mut cache = match format {
+            None => KvCache::sliding(stream, WINDOW)?,
+            Some(format) => KvCache::global_with_format(stream, start + rows, format)?,
+        };
+        let q = stream.clone_htod(&rng.normals(rows * HEADS * HEAD_DIM, 1.0))?;
+        let k = stream.clone_htod(&rng.normals(rows * ROW, 1.0))?;
+        let v = stream.clone_htod(&rng.normals(rows * ROW, 1.0))?;
+        let bias = stream.clone_htod(&rng.normals(rows * HEADS * EXTENT, 1.0))?;
+        let sinks = stream.clone_htod(&rng.normals(rows * HEADS, 1.0))?;
+        let mut out = stream.alloc_zeros::<bf16>(rows * HEADS * HEAD_DIM)?;
+        stream.memcpy_htod(&[u32::try_from(start)?], &mut start_dev)?;
+        let mut call = |cache: &mut KvCache| {
+            attention.prefill_attention(
+                stream,
+                &q,
+                &k,
+                &v,
+                cache,
+                &start_dev,
+                rows,
+                &bias,
+                &sinks,
+                &mut scratch,
+                &mut out,
+            )
+        };
+        let begin = gpu
+            .context()
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+        let end = gpu
+            .context()
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+        // Seconds per call of `f`, the fastest of the batches.
+        let time = |f: &mut dyn FnMut() -> anyhow::Result<()>| -> anyhow::Result<f64> {
+            f()?;
+            let mut best = f64::INFINITY;
+            for _ in 0..BATCHES {
+                begin.record(stream)?;
+                for _ in 0..CALLS {
+                    f()?;
+                }
+                end.record(stream)?;
+                best = best.min(f64::from(begin.elapsed_ms(&end)?) * 1e-3 / CALLS as f64);
+            }
+            Ok(best)
+        };
+        let seconds = time(&mut || call(&mut cache))?;
+
+        // Keys each row sees, and the distinct keys the call reads.
+        let seen = |i: usize| match format {
+            None => (start + i + 1).min(WINDOW),
+            Some(_) => start + i + 1,
+        };
+        let pairs: usize = (0..rows).map(seen).sum();
+        let flops = (pairs * HEADS * HEAD_DIM * 4) as f64;
+        let distinct = match format {
+            None => (start + rows).min(WINDOW + rows - 1),
+            Some(_) => start + rows,
+        };
+        let element = format.map_or(2, KvFormat::element_bytes);
+        let bytes = (distinct * ROW * 2 * element) as f64;
+        eprintln!(
+            "| {name} | {rows} | {start} | {:.1} | {:.1} | {:.0}% | {:.0} | {:.0}% |",
+            seconds * 1e6,
+            flops / seconds * 1e-12,
+            100.0 * flops / seconds / PEAK_FLOPS,
+            bytes / seconds * 1e-9,
+            100.0 * bytes / seconds / PEAK_BYTES,
+        );
+
+        if rows == 1 {
+            let position = stream.clone_htod(&[u32::try_from(start)?])?;
+            let mut decode_out = stream.alloc_zeros::<bf16>(HEADS * HEAD_DIM)?;
+            let mut decode = |cache: &mut KvCache| -> anyhow::Result<()> {
+                attention.append(stream, cache, &position, &k, &v)?;
+                attention.decode_attention(
+                    stream,
+                    &q,
+                    cache,
+                    &position,
+                    &bias,
+                    &sinks,
+                    &mut decode_scratch,
+                    &mut decode_out,
+                )
+            };
+            let seconds = time(&mut || decode(&mut cache))?;
+            eprintln!(
+                "| {name}, append + decode | 1 | {start} | {:.1} | | | {:.0} | {:.0}% |",
+                seconds * 1e6,
+                bytes / seconds * 1e-9,
+                100.0 * bytes / seconds / PEAK_BYTES,
+            );
+        }
+    }
     Ok(())
 }

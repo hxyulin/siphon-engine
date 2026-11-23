@@ -35,6 +35,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cfloat>
+#include <climits>
 #include <cstdint>
 
 namespace {
@@ -597,3 +598,683 @@ decode_attention_fp8(const __nv_bfloat16* q, const uint8_t* k_cache, const uint8
     decode_attention<Fp8Format>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, counters,
                                 out, position_ptr, slots, window, extent, scale);
 }
+
+// Chunked prefill: attention of m consecutive query rows, at positions
+// start..start+m-1, over a KV cache plus the chunk's own keys.
+//
+// Row i sees exactly what a decode step at position start + i sees after its
+// append: keys at positions max(0, start + i - window + 1)..start + i (from 0
+// for a global layer), with the same bias, sink and scale. Positions below
+// `cache_end` come from the cache, at slot p mod slots. Positions from
+// `cache_end` on come from the chunk's input rows k_in and v_in, row p - start.
+// The launcher passes cache_end = start for a sliding cache, whose ring the
+// chunk's append would overwrite, and appends after this kernel; it appends
+// first and passes cache_end = start + m for a global cache, which never wraps.
+//
+// Tensor cores do both products with mma.sync.m16n8k16 and F32 accumulators:
+// S = Q K^T in BF16 and O += P V in F16, and the softmax runs online in F32
+// (exp2 domain). The 3 query heads of KV head g share its keys, so they form
+// the M dimension together: M row 3i + h is query row i, head 3g + h. A block
+// of 8 warps takes 128 M rows, 16 per warp, and walks their key range in tiles
+// of 64 keys, copying tile t + 1 while it computes tile t. Each warp copies the
+// bias of its own rows for the next tile once it has read the current one.
+// Tiles that every row sees in full skip the mask, and tiles beyond the bias
+// extent skip the bias. E4M3 tiles are copied to a staging buffer and decoded
+// with the hardware converter in shared memory, keys to BF16 and values to
+// F16; decoding is exact. The
+// block needs 84 KB of shared memory and 255 registers per thread, so one
+// block runs per SM.
+//
+// Differences from decode attention, all inside F32 rounding except the
+// second: the scale multiplies the F32 dot product instead of q, and P is
+// rounded to F16 for the P V product (relative error at most 2^-11 per weight
+// down to 2^-29 of the largest weight, an eighth of BF16's 2^-8, at the same
+// tensor-core rate). V converts to F16 exactly from magnitude 2^-14 up, and
+// within 2^-25 below. The softmax denominator sums the F32 weights.
+//
+// Blocks (x, g, z): KV head g, M rows of block x (heaviest first), split z of
+// the block's key tiles. With one split each block writes `out` directly.
+// Otherwise each writes its unnormalized output, max and sum (log2 domain) per
+// row, and the last block of (x, g) to finish, counted in counters, combines
+// them and resets the counter.
+namespace {
+
+constexpr int kPrefillKeys = 64;
+// Most key splits per block of rows; PREFILL_MAX_SPLITS in the launcher.
+constexpr int kPrefillMaxSplits = 64;
+// 64 consecutive distances span at most 9 aligned chunks of 8 bias values.
+constexpr int kBiasChunks = kPrefillKeys / 8 + 1;
+constexpr int kBiasStride = kBiasChunks * 8;
+constexpr float kLog2e = 1.4426950408889634f;
+// The softmax weights and sums carry a factor of 2^15, which cancels in O / l,
+// so that F16 weights keep full precision down to 2^-29 of the largest one
+// instead of 2^-14. The largest weight, 2^15, stays below F16's 65504.
+constexpr float kPScaleLog2 = 15.f;
+constexpr float kPScale = 32768.f;
+
+// Element offset of 16-byte chunk `chunk` of row `row` in a [rows, 128] BF16
+// tile. The XOR spreads the 8 rows an ldmatrix reads over distinct banks.
+__device__ __forceinline__ int swizzle(int row, int chunk) {
+    return row * kHeadDim + ((chunk ^ (row & 7)) << 3);
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* p) {
+    const auto a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+}
+
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], const void* p) {
+    const auto a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+}
+
+// c += a b for a 16x16 BF16 A fragment, a 16x8 BF16 B fragment and F32 c.
+__device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// 2^x, flushing subnormal results to zero; -inf gives 0.
+__device__ __forceinline__ float exp2_ftz(float x) {
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// c += a b for a 16x16 F16 A fragment, a 16x8 F16 B fragment and F32 c.
+__device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t pack_f16x2(float lo, float hi) {
+    const __half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+// A BF16 pair as an F16 pair: exact for magnitudes from 2^-14 to 65504, and
+// within 2^-25 below.
+__device__ __forceinline__ uint32_t bf16x2_to_f16x2(uint32_t x) {
+    return pack_f16x2(__uint_as_float(x << 16), __uint_as_float(x & 0xffff0000u));
+}
+
+__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+// Two E4M3 values (first in the low byte) as a BF16 pair, exact.
+__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t pair) {
+    const float2 f = e4m3x2_to_float2(pair);
+    return pack_bf16x2(f.x, f.y);
+}
+
+// Two E4M3 values (first in the low byte) as an F16 pair, exact.
+__device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint32_t pair) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3);
+    return uint32_t(h.x) | uint32_t(h.y) << 16;
+}
+
+// The 16 E4M3 values in `raw` as two 16-byte chunks of F16.
+__device__ __forceinline__ void e4m3x16_to_f16(uint4 raw, uint4& lo, uint4& hi) {
+    lo = make_uint4(e4m3x2_to_f16x2(raw.x & 0xffffu), e4m3x2_to_f16x2(raw.x >> 16), e4m3x2_to_f16x2(raw.y & 0xffffu),
+                    e4m3x2_to_f16x2(raw.y >> 16));
+    hi = make_uint4(e4m3x2_to_f16x2(raw.z & 0xffffu), e4m3x2_to_f16x2(raw.z >> 16), e4m3x2_to_f16x2(raw.w & 0xffffu),
+                    e4m3x2_to_f16x2(raw.w >> 16));
+}
+
+// The 16 E4M3 values in `raw` as two 16-byte chunks of BF16.
+__device__ __forceinline__ void e4m3x16_to_bf16(uint4 raw, uint4& lo, uint4& hi) {
+    lo = make_uint4(e4m3x2_to_bf16x2(raw.x & 0xffffu), e4m3x2_to_bf16x2(raw.x >> 16),
+                    e4m3x2_to_bf16x2(raw.y & 0xffffu), e4m3x2_to_bf16x2(raw.y >> 16));
+    hi = make_uint4(e4m3x2_to_bf16x2(raw.z & 0xffffu), e4m3x2_to_bf16x2(raw.z >> 16),
+                    e4m3x2_to_bf16x2(raw.w & 0xffffu), e4m3x2_to_bf16x2(raw.w >> 16));
+}
+
+template <class F, int kWarps>
+struct alignas(16) PrefillShared {
+    static constexpr bool kFp8 = sizeof(typename F::Elem) == 1;
+    static constexpr int kRows = 16 * kWarps;
+    // BF16 key and value tiles, [64, 128] swizzled: two stages, or for E4M3 one
+    // tile that each staged tile is decoded into.
+    static constexpr int kStages = kFp8 ? 1 : 2;
+    __nv_bfloat16 k[kStages][kPrefillKeys * kHeadDim];
+    __nv_bfloat16 v[kStages][kPrefillKeys * kHeadDim];
+    // E4M3 staging tiles, [64, 128] unswizzled (a stub for BF16).
+    static constexpr int kStaged = kFp8 ? kPrefillKeys * kHeadDim : 16;
+    uint8_t k8[2][kStaged];
+    uint8_t v8[2][kStaged];
+    // Bias values of each M row for the tile's distances: 9 aligned chunks
+    // starting at the chunk that holds the smallest distance. Each warp loads
+    // and reads only its own 16 rows.
+    __nv_bfloat16 bias[kRows * kBiasStride];
+    bool last;
+};
+
+// One tile of keys: positions p0..min(p0 + 64, end) - 1, from the input rows
+// or the cache. `full` means every M row of the block sees every key, `biased`
+// that some row has a key closer than the bias extent, and `near` that every
+// row's keys all are.
+struct PrefillTile {
+    unsigned p0;
+    unsigned end;
+    bool input;
+    bool full;
+    bool biased;
+    bool near;
+};
+
+template <class F, int kWarps>
+__device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const __nv_bfloat16* k_in,
+                                                  const __nv_bfloat16* v_in, const typename F::Elem* k_cache,
+                                                  const typename F::Elem* v_cache, const __nv_bfloat16* bias,
+                                                  const __nv_bfloat16* sinks, float* partial_out,
+                                                  float* partial_max, float* partial_sum, unsigned* counters,
+                                                  __nv_bfloat16* out, const unsigned* start_ptr, unsigned rows,
+                                                  unsigned slots, unsigned window, unsigned extent,
+                                                  unsigned input_keys, float scale) {
+    using Shared = PrefillShared<F, kWarps>;
+    constexpr int kThreads = kWarps * 32;
+    constexpr int kRows = Shared::kRows;
+    constexpr bool kFp8 = Shared::kFp8;
+    extern __shared__ __align__(16) unsigned char prefill_smem[];
+    Shared& sm = *reinterpret_cast<Shared*>(prefill_smem);
+
+    const unsigned start = *start_ptr;
+    const int block_m = gridDim.x - 1 - blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int split = blockIdx.z;
+    const int splits = gridDim.z;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const unsigned total_m = rows * kGroup;
+    const unsigned m0 = block_m * kRows;
+    const unsigned r_lo = m0 / kGroup;
+    const unsigned r_hi = (min(m0 + kRows, total_m) - 1) / kGroup;
+
+    // Key positions lo..hi-1 cover every row of the block: those below
+    // cache_end come from the cache, the rest from the input rows.
+    const unsigned hi = start + r_hi + 1;
+    const unsigned lo = window != 0 && start + r_lo + 1 > window ? start + r_lo + 1 - window : 0;
+    const unsigned cache_end = input_keys ? start : start + rows;
+    const unsigned a_end = min(hi, cache_end);
+    const unsigned a_tiles = a_end > lo ? (a_end - lo + kPrefillKeys - 1) / kPrefillKeys : 0;
+    const unsigned b_lo = max(lo, cache_end);
+    const unsigned b_tiles = hi > b_lo ? (hi - b_lo + kPrefillKeys - 1) / kPrefillKeys : 0;
+    const unsigned tiles = a_tiles + b_tiles;
+    const unsigned t_begin = unsigned(split) * tiles / splits;
+    const unsigned t_end = unsigned(split + 1) * tiles / splits;
+
+    auto tile_at = [&](unsigned t) {
+        PrefillTile tile;
+        tile.input = t >= a_tiles;
+        tile.p0 = tile.input ? b_lo + (t - a_tiles) * kPrefillKeys : lo + t * kPrefillKeys;
+        tile.end = tile.input ? hi : a_end;
+        const unsigned last = tile.p0 + kPrefillKeys - 1;
+        tile.full = last < tile.end && last <= start + r_lo && (window == 0 || start + r_hi - tile.p0 < window);
+        tile.biased = int(start + r_lo) - int(last) < int(extent);
+        tile.near = start + r_hi - tile.p0 < extent;
+        return tile;
+    };
+
+    // Starts copying a tile's keys and values into stage `stage`.
+    auto load = [&](const PrefillTile& tile, int stage) {
+        // Source row of the tile's first key, and the ring size it wraps at.
+        // A tile has fewer keys than the ring has slots, so it wraps at most
+        // once.
+        const unsigned first = tile.input ? tile.p0 - start : tile.p0 % slots;
+        const unsigned wrap = tile.input ? 0xffffffffu : slots;
+        if constexpr (kFp8) {
+            // 8 chunks of 16 E4M3 values per row.
+            constexpr int kChunks = kHeadDim / 16;
+            const int chunk = threadIdx.x % kChunks;
+#pragma unroll
+            for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
+                const bool valid = tile.p0 + row < tile.end;
+                unsigned source = first + row;
+                source = source >= wrap ? source - wrap : source;
+                const size_t offset = size_t(valid ? source : 0) * kKvRow + kv_head * kHeadDim + chunk * 16;
+                copy_async16(&sm.k8[stage][row * kHeadDim + chunk * 16], k_cache + offset, valid);
+                copy_async16(&sm.v8[stage][row * kHeadDim + chunk * 16], v_cache + offset, valid);
+            }
+        } else {
+            constexpr int kChunks = kHeadDim / 8;
+            const int chunk = threadIdx.x % kChunks;
+            const __nv_bfloat16* ks = tile.input ? k_in : reinterpret_cast<const __nv_bfloat16*>(k_cache);
+            const __nv_bfloat16* vs = tile.input ? v_in : reinterpret_cast<const __nv_bfloat16*>(v_cache);
+#pragma unroll
+            for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
+                const bool valid = tile.p0 + row < tile.end;
+                unsigned source = first + row;
+                source = source >= wrap ? source - wrap : source;
+                const size_t offset = size_t(valid ? source : 0) * kKvRow + kv_head * kHeadDim + chunk * 8;
+                copy_async16(&sm.k[stage][swizzle(row, chunk)], ks + offset, valid);
+                copy_async16(&sm.v[stage][swizzle(row, chunk)], vs + offset, valid);
+            }
+        }
+        copy_async_commit();
+    };
+
+    // The bias chunks this lane copies for its warp's 16 rows: chunk c of a
+    // row's 9, its bias row, query position and shared memory slot.
+    constexpr int kLaneBiasCopies = (16 * kBiasChunks + 31) / 32;
+    const __nv_bfloat16* bias_row[kLaneBiasCopies];
+    int bias_position[kLaneBiasCopies];
+    int bias_chunk[kLaneBiasCopies];
+    __nv_bfloat16* bias_dst[kLaneBiasCopies];
+#pragma unroll
+    for (int k = 0; k < kLaneBiasCopies; ++k) {
+        const int i = lane + 32 * k;
+        const int local = warp * 16 + i / kBiasChunks;
+        const unsigned mg = m0 + local;
+        const unsigned r = mg / kGroup;
+        const bool valid = i < 16 * kBiasChunks && mg < total_m;
+        bias_row[k] = bias + (size_t(r) * kHeads + kv_head * kGroup + mg % kGroup) * extent;
+        // A position that makes every chunk invalid.
+        bias_position[k] = valid ? int(start + r) : INT_MIN / 2;
+        bias_chunk[k] = i % kBiasChunks;
+        bias_dst[k] = &sm.bias[local * kBiasStride + bias_chunk[k] * 8];
+    }
+
+    // Starts copying the bias of this warp's 16 rows for a tile.
+    auto load_bias = [&](const PrefillTile& tile) {
+#pragma unroll
+        for (int k = 0; k < kLaneBiasCopies; ++k) {
+            if (lane + 32 * k < 16 * kBiasChunks) {
+                const int first = bias_position[k] - int(tile.p0 + kPrefillKeys - 1);
+                const int chunk = (first >> 3) + bias_chunk[k];
+                const bool valid = chunk >= 0 && (chunk + 1) * 8 <= int(extent);
+                copy_async16(bias_dst[k], valid ? bias_row[k] + chunk * 8 : bias, valid);
+            }
+        }
+        copy_async_commit();
+    };
+
+    // This thread's two M rows: local rows 16w + lane/4 and 8 below it.
+    int local[2];
+    bool valid_row[2];
+    unsigned position[2];
+    size_t row_head[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        local[i] = warp * 16 + lane / 4 + 8 * i;
+        const unsigned mg = m0 + local[i];
+        valid_row[i] = mg < total_m;
+        const unsigned r = valid_row[i] ? mg / kGroup : 0;
+        position[i] = start + r;
+        row_head[i] = size_t(r) * kHeads + kv_head * kGroup + mg % kGroup;
+    }
+
+    if (t_begin < t_end) {
+        const PrefillTile first = tile_at(t_begin);
+        load(first, 0);
+        if (first.biased) {
+            load_bias(first);
+        }
+    }
+
+    // Query A fragments: register j of k-step s holds row (j & 1), dims
+    // 16s + 2(lane % 4) + 8(j >> 1) and the next.
+    uint32_t qa[kHeadDim / 16][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const __nv_bfloat16* row = q + row_head[i] * kHeadDim + (lane % 4) * 2;
+#pragma unroll
+        for (int s = 0; s < kHeadDim / 16; ++s) {
+            qa[s][i] = valid_row[i] ? *reinterpret_cast<const uint32_t*>(row + 16 * s) : 0;
+            qa[s][2 + i] = valid_row[i] ? *reinterpret_cast<const uint32_t*>(row + 16 * s + 8) : 0;
+        }
+    }
+
+    const float score_scale = scale * kLog2e;
+    float m[2];
+    float l[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        m[i] = -FLT_MAX;
+        l[i] = 0.f;
+        if (split == 0) {
+            m[i] = valid_row[i] ? __bfloat162float(sinks[row_head[i]]) * kLog2e : 0.f;
+            l[i] = lane % 4 == 0 ? kPScale : 0.f;
+        }
+    }
+    float o[kHeadDim / 8][4] = {};
+
+    for (unsigned t = t_begin; t < t_end; ++t) {
+        const int stage = (t - t_begin) % 2;
+        const PrefillTile tile = tile_at(t);
+        copy_async_wait_all();
+        __syncthreads();
+        const bool more = t + 1 < t_end;
+        const PrefillTile next = tile_at(more ? t + 1 : t);
+        if (more) {
+            load(next, 1 - stage);
+        }
+        if constexpr (kFp8) {
+            for (int i = threadIdx.x; i < kPrefillKeys * 8; i += kThreads) {
+                const int row = i / 8;
+                const int chunk = i % 8;
+                uint4 lo4;
+                uint4 hi4;
+                e4m3x16_to_bf16(*reinterpret_cast<const uint4*>(&sm.k8[stage][row * kHeadDim + chunk * 16]), lo4,
+                                hi4);
+                *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * chunk)]) = lo4;
+                *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * chunk + 1)]) = hi4;
+                e4m3x16_to_f16(*reinterpret_cast<const uint4*>(&sm.v8[stage][row * kHeadDim + chunk * 16]), lo4,
+                                hi4);
+                *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * chunk)]) = lo4;
+                *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * chunk + 1)]) = hi4;
+            }
+            __syncthreads();
+        }
+        const __nv_bfloat16* keys = sm.k[kFp8 ? 0 : stage];
+        const __nv_bfloat16* values = sm.v[kFp8 ? 0 : stage];
+
+        // S = Q K^T: n-tile n holds keys 8n..8n+7.
+        float s[kPrefillKeys / 8][4] = {};
+#pragma unroll
+        for (int ks = 0; ks < kHeadDim / 16; ++ks) {
+#pragma unroll
+            for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                uint32_t b[4];
+                ldmatrix_x4(b, keys + swizzle(np * 16 + (lane >> 4) * 8 + (lane & 7), 2 * ks + ((lane >> 3) & 1)));
+                mma_bf16(s[2 * np], qa[ks], b[0], b[1]);
+                mma_bf16(s[2 * np + 1], qa[ks], b[2], b[3]);
+            }
+        }
+
+        // Scores in the log2 domain, with bias and mask. Element e of n-tile n
+        // is row e / 2, key 8n + 2(lane % 4) + e % 2.
+        // Element (n, e) of row i has its bias at bias_base[i] - 8n - e % 2.
+        const __nv_bfloat16* bias_base[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int first = int(position[i]) - int(tile.p0 + kPrefillKeys - 1);
+            bias_base[i] = sm.bias + local[i] * kBiasStride + (first & 7) + kPrefillKeys - 1 - (lane % 4) * 2;
+        }
+        if (tile.full && !tile.biased) {
+#pragma unroll
+            for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    s[n][e] *= score_scale;
+                }
+            }
+        } else if (tile.full && tile.near) {
+#pragma unroll
+            for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float b = __bfloat162float(bias_base[e / 2][-(n * 8 + e % 2)]);
+                    s[n][e] = fmaf(b, kLog2e, s[n][e] * score_scale);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int i = e / 2;
+                    const int j = n * 8 + (lane % 4) * 2 + e % 2;
+                    const unsigned p = tile.p0 + j;
+                    const unsigned distance = position[i] - p;
+                    const bool visible =
+                        p < tile.end && p <= position[i] && (window == 0 || distance < window);
+                    float x = s[n][e] * score_scale;
+                    if (tile.biased && distance < extent) {
+                        x = fmaf(__bfloat162float(bias_base[i][-(n * 8 + e % 2)]), kLog2e, x);
+                    }
+                    s[n][e] = visible ? x : -INFINITY;
+                }
+            }
+        }
+
+        // This warp has read its bias rows; copy the next tile's while the
+        // softmax and P V run.
+        if (more && next.biased) {
+            __syncwarp();
+            load_bias(next);
+        }
+
+        // Online softmax over the row's 4 lanes.
+        float factor[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float mx = m[i];
+#pragma unroll
+            for (int n = 0; n < kPrefillKeys / 8; ++n) {
+                mx = fmaxf(mx, fmaxf(s[n][2 * i], s[n][2 * i + 1]));
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            factor[i] = exp2_ftz(m[i] - mx);
+            m[i] = mx;
+        }
+        // Weights times kPScale, so that F16 keeps weights down to 2^-29 of the
+        // row's largest at full precision.
+        const float offset[2] = {m[0] - kPScaleLog2, m[1] - kPScaleLog2};
+        float sum[2] = {0.f, 0.f};
+#pragma unroll
+        for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                s[n][e] = exp2_ftz(s[n][e] - offset[e / 2]);
+                sum[e / 2] += s[n][e];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            l[i] = fmaf(l[i], factor[i], sum[i]);
+        }
+#pragma unroll
+        for (int n = 0; n < kHeadDim / 8; ++n) {
+            o[n][0] *= factor[0];
+            o[n][1] *= factor[0];
+            o[n][2] *= factor[1];
+            o[n][3] *= factor[1];
+        }
+
+        // O += P V in F16, P as A fragments: k-step kk covers keys
+        // 16kk..16kk+15. BF16 values convert to F16 in registers; E4M3 values
+        // were decoded to F16.
+#pragma unroll
+        for (int kk = 0; kk < kPrefillKeys / 16; ++kk) {
+            const uint32_t pa[4] = {pack_f16x2(s[2 * kk][0], s[2 * kk][1]), pack_f16x2(s[2 * kk][2], s[2 * kk][3]),
+                                    pack_f16x2(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                                    pack_f16x2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+                uint32_t b[4];
+                ldmatrix_x4_trans(b, values + swizzle(kk * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), 2 * dp + (lane >> 4)));
+                if constexpr (!kFp8) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        b[i] = bf16x2_to_f16x2(b[i]);
+                    }
+                }
+                mma_f16(o[2 * dp], pa, b[0], b[1]);
+                mma_f16(o[2 * dp + 1], pa, b[2], b[3]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+    }
+
+    if (splits == 1) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            if (!valid_row[i]) {
+                continue;
+            }
+            const float inv = 1.f / l[i];
+            __nv_bfloat16* dst = out + row_head[i] * kHeadDim + (lane % 4) * 2;
+#pragma unroll
+            for (int n = 0; n < kHeadDim / 8; ++n) {
+                *reinterpret_cast<__nv_bfloat162*>(dst + 8 * n) =
+                    __floats2bfloat162_rn(o[n][2 * i] * inv, o[n][2 * i + 1] * inv);
+            }
+        }
+        return;
+    }
+
+    const size_t heads_total = size_t(rows) * kHeads;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        if (!valid_row[i]) {
+            continue;
+        }
+        const size_t index = size_t(split) * heads_total + row_head[i];
+        float* dst = partial_out + index * kHeadDim + (lane % 4) * 2;
+#pragma unroll
+        for (int n = 0; n < kHeadDim / 8; ++n) {
+            *reinterpret_cast<float2*>(dst + 8 * n) = make_float2(o[n][2 * i], o[n][2 * i + 1]);
+        }
+        if (lane % 4 == 0) {
+            partial_max[index] = m[i];
+            partial_sum[index] = l[i];
+        }
+    }
+
+    // The last block of these M rows to finish combines the splits.
+    __threadfence();
+    __syncthreads();
+    unsigned* counter = &counters[kv_head * gridDim.x + blockIdx.x];
+    if (threadIdx.x == 0) {
+        sm.last = atomicAdd(counter, 1u) == unsigned(splits - 1);
+    }
+    __syncthreads();
+    if (!sm.last) {
+        return;
+    }
+    __threadfence();
+    // Each row's weight for each split, exp2(max_z - max) / total, in the
+    // shared memory the tiles used: [splits, kRows] floats.
+    static_assert(kPrefillMaxSplits * kRows * sizeof(float) <= sizeof(Shared));
+    float* weights = reinterpret_cast<float*>(prefill_smem);
+    if (threadIdx.x < kRows && m0 + threadIdx.x < total_m) {
+        const unsigned mg = m0 + threadIdx.x;
+        const size_t rh = size_t(mg / kGroup) * kHeads + kv_head * kGroup + mg % kGroup;
+        float mx = -FLT_MAX;
+        for (int z = 0; z < splits; ++z) {
+            mx = fmaxf(mx, __ldcg(&partial_max[z * heads_total + rh]));
+        }
+        float total = 0.f;
+        for (int z = 0; z < splits; ++z) {
+            const float f = exp2_ftz(__ldcg(&partial_max[z * heads_total + rh]) - mx);
+            weights[z * kRows + threadIdx.x] = f;
+            total = fmaf(f, __ldcg(&partial_sum[z * heads_total + rh]), total);
+        }
+        const float inv = 1.f / total;
+        for (int z = 0; z < splits; ++z) {
+            weights[z * kRows + threadIdx.x] *= inv;
+        }
+    }
+    __syncthreads();
+    // Lane l sums dims 4l..4l+3 of rows warp, warp + kWarps, ..., so that
+    // each split's loads are independent.
+    constexpr int kWarpRows = kRows / kWarps;
+    size_t rh[kWarpRows];
+    float4 acc[kWarpRows];
+#pragma unroll
+    for (int k = 0; k < kWarpRows; ++k) {
+        const unsigned mg = min(m0 + warp + kWarps * k, total_m - 1);
+        rh[k] = size_t(mg / kGroup) * kHeads + kv_head * kGroup + mg % kGroup;
+        acc[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    for (int z = 0; z < splits; ++z) {
+#pragma unroll
+        for (int k = 0; k < kWarpRows; ++k) {
+            const float f = weights[z * kRows + warp + kWarps * k];
+            const float4 p =
+                __ldcg(reinterpret_cast<const float4*>(partial_out + (z * heads_total + rh[k]) * kHeadDim) + lane);
+            acc[k].x = fmaf(f, p.x, acc[k].x);
+            acc[k].y = fmaf(f, p.y, acc[k].y);
+            acc[k].z = fmaf(f, p.z, acc[k].z);
+            acc[k].w = fmaf(f, p.w, acc[k].w);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < kWarpRows; ++k) {
+        if (m0 + warp + kWarps * k < total_m) {
+            __nv_bfloat16* dst = out + rh[k] * kHeadDim + lane * 4;
+            *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(acc[k].x, acc[k].y);
+            *reinterpret_cast<__nv_bfloat162*>(dst + 2) = __floats2bfloat162_rn(acc[k].z, acc[k].w);
+        }
+    }
+    if (threadIdx.x == 0) {
+        *counter = 0;
+    }
+}
+
+constexpr int kPrefillWarps = 8;
+
+}  // namespace
+
+// Writes `rows` tokens' k and v ([rows, 8, 128] each) into the caches at slots
+// (*start + i) mod slots, as `rows` calls of kv_append_bf16 would. One block
+// of 128 threads per token.
+extern "C" __global__ void __launch_bounds__(128)
+kv_append_rows_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* k_cache,
+                    __nv_bfloat16* v_cache, const unsigned* start, unsigned slots) {
+    const size_t i = threadIdx.x * 8;
+    const size_t src = size_t(blockIdx.x) * kKvRow + i;
+    const size_t dst = size_t((*start + blockIdx.x) % slots) * kKvRow + i;
+    *reinterpret_cast<uint4*>(k_cache + dst) = *reinterpret_cast<const uint4*>(k + src);
+    *reinterpret_cast<uint4*>(v_cache + dst) = *reinterpret_cast<const uint4*>(v + src);
+}
+
+// The FP8 variant of `kv_append_rows_bf16`, rounding as `kv_append_fp8`.
+extern "C" __global__ void __launch_bounds__(128)
+kv_append_rows_fp8(const __nv_bfloat16* k, const __nv_bfloat16* v, uint8_t* k_cache, uint8_t* v_cache,
+                   const unsigned* start, unsigned slots) {
+    const size_t i = threadIdx.x * 8;
+    const size_t src = size_t(blockIdx.x) * kKvRow + i;
+    const size_t dst = size_t((*start + blockIdx.x) % slots) * kKvRow + i;
+    float x[8];
+    unpack_bf16x8(*reinterpret_cast<const uint4*>(k + src), x);
+    *reinterpret_cast<uint2*>(k_cache + dst) =
+        make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
+    unpack_bf16x8(*reinterpret_cast<const uint4*>(v + src), x);
+    *reinterpret_cast<uint2*>(v_cache + dst) =
+        make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
+}
+
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
+                       const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const __nv_bfloat16* bias,
+                       const __nv_bfloat16* sinks, float* partial_out, float* partial_max, float* partial_sum,
+                       unsigned* counters, __nv_bfloat16* out, const unsigned* start, unsigned rows,
+                       unsigned slots, unsigned window, unsigned extent, unsigned input_keys, float scale) {
+    prefill_attention<Bf16Format, kPrefillWarps>(q, k_in, v_in, k_cache, v_cache, bias, sinks, partial_out,
+                                                 partial_max, partial_sum, counters, out, start, rows, slots,
+                                                 window, extent, input_keys, scale);
+}
+
+// `prefill_attention_bf16` over E4M3 caches. Every key comes from the cache
+// (input_keys must be 0).
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_fp8(const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
+                      const uint8_t* k_cache, const uint8_t* v_cache, const __nv_bfloat16* bias,
+                      const __nv_bfloat16* sinks, float* partial_out, float* partial_max, float* partial_sum,
+                      unsigned* counters, __nv_bfloat16* out, const unsigned* start, unsigned rows, unsigned slots,
+                      unsigned window, unsigned extent, unsigned input_keys, float scale) {
+    prefill_attention<Fp8Format, kPrefillWarps>(q, k_in, v_in, k_cache, v_cache, bias, sinks, partial_out,
+                                                partial_max, partial_sum, counters, out, start, rows, slots,
+                                                window, extent, input_keys, scale);
+}
+
+// The launcher passes PREFILL_SHARED_BYTES of dynamic shared memory.
+static_assert(sizeof(PrefillShared<Bf16Format, kPrefillWarps>) <= 84048);
+static_assert(sizeof(PrefillShared<Fp8Format, kPrefillWarps>) <= 84048);
