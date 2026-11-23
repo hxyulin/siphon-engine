@@ -2,9 +2,11 @@
 //! layer visit for the whole chunk before the next visit.
 //!
 //! Each chunk fills the KV caches and conv states as stepping its tokens one at a time
-//! would, so [`Model::step`] continues after it. The small kernels have multi-row forms
-//! that give the single-row results bit for bit. The three heavy operations go through
-//! [`Ctx::gemm_rows`], [`Ctx::moe_rows`] and [`Ctx::attention_rows`].
+//! would, so [`Model::step`] continues after it. The small kernels have multi-row forms.
+//! Most give the single-row results bit for bit; depth attention, the router logits and
+//! the message gates' products sum in their own orders and differ by F32 rounding. The
+//! three heavy operations go through [`Ctx::gemm_rows`], [`Ctx::moe_rows`] and
+//! [`Ctx::attention_rows`].
 //!
 //! A chunk's buffers hold `[rows, ...]` per intermediate. The block states of one chunk
 //! are `[blocks, rows, 2304]`, so the states in use are one contiguous run.
@@ -21,8 +23,9 @@ use crate::{
     ops::{
         attention,
         experts::{ExpertScratch, QuantizedRows},
+        misc::{GATE_SLOTS, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
-        routing::{NormDest, Partial, RouterRowsScratch},
+        routing::{DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsPartial},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -49,7 +52,10 @@ pub enum PrefillLogits<'a> {
 struct GateRows {
     /// Per slot, the normalized state and message side by side, BF16 `[rows, 2 * hidden]`.
     inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
+    /// The down projections, BF16 `[slots, rows, rank]`.
     down: CudaSlice<bf16>,
+    /// A gate's output, F32 `[rows, hidden]`.
+    out: CudaSlice<f32>,
 }
 
 /// Intermediates of attention for a chunk, `[rows, ...]` versions of `AttentionTemps`.
@@ -103,12 +109,13 @@ pub(super) struct PrefillScratch {
     blocks: CudaSlice<f32>,
     bank: CudaSlice<f32>,
     bank_normed: CudaSlice<f32>,
-    /// F32 `[rows, 4, hidden]`.
-    messages: CudaSlice<f32>,
-    normed_residual: CudaSlice<f32>,
+    /// Block states in the bank, the candidates of the messages besides `bank_normed`.
+    bank_rows: usize,
+    /// The weights of the messages over their candidates, F32 `[rows, 4, bank_rows + 1]`;
+    /// the message gates rebuild the messages from them.
+    message_probs: CudaSlice<f32>,
     /// F32 `[rows, 1 or 3, hidden]`.
     attention_inputs: CudaSlice<f32>,
-    gated: CudaSlice<f32>,
     gate: GateRows,
     qkv_in: [CudaSlice<bf16>; 3],
     attention: AttentionRows,
@@ -148,10 +155,9 @@ impl PrefillScratch {
             blocks: zeros(stream, rows * max_blocks * hidden)?,
             bank: zeros(stream, rows * max_blocks * hidden)?,
             bank_normed: zeros(stream, rows * hidden)?,
-            messages: zeros(stream, rows * MESSAGE_SLOTS * hidden)?,
-            normed_residual: zeros(stream, rows * hidden)?,
+            bank_rows: 0,
+            message_probs: zeros(stream, rows * MESSAGE_SLOTS * FUSED_MAX_CANDIDATES)?,
             attention_inputs: zeros(stream, rows * 3 * hidden)?,
-            gated: zeros(stream, rows * hidden)?,
             gate: GateRows {
                 inputs: [
                     zeros(stream, rows * 2 * hidden)?,
@@ -159,7 +165,8 @@ impl PrefillScratch {
                     zeros(stream, rows * 2 * hidden)?,
                     zeros(stream, rows * 2 * hidden)?,
                 ],
-                down: zeros(stream, rows * cfg.loop_config.gate_rank)?,
+                down: zeros(stream, MESSAGE_SLOTS * rows * cfg.loop_config.gate_rank)?,
+                out: zeros(stream, rows * hidden)?,
             },
             qkv_in: [
                 zeros(stream, rows * hidden)?,
@@ -222,16 +229,6 @@ fn rows_mut<T>(x: &mut CudaSlice<T>, rows: usize, width: usize) -> CudaViewMut<'
 
 /// Column block `offset..offset + width` of `rows` rows that are `stride` apart: a view
 /// from the first row's block to the end of the last row's.
-fn strided<T>(
-    x: &CudaSlice<T>,
-    rows: usize,
-    stride: usize,
-    offset: usize,
-    width: usize,
-) -> CudaView<'_, T> {
-    x.slice(offset..offset + (rows - 1) * stride + width)
-}
-
 fn strided_mut<T>(
     x: &mut CudaSlice<T>,
     rows: usize,
@@ -330,16 +327,24 @@ impl Model {
     }
 }
 
+/// The messages of a chunk, as their candidates and weights: `bank_rows` block states of
+/// `[rows, hidden]` and the normalized bank, with the weights `[rows, 4, bank_rows + 1]`.
+struct Messages<'a> {
+    bank: CudaView<'a, f32>,
+    normed: CudaView<'a, f32>,
+    probs: CudaView<'a, f32>,
+}
+
 /// What [`Ctx::attention_inputs_rows`] reads and writes, as `AttentionInputs` for a chunk.
 struct AttentionInputsRows<'a> {
     x: CudaView<'a, bf16>,
     states: CudaView<'a, f32>,
-    normed: CudaViewMut<'a, f32>,
+    /// Receives the normalized visit input at a block start.
+    normed: Option<CudaViewMut<'a, f32>>,
     inputs: &'a mut CudaSlice<f32>,
     qkv_in: &'a mut [CudaSlice<bf16>; 3],
     gate: &'a mut GateRows,
-    gated: &'a mut CudaSlice<f32>,
-    messages: Option<(&'a [MessageGateWeights; MESSAGE_SLOTS], &'a CudaSlice<f32>)>,
+    messages: Option<(&'a [MessageGateWeights; MESSAGE_SLOTS], Messages<'a>)>,
 }
 
 impl Ctx {
@@ -397,7 +402,6 @@ impl Ctx {
             &mut rows_mut(&mut p.prelude_hidden, m, hidden),
         )?;
         let prelude_blocks = blocks.len;
-        let mut bank_rows = 0;
         for pass in 0..passes {
             if pass > 0 {
                 self.kernels.norm.unweighted_rms_norm_bf16(
@@ -406,11 +410,17 @@ impl Ctx {
                     &mut rows_mut(&mut p.bank_normed, m, hidden),
                     self.eps(),
                 )?;
-                bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
-                ensure!(bank_rows > 0, "the message bank needs a block state");
+                p.bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
+                ensure!(p.bank_rows > 0, "the message bank needs a block state");
+                ensure!(
+                    p.bank_rows < FUSED_MAX_CANDIDATES,
+                    "{} bank states; at most {} fit",
+                    p.bank_rows,
+                    FUSED_MAX_CANDIDATES - 1
+                );
                 self.stream.memcpy_dtod(
                     &p.blocks.slice((prelude_blocks + 1) * mh..blocks.len * mh),
-                    &mut p.bank.slice_mut(..bank_rows * mh),
+                    &mut p.bank.slice_mut(..p.bank_rows * mh),
                 )?;
                 self.stream.memcpy_dtod(
                     &rows(&p.prelude_hidden, m, hidden),
@@ -420,24 +430,32 @@ impl Ctx {
             }
             for (i, layer) in (core_start..core_end).enumerate() {
                 if pass > 0 {
-                    // The messages, and their normalized halves of the gate inputs.
+                    // The messages' weights, and their normalized halves of the gate inputs.
+                    let bank_rows = p.bank_rows;
                     let dests = p.gate.inputs.each_mut().map(|x| {
                         Some(NormDest {
                             out: strided_mut(x, m, 2 * hidden, hidden, hidden),
                             weight: None,
                         })
                     });
-                    self.kernels.routing.depth_attention_fused_rows(
+                    self.kernels.routing.depth_attention_rows(
                         &self.stream,
-                        &p.bank.slice(..bank_rows * mh),
-                        Partial::Normalized(rows(&p.bank_normed, m, hidden)),
-                        None,
-                        &self.weights.message_queries[i],
-                        Some(rows_mut(&mut p.messages, m, MESSAGE_SLOTS * hidden)),
-                        dests,
-                        2 * hidden,
+                        DepthRows {
+                            blocks: p.bank.slice(..bank_rows * mh),
+                            partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
+                            normed_partial: None,
+                            queries: &self.weights.message_queries[i],
+                            out: None,
+                            probs: Some(rows_mut(
+                                &mut p.message_probs,
+                                m,
+                                MESSAGE_SLOTS * (bank_rows + 1),
+                            )),
+                            dests,
+                            dst_stride: 2 * hidden,
+                            rows: m,
+                        },
                         self.eps(),
-                        m,
                     )?;
                 }
                 self.visit_rows(p, next_visit()?, layer, &mut blocks, pass > 0, m)?;
@@ -450,25 +468,28 @@ impl Ctx {
             return Ok(());
         }
 
-        self.kernels.routing.depth_attention_fused_rows(
+        self.kernels.routing.depth_attention_rows(
             &self.stream,
-            &blocks.rows(&p.blocks, mh)?,
-            Partial::Bf16(rows(&p.hidden, m, hidden)),
-            None,
-            &self.weights.final_query,
-            None,
-            [
-                Some(NormDest {
-                    out: rows_mut(&mut p.final_hidden, m, hidden),
-                    weight: Some(&self.weights.norm),
-                }),
-                None,
-                None,
-                None,
-            ],
-            hidden,
+            DepthRows {
+                blocks: blocks.rows(&p.blocks, mh)?,
+                partial: RowsPartial::Bf16(rows(&p.hidden, m, hidden)),
+                normed_partial: None,
+                queries: &self.weights.final_query,
+                out: None,
+                probs: None,
+                dests: [
+                    Some(NormDest {
+                        out: rows_mut(&mut p.final_hidden, m, hidden),
+                        weight: Some(&self.weights.norm),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                dst_stride: hidden,
+                rows: m,
+            },
             self.eps(),
-            m,
         )?;
 
         // The last row's logits and greedy token, in the decode buffers.
@@ -554,12 +575,9 @@ impl Ctx {
         };
 
         // The normalized visit input goes straight into the new block state at a block start.
+        // Elsewhere nothing reads it.
         let (states, mut rest) = p.blocks.split_at_mut(blocks.len * mh);
-        let normed = if block_start {
-            rest.slice_mut(..mh)
-        } else {
-            rows_mut(&mut p.normed_residual, m, hidden)
-        };
+        let normed = block_start.then(|| rest.slice_mut(..mh));
         let one_input = self.attention_inputs_rows(
             w,
             AttentionInputsRows {
@@ -569,8 +587,16 @@ impl Ctx {
                 inputs: &mut p.attention_inputs,
                 qkv_in: &mut p.qkv_in,
                 gate: &mut p.gate,
-                gated: &mut p.gated,
-                messages: gates.map(|g| (g, &p.messages)),
+                messages: gates.map(|g| {
+                    (
+                        g,
+                        Messages {
+                            bank: p.bank.slice(..p.bank_rows * mh),
+                            normed: rows(&p.bank_normed, m, hidden),
+                            probs: rows(&p.message_probs, m, MESSAGE_SLOTS * (p.bank_rows + 1)),
+                        },
+                    )
+                }),
             },
             sliding,
             m,
@@ -594,53 +620,79 @@ impl Ctx {
             m,
         )?;
 
-        let block_hidden = rows(&p.hidden, m, hidden);
-        self.kernels.conv.short_conv_residual_rows(
+        // The post-attention conv and residual add run inside the MLP's depth attention.
+        // Without message gates, its output goes straight to the router input after the
+        // MLP norm; with them, the gate normalizes its output into the router input.
+        let (mlp_out, dests) = match gates {
+            Some(_) => (
+                Some(rows_mut(&mut p.mlp_input, m, hidden)),
+                [
+                    None,
+                    None,
+                    None,
+                    Some(NormDest {
+                        out: strided_mut(&mut p.gate.inputs[3], m, 2 * hidden, 0, hidden),
+                        weight: None,
+                    }),
+                ],
+            ),
+            None => (
+                None,
+                [
+                    Some(NormDest {
+                        out: rows_mut(&mut p.mlp_x, m, hidden),
+                        weight: Some(&w.mlp_norm),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+            ),
+        };
+        self.kernels.routing.depth_attention_rows(
+            &self.stream,
+            DepthRows {
+                blocks: blocks.rows(&p.blocks, mh)?,
+                partial: RowsPartial::ConvResidual {
+                    x: rows(&p.attention.proj, m, hidden),
+                    weight: &w.post_attention_conv,
+                    state: state.conv[2].as_view(),
+                    hidden: (!block_start).then(|| rows(&p.hidden, m, hidden)),
+                    residual: rows_mut(&mut p.residual, m, hidden),
+                },
+                normed_partial: None,
+                queries: &w.mlp_query,
+                out: mlp_out,
+                probs: None,
+                dests,
+                dst_stride: if gates.is_some() { 2 * hidden } else { hidden },
+                rows: m,
+            },
+            self.eps(),
+        )?;
+        self.kernels.conv.shift_state(
             &self.stream,
             &rows(&p.attention.proj, m, hidden),
-            &w.post_attention_conv,
             &mut state.conv[2],
-            (!block_start).then_some(&block_hidden as &dyn crate::DeviceIn<bf16>),
-            &mut rows_mut(&mut p.residual, m, hidden),
+            hidden,
             m,
         )?;
-
-        let gate_dest = gates.map(|_| NormDest {
-            out: strided_mut(&mut p.gate.inputs[3], m, 2 * hidden, 0, hidden),
-            weight: None,
-        });
-        self.kernels.routing.depth_attention_fused_rows(
-            &self.stream,
-            &blocks.rows(&p.blocks, mh)?,
-            Partial::F32(rows(&p.residual, m, hidden)),
-            None,
-            &w.mlp_query,
-            Some(rows_mut(&mut p.mlp_input, m, hidden)),
-            [None, None, None, gate_dest],
-            2 * hidden,
-            self.eps(),
-            m,
-        )?;
-        let mlp_input = match gates {
-            Some(gates) => {
-                self.message_gate_rows(
-                    &gates[3],
-                    &mut p.gate,
-                    3,
-                    (&rows(&p.mlp_input, m, hidden), hidden),
-                    (
-                        &strided(&p.messages, m, MESSAGE_SLOTS * hidden, 3 * hidden, hidden),
-                        MESSAGE_SLOTS * hidden,
-                    ),
-                    rows_mut(&mut p.gated, m, hidden),
-                    None,
-                    m,
-                )?;
-                &p.gated
-            }
-            None => &p.mlp_input,
-        };
-        self.moe_block_rows(w, &mut p.moe, &rows(mlp_input, m, hidden), &mut p.mlp_x, m)?;
+        if let Some(gates) = gates {
+            self.message_gate_rows(
+                &gates[3..],
+                &mut p.gate,
+                3,
+                (rows(&p.mlp_input, m, hidden), hidden, 0),
+                &Messages {
+                    bank: p.bank.slice(..p.bank_rows * mh),
+                    normed: rows(&p.bank_normed, m, hidden),
+                    probs: rows(&p.message_probs, m, MESSAGE_SLOTS * (p.bank_rows + 1)),
+                },
+                vec![(&w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))],
+                m,
+            )?;
+        }
+        self.moe_block_rows(w, &mut p.moe, &p.mlp_x, m)?;
 
         self.kernels.conv.moe_conv_residual_rows(
             &self.stream,
@@ -678,7 +730,9 @@ impl Ctx {
                 a.messages.is_none(),
                 "layer without depth attention got messages"
             );
-            let mut normed = a.normed;
+            let mut normed = a
+                .normed
+                .context("a layer without depth attention must start a block")?;
             self.kernels.norm.unweighted_rms_norm_bf16(
                 &self.stream,
                 &a.x,
@@ -735,42 +789,46 @@ impl Ctx {
             )
         };
         let [d0, d1, d2] = dests;
-        self.kernels.routing.depth_attention_fused_rows(
+        self.kernels.routing.depth_attention_rows(
             &self.stream,
-            &a.states,
-            Partial::Bf16(a.x),
-            Some(a.normed),
-            query,
-            a.messages
-                .is_some()
-                .then(|| a.inputs.slice_mut(..m * count * hidden)),
-            [d0, d1, d2, None],
-            dst_stride,
+            DepthRows {
+                blocks: a.states,
+                partial: RowsPartial::Bf16(a.x),
+                normed_partial: a.normed,
+                queries: query,
+                out: a
+                    .messages
+                    .is_some()
+                    .then(|| a.inputs.slice_mut(..m * count * hidden)),
+                probs: None,
+                dests: [d0, d1, d2, None],
+                dst_stride,
+                rows: m,
+            },
             self.eps(),
-            m,
         )?;
         let Some((gates, messages)) = a.messages else {
             return Ok(shared);
         };
-        for (i, norm) in norms.into_iter().enumerate() {
-            let slot = if shared { 0 } else { i };
-            self.message_gate_rows(
-                &gates[i],
-                &mut *a.gate,
-                i,
-                (
-                    &strided(a.inputs, m, count * hidden, slot * hidden, hidden),
-                    count * hidden,
-                ),
-                (
-                    &strided(messages, m, MESSAGE_SLOTS * hidden, i * hidden, hidden),
-                    MESSAGE_SLOTS * hidden,
-                ),
-                rows_mut(a.gated, m, hidden),
-                Some((norm, a.qkv_in[i].slice_mut(..mh))),
-                m,
-            )?;
-        }
+        // The three gates of the attention inputs, each into its input norm.
+        let [q0, q1, q2] = &mut *a.qkv_in;
+        self.message_gate_rows(
+            &gates[..GATE_SLOTS],
+            a.gate,
+            0,
+            (
+                a.inputs.slice(..),
+                count * hidden,
+                if shared { 0 } else { hidden },
+            ),
+            &messages,
+            [norms[0], norms[1], norms[2]]
+                .into_iter()
+                .zip([q0, q1, q2])
+                .map(|(norm, q)| (norm, q.slice_mut(..mh)))
+                .collect(),
+            m,
+        )?;
         Ok(false)
     }
 
@@ -913,56 +971,95 @@ impl Ctx {
         )
     }
 
-    /// [`Ctx::message_gate`] for a chunk of `m` rows: `h` and `message` are rows with
-    /// their strides, and `norm` the norm weight and destination rows.
-    #[expect(clippy::too_many_arguments, reason = "the gate's inputs and outputs")]
+    /// [`Ctx::message_gate`] for a chunk of `m` rows and the gates of slots
+    /// `first .. first + g.len()`, one, or three at once. `h` holds the gates' states with
+    /// its row and gate strides. Each gate normalizes its output with its `norms` weight into
+    /// its destination.
+    #[expect(clippy::too_many_arguments, reason = "the gates' inputs and outputs")]
     fn message_gate_rows(
         &self,
-        g: &MessageGateWeights,
+        weights: &[MessageGateWeights],
         t: &mut GateRows,
-        slot: usize,
-        h: (&CudaView<'_, f32>, usize),
-        message: (&CudaView<'_, f32>, usize),
-        mut out: CudaViewMut<'_, f32>,
-        norm: Option<(&CudaSlice<bf16>, CudaViewMut<'_, bf16>)>,
+        first: usize,
+        (state, h_stride, h_slot_stride): (CudaView<'_, f32>, usize, usize),
+        messages: &Messages<'_>,
+        norms: Vec<(&CudaSlice<bf16>, CudaViewMut<'_, bf16>)>,
         m: usize,
     ) -> anyhow::Result<()> {
         let hidden = self.hidden();
         let rank = self.config.loop_config.gate_rank;
-        self.gemm_rows(
-            &mut [RowProduct {
-                weight: &g.down,
-                x: rows(&t.inputs[slot], m, 2 * hidden),
-                out: rows_mut(&mut t.down, m, rank),
-            }],
-            m,
-        )?;
-        let mut norm = norm;
-        let norm = norm
-            .as_mut()
-            .map(|(weight, normed)| (*weight, normed as &mut dyn crate::DeviceOut<bf16>));
-        self.kernels.misc.message_gate_out_rows(
-            &self.stream,
-            &rows(&t.down, m, rank),
-            &g.forget,
-            &g.gain,
-            h,
-            message,
-            &mut out,
-            norm,
-            self.eps(),
-            m,
-        )
+        let mr = m * rank;
+        let n = weights.len();
+        ensure!(n == norms.len(), "{n} gates with {} norms", norms.len());
+        let mut down = t.down.slice_mut(first * mr..(first + n) * mr);
+        match n {
+            1 => self.gemm_rows(
+                &mut [RowProduct {
+                    weight: &weights[0].down,
+                    x: rows(&t.inputs[first], m, 2 * hidden),
+                    out: down.slice_mut(..),
+                }],
+                m,
+            )?,
+            3 => {
+                let (d0, mut rest) = down.split_at_mut(mr);
+                let (d1, d2) = rest.split_at_mut(mr);
+                let [x0, x1, x2] = [0, 1, 2].map(|i| rows(&t.inputs[first + i], m, 2 * hidden));
+                self.gemm_rows(
+                    &mut [
+                        RowProduct {
+                            weight: &weights[0].down,
+                            x: x0,
+                            out: d0,
+                        },
+                        RowProduct {
+                            weight: &weights[1].down,
+                            x: x1,
+                            out: d1,
+                        },
+                        RowProduct {
+                            weight: &weights[2].down,
+                            x: x2,
+                            out: d2,
+                        },
+                    ],
+                    m,
+                )?;
+            }
+            _ => anyhow::bail!("{n} gates; one or three run at once"),
+        }
+        // One gate at a time, so that every gate rewrites the same output rows in L2.
+        let candidates = messages.bank.len() / (m * hidden) + 1;
+        for (i, (w, (norm, mut normed))) in weights.iter().zip(norms).enumerate() {
+            let slot = first + i;
+            self.kernels.misc.message_gate_out_rows(
+                &self.stream,
+                &t.down.slice(slot * mr..(slot + 1) * mr),
+                &w.forget,
+                &w.gain,
+                (&state.slice(i * h_slot_stride..), h_stride),
+                (&messages.normed, hidden),
+                Some(&MessageMix {
+                    blocks: messages.bank.slice(..),
+                    probs: messages.probs.slice(slot * candidates..),
+                    probs_stride: MESSAGE_SLOTS * candidates,
+                }),
+                &mut rows_mut(&mut t.out, m, hidden),
+                Some((norm, &mut normed)),
+                self.eps(),
+                m,
+            )?;
+        }
+        Ok(())
     }
 
-    /// [`Ctx::moe`] for a chunk of `m` rows: the router, then the expert products and
-    /// SwiGLU into `t.down`.
+    /// [`Ctx::moe`] for a chunk of `m` rows from the MLP input `x` after its norm: the
+    /// router, then the expert products and SwiGLU into `t.down`.
     fn moe_block_rows(
         &self,
         w: &LayerWeights,
         t: &mut MoeRows,
-        input: &CudaView<'_, f32>,
-        x: &mut CudaSlice<bf16>,
+        x: &CudaSlice<bf16>,
         m: usize,
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
@@ -971,12 +1068,9 @@ impl Ctx {
         let top_k = cfg.num_experts_per_tok;
         self.kernels.routing.moe_router_rows(
             &self.stream,
-            input,
-            &w.mlp_norm,
-            self.eps(),
+            &rows(x, m, hidden),
             &w.router,
             &w.router_bias,
-            &mut rows_mut(x, m, hidden),
             &mut rows_mut(&mut t.logits, m, cfg.n_routed_experts),
             &mut rows_mut(&mut t.indices, m, top_k),
             &mut rows_mut(&mut t.weights, m, top_k),

@@ -22,11 +22,11 @@ use inkling_cuda::{
     Gpu,
     ops::{
         conv::Conv,
-        misc::Misc,
+        misc::{MessageMix, Misc},
         norm::Norm,
         routing::{
-            DepthStep, EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul,
-            RouterRowsScratch, Routing, StepPartial, TOP_K,
+            DepthRows, DepthStep, EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul,
+            RouterRowsScratch, Routing, RowsPartial, StepPartial, TOP_K,
         },
     },
 };
@@ -534,6 +534,10 @@ fn moe_router_matches_separate_kernels() -> anyhow::Result<()> {
 /// The chunked router against single-row calls, bit for bit: the norm, the logits (a tiled
 /// product that keeps the single-row sums), the experts and their weights. 130 rows cover
 /// two full row tiles of 64 and a partial one.
+/// The chunked router against `moe_router` run one row at a time, from the normalized rows
+/// that `moe_router` writes: logits within 1e-5 (the tiled product sums in another order),
+/// the same experts, and weights within 2e-6, as for the decode router above. 130 rows
+/// cover two full row tiles of 64 and a partial one.
 #[test]
 fn moe_router_rows_matches_single_row() -> anyhow::Result<()> {
     const ROWS: usize = 130;
@@ -546,37 +550,10 @@ fn moe_router_rows_matches_single_row() -> anyhow::Result<()> {
     let bias_dev = stream.clone_htod(&bias)?;
     let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 400, 0.5, 1.0))?;
     let x_host = pseudo_random(ROWS * HIDDEN, 700, 4.0);
-    let x = stream.clone_htod(&x_host)?;
 
-    let mut x_out = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
-    let mut logits = stream.alloc_zeros::<f32>(ROWS * EXPERTS)?;
-    let mut indices = stream.alloc_zeros::<i32>(ROWS * TOP_K)?;
-    let mut weights = stream.alloc_zeros::<f32>(ROWS * TOP_K)?;
-    // More rows than the call uses, as in a short last chunk.
-    let mut scratch = RouterRowsScratch::new(stream, ROWS + 7)?;
-    routing.moe_router_rows(
-        stream,
-        &x,
-        &weight,
-        EPS,
-        &router,
-        &bias_dev,
-        &mut x_out,
-        &mut logits,
-        &mut indices,
-        &mut weights,
-        &mut scratch,
-        ROUTE_SCALE,
-        ROWS,
-    )?;
-    let x_out = stream.clone_dtoh(&x_out)?;
-    let logits = stream.clone_dtoh(&logits)?;
-    let indices = stream.clone_dtoh(&indices)?;
-    let weights = stream.clone_dtoh(&weights)?;
-
-    let f32_bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
-    let bf16_bits = |v: &[bf16]| -> Vec<u16> { v.iter().map(|x| x.to_bits()).collect() };
     let mut counter = stream.alloc_zeros::<u32>(1)?;
+    let mut x_norm = Vec::new();
+    let mut want = Vec::new();
     for row in 0..ROWS {
         let x_row = stream.clone_htod(&x_host[row * HIDDEN..(row + 1) * HIDDEN])?;
         let mut x_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
@@ -597,25 +574,54 @@ fn moe_router_rows_matches_single_row() -> anyhow::Result<()> {
             &mut counter,
             ROUTE_SCALE,
         )?;
-        assert_eq!(
-            bf16_bits(&x_out[row * HIDDEN..(row + 1) * HIDDEN]),
-            bf16_bits(&stream.clone_dtoh(&x_want)?),
-            "row {row}: input"
-        );
-        assert_eq!(
-            f32_bits(&logits[row * EXPERTS..(row + 1) * EXPERTS]),
-            f32_bits(&stream.clone_dtoh(&logits_want)?),
-            "row {row}: logits"
-        );
-        assert_eq!(
-            indices[row * TOP_K..(row + 1) * TOP_K],
+        x_norm.extend(stream.clone_dtoh(&x_want)?);
+        want.push((
+            stream.clone_dtoh(&logits_want)?,
             stream.clone_dtoh(&indices_want)?,
-            "row {row}: experts"
+            stream.clone_dtoh(&weights_want)?,
+        ));
+    }
+
+    let x = stream.clone_htod(&x_norm)?;
+    let mut logits = stream.alloc_zeros::<f32>(ROWS * EXPERTS)?;
+    let mut indices = stream.alloc_zeros::<i32>(ROWS * TOP_K)?;
+    let mut weights = stream.alloc_zeros::<f32>(ROWS * TOP_K)?;
+    // More rows than the call uses, as in a short last chunk.
+    let mut scratch = RouterRowsScratch::new(stream, ROWS + 7)?;
+    routing.moe_router_rows(
+        stream,
+        &x,
+        &router,
+        &bias_dev,
+        &mut logits,
+        &mut indices,
+        &mut weights,
+        &mut scratch,
+        ROUTE_SCALE,
+        ROWS,
+    )?;
+    let logits = stream.clone_dtoh(&logits)?;
+    let indices = stream.clone_dtoh(&indices)?;
+    let weights = stream.clone_dtoh(&weights)?;
+    for (row, (logits_want, indices_want, weights_want)) in want.iter().enumerate() {
+        let label = format!("row {row}");
+        assert_f32_within(
+            &format!("{label}: logits"),
+            &logits[row * EXPERTS..(row + 1) * EXPERTS],
+            logits_want,
+            1e-5,
         );
-        assert_eq!(
-            f32_bits(&weights[row * TOP_K..(row + 1) * TOP_K]),
-            f32_bits(&stream.clone_dtoh(&weights_want)?),
-            "row {row}: weights"
+        let range = row * TOP_K..(row + 1) * TOP_K;
+        let got = pairs_by_expert(&indices[range.clone()], &weights[range]);
+        let want = pairs_by_expert(indices_want, weights_want);
+        let experts = |p: &[Vec<(i32, f32)>]| -> Vec<i32> { p[0].iter().map(|e| e.0).collect() };
+        assert_eq!(experts(&got), experts(&want), "{label}: experts");
+        let weights_of = |p: &[Vec<(i32, f32)>]| -> Vec<f32> { p[0].iter().map(|e| e.1).collect() };
+        assert_f32_within(
+            &format!("{label}: weights"),
+            &weights_of(&got),
+            &weights_of(&want),
+            2e-6,
         );
     }
     Ok(())
@@ -716,15 +722,21 @@ fn max_error(got: &[f32], exact: &[f64]) -> f64 {
 
 /// Checks the decode kernel's results (`got`) against the fused kernel's (`want`) and
 /// the F64 reference `exact`. The output's largest error from `exact` may be at most
-/// twice the fused kernel's, or 2^-22 of the largest output, whichever is larger. A
-/// destination element may differ from the fused kernel's by one BF16 ulp, or by the
+/// twice the fused kernel's, or `floor` times the largest output, whichever is larger. The
+/// normalized partial may differ by `normed_ulps`. A destination element may differ from the fused kernel's by one BF16 ulp, or by the
 /// output difference carried through the norm (twice the output bound over the row's
 /// RMS, times 1.5, the largest norm weight): elements near zero can move by more ulps.
-fn assert_depth_close(label: &str, got: &DepthResults, want: &DepthResults, exact: &[f64]) {
+fn assert_depth_close(
+    label: &str,
+    got: &DepthResults,
+    want: &DepthResults,
+    exact: &[f64],
+    (floor, normed_ulps): (f64, u64),
+) {
     let magnitude = exact.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     let fused_error = max_error(&want.out, exact);
     let step_error = max_error(&got.out, exact);
-    let bound = (2.0 * fused_error).max(magnitude * 2f64.powi(-22));
+    let bound = (2.0 * fused_error).max(magnitude * floor);
     eprintln!(
         "{label}: out error {step_error:.2e}, fused kernel {fused_error:.2e}, largest output \
          {magnitude:.2e}"
@@ -737,7 +749,7 @@ fn assert_depth_close(label: &str, got: &DepthResults, want: &DepthResults, exac
         &format!("{label}: normed partial"),
         &got.normed,
         &want.normed,
-        2,
+        normed_ulps,
     );
     let nq = want.out.len() / HIDDEN;
     for (k, (g, w)) in got.dests.iter().zip(&want.dests).enumerate() {
@@ -889,7 +901,13 @@ fn depth_attention_step_matches_fused() -> anyhow::Result<()> {
                     "f32" => depth_reference(&row_blocks, &raw, true, set),
                     _ => depth_reference(&row_blocks, &raw_wide, true, set),
                 };
-                assert_depth_close(&format!("{case} {kind} set {b}"), &got, &want, &exact);
+                assert_depth_close(
+                    &format!("{case} {kind} set {b}"),
+                    &got,
+                    &want,
+                    &exact,
+                    (2f64.powi(-22), 2),
+                );
             }
         }
     }
@@ -1011,7 +1029,7 @@ fn depth_attention_step_conv_matches_separate_kernels() -> anyhow::Result<()> {
             true,
             &stream.clone_dtoh(&query)?,
         );
-        assert_depth_close(&label, &got, &want, &exact);
+        assert_depth_close(&label, &got, &want, &exact, (2f64.powi(-22), 2));
     }
     Ok(())
 }
@@ -1090,6 +1108,254 @@ fn moe_router_step_matches_moe_router() -> anyhow::Result<()> {
             [0],
             "the kernel resets its counter"
         );
+    }
+    Ok(())
+}
+
+/// The chunked depth attention against the fused single-row kernel, for 1 to 5 block
+/// states, 1, 3 and 4 queries, and every kind of partial, over 600 rows, more than the
+/// grid's blocks, so blocks loop over rows. Every 37th row and the last are checked as in
+/// `depth_attention_step_matches_fused`, with looser floors for the 1080 sampled rows: the
+/// output within twice the fused kernel's error from an F64 reference or 2^-20 of the
+/// largest output (the worst row was 3 F32 ulps off), the normalized partial within 4 ulps
+/// (its sum of squares adds 2304 terms in another order; the worst row was 3 ulps off), and the destinations within one BF16 ulp or the output difference carried
+/// through the norm. Destinations sit 2 x 2304 apart, as halves of the gate inputs. With
+/// the conv partial, the residual matches `short_conv_residual_rows` bit for bit.
+#[test]
+#[expect(clippy::too_many_lines, reason = "four partials, one reference each")]
+fn depth_attention_rows_matches_fused() -> anyhow::Result<()> {
+    const ROWS: usize = 600;
+    const STRIDE: usize = 2 * HIDDEN;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let conv = Conv::load(gpu.context())?;
+    let weights: Vec<CudaSlice<bf16>> = (0..3)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN, 200 + k, 0.5, 1.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let conv_weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 4, 1, 0.5, 0.0))?;
+    let conv_state_host = pseudo_random(3 * HIDDEN, 2, 2.0);
+    let conv_state = stream.clone_htod(&conv_state_host)?;
+    let raw_host = pseudo_random(ROWS * HIDDEN, 300, 2.0);
+    let raw = stream.clone_htod(&raw_host)?;
+    let raw_bf16_host: Vec<bf16> = raw_host.iter().map(|&v| bf16::from_f32(v)).collect();
+    let raw_bf16 = stream.clone_htod(&raw_bf16_host)?;
+    let hidden = stream.clone_htod(&pseudo_random_bf16(ROWS * HIDDEN, 301, 3.0, 0.0))?;
+    // The reference residual; the call also shifts its own copy of the state.
+    let mut residual_want = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+    conv.short_conv_residual_rows(
+        stream,
+        &raw_bf16,
+        &conv_weight,
+        &mut stream.clone_htod(&conv_state_host)?,
+        Some(&hidden as &dyn inkling_cuda::DeviceIn<bf16>),
+        &mut residual_want,
+        ROWS,
+    )?;
+    let residual_want = stream.clone_dtoh(&residual_want)?;
+    let sampled: Vec<usize> = (0..ROWS).step_by(37).chain([ROWS - 1]).collect();
+
+    for nb in 1..FUSED_MAX_CANDIDATES {
+        let blocks_host = pseudo_random(nb * ROWS * HIDDEN, 400 + nb as u32, 1.0);
+        let blocks = stream.clone_htod(&blocks_host)?;
+        for nq in [1, 3, 4] {
+            let queries_host = pseudo_random(nq * HIDDEN, 500 + nq as u32, 1.0);
+            let queries = stream.clone_htod(&queries_host)?;
+            for kind in ["normalized", "f32", "bf16", "conv"] {
+                let mut residual = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+                let partial = match kind {
+                    "normalized" => RowsPartial::Normalized(raw.as_view()),
+                    "f32" => RowsPartial::F32(raw.as_view()),
+                    "bf16" => RowsPartial::Bf16(raw_bf16.as_view()),
+                    _ => RowsPartial::ConvResidual {
+                        x: raw_bf16.as_view(),
+                        weight: &conv_weight,
+                        state: conv_state.as_view(),
+                        hidden: Some(hidden.as_view()),
+                        residual: residual.as_view_mut(),
+                    },
+                };
+                let mut normed = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+                let mut out = stream.alloc_zeros::<f32>(ROWS * nq * HIDDEN)?;
+                let mut dests: Vec<CudaSlice<bf16>> = (0..4)
+                    .map(|_| Ok(stream.alloc_zeros::<bf16>(ROWS * STRIDE)?))
+                    .collect::<anyhow::Result<_>>()?;
+                let [d0, d1, d2, d3] = &mut dests[..] else {
+                    unreachable!()
+                };
+                routing.depth_attention_rows(
+                    stream,
+                    DepthRows {
+                        blocks: blocks.slice(..nb * ROWS * HIDDEN),
+                        partial,
+                        normed_partial: Some(normed.as_view_mut()),
+                        queries: &queries,
+                        out: Some(out.as_view_mut()),
+                        probs: None,
+                        dests: [
+                            Some(norm_dest(d0, Some(&weights[0]))),
+                            Some(norm_dest(d1, Some(&weights[1]))),
+                            Some(norm_dest(d2, Some(&weights[2]))),
+                            Some(norm_dest(d3, None)),
+                        ],
+                        dst_stride: STRIDE,
+                        rows: ROWS,
+                    },
+                    EPS,
+                )?;
+                let out = stream.clone_dtoh(&out)?;
+                let normed = stream.clone_dtoh(&normed)?;
+                let dests: Vec<Vec<bf16>> = dests
+                    .iter()
+                    .map(|d| Ok(stream.clone_dtoh(d)?))
+                    .collect::<anyhow::Result<_>>()?;
+                if kind == "conv" {
+                    assert_f32_within_ulps(
+                        &format!("{nb} blocks, {nq} queries: residual"),
+                        &stream.clone_dtoh(&residual)?,
+                        &residual_want,
+                        0,
+                    );
+                }
+                for &row in &sampled {
+                    let rh = row * HIDDEN..(row + 1) * HIDDEN;
+                    let row_blocks: Vec<f32> = (0..nb)
+                        .flat_map(|i| {
+                            blocks_host[(i * ROWS + row) * HIDDEN..(i * ROWS + row + 1) * HIDDEN]
+                                .iter()
+                                .copied()
+                        })
+                        .collect();
+                    let row_blocks_dev = stream.clone_htod(&row_blocks)?;
+                    let (partial_host, normalize): (Vec<f32>, bool) = match kind {
+                        "normalized" => (raw_host[rh.clone()].to_vec(), false),
+                        "f32" => (raw_host[rh.clone()].to_vec(), true),
+                        "bf16" => (
+                            raw_bf16_host[rh.clone()]
+                                .iter()
+                                .map(|v| v.to_f32())
+                                .collect(),
+                            true,
+                        ),
+                        _ => (residual_want[rh.clone()].to_vec(), true),
+                    };
+                    let partial_dev = stream.clone_htod(&partial_host)?;
+                    let bf16_dev = stream.clone_htod(&raw_bf16_host[rh.clone()])?;
+                    let reference = match kind {
+                        "normalized" => Partial::Normalized(partial_dev.as_view()),
+                        "bf16" => Partial::Bf16(bf16_dev.as_view()),
+                        _ => Partial::F32(partial_dev.as_view()),
+                    };
+                    let want = fused_depth(
+                        &gpu,
+                        &routing,
+                        &row_blocks_dev,
+                        reference,
+                        &queries,
+                        &weights,
+                    )?;
+                    let got = DepthResults {
+                        out: out[row * nq * HIDDEN..(row + 1) * nq * HIDDEN].to_vec(),
+                        normed: normed[rh].to_vec(),
+                        dests: dests
+                            .iter()
+                            .map(|d| d[row * STRIDE..row * STRIDE + HIDDEN].to_vec())
+                            .collect(),
+                    };
+                    let exact =
+                        depth_reference(&row_blocks, &partial_host, normalize, &queries_host);
+                    assert_depth_close(
+                        &format!("{nb} blocks, {nq} queries, {kind}, row {row}"),
+                        &got,
+                        &want,
+                        &exact,
+                        (2f64.powi(-20), 4),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The chunked message gate fed with a message rebuilt from the depth attention's weights
+/// against the same gate fed with the depth attention's output rows, bit for bit, for 1
+/// and 2 bank states and each of the 4 message slots, over 150 rows.
+#[test]
+fn message_gate_rebuilds_messages_bit_for_bit() -> anyhow::Result<()> {
+    const ROWS: usize = 150;
+    const SLOTS: usize = 4;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let misc = Misc::load(gpu.context())?;
+    let upload_bf16 = |len: usize, seed: u32, scale: f32| -> anyhow::Result<CudaSlice<bf16>> {
+        Ok(stream.clone_htod(&pseudo_random_bf16(len, seed, scale, 0.0))?)
+    };
+    let normed = stream.clone_htod(&pseudo_random(ROWS * HIDDEN, 900, 1.0))?;
+    let queries = stream.clone_htod(&pseudo_random(SLOTS * HIDDEN, 901, 1.0))?;
+    let h = stream.clone_htod(&pseudo_random(ROWS * HIDDEN, 902, 3.0))?;
+    let down = upload_bf16(ROWS * 64, 903, 2.0)?;
+    let forget = upload_bf16(HIDDEN * 64, 904, 0.3)?;
+    let gain = upload_bf16(HIDDEN * 64, 905, 0.3)?;
+    let norm_weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 906, 0.5, 1.0))?;
+    for nb in [1, 2] {
+        let bank = stream.clone_htod(&pseudo_random(nb * ROWS * HIDDEN, 910 + nb as u32, 1.0))?;
+        let mut messages = stream.alloc_zeros::<f32>(ROWS * SLOTS * HIDDEN)?;
+        let mut probs = stream.alloc_zeros::<f32>(ROWS * SLOTS * (nb + 1))?;
+        routing.depth_attention_rows(
+            stream,
+            DepthRows {
+                blocks: bank.as_view(),
+                partial: RowsPartial::Normalized(normed.as_view()),
+                normed_partial: None,
+                queries: &queries,
+                out: Some(messages.as_view_mut()),
+                probs: Some(probs.as_view_mut()),
+                dests: [None, None, None, None],
+                dst_stride: HIDDEN,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+        for slot in 0..SLOTS {
+            let mut results = Vec::new();
+            for rebuild in [false, true] {
+                let mut out = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+                let mut out_normed = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+                let message = messages.slice(slot * HIDDEN..);
+                let (m, m_stride) = if rebuild {
+                    (normed.slice(..), HIDDEN)
+                } else {
+                    (
+                        message.slice(..(ROWS - 1) * SLOTS * HIDDEN + HIDDEN),
+                        SLOTS * HIDDEN,
+                    )
+                };
+                let mix = MessageMix {
+                    blocks: bank.as_view(),
+                    probs: probs.slice(slot * (nb + 1)..),
+                    probs_stride: SLOTS * (nb + 1),
+                };
+                misc.message_gate_out_rows(
+                    stream,
+                    &down,
+                    &forget,
+                    &gain,
+                    (&h, HIDDEN),
+                    (&m, m_stride),
+                    rebuild.then_some(&mix),
+                    &mut out,
+                    Some((&norm_weight, &mut out_normed)),
+                    EPS,
+                    ROWS,
+                )?;
+                results.push((stream.clone_dtoh(&out)?, stream.clone_dtoh(&out_normed)?));
+            }
+            let label = format!("{nb} bank states, slot {slot}");
+            assert_f32_within_ulps(&format!("{label}: out"), &results[1].0, &results[0].0, 0);
+            assert_bf16_close(&format!("{label}: normed"), &results[1].1, &results[0].1, 0);
+        }
     }
     Ok(())
 }

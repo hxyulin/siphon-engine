@@ -788,162 +788,190 @@ message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __r
 }
 
 // ---------------------------------------------------------------------------
-// message_gate_out_2304 for the rows of a chunk, in two kernels: the gate outputs for a
-// tile of rows and output columns that shares the weight loads, then the optional norm.
-// Both keep message_gate_out_2304's order, so each row's results equal a single-row
-// call's bit for bit: output (row, d) sums four chains, one per lane of its 4-lane
-// group (columns 16 i + 4 l + 0..3), and adds them as (s0 + s2) + (s1 + s3).
+// message_gate_out_2304 for the rows of a chunk, in two kernels: the gate outputs, then
+// the optional norm. The two products with the BF16 down projection run on tensor cores
+// (mma.sync with F32 accumulators), so they sum in another order than
+// message_gate_out_2304 and results differ by F32 rounding. The combine after them is
+// message_gate_out_2304's.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-constexpr int kTileRows = 32;
-constexpr int kTileCols = 64;
-constexpr int kTileThreads = 256;
-// Each thread holds 4 rows (rt + 8 i) by 2 adjacent columns (2 cp, 2 cp + 1). A warp
-// spans 8 column pairs and 4 row groups.
-constexpr int kThreadRows = 4;
-constexpr int kColPairs = kTileCols / 2;
-constexpr int kRowGroups = kTileRows / kThreadRows;
-static_assert(kColPairs * kRowGroups == kTileThreads, "threads cover the tile");
-// Rows of the down tile, padded so that 4 consecutive rows fall on different banks.
-constexpr int kDownPitch = kGateRank + 4;
-static_assert(kHidden % kTileCols == 0, "tiles cover the row");
+constexpr int kGtRows = 64;
+constexpr int kGtCols = 64;
+constexpr int kGtThreads = 256;
+// Most block states a rebuilt message mixes, as depth_attention_rows_2304 allows.
+constexpr int kGtMaxBlocks = 5;
+// 16-byte chunks per row of a [*, 64] BF16 tile.
+constexpr int kGtChunks = kGateRank / 8;
+static_assert(kHidden % kGtCols == 0, "tiles cover the row");
+
+// Element offset of 16-byte chunk `chunk` of row `row` in a [rows, 64] BF16 tile. The XOR
+// spreads the 8 rows an ldmatrix reads over distinct banks.
+__device__ __forceinline__ int gate_swizzle(int row, int chunk) {
+    return row * kGateRank + ((chunk ^ (row & 7)) << 3);
+}
+
+__device__ __forceinline__ void gate_ldmatrix_x4(uint32_t (&r)[4], const void* p) {
+    const auto a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+}
+
+// c += a b for a 16x16 BF16 A fragment, a 16x8 BF16 B fragment and F32 c.
+__device__ __forceinline__ void gate_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 
 }  // namespace
 
-// out[row] = message_gate_out_2304's output for each row of a chunk: down [rows, 64],
-// out [rows, 2304], and the h and m rows h_stride and m_stride floats apart (even, so
-// pairs of floats stay aligned). Grid: (2304 / 64, ceil(rows / 32)), 256 threads.
-extern "C" __global__ void __launch_bounds__(kTileThreads, 2)
-message_gate_out_rows_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
+// For each row and column d: out[row, d] = (1 - tanh(f)) * h[row, d] + tanh(g) * m[row, d],
+// with f and g the dots of down[row] ([rows, 64] BF16) with forget[d] and gain[d]
+// ([2304, 64] BF16). The h and m rows are h_stride and m_stride floats apart (even); out
+// is [rows, 2304]. Grid: (2304 / 64, ceil(rows / 64)), 256 threads.
+//
+// With probs not null, the message is rebuilt from its depth-attention candidates as
+// depth_attention_rows_2304 computed it: m[row] = fmaf(w_nb, m_given[row], sum over
+// i < nb of w_i * blocks[i, row], chained by fmaf from 0), where blocks[i] starts at
+// blocks + i * block_stride with rows 2304 apart, and w_i = probs[row * probs_stride + i].
+// nb is at most 5.
+extern "C" __global__ void __launch_bounds__(kGtThreads)
+message_gate_out_rows_2304(const __nv_bfloat16* down, const __nv_bfloat16* __restrict__ forget,
                            const __nv_bfloat16* __restrict__ gain, const float* h, int h_stride, const float* m,
-                           int m_stride, float* out, int rows) {
-    // ws[k][cp] = (forget[2 cp][k], gain[2 cp][k], forget[2 cp + 1][k], gain[2 cp + 1][k]).
-    __shared__ float4 ws[kGateRank][kColPairs];
-    __shared__ __align__(16) float ds[kTileRows][kDownPitch];
+                           int m_stride, const float* blocks, int block_stride, int nb, const float* probs,
+                           int probs_stride, float* out, int rows) {
+    __shared__ __align__(16) __nv_bfloat16 as[kGtRows * kGateRank];
+    __shared__ __align__(16) __nv_bfloat16 fs[kGtCols * kGateRank];
+    __shared__ __align__(16) __nv_bfloat16 gs[kGtCols * kGateRank];
     const int tid = threadIdx.x;
-    const int d0 = blockIdx.x * kTileCols;
-    const int r0 = blockIdx.y * kTileRows;
-
-    // 8 BF16 weights per load: thread idx takes column idx % 64 and k from 8 (idx / 64).
-    constexpr int kWeightLoads = kTileCols * kGateRank / 8 / kTileThreads;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int d0 = blockIdx.x * kGtCols;
+    const int r0 = blockIdx.y * kGtRows;
+    static_assert(kGtCols * kGtChunks == 2 * kGtThreads, "two weight chunks per thread");
 #pragma unroll
-    for (int q = 0; q < kWeightLoads; ++q) {
-        const int idx = tid + q * kTileThreads;
-        const int col = idx % kTileCols;
-        const int k0 = idx / kTileCols * 8;
-        const size_t at = size_t(d0 + col) * kGateRank + k0;
-        const uint4 fp = *reinterpret_cast<const uint4*>(forget + at);
-        const uint4 gp = *reinterpret_cast<const uint4*>(gain + at);
-        const auto* fv = reinterpret_cast<const __nv_bfloat16*>(&fp);
-        const auto* gv = reinterpret_cast<const __nv_bfloat16*>(&gp);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            auto* dst = reinterpret_cast<float2*>(&ws[k0 + i][col / 2]) + col % 2;
-            *dst = make_float2(__bfloat162float(fv[i]), __bfloat162float(gv[i]));
-        }
+    for (int i = 0; i < 2; ++i) {
+        const int idx = tid + i * kGtThreads;
+        const int r = idx / kGtChunks;
+        const int c = idx % kGtChunks;
+        const size_t at = size_t(d0 + r) * kGateRank + 8 * c;
+        *reinterpret_cast<uint4*>(&fs[gate_swizzle(r, c)]) = *reinterpret_cast<const uint4*>(forget + at);
+        *reinterpret_cast<uint4*>(&gs[gate_swizzle(r, c)]) = *reinterpret_cast<const uint4*>(gain + at);
     }
     pdl_trigger();
     pdl_wait();
-    static_assert(kTileRows * kGateRank / 8 == kTileThreads, "one down load per thread");
-    {
-        const int row = tid / (kGateRank / 8);
-        const int k0 = tid % (kGateRank / 8) * 8;
-        uint4 p = make_uint4(0, 0, 0, 0);
-        if (r0 + row < rows) {
-            p = *reinterpret_cast<const uint4*>(down + size_t(r0 + row) * kGateRank + k0);
-        }
-        const auto* v = reinterpret_cast<const __nv_bfloat16*>(&p);
+    static_assert(kGtRows * kGtChunks == 2 * kGtThreads, "two down chunks per thread");
+    uint4 dv[2];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            ds[row][k0 + i] = __bfloat162float(v[i]);
+    for (int i = 0; i < 2; ++i) {
+        const int idx = tid + i * kGtThreads;
+        const int r = idx / kGtChunks;
+        const int c = idx % kGtChunks;
+        dv[i] = make_uint4(0, 0, 0, 0);
+        if (r0 + r < rows) {
+            dv[i] = *reinterpret_cast<const uint4*>(down + size_t(r0 + r) * kGateRank + 8 * c);
         }
+    }
+    // Warp w takes rows 16 (w / 2) .. and columns 32 (w % 2) .. of the tile: 4 column
+    // groups of 8, each with an f and a g accumulator. Accumulator element (half, j) of
+    // column group n is row wr + lane / 4 + 8 half and column wc + 8 n + 2 (lane % 4) + j.
+    // h and m load during the products.
+    const int wr = warp / 2 * 16;
+    const int wc = warp % 2 * 32;
+    float2 hv[2][4];
+    float2 mv[2][4];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+            hv[half][n] = *reinterpret_cast<const float2*>(h + size_t(row) * h_stride + d);
+            mv[half][n] = *reinterpret_cast<const float2*>(m + size_t(row) * m_stride + d);
+        }
+        if (probs != nullptr) {
+            // Every load first; the bank holds at most kGtMaxBlocks states.
+            const float* w = probs + size_t(row) * probs_stride;
+            float2 b[kGtMaxBlocks][4];
+            float wi[kGtMaxBlocks];
+#pragma unroll
+            for (int i = 0; i < kGtMaxBlocks; ++i) {
+                if (i < nb) {
+                    wi[i] = w[i];
+#pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+                        b[i][n] = *reinterpret_cast<const float2*>(blocks + size_t(i) * block_stride +
+                                                                   size_t(row) * kHidden + d);
+                    }
+                }
+            }
+            const float wp = w[nb];
+            float2 acc[4] = {};
+#pragma unroll
+            for (int i = 0; i < kGtMaxBlocks; ++i) {
+                if (i < nb) {
+#pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        acc[n].x = fmaf(wi[i], b[i][n].x, acc[n].x);
+                        acc[n].y = fmaf(wi[i], b[i][n].y, acc[n].y);
+                    }
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                mv[half][n].x = fmaf(wp, mv[half][n].x, acc[n].x);
+                mv[half][n].y = fmaf(wp, mv[half][n].y, acc[n].y);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int idx = tid + i * kGtThreads;
+        *reinterpret_cast<uint4*>(&as[gate_swizzle(idx / kGtChunks, idx % kGtChunks)]) = dv[i];
     }
     __syncthreads();
+    float acc_f[4][4] = {};
+    float acc_g[4][4] = {};
+#pragma unroll
+    for (int k = 0; k < kGateRank / 16; ++k) {
+        uint32_t a[4];
+        gate_ldmatrix_x4(a, &as[gate_swizzle(wr + lane % 16, 2 * k + lane / 16)]);
+#pragma unroll
+        for (int np = 0; np < 2; ++np) {
+            // Column groups 2 np and 2 np + 1: lanes 0-15 address the first, 16-31 the second.
+            const int n = wc + 16 * np + lane % 8 + 8 * (lane / 16);
+            const int chunk = 2 * k + (lane / 8) % 2;
+            uint32_t bf[4];
+            uint32_t bg[4];
+            gate_ldmatrix_x4(bf, &fs[gate_swizzle(n, chunk)]);
+            gate_ldmatrix_x4(bg, &gs[gate_swizzle(n, chunk)]);
+            gate_mma(acc_f[2 * np], a, bf[0], bf[1]);
+            gate_mma(acc_f[2 * np + 1], a, bf[2], bf[3]);
+            gate_mma(acc_g[2 * np], a, bg[0], bg[1]);
+            gate_mma(acc_g[2 * np + 1], a, bg[2], bg[3]);
+        }
+    }
 
-    const int lane = tid % 32;
-    const int warp = tid / 32;
-    const int cp = warp % 4 * 8 + lane % 8;
-    const int rt = warp / 4 * 4 + lane / 8;
-    const int d = d0 + 2 * cp;
-    // h and m load during the products.
-    float2 hv[kThreadRows];
-    float2 mv[kThreadRows];
 #pragma unroll
-    for (int i = 0; i < kThreadRows; ++i) {
-        const int row = min(r0 + rt + kRowGroups * i, rows - 1);
-        hv[i] = *reinterpret_cast<const float2*>(h + size_t(row) * h_stride + d);
-        mv[i] = *reinterpret_cast<const float2*>(m + size_t(row) * m_stride + d);
-    }
-    // Lane l of the single-row kernel's 4-lane group chains the k groups k4 = l, l + 4,
-    // l + 8, l + 12. The lanes run in the order 0, 2, 1, 3, so that (s0 + s2) closes before
-    // lanes 1 and 3 start. Index [i][j] is row rt + 8 i and column 2 cp + j.
-    float f02[kThreadRows][2];
-    float g02[kThreadRows][2];
-    float f1[kThreadRows][2];
-    float g1[kThreadRows][2];
-    float fp[kThreadRows][2];
-    float gp[kThreadRows][2];
-#pragma unroll
-    for (int step = 0; step < kLanesPerRow; ++step) {
-        const int l = step == 1 ? 2 : step == 2 ? 1 : step;
-        float f[kThreadRows][2] = {};
-        float g[kThreadRows][2] = {};
-#pragma unroll
-        for (int i4 = 0; i4 < kGateRank / 16; ++i4) {
-            const int k4 = 4 * i4 + l;
-            float4 dv[kThreadRows];
-#pragma unroll
-            for (int i = 0; i < kThreadRows; ++i) {
-                dv[i] = *reinterpret_cast<const float4*>(&ds[rt + kRowGroups * i][4 * k4]);
-            }
-#pragma unroll
-            for (int kk = 0; kk < 4; ++kk) {
-                const float4 wv = ws[4 * k4 + kk][cp];
-#pragma unroll
-                for (int i = 0; i < kThreadRows; ++i) {
-                    const float x = kk == 0 ? dv[i].x : kk == 1 ? dv[i].y : kk == 2 ? dv[i].z : dv[i].w;
-                    f[i][0] = ffma(wv.x, x, f[i][0]);
-                    g[i][0] = ffma(wv.y, x, g[i][0]);
-                    f[i][1] = ffma(wv.z, x, f[i][1]);
-                    g[i][1] = ffma(wv.w, x, g[i][1]);
-                }
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < kThreadRows; ++i) {
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                if (step == 0) {
-                    f02[i][j] = f[i][j];
-                    g02[i][j] = g[i][j];
-                } else if (step == 1) {
-                    f02[i][j] = fadd(f02[i][j], f[i][j]);
-                    g02[i][j] = fadd(g02[i][j], g[i][j]);
-                } else if (step == 2) {
-                    f1[i][j] = f[i][j];
-                    g1[i][j] = g[i][j];
-                } else {
-                    fp[i][j] = fadd(f02[i][j], fadd(f1[i][j], f[i][j]));
-                    gp[i][j] = fadd(g02[i][j], fadd(g1[i][j], g[i][j]));
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < kThreadRows; ++i) {
-        const int row = r0 + rt + kRowGroups * i;
+    for (int half = 0; half < 2; ++half) {
+        const int row = r0 + wr + lane / 4 + 8 * half;
         if (row >= rows) {
             continue;
         }
-        float o[2];
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            o[j] = fadd(fmul(fsub(1.f, tanhf(fp[i][j])), j == 0 ? hv[i].x : hv[i].y),
-                        fmul(tanhf(gp[i][j]), j == 0 ? mv[i].x : mv[i].y));
+        for (int n = 0; n < 4; ++n) {
+            const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+            const float o0 = fadd(fmul(fsub(1.f, tanhf(acc_f[n][2 * half])), hv[half][n].x),
+                                  fmul(tanhf(acc_g[n][2 * half]), mv[half][n].x));
+            const float o1 = fadd(fmul(fsub(1.f, tanhf(acc_f[n][2 * half + 1])), hv[half][n].y),
+                                  fmul(tanhf(acc_g[n][2 * half + 1]), mv[half][n].y));
+            *reinterpret_cast<float2*>(out + size_t(row) * kHidden + d) = make_float2(o0, o1);
         }
-        *reinterpret_cast<float2*>(out + size_t(row) * kHidden + d) = make_float2(o[0], o[1]);
     }
 }
 

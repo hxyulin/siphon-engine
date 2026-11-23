@@ -374,8 +374,7 @@ __device__ void store4(__nv_bfloat16* p, const float (&v)[4]) {
 // up front, which the separate kernel, looping over candidates and queries,
 // did not do.
 //
-// `block_stride` is the distance between block states: 2304 for one row, or a whole
-// chunk's rows for depth_attention_fused_rows_2304.
+// `block_stride` is the distance between block states.
 namespace {
 
 __device__ __forceinline__ void
@@ -622,31 +621,6 @@ depth_attention_fused_2304(const float* __restrict__ blocks, int nb, const float
                               scale);
 }
 
-// depth_attention_fused_2304 for each row (blockIdx.x) of a chunk. Block state i of row
-// r is at blocks + i * block_stride + r * 2304. The partial, normed_partial and out rows
-// are consecutive ([rows, 2304] and [rows, nq, 2304]); the destination rows are
-// dst_stride apart, so a destination can be one half of a [rows, 2 * 2304] buffer.
-extern "C" __global__ void __launch_bounds__(kDepthThreads)
-depth_attention_fused_rows_2304(const float* __restrict__ blocks, int block_stride, int nb,
-                                const float* partial_f32, const __nv_bfloat16* partial_bf16,
-                                int normalize_partial, float* normed_partial, const float* __restrict__ queries,
-                                int nq, float* out, __nv_bfloat16* dst0, __nv_bfloat16* dst1,
-                                __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,
-                                const __nv_bfloat16* weight0, const __nv_bfloat16* weight1,
-                                const __nv_bfloat16* weight2, const __nv_bfloat16* weight3, float eps,
-                                float scale) {
-    const size_t row = blockIdx.x;
-    const size_t at = row * kHidden;
-    const size_t dst_at = row * size_t(dst_stride);
-    const auto offset = [&](__nv_bfloat16* p) { return p != nullptr ? p + dst_at : nullptr; };
-    depth_attention_fused_row(blocks + at, block_stride, nb, partial_f32 != nullptr ? partial_f32 + at : nullptr,
-                              partial_bf16 != nullptr ? partial_bf16 + at : nullptr, normalize_partial,
-                              normed_partial != nullptr ? normed_partial + at : nullptr, queries, nq,
-                              out != nullptr ? out + row * size_t(nq) * kHidden : nullptr, offset(dst0),
-                              offset(dst1), offset(dst2), offset(dst3), weight0, weight1, weight2, weight3, eps,
-                              scale);
-}
-
 namespace {
 
 constexpr int kRouterThreads = kDepthThreads;
@@ -828,326 +802,132 @@ moe_router_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ n
 }
 
 // ---------------------------------------------------------------------------
-// moe_router_2304 for the rows of a chunk, in three kernels: the norm, the logits as a
-// tiled F32 matrix product split along the inner dimension, and the routing. Every sum
-// keeps moe_router_2304's order, so each row's results equal a single-row call's bit
-// for bit.
-//
-// router_logits_2304's order for one logit: thread t < 256 of the block (warp w = t / 32,
-// lane l = t % 32) chains fmaf over its columns 4t + 1024c + 0..3 for c = 0, 1 and, if
-// t < 64, 2. Each warp then adds its 32 lane sums with a shuffle-down tree, pairing lanes
-// 16 apart, then 8, 4, 2 and 1. The 8 warp sums are added in order.
-//
-// Visiting the lanes in bit-reversed order, lane = rev5(j) for j = 0..31, makes the
-// tree's pairs adjacent: the tree adds steps 2i and 2i + 1, then adjacent pairs, and so
-// on. Steps j = 8g .. 8g + 7 (g = 0..3) are the lanes r + 4k (k = 0..7) for r = rev2(g),
-// and form one subtree T(w, g); the warp's sum is (T0 + T1) + (T2 + T3).
-//
-// moe_router_logits_rows_2304 computes one subtree for a tile of rows and experts, and
-// moe_router_route_rows_2304 adds the 32 subtrees of each logit.
+// The router for the rows of a chunk, from rows that are already normalized (the kernel
+// before writes them as a weighted RMS norm destination): logits = F32(x) @ router.T as a
+// tiled F32 matrix product split along the inner dimension, then the top-8 routing of
+// moe_router_2304. The logits sum in their own order, so they differ from
+// moe_router_2304's by F32 rounding.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-constexpr int kSplits = kLogitsThreads / 32;
-constexpr int kLanes = 32;
-constexpr int kQuarters = 4;
-constexpr int kSubtrees = kSplits * kQuarters;
-constexpr int kSubtreeLanes = kLanes / kQuarters;
-constexpr int kMaxChunks = 3;
-constexpr int kTileRows = 64;
-constexpr int kTileExperts = 32;
-constexpr int kTileThreads = 128;
-// Each thread holds 4 rows by 4 experts: the row pairs (2 p, 2 p + 1) for p = tr + 16 i
-// and the experts te + 8 i. One 16-byte shared-memory read gives a row pair's x. A warp
-// spans 8 values of tr and 4 of te, so its reads stay within 128 and 64 bytes.
-constexpr int kThreadPairs = 2;
-constexpr int kThreadRows = 2 * kThreadPairs;
-constexpr int kThreadExperts = 4;
-constexpr int kPairGroups = kTileRows / kThreadRows;
-constexpr int kExpertGroups = kTileExperts / kThreadExperts;
-static_assert(kPairGroups * kExpertGroups == kTileThreads, "threads cover the tile");
-// Rows per block of moe_router_norm_rows_2304: one per warp.
-constexpr int kNormRows = 8;
-constexpr int kRuns = kHidden / 4;
-
-// Columns of chunk c exist for warps w < 2 only (t < 64).
-__host__ __device__ constexpr int chunks_of(int w) { return w < 2 ? 3 : 2; }
-
-// The permuted copy of the normed rows that moe_router_norm_rows_2304 writes for the
-// logits kernel holds runs of 4 BF16 values. Run (w, g, k, c) of every row comes
-// before the next run, so that a subtree's runs for consecutive rows are contiguous:
-// run index (subtree_base(w, g) + k * chunks_of(w) + c) * rows + row.
-__device__ __forceinline__ int subtree_base(int w, int g) {
-    const int before = w < 2 ? w * kQuarters * kSubtreeLanes * 3
-                             : 2 * kQuarters * kSubtreeLanes * 3 + (w - 2) * kQuarters * kSubtreeLanes * 2;
-    return before + g * kSubtreeLanes * chunks_of(w);
-}
-
-__device__ __forceinline__ int rev2(int g) { return ((g & 1) << 1) | (g >> 1); }
-
-__device__ __forceinline__ int rev3(int m) { return ((m & 1) << 2) | (m & 2) | (m >> 2); }
-
-// The run of the permuted copy that holds columns col .. col + 3 (col a multiple of 4).
-__device__ __forceinline__ int permuted_run(int col) {
-    const int t = col % 1024 / 4;
-    const int c = col / 1024;
-    const int w = t / kLanes;
-    const int lane = t % kLanes;
-    const int g = rev2(lane % kQuarters);
-    const int k = lane / kQuarters;
-    return subtree_base(w, g) + k * chunks_of(w) + c;
-}
-
-__device__ __forceinline__ uint32_t smem_addr(const void* p) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
-}
-
-template <int Bytes>
-__device__ __forceinline__ void cp_async(uint32_t dst, const void* src, bool valid) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::"r"(dst), "l"(src), "n"(Bytes),
-                 "r"(valid ? Bytes : 0));
-}
-
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
-
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
-
-__device__ __forceinline__ void bf16x4_to_f32(uint2 p, float (&v)[4]) {
-    v[0] = __uint_as_float(p.x << 16);
-    v[1] = __uint_as_float(p.x & 0xffff0000u);
-    v[2] = __uint_as_float(p.y << 16);
-    v[3] = __uint_as_float(p.y & 0xffff0000u);
-}
-
-template <int Chunks>
-__device__ __forceinline__ void router_subtree_tile(const uint2* __restrict__ xp, const float* __restrict__ router,
-                                                    float* partials, int rows, int w, int g, uint2* xs,
-                                                    float4* ws) {
-    const int tid = threadIdx.x;
-    const int lane = tid % 32;
-    const int warp = tid / 32;
-    const int tr = warp / 2 * 8 + lane / 4;
-    const int te = warp % 2 * 4 + lane % 4;
-    const int r0 = blockIdx.x * kTileRows;
-    const int e0 = blockIdx.y * kTileExperts;
-    const int r = rev2(g);
-
-    for (int idx = tid; idx < kSubtreeLanes * Chunks * kTileExperts; idx += kTileThreads) {
-        const int e = idx % kTileExperts;
-        const int kc = idx / kTileExperts;
-        const int t = w * kLanes + r + kQuarters * (kc / Chunks);
-        const float* src = router + size_t(e0 + e) * kHidden + 4 * t + 1024 * (kc % Chunks);
-        cp_async<16>(smem_addr(&ws[kc * kTileExperts + e]), src, true);
-    }
-    pdl_trigger();
-    pdl_wait();
-    const uint2* xsub = xp + size_t(subtree_base(w, g)) * rows;
-    for (int idx = tid; idx < kSubtreeLanes * Chunks * kTileRows; idx += kTileThreads) {
-        const int row = idx % kTileRows;
-        const int kc = idx / kTileRows;
-        const bool valid = r0 + row < rows;
-        const uint2* src = xsub + size_t(kc) * rows + (valid ? r0 + row : 0);
-        cp_async<8>(smem_addr(&xs[kc * kTileRows + row]), src, valid);
-    }
-    cp_async_commit();
-    cp_async_wait_all();
-    __syncthreads();
-
-    // level[b] holds the sum of the last 2^b steps that closed a subtree of that size.
-    float level[3][kThreadRows][kThreadExperts];
-#pragma unroll 1
-    for (int m = 0; m < kSubtreeLanes; ++m) {
-        const int k = rev3(m);
-        float acc[kThreadRows][kThreadExperts] = {};
-#pragma unroll
-        for (int c = 0; c < Chunks; ++c) {
-            float xv[kThreadRows][4];
-            float wv[kThreadExperts][4];
-#pragma unroll
-            for (int i = 0; i < kThreadPairs; ++i) {
-                const uint4 pair =
-                    *reinterpret_cast<const uint4*>(&xs[(k * Chunks + c) * kTileRows + 2 * (tr + kPairGroups * i)]);
-                bf16x4_to_f32(make_uint2(pair.x, pair.y), xv[2 * i]);
-                bf16x4_to_f32(make_uint2(pair.z, pair.w), xv[2 * i + 1]);
-            }
-#pragma unroll
-            for (int i = 0; i < kThreadExperts; ++i) {
-                const float4 v = ws[(k * Chunks + c) * kTileExperts + te + kExpertGroups * i];
-                wv[i][0] = v.x;
-                wv[i][1] = v.y;
-                wv[i][2] = v.z;
-                wv[i][3] = v.w;
-            }
-#pragma unroll
-            for (int n = 0; n < 4; ++n) {
-#pragma unroll
-                for (int a = 0; a < kThreadRows; ++a) {
-#pragma unroll
-                    for (int b = 0; b < kThreadExperts; ++b) {
-                        acc[a][b] = fmaf(wv[b][n], xv[a][n], acc[a][b]);
-                    }
-                }
-            }
-        }
-        // Fold step m into the subtree: a binary counter over m. The branches are uniform
-        // and every array index is a constant.
-        const auto store = [&](float (&dst)[kThreadRows][kThreadExperts]) {
-#pragma unroll
-            for (int a = 0; a < kThreadRows; ++a) {
-#pragma unroll
-                for (int b = 0; b < kThreadExperts; ++b) {
-                    dst[a][b] = acc[a][b];
-                }
-            }
-        };
-        const auto add = [&](const float (&src)[kThreadRows][kThreadExperts]) {
-#pragma unroll
-            for (int a = 0; a < kThreadRows; ++a) {
-#pragma unroll
-                for (int b = 0; b < kThreadExperts; ++b) {
-                    acc[a][b] = src[a][b] + acc[a][b];
-                }
-            }
-        };
-        if (!(m & 1)) {
-            store(level[0]);
-        } else {
-            add(level[0]);
-            if (!(m & 2)) {
-                store(level[1]);
-            } else {
-                add(level[1]);
-                if (!(m & 4)) {
-                    store(level[2]);
-                } else {
-                    add(level[2]);
-                    store(level[0]);
-                }
-            }
-        }
-    }
-
-    float* out = partials + size_t(w * kQuarters + g) * rows * kExperts;
-#pragma unroll
-    for (int a = 0; a < kThreadRows; ++a) {
-        const int row = r0 + 2 * (tr + kPairGroups * (a / 2)) + a % 2;
-        if (row < rows) {
-#pragma unroll
-            for (int b = 0; b < kThreadExperts; ++b) {
-                out[size_t(row) * kExperts + e0 + te + kExpertGroups * b] = level[0][a][b];
-            }
-        }
-    }
-}
+constexpr int kRouterTileRows = 64;
+constexpr int kRouterTileK = 16;
+constexpr int kRouterTileThreads = 256;
+// Each thread holds 4 rows (4 tr + 0..3) by 8 experts (4 te + 0..3 and 64 + 4 te + 0..3).
+constexpr int kRouterRowGroups = kRouterTileRows / 4;
+constexpr int kRouterExpertGroups = kRouterTileThreads / kRouterRowGroups;
+static_assert(kRouterExpertGroups * 8 == kExperts, "threads cover the experts");
+// The x tile holds [k][row], padded so that the transposing stores spread over banks.
+constexpr int kRouterXPitch = kRouterTileRows + 4;
 
 }  // namespace
 
-// Step 1 of 3: x_out = bf16(rms_norm(x) * norm_weight) for each row of x and x_out
-// ([rows, 2304]), as moe_router_2304 computes it, and the same values permuted for the
-// logits kernel into x_perm ([rows * 2304], see subtree_base). One warp per row, 8 rows
-// per block (256 threads). The warp repeats the norm's sums: virtual warp v of the 576
-// virtual threads (lanes l, columns 4 (32 v + l) ..) is the warp's step v, and lane v
-// keeps that step's sum for the final butterfly.
-extern "C" __global__ void __launch_bounds__(kNormRows * 32)
-moe_router_norm_rows_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
-                          __nv_bfloat16* x_out, uint2* x_perm, int rows) {
-    constexpr int kSteps = kRuns / 32;
-    // The block's rows by permuted run, padded so that consecutive rows fall on
-    // different banks.
-    __shared__ uint2 ys[kNormRows][kRuns + 1];
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
-    const int r0 = blockIdx.x * kNormRows;
-    const int row = r0 + warp;
+// partials[s, row, e] = sum over k in slice s of x[row, k] * router[e, k], for the
+// [rows, 2304] BF16 x and the [128, 2304] F32 router. Slice s is columns
+// s * slice .. (s + 1) * slice, a multiple of 16. Grid: (ceil(rows / 64), 2304 / slice),
+// 256 threads.
+extern "C" __global__ void __launch_bounds__(kRouterTileThreads)
+moe_router_logits_rows_2304(const __nv_bfloat16* x, const float* __restrict__ router,
+                            float* partials, int rows, int slice) {
+    __shared__ __align__(16) float xs[2][kRouterTileK][kRouterXPitch];
+    __shared__ __align__(16) float ws[2][kRouterTileK][kExperts];
+    const int tid = threadIdx.x;
+    const int r0 = blockIdx.x * kRouterTileRows;
+    const int k0 = blockIdx.y * slice;
+    const int tiles = slice / kRouterTileK;
+    const int tr = tid / kRouterExpertGroups;
+    const int te = tid % kRouterExpertGroups;
+
+    // Loader roles. x: thread i takes row i / 4 and columns 4 (i % 4) .. of the tile.
+    // router: thread i takes experts i / 4 and 64 + i / 4, columns 4 (i % 4) ...
+    const int xr = tid / 4;
+    const int xk = tid % 4 * 4;
+    const bool x_valid = r0 + xr < rows;
+    const __nv_bfloat16* xp = x + size_t(x_valid ? r0 + xr : 0) * kHidden + k0 + xk;
+    const int we = tid / 4;
+    const int wk = tid % 4 * 4;
+    const float* wp0 = router + size_t(we) * kHidden + k0 + wk;
+    const float* wp1 = router + size_t(we + 64) * kHidden + k0 + wk;
+
+    float4 w0 = *reinterpret_cast<const float4*>(wp0);
+    float4 w1 = *reinterpret_cast<const float4*>(wp1);
     pdl_trigger();
     pdl_wait();
-    if (row < rows) {
-        const size_t at = size_t(row) * kHidden;
-        float v[kSteps][4];
+    uint2 xv = x_valid ? *reinterpret_cast<const uint2*>(xp) : make_uint2(0, 0);
+
+    const auto stage = [&](int buf) {
+        const auto* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
 #pragma unroll
-        for (int s = 0; s < kSteps; ++s) {
-            load4(x + at + 4 * (32 * s + lane), v[s]);
+        for (int j = 0; j < 4; ++j) {
+            xs[buf][xk + j][xr] = __bfloat162float(xb[j]);
         }
-        float mine = 0.f;
+        const float a[4] = {w0.x, w0.y, w0.z, w0.w};
+        const float b[4] = {w1.x, w1.y, w1.z, w1.w};
 #pragma unroll
-        for (int s = 0; s < kSteps; ++s) {
-            float p = 0.f;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                p = fmaf(v[s][i], v[s][i], p);
-            }
-            p = warp_sum(p);
-            if (lane == s) {
-                mine = p;
-            }
+        for (int j = 0; j < 4; ++j) {
+            ws[buf][wk + j][we] = a[j];
+            ws[buf][wk + j][we + 64] = b[j];
         }
-        static_assert(kSteps == kNormVirtualWarps, "one step per virtual warp");
-        const float inv = inv_rms_f32(warp_sum(mine), eps);
-#pragma unroll
-        for (int s = 0; s < kSteps; ++s) {
-            const int col = 4 * (32 * s + lane);
-            float w[4];
-            float y[4];
-            load4(norm_weight + col, w);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                y[i] = (v[s][i] * inv) * w[i];
-            }
-            store4(x_out + at + col, y);
-            store4(reinterpret_cast<__nv_bfloat16*>(&ys[warp][permuted_run(col)]), y);
-        }
-    }
+    };
+    stage(0);
     __syncthreads();
-    // Each run's 8 rows are 64 contiguous bytes of x_perm.
-    for (int idx = threadIdx.x; idx < kRuns * kNormRows; idx += blockDim.x) {
-        const int j = idx % kNormRows;
-        const int run = idx / kNormRows;
-        if (r0 + j < rows) {
-            x_perm[size_t(run) * rows + r0 + j] = ys[j][run];
+
+    float acc[4][8] = {};
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int buf = tile & 1;
+        if (tile + 1 < tiles) {
+            const int off = (tile + 1) * kRouterTileK;
+            w0 = *reinterpret_cast<const float4*>(wp0 + off);
+            w1 = *reinterpret_cast<const float4*>(wp1 + off);
+            xv = x_valid ? *reinterpret_cast<const uint2*>(xp + off) : make_uint2(0, 0);
+        }
+#pragma unroll
+        for (int k = 0; k < kRouterTileK; ++k) {
+            const float4 xa = *reinterpret_cast<const float4*>(&xs[buf][k][4 * tr]);
+            const float4 wa = *reinterpret_cast<const float4*>(&ws[buf][k][4 * te]);
+            const float4 wb = *reinterpret_cast<const float4*>(&ws[buf][k][64 + 4 * te]);
+            const float xr4[4] = {xa.x, xa.y, xa.z, xa.w};
+            const float we8[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    acc[i][j] = fmaf(xr4[i], we8[j], acc[i][j]);
+                }
+            }
+        }
+        if (tile + 1 < tiles) {
+            stage(buf ^ 1);
+        }
+        __syncthreads();
+    }
+
+    float* out = partials + size_t(blockIdx.y) * rows * kExperts;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = r0 + 4 * tr + i;
+        if (row < rows) {
+            float* o = out + size_t(row) * kExperts;
+            *reinterpret_cast<float4*>(o + 4 * te) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+            *reinterpret_cast<float4*>(o + 64 + 4 * te) =
+                make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
         }
     }
 }
 
-// Step 2 of 3: partials[w * 4 + g, row, e] = subtree T(w, g) of logit (row, e) of
-// F32(x) @ router.T, from the permuted rows x_perm and the [128, 2304] F32 router.
-// Grid: (ceil(rows / 64), 4, 32), 128 threads.
-extern "C" __global__ void __launch_bounds__(kTileThreads, 4)
-moe_router_logits_rows_2304(const uint2* __restrict__ x_perm, const float* __restrict__ router, float* partials,
-                            int rows) {
-    // Runs of 4: x at [k][c][row] (BF16), the router at [k][c][expert] (F32).
-    __shared__ __align__(16) uint2 xs[kSubtreeLanes * kMaxChunks * kTileRows];
-    __shared__ float4 ws[kSubtreeLanes * kMaxChunks * kTileExperts];
-    const int w = blockIdx.z / kQuarters;
-    const int g = blockIdx.z % kQuarters;
-    if (w < 2) {
-        router_subtree_tile<3>(x_perm, router, partials, rows, w, g, xs, ws);
-    } else {
-        router_subtree_tile<2>(x_perm, router, partials, rows, w, g, xs, ws);
-    }
-}
-
-// Step 3 of 3: for each row (blockIdx.x), logits[row, e] = the sum of warps
-// (T0 + T1) + (T2 + T3), added in warp order, then moe_router_2304's top-8 routing into
-// indices and weights ([rows, 8]). 128 threads.
+// For each row (blockIdx.x), logits[row, e] = the sum of the `splits` partials in order,
+// then moe_router_2304's top-8 routing into indices and weights ([rows, 8]). 128 threads.
 extern "C" __global__ void __launch_bounds__(kExperts)
-moe_router_route_rows_2304(const float* __restrict__ partials, const float* __restrict__ bias, float* logits,
-                           int32_t* indices, float* weights, int rows, float route_scale) {
+moe_router_route_rows_2304(const float* partials, int splits, const float* __restrict__ bias,
+                           float* logits, int32_t* indices, float* weights, int rows, float route_scale) {
     const size_t row = blockIdx.x;
     const int e = threadIdx.x;
     pdl_trigger();
     pdl_wait();
-    float p[kSubtrees];
-#pragma unroll
-    for (int s = 0; s < kSubtrees; ++s) {
-        p[s] = partials[(size_t(s) * rows + row) * kExperts + e];
-    }
     float total = 0.f;
-#pragma unroll
-    for (int w = 0; w < kSplits; ++w) {
-        const float* q = p + w * kQuarters;
-        const float warp_sum = (q[0] + q[1]) + (q[2] + q[3]);
-        total = w == 0 ? warp_sum : total + warp_sum;
+    for (int s = 0; s < splits; ++s) {
+        total += partials[(size_t(s) * rows + row) * kExperts + e];
     }
     logits[row * kExperts + e] = total;
     // route_top8 reads each logit back in the thread that wrote it.
@@ -1623,3 +1403,349 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
         *counter = 0;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Depth attention for the rows of a chunk, in the order of depth_attention_step_2304
+// rather than MLX's: thread t holds elements 4t.. and 4(t + 288).. of every row, and each
+// sum runs per thread, then across each warp, then across the 9 warps in order. Results
+// differ from depth_attention_fused_2304 by F32 rounding.
+//
+// One kernel per block count NB and query count NQ, so that each holds only the registers
+// it needs. A block loads the queries once, then takes rows blockIdx.x,
+// blockIdx.x + gridDim.x, and so on.
+//
+// Pointers to data that earlier kernels write are not __restrict__ here and in the router
+// below: a const __restrict__ pointer lets nvcc load through the non-coherent path, and
+// ptxas may move such loads above pdl_wait, before the data is written.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Sums v[0 .. V) across the warp, V a power of two: lane l gets the sum of v[l % V], in
+// log2(V) + (5 - log2(V)) steps of xor shuffles.
+template <int V>
+__device__ __forceinline__ float warp_transpose_sum_n(float (&v)[V]) {
+    static_assert(V >= 1 && V <= 32 && (V & (V - 1)) == 0, "V is a power of two up to 32");
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int half = V / 2; half >= 1; half /= 2) {
+        const bool upper = (lane & half) != 0;
+#pragma unroll
+        for (int k = 0; k < half; ++k) {
+            const float send = upper ? v[k] : v[k + half];
+            const float keep = upper ? v[k + half] : v[k];
+            v[k] = keep + __shfl_xor_sync(0xffffffffu, send, half);
+        }
+    }
+    float s = v[0];
+#pragma unroll
+    for (int offset = V; offset < 32; offset *= 2) {
+        s += __shfl_xor_sync(0xffffffffu, s, offset);
+    }
+    return s;
+}
+
+__host__ __device__ constexpr int pow2_at_least(int n) {
+    int p = 1;
+    while (p < n) {
+        p *= 2;
+    }
+    return p;
+}
+
+__device__ __forceinline__ void load8_bf16(const __nv_bfloat16* p, int ca, int cb, float (&v)[8]) {
+    unpack_bf16x4(*reinterpret_cast<const uint2*>(p + ca), v);
+    unpack_bf16x4(*reinterpret_cast<const uint2*>(p + cb), v + 4);
+}
+
+template <int NB, int NQ>
+__device__ __forceinline__ void
+depth_attention_rows(const float* blocks, int block_stride, const float* partial_f32,
+                     const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,
+                     const float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,
+                     float* normed_partial, const float* __restrict__ queries, float* out, float* probs,
+                     __nv_bfloat16* dst0, __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
+                     int dst_stride,
+                     const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,
+                     const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3,
+                     float eps, float scale, int rows) {
+    constexpr int kCandidates = NB + 1;
+    constexpr int kDots = kCandidates * NQ;
+    // The dots, then the partial's sum of squares.
+    constexpr int kValues = pow2_at_least(kDots + 1);
+    static_assert(kValues <= 32, "the first reduction fits a warp");
+    __shared__ float red[2][kStepWarps][32];
+    __shared__ float red_norm[2][NQ][kStepWarps];
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kStepThreads);
+    __nv_bfloat16* const dst[kDests] = {dst0, dst1, dst2, dst3};
+    const __nv_bfloat16* const weight[kDests] = {weight0, weight1, weight2, weight3};
+    unsigned normed_rows = 0;
+#pragma unroll
+    for (int k = 0; k < kDests; ++k) {
+        if (dst[k] != nullptr) {
+            normed_rows |= 1u << min(k, NQ - 1);
+        }
+    }
+
+    // Weights first: they do not depend on earlier kernels.
+    float q[NQ][8];
+#pragma unroll
+    for (int j = 0; j < NQ; ++j) {
+        load8(queries + size_t(j) * kHidden, ca, cb, q[j]);
+    }
+    pdl_trigger();
+    pdl_wait();
+
+    int parity = 0;
+    for (int row = blockIdx.x; row < rows; row += gridDim.x, parity ^= 1) {
+        const size_t at = size_t(row) * kHidden;
+        float s[NB][8];
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            load8(blocks + size_t(i) * block_stride + at, ca, cb, s[i]);
+        }
+        float p[8];
+        if (mode == kPartialConvResidual) {
+            // short_conv_residual_rows_2304 for this row: the window is rows row - 3 .. row
+            // of the attention output, reaching into the conv state before the chunk.
+            float win[4][8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int r = row - 3 + k;
+                if (r >= 0) {
+                    load8_bf16(partial_bf16 + size_t(r) * kHidden, ca, cb, win[k]);
+                } else {
+                    load8(conv_state + size_t(3 + r) * kHidden, ca, cb, win[k]);
+                }
+            }
+            float hid[8];
+            if (conv_hidden != nullptr) {
+                load8_bf16(conv_hidden + at, ca, cb, hid);
+            }
+            // The conv taps of this thread's 8 channels, 4 per channel; after the first row
+            // they come from L1.
+            uint4 taps[4];
+            const uint4* wa = reinterpret_cast<const uint4*>(conv_weight + 4 * ca);
+            const uint4* wb = reinterpret_cast<const uint4*>(conv_weight + 4 * cb);
+            taps[0] = wa[0];
+            taps[1] = wa[1];
+            taps[2] = wb[0];
+            taps[3] = wb[1];
+            const auto* w = reinterpret_cast<const __nv_bfloat16*>(taps);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float acc = 0.f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(win[k][e]), __bfloat162float(w[4 * e + k])));
+                }
+                const float y = round_to_bf16(div_short_conv(__fadd_rn(round_to_bf16(acc), win[3][e])));
+                p[e] = conv_hidden != nullptr ? __fadd_rn(hid[e], y) : y;
+            }
+            store8(residual + at, ca, cb, p);
+        } else if (mode == kPartialBf16) {
+            load8_bf16(partial_bf16 + at, ca, cb, p);
+        } else {
+            load8(partial_f32 + at, ca, cb, p);
+        }
+
+        // First reduction: every dot product (candidate i, query j at i * NQ + j, the
+        // partial last), and the partial's sum of squares.
+        float v[kValues];
+#pragma unroll
+        for (int k = 0; k < kValues; ++k) {
+            v[k] = 0.f;
+        }
+#pragma unroll
+        for (int j = 0; j < NQ; ++j) {
+#pragma unroll
+            for (int i = 0; i < NB; ++i) {
+                float acc = 0.f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    acc = fmaf(s[i][e], q[j][e], acc);
+                }
+                v[i * NQ + j] = acc;
+            }
+            float acc = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                acc = fmaf(p[e], q[j][e], acc);
+            }
+            v[NB * NQ + j] = acc;
+        }
+        if (mode != kPartialNormalized) {
+            float acc = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                acc = fmaf(p[e], p[e], acc);
+            }
+            v[kDots] = acc;
+        }
+        red[parity][warp][lane] = warp_transpose_sum_n(v);
+        __syncthreads();
+        float total = 0.f;
+#pragma unroll
+        for (int w = 0; w < kStepWarps; ++w) {
+            total += red[parity][w][lane];
+        }
+        const float squares = __shfl_sync(0xffffffffu, total, kDots);
+        const float inv_p = mode == kPartialNormalized ? 1.f : inv_rms_f32(squares, eps);
+
+        // Softmax over the candidates of each query: lane k < kDots holds candidate k / NQ
+        // of query k % NQ.
+        const bool valid = lane < kDots;
+        const int qj = lane % NQ;
+        const float logit = valid ? (lane >= NB * NQ ? total * inv_p : total) * scale : -INFINITY;
+        float mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < kCandidates; ++i) {
+            mx = fmaxf(mx, __shfl_sync(0xffffffffu, logit, i * NQ + qj));
+        }
+        const float ex = valid ? fast_exp(logit - mx) : 0.f;
+        float z = 0.f;
+#pragma unroll
+        for (int i = 0; i < kCandidates; ++i) {
+            z += __shfl_sync(0xffffffffu, ex, i * NQ + qj);
+        }
+        const float prob = valid ? ex / z : 0.f;
+
+        // Output rows. The partial's scale folds into its weight.
+        float o[NQ][8];
+#pragma unroll
+        for (int j = 0; j < NQ; ++j) {
+            float pr[kCandidates];
+#pragma unroll
+            for (int i = 0; i < kCandidates; ++i) {
+                pr[i] = __shfl_sync(0xffffffffu, prob, i * NQ + j);
+            }
+            const float pp = pr[NB] * inv_p;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float acc = 0.f;
+#pragma unroll
+                for (int i = 0; i < NB; ++i) {
+                    acc = fmaf(pr[i], s[i][e], acc);
+                }
+                o[j][e] = fmaf(pp, p[e], acc);
+            }
+            if (out != nullptr) {
+                store8(out + (size_t(row) * NQ + j) * kHidden, ca, cb, o[j]);
+            }
+            if (probs != nullptr && t == 0) {
+                float* pj = probs + (size_t(row) * NQ + j) * kCandidates;
+#pragma unroll
+                for (int i = 0; i < NB; ++i) {
+                    pj[i] = pr[i];
+                }
+                pj[NB] = pp;
+            }
+        }
+        if (normed_partial != nullptr) {
+            float np[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                np[e] = p[e] * inv_p;
+            }
+            store8(normed_partial + at, ca, cb, np);
+        }
+        if (normed_rows == 0) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < NQ; ++j) {
+            if (normed_rows & (1u << j)) {
+                float acc = 0.f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    acc = fmaf(o[j][e], o[j][e], acc);
+                }
+                acc = warp_sum(acc);
+                if (lane == 0) {
+                    red_norm[parity][j][warp] = acc;
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < NQ; ++j) {
+            if (!(normed_rows & (1u << j))) {
+                continue;
+            }
+            float sum = 0.f;
+#pragma unroll
+            for (int w = 0; w < kStepWarps; ++w) {
+                sum += red_norm[parity][j][w];
+            }
+            const float inv = inv_rms_f32(sum, eps);
+#pragma unroll
+            for (int k = 0; k < kDests; ++k) {
+                if (dst[k] == nullptr || min(k, NQ - 1) != j) {
+                    continue;
+                }
+                float y[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    y[e] = o[j][e] * inv;
+                }
+                if (weight[k] != nullptr) {
+                    float w[8];
+                    load8_bf16(weight[k], ca, cb, w);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        y[e] *= w[e];
+                    }
+                }
+                __nv_bfloat16* d = dst[k] + size_t(row) * dst_stride;
+                const float ya[4] = {y[0], y[1], y[2], y[3]};
+                const float yb[4] = {y[4], y[5], y[6], y[7]};
+                store4(d + ca, ya);
+                store4(d + cb, yb);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+// depth_attention_rows_2304_<NB>_<NQ>: NB block states ([NB] runs of [rows, 2304],
+// block_stride apart) and the partial attend for NQ queries, for each of `rows` rows.
+// `mode` picks the partial as in depth_attention_step_2304; with kPartialConvResidual,
+// partial_bf16 is the attention output [rows, 2304], conv_state ([3, 2304] F32, only
+// read) holds the rows before the chunk, and each row's residual goes to `residual`.
+// out is [rows, NQ, 2304]. probs, if not null, receives each output's weights
+// ([rows, NQ, NB + 1]): out = fmaf(w_NB, partial, sum over i < NB of w_i * block_i, the
+// products chained by fmaf in order from 0), with the partial as given, for kernels that
+// rebuild an output from its candidates. Destination k receives output row
+// min(k, NQ - 1) after an RMS norm, times weight_k if that is not null, as BF16 rows
+// dst_stride apart.
+#define DEPTH_ATTENTION_ROWS(NB, NQ)                                                                            \
+    extern "C" __global__ void __launch_bounds__(kStepThreads) depth_attention_rows_2304_##NB##_##NQ(        \
+        const float* blocks, int block_stride, const float* partial_f32,                                       \
+        const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,            \
+        const float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,                             \
+        float* normed_partial, const float* __restrict__ queries, float* out, float* probs,                     \
+        __nv_bfloat16* dst0, __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,    \
+        const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,                  \
+        const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3, float eps,       \
+        float scale, int rows) {                                                                               \
+        depth_attention_rows<NB, NQ>(blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight,        \
+                                     conv_state, conv_hidden, residual, normed_partial, queries, out, probs,    \
+                                     dst0, dst1, dst2, dst3, dst_stride, weight0, weight1, weight2, weight3,    \
+                                     eps, scale, rows);                                                        \
+    }
+
+#define DEPTH_ATTENTION_ROWS_Q(NQ) \
+    DEPTH_ATTENTION_ROWS(1, NQ)    \
+    DEPTH_ATTENTION_ROWS(2, NQ)    \
+    DEPTH_ATTENTION_ROWS(3, NQ)    \
+    DEPTH_ATTENTION_ROWS(4, NQ)    \
+    DEPTH_ATTENTION_ROWS(5, NQ)
+
+DEPTH_ATTENTION_ROWS_Q(1)
+DEPTH_ATTENTION_ROWS_Q(3)
+DEPTH_ATTENTION_ROWS_Q(4)

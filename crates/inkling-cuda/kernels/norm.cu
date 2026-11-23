@@ -486,23 +486,166 @@ attention_post_bf16(const __nv_bfloat16* __restrict__ k_raw, const __nv_bfloat16
 // attention_post_bf16 for each row (blockIdx.y) of a chunk whose first row sits at
 // position *start. The per-row buffers are [rows, ...]. The k and v conv states are
 // only read; shift_state_rows in conv.cu shifts k_raw and v_raw into them afterwards.
+// Every value rounds as attention_post_row computes it. Inputs that earlier kernels write
+// are not __restrict__, so that no load of them becomes a non-coherent load, which ptxas
+// may move above pdl_wait.
 extern "C" __global__ void __launch_bounds__(kPostThreads)
-attention_post_rows_bf16(const __nv_bfloat16* __restrict__ k_raw, const __nv_bfloat16* __restrict__ v_raw,
+attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                          const __nv_bfloat16* __restrict__ k_weight, const __nv_bfloat16* __restrict__ v_weight,
-                         const __nv_bfloat16* __restrict__ k_dynamic, const __nv_bfloat16* __restrict__ v_dynamic,
+                         const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
                          const float* __restrict__ k_static, const float* __restrict__ v_static,
-                         float* __restrict__ k_state, float* __restrict__ v_state,
-                         const __nv_bfloat16* __restrict__ q_raw, const __nv_bfloat16* __restrict__ q_scale,
-                         const __nv_bfloat16* __restrict__ r_raw, const __nv_bfloat16* __restrict__ r_scale,
-                         __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
-                         __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ r,
-                         const uint32_t* __restrict__ start, int log_scale, float alpha, float n_floor,
-                         float qk_threshold, float rel_threshold, float eps) {
+                         const float* k_state, const float* v_state, const __nv_bfloat16* q_raw,
+                         const __nv_bfloat16* __restrict__ q_scale, const __nv_bfloat16* r_raw,
+                         const __nv_bfloat16* __restrict__ r_scale, __nv_bfloat16* k, __nv_bfloat16* v,
+                         __nv_bfloat16* q, __nv_bfloat16* r, const uint32_t* start, int log_scale, float alpha,
+                         float n_floor, float qk_threshold, float rel_threshold, float eps) {
     const int row = blockIdx.y;
+    const int b = blockIdx.x;
+    if (b >= kQBlock0) {
+        pdl_trigger();
+        pdl_wait();
+        const float tau = log_scale ? log_scale_tau(*start + uint32_t(row), alpha, n_floor) : 1.f;
+        // bf16(x * tau) as log_scale_bf16 does it, or x unchanged.
+        const auto scaled = [&](float x) {
+            return log_scale ? __bfloat162float(__float2bfloat16(__fmul_rn(x, tau))) : x;
+        };
+        if (b < kRBlock) {
+            // Queries: the scaled L2 clip of each head, one warp per head.
+            const int head = (b - kQBlock0) * kHeadsPerBlock + threadIdx.x / 32;
+            const size_t c0 = size_t(row) * kQHeads * kHeadDim + head * kHeadDim + threadIdx.x % 32 * kVec;
+            float x[kVec];
+            float sc[kVec];
+            load_bf16x4(q_raw + c0, x);
+            load_bf16x4(q_scale + head * kHeadDim + threadIdx.x % 32 * kVec, sc);
+#pragma unroll
+            for (int i = 0; i < kVec; ++i) {
+                x[i] = __fmul_rn(x[i], sc[i]);
+            }
+            const float factor = l2_clip_factor(l2_sum_128(x), qk_threshold);
+#pragma unroll
+            for (int i = 0; i < kVec; ++i) {
+                x[i] = scaled(__bfloat162float(__float2bfloat16(__fmul_rn(x[i], factor))));
+            }
+            store_bf16x4(q + c0, x);
+            return;
+        }
+        // Relative-position heads: one thread each, summing in order as l2_clip_bf16_16 does.
+        const int head = threadIdx.x;
+        if (head >= kQHeads) {
+            return;
+        }
+        const size_t at = (size_t(row) * kQHeads + head) * kRelDim;
+        float x[kRelDim];
+#pragma unroll
+        for (int i = 0; i < kRelDim; i += kVec) {
+            float part[kVec];
+            float sc[kVec];
+            load_bf16x4(r_raw + at + i, part);
+            load_bf16x4(r_scale + head * kRelDim + i, sc);
+#pragma unroll
+            for (int j = 0; j < kVec; ++j) {
+                x[i + j] = __fmul_rn(part[j], sc[j]);
+            }
+        }
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < kRelDim; ++i) {
+            acc = __fadd_rn(acc, __fmul_rn(x[i], x[i]));
+        }
+        const float factor = l2_clip_factor(acc, rel_threshold);
+#pragma unroll
+        for (int i = 0; i < kRelDim; i += kVec) {
+            float part[kVec];
+#pragma unroll
+            for (int j = 0; j < kVec; ++j) {
+                part[j] = scaled(__bfloat162float(__float2bfloat16(__fmul_rn(x[i + j], factor))));
+            }
+            store_bf16x4(r + at + i, part);
+        }
+        return;
+    }
+    // Keys and values: short conv (static, or dynamic when k_dynamic is not null) of
+    // rows row - 3 .. row, reaching into the conv state before the chunk, then the L2 clip
+    // (keys) or the unweighted RMS norm of the head (values).
+    const bool is_k = b < kVBlock0;
+    const int head = (is_k ? b - kKBlock0 : b - kVBlock0) * kHeadsPerBlock + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int c0 = head * kHeadDim + lane * kVec;
+    const __nv_bfloat16* x = is_k ? k_raw : v_raw;
+    const float* state = is_k ? k_state : v_state;
+    const __nv_bfloat16* dynamic = is_k ? k_dynamic : v_dynamic;
+    const bool dyn = dynamic != nullptr;
+    // Weights first. Static conv: 4 taps per channel. Dynamic conv: the static weights by
+    // lag, [4, 1024].
+    float taps[kVec][conv_step::kKernel];
+    float stat[conv_step::kKernel][kVec];
+    if (dyn) {
+        const float* sw = is_k ? k_static : v_static;
+#pragma unroll
+        for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+            load_f32x4(sw + lag * kKvDims + c0, stat[lag]);
+        }
+    } else {
+        const __nv_bfloat16* w = is_k ? k_weight : v_weight;
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            load_bf16x4(w + size_t(c0 + i) * conv_step::kKernel, taps[i]);
+        }
+    }
     pdl_trigger();
     pdl_wait();
-    attention_post_row<true>(k_raw, v_raw, k_weight, v_weight, k_dynamic, v_dynamic, k_static, v_static,
-                             k_state, v_state, q_raw, q_scale, r_raw, r_scale, k, v, q, r, row,
-                             log_scale ? *start + uint32_t(row) : 0u, log_scale, alpha, n_floor,
-                             qk_threshold, rel_threshold, eps);
+    float win[conv_step::kKernel][kVec];
+#pragma unroll
+    for (int kk = 0; kk < conv_step::kKernel; ++kk) {
+        const int t = row - (conv_step::kKernel - 1) + kk;
+        if (t >= 0) {
+            load_bf16x4(x + size_t(t) * kKvDims + c0, win[kk]);
+        } else {
+            load_f32x4(state + size_t(conv_step::kKernel - 1 + t) * kKvDims + c0, win[kk]);
+        }
+    }
+    float dw[conv_step::kKernel];
+    if (dyn) {
+        load_bf16x4(dynamic + size_t(row) * kKvHeads * conv_step::kKernel + head * conv_step::kKernel, dw);
+    }
+    float y[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        float acc = 0.f;
+        float out;
+        if (dyn) {
+            // dynamic_conv_window in conv_step.cuh.
+#pragma unroll
+            for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+                const float w = __fadd_rn(stat[lag][i], dw[lag]);
+                acc = __fadd_rn(acc, __fmul_rn(win[conv_step::kKernel - 1 - lag][i], w));
+            }
+            out = __fdiv_rn(__fadd_rn(acc, win[conv_step::kKernel - 1][i]), conv_step::kDynamicDivisor);
+        } else {
+            // short_conv_window in conv_step.cuh.
+#pragma unroll
+            for (int kk = 0; kk < conv_step::kKernel; ++kk) {
+                acc = __fadd_rn(acc, __fmul_rn(conv_step::round_bf16(win[kk][i]), taps[i][kk]));
+            }
+            out = __fdiv_rn(__fadd_rn(conv_step::round_bf16(acc), win[conv_step::kKernel - 1][i]),
+                            conv_step::kShortDivisor);
+        }
+        y[i] = __bfloat162float(__float2bfloat16(out));
+    }
+    const size_t at = size_t(row) * kKvDims + c0;
+    if (is_k) {
+        const float factor = l2_clip_factor(l2_sum_128(y), qk_threshold);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            y[i] = __fmul_rn(y[i], factor);
+        }
+        store_bf16x4(k + at, y);
+    } else {
+        const float scale = inv_rms_f32(warp_sum(fma_sum_squares(y)), kHeadDim, eps);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            y[i] *= scale;
+        }
+        store_bf16x4(v + at, y);
+    }
 }

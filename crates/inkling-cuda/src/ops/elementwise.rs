@@ -160,12 +160,16 @@ impl Elementwise {
             out.len()
         );
         let n = attn.len();
-        let mut launch = stream.launch_builder(&self.attention_gate_bf16);
-        launch.arg(&attn).arg(&gate).arg(&mut out).arg(&n);
+        let mut args = KernelArgs::default();
+        args.ptr(&attn, stream)
+            .ptr(&gate, stream)
+            .ptr_mut(&mut out, stream)
+            .u64(u64::try_from(n)?);
         // SAFETY: the arguments match `attention_gate_bf16(const bf16*, const bf16*, bf16*,
-        // size_t)`, and all three buffers hold `n` elements.
-        unsafe { launch.launch(grid_stride(n)) }?;
-        Ok(())
+        // size_t)`, all three buffers hold `n` elements, a multiple of 8 (whole rows of
+        // 3072), cudarc allocations are 256-byte aligned and rows keep 16-byte alignment, and
+        // the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.attention_gate_bf16, grid_stride(n / 8)) }
     }
 
     /// Multiplies each `row_width`-element row of `x` in place by the log-scaling factor

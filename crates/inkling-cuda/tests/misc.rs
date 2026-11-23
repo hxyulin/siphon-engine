@@ -27,6 +27,10 @@ const EPS: f32 = 1e-6;
 /// Allowed combine error, as a multiple of `|h| + |m|`. Metal's tanh is up to 3 F32 ulps from
 /// the true value, which is at most 3 * 2^-24 for a result below 1.
 const COMBINE_TOLERANCE: f32 = 1.0 / (1 << 21) as f32;
+/// Allowed difference between the chunked and single-row gate outputs, as a multiple of
+/// `|h| + |m|`: the dots of 64 products, summed in two orders, differ by a few F32 ulps of
+/// their magnitude, and tanh' <= 1 carries that into each factor.
+const GATE_ROWS_TOLERANCE: f32 = 1.0 / (1 << 18) as f32;
 
 struct Setup {
     fixture: Fixture,
@@ -459,12 +463,18 @@ fn argmax_wide_matches_argmax() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The chunked message gate against single-row calls, bit for bit, with and without the
-/// norm. 45 rows cover a full row tile of 32 and a partial one; h and m rows sit 2 x 2304
-/// floats apart, as in the model.
+/// The chunked message gate against single-row calls, with and without the norm. 77 rows
+/// cover a full row tile of 64 and a partial one; h and m rows sit 2 x 2304 floats apart,
+/// as in the model.
+///
+/// The chunked kernel sums the two products with the down projection on tensor cores, the
+/// single-row kernel with FMA chains, so the dots differ by F32 rounding: 64 products of
+/// BF16 values, each exact in F32, whose sums round at most 64 times. The gate output is
+/// checked within `GATE_ROWS_TOLERANCE` of `|h| + |m|`, and the BF16 normalized output
+/// within one ulp.
 #[test]
 fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
-    const ROWS: usize = 45;
+    const ROWS: usize = 77;
     const STRIDE: usize = 2 * HIDDEN;
     let s = Setup::new()?;
     let stream = s.stream();
@@ -491,6 +501,7 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
         &gain,
         (&h, STRIDE),
         (&m, STRIDE),
+        None,
         &mut out,
         Some((&weight, &mut normed)),
         EPS,
@@ -504,6 +515,7 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
         &gain,
         (&h, STRIDE),
         (&m, STRIDE),
+        None,
         &mut out_plain,
         None,
         EPS,
@@ -512,8 +524,8 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
     let (out, normed) = (stream.clone_dtoh(&out)?, stream.clone_dtoh(&normed)?);
     let out_plain = stream.clone_dtoh(&out_plain)?;
 
-    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
     let mut counter = stream.alloc_zeros::<u32>(GATE_SLOTS)?;
+    let mut worst = 0.0f32;
     for row in 0..ROWS {
         let h_row = stream.clone_htod(&h_host[row * STRIDE..row * STRIDE + HIDDEN])?;
         let m_row = stream.clone_htod(&m_host[row * STRIDE..row * STRIDE + HIDDEN])?;
@@ -535,22 +547,30 @@ fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
             &mut counter,
             EPS,
         )?;
-        let out_want = bits(&stream.clone_dtoh(&out_want)?);
+        let out_want = stream.clone_dtoh(&out_want)?;
         let range = row * HIDDEN..(row + 1) * HIDDEN;
-        assert_eq!(bits(&out[range.clone()]), out_want, "row {row}: out");
         assert_eq!(
-            bits(&out_plain[range.clone()]),
-            out_want,
-            "row {row}: out without the norm"
+            out[range.clone()],
+            out_plain[range.clone()],
+            "row {row}: out with and without the norm"
         );
-        let normed_bits: Vec<u16> = normed[range].iter().map(|x| x.to_bits()).collect();
-        let want_bits: Vec<u16> = stream
-            .clone_dtoh(&normed_want)?
-            .iter()
-            .map(|x| x.to_bits())
-            .collect();
-        assert_eq!(normed_bits, want_bits, "row {row}: normed");
+        for (d, (&got, &want)) in out[range.clone()].iter().zip(&out_want).enumerate() {
+            let scale = h_host[row * STRIDE + d].abs() + m_host[row * STRIDE + d].abs();
+            let error = (got - want).abs() / scale;
+            worst = worst.max(error);
+            assert!(
+                error <= GATE_ROWS_TOLERANCE,
+                "row {row}, column {d}: got {got:e}, want {want:e}"
+            );
+        }
+        assert_bf16_close(
+            &format!("row {row}: normed"),
+            &normed[range],
+            &stream.clone_dtoh(&normed_want)?,
+            1,
+        );
     }
+    eprintln!("largest gate output error: {worst:.2e} of |h| + |m|");
     Ok(())
 }
 

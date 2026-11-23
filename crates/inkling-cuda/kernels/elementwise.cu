@@ -73,13 +73,25 @@ extern "C" __global__ void softcapped_swiglu_bf16(const __nv_bfloat162* gate_up,
     }
 }
 
-// out = bf16(f32(attn) * sigmoid(f32(gate))), the end of `Attention._attend`.
+// out = bf16(f32(attn) * sigmoid(f32(gate))), the end of `Attention._attend`, for n
+// elements, a multiple of 8. Each thread takes 8 consecutive elements per step.
 extern "C" __global__ void attention_gate_bf16(const __nv_bfloat16* attn,
                                                const __nv_bfloat16* gate,
                                                __nv_bfloat16* out, size_t n) {
-    for (size_t i = grid_index(); i < n; i += grid_stride()) {
-        const float g = mlx_sigmoid(__bfloat162float(gate[i]));
-        out[i] = to_bf16(fmul(__bfloat162float(attn[i]), g));
+    pdl_trigger();
+    pdl_wait();
+    for (size_t v = grid_index(); v < n / kVec; v += grid_stride()) {
+        const uint4 a = reinterpret_cast<const uint4*>(attn)[v];
+        const uint4 g = reinterpret_cast<const uint4*>(gate)[v];
+        const auto* av = reinterpret_cast<const __nv_bfloat16*>(&a);
+        const auto* gv = reinterpret_cast<const __nv_bfloat16*>(&g);
+        uint4 o;
+        auto* ov = reinterpret_cast<__nv_bfloat16*>(&o);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            ov[i] = to_bf16(fmul(__bfloat162float(av[i]), mlx_sigmoid(__bfloat162float(gv[i]))));
+        }
+        reinterpret_cast<uint4*>(out)[v] = o;
     }
 }
 

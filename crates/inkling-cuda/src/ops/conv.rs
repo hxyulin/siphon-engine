@@ -24,6 +24,10 @@ const DYNAMIC_DIMS: usize = 1024;
 const DYNAMIC_HEADS: usize = 8;
 /// Threads per block; each thread owns one channel.
 const BLOCK: u32 = 256;
+/// Rows per block of `moe_conv_residual_rows_2304`, and its threads and columns per block.
+const MOE_CONV_ROWS: usize = 8;
+const MOE_CONV_THREADS: u32 = 192;
+const MOE_CONV_BLOCK_COLS: usize = 768;
 /// Hidden width, the channels of the post-attention and post-MLP convs.
 const HIDDEN: usize = 2304;
 /// Experts per token in the MoE combine.
@@ -55,8 +59,7 @@ pub struct Conv {
     short_conv_residual_2304: CudaFunction,
     moe_conv_residual_2304: CudaFunction,
     short_conv_residual_rows_2304: CudaFunction,
-    moe_combine_rows_2304: CudaFunction,
-    post_mlp_conv_rows_2304: CudaFunction,
+    moe_conv_residual_rows_2304: CudaFunction,
     shift_state_rows: CudaFunction,
 }
 
@@ -87,8 +90,7 @@ impl Conv {
             short_conv_residual_2304: module.load_function("short_conv_residual_2304")?,
             moe_conv_residual_2304: module.load_function("moe_conv_residual_2304")?,
             short_conv_residual_rows_2304: module.load_function("short_conv_residual_rows_2304")?,
-            moe_combine_rows_2304: module.load_function("moe_combine_rows_2304")?,
-            post_mlp_conv_rows_2304: module.load_function("post_mlp_conv_rows_2304")?,
+            moe_conv_residual_rows_2304: module.load_function("moe_conv_residual_rows_2304")?,
             shift_state_rows: module.load_function("shift_state_rows")?,
         })
     }
@@ -296,7 +298,8 @@ impl Conv {
 
     /// [`Conv::moe_conv_residual`] for the `rows` rows of a chunk: `experts`
     /// `[rows, 8, 2304]`, `weights` `[rows, 8]`, `residual` and `out` `[rows, 2304]`.
-    /// `combined` `[rows, 2304]` receives the MoE combine, the conv's input. Updates
+    /// `combined` `[rows, 2304]` receives the MoE combine, the conv's input, of the last
+    /// three rows, which the state shift reads; its other rows are left alone. Updates
     /// `state` as [`Conv::short_conv_residual_rows`] does, and gives the single-row results
     /// bit for bit.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
@@ -325,24 +328,29 @@ impl Conv {
         ] {
             check_len(name, len, rows * HIDDEN)?;
         }
-        let config = hidden_rows_config(rows)?;
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(HIDDEN / MOE_CONV_BLOCK_COLS)?,
+                u32::try_from(rows.div_ceil(MOE_CONV_ROWS)).context("too many rows")?,
+                1,
+            ),
+            block_dim: (MOE_CONV_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut args = KernelArgs::default();
         args.ptr(&experts, stream)
             .ptr(&weights, stream)
-            .ptr_mut(&mut combined, stream);
-        // SAFETY: the arguments match `moe_combine_rows_2304(const bf16*, const float*,
-        // bf16*)`, the buffers hold `rows` rows as checked above, and the grid has one y index
-        // per row.
-        unsafe { args.launch_pdl(stream, &self.moe_combine_rows_2304, config) }?;
-        let mut args = KernelArgs::default();
-        args.ptr(&combined, stream)
             .ptr(weight, stream)
             .ptr(&*state, stream)
             .ptr(&residual, stream)
-            .ptr_mut(&mut out, stream);
-        // SAFETY: the arguments match `post_mlp_conv_rows_2304(const bf16*, const bf16*,
-        // const float*, const float*, bf16*)`, with the lengths checked above.
-        unsafe { args.launch_pdl(stream, &self.post_mlp_conv_rows_2304, config) }?;
+            .ptr_mut(&mut combined, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(rows).context("too many rows")?);
+        // SAFETY: the arguments match `moe_conv_residual_rows_2304(const bf16*, const float*,
+        // const bf16*, const float*, const float*, bf16*, bf16*, int)`, the buffers hold
+        // `rows` rows as checked above, and the grid covers the row in 3 blocks of 768
+        // columns and the rows in tiles of 16 (the kernel stops at `rows`).
+        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_rows_2304, config) }?;
         self.shift_state(stream, &combined.slice(..), state, HIDDEN, rows)
     }
 
