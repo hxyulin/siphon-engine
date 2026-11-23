@@ -54,7 +54,6 @@ pub struct Spec {
     ring_backup: CudaFunction,
     ring_restore: CudaFunction,
     accept_greedy: CudaFunction,
-    row_positions: CudaFunction,
 }
 
 impl Spec {
@@ -69,31 +68,7 @@ impl Spec {
             ring_backup: f("ring_backup")?,
             ring_restore: f("ring_restore")?,
             accept_greedy: f("accept_greedy")?,
-            row_positions: f("row_positions")?,
         })
-    }
-
-    /// Writes `start + i` to `positions[i]` for each of `rows` rows.
-    pub fn row_positions(
-        &self,
-        stream: &CudaStream,
-        start: &CudaSlice<u32>,
-        positions: &mut CudaSlice<u32>,
-        rows: usize,
-    ) -> anyhow::Result<()> {
-        check_len("start", start.len(), 1)?;
-        ensure!(
-            (1..=positions.len().min(VERIFY_ROWS)).contains(&rows),
-            "{rows} rows, {} positions",
-            positions.len()
-        );
-        let rows = i32::try_from(rows)?;
-        let mut launch = stream.launch_builder(&self.row_positions);
-        launch.arg(start).arg(positions).arg(&rows);
-        // SAFETY: the arguments match `row_positions(const unsigned*, unsigned*, int)`; the
-        // one block of 32 threads writes the first `rows` positions, which exist.
-        unsafe { launch.launch(one_block(32)) }?;
-        Ok(())
     }
 
     /// Copies the rows of `src` `[rows, 2304]` into tap `tap` of `taps` `[rows, 4, 2304]`.

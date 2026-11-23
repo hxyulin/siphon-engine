@@ -1404,6 +1404,73 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
     }
 }
 
+// moe_router_step_2304 for 1 to kStepRouterRows rows of a step, such as a speculative
+// verify: each row's logits sum exactly as moe_router_step_2304 sums one row's, so each
+// row's logits, indices and weights equal a one-row call's bit for bit, for every row
+// count. One block per expert reads its router row once for all rows; the last block to
+// finish routes every row. `counter` must start at 0; the last block resets it.
+constexpr int kStepRouterRows = 8;
+
+extern "C" __global__ void __launch_bounds__(kStepThreads)
+moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restrict__ router,
+                          const float* __restrict__ bias, float* logits, int32_t* indices,
+                          float* weights, unsigned* counter, float route_scale) {
+    __shared__ float warp_dots[kStepRouterRows][kStepWarps];
+    __shared__ bool last;
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kStepThreads);
+    const int e = blockIdx.x;
+    float w[8];
+    load8(router + size_t(e) * kHidden, ca, cb, w);
+    pdl_trigger();
+    pdl_wait();
+    for (int r = 0; r < rows; ++r) {
+        const __nv_bfloat16* xr = x + size_t(r) * kHidden;
+        float xv[8];
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(xr + ca), xv);
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(xr + cb), xv + 4);
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc = fmaf(w[i], xv[i], acc);
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) {
+            warp_dots[r][warp] = acc;
+        }
+    }
+    __syncthreads();
+    if (t < rows) {
+        float total = 0.f;
+#pragma unroll
+        for (int s = 0; s < kStepWarps; ++s) {
+            total += warp_dots[t][s];
+        }
+        logits[t * kExperts + e] = total;
+        // Orders this thread's logit before thread 0's count below.
+        __threadfence();
+    }
+    __syncthreads();
+    if (t == 0) {
+        unsigned old;
+        asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], 1;" : "=r"(old) : "l"(counter) : "memory");
+        last = old == kExperts - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        route_top8(logits + r * kExperts, bias, indices + r * kTopK, weights + r * kTopK, route_scale);
+    }
+    if (t == 0) {
+        *counter = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Depth attention for the rows of a chunk, in the order of depth_attention_step_2304
 // rather than MLX's: thread t holds elements 4t.. and 4(t + 288).. of every row, and each

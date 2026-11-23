@@ -132,6 +132,11 @@ impl KernelArgs {
         self
     }
 
+    pub fn u32(&mut self, v: u32) -> &mut Self {
+        self.0.push(u64::from(v));
+        self
+    }
+
     pub fn f32(&mut self, v: f32) -> &mut Self {
         self.0.push(u64::from(v.to_bits()));
         self

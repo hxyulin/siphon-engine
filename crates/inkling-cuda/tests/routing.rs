@@ -26,7 +26,7 @@ use inkling_cuda::{
         norm::Norm,
         routing::{
             DepthRows, DepthStep, EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul,
-            RouterRowsScratch, Routing, RowsPartial, StepPartial, TOP_K,
+            RouterRowsScratch, Routing, RowsPartial, STEP_ROUTER_ROWS, StepPartial, TOP_K,
         },
     },
 };
@@ -1102,6 +1102,84 @@ fn moe_router_step_matches_moe_router() -> anyhow::Result<()> {
             &weights_of(&got),
             &weights_of(&want),
             2e-6,
+        );
+        assert_eq!(
+            stream.clone_dtoh(&counter)?,
+            [0],
+            "the kernel resets its counter"
+        );
+    }
+    Ok(())
+}
+
+/// The multi-row step router against the one-row step router: every row's logits,
+/// indices and weights bit for bit, for 1 to 8 rows.
+#[test]
+fn moe_router_step_rows_matches_step() -> anyhow::Result<()> {
+    let fixture = Fixture::load("routing")?;
+    let (bias, _) = fixture.f32("router.bias")?;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let router = stream.clone_htod(&router_weight())?;
+    let bias_dev = stream.clone_htod(&bias)?;
+    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    let rows_max = STEP_ROUTER_ROWS;
+    let x_host = pseudo_random_bf16(rows_max * HIDDEN, 600, 2.0, 0.0);
+    // Each row alone through the one-row kernel.
+    let mut want = (Vec::new(), Vec::new(), Vec::new());
+    for r in 0..rows_max {
+        let x = stream.clone_htod(&x_host[r * HIDDEN..(r + 1) * HIDDEN])?;
+        let mut logits = stream.alloc_zeros::<f32>(EXPERTS)?;
+        let mut indices = stream.alloc_zeros::<i32>(TOP_K)?;
+        let mut weights = stream.alloc_zeros::<f32>(TOP_K)?;
+        routing.moe_router_step(
+            stream,
+            &x,
+            &router,
+            &bias_dev,
+            &mut logits,
+            &mut indices,
+            &mut weights,
+            &mut counter,
+            ROUTE_SCALE,
+        )?;
+        want.0.extend(stream.clone_dtoh(&logits)?);
+        want.1.extend(stream.clone_dtoh(&indices)?);
+        want.2.extend(stream.clone_dtoh(&weights)?);
+    }
+    let to_bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for rows in 1..=rows_max {
+        let x_rows = stream.clone_htod(&x_host[..rows * HIDDEN])?;
+        let mut logits = stream.alloc_zeros::<f32>(rows * EXPERTS)?;
+        let mut indices = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+        let mut weights = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+        routing.moe_router_step_rows(
+            stream,
+            &x_rows,
+            &router,
+            &bias_dev,
+            &mut logits,
+            &mut indices,
+            &mut weights,
+            &mut counter,
+            ROUTE_SCALE,
+            rows,
+        )?;
+        assert_eq!(
+            to_bits(&stream.clone_dtoh(&logits)?),
+            to_bits(&want.0[..rows * EXPERTS]),
+            "{rows} rows: logits"
+        );
+        assert_eq!(
+            stream.clone_dtoh(&indices)?,
+            want.1[..rows * TOP_K],
+            "{rows} rows: indices"
+        );
+        assert_eq!(
+            to_bits(&stream.clone_dtoh(&weights)?),
+            to_bits(&want.2[..rows * TOP_K]),
+            "{rows} rows: weights"
         );
         assert_eq!(
             stream.clone_dtoh(&counter)?,

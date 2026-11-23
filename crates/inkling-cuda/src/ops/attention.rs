@@ -74,6 +74,17 @@ const PREFILL_BLOCK: u32 = 256;
 const PREFILL_SHARED_BYTES: u32 = 84_240;
 /// F32 values of one prefill partial slot: 128 rows of 128 outputs, a max and a sum.
 const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
+/// Most rows [`Attention::attention_rows`] takes, `kRowsMax` in the kernel.
+pub const ROWS_MAX: usize = 8;
+/// Blocks per KV head of `attention_rows_*`: each takes every 32nd split of 64 slots.
+const ROWS_BLOCKS: usize = 32;
+/// Most query rows one warp of `attention_rows_*` owns: 3 heads x 8 rows over 8 warps.
+const ROWS_WARP_QUERIES: usize = 3;
+/// Threads per block of `attention_rows_*`.
+const ROWS_THREADS: u32 = 256;
+/// Dynamic shared memory of `attention_rows_bf16` and `attention_rows_fp8`, the sizes of
+/// `RowsShared` in the kernel.
+const ROWS_SHARED_BYTES: [u32; 2] = [49_152, 32_768];
 
 /// Element format of the global-layer KV caches. Sliding caches are always BF16.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -385,6 +396,29 @@ pub struct Attention {
     decode_step_fp8: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
+    /// `attention_rows_bf16_<NQ>` and `attention_rows_fp8_<NQ>` for NQ = 1 to 3.
+    rows: Vec<[CudaFunction; 2]>,
+    rows_combine: CudaFunction,
+}
+
+/// The partials of [`Attention::attention_rows`]: per query row of up to 8 x 24, one
+/// output, max and sum per block of its KV head.
+#[derive(Debug)]
+pub struct RowsAttentionScratch {
+    out: CudaSlice<f32>,
+    max: CudaSlice<f32>,
+    sum: CudaSlice<f32>,
+}
+
+impl RowsAttentionScratch {
+    pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let rows = ROWS_MAX * HEADS * ROWS_BLOCKS;
+        Ok(Self {
+            out: stream.alloc_zeros(rows * HEAD_DIM)?,
+            max: stream.alloc_zeros(rows)?,
+            sum: stream.alloc_zeros(rows)?,
+        })
+    }
 }
 
 fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
@@ -404,6 +438,14 @@ fn extent(name: &str, len: usize, rows: usize) -> anyhow::Result<u32> {
 impl Attention {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "attention", cubin!("attention"))?;
+        let rows_function = |name: &str, smem: u32| -> anyhow::Result<CudaFunction> {
+            let function = module.load_function(name)?;
+            function.set_attribute(
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem.cast_signed(),
+            )?;
+            Ok(function)
+        };
         let prefill = module.load_function("prefill_attention_bf16")?;
         let prefill_fp8 = module.load_function("prefill_attention_fp8")?;
         for function in [&prefill, &prefill_fp8] {
@@ -425,7 +467,120 @@ impl Attention {
             decode_step_fp8: module.load_function("decode_step_fp8")?,
             prefill,
             prefill_fp8,
+            rows: (1..=ROWS_WARP_QUERIES)
+                .map(|nq| {
+                    Ok([
+                        rows_function(&format!("attention_rows_bf16_{nq}"), ROWS_SHARED_BYTES[0])?,
+                        rows_function(&format!("attention_rows_fp8_{nq}"), ROWS_SHARED_BYTES[1])?,
+                    ])
+                })
+                .collect::<anyhow::Result<_>>()?,
+            rows_combine: module.load_function("attention_rows_combine")?,
         })
+    }
+
+    /// The attention of the `rows` rows of a step, 1 to [`ROWS_MAX`], such as a speculative
+    /// verify, at positions `start + i`: attends from each row's query (`q`
+    /// `[rows, 24, 128]`) into `out` (`[rows, 24, 128]`) as `rows` pairs of
+    /// [`Attention::append`] and [`Attention::decode_attention`] would, with each row's
+    /// relative bias (`bias` `[rows, 24, extent]`) and sinks (`sinks` `[rows, 24]`), then
+    /// appends their keys `k` and values `v` (`[rows, 8, 128]`) to `cache`.
+    ///
+    /// Each key and value tile streams once for all rows. Each row's result depends only on
+    /// its position, its query and the cache: it is the same, bit for bit, for every row
+    /// count and whatever the other rows hold, so a call of one row at position `start + i`
+    /// gives row `i`. It differs from [`Attention::decode_attention`]'s by F32 summation
+    /// order. The caller checks [`KvCache::holds`] for the last row's position.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the attention inputs and outputs"
+    )]
+    pub fn attention_rows(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        cache: &mut KvCache,
+        start: &CudaSlice<u32>,
+        rows: usize,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
+        scratch: &mut RowsAttentionScratch,
+        out: &mut impl DeviceOut<bf16>,
+    ) -> anyhow::Result<()> {
+        let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
+        let mut out = out.view_mut();
+        ensure!(
+            (1..=ROWS_MAX).contains(&rows),
+            "{rows} rows, expected 1 to {ROWS_MAX}"
+        );
+        check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        check_len("sinks", sinks.len(), rows * HEADS)?;
+        check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("start", start.len(), 1)?;
+        let extent = extent("bias", bias.len(), rows * HEADS)?;
+        let slots = u32::try_from(cache.slots)?;
+        let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
+        // The entry point whose loops cover each warp's query rows, ceil(3 rows / 8).
+        let entry = &self.rows[(3 * rows).div_ceil(8) - 1];
+        let (function, smem) = match cache.data {
+            KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
+            KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
+        match &cache.data {
+            KvData::Bf16 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
+            KvData::Fp8 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
+        };
+        args.ptr(&bias, stream)
+            .ptr(&sinks, stream)
+            .ptr_mut(&mut scratch.out, stream)
+            .ptr_mut(&mut scratch.max, stream)
+            .ptr_mut(&mut scratch.sum, stream)
+            .ptr(start, stream)
+            .i32(i32::try_from(rows)?)
+            .u32(slots)
+            .u32(window)
+            .u32(extent)
+            .f32(SCALE);
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS as u32, 1),
+            block_dim: (ROWS_THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        // SAFETY: the arguments match `attention_rows_bf16_<NQ>(const bf16* q, const bf16* k_new,
+        // const bf16* v_new, const bf16* k_cache, const bf16* v_cache, const bf16* bias, const bf16* sinks, float* partial_out, float*
+        // partial_max, float* partial_sum, const unsigned* start, int rows, unsigned slots,
+        // unsigned window, unsigned extent, float scale)`, or `attention_rows_fp8_<NQ>` with
+        // `uint8_t*` caches. The kernel reads slots below min(start + rows, slots) of the
+        // caches, which the caller checked the cache holds, `rows` rows of q, k, v, bias and
+        // sinks,
+        // and writes partials for `rows` x 24 query rows of `ROWS_BLOCKS` blocks, which the
+        // scratch holds. It reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, function, config) }?;
+
+        let mut args = KernelArgs::default();
+        args.ptr(&scratch.out, stream)
+            .ptr(&scratch.max, stream)
+            .ptr(&scratch.sum, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(ROWS_BLOCKS)?);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows * HEADS)?, 1, 1),
+            block_dim: (HEAD_DIM as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `attention_rows_combine(const float*, const float*,
+        // const float*, bf16*, int)`; the grid has one block per query row, each reading the
+        // `ROWS_BLOCKS` partials the attention kernel wrote and writing its 128 outputs,
+        // which `out` holds. It reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.rows_combine, config) }?;
+        // After the attention kernel, which reads the slots the rows overwrite.
+        self.append_rows(stream, cache, start, rows, &k, &v)
     }
 
     /// `bias = rel @ table` for relative states `rel` `[rows, 24, 16]` and the layer's

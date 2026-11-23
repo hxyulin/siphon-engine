@@ -1,0 +1,216 @@
+//! The expert MLP of 1 to 8 rows in one kernel (`kernels/experts_rows.cu`).
+//!
+//! [`ExpertsRows::expert_mlp_rows`] runs, for every (row, slot) pair, the routed expert's
+//! `w13`, the softcapped SwiGLU and `w2`, as [`crate::ops::experts::Experts::expert_mlp`]
+//! does for one row. It groups the pairs by expert on the device and streams each distinct
+//! expert's weights once for all its rows, so a call reads the weights of the distinct
+//! experts, not of 8 per row. Nothing depends on the host knowing the routing, so the call
+//! can be captured in a CUDA graph.
+//!
+//! Each pair's results are the same, bit for bit, for every row count and whatever the
+//! other rows route to. They differ from `expert_mlp`'s by F32 summation order.
+
+use std::sync::Arc;
+
+use anyhow::{Context as _, ensure};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaStream, LaunchConfig,
+    sys::{CUdevice_attribute, CUfunction_attribute},
+};
+use half::bf16;
+
+use crate::{
+    DeviceIn, DeviceOut,
+    gpu::{KernelArgs, cubin, load_module},
+    ops::experts::{ExpertFormat, ExpertWeights},
+};
+
+/// Most rows one call takes.
+pub const MAX_ROWS: usize = 8;
+/// Experts each row routes to.
+const SLOTS: usize = 8;
+/// `w13` is `[experts, 2 * K2, K13]` and `w2` `[experts, N2, K2]`.
+const K13: usize = 2304;
+const K2: usize = 1152;
+const N2: usize = 2304;
+/// Warps per block, `kWarps` in the kernel.
+const WARPS: usize = 4;
+/// Dynamic shared memory per block: `kWarps` warps of `kRing` slots of 16 rows of 128 bytes.
+const SMEM: usize = WARPS * 3 * 16 * 128;
+
+#[derive(Debug)]
+pub struct ExpertsRows {
+    /// NVFP4 and MXFP8.
+    kernels: [CudaFunction; 2],
+    /// Blocks of each kernel that fit on the GPU at once.
+    blocks: [usize; 2],
+}
+
+impl ExpertsRows {
+    pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
+        let module = load_module(ctx, "experts_rows", cubin!("experts_rows"))?;
+        let sms = usize::try_from(
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )?;
+        let load = |name: &str, smem: usize| -> anyhow::Result<(CudaFunction, usize)> {
+            let function = module.load_function(name)?;
+            function.set_attribute(
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(smem)?,
+            )?;
+            let per_sm = function.occupancy_max_active_blocks_per_multiprocessor(
+                u32::try_from(WARPS * 32)?,
+                smem,
+                None,
+            )?;
+            let per_sm = usize::try_from(per_sm)?;
+            ensure!(per_sm > 0, "{name} does not fit on an SM");
+            Ok((function, per_sm * sms))
+        };
+        let (nvfp4, nvfp4_blocks) = load("expert_mlp_rows_nvfp4", SMEM)?;
+        let (mxfp8, mxfp8_blocks) = load("expert_mlp_rows_mxfp8", SMEM)?;
+        Ok(Self {
+            kernels: [nvfp4, mxfp8],
+            blocks: [nvfp4_blocks, mxfp8_blocks],
+        })
+    }
+
+    /// The expert MLP of `m` rows, 1 to [`MAX_ROWS`]: for row `r` and slot `s`, with
+    /// `e = indices[r][s]`, `act[8 r + s] = softcapped_swiglu(x[r] @ w13[e]^T)` and
+    /// `out[8 r + s] = act[8 r + s] @ w2[e]^T`.
+    ///
+    /// - `x`: BF16 `[m, 2304]`; `indices`: `[m, 8]` expert ids, in range and distinct within
+    ///   each row, as the router writes them;
+    /// - `w13`, `w2`: one layer's projections, both NVFP4 or both MXFP8, with `w13` of
+    ///   `2304` interleaved gate and up rows of input width 2304 and `w2` of 2304 rows of
+    ///   input width 1152;
+    /// - `act`: BF16 `[m * 8, 1152]` and `out`: BF16 `[m * 8, 2304]`, written;
+    /// - `sync`: at least `1 + 8 m` zeros, which the kernel leaves zero.
+    ///
+    /// Launches with programmatic dependent launch; the kernel reads nothing before the
+    /// previous kernel ends.
+    #[expect(clippy::too_many_arguments, reason = "the MLP's inputs and outputs")]
+    pub fn expert_mlp_rows(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        indices: &impl DeviceIn<i32>,
+        w13: &ExpertWeights<'_>,
+        w2: &ExpertWeights<'_>,
+        act: &mut impl DeviceOut<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        sync: &mut impl DeviceOut<u32>,
+        gate_softcap: f32,
+        up_softcap: f32,
+    ) -> anyhow::Result<()> {
+        let (x, indices, mut act, mut out, mut sync) = (
+            x.view(),
+            indices.view(),
+            act.view_mut(),
+            out.view_mut(),
+            sync.view_mut(),
+        );
+        ensure!(
+            indices.len().is_multiple_of(SLOTS),
+            "indices has {} ids, not whole rows of {SLOTS}",
+            indices.len()
+        );
+        let m = indices.len() / SLOTS;
+        ensure!(
+            (1..=MAX_ROWS).contains(&m),
+            "{m} rows, expected 1 to {MAX_ROWS}"
+        );
+        ensure!(
+            x.len() == m * K13,
+            "x has {} values, expected {m} x {K13}",
+            x.len()
+        );
+        ensure!(
+            act.len() == m * SLOTS * K2 && out.len() == m * SLOTS * N2,
+            "act has {} and out {} values, expected {m} x 8 x {K2} and x {N2}",
+            act.len(),
+            out.len()
+        );
+        ensure!(
+            sync.len() > m * SLOTS,
+            "sync has {} counters, expected at least {}",
+            sync.len(),
+            1 + m * SLOTS
+        );
+        ensure!(
+            w13.k == K13 && w13.n == 2 * K2 && w2.k == K2 && w2.n == N2,
+            "w13 must be {} x {K13} and w2 {N2} x {K2}, not {} x {} and {} x {}",
+            2 * K2,
+            w13.n,
+            w13.k,
+            w2.n,
+            w2.k
+        );
+        let format = match (w13.format, w2.format) {
+            (ExpertFormat::Nvfp4 { .. }, ExpertFormat::Nvfp4 { .. }) => 0,
+            (ExpertFormat::Mxfp8, ExpertFormat::Mxfp8) => 1,
+            _ => anyhow::bail!("w13 and w2 must share a format"),
+        };
+        let experts = |p: &ExpertWeights<'_>, row_bytes: usize, group: usize| {
+            let per_expert = p.n * row_bytes;
+            ensure!(
+                p.weight.len().is_multiple_of(per_expert) && !p.weight.is_empty(),
+                "weight of {} bytes is not whole experts",
+                p.weight.len()
+            );
+            let n = p.weight.len() / per_expert;
+            ensure!(
+                p.scales.len() == n * p.n * (p.k / group),
+                "scales of {} bytes, expected {n} x {} x {}",
+                p.scales.len(),
+                p.n,
+                p.k / group
+            );
+            if let ExpertFormat::Nvfp4 { global_scale } = p.format {
+                ensure!(global_scale.len() == n, "one global scale per expert");
+            }
+            Ok(n)
+        };
+        let (bytes, group) = if format == 0 { (2, 16) } else { (1, 32) };
+        let n13 = experts(w13, w13.k / bytes, group)?;
+        let n2 = experts(w2, w2.k / bytes, group)?;
+        ensure!(n13 == n2, "w13 has {n13} experts and w2 {n2}");
+
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(&indices, stream)
+            .i32(i32::try_from(m)?)
+            .ptr(w13.weight, stream)
+            .ptr(w13.scales, stream);
+        global_scale(&mut args, w13.format, stream);
+        args.ptr(w2.weight, stream).ptr(w2.scales, stream);
+        global_scale(&mut args, w2.format, stream);
+        args.ptr_mut(&mut act, stream)
+            .ptr_mut(&mut out, stream)
+            .f32(gate_softcap)
+            .f32(up_softcap)
+            .ptr_mut(&mut sync, stream);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(self.blocks[format]).context("grid")?, 1, 1),
+            block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
+            shared_mem_bytes: u32::try_from(SMEM)?,
+        };
+        // SAFETY: the arguments match `expert_mlp_rows_*(const bf16*, const int*, int,
+        // const u8*, const u8*, const float*, const u8*, const u8*, const float*, bf16*,
+        // bf16*, float, float, unsigned*)`. The checks above give `x` m rows of 2304, `act`
+        // and `out` 8 m pairs of 1152 and 2304, the weights the kernel's shapes for every
+        // expert id the router writes, and `sync` 1 + 8 m counters, zero as the kernel
+        // leaves them. The grid holds only blocks that fit on the GPU at once, which the
+        // kernel's waits need. Only the NVFP4 kernel reads the global scales. The kernel
+        // reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.kernels[format], config) }
+    }
+}
+
+/// The global scale argument: NVFP4's scales, or a null pointer for MXFP8.
+fn global_scale(args: &mut KernelArgs, format: ExpertFormat<'_>, stream: &CudaStream) {
+    match format {
+        ExpertFormat::Nvfp4 { global_scale } => args.ptr(global_scale, stream),
+        ExpertFormat::Mxfp8 => args.u64(0),
+    };
+}

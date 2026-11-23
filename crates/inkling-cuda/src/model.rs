@@ -36,8 +36,10 @@ use crate::{
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, ExpertActivations, Experts},
+        experts_rows::ExpertsRows,
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
-        linear_fp8::{Fp8Gemv, LinearFp8},
+        linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
+        linear_rows::{self, LinearRows, RowsProduct},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
         norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
@@ -57,8 +59,10 @@ struct Kernels {
     conv: Conv,
     elementwise: Elementwise,
     experts: Experts,
+    experts_rows: ExpertsRows,
     linear: Linear,
     linear_fp8: LinearFp8,
+    linear_rows: LinearRows,
     misc: Misc,
     norm: Norm,
     routing: Routing,
@@ -396,8 +400,10 @@ impl Model {
             conv: Conv::load(ctx)?,
             elementwise: Elementwise::load(ctx)?,
             experts: Experts::load(ctx)?,
+            experts_rows: ExpertsRows::load(ctx)?,
             linear: Linear::load(ctx)?,
             linear_fp8: LinearFp8::load(ctx)?,
+            linear_rows: LinearRows::load(ctx)?,
             misc: Misc::load(ctx)?,
             norm: Norm::load(ctx)?,
             routing: Routing::load(ctx)?,
@@ -936,6 +942,9 @@ impl Blocks {
 /// One product of [`Ctx::gemm_rows`]: `out [m, n] = x [m, k] @ weight [n, k]^T`.
 struct RowProduct<'a> {
     weight: &'a CudaSlice<bf16>,
+    /// The weight's FP8 copy, which the multi-row kernel reads instead when every product
+    /// of a batch has one.
+    fp8: Option<&'a Fp8Matrix>,
     x: CudaView<'a, bf16>,
     out: CudaViewMut<'a, bf16>,
 }
@@ -1542,13 +1551,15 @@ impl Ctx {
     /// `out [m, n] = x [m, k] @ weight [n, k]^T` for every product, all with the same `m`
     /// and `k`, as one batch.
     ///
-    /// Runs the tensor-core GEMM, which hands `m = 1` to the batched GEMV unless `tiled`.
-    /// With `tiled`, each row sums in the same order for any `m` up to 16.
+    /// Runs the tensor-core GEMM, which hands `m = 1` to the batched GEMV, unless
+    /// `invariant`. With `invariant`, `m` is at most 8 and the multi-row products of
+    /// [`LinearRows`] run: each row's result is the same, bit for bit, for every `m` and
+    /// whatever the other rows hold, and the FP8 copies stream when every product has one.
     fn gemm_rows(
         &self,
         products: &mut [RowProduct<'_>],
         m: usize,
-        tiled: bool,
+        invariant: bool,
     ) -> anyhow::Result<()> {
         ensure!(m > 0, "no rows");
         for (i, p) in products.iter().enumerate() {
@@ -1559,17 +1570,30 @@ impl Ctx {
                 p.out.len()
             );
         }
+        if invariant {
+            ensure!(
+                m <= linear_rows::MAX_ROWS,
+                "{m} rows; the invariant products take at most {}",
+                linear_rows::MAX_ROWS
+            );
+            let fp8 = products.iter().all(|p| p.fp8.is_some());
+            let mut rows: Vec<RowsProduct<'_>> = products
+                .iter_mut()
+                .map(|p| match p.fp8 {
+                    Some(q) if fp8 => RowsProduct::fp8(q, &p.x, &mut p.out),
+                    _ => RowsProduct::bf16(p.weight, &p.x, &mut p.out),
+                })
+                .collect();
+            return self
+                .kernels
+                .linear_rows
+                .run(&self.stream, &mut rows, m, Start::Early);
+        }
         let mut gemms: Vec<Gemm<'_, bf16>> = products
             .iter_mut()
             .map(|p| Gemm::new(p.weight, &p.x, &mut p.out))
             .collect();
-        if tiled {
-            self.kernels
-                .linear
-                .gemm_bf16_tiled(&self.stream, &mut gemms, m)?;
-        } else {
-            self.kernels.linear.gemm_bf16(&self.stream, &mut gemms, m)?;
-        }
+        self.kernels.linear.gemm_bf16(&self.stream, &mut gemms, m)?;
         Ok(())
     }
 
@@ -1671,58 +1695,6 @@ impl Ctx {
             scratch,
             out,
         )
-    }
-
-    /// [`Ctx::attention_rows`] one row at a time, as `m` decode steps would: row `i`
-    /// appends its key and value at `positions[i]`, then attends from there with
-    /// [`Attention::decode_attention`]. Each row's result then depends only on its
-    /// position and the cache, not on where the chunk starts or on its other rows, and
-    /// repeats exactly from run to run. The prefill kernel tiles the keys from the chunk's
-    /// start and splits the work by the row count, so its sum order has neither property.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the attention inputs and outputs"
-    )]
-    fn attention_by_position(
-        &self,
-        q: &CudaView<'_, bf16>,
-        k: &CudaView<'_, bf16>,
-        v: &CudaView<'_, bf16>,
-        cache: &mut KvCache,
-        positions: &CudaSlice<u32>,
-        m: usize,
-        bias: &CudaView<'_, bf16>,
-        sinks: &CudaView<'_, bf16>,
-        scratch: &mut AttentionScratch,
-        out: &mut CudaViewMut<'_, bf16>,
-    ) -> anyhow::Result<()> {
-        /// Row `i` of the `m` rows of `x`.
-        fn row<'a>(x: &'a CudaView<'_, bf16>, i: usize, m: usize) -> CudaView<'a, bf16> {
-            let width = x.len() / m;
-            x.slice(i * width..(i + 1) * width)
-        }
-        ensure!(
-            positions.len() >= m,
-            "{m} rows, {} positions",
-            positions.len()
-        );
-        let attention = &self.kernels.attention;
-        let q_width = out.len() / m;
-        for i in 0..m {
-            let position = positions.slice(i..=i);
-            attention.append(&self.stream, cache, &position, &row(k, i, m), &row(v, i, m))?;
-            attention.decode_attention(
-                &self.stream,
-                &row(q, i, m),
-                cache,
-                &position,
-                &row(bias, i, m),
-                &row(sinks, i, m),
-                scratch,
-                &mut out.slice_mut(i * q_width..(i + 1) * q_width),
-            )?;
-        }
-        Ok(())
     }
 
     fn hidden(&self) -> usize {

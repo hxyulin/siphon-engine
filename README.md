@@ -118,10 +118,14 @@ The verify pass has one CUDA graph per width, captured on first use, with the to
 
 The rings keep 1024 slots. A ring of 1032 slots would make the backup unnecessary, but decode attention splits its cache by slot, so its results change with the ring size.
 
-Each verify row gives the same logits, bit for bit, as a verify of that row alone at its position, whatever the other rows hold. So speculation emits exactly the tokens of greedy decoding through the verify pass one row at a time, whatever the draft proposes. Two choices make this hold:
+Each verify row gives the same logits, bit for bit, as a verify of that row alone at its position, whatever the other rows hold. So speculation emits exactly the tokens of greedy decoding through the verify pass one row at a time, whatever the draft proposes. The pass runs kernels built for 1 to 8 rows, whose rows each sum in an order that depends only on their own position and data:
 
-- The GEMMs run on tensor cores at one row too: up to 16 rows share one tile and split, so a row's sum order does not depend on the row count.
-- Attention runs one row at a time: each row appends its key and value and attends with the decode kernel at its own position, as a step does. The prefill attention kernel tiles the keys from the chunk's start, so a row's sum order depends on where its chunk starts.
+- Dense products (`ops::linear_rows`): each 16-row weight tile streams once for all rows, through per-warp `cp.async` rings onto `mma.sync m16n8k16`, with the weights as the 16-row operand and the rows as the 8 columns. With `--weights fp8` the verify reads the FP8 copies, widened exactly to BF16.
+- Router (`Routing::moe_router_step_rows`): the decode router's sums for every row, so each row's experts and weights equal a step's bit for bit.
+- Experts (`ops::experts_rows`): one kernel groups the row-slot pairs by expert on the device and streams each distinct expert's `w13` and `w2` once, on tensor cores with the expert's pairs as the columns. An E2M1 or E4M3 weight times its block scale is an exact BF16 value.
+- Attention (`Attention::attention_rows`): each key and value tile streams once for the 3 query heads and all rows. The cache splits by absolute slot, a row's masked keys weigh exactly zero, and the slot a row's key goes to shows the new key to that row and later rows and the old entry to earlier ones. The rows' keys append after attention, so 1024-slot rings work.
+
+`tests/linear_rows.rs`, `tests/experts_rows.rs`, `tests/attention_rows.rs` and `moe_router_step_rows_matches_step` in `tests/routing.rs` check each kernel's row invariance bit for bit, and its distance from the decode and prefill kernels.
 
 The verify pass computes the same model as `Model::step` but sums in other orders, so the two greedy outputs split at the first near-tie: after 247 to 817 of 1024 tokens on the three texts.
 
@@ -134,26 +138,28 @@ INKLING_MODEL=<model-dir> INKLING_TAPS=reference/out/regex-readme-taps.safetenso
 
 `eval --verify WIDTH` teacher-forces a capture through verify passes of WIDTH rows, and passes the quality gate at widths 1 and 4. `bench --prompt <capture> --spec K` compares speculation with plain decode from one prefilled state, and `--verify-widths` times one pass of each width.
 
-The verify pass is slow at small widths, since prefill's kernels are built for many rows. With BF16 weights, one pass takes:
+One verify pass, after the `anyhow` prompt of 10,674 tokens or with the caches marked full to 32,768 or 131,072:
 
 | Rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Context 2,286, ms | 7.57 | 8.44 | 9.24 | 10.14 | 11.18 | 12.08 | 12.77 | 13.26 |
-| Context 32,768, ms | 8.19 | 9.75 | 11.17 | 12.57 | 14.14 | 15.66 | 16.96 | 18.18 |
+| 10,674, BF16 weights, ms | 6.41 | 6.93 | 7.62 | 8.15 | 8.67 | 9.30 | 9.64 | 10.03 |
+| 10,674, FP8 weights, ms | 5.56 | 6.09 | 6.74 | 7.29 | 7.79 | 8.44 | 8.82 | 9.20 |
+| 32,768, BF16 weights, ms | 6.95 | 7.59 | 8.44 | 8.91 | 9.56 | 10.42 | 10.79 | 11.22 |
+| 32,768, FP8 weights, ms | 6.10 | 6.74 | 7.59 | 8.09 | 8.72 | 9.57 | 9.97 | 10.36 |
+| 131,072, BF16 weights, ms | 9.29 | 10.21 | 11.88 | 12.48 | 13.32 | 15.10 | 15.64 | 16.19 |
 | Bandwidth model, ms | 3.82 | 4.49 | 5.03 | 5.49 | 5.92 | 6.31 | 6.68 | 7.02 |
 
-The bandwidth model reads the dense weights once and 8 m^0.6 distinct experts per visit at 84% of 1.70 TB/s, without KV. At 4 rows and context 2,286, the pass spends 2.7 ms in the dense GEMMs, 4.3 ms in the expert GEMMs, 1.05 ms in attention, 0.9 ms in the router logits and 1.8 ms in about 1,100 small kernels. At context 32,768, every row reads the global caches on its own.
+The bandwidth model reads the BF16 dense weights once and 8 m^0.6 distinct experts per visit at 84% of 1.70 TB/s, without KV. At 4 rows and 10,674 tokens with BF16 weights, a pass spends 3.37 ms in the experts, 2.1 ms in the dense products (0.55 ms of it the LM head), 1.0 ms in attention and about 2 ms in small kernels: depth attention, message gates, the router, the relative bias, conv states and norms.
 
-`bench --spec 3` with BF16 weights, 512 tokens after each text, on one RTX 5090:
+`bench --spec 3`, 512 tokens after each text:
 
-| Text, context | Plain decode | Speculation | Tokens per round | Acceptance by position | Round: verify + draft + host |
-| --- | ---: | ---: | ---: | --- | --- |
-| `regex-readme`, 2,286 | 255.9 tok/s | 239.4 tok/s | 3.08 | 84.3%, 67.5%, 56.6% | 11.14 + 1.73 + 0.01 ms |
-| `half`, 2,273 | 253.0 tok/s | 278.9 tok/s | 3.63 | 92.9%, 86.5%, 83.7% | 11.28 + 1.73 + 0.01 ms |
-| `anyhow`, 10,674 | 239.3 tok/s | 288.4 tok/s | 3.89 | 97.7%, 97.0%, 93.9% | 11.61 + 1.85 + 0.02 ms |
-| `anyhow`, 32,768 | 208.7 tok/s | 246.9 tok/s | 3.96 | 99.2%, 99.2%, 97.7% | 13.84 + 2.18 + 0.03 ms |
+| Text, context | Plain decode | Speculation, BF16 weights | Speculation, FP8 weights | Tokens per round | Round with BF16 weights: verify + draft |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `regex-readme`, 2,286 | 255 tok/s | 334 tok/s | 328 tok/s | 3.20 | 8.37 + 1.18 ms |
+| `anyhow`, 10,674 | 239 tok/s | 395 tok/s | 426 tok/s | 3.92 | 8.68 + 1.21 ms |
+| `anyhow`, 32,768 | 209 tok/s | 365 tok/s | 393 tok/s | 3.93 | 9.46 + 1.28 ms |
 
-The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At that acceptance, 2.1 tokens per round of 12.9 ms would give 163 tok/s. With `--weights fp8`, plain decode runs at 304 to 324 tok/s, while the verify and the draft stay on BF16 weights.
+The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At that acceptance, 2.1 tokens per round of about 9.6 ms would give 220 tok/s with BF16 weights. With `--weights fp8`, plain decode runs at 265 tok/s at context 0.
 
 ## Benchmarks and profiling
 

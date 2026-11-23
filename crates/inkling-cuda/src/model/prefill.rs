@@ -26,6 +26,7 @@ use crate::{
     ops::{
         attention,
         experts::{ExpertScratch, QuantizedRows},
+        linear_fp8::Fp8Matrix,
         misc::{GATE_SLOTS, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsPartial},
@@ -77,10 +78,8 @@ struct AttentionRows {
     /// Whether the products and attention run in a fixed order for any row count (see
     /// [`PrefillScratch::new`]).
     invariant: bool,
-    /// Each row's position, for attention one row at a time.
-    positions: CudaSlice<u32>,
-    /// The decode attention scratch, for attention one row at a time.
-    decode: attention::AttentionScratch,
+    /// The partials of the multi-row attention, which invariant chunks run.
+    rows: attention::RowsAttentionScratch,
     k_raw: CudaSlice<bf16>,
     v_raw: CudaSlice<bf16>,
     k_dynamic: CudaSlice<bf16>,
@@ -102,6 +101,12 @@ struct AttentionRows {
 
 /// Intermediates of the MoE block for a chunk.
 struct MoeRows {
+    /// Whether the router and experts run the multi-row step kernels, whose rows are the
+    /// same bit for bit for any row count (see [`PrefillScratch::new`]).
+    invariant: bool,
+    /// The counters of the multi-row router and expert kernels, left zero by each call.
+    router_counter: CudaSlice<u32>,
+    expert_sync: CudaSlice<u32>,
     logits: CudaSlice<f32>,
     router: RouterRowsScratch,
     indices: CudaSlice<i32>,
@@ -161,10 +166,11 @@ pub(super) struct PrefillScratch {
 impl PrefillScratch {
     /// Buffers for chunks of up to `rows` rows. With `invariant`, each row's results depend
     /// only on its position, its token and the state before it, bit for bit: not on the
-    /// chunk's start, its row count up to 16 or its other rows. The GEMMs then run on
-    /// tensor cores at one row too, and attention runs one row at a time with the decode
-    /// kernels. The verify pass sets it, so that each of its rows equals a verify of that
-    /// row alone.
+    /// chunk's start, its row count up to 8 or its other rows. The dense products then run
+    /// the multi-row kernels of `ops::linear_rows` (on the FP8 copies when the model has
+    /// them), the router and experts those of `Routing::moe_router_step_rows` and
+    /// `ops::experts_rows`, and attention those of `Attention::attention_rows`. The verify
+    /// pass sets it, so that each of its rows equals a verify of that row alone.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         cfg: &TextConfig,
@@ -214,8 +220,7 @@ impl PrefillScratch {
             ],
             attention: AttentionRows {
                 invariant,
-                positions: zeros(stream, rows)?,
-                decode: attention::AttentionScratch::new(stream)?,
+                rows: attention::RowsAttentionScratch::new(stream)?,
                 k_raw: zeros(stream, rows * kv_dims)?,
                 v_raw: zeros(stream, rows * kv_dims)?,
                 k_dynamic: zeros(stream, rows * dynamic)?,
@@ -238,6 +243,9 @@ impl PrefillScratch {
             mlp_input: zeros(stream, rows * hidden)?,
             mlp_x: zeros(stream, rows * hidden)?,
             moe: MoeRows {
+                invariant,
+                router_counter: zeros(stream, 1)?,
+                expert_sync: zeros(stream, 1 + rows * top_k)?,
                 logits: zeros(stream, rows * cfg.n_routed_experts)?,
                 router: RouterRowsScratch::new(stream, rows)?,
                 indices: zeros(stream, rows * top_k)?,
@@ -468,12 +476,6 @@ impl Ctx {
         let mut next_visit = || visits.next().context("fewer visit caches than visits");
 
         if let Some(v) = p.verify.as_mut() {
-            self.kernels.spec.row_positions(
-                &self.stream,
-                &p.start,
-                &mut p.attention.positions,
-                m,
-            )?;
             self.kernels
                 .spec
                 .conv_backup(&self.stream, &v.states, &mut v.conv_backup)?;
@@ -623,6 +625,7 @@ impl Ctx {
         self.gemm_rows(
             &mut [RowProduct {
                 weight: &self.weights.lm_head,
+                fp8: None,
                 x: p.final_hidden.slice((m - 1) * hidden..mh),
                 out: s.logits.as_view_mut(),
             }],
@@ -651,6 +654,7 @@ impl Ctx {
             self.gemm_rows(
                 &mut [RowProduct {
                     weight: &self.weights.lm_head,
+                    fp8: None,
                     x: p.final_hidden.slice(first * hidden..(first + n) * hidden),
                     out: rows_mut(&mut p.head_logits, n, padded),
                 }],
@@ -681,6 +685,7 @@ impl Ctx {
         self.gemm_rows(
             &mut [RowProduct {
                 weight: &self.weights.lm_head,
+                fp8: self.weights.lm_head_fp8.as_ref(),
                 x: rows(&p.final_hidden, m, self.hidden()),
                 out: rows_mut(&mut p.head_logits, m, padded),
             }],
@@ -1061,12 +1066,13 @@ impl Ctx {
         m: usize,
     ) -> anyhow::Result<()> {
         fn product<'a>(
-            weight: &'a CudaSlice<bf16>,
+            (weight, fp8): (&'a CudaSlice<bf16>, Option<&'a Fp8Matrix>),
             x: &'a CudaView<'_, bf16>,
             out: CudaViewMut<'a, bf16>,
         ) -> RowProduct<'a> {
             RowProduct {
                 weight,
+                fp8,
                 x: x.slice(..),
                 out,
             }
@@ -1080,18 +1086,28 @@ impl Ctx {
         let heads = cfg.num_attention_heads;
         let taps = cfg.num_key_value_heads * cfg.sconv_kernel_size;
         let invariant = t.invariant;
+        // The FP8 copies in `input_projections` order, which the multi-row products read.
+        let fp8 = |i: usize| w.fp8.as_ref().map(|f| &f.inputs[i]);
 
         let mut products = vec![
-            product(&a.q, &q_in, rows_mut(&mut t.q_raw, m, q_dims)),
-            product(&a.r, &q_in, rows_mut(&mut t.r_raw, m, rel_dims)),
-            product(&a.gate, &q_in, rows_mut(&mut t.gate, m, q_dims)),
-            product(&a.sink, &q_in, rows_mut(&mut t.sinks, m, heads)),
-            product(&a.k, &k_in, rows_mut(&mut t.k_raw, m, kv_dims)),
-            product(&a.v, &v_in, rows_mut(&mut t.v_raw, m, kv_dims)),
+            product((&a.q, fp8(0)), &q_in, rows_mut(&mut t.q_raw, m, q_dims)),
+            product((&a.r, fp8(1)), &q_in, rows_mut(&mut t.r_raw, m, rel_dims)),
+            product((&a.gate, fp8(2)), &q_in, rows_mut(&mut t.gate, m, q_dims)),
+            product((&a.sink, fp8(3)), &q_in, rows_mut(&mut t.sinks, m, heads)),
+            product((&a.k, fp8(4)), &k_in, rows_mut(&mut t.k_raw, m, kv_dims)),
+            product((&a.v, fp8(5)), &v_in, rows_mut(&mut t.v_raw, m, kv_dims)),
         ];
         if let KvConv::Dynamic { k_proj, v_proj, .. } = &a.kv_conv {
-            products.push(product(k_proj, &k_in, rows_mut(&mut t.k_dynamic, m, taps)));
-            products.push(product(v_proj, &v_in, rows_mut(&mut t.v_dynamic, m, taps)));
+            products.push(product(
+                (k_proj, fp8(6)),
+                &k_in,
+                rows_mut(&mut t.k_dynamic, m, taps),
+            ));
+            products.push(product(
+                (v_proj, fp8(7)),
+                &v_in,
+                rows_mut(&mut t.v_dynamic, m, taps),
+            ));
         }
         self.gemm_rows(&mut products, m, invariant)?;
         drop(products);
@@ -1157,16 +1173,17 @@ impl Ctx {
         )?;
 
         if invariant {
-            self.attention_by_position(
+            self.kernels.attention.attention_rows(
+                &self.stream,
                 &rows(&t.q, m, q_dims),
                 &rows(&t.k, m, kv_dims),
                 &rows(&t.v, m, kv_dims),
                 &mut state.kv,
-                &t.positions,
+                start,
                 m,
                 &rows(&t.bias, m, heads * cfg.rel_extent),
                 &rows(&t.sinks, m, heads),
-                &mut t.decode,
+                &mut t.rows,
                 &mut rows_mut(&mut t.out, m, q_dims),
             )?;
         } else {
@@ -1192,6 +1209,7 @@ impl Ctx {
         self.gemm_rows(
             &mut [RowProduct {
                 weight: &a.o,
+                fp8: w.fp8.as_ref().map(|f| &f.o),
                 x: rows(&t.gated, m, q_dims),
                 out: rows_mut(&mut t.proj, m, hidden),
             }],
@@ -1226,6 +1244,7 @@ impl Ctx {
             1 => self.gemm_rows(
                 &mut [RowProduct {
                     weight: &weights[0].down,
+                    fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
                     x: rows(&t.inputs[first], m, 2 * hidden),
                     out: down.slice_mut(..),
                 }],
@@ -1240,16 +1259,19 @@ impl Ctx {
                     &mut [
                         RowProduct {
                             weight: &weights[0].down,
+                            fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
                             x: x0,
                             out: d0,
                         },
                         RowProduct {
                             weight: &weights[1].down,
+                            fp8: weights[1].fp8.as_ref().map(|f| &f[0]),
                             x: x1,
                             out: d1,
                         },
                         RowProduct {
                             weight: &weights[2].down,
+                            fp8: weights[2].fp8.as_ref().map(|f| &f[0]),
                             x: x2,
                             out: d2,
                         },
@@ -1298,6 +1320,34 @@ impl Ctx {
         let hidden = cfg.hidden_size;
         let width = cfg.intermediate_size;
         let top_k = cfg.num_experts_per_tok;
+        if t.invariant {
+            // Each row as a step routes it, and each distinct expert streams once.
+            self.kernels.routing.moe_router_step_rows(
+                &self.stream,
+                &rows(x, m, hidden),
+                &w.router,
+                &w.router_bias,
+                &mut rows_mut(&mut t.logits, m, cfg.n_routed_experts),
+                &mut rows_mut(&mut t.indices, m, top_k),
+                &mut rows_mut(&mut t.weights, m, top_k),
+                &mut t.router_counter,
+                cfg.route_scale,
+                m,
+            )?;
+            let (w13, w2) = self.expert_weights(w);
+            return self.kernels.experts_rows.expert_mlp_rows(
+                &self.stream,
+                &rows(x, m, hidden),
+                &rows(&t.indices, m, top_k),
+                &w13,
+                &w2,
+                &mut rows_mut(&mut t.act, m, top_k * width),
+                &mut rows_mut(&mut t.down, m, top_k * hidden),
+                &mut t.expert_sync,
+                cfg.mlp_gate_softcap,
+                cfg.mlp_up_softcap,
+            );
+        }
         self.kernels.routing.moe_router_rows(
             &self.stream,
             &rows(x, m, hidden),

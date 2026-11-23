@@ -174,10 +174,3 @@ extern "C" __global__ void accept_greedy(const int* tokens, const int* argmax, c
     }
     *anchor = argmax[accepted];
 }
-
-// positions[i] = *start + i for i < rows (at most 32), for attention one row at a time.
-extern "C" __global__ void row_positions(const unsigned* start, unsigned* positions, int rows) {
-    if (int(threadIdx.x) < rows) {
-        positions[threadIdx.x] = *start + threadIdx.x;
-    }
-}

@@ -74,6 +74,7 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
 STRUCT_FIELDS = {
     ("linear.cu", "Batch"): (32, 256, {0: "seg.w", 8: "seg.x", 16: "seg.out"}),
     ("linear_fp8.cu", "Batch"): (40, 320, {0: "seg.w", 8: "seg.scale", 16: "seg.x", 24: "seg.out"}),
+    ("linear_rows.cu", "Batch"): (40, 320, {0: "seg.w", 8: "seg.scale", 16: "seg.x", 24: "seg.out"}),
 }
 READ_ONLY |= {"batch.seg.w", "batch.seg.scale"}
 

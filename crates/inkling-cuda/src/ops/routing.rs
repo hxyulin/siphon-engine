@@ -17,6 +17,8 @@ const HIDDEN: usize = 2304;
 pub const EXPERTS: usize = 128;
 /// Experts chosen per token.
 pub const TOP_K: usize = 8;
+/// Most rows [`Routing::moe_router_step_rows`] takes, `kStepRouterRows` in the kernel.
+pub const STEP_ROUTER_ROWS: usize = 8;
 /// Threads per block of `router_logits_2304`, which fixes its summation order.
 const LOGITS_THREADS: u32 = 256;
 /// Threads per block of `expert_routing_128_top8`: one warp per row.
@@ -189,6 +191,7 @@ pub struct Routing {
     moe_router_route_rows_2304: CudaFunction,
     depth_attention_step_2304: CudaFunction,
     moe_router_step_2304: CudaFunction,
+    moe_router_step_rows_2304: CudaFunction,
     /// `depth_attention_rows_2304_<nb>_<nq>` at `[nq index][nb - 1]`, with the most blocks
     /// that run at once.
     depth_attention_rows_2304: Vec<Vec<(CudaFunction, u32)>>,
@@ -210,6 +213,7 @@ impl Routing {
             moe_router_route_rows_2304: module.load_function("moe_router_route_rows_2304")?,
             depth_attention_step_2304: module.load_function("depth_attention_step_2304")?,
             moe_router_step_2304: module.load_function("moe_router_step_2304")?,
+            moe_router_step_rows_2304: module.load_function("moe_router_step_rows_2304")?,
             depth_attention_rows_2304: ROWS_QUERY_COUNTS
                 .iter()
                 .map(|nq| {
@@ -811,6 +815,69 @@ impl Routing {
         // the kernel reads or writes, the grid has one block per expert, and the kernel reads
         // only the router before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_step_2304, config) }
+    }
+
+    /// [`Self::moe_router_step`] for `rows` rows of a step, 1 to [`STEP_ROUTER_ROWS`]: `x`
+    /// `[rows, 2304]`, `logits` `[rows, 128]`, `indices` and `weights` `[rows, 8]`. Each
+    /// row's results equal a one-row [`Self::moe_router_step`] call's bit for bit. The
+    /// router weights stream once for all rows.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router_step_rows(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        logits: &mut impl DeviceOut<f32>,
+        indices: &mut impl DeviceOut<i32>,
+        weights: &mut impl DeviceOut<f32>,
+        counter: &mut CudaSlice<u32>,
+        route_scale: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let x = x.view();
+        let (mut logits, mut indices, mut weights) =
+            (logits.view_mut(), indices.view_mut(), weights.view_mut());
+        ensure!(
+            (1..=STEP_ROUTER_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {STEP_ROUTER_ROWS}"
+        );
+        ensure!(
+            x.len() == rows * HIDDEN,
+            "x must hold {rows} x {HIDDEN} elements"
+        );
+        ensure!(
+            router.len() == EXPERTS * HIDDEN,
+            "router has {} elements",
+            router.len()
+        );
+        ensure!(bias.len() == EXPERTS, "bias length");
+        ensure!(logits.len() == rows * EXPERTS, "logits length");
+        ensure!(
+            indices.len() == rows * TOP_K && weights.len() == rows * TOP_K,
+            "indices or weights length"
+        );
+        ensure!(!counter.is_empty(), "counter is empty");
+        let config = LaunchConfig {
+            grid_dim: (EXPERTS as u32, 1, 1),
+            block_dim: (ROUTER_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .i32(i32::try_from(rows)?)
+            .ptr(router, stream)
+            .ptr(bias, stream)
+            .ptr_mut(&mut logits, stream)
+            .ptr_mut(&mut indices, stream)
+            .ptr_mut(&mut weights, stream)
+            .ptr_mut(counter, stream)
+            .f32(route_scale);
+        // SAFETY: the arguments match `moe_router_step_rows_2304(const bf16*, int, const
+        // float*, const float*, float*, int32_t*, float*, unsigned*, float)`, every buffer
+        // has the length the kernel reads or writes for `rows` rows, the grid has one block
+        // per expert, and the kernel reads only the router before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_step_rows_2304, config) }
     }
 
     /// The router for each of the `rows` rows of a chunk from rows `x` (`[rows, 2304]`) that
