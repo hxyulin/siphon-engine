@@ -237,3 +237,479 @@ prefetch_l2(const __grid_constant__ Ranges r) {
         __trap();
     }
 }
+
+// Matrix products `out = x @ W^T` on tensor cores, for prefill: x is [m, k], W is [n, k]
+// as stored in the checkpoint, out is [m, n], all row-major. BF16 weights, F32
+// accumulation.
+//
+// One launch runs up to kMaxProducts products that share m and k, each with its own
+// weight, input and output. A block computes one BM x BN tile of one product. Blocks walk
+// a product's tiles with m fastest, so the blocks that share a weight tile run together
+// and the weight streams from DRAM about once.
+//
+// A block stages BM x BK of x and BN x BK of W per k step in shared memory with cp.async,
+// STAGES steps deep, and its warps multiply them with mma.sync m16n8k16 fed by ldmatrix.
+// The warps form a WM x WN x WK grid: WM x WN split the tile, and WK > 1 splits each k
+// step's 16-wide slices over warps, whose partial sums meet in shared memory at the end.
+// BF16 rows of shared memory are XOR-swizzled in 16-byte chunks, so ldmatrix reads are
+// free of bank conflicts. Rows and columns past m, n and k load as zeros through
+// cp.async's source size, and stores past m and n are skipped.
+//
+// When the tiles cannot fill the GPU, as for small m or narrow outputs, the launcher runs
+// each tile as a cluster of `splits` blocks. Each block sums a contiguous share of the k
+// steps, and the blocks add their partial sums through distributed shared memory, so the
+// split needs no scratch buffer and no second launch.
+//
+// With F32 x, each value splits into three BF16 parts, hi + mid + lo, which carry 24 of
+// its bits; each part runs its own mma. BF16 x BF16 products are exact in F32, so the
+// result matches an F32 product with the widened weights up to sum order and about 2^-25
+// of each |w x|.
+
+namespace gemm {
+
+constexpr int kMaxProducts = 8;
+
+struct Product {
+    const __nv_bfloat16* w;
+    const void* x;
+    void* out;
+    int n;
+    // Tiles of this product and every product before it.
+    int tile_end;
+};
+
+struct Batch {
+    Product p[kMaxProducts];
+    int count;
+    int m;
+    int k;
+    // Blocks per tile, one cluster: each sums a share of the k steps.
+    int splits;
+};
+
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+// 16 bytes from global to shared memory, or 16 zero bytes when `valid` is false.
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, bool valid) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src),
+                 "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// d += a @ b for one 16 x 8 x 16 slice.
+__device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0,
+                                    uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Float at shared address `addr` of block `rank` of this cluster.
+__device__ __forceinline__ float ld_cluster(uint32_t addr, int rank) {
+    uint32_t remote;
+    float v;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(addr), "r"(rank));
+    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void cluster_sync() {
+    asm volatile(
+        "barrier.cluster.arrive.release.aligned;\n"
+        "barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ uint32_t pack(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return uint32_t(__bfloat16_as_ushort(lo)) | (uint32_t(__bfloat16_as_ushort(hi)) << 16);
+}
+
+// Splits two F32 values into three BF16 pairs whose sums give back about 24 bits of each.
+// Each difference is exact in F32.
+__device__ __forceinline__ void split3(float2 v, uint32_t& hi, uint32_t& mid, uint32_t& lo) {
+    const __nv_bfloat16 hx = __float2bfloat16_rn(v.x), hy = __float2bfloat16_rn(v.y);
+    const float rx = v.x - __bfloat162float(hx), ry = v.y - __bfloat162float(hy);
+    const __nv_bfloat16 mx = __float2bfloat16_rn(rx), my = __float2bfloat16_rn(ry);
+    const __nv_bfloat16 lx = __float2bfloat16_rn(rx - __bfloat162float(mx));
+    const __nv_bfloat16 ly = __float2bfloat16_rn(ry - __bfloat162float(my));
+    hi = pack(hx, hy);
+    mid = pack(mx, my);
+    lo = pack(lx, ly);
+}
+
+__device__ __forceinline__ void store2(__nv_bfloat16* out, size_t i, bool pair, bool second,
+                                       float a, float b) {
+    if (pair) {
+        *reinterpret_cast<__nv_bfloat162*>(out + i) = __floats2bfloat162_rn(a, b);
+    } else {
+        out[i] = __float2bfloat16_rn(a);
+        if (second) {
+            out[i + 1] = __float2bfloat16_rn(b);
+        }
+    }
+}
+
+__device__ __forceinline__ void store2(float* out, size_t i, bool pair, bool second, float a,
+                                       float b) {
+    if (pair) {
+        *reinterpret_cast<float2*>(out + i) = make_float2(a, b);
+    } else {
+        out[i] = a;
+        if (second) {
+            out[i + 1] = b;
+        }
+    }
+}
+
+// Shared-memory layout of one stage of a [rows, BK] operand tile of element type T, in
+// 16-byte chunks. BF16 rows of 4 or more chunks swap chunks by an XOR of the row, so the
+// 8 rows one ldmatrix reads fall in distinct banks. F32 rows (x of gemm_f32, read as
+// float2 pairs) carry 8 elements of padding instead.
+template <typename T, int BK>
+struct Layout {
+    static constexpr int kChunks = BK * int(sizeof(T)) / 16;  // per row
+    static constexpr bool kSwizzle = sizeof(T) == 2;
+    static constexpr int kRowBytes = kSwizzle ? BK * 2 : (BK + 8) * 4;
+    static_assert(!kSwizzle || kChunks == 4 || kChunks % 8 == 0, "swizzle of 4 or 8k chunks");
+
+    // XOR applied to the chunk index of row `row`.
+    __device__ static constexpr int mask(int row) {
+        if constexpr (!kSwizzle) {
+            return 0;
+        } else if constexpr (kChunks == 4) {
+            return row / 2 % 4;
+        } else {
+            return row % 8;
+        }
+    }
+
+    __device__ static constexpr int offset(int row, int chunk) {
+        return row * kRowBytes + (chunk ^ mask(row)) * 16;
+    }
+};
+
+template <typename Tx, int BM, int BN, int BK, int WM, int WN, int WK, int STAGES>
+struct Tile {
+    using A = Layout<Tx, BK>;
+    using B = Layout<__nv_bfloat16, BK>;
+    static constexpr int kWarps = WM * WN * WK;
+    static constexpr int kThreads = 32 * kWarps;
+    static constexpr int kWarpM = BM / WM;
+    static constexpr int kWarpN = BN / WN;
+    static constexpr int kMi = kWarpM / 16;
+    static constexpr int kNi = kWarpN / 8;
+    static constexpr int kStageA = BM * A::kRowBytes;
+    static constexpr int kStageB = BN * B::kRowBytes;
+    static constexpr int kStage = kStageA + kStageB;
+    static constexpr int kLoadsA = BM * A::kChunks / kThreads;  // chunks per thread
+    static constexpr int kLoadsB = BN * B::kChunks / kThreads;
+    // Partial sums of WK - 1 warps per slice, or one tile for the cluster reduction.
+    static constexpr int kReduceBytes = (WK > 2 ? WK - 1 : 1) * BM * BN * 4;
+    static constexpr int kSmemBytes =
+        STAGES * kStage > kReduceBytes ? STAGES * kStage : kReduceBytes;
+    static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0, "whole 16 x 16 warp slices");
+    static_assert(BK % (16 * WK) == 0, "whole k slices per warp");
+    static_assert(kLoadsA * kThreads == BM * A::kChunks, "threads share x chunks evenly");
+    static_assert(kLoadsB * kThreads == BN * B::kChunks, "threads share W chunks evenly");
+    static_assert(STAGES >= 2, "a pipeline needs two stages");
+};
+
+// One thread's share of the copies of an operand tile: a source row and chunk per copy,
+// fixed for the whole k loop.
+template <typename T, int BK, int LOADS, int THREADS>
+struct Loader {
+    using L = Layout<T, BK>;
+    static constexpr int kPerChunk = 16 / int(sizeof(T));
+    const T* src[LOADS];
+    int col[LOADS];      // first element of the chunk within a k step
+    uint32_t dst[LOADS];  // byte offset within a stage
+    uint32_t live;        // bit i: copy i reads a row below the row count
+
+    __device__ Loader(const T* base, int row0, int rows, int k, int tid) : live(0) {
+#pragma unroll
+        for (int i = 0; i < LOADS; ++i) {
+            const int c = tid + i * THREADS;
+            const int r = c / L::kChunks;
+            const int ch = c % L::kChunks;
+            col[i] = ch * kPerChunk;
+            dst[i] = L::offset(r, ch);
+            const bool ok = row0 + r < rows;
+            live |= uint32_t(ok) << i;
+            src[i] = base + size_t(ok ? row0 + r : 0) * k + col[i];
+        }
+    }
+
+    __device__ void load(uint32_t stage, int k0, int k) const {
+#pragma unroll
+        for (int i = 0; i < LOADS; ++i) {
+            const bool ok = (live >> i & 1) && col[i] < k - k0;
+            cp_async16(stage + dst[i], ok ? src[i] + k0 : src[i], ok);
+        }
+    }
+};
+
+template <typename Tx, int BM, int BN, int BK, int WM, int WN, int WK, int STAGES>
+__device__ void gemm(const Batch& b, char* smem) {
+    using T = Tile<Tx, BM, BN, BK, WM, WN, WK, STAGES>;
+    using LA = typename T::A;
+    using LB = typename T::B;
+
+    // Clusters run along x, so a cluster is `splits` consecutive blocks.
+    const int splits = b.splits;
+    const int rank = int(blockIdx.x) % splits;
+    const int block = int(blockIdx.x) / splits;
+    int s = 0;
+    int tile_begin = 0;
+    while (s + 1 < b.count && block >= b.p[s].tile_end) {
+        tile_begin = b.p[s].tile_end;
+        ++s;
+    }
+    const Product& p = b.p[s];
+    const int m = b.m, n = p.n, k = b.k;
+    const int tiles_m = (m + BM - 1) / BM;
+    const int tile = block - tile_begin;
+    const int m0 = (tile % tiles_m) * BM;
+    const int n0 = (tile / tiles_m) * BN;
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int wk = warp % WK;
+    const int wn = warp / WK % WN;
+    const int wm = warp / (WK * WN);
+
+    const uint32_t smem0 = smem_addr(smem);
+    const Loader<Tx, BK, T::kLoadsA, T::kThreads> load_a(static_cast<const Tx*>(p.x), m0, m, k,
+                                                          tid);
+    const Loader<__nv_bfloat16, BK, T::kLoadsB, T::kThreads> load_b(p.w, n0, n, k, tid);
+    auto load = [&](int stage, int step) {
+        const uint32_t base = smem0 + stage * T::kStage;
+        load_a.load(base, step * BK, k);
+        load_b.load(base + T::kStageA, step * BK, k);
+    };
+
+    // ldmatrix rows of this lane: A rows lane % 16 and chunk lane / 16 of each 16 x 16
+    // slice; B rows lane % 8 + 8 (lane / 16) and chunk lane / 8 % 2. Slice origins are
+    // multiples of 8 rows and 2 chunks, so the swizzle depends only on the lane.
+    const int a_row = wm * T::kWarpM + lane % 16;
+    const int b_row = wn * T::kWarpN + lane % 8 + lane / 16 * 8;
+    const uint32_t a_base = a_row * LA::kRowBytes;
+    const uint32_t b_base = T::kStageA + b_row * LB::kRowBytes;
+    const int a_xor = (lane / 16) ^ LA::mask(a_row);
+    const int b_xor = (lane / 8 % 2) ^ LB::mask(b_row);
+
+    float acc[T::kMi][T::kNi][4] = {};
+
+    // This block's share of the k steps.
+    const int all_steps = (k + BK - 1) / BK;
+    const int share = (all_steps + splits - 1) / splits;
+    const int first_step = min(all_steps, rank * share);
+    const int k_steps = min(all_steps, first_step + share);
+#pragma unroll
+    for (int st = 0; st < STAGES - 1; ++st) {
+        if (first_step + st < k_steps) {
+            load(st, first_step + st);
+        }
+        cp_async_commit();
+    }
+
+    int stage = 0;
+    for (int step = first_step; step < k_steps; ++step) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        const int next = step + STAGES - 1;
+        if (next < k_steps) {
+            load((stage + STAGES - 1) % STAGES, next);
+        }
+        cp_async_commit();
+
+        const uint32_t st_addr = smem0 + stage * T::kStage;
+        const char* st_ptr = smem + stage * T::kStage;
+#pragma unroll
+        for (int kk = wk * 16; kk < BK; kk += 16 * WK) {
+            uint32_t bf[T::kNi][2];
+#pragma unroll
+            for (int nj = 0; nj < T::kNi; nj += 2) {
+                uint32_t r[4];
+                ldmatrix_x4(r, st_addr + b_base + nj * 8 * LB::kRowBytes +
+                                   ((kk / 8) ^ b_xor) * 16);
+                bf[nj][0] = r[0];
+                bf[nj][1] = r[1];
+                bf[nj + 1][0] = r[2];
+                bf[nj + 1][1] = r[3];
+            }
+#pragma unroll
+            for (int mi = 0; mi < T::kMi; ++mi) {
+                if constexpr (sizeof(Tx) == 2) {
+                    uint32_t af[4];
+                    ldmatrix_x4(af, st_addr + a_base + mi * 16 * LA::kRowBytes +
+                                        ((kk / 8) ^ a_xor) * 16);
+#pragma unroll
+                    for (int ni = 0; ni < T::kNi; ++ni) {
+                        mma(acc[mi][ni], af, bf[ni][0], bf[ni][1]);
+                    }
+                } else {
+                    // Fragment layout of mma's A operand: rows g and g + 8, columns 2t,
+                    // 2t + 1 and the same plus 8.
+                    const int g = lane / 4, t = lane % 4;
+                    const float* base = reinterpret_cast<const float*>(
+                        st_ptr + (wm * T::kWarpM + mi * 16 + g) * LA::kRowBytes) + kk + 2 * t;
+                    constexpr int kRow = LA::kRowBytes / 4;
+                    uint32_t hi[4], mid[4], lo[4];
+                    const float2 v[4] = {
+                        *reinterpret_cast<const float2*>(base),
+                        *reinterpret_cast<const float2*>(base + 8 * kRow),
+                        *reinterpret_cast<const float2*>(base + 8),
+                        *reinterpret_cast<const float2*>(base + 8 * kRow + 8),
+                    };
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        split3(v[i], hi[i], mid[i], lo[i]);
+                    }
+#pragma unroll
+                    for (int ni = 0; ni < T::kNi; ++ni) {
+                        mma(acc[mi][ni], lo, bf[ni][0], bf[ni][1]);
+                        mma(acc[mi][ni], mid, bf[ni][0], bf[ni][1]);
+                        mma(acc[mi][ni], hi, bf[ni][0], bf[ni][1]);
+                    }
+                }
+            }
+        }
+        stage = stage + 1 == STAGES ? 0 : stage + 1;
+    }
+
+    constexpr int kValues = T::kMi * T::kNi * 4;  // accumulators per thread
+    float* const red = reinterpret_cast<float*>(smem);
+    const int slice = wm * WN + wn;
+    if constexpr (WK > 1) {
+        // Warps with wk > 0 hand their partial sums to the wk = 0 warp of their slice.
+        cp_async_wait<0>();
+        __syncthreads();
+        if (wk > 0) {
+            float* dst = red + ((wk - 1) * WM * WN + slice) * kValues * 32 + lane;
+#pragma unroll
+            for (int v = 0; v < kValues; ++v) {
+                dst[v * 32] = (&acc[0][0][0])[v];
+            }
+        }
+        __syncthreads();
+        if (wk == 0) {
+#pragma unroll
+            for (int j = 1; j < WK; ++j) {
+                const float* src = red + ((j - 1) * WM * WN + slice) * kValues * 32 + lane;
+#pragma unroll
+                for (int v = 0; v < kValues; ++v) {
+                    (&acc[0][0][0])[v] += src[v * 32];
+                }
+            }
+        }
+    }
+
+    Tx* const out = static_cast<Tx*>(p.out);
+    const int g = lane / 4, t = lane % 4;
+    auto store = [&](int mi, int ni, const float (&v)[4]) {
+        const int col = n0 + wn * T::kWarpN + ni * 8 + 2 * t;
+        if (col >= n) {
+            return;
+        }
+        const bool second = col + 1 < n;
+        const bool pair = second && n % 2 == 0;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = m0 + wm * T::kWarpM + mi * 16 + g + 8 * h;
+            if (row < m) {
+                store2(out, size_t(row) * n + col, pair, second, v[2 * h], v[2 * h + 1]);
+            }
+        }
+    };
+
+    if (splits == 1) {
+        if (wk == 0) {
+#pragma unroll
+            for (int mi = 0; mi < T::kMi; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < T::kNi; ++ni) {
+                    store(mi, ni, acc[mi][ni]);
+                }
+        }
+        return;
+    }
+
+    // Split k: every block of the cluster parks its sums in shared memory, then block r
+    // adds up and stores the 16 x 8 slices (mi, ni) with (mi kNi + ni) % splits == r.
+    // The second barrier keeps each block's shared memory alive until the reads finish.
+    cp_async_wait<0>();
+    __syncthreads();
+    if (wk == 0) {
+        float* dst = red + slice * kValues * 32 + lane;
+#pragma unroll
+        for (int v = 0; v < kValues; ++v) {
+            dst[v * 32] = (&acc[0][0][0])[v];
+        }
+    }
+    cluster_sync();
+    if (wk == 0) {
+        const uint32_t base = smem_addr(red + slice * kValues * 32 + lane);
+#pragma unroll
+        for (int mi = 0; mi < T::kMi; ++mi)
+#pragma unroll
+            for (int ni = 0; ni < T::kNi; ++ni) {
+                if ((mi * T::kNi + ni) % splits != rank) {
+                    continue;
+                }
+                float v[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    v[e] = acc[mi][ni][e];
+                }
+                for (int j = 0; j < splits; ++j) {
+                    if (j == rank) {
+                        continue;
+                    }
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        v[e] += ld_cluster(base + ((mi * T::kNi + ni) * 4 + e) * 32 * 4, j);
+                    }
+                }
+                store(mi, ni, v);
+            }
+    }
+    cluster_sync();
+}
+
+}  // namespace gemm
+
+// Entry points by input type and tile; the name gives BM x BN. The launcher picks one
+// from m and sets the dynamic shared memory to Tile::kSmemBytes.
+#define GEMM_ENTRY(name, Tx, BM, BN, BK, WM, WN, WK, STAGES)                               \
+    extern "C" __global__ void __launch_bounds__(                                          \
+        gemm::Tile<Tx, BM, BN, BK, WM, WN, WK, STAGES>::kThreads)                          \
+        name(const __grid_constant__ gemm::Batch batch) {                                  \
+        extern __shared__ __align__(16) char gemm_smem[];                                  \
+        gemm::gemm<Tx, BM, BN, BK, WM, WN, WK, STAGES>(batch, gemm_smem);                  \
+    }
+
+// Small m: 16 or 32 rows, BK = 64 for long contiguous weight reads, two blocks per SM.
+GEMM_ENTRY(gemm_bf16_16x64, __nv_bfloat16, 16, 64, 64, 1, 2, 2, 4)
+GEMM_ENTRY(gemm_bf16_32x64, __nv_bfloat16, 32, 64, 64, 1, 2, 2, 4)
+// Large m: 32 x 32 warp tiles, two blocks per SM; 64 x 128 when its tiles fill the GPU.
+GEMM_ENTRY(gemm_bf16_64x64, __nv_bfloat16, 64, 64, 64, 2, 2, 1, 3)
+GEMM_ENTRY(gemm_bf16_64x128, __nv_bfloat16, 64, 128, 64, 2, 2, 1, 2)
+// F32 inputs: shared rows hold F32 x, so BK = 32 keeps the large tile at two blocks per SM.
+GEMM_ENTRY(gemm_f32_16x64, float, 16, 64, 64, 1, 2, 2, 3)
+GEMM_ENTRY(gemm_f32_64x64, float, 64, 64, 32, 2, 2, 1, 3)
