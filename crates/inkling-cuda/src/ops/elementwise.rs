@@ -9,7 +9,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{KernelArgs, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -81,10 +81,11 @@ impl Elementwise {
     pub fn embedding(
         &self,
         stream: &CudaStream,
-        ids: &CudaSlice<i32>,
+        ids: &impl DeviceIn<i32>,
         table: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
+        let (ids, mut out) = (ids.view(), out.view_mut());
         let vocab = ensure_rows("table", table.len(), HIDDEN)?;
         let vocab = i32::try_from(vocab).context("table has too many rows")?;
         ensure!(
@@ -103,7 +104,7 @@ impl Elementwise {
             shared_mem_bytes: 0,
         };
         let mut launch = stream.launch_builder(&self.embedding_bf16_2304);
-        launch.arg(ids).arg(table).arg(out).arg(&vocab);
+        launch.arg(&ids).arg(table).arg(&mut out).arg(&vocab);
         // SAFETY: the arguments match `embedding_bf16_2304(const int*, const bf16*, bf16*, int)`.
         // `out` holds one row per id, and the kernel bounds-checks each id against `vocab`.
         unsafe { launch.launch(config) }?;
@@ -115,11 +116,12 @@ impl Elementwise {
     pub fn softcapped_swiglu(
         &self,
         stream: &CudaStream,
-        gate_up: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
+        gate_up: &impl DeviceIn<bf16>,
+        out: &mut impl DeviceOut<bf16>,
         gate_softcap: f32,
         up_softcap: f32,
     ) -> anyhow::Result<()> {
+        let (gate_up, mut out) = (gate_up.view(), out.view_mut());
         ensure_rows("gate_up", gate_up.len(), 2 * EXPERT_WIDTH)?;
         ensure!(
             gate_up.len() == 2 * out.len(),
@@ -129,8 +131,8 @@ impl Elementwise {
         );
         let n = out.len();
         let mut args = KernelArgs::default();
-        args.ptr(gate_up, stream)
-            .ptr_mut(out, stream)
+        args.ptr(&gate_up, stream)
+            .ptr_mut(&mut out, stream)
             .u64(n as u64)
             .f32(gate_softcap)
             .f32(up_softcap);
@@ -144,10 +146,11 @@ impl Elementwise {
     pub fn attention_gate(
         &self,
         stream: &CudaStream,
-        attn: &CudaSlice<bf16>,
-        gate: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
+        attn: &impl DeviceIn<bf16>,
+        gate: &impl DeviceIn<bf16>,
+        out: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
+        let (attn, gate, mut out) = (attn.view(), gate.view(), out.view_mut());
         ensure_rows("attn", attn.len(), ATTENTION_WIDTH)?;
         ensure!(
             gate.len() == attn.len() && out.len() == attn.len(),
@@ -158,7 +161,7 @@ impl Elementwise {
         );
         let n = attn.len();
         let mut launch = stream.launch_builder(&self.attention_gate_bf16);
-        launch.arg(attn).arg(gate).arg(out).arg(&n);
+        launch.arg(&attn).arg(&gate).arg(&mut out).arg(&n);
         // SAFETY: the arguments match `attention_gate_bf16(const bf16*, const bf16*, bf16*,
         // size_t)`, and all three buffers hold `n` elements.
         unsafe { launch.launch(grid_stride(n)) }?;
@@ -295,10 +298,11 @@ impl Elementwise {
     pub fn logit_softcap(
         &self,
         stream: &CudaStream,
-        logits: &CudaSlice<bf16>,
-        out: &mut CudaSlice<f32>,
+        logits: &impl DeviceIn<bf16>,
+        out: &mut impl DeviceOut<f32>,
         softcap: f32,
     ) -> anyhow::Result<()> {
+        let (logits, mut out) = (logits.view(), out.view_mut());
         let rows = ensure_rows("logits", logits.len(), PADDED_VOCAB)?;
         ensure!(
             out.len() == rows * VOCAB,
@@ -309,8 +313,8 @@ impl Elementwise {
         let (in_width, out_width) = (PADDED_VOCAB as u32, VOCAB as u32);
         let mut launch = stream.launch_builder(&self.logit_softcap_bf16_f32);
         launch
-            .arg(logits)
-            .arg(out)
+            .arg(&logits)
+            .arg(&mut out)
             .arg(&n)
             .arg(&in_width)
             .arg(&out_width)

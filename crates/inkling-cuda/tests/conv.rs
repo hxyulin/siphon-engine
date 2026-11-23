@@ -245,3 +245,119 @@ fn moe_conv_residual_matches_separate_kernels() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Chunk sizes for the multi-row tests: chunks of one and two rows reach into the state
+/// for more than one row of their window.
+const CHUNKS: [usize; 4] = [5, 1, 2, 7];
+
+/// The multi-row post-attention conv against one single-row call per row, over chunks of
+/// several sizes with one carried state. Same rounded operations, so bit for bit.
+#[test]
+fn short_conv_residual_rows_match_single_rows() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let conv = Conv::load(gpu.context())?;
+    let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 4, 5, 0.5, 0.0))?;
+    let start = pseudo_random(3 * HIDDEN, 6, 2.0);
+    let mut state_rows = stream.clone_htod(&start)?;
+    let mut state_single = stream.clone_htod(&start)?;
+    for (chunk, &rows) in CHUNKS.iter().enumerate() {
+        let seed = 60 + 2 * chunk as u32;
+        let x = pseudo_random_bf16(rows * HIDDEN, seed, 3.0, 0.0);
+        let hidden = pseudo_random_bf16(rows * HIDDEN, seed + 1, 3.0, 0.0);
+        // The second chunk starts a block, without the residual input.
+        let with_hidden = chunk != 1;
+        let mut want = Vec::new();
+        for r in 0..rows {
+            let x_row = stream.clone_htod(&x[r * HIDDEN..(r + 1) * HIDDEN])?;
+            let h_row = stream.clone_htod(&hidden[r * HIDDEN..(r + 1) * HIDDEN])?;
+            let mut out = stream.alloc_zeros::<f32>(HIDDEN)?;
+            conv.short_conv_residual(
+                stream,
+                &x_row,
+                &weight,
+                &mut state_single,
+                with_hidden.then_some(&h_row),
+                &mut out,
+            )?;
+            want.extend(stream.clone_dtoh(&out)?);
+        }
+        let x = stream.clone_htod(&x)?;
+        let hidden = stream.clone_htod(&hidden)?;
+        let mut got = stream.alloc_zeros::<f32>(rows * HIDDEN)?;
+        conv.short_conv_residual_rows(
+            stream,
+            &x,
+            &weight,
+            &mut state_rows,
+            with_hidden.then_some(&hidden as &dyn inkling_cuda::DeviceIn<bf16>),
+            &mut got,
+            rows,
+        )?;
+        let label = format!("chunk {chunk} of {rows} rows");
+        assert_f32_within_ulps(&label, &stream.clone_dtoh(&got)?, &want, 0);
+        assert_f32_within_ulps(
+            &format!("{label} state"),
+            &stream.clone_dtoh(&state_rows)?,
+            &stream.clone_dtoh(&state_single)?,
+            0,
+        );
+    }
+    Ok(())
+}
+
+/// The multi-row MoE combine, post-MLP conv and residual add against one single-row call
+/// per row. Bit for bit.
+#[test]
+fn moe_conv_residual_rows_match_single_rows() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let conv = Conv::load(gpu.context())?;
+    let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 4, 7, 0.5, 0.0))?;
+    let start = pseudo_random(3 * HIDDEN, 8, 2.0);
+    let mut state_rows = stream.clone_htod(&start)?;
+    let mut state_single = stream.clone_htod(&start)?;
+    for (chunk, &rows) in CHUNKS.iter().enumerate() {
+        let seed = 80 + 3 * chunk as u32;
+        let experts = pseudo_random_bf16(rows * TOP_K * HIDDEN, seed, 2.0, 0.0);
+        let routing: Vec<f32> = pseudo_random(rows * TOP_K, seed + 1, 1.0)
+            .iter()
+            .map(|v| v.abs())
+            .collect();
+        let residual = pseudo_random(rows * HIDDEN, seed + 2, 4.0);
+        let mut want = Vec::new();
+        for r in 0..rows {
+            let e = stream.clone_htod(&experts[r * TOP_K * HIDDEN..(r + 1) * TOP_K * HIDDEN])?;
+            let w = stream.clone_htod(&routing[r * TOP_K..(r + 1) * TOP_K])?;
+            let res = stream.clone_htod(&residual[r * HIDDEN..(r + 1) * HIDDEN])?;
+            let mut out = stream.alloc_zeros::<bf16>(HIDDEN)?;
+            conv.moe_conv_residual(stream, &e, &w, &weight, &mut state_single, &res, &mut out)?;
+            want.extend(stream.clone_dtoh(&out)?);
+        }
+        let experts = stream.clone_htod(&experts)?;
+        let routing = stream.clone_htod(&routing)?;
+        let residual = stream.clone_htod(&residual)?;
+        let mut combined = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        let mut got = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        conv.moe_conv_residual_rows(
+            stream,
+            &experts,
+            &routing,
+            &weight,
+            &mut state_rows,
+            &residual,
+            &mut combined,
+            &mut got,
+            rows,
+        )?;
+        let label = format!("chunk {chunk} of {rows} rows");
+        assert_bf16_close(&label, &stream.clone_dtoh(&got)?, &want, 0);
+        assert_f32_within_ulps(
+            &format!("{label} state"),
+            &stream.clone_dtoh(&state_rows)?,
+            &stream.clone_dtoh(&state_single)?,
+            0,
+        );
+    }
+    Ok(())
+}

@@ -373,14 +373,19 @@ __device__ void store4(__nv_bfloat16* p, const float (&v)[4]) {
 // Sums follow depth_attention_2304 and the norm kernels. All loads are issued
 // up front, which the separate kernel, looping over candidates and queries,
 // did not do.
-extern "C" __global__ void __launch_bounds__(kDepthThreads)
-depth_attention_fused_2304(const float* __restrict__ blocks, int nb, const float* partial_f32,
-                         const __nv_bfloat16* partial_bf16, int normalize_partial, float* normed_partial,
-                         const float* __restrict__ queries, int nq, float* out, __nv_bfloat16* dst0,
-                         __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
-                         const __nv_bfloat16* weight0, const __nv_bfloat16* weight1,
-                         const __nv_bfloat16* weight2, const __nv_bfloat16* weight3, float eps,
-                         float scale) {
+//
+// `block_stride` is the distance between block states: 2304 for one row, or a whole
+// chunk's rows for depth_attention_fused_rows_2304.
+namespace {
+
+__device__ __forceinline__ void
+depth_attention_fused_row(const float* __restrict__ blocks, int block_stride, int nb, const float* partial_f32,
+                          const __nv_bfloat16* partial_bf16, int normalize_partial, float* normed_partial,
+                          const float* __restrict__ queries, int nq, float* out, __nv_bfloat16* dst0,
+                          __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
+                          const __nv_bfloat16* weight0, const __nv_bfloat16* weight1,
+                          const __nv_bfloat16* weight2, const __nv_bfloat16* weight3, float eps,
+                          float scale) {
     __shared__ float warp_dots[kFusedDots][kDepthWarps];
     __shared__ float probs[kFusedDots];
     __shared__ float vw[kFusedMaxQueries + 1][kNormVirtualWarps];
@@ -409,7 +414,7 @@ depth_attention_fused_2304(const float* __restrict__ blocks, int nb, const float
         const float pd = partial_f32 != nullptr ? partial_f32[d] : __bfloat162float(partial_bf16[d]);
 #pragma unroll
         for (int i = 0; i < kFusedMaxCandidates; ++i) {
-            s[i][m] = i < nb ? blocks[size_t(i) * kHidden + d] : (i == nb ? pd : 0.f);
+            s[i][m] = i < nb ? blocks[size_t(i) * block_stride + d] : (i == nb ? pd : 0.f);
         }
     }
     // The partial's scale; a select per candidate keeps s in registers.
@@ -602,6 +607,46 @@ depth_attention_fused_2304(const float* __restrict__ blocks, int nb, const float
     }
 }
 
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kDepthThreads)
+depth_attention_fused_2304(const float* __restrict__ blocks, int nb, const float* partial_f32,
+                           const __nv_bfloat16* partial_bf16, int normalize_partial, float* normed_partial,
+                           const float* __restrict__ queries, int nq, float* out, __nv_bfloat16* dst0,
+                           __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
+                           const __nv_bfloat16* weight0, const __nv_bfloat16* weight1,
+                           const __nv_bfloat16* weight2, const __nv_bfloat16* weight3, float eps,
+                           float scale) {
+    depth_attention_fused_row(blocks, kHidden, nb, partial_f32, partial_bf16, normalize_partial, normed_partial,
+                              queries, nq, out, dst0, dst1, dst2, dst3, weight0, weight1, weight2, weight3, eps,
+                              scale);
+}
+
+// depth_attention_fused_2304 for each row (blockIdx.x) of a chunk. Block state i of row
+// r is at blocks + i * block_stride + r * 2304. The partial, normed_partial and out rows
+// are consecutive ([rows, 2304] and [rows, nq, 2304]); the destination rows are
+// dst_stride apart, so a destination can be one half of a [rows, 2 * 2304] buffer.
+extern "C" __global__ void __launch_bounds__(kDepthThreads)
+depth_attention_fused_rows_2304(const float* __restrict__ blocks, int block_stride, int nb,
+                                const float* partial_f32, const __nv_bfloat16* partial_bf16,
+                                int normalize_partial, float* normed_partial, const float* __restrict__ queries,
+                                int nq, float* out, __nv_bfloat16* dst0, __nv_bfloat16* dst1,
+                                __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,
+                                const __nv_bfloat16* weight0, const __nv_bfloat16* weight1,
+                                const __nv_bfloat16* weight2, const __nv_bfloat16* weight3, float eps,
+                                float scale) {
+    const size_t row = blockIdx.x;
+    const size_t at = row * kHidden;
+    const size_t dst_at = row * size_t(dst_stride);
+    const auto offset = [&](__nv_bfloat16* p) { return p != nullptr ? p + dst_at : nullptr; };
+    depth_attention_fused_row(blocks + at, block_stride, nb, partial_f32 != nullptr ? partial_f32 + at : nullptr,
+                              partial_bf16 != nullptr ? partial_bf16 + at : nullptr, normalize_partial,
+                              normed_partial != nullptr ? normed_partial + at : nullptr, queries, nq,
+                              out != nullptr ? out + row * size_t(nq) * kHidden : nullptr, offset(dst0),
+                              offset(dst1), offset(dst2), offset(dst3), weight0, weight1, weight2, weight3, eps,
+                              scale);
+}
+
 namespace {
 
 constexpr int kRouterThreads = kDepthThreads;
@@ -620,11 +665,13 @@ constexpr int kGemvChunks = (kHidden + kLogitsThreads * 4 - 1) / (kLogitsThreads
 // Each block computes the norm itself and the logits of two experts. The last block
 // to finish, found with `counter`, routes. `counter` must start at 0; the last block
 // resets it, so the kernel can run again from a graph.
-extern "C" __global__ void __launch_bounds__(kRouterThreads)
-moe_router_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
-                const float* __restrict__ router, const float* __restrict__ bias,
-                __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
-                unsigned* counter, float route_scale) {
+namespace {
+
+__device__ __forceinline__ void
+moe_router_row(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
+               const float* __restrict__ router, const float* __restrict__ bias,
+               __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
+               unsigned* counter, float route_scale) {
     __shared__ float vw[kNormVirtualWarps];
     __shared__ float xs[kHidden];
     __shared__ float warp_dots[kExpertsPerBlock][kLogitsThreads / 32];
@@ -757,4 +804,27 @@ moe_router_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ n
     if (threadIdx.x == 0) {
         *counter = 0;
     }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kRouterThreads)
+moe_router_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
+                const float* __restrict__ router, const float* __restrict__ bias,
+                __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
+                unsigned* counter, float route_scale) {
+    moe_router_row(x, norm_weight, eps, router, bias, x_out, logits, indices, weights, counter, route_scale);
+}
+
+// moe_router_2304 for each row (blockIdx.y) of a chunk: x and x_out [rows, 2304], logits
+// [rows, 128], indices and weights [rows, 8], and one counter per row, each holding 0.
+extern "C" __global__ void __launch_bounds__(kRouterThreads)
+moe_router_rows_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
+                     const float* __restrict__ router, const float* __restrict__ bias,
+                     __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
+                     unsigned* counters, float route_scale) {
+    const size_t row = blockIdx.y;
+    moe_router_row(x + row * kHidden, norm_weight, eps, router, bias, x_out + row * kHidden,
+                   logits + row * kExperts, indices + row * kTopK, weights + row * kTopK, counters + row,
+                   route_scale);
 }

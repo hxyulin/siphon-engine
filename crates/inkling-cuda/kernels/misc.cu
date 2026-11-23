@@ -194,11 +194,13 @@ __device__ __forceinline__ float warp_sum(float v) {
 // RMSNorm after every query, key and value gate, summed as rms_norm_f32_2304 does.
 // The last block to finish, found with `counter`, applies it. `counter` must start
 // at 0 and is reset by that block.
-extern "C" __global__ void __launch_bounds__(kGateThreads)
-message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
-                      const __nv_bfloat16* __restrict__ gain, const float* h, const float* m, float* out,
-                      const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
-                      unsigned* counter, float eps) {
+namespace {
+
+__device__ __forceinline__ void
+message_gate_out_row(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
+                     const __nv_bfloat16* __restrict__ gain, const float* h, const float* m, float* out,
+                     const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
+                     unsigned* counter, float eps) {
     __shared__ float vw[kNormVirtualWarps];
     __shared__ bool last;
     const int lane = threadIdx.x % 32;
@@ -302,4 +304,28 @@ message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat1
     if (threadIdx.x == 0) {
         *counter = 0;
     }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_out_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
+                      const __nv_bfloat16* __restrict__ gain, const float* h, const float* m, float* out,
+                      const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
+                      unsigned* counter, float eps) {
+    message_gate_out_row(down, forget, gain, h, m, out, norm_weight, normed, counter, eps);
+}
+
+// message_gate_out_2304 for each row (blockIdx.y) of a chunk: down [rows, 64], out and
+// normed [rows, 2304], one counter per row holding 0, and the h and m rows h_stride and
+// m_stride floats apart.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_out_rows_2304(const __nv_bfloat16* __restrict__ down, const __nv_bfloat16* __restrict__ forget,
+                           const __nv_bfloat16* __restrict__ gain, const float* h, int h_stride, const float* m,
+                           int m_stride, float* out, const __nv_bfloat16* __restrict__ norm_weight,
+                           __nv_bfloat16* normed, unsigned* counters, float eps) {
+    const size_t row = blockIdx.y;
+    message_gate_out_row(down + row * kGateRank, forget, gain, h + row * size_t(h_stride), m + row * size_t(m_stride),
+                         out + row * kHidden, norm_weight, normed != nullptr ? normed + row * kHidden : nullptr,
+                         counters + row, eps);
 }

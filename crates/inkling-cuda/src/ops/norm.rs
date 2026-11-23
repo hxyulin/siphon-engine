@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg as _,
 };
 use half::bf16;
 
@@ -36,11 +37,11 @@ pub enum KvConvWeights<'a> {
         k: &'a CudaSlice<bf16>,
         v: &'a CudaSlice<bf16>,
     },
-    /// `DynamicShortConvolution`: the row's BF16 taps `[8 heads * 4]` and the F32 static
-    /// weights `[4, 1024]`.
+    /// `DynamicShortConvolution`: each row's BF16 taps `[rows, 8 heads * 4]` and the F32
+    /// static weights `[4, 1024]`.
     Dynamic {
-        k_dynamic: &'a CudaSlice<bf16>,
-        v_dynamic: &'a CudaSlice<bf16>,
+        k_dynamic: CudaView<'a, bf16>,
+        v_dynamic: CudaView<'a, bf16>,
         k_static: &'a CudaSlice<f32>,
         v_static: &'a CudaSlice<f32>,
     },
@@ -72,6 +73,30 @@ pub struct AttentionPost<'a> {
     pub eps: f32,
 }
 
+/// Inputs and outputs of [`Norm::attention_post_rows`] for the rows of a chunk: the
+/// per-row buffers of [`AttentionPost`] with `rows` rows each.
+pub struct AttentionPostRows<'a> {
+    pub k_raw: CudaView<'a, bf16>,
+    pub v_raw: CudaView<'a, bf16>,
+    pub conv: KvConvWeights<'a>,
+    /// Conv states, F32 `[3, 1024]`, only read.
+    pub k_state: &'a CudaSlice<f32>,
+    pub v_state: &'a CudaSlice<f32>,
+    pub q_raw: CudaView<'a, bf16>,
+    pub q_scale: &'a CudaSlice<bf16>,
+    pub r_raw: CudaView<'a, bf16>,
+    pub r_scale: &'a CudaSlice<bf16>,
+    pub k: CudaViewMut<'a, bf16>,
+    pub v: CudaViewMut<'a, bf16>,
+    pub q: CudaViewMut<'a, bf16>,
+    pub r: CudaViewMut<'a, bf16>,
+    /// For full attention, the position of row 0 (one value), alpha and n_floor.
+    pub log_scale: Option<(&'a CudaSlice<u32>, f32, f32)>,
+    pub qk_threshold: f32,
+    pub rel_threshold: f32,
+    pub eps: f32,
+}
+
 #[derive(Debug)]
 pub struct Norm {
     rms_norm_bf16_2304: CudaFunction,
@@ -82,6 +107,7 @@ pub struct Norm {
     l2_clip_bf16_128: CudaFunction,
     l2_clip_bf16_16: CudaFunction,
     attention_post_bf16: CudaFunction,
+    attention_post_rows_bf16: CudaFunction,
 }
 
 /// Row count of `x` as a grid dimension, after checking that `x` holds whole rows of `width`.
@@ -128,6 +154,7 @@ impl Norm {
             l2_clip_bf16_128: module.load_function("l2_clip_bf16_128")?,
             l2_clip_bf16_16: module.load_function("l2_clip_bf16_16")?,
             attention_post_bf16: module.load_function("attention_post_bf16")?,
+            attention_post_rows_bf16: module.load_function("attention_post_rows_bf16")?,
         })
     }
 
@@ -135,16 +162,17 @@ impl Norm {
     pub fn rms_norm(
         &self,
         stream: &CudaStream,
-        x: &CudaSlice<bf16>,
+        x: &impl DeviceIn<bf16>,
         weight: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
         eps: f32,
     ) -> anyhow::Result<()> {
+        let (x, mut out) = (x.view(), out.view_mut());
         check_weight(weight.len())?;
         let rows = rows(x.len(), HIDDEN)?;
         check_out(out.len(), x.len())?;
         let mut launch = stream.launch_builder(&self.rms_norm_bf16_2304);
-        launch.arg(x).arg(weight).arg(out).arg(&eps);
+        launch.arg(&x).arg(weight).arg(&mut out).arg(&eps);
         // SAFETY: the arguments match `rms_norm_bf16_2304(const bf16*, const bf16*, bf16*, float)`,
         // and the checks above keep every row inside `x` and `out`.
         unsafe { launch.launch(row_config(rows)) }?;
@@ -198,15 +226,15 @@ impl Norm {
     pub fn unweighted_rms_norm_bf16(
         &self,
         stream: &CudaStream,
-        x: &CudaSlice<bf16>,
+        x: &impl DeviceIn<bf16>,
         out: &mut impl DeviceOut<f32>,
         eps: f32,
     ) -> anyhow::Result<()> {
-        let mut out = out.view_mut();
+        let (x, mut out) = (x.view(), out.view_mut());
         let rows = rows(x.len(), HIDDEN)?;
         check_out(out.len(), x.len())?;
         let mut args = KernelArgs::default();
-        args.ptr(x, stream).ptr_mut(&mut out, stream).f32(eps);
+        args.ptr(&x, stream).ptr_mut(&mut out, stream).f32(eps);
         // SAFETY: the arguments match `unweighted_rms_norm_bf16_f32_2304(const bf16*, float*,
         // float)`, the checks above keep every row inside `x` and `out`, and the kernel reads
         // nothing before `pdl_wait`.
@@ -372,8 +400,8 @@ impl Norm {
                 check("v_static", v_static.len(), CONV_TAPS * kv)?;
                 args.u64(0)
                     .u64(0)
-                    .ptr(*k_dynamic, stream)
-                    .ptr(*v_dynamic, stream)
+                    .ptr(k_dynamic, stream)
+                    .ptr(v_dynamic, stream)
                     .ptr(*k_static, stream)
                     .ptr(*v_static, stream);
             }
@@ -404,5 +432,112 @@ impl Norm {
         // without dynamic taps, the position only with log scaling), and it reads nothing
         // before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.attention_post_bf16, config) }
+    }
+
+    /// [`Norm::attention_post`] for each of the `rows` rows of a chunk, whose row 0 sits at
+    /// the position in `log_scale`. Row `t`'s convs read rows `t - 3 ..= t` of `k_raw` and
+    /// `v_raw`, reaching into the states before row 0. The states are only read: the caller
+    /// shifts `k_raw` and `v_raw` into them afterwards with
+    /// [`Conv::shift_state`](crate::ops::conv::Conv::shift_state). Each row's results equal
+    /// a single-row call's bit for bit.
+    pub fn attention_post_rows(
+        &self,
+        stream: &CudaStream,
+        a: AttentionPostRows<'_>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let kv = KV_HEADS * HEAD_DIM;
+        let check = |name: &str, len: usize, want: usize| {
+            ensure!(len == want, "{name} has {len} elements, expected {want}");
+            Ok(())
+        };
+        ensure!(rows > 0, "no rows");
+        for (name, len) in [
+            ("k_raw", a.k_raw.len()),
+            ("v_raw", a.v_raw.len()),
+            ("k", a.k.len()),
+            ("v", a.v.len()),
+        ] {
+            check(name, len, rows * kv)?;
+        }
+        check("k_state", a.k_state.len(), (CONV_TAPS - 1) * kv)?;
+        check("v_state", a.v_state.len(), (CONV_TAPS - 1) * kv)?;
+        check("q_raw", a.q_raw.len(), rows * Q_HEADS * HEAD_DIM)?;
+        check("q", a.q.len(), rows * Q_HEADS * HEAD_DIM)?;
+        check("q_scale", a.q_scale.len(), Q_HEADS * HEAD_DIM)?;
+        check("r_raw", a.r_raw.len(), rows * Q_HEADS * REL_DIM)?;
+        check("r", a.r.len(), rows * Q_HEADS * REL_DIM)?;
+        check("r_scale", a.r_scale.len(), Q_HEADS * REL_DIM)?;
+        let config = LaunchConfig {
+            grid_dim: (
+                POST_BLOCKS,
+                u32::try_from(rows).context("too many rows")?,
+                1,
+            ),
+            block_dim: (POST_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&a.k_raw, stream).ptr(&a.v_raw, stream);
+        match &a.conv {
+            KvConvWeights::Static { k, v } => {
+                check("k conv weight", k.len(), kv * CONV_TAPS)?;
+                check("v conv weight", v.len(), kv * CONV_TAPS)?;
+                args.ptr(*k, stream)
+                    .ptr(*v, stream)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0);
+            }
+            KvConvWeights::Dynamic {
+                k_dynamic,
+                v_dynamic,
+                k_static,
+                v_static,
+            } => {
+                check("k_dynamic", k_dynamic.len(), rows * KV_HEADS * CONV_TAPS)?;
+                check("v_dynamic", v_dynamic.len(), rows * KV_HEADS * CONV_TAPS)?;
+                check("k_static", k_static.len(), CONV_TAPS * kv)?;
+                check("v_static", v_static.len(), CONV_TAPS * kv)?;
+                args.u64(0)
+                    .u64(0)
+                    .ptr(k_dynamic, stream)
+                    .ptr(v_dynamic, stream)
+                    .ptr(*k_static, stream)
+                    .ptr(*v_static, stream);
+            }
+        }
+        let (start, log_scale, alpha, n_floor) = match a.log_scale {
+            Some((start, alpha, n_floor)) => {
+                check("start", start.len(), 1)?;
+                (Some(start), 1, alpha, n_floor)
+            }
+            None => (None, 0, 0.0, 1.0),
+        };
+        let (mut k_out, mut v_out, mut q_out, mut r_out) = (a.k, a.v, a.q, a.r);
+        args.ptr(a.k_state, stream)
+            .ptr(a.v_state, stream)
+            .ptr(&a.q_raw, stream)
+            .ptr(a.q_scale, stream)
+            .ptr(&a.r_raw, stream)
+            .ptr(a.r_scale, stream)
+            .ptr_mut(&mut k_out, stream)
+            .ptr_mut(&mut v_out, stream)
+            .ptr_mut(&mut q_out, stream)
+            .ptr_mut(&mut r_out, stream)
+            .opt(start, stream)
+            .i32(log_scale)
+            .f32(alpha)
+            .f32(n_floor)
+            .f32(a.qk_threshold)
+            .f32(a.rel_threshold)
+            .f32(a.eps);
+        // SAFETY: the arguments match `attention_post_rows_bf16`'s signature, which is
+        // `attention_post_bf16`'s with `start` for `position`. Every per-row buffer holds
+        // `rows` rows as checked above and the grid has one y index per row; the kernel reads
+        // no null pointer (the static conv weights only without dynamic taps, `start` only
+        // with log scaling), writes no state, and reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.attention_post_rows_bf16, config) }
     }
 }

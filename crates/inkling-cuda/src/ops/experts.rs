@@ -8,7 +8,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
 
 /// Experts each token routes to.
 const SLOTS: usize = 8;
@@ -85,11 +85,12 @@ impl Experts {
     pub fn expert_matvec(
         &self,
         stream: &CudaStream,
-        x: &CudaSlice<bf16>,
-        indices: &CudaSlice<i32>,
+        x: &impl DeviceIn<bf16>,
+        indices: &impl DeviceIn<i32>,
         weights: &ExpertWeights<'_>,
-        out: &mut CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
+        let (x, indices, mut out) = (x.view(), indices.view(), out.view_mut());
         let &ExpertWeights {
             format,
             weight,
@@ -171,13 +172,13 @@ impl Experts {
             shared_mem_bytes: 0,
         };
         let mut launch = stream.launch_builder(function);
-        launch.arg(x).arg(indices).arg(weight).arg(scales);
+        launch.arg(&x).arg(&indices).arg(weight).arg(scales);
         match format {
             ExpertFormat::Nvfp4 { global_scale } => launch.arg(global_scale),
             ExpertFormat::Mxfp8 => launch.arg(&null),
         };
         launch
-            .arg(out)
+            .arg(&mut out)
             .arg(&n_arg)
             .arg(&k_arg)
             .arg(&inputs_arg)

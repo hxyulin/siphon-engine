@@ -2,9 +2,12 @@
 //! still computes the same model as MLX-LM, within a multiple of MLX's own noise.
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
+//!        [--prefill CHUNK]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
-//! text's next token, so a wrong prediction does not change later inputs. The gate
+//! text's next token, so a wrong prediction does not change later inputs. With
+//! `--prefill`, the text runs through `Model::prefill` in chunks of CHUNK rows instead
+//! of one step per token, and every row's logits are scored. The gate
 //! reports, per range of positions, top-1 agreement with MLX, the mean difference in
 //! the log-probability of the actual next token, and perplexity. It also reports
 //! KL(MLX || engine) at the captured positions and how many greedy tokens after the
@@ -27,7 +30,12 @@ mod linux {
 
     use anyhow::{Context as _, ensure};
     use inkling::{Checkpoint, TextConfig};
-    use inkling_cuda::{Gpu, model::Model, ops::attention::KvFormat, weights::Weights};
+    use inkling_cuda::{
+        Gpu,
+        model::{MAX_PREFILL_CHUNK, Model, PrefillLogits},
+        ops::attention::KvFormat,
+        weights::Weights,
+    };
     use safetensors::{Dtype, SafeTensors};
 
     // Thresholds, from MLX's disagreement with itself between its chunked (multi-row)
@@ -53,30 +61,42 @@ mod linux {
         capture: PathBuf,
         passes: Option<usize>,
         kv: KvFormat,
+        /// Chunk size for `Model::prefill`, or `None` to step token by token.
+        prefill: Option<usize>,
     }
 
     fn args() -> anyhow::Result<Args> {
         let mut positional = Vec::new();
         let mut passes = None;
         let mut kv = KvFormat::Bf16;
+        let mut prefill = None;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if arg == "--passes" {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
             } else if arg == "--kv" {
                 kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
+            } else if arg == "--prefill" {
+                let chunk: usize = it.next().context("--prefill needs a chunk size")?.parse()?;
+                ensure!(
+                    (1..=MAX_PREFILL_CHUNK).contains(&chunk),
+                    "--prefill takes 1 to {MAX_PREFILL_CHUNK} rows"
+                );
+                prefill = Some(chunk);
             } else {
                 positional.push(PathBuf::from(arg));
             }
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
-            "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]",
+            "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
+             [--prefill CHUNK]",
         )?;
         Ok(Args {
             model,
             capture,
             passes,
             kv,
+            prefill,
         })
     }
 
@@ -164,6 +184,19 @@ mod linux {
         let sum: f64 = x.iter().map(|&v| f64::from(v - max).exp()).sum();
         let log_sum = sum.ln();
         x.iter().map(|&v| f64::from(v - max) - log_sum).collect()
+    }
+
+    /// Index of the largest logit, the first on ties, with NaN largest, as `mx.argmax` and
+    /// the engine's argmax kernel pick it.
+    fn argmax(x: &[f32]) -> u32 {
+        let mut best = 0;
+        for (i, &v) in x.iter().enumerate() {
+            let b = x[best];
+            if v > b || (v.is_nan() && !b.is_nan()) {
+                best = i;
+            }
+        }
+        best as u32
     }
 
     /// Log-probability of `token` under softmax of the logits.
@@ -293,11 +326,9 @@ mod linux {
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)
         let mut kls: Vec<(usize, f64, u32, u32)> = Vec::new();
-        let mut next = 0;
         let started = Instant::now();
-        for (i, &token) in capture.tokens.iter().enumerate() {
-            next = model.step(token, None)?;
-            let logits = &model.logits()?;
+        // Scores the engine's logits at position i, whose top-1 token is `next`.
+        let mut score = |i: usize, logits: &[f32], next: u32| -> anyhow::Result<()> {
             ensure!(
                 logits.len() == vocab,
                 "the engine returned {} logits",
@@ -326,13 +357,24 @@ mod linux {
                 let want = &capture.logits[k * vocab..(k + 1) * vocab];
                 kls.push((i, kl(want, logits), next, mlx_next));
             }
-            if (i + 1) % 1024 == 0 {
+            if (i + 1).is_multiple_of(1024) {
                 let seconds = started.elapsed().as_secs_f64();
                 eprintln!(
                     "{}/{n} tokens, {:.0} ms per token",
                     i + 1,
                     seconds * 1e3 / (i + 1) as f64
                 );
+            }
+            Ok(())
+        };
+        let mut next = 0;
+        if let Some(chunk) = args.prefill {
+            let mut callback = |i: usize, logits: &[f32]| score(i, logits, argmax(logits));
+            next = model.prefill(&capture.tokens, chunk, PrefillLogits::All(&mut callback))?;
+        } else {
+            for (i, &token) in capture.tokens.iter().enumerate() {
+                next = model.step(token, None)?;
+                score(i, &model.logits()?, next)?;
             }
         }
         let forced_seconds = started.elapsed().as_secs_f64();
@@ -350,7 +392,14 @@ mod linux {
             .count();
         let seconds = started.elapsed().as_secs_f64();
 
-        println!("{n} tokens; MLX capture mode: {}", capture.mode);
+        let engine_mode = args.prefill.map_or_else(
+            || "token by token".to_owned(),
+            |chunk| format!("prefill in chunks of {chunk}"),
+        );
+        println!(
+            "{n} tokens; MLX capture mode: {}; engine: {engine_mode}",
+            capture.mode
+        );
         println!(
             "{:<20} {:>13} {:>7} {:>8} {:>12}  perplexity engine / MLX",
             "range", "positions", "tokens", "top-1", "|dlogprob|"
@@ -385,7 +434,7 @@ mod linux {
             capture.continuation.len()
         );
         println!(
-            "runtime {seconds:.0} s: {:.1} ms per teacher-forced token, logits read back each step",
+            "runtime {seconds:.0} s: {:.1} ms per teacher-forced token, every position's logits read back",
             forced_seconds * 1e3 / n as f64
         );
 

@@ -63,4 +63,49 @@ __device__ __forceinline__ __nv_bfloat16 dynamic_conv(float x, const __nv_bfloat
     return __float2bfloat16(__fdiv_rn(__fadd_rn(acc, x), kDynamicDivisor));
 }
 
+// The multi-row forms. Row t of a chunk convolves rows t - 3 .. t of the chunk's
+// inputs, reaching into the carried state for rows before the chunk, and leaves the
+// state alone; shift_state_rows in conv.cu then shifts the chunk into the state. Each
+// row rounds exactly as the single-row form above.
+
+// The window of row t for channel c, oldest first: x [rows, dims] BF16 rows t - 3 .. t,
+// with the rows before 0 taken from state [3, dims].
+__device__ __forceinline__ void load_window(const __nv_bfloat16* __restrict__ x,
+                                            const float* __restrict__ state, int c, int dims, int t,
+                                            float (&win)[kKernel]) {
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        const int row = t - (kKernel - 1) + k;
+        win[k] = row >= 0 ? __bfloat162float(x[size_t(row) * dims + c])
+                          : state[size_t(kKernel - 1 + row) * dims + c];
+    }
+}
+
+// short_conv over a given window, oldest row first; win[3] is the current row.
+__device__ __forceinline__ __nv_bfloat16 short_conv_window(const float (&win)[kKernel],
+                                                           const __nv_bfloat16* __restrict__ weight,
+                                                           int c) {
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(win[k]), __bfloat162float(weight[size_t(c) * kKernel + k])));
+    }
+    const float conv = round_bf16(acc);
+    return __float2bfloat16(__fdiv_rn(__fadd_rn(conv, win[kKernel - 1]), kShortDivisor));
+}
+
+// dynamic_conv over a given window, oldest row first; win[3] is the current row.
+__device__ __forceinline__ __nv_bfloat16 dynamic_conv_window(const float (&win)[kKernel],
+                                                             const __nv_bfloat16* __restrict__ dynamic,
+                                                             const float* __restrict__ static_weight,
+                                                             int c, int dims) {
+    float acc = 0.f;
+#pragma unroll
+    for (int lag = 0; lag < kKernel; ++lag) {
+        const float w = __fadd_rn(static_weight[lag * dims + c], __bfloat162float(dynamic[lag]));
+        acc = __fadd_rn(acc, __fmul_rn(win[kKernel - 1 - lag], w));
+    }
+    return __float2bfloat16(__fdiv_rn(__fadd_rn(acc, win[kKernel - 1]), kDynamicDivisor));
+}
+
 }  // namespace conv_step

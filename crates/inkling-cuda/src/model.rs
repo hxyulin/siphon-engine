@@ -8,6 +8,12 @@
 //! its position from device memory, so a step launches the same work at every position
 //! and never waits on the host. An untraced step replays that work as one CUDA graph,
 //! captured on the first untraced step.
+//!
+//! [`Model::prefill`] runs a prompt in chunks of many rows instead; see [`prefill`].
+
+mod prefill;
+
+pub use prefill::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits};
 
 use std::{ops::Range, sync::Arc};
 
@@ -22,7 +28,7 @@ use inkling::TextConfig;
 use crate::{
     DeviceIn, Gpu,
     ops::{
-        attention::{Attention, AttentionScratch, KvCache, KvFormat},
+        attention::{Attention, AttentionScratch, KvCache, KvData, KvFormat},
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
@@ -56,6 +62,36 @@ struct VisitState {
     /// Short-conv input history, F32 `[kernel - 1, dims]`: keys, values, post-attention
     /// and post-MLP, as in MLX-LM's `ArraysCache(4)`.
     conv: [CudaSlice<f32>; 4],
+}
+
+/// One visit's caches from [`Model::cache_snapshot`].
+#[derive(Debug)]
+pub struct VisitSnapshot {
+    /// Every cache slot, `[slots, 8, 128]`.
+    pub keys: Vec<f32>,
+    pub values: Vec<f32>,
+    /// The key, value, post-attention and post-MLP conv states, `[3, dims]` each.
+    pub conv: Vec<Vec<f32>>,
+}
+
+fn widen(x: &[bf16]) -> Vec<f32> {
+    x.iter().map(|v| v.to_f32()).collect()
+}
+
+/// The value of an E4M3 byte: 1 sign, 4 exponent (bias 7) and 3 mantissa bits.
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((b >> 3) & 0xf);
+    let mantissa = f32::from(b & 7);
+    if exponent == 0xf && b & 7 == 7 {
+        return f32::NAN;
+    }
+    let magnitude = if exponent == 0 {
+        mantissa / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    };
+    sign * magnitude
 }
 
 /// Inputs and outputs of each visit, read back for parity checks.
@@ -266,6 +302,8 @@ pub struct Model {
     graph: Option<StepGraph>,
     /// Position of the next token.
     position: usize,
+    /// Buffers of [`Model::prefill`], allocated on its first call.
+    prefill: Option<prefill::PrefillScratch>,
 }
 
 /// Everything a step reads but does not change.
@@ -369,7 +407,58 @@ impl Model {
             max_blocks,
             graph: None,
             position: 0,
+            prefill: None,
         })
+    }
+
+    /// Starts a new sequence: zeroes every KV cache and conv state and moves to position 0.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        for visit in &mut self.visits {
+            visit.kv.clear(&self.ctx.stream)?;
+            for state in &mut visit.conv {
+                self.ctx.stream.memset_zeros(state)?;
+            }
+        }
+        self.position = 0;
+        Ok(())
+    }
+
+    /// Every visit's KV cache and conv states, widened to F32, for tests that compare two
+    /// ways of filling them.
+    pub fn cache_snapshot(&self) -> anyhow::Result<Vec<VisitSnapshot>> {
+        let stream = &self.ctx.stream;
+        self.visits
+            .iter()
+            .map(|v| {
+                let (keys, values) = match v.kv.data() {
+                    KvData::Bf16 { keys, values } => (
+                        widen(&stream.clone_dtoh(keys)?),
+                        widen(&stream.clone_dtoh(values)?),
+                    ),
+                    KvData::Fp8 { keys, values } => (
+                        stream
+                            .clone_dtoh(keys)?
+                            .into_iter()
+                            .map(e4m3_to_f32)
+                            .collect(),
+                        stream
+                            .clone_dtoh(values)?
+                            .into_iter()
+                            .map(e4m3_to_f32)
+                            .collect(),
+                    ),
+                };
+                Ok(VisitSnapshot {
+                    keys,
+                    values,
+                    conv: v
+                        .conv
+                        .iter()
+                        .map(|c| Ok(stream.clone_dtoh(c)?))
+                        .collect::<anyhow::Result<_>>()?,
+                })
+            })
+            .collect()
     }
 
     /// Position of the next token.
@@ -547,7 +636,7 @@ impl Model {
         ctx.kernels.routing.depth_attention_fused(
             &ctx.stream,
             &blocks.rows(&s.blocks, hidden)?,
-            Partial::Bf16(&s.hidden),
+            Partial::Bf16(s.hidden.as_view()),
             None,
             &ctx.weights.final_query,
             None,
@@ -605,6 +694,13 @@ impl Blocks {
         ensure!(self.len > 0, "depth attention needs a block state");
         Ok(states.slice(..self.len * hidden))
     }
+}
+
+/// One product of [`Ctx::gemm_rows`]: `out [m, n] = x [m, k] @ weight [n, k]^T`.
+struct RowProduct<'a> {
+    weight: &'a CudaSlice<bf16>,
+    x: CudaView<'a, bf16>,
+    out: CudaViewMut<'a, bf16>,
 }
 
 /// What [`Ctx::attention_inputs`] reads and writes.
@@ -846,7 +942,7 @@ impl Ctx {
         self.kernels.routing.depth_attention_fused(
             &self.stream,
             &a.states,
-            Partial::Bf16(a.x),
+            Partial::Bf16(a.x.as_view()),
             Some(a.normed),
             query,
             a.messages
@@ -910,8 +1006,8 @@ impl Ctx {
             KvConv::Dynamic {
                 k_static, v_static, ..
             } => KvConvWeights::Dynamic {
-                k_dynamic: &t.k_dynamic,
-                v_dynamic: &t.v_dynamic,
+                k_dynamic: t.k_dynamic.as_view(),
+                v_dynamic: t.v_dynamic.as_view(),
                 k_static,
                 v_static,
             },
@@ -1009,9 +1105,6 @@ impl Ctx {
         x: &mut CudaSlice<bf16>,
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
-        let hidden = cfg.hidden_size;
-        let width = cfg.intermediate_size;
-
         self.kernels.routing.moe_router(
             &self.stream,
             input,
@@ -1027,6 +1120,28 @@ impl Ctx {
             cfg.route_scale,
         )?;
 
+        let (w13, w2) = self.expert_weights(w);
+        self.kernels
+            .experts
+            .expert_matvec(&self.stream, x, &t.indices, &w13, &mut t.gate_up)?;
+        self.kernels.elementwise.softcapped_swiglu(
+            &self.stream,
+            &t.gate_up,
+            &mut t.act,
+            cfg.mlp_gate_softcap,
+            cfg.mlp_up_softcap,
+        )?;
+        self.kernels
+            .experts
+            .expert_matvec(&self.stream, &t.act, &t.indices, &w2, &mut t.down)
+    }
+
+    /// The layer's `w13` and `w2` expert projections as the expert kernels take them.
+    fn expert_weights<'a>(
+        &self,
+        w: &'a LayerWeights,
+    ) -> (experts::ExpertWeights<'a>, experts::ExpertWeights<'a>) {
+        let (hidden, width) = (self.config.hidden_size, self.config.intermediate_size);
         let e = &w.experts;
         let (w13_format, w2_format) = match &e.format {
             ExpertFormat::Nvfp4 {
@@ -1056,19 +1171,133 @@ impl Ctx {
             n: hidden,
             k: width,
         };
+        (w13, w2)
+    }
+
+    // The three heavy multi-row operations of prefill. Each runs its fallback, built from
+    // the decode kernels; a fast multi-row kernel replaces the body in one place.
+
+    /// `out [m, n] = x [m, k] @ weight [n, k]^T` for every product, all with the same `m`
+    /// and `k`, as one batch.
+    ///
+    /// Fallback: one batched decode GEMV per row, on row views. The fast version is
+    /// `Linear::gemm_bf16(stream, &mut [Gemm::new(weight, x, out)], m)`.
+    fn gemm_rows(&self, products: &mut [RowProduct<'_>], m: usize) -> anyhow::Result<()> {
+        ensure!(m > 0, "no rows");
+        for (i, p) in products.iter().enumerate() {
+            ensure!(
+                p.x.len().is_multiple_of(m) && p.out.len().is_multiple_of(m),
+                "product {i}: x has {} and out {} elements, not whole rows of {m}",
+                p.x.len(),
+                p.out.len()
+            );
+        }
+        let weights: Vec<&CudaSlice<bf16>> = products.iter().map(|p| p.weight).collect();
+        for row in 0..m {
+            let xs: Vec<CudaView<'_, bf16>> = products
+                .iter()
+                .map(|p| {
+                    let k = p.x.len() / m;
+                    p.x.slice(row * k..(row + 1) * k)
+                })
+                .collect();
+            let mut outs: Vec<CudaViewMut<'_, bf16>> = products
+                .iter_mut()
+                .map(|p| {
+                    let n = p.out.len() / m;
+                    p.out.slice_mut(row * n..(row + 1) * n)
+                })
+                .collect();
+            let mut gemvs: Vec<Gemv<'_, bf16>> = weights
+                .iter()
+                .zip(&xs)
+                .zip(&mut outs)
+                .map(|((w, x), out)| Gemv::new(*w, x, out))
+                .collect();
+            self.kernels.linear.gemv_bf16(&self.stream, &mut gemvs)?;
+        }
+        Ok(())
+    }
+
+    /// The expert products of `m` rows: `out` `[m, 8, n]` from `x` `[m, 1, k]` (one input
+    /// for all 8 experts) or `[m, 8, k]` (one per expert) and the routed `indices`
+    /// `[m, 8]`.
+    ///
+    /// Fallback: [`Experts::expert_matvec`] over all `m` rows in one launch. The fast
+    /// version is `Experts::expert_matmul` with the same arguments.
+    fn moe_rows(
+        &self,
+        x: &CudaView<'_, bf16>,
+        indices: &CudaView<'_, i32>,
+        weights: &experts::ExpertWeights<'_>,
+        out: &mut CudaViewMut<'_, bf16>,
+        m: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(indices.len() == m * 8, "indices must hold {m} x 8 ids");
         self.kernels
             .experts
-            .expert_matvec(&self.stream, x, &t.indices, &w13, &mut t.gate_up)?;
-        self.kernels.elementwise.softcapped_swiglu(
-            &self.stream,
-            &t.gate_up,
-            &mut t.act,
-            cfg.mlp_gate_softcap,
-            cfg.mlp_up_softcap,
-        )?;
-        self.kernels
-            .experts
-            .expert_matvec(&self.stream, &t.act, &t.indices, &w2, &mut t.down)
+            .expert_matvec(&self.stream, x, indices, weights, out)
+    }
+
+    /// Appends the keys `k` and values `v` (`[m, 8, 128]`) of `m` rows to `cache` and
+    /// attends causally from each row's query (`q` `[m, 24, 128]`) into `out`
+    /// (`[m, 24, 128]`). Row `i` sits at position `start + i`, where `start` holds one
+    /// value; `positions` holds `start, start + 1, ...` for at least `m` rows. `bias`
+    /// `[m, 24, extent]` and `sinks` `[m, 24]` are each row's relative bias and sink
+    /// logits.
+    ///
+    /// Fallback: for each row, [`Attention::append`] and [`Attention::decode_attention`]
+    /// with that row's position from `positions`. The fast version is
+    /// `Attention::prefill_attention(stream, q, k, v, cache, start, m, bias, sinks,
+    /// scratch, out)`, which reads neither `positions` nor the decode `scratch` layout.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the attention inputs and outputs"
+    )]
+    fn attention_rows(
+        &self,
+        q: &CudaView<'_, bf16>,
+        k: &CudaView<'_, bf16>,
+        v: &CudaView<'_, bf16>,
+        cache: &mut KvCache,
+        _start: &CudaSlice<u32>,
+        positions: &CudaSlice<u32>,
+        m: usize,
+        bias: &CudaView<'_, bf16>,
+        sinks: &CudaView<'_, bf16>,
+        scratch: &mut AttentionScratch,
+        out: &mut CudaViewMut<'_, bf16>,
+    ) -> anyhow::Result<()> {
+        fn row<'a>(x: &'a CudaView<'_, bf16>, i: usize, m: usize) -> CudaView<'a, bf16> {
+            let n = x.len() / m;
+            x.slice(i * n..(i + 1) * n)
+        }
+        ensure!(
+            m > 0 && positions.len() >= m,
+            "positions must cover {m} rows"
+        );
+        let q_width = out.len() / m;
+        for i in 0..m {
+            let position = positions.slice(i..=i);
+            self.kernels.attention.append(
+                &self.stream,
+                cache,
+                &position,
+                &row(k, i, m),
+                &row(v, i, m),
+            )?;
+            self.kernels.attention.decode_attention(
+                &self.stream,
+                &row(q, i, m),
+                cache,
+                &position,
+                &row(bias, i, m),
+                &row(sinks, i, m),
+                scratch,
+                &mut out.slice_mut(i * q_width..(i + 1) * q_width),
+            )?;
+        }
+        Ok(())
     }
 
     fn hidden(&self) -> usize {

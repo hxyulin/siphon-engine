@@ -180,3 +180,98 @@ extern "C" __global__ void moe_conv_residual_2304(const __nv_bfloat16* __restric
     const float y = __bfloat162float(conv_step::short_conv(x, weight, state, c, kHidden));
     out[c] = __float2bfloat16(__fadd_rn(residual[c], y));
 }
+
+// ---------------------------------------------------------------------------
+// Multi-row forms of the two kernels above, for prefill. Each block takes one row
+// (blockIdx.y) of a chunk and convolves it from the chunk's own earlier inputs and the
+// carried state, which it only reads, so the rows run in parallel. shift_state_rows
+// then shifts the chunk's inputs into the state. Every row rounds as the single-row
+// kernels do, so a chunk gives their results bit for bit.
+// ---------------------------------------------------------------------------
+
+// short_conv_residual_2304 for rows [rows, 2304] of x, hidden and residual.
+extern "C" __global__ void short_conv_residual_rows_2304(const __nv_bfloat16* __restrict__ x,
+                                                         const __nv_bfloat16* __restrict__ weight,
+                                                         const float* __restrict__ state,
+                                                         const __nv_bfloat16* __restrict__ hidden,
+                                                         float* __restrict__ residual) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= kHidden) {
+        return;
+    }
+    float win[conv_step::kKernel];
+    conv_step::load_window(x, state, c, kHidden, t, win);
+    const float y = __bfloat162float(conv_step::short_conv_window(win, weight, c));
+    const size_t i = size_t(t) * kHidden + c;
+    residual[i] = hidden != nullptr ? __fadd_rn(__bfloat162float(hidden[i]), y) : y;
+}
+
+// The MoE combine of moe_conv_residual_2304 for each row: combined [rows, 2304] from
+// experts [rows, 8, 2304] and weights [rows, 8].
+extern "C" __global__ void moe_combine_rows_2304(const __nv_bfloat16* __restrict__ experts,
+                                                 const float* __restrict__ weights,
+                                                 __nv_bfloat16* __restrict__ combined) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= kHidden) {
+        return;
+    }
+    const __nv_bfloat16* e = experts + size_t(t) * kTopK * kHidden;
+    const float* w = weights + size_t(t) * kTopK;
+    float total = 0.f;
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+        total = __fadd_rn(total, __fmul_rn(__bfloat162float(e[size_t(k) * kHidden + c]), w[k]));
+    }
+    combined[size_t(t) * kHidden + c] = __float2bfloat16(total);
+}
+
+// The post-MLP conv and residual add of moe_conv_residual_2304 for each row, from the
+// combined expert outputs [rows, 2304]: out = bf16(residual + conv).
+extern "C" __global__ void post_mlp_conv_rows_2304(const __nv_bfloat16* __restrict__ combined,
+                                                   const __nv_bfloat16* __restrict__ weight,
+                                                   const float* __restrict__ state,
+                                                   const float* __restrict__ residual,
+                                                   __nv_bfloat16* __restrict__ out) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= kHidden) {
+        return;
+    }
+    float win[conv_step::kKernel];
+    conv_step::load_window(combined, state, c, kHidden, t, win);
+    const float y = __bfloat162float(conv_step::short_conv_window(win, weight, c));
+    const size_t i = size_t(t) * kHidden + c;
+    out[i] = __float2bfloat16(__fadd_rn(residual[i], y));
+}
+
+// Shifts the conv inputs x [rows, dims] of a chunk into state [3, dims]: afterwards the
+// state holds the last three rows of the old state followed by x. One thread per channel.
+extern "C" __global__ void shift_state_rows(const __nv_bfloat16* __restrict__ x, float* __restrict__ state,
+                                           int dims, int rows) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= dims) {
+        return;
+    }
+    constexpr int kRows = conv_step::kKernel - 1;
+    float old[kRows];
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+        old[k] = state[size_t(k) * dims + c];
+    }
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+        // Index k + rows of the old state followed by x.
+        const int i = k + rows;
+        state[size_t(k) * dims + c] = i < kRows ? old[i] : __bfloat162float(x[size_t(i - kRows) * dims + c]);
+    }
+}

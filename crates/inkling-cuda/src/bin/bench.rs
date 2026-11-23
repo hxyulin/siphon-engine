@@ -1,7 +1,14 @@
-//! Times greedy decode at several context lengths.
+//! Times greedy decode at several context lengths, or prefill at several prompt lengths.
 //!
 //! usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps N]
 //!        [--warmup N] [--kv bf16|fp8] [--json]
+//!        bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--passes N]
+//!        [--kv bf16|fp8] [--json]
+//!
+//! With `--prefill`, each prompt length runs once through `Model::prefill` in chunks of
+//! `--chunk` rows from an empty cache, after one warmup chunk, and the time to the first
+//! token is the time `prefill` takes to return the greedy next token. The prompt tokens
+//! are arbitrary ids, so expert routing differs from real text.
 //!
 //! For each context length the runner skips its caches to that length without computing
 //! the skipped tokens, runs `--warmup` steps, then times `--steps` steps. The tokens it
@@ -29,7 +36,12 @@ mod linux {
 
     use anyhow::{Context as _, ensure};
     use inkling::{Checkpoint, TextConfig};
-    use inkling_cuda::{Gpu, model::Model, ops::attention::KvFormat, weights::Weights};
+    use inkling_cuda::{
+        Gpu,
+        model::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits},
+        ops::attention::KvFormat,
+        weights::Weights,
+    };
 
     /// Bytes of weights one decode step reads.
     const WEIGHT_BYTES_PER_TOKEN: f64 = 5.5e9;
@@ -41,7 +53,9 @@ mod linux {
     /// Free memory to leave for the runner's per-step buffers.
     const HEADROOM: usize = 2 << 30;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
-                         [--steps N] [--warmup N] [--kv bf16|fp8] [--json]";
+                         [--steps N] [--warmup N] [--kv bf16|fp8] [--json]\n       \
+                         bench <model-dir> --prefill 512,4096 [--chunk 512] [--passes N] \
+                         [--kv bf16|fp8] [--json]";
 
     struct Args {
         model: PathBuf,
@@ -51,6 +65,17 @@ mod linux {
         warmup: usize,
         kv: KvFormat,
         json: bool,
+        /// Prompt lengths to time prefill at, instead of timing decode.
+        prefill: Option<Vec<usize>>,
+        chunk: usize,
+    }
+
+    fn token_counts(arg: &str, value: &str) -> anyhow::Result<Vec<usize>> {
+        value
+            .split(',')
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("{arg} takes comma-separated token counts"))
     }
 
     fn args() -> anyhow::Result<Args> {
@@ -61,19 +86,15 @@ mod linux {
         let mut warmup = 10;
         let mut kv = KvFormat::Bf16;
         let mut json = false;
+        let mut prefill = None;
+        let mut chunk = DEFAULT_PREFILL_CHUNK;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             let mut value = || it.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
-                "--contexts" => {
-                    contexts = Some(
-                        value()?
-                            .split(',')
-                            .map(str::parse)
-                            .collect::<Result<_, _>>()
-                            .context("--contexts takes comma-separated token counts")?,
-                    );
-                }
+                "--contexts" => contexts = Some(token_counts(&arg, &value()?)?),
+                "--prefill" => prefill = Some(token_counts(&arg, &value()?)?),
+                "--chunk" => chunk = value()?.parse()?,
                 "--passes" => passes = Some(value()?.parse()?),
                 "--steps" => steps = value()?.parse()?,
                 "--warmup" => warmup = value()?.parse()?,
@@ -87,6 +108,14 @@ mod linux {
             }
         }
         ensure!(steps > 0, "--steps must be positive");
+        ensure!(
+            (1..=MAX_PREFILL_CHUNK).contains(&chunk),
+            "--chunk takes 1 to {MAX_PREFILL_CHUNK} rows"
+        );
+        ensure!(
+            prefill.as_ref().is_none_or(|p| p.iter().all(|&n| n > 0)),
+            "--prefill lengths must be positive"
+        );
         Ok(Args {
             model: model.context(USAGE)?,
             contexts,
@@ -95,6 +124,8 @@ mod linux {
             warmup,
             kv,
             json,
+            prefill,
+            chunk,
         })
     }
 
@@ -200,8 +231,121 @@ mod linux {
         }
     }
 
+    /// One timed prefill.
+    struct PrefillRow {
+        tokens: usize,
+        seconds: f64,
+        sm_mhz: String,
+        mem_mhz: String,
+    }
+
+    /// Times `Model::prefill` at each length in `lengths`.
+    fn bench_prefill(args: &Args, lengths: &[usize]) -> anyhow::Result<()> {
+        let config = TextConfig::load(&args.model)?;
+        let passes = args.passes.unwrap_or(config.loop_config.num_passes);
+        let vocab = u32::try_from(config.unpadded_vocab_size)?;
+        let gpu = Gpu::new(0)?;
+        let before = gpu_state()?;
+        eprintln!("loading weights");
+        let checkpoint = Checkpoint::open(&args.model)?;
+        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let longest = lengths.iter().copied().max().unwrap_or(0).max(args.chunk);
+        let mut model = Model::with_kv_format(&gpu, config, weights, passes, longest, args.kv)?;
+        // Arbitrary ids spread over the vocabulary.
+        let prompt: Vec<u32> = (0..longest as u32)
+            .map(|i| (i.wrapping_mul(7919) + 13) % vocab)
+            .collect();
+
+        // One chunk first, which allocates the prefill buffers.
+        model.prefill(&prompt[..args.chunk], args.chunk, PrefillLogits::Last)?;
+        let mut rows = Vec::new();
+        for &tokens in lengths {
+            model.reset()?;
+            gpu.stream().synchronize()?;
+            let start = Instant::now();
+            model.prefill(&prompt[..tokens], args.chunk, PrefillLogits::Last)?;
+            let seconds = start.elapsed().as_secs_f64();
+            let after = gpu_state()?;
+            rows.push(PrefillRow {
+                tokens,
+                seconds,
+                sm_mhz: after.sm_mhz,
+                mem_mhz: after.mem_mhz,
+            });
+            if !args.json {
+                eprintln!("prefill {tokens} done");
+            }
+        }
+
+        if args.json {
+            let processes: Vec<String> = before.processes.iter().map(|p| quote(p)).collect();
+            let rows: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{{\"tokens\":{},\"ttft_ms\":{:.2},\"tok_per_s\":{:.1},\"sm_mhz\":{},\
+                         \"mem_mhz\":{}}}",
+                        r.tokens,
+                        r.seconds * 1e3,
+                        r.tokens as f64 / r.seconds,
+                        quote(&r.sm_mhz),
+                        quote(&r.mem_mhz),
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"processes_before_load\":[{}],\
+                 \"passes\":{passes},\"kv\":{},\"chunk\":{},\"rows\":[{}]}}",
+                quote(&before.timestamp),
+                quote(&before.name),
+                quote(&before.driver),
+                processes.join(","),
+                quote(&args.kv.to_string()),
+                args.chunk,
+                rows.join(","),
+            );
+        } else {
+            println!(
+                "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
+                 before load: {}",
+                before.timestamp,
+                before.name,
+                before.driver,
+                before.max_sm_mhz,
+                before.max_mem_mhz,
+                if before.processes.is_empty() {
+                    "none".to_owned()
+                } else {
+                    before.processes.join(" ")
+                },
+            );
+            println!(
+                "passes {passes}, {} global KV cache, prefill chunks of {}\n",
+                args.kv, args.chunk
+            );
+            println!(
+                "| prompt tokens | time to first token ms | prefill tok/s | SM MHz | mem MHz |"
+            );
+            println!("|---:|---:|---:|---:|---:|");
+            for r in &rows {
+                println!(
+                    "| {} | {:.1} | {:.1} | {} | {} |",
+                    r.tokens,
+                    r.seconds * 1e3,
+                    r.tokens as f64 / r.seconds,
+                    r.sm_mhz,
+                    r.mem_mhz,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn main() -> anyhow::Result<()> {
         let mut args = args()?;
+        if let Some(lengths) = args.prefill.take() {
+            return bench_prefill(&args, &lengths);
+        }
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let global_visits = config

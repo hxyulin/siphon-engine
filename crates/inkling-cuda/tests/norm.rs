@@ -17,7 +17,7 @@ use inkling_cuda::{
         conv::Conv,
         elementwise::Elementwise,
         misc::Misc,
-        norm::{AttentionPost, KvConvWeights, Norm},
+        norm::{AttentionPost, AttentionPostRows, KvConvWeights, Norm},
     },
 };
 
@@ -329,8 +329,8 @@ fn attention_post_matches_separate_kernels() -> anyhow::Result<()> {
             let (mut q, mut r) = (zeros(Q_HEADS * 128)?, zeros(Q_HEADS * 16)?);
             let conv_weights = if dynamic {
                 KvConvWeights::Dynamic {
-                    k_dynamic: &k_dyn,
-                    v_dynamic: &v_dyn,
+                    k_dynamic: k_dyn.as_view(),
+                    v_dynamic: v_dyn.as_view(),
                     k_static: &k_static,
                     v_static: &v_static,
                 }
@@ -392,6 +392,173 @@ fn attention_post_matches_separate_kernels() -> anyhow::Result<()> {
                     0,
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// The multi-row attention post-processing against one single-row call per row, over
+/// chunks of 5, 1, 2 and 7 rows with carried conv states, for static and dynamic convs,
+/// with and without log scaling. Same rounded operations, so bit for bit.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the single-row and multi-row calls per chunk"
+)]
+fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
+    const CHUNKS: [usize; 4] = [5, 1, 2, 7];
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let norm = Norm::load(gpu.context())?;
+    let conv = Conv::load(gpu.context())?;
+    let (alpha, n_floor) = (0.1, 8192.0);
+    let q_scale = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 128, 70, 0.5, 1.0))?;
+    let r_scale = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 16, 71, 0.5, 1.0))?;
+    let k_weight = stream.clone_htod(&pseudo_random_bf16(KV * 4, 72, 0.5, 0.0))?;
+    let v_weight = stream.clone_htod(&pseudo_random_bf16(KV * 4, 73, 0.5, 0.0))?;
+    let k_static = stream.clone_htod(&pseudo_random(4 * KV, 74, 0.5))?;
+    let v_static = stream.clone_htod(&pseudo_random(4 * KV, 75, 0.5))?;
+    for (dynamic, log_scale) in [(false, false), (false, true), (true, false), (true, true)] {
+        let start_k = pseudo_random(3 * KV, 76, 2.0);
+        let start_v = pseudo_random(3 * KV, 77, 2.0);
+        let (mut k_state, mut v_state) =
+            (stream.clone_htod(&start_k)?, stream.clone_htod(&start_v)?);
+        let (mut k_state_ref, mut v_state_ref) =
+            (stream.clone_htod(&start_k)?, stream.clone_htod(&start_v)?);
+        // Positions around the log-scaling floor, so tau changes within a chunk.
+        let mut position = 8185u32;
+        for (chunk, &rows) in CHUNKS.iter().enumerate() {
+            let label = format!("dynamic {dynamic}, log scale {log_scale}, chunk {chunk}");
+            let seed = 200 + 10 * chunk as u32;
+            let k_raw = pseudo_random_bf16(rows * KV, seed + 1, 6.0, 0.0);
+            let v_raw = pseudo_random_bf16(rows * KV, seed + 2, 6.0, 0.0);
+            let k_dyn = pseudo_random_bf16(rows * 32, seed + 3, 0.5, 0.0);
+            let v_dyn = pseudo_random_bf16(rows * 32, seed + 4, 0.5, 0.0);
+            let q_raw = pseudo_random_bf16(rows * Q_HEADS * 128, seed + 5, 3.0, 0.0);
+            let r_raw = pseudo_random_bf16(rows * Q_HEADS * 16, seed + 6, 3.0, 0.0);
+
+            let mut want: [Vec<bf16>; 4] = Default::default();
+            for r in 0..rows {
+                let part =
+                    |x: &[bf16], width: usize| stream.clone_htod(&x[r * width..(r + 1) * width]);
+                let (k_raw, v_raw) = (part(&k_raw, KV)?, part(&v_raw, KV)?);
+                let (k_dyn, v_dyn) = (part(&k_dyn, 32)?, part(&v_dyn, 32)?);
+                let (q_raw, r_raw) = (part(&q_raw, Q_HEADS * 128)?, part(&r_raw, Q_HEADS * 16)?);
+                let at = stream.clone_htod(&[position + r as u32])?;
+                let (mut k, mut v) = (stream.alloc_zeros(KV)?, stream.alloc_zeros(KV)?);
+                let mut q = stream.alloc_zeros(Q_HEADS * 128)?;
+                let mut rel = stream.alloc_zeros(Q_HEADS * 16)?;
+                let conv_weights = if dynamic {
+                    KvConvWeights::Dynamic {
+                        k_dynamic: k_dyn.as_view(),
+                        v_dynamic: v_dyn.as_view(),
+                        k_static: &k_static,
+                        v_static: &v_static,
+                    }
+                } else {
+                    KvConvWeights::Static {
+                        k: &k_weight,
+                        v: &v_weight,
+                    }
+                };
+                norm.attention_post(
+                    stream,
+                    AttentionPost {
+                        k_raw: &k_raw,
+                        v_raw: &v_raw,
+                        conv: conv_weights,
+                        k_state: &mut k_state_ref,
+                        v_state: &mut v_state_ref,
+                        q_raw: &q_raw,
+                        q_scale: &q_scale,
+                        r_raw: &r_raw,
+                        r_scale: &r_scale,
+                        k: &mut k,
+                        v: &mut v,
+                        q: &mut q,
+                        r: &mut rel,
+                        log_scale: log_scale.then_some((&at, alpha, n_floor)),
+                        qk_threshold: QK_THRESHOLD,
+                        rel_threshold: REL_THRESHOLD,
+                        eps: EPS,
+                    },
+                )?;
+                for (w, x) in want.iter_mut().zip([&k, &v, &q, &rel]) {
+                    w.extend(stream.clone_dtoh(x)?);
+                }
+            }
+
+            let (k_raw, v_raw) = (stream.clone_htod(&k_raw)?, stream.clone_htod(&v_raw)?);
+            let (k_dyn, v_dyn) = (stream.clone_htod(&k_dyn)?, stream.clone_htod(&v_dyn)?);
+            let (q_raw, r_raw) = (stream.clone_htod(&q_raw)?, stream.clone_htod(&r_raw)?);
+            let start = stream.clone_htod(&[position])?;
+            let mut k: CudaSlice<bf16> = stream.alloc_zeros(rows * KV)?;
+            let mut v: CudaSlice<bf16> = stream.alloc_zeros(rows * KV)?;
+            let mut q: CudaSlice<bf16> = stream.alloc_zeros(rows * Q_HEADS * 128)?;
+            let mut rel: CudaSlice<bf16> = stream.alloc_zeros(rows * Q_HEADS * 16)?;
+            let conv_weights = if dynamic {
+                KvConvWeights::Dynamic {
+                    k_dynamic: k_dyn.as_view(),
+                    v_dynamic: v_dyn.as_view(),
+                    k_static: &k_static,
+                    v_static: &v_static,
+                }
+            } else {
+                KvConvWeights::Static {
+                    k: &k_weight,
+                    v: &v_weight,
+                }
+            };
+            norm.attention_post_rows(
+                stream,
+                AttentionPostRows {
+                    k_raw: k_raw.as_view(),
+                    v_raw: v_raw.as_view(),
+                    conv: conv_weights,
+                    k_state: &k_state,
+                    v_state: &v_state,
+                    q_raw: q_raw.as_view(),
+                    q_scale: &q_scale,
+                    r_raw: r_raw.as_view(),
+                    r_scale: &r_scale,
+                    k: k.as_view_mut(),
+                    v: v.as_view_mut(),
+                    q: q.as_view_mut(),
+                    r: rel.as_view_mut(),
+                    log_scale: log_scale.then_some((&start, alpha, n_floor)),
+                    qk_threshold: QK_THRESHOLD,
+                    rel_threshold: REL_THRESHOLD,
+                    eps: EPS,
+                },
+                rows,
+            )?;
+            conv.shift_state(stream, &k_raw, &mut k_state, KV, rows)?;
+            conv.shift_state(stream, &v_raw, &mut v_state, KV, rows)?;
+            for (name, got, want) in [
+                ("k", &k, &want[0]),
+                ("v", &v, &want[1]),
+                ("q", &q, &want[2]),
+                ("r", &rel, &want[3]),
+            ] {
+                assert_bf16_close(
+                    &format!("{label}: {name}"),
+                    &stream.clone_dtoh(got)?,
+                    want,
+                    0,
+                );
+            }
+            for (name, got, want) in [
+                ("k state", &k_state, &k_state_ref),
+                ("v state", &v_state, &v_state_ref),
+            ] {
+                assert_f32_within_ulps(
+                    &format!("{label}: {name}"),
+                    &stream.clone_dtoh(got)?,
+                    &stream.clone_dtoh(want)?,
+                    0,
+                );
+            }
+            position += rows as u32;
         }
     }
     Ok(())

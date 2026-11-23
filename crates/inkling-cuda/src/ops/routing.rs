@@ -39,7 +39,7 @@ pub enum Partial<'a> {
     /// An F32 row that gets an unweighted RMS norm first.
     F32(CudaView<'a, f32>),
     /// A BF16 row that is widened and gets an unweighted RMS norm first.
-    Bf16(&'a CudaSlice<bf16>),
+    Bf16(CudaView<'a, bf16>),
 }
 
 /// A BF16 copy of one depth-attention output row after an RMS norm.
@@ -70,7 +70,9 @@ pub struct Routing {
     expert_routing_128_top8: CudaFunction,
     depth_attention_2304: CudaFunction,
     depth_attention_fused_2304: CudaFunction,
+    depth_attention_fused_rows_2304: CudaFunction,
     moe_router_2304: CudaFunction,
+    moe_router_rows_2304: CudaFunction,
 }
 
 impl Routing {
@@ -81,7 +83,10 @@ impl Routing {
             expert_routing_128_top8: module.load_function("expert_routing_128_top8")?,
             depth_attention_2304: module.load_function("depth_attention_2304")?,
             depth_attention_fused_2304: module.load_function("depth_attention_fused_2304")?,
+            depth_attention_fused_rows_2304: module
+                .load_function("depth_attention_fused_rows_2304")?,
             moe_router_2304: module.load_function("moe_router_2304")?,
+            moe_router_rows_2304: module.load_function("moe_router_rows_2304")?,
         })
     }
 
@@ -296,9 +301,10 @@ impl Routing {
             Partial::F32(x) => (Some(x), None, 1),
             Partial::Bf16(x) => (None, Some(x), 1),
         };
-        let partial_len = partial_f32
-            .as_ref()
-            .map_or_else(|| partial_bf16.map_or(0, CudaSlice::len), CudaView::len);
+        let partial_len = partial_f32.as_ref().map_or_else(
+            || partial_bf16.as_ref().map_or(0, CudaView::len),
+            CudaView::len,
+        );
         ensure!(
             partial_len == HIDDEN,
             "partial has {partial_len} elements, expected {HIDDEN}"
@@ -323,7 +329,7 @@ impl Routing {
         args.ptr(&blocks, stream)
             .i32(i32::try_from(nb)?)
             .opt(partial_f32.as_ref(), stream)
-            .opt(partial_bf16, stream)
+            .opt(partial_bf16.as_ref(), stream)
             .i32(normalize)
             .opt_mut(normed_partial.as_mut(), stream)
             .ptr(queries, stream)
@@ -415,5 +421,186 @@ impl Routing {
         // every buffer has the length the kernel reads or writes, and it reads only weights
         // before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_2304, config) }
+    }
+
+    /// [`Routing::depth_attention_fused`] for each of the `rows` rows of a chunk, with the
+    /// same results per row.
+    ///
+    /// `blocks` holds `nb` block states of `[rows, 2304]` each, one after another. The
+    /// partial, `normed_partial` and `out` hold `[rows, 2304]`, `[rows, 2304]` and
+    /// `[rows, nq, 2304]`. The rows of each destination are `dst_stride` elements apart, so
+    /// a destination may be one half of a `[rows, 2 * 2304]` buffer: its view starts at
+    /// row 0 and must reach the end of the last row.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn depth_attention_fused_rows(
+        &self,
+        stream: &CudaStream,
+        blocks: &impl DeviceIn<f32>,
+        partial: Partial<'_>,
+        mut normed_partial: Option<CudaViewMut<'_, f32>>,
+        queries: &CudaSlice<f32>,
+        mut out: Option<CudaViewMut<'_, f32>>,
+        mut dests: [Option<NormDest<'_>>; FUSED_DESTS],
+        dst_stride: usize,
+        eps: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let blocks = blocks.view();
+        ensure!(rows > 0, "no rows");
+        let block_len = rows * HIDDEN;
+        ensure!(
+            blocks.len().is_multiple_of(block_len),
+            "blocks has {} elements, not a multiple of {rows} x {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / block_len;
+        ensure!(
+            nb < FUSED_MAX_CANDIDATES,
+            "{nb} blocks; at most {} fit",
+            FUSED_MAX_CANDIDATES - 1
+        );
+        ensure!(
+            !queries.is_empty() && queries.len().is_multiple_of(HIDDEN),
+            "queries has {} elements, not a positive multiple of {HIDDEN}",
+            queries.len()
+        );
+        let nq = queries.len() / HIDDEN;
+        ensure!(
+            nq <= FUSED_MAX_QUERIES,
+            "{nq} queries; at most {FUSED_MAX_QUERIES} fit"
+        );
+        let (partial_f32, partial_bf16, normalize) = match partial {
+            Partial::Normalized(x) => (Some(x), None, 0i32),
+            Partial::F32(x) => (Some(x), None, 1),
+            Partial::Bf16(x) => (None, Some(x), 1),
+        };
+        let partial_len = partial_f32.as_ref().map_or_else(
+            || partial_bf16.as_ref().map_or(0, CudaView::len),
+            CudaView::len,
+        );
+        ensure!(
+            partial_len == block_len,
+            "partial has {partial_len} elements, expected {rows} x {HIDDEN}"
+        );
+        ensure!(
+            normed_partial.as_ref().is_none_or(|x| x.len() == block_len),
+            "normed_partial must hold {rows} x {HIDDEN} elements"
+        );
+        ensure!(
+            out.as_ref().is_none_or(|x| x.len() == rows * nq * HIDDEN),
+            "out must hold {rows} x {nq} x {HIDDEN} elements"
+        );
+        ensure!(dst_stride >= HIDDEN, "dst_stride is below {HIDDEN}");
+        let dest_len = (rows - 1) * dst_stride + HIDDEN;
+        for dest in dests.iter().flatten() {
+            ensure!(
+                dest.out.len() >= dest_len && dest.weight.is_none_or(|w| w.len() == HIDDEN),
+                "destinations must reach {dest_len} elements and norm weights hold {HIDDEN}"
+            );
+        }
+
+        let scale = (HIDDEN as f32).sqrt().recip();
+        let mut args = KernelArgs::default();
+        args.ptr(&blocks, stream)
+            .i32(i32::try_from(block_len).context("too many rows")?)
+            .i32(i32::try_from(nb)?)
+            .opt(partial_f32.as_ref(), stream)
+            .opt(partial_bf16.as_ref(), stream)
+            .i32(normalize)
+            .opt_mut(normed_partial.as_mut(), stream)
+            .ptr(queries, stream)
+            .i32(i32::try_from(nq)?)
+            .opt_mut(out.as_mut(), stream);
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().map(|d| &mut d.out), stream);
+        }
+        args.i32(i32::try_from(dst_stride).context("dst_stride too large")?);
+        for dest in &dests {
+            args.opt(dest.as_ref().and_then(|d| d.weight), stream);
+        }
+        args.f32(eps).f32(scale);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
+            block_dim: (DEPTH_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `depth_attention_fused_rows_2304`'s signature, every
+        // non-null pointer comes from a live buffer that holds the rows checked above, the
+        // grid has one block per row, and the kernel reads only the queries before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.depth_attention_fused_rows_2304, config) }
+    }
+
+    /// [`Routing::moe_router`] for each of the `rows` rows of a chunk: `x` and `x_out`
+    /// `[rows, 2304]`, `logits` `[rows, 128]`, `indices` and `weights` `[rows, 8]`, and
+    /// `counters` `[rows]`, each holding 0 and left at 0. Each row's results equal a
+    /// single-row call's bit for bit.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router_rows(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<f32>,
+        norm_weight: &CudaSlice<bf16>,
+        eps: f32,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        x_out: &mut impl DeviceOut<bf16>,
+        logits: &mut impl DeviceOut<f32>,
+        indices: &mut impl DeviceOut<i32>,
+        weights: &mut impl DeviceOut<f32>,
+        counters: &mut impl DeviceOut<u32>,
+        route_scale: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let x = x.view();
+        let (mut x_out, mut logits, mut indices, mut weights, mut counters) = (
+            x_out.view_mut(),
+            logits.view_mut(),
+            indices.view_mut(),
+            weights.view_mut(),
+            counters.view_mut(),
+        );
+        ensure!(rows > 0, "no rows");
+        ensure!(
+            x.len() == rows * HIDDEN && x_out.len() == rows * HIDDEN,
+            "x and x_out must hold {rows} x {HIDDEN} elements"
+        );
+        ensure!(norm_weight.len() == HIDDEN, "norm weight length");
+        ensure!(
+            router.len() == EXPERTS * HIDDEN,
+            "router has {} elements",
+            router.len()
+        );
+        ensure!(bias.len() == EXPERTS, "bias length");
+        ensure!(logits.len() == rows * EXPERTS, "logits length");
+        ensure!(
+            indices.len() == rows * TOP_K && weights.len() == rows * TOP_K,
+            "indices or weights length"
+        );
+        ensure!(counters.len() == rows, "counters length");
+        let config = LaunchConfig {
+            grid_dim: (
+                ROUTER_BLOCKS,
+                u32::try_from(rows).context("too many rows")?,
+                1,
+            ),
+            block_dim: (ROUTER_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(norm_weight, stream)
+            .f32(eps)
+            .ptr(router, stream)
+            .ptr(bias, stream)
+            .ptr_mut(&mut x_out, stream)
+            .ptr_mut(&mut logits, stream)
+            .ptr_mut(&mut indices, stream)
+            .ptr_mut(&mut weights, stream)
+            .ptr_mut(&mut counters, stream)
+            .f32(route_scale);
+        // SAFETY: the arguments match `moe_router_rows_2304`, which is `moe_router_2304`
+        // with one counter per row; every buffer holds `rows` rows as checked above, the grid
+        // has one y index per row, and the kernel reads only weights before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_rows_2304, config) }
     }
 }

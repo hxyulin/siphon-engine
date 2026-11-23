@@ -30,6 +30,20 @@ Each `crates/inkling-cuda/src/ops/<group>.rs` launches the kernels in `kernels/<
 cd reference/fixtures && uv run --project .. python <group>.py
 ```
 
+## Prefill
+
+`Model::step` runs one token. `Model::prefill(tokens, chunk, logits)` runs a whole prompt from the current position in chunks of up to `chunk` rows: every layer visit for a chunk, then the next chunk. It fills every KV cache and conv state as stepping the tokens would, advances the position by `tokens.len()`, and returns the greedy next token, so `step` continues from there.
+
+- `chunk` is 1 to 1024 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 512, the chunk MLX's chunked captures use. The first call allocates about 0.5 GB of buffers for 1024 rows, less for smaller chunks.
+- `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
+- `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
+
+The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. Until fast multi-row kernels replace them, these run the decode kernels row by row, so prefill takes about as long as stepping. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024 and 433. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
+
+```sh
+INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill -- --ignored --nocapture
+```
+
 ## Benchmarks and profiling
 
 The `bench` binary times greedy decode at several context lengths. For each length it marks every cache as full to that length without computing it, runs warmup steps, then times `--steps` steps. It prints one markdown table row per context length, or JSON with `--json`, along with the time, the GPU clocks and the processes on the GPU. Numbers are comparable only on an otherwise idle GPU.
@@ -40,6 +54,12 @@ target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps
 ```
 
 Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token, 16 KiB with `--kv fp8`) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token, plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
+
+With `--prefill`, `bench` times `Model::prefill` instead, once per prompt length from an empty cache, after one warmup chunk. It reports the time to the first token. The prompt is arbitrary token ids, so expert routing differs from real text:
+
+```sh
+target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf16|fp8] [--json]
+```
 
 ## KV cache format
 
@@ -110,8 +130,10 @@ uv run --project reference python -I reference/capture_eval.py compare reference
 The `eval` binary runs the engine over a capture on the GPU. It reports top-1 agreement, the mean absolute difference of the next-token log-probability, and perplexity, per range of positions. It also reports KL(MLX || engine) at the sampled positions, with the worst positions, and the greedy continuation match. It prints a verdict and exits with status 1 on failure:
 
 ```sh
-cargo run --release -p inkling-cuda --bin eval -- <model-dir> reference/out/anyhow-chunked.safetensors [--kv bf16|fp8]
+cargo run --release -p inkling-cuda --bin eval -- <model-dir> reference/out/anyhow-chunked.safetensors [--kv bf16|fp8] [--prefill CHUNK]
 ```
+
+With `--prefill CHUNK`, the engine runs the text through `Model::prefill` in chunks of CHUNK rows and scores every row's logits, then generates the continuation with `step`.
 
 The thresholds are about 1.5 to 2 times MLX's disagreement between its chunked and token-by-token paths on the three texts:
 

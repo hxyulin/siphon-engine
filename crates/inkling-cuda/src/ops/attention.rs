@@ -24,7 +24,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
 
 /// Query heads.
 pub const HEADS: usize = 24;
@@ -201,6 +201,21 @@ impl KvCache {
     pub fn data(&self) -> &KvData {
         &self.data
     }
+
+    /// Zeroes every slot.
+    pub fn clear(&mut self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        match &mut self.data {
+            KvData::Bf16 { keys, values } => {
+                stream.memset_zeros(keys)?;
+                stream.memset_zeros(values)?;
+            }
+            KvData::Fp8 { keys, values } => {
+                stream.memset_zeros(keys)?;
+                stream.memset_zeros(values)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Per-split partial results of [`Attention::decode_attention`] and the per-KV-head counts of
@@ -270,31 +285,43 @@ impl Attention {
         })
     }
 
-    /// `bias = rel @ table` for relative states `rel` `[24, 16]` and the layer's
-    /// `rel_logits_proj.proj` table `[16, extent]`, written to `bias` `[24, extent]`.
+    /// `bias = rel @ table` for relative states `rel` `[rows, 24, 16]` and the layer's
+    /// `rel_logits_proj.proj` table `[16, extent]`, written to `bias` `[rows, 24, extent]`.
+    /// Decode passes one row.
     ///
     /// Bit-exact with MLX's BF16 matmul for this shape.
     pub fn relative_bias(
         &self,
         stream: &CudaStream,
-        rel: &CudaSlice<bf16>,
+        rel: &impl DeviceIn<bf16>,
         table: &CudaSlice<bf16>,
-        bias: &mut CudaSlice<bf16>,
+        bias: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
-        check_len("rel", rel.len(), HEADS * REL_DIM)?;
+        let (rel, mut bias) = (rel.view(), bias.view_mut());
+        ensure!(
+            !rel.is_empty() && rel.len().is_multiple_of(HEADS * REL_DIM),
+            "rel has {} elements, not a positive multiple of {HEADS} x {REL_DIM}",
+            rel.len()
+        );
+        let heads = rel.len() / REL_DIM;
         let extent = extent("table", table.len(), REL_DIM)?;
-        check_len("bias", bias.len(), HEADS * extent as usize)?;
+        check_len("bias", bias.len(), heads * extent as usize)?;
         let config = LaunchConfig {
-            grid_dim: (extent.div_ceil(BIAS_BLOCK), HEADS as u32, 1),
+            grid_dim: (
+                extent.div_ceil(BIAS_BLOCK),
+                u32::try_from(heads).context("too many rows")?,
+                1,
+            ),
             block_dim: (BIAS_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
         let extent = i32::try_from(extent).context("bias table too wide")?;
         let mut launch = stream.launch_builder(&self.relative_bias);
-        launch.arg(rel).arg(table).arg(bias).arg(&extent);
+        launch.arg(&rel).arg(table).arg(&mut bias).arg(&extent);
         // SAFETY: the arguments match `relative_bias_bf16(const bf16*, const bf16*, bf16*, int)`.
-        // The checks above size `rel`, `table` and `bias` for 24 heads and `extent` columns, and
-        // the kernel skips threads past `extent`.
+        // The kernel takes one head per `blockIdx.y`; the checks above size `rel`, `table`
+        // and `bias` for `heads` heads and `extent` columns, and the kernel skips threads past
+        // `extent`.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -308,11 +335,11 @@ impl Attention {
         &self,
         stream: &CudaStream,
         cache: &mut KvCache,
-        position: &CudaSlice<u32>,
+        position: &impl DeviceIn<u32>,
         k: &impl DeviceIn<bf16>,
         v: &impl DeviceIn<bf16>,
     ) -> anyhow::Result<()> {
-        let (k, v) = (k.view(), v.view());
+        let (k, v, position) = (k.view(), v.view(), position.view());
         check_len("k", k.len(), KV_ROW)?;
         check_len("v", v.len(), KV_ROW)?;
         check_len("position", position.len(), 1)?;
@@ -332,7 +359,7 @@ impl Attention {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
             KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
         };
-        launch.arg(position).arg(&slots);
+        launch.arg(&position).arg(&slots);
         // SAFETY: the arguments match `kv_append_bf16(const bf16*, const bf16*, bf16*, bf16*,
         // const unsigned*, unsigned)`, or `kv_append_fp8` with `uint8_t*` caches for an FP8
         // cache. `k` and `v` hold one 1024-element row, `position` the one value the kernel
@@ -356,14 +383,21 @@ impl Attention {
     pub fn decode_attention(
         &self,
         stream: &CudaStream,
-        q: &CudaSlice<bf16>,
+        q: &impl DeviceIn<bf16>,
         cache: &KvCache,
-        position: &CudaSlice<u32>,
-        bias: &CudaSlice<bf16>,
-        sinks: &CudaSlice<bf16>,
+        position: &impl DeviceIn<u32>,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
         scratch: &mut AttentionScratch,
-        out: &mut CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
+        let (q, position, bias, sinks, mut out) = (
+            q.view(),
+            position.view(),
+            bias.view(),
+            sinks.view(),
+            out.view_mut(),
+        );
         check_len("q", q.len(), HEADS * HEAD_DIM)?;
         check_len("sinks", sinks.len(), HEADS)?;
         check_len("out", out.len(), HEADS * HEAD_DIM)?;
@@ -377,20 +411,20 @@ impl Attention {
             KvData::Fp8 { .. } => &self.decode_fp8,
         };
         let mut launch = stream.launch_builder(function);
-        launch.arg(q);
+        launch.arg(&q);
         match &cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
             KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
         };
         launch
-            .arg(bias)
-            .arg(sinks)
+            .arg(&bias)
+            .arg(&sinks)
             .arg(&mut scratch.out)
             .arg(&mut scratch.max)
             .arg(&mut scratch.sum)
             .arg(&mut scratch.counters)
-            .arg(out)
-            .arg(position)
+            .arg(&mut out)
+            .arg(&position)
             .arg(&slots)
             .arg(&window)
             .arg(&extent)

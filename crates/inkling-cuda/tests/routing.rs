@@ -391,7 +391,7 @@ fn depth_attention_fused_matches_separate_kernels() -> anyhow::Result<()> {
             stream,
             &blocks_dev,
             if as_bf16 {
-                Partial::Bf16(&raw_bf16_dev)
+                Partial::Bf16(raw_bf16_dev.as_view())
             } else {
                 Partial::F32(raw_dev.as_view())
             },
