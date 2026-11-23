@@ -34,11 +34,11 @@ cd reference/fixtures && uv run --project .. python <group>.py
 
 `Model::step` runs one token. `Model::prefill(tokens, chunk, logits)` runs a whole prompt from the current position in chunks of up to `chunk` rows: every layer visit for a chunk, then the next chunk. It fills every KV cache and conv state as stepping the tokens would, advances the position by `tokens.len()`, and returns the greedy next token, so `step` continues from there.
 
-- `chunk` is 1 to 2048 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 2048, the fastest measured: bigger chunks read each expert weight once for more rows. MLX's chunked captures use 512. The first call allocates buffers for its chunk size: about 0.28 GB at 512 rows, 0.5 GB at 1024 and 0.95 GB at 2048.
+- `chunk` is 1 to 2048 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 2048, the fastest measured: bigger chunks read each expert weight once for more rows. MLX's chunked captures use 512. The first call allocates buffers for its chunk size: about 0.27 GB at 512 rows, 0.47 GB at 1024 and 0.9 GB at 2048.
 - `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
 - `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
 
-The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024, 433 and 2048. At 2048 the whole prompt is one chunk wider than the sliding window. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
+The small kernels have multi-row forms that give the single-row results bit for bit. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, with the softcapped SwiGLU in the `w13` product's epilogue, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024, 433 and 2048. At 2048 the whole prompt is one chunk wider than the sliding window. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
 
 ```sh
 INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill -- --ignored --nocapture
@@ -116,6 +116,40 @@ pixi run nsys export --type sqlite -o decode.sqlite decode.nsys-rep
 ```
 
 The trace marks the end of each step with a 4-byte device-to-host copy, the sampled token. `ncu` needs the GPU performance counters, which the driver limits to administrators unless the `NVreg_RestrictProfilingToAdminUsers=0` module option is set. Without it, `ncu` fails with `ERR_NVGPUCTRPERM`.
+
+## Expert activation format
+
+Prefill's expert products take `--expert-activations bf16|quantized` in `bench` and `eval`, and `Model::set_expert_activations` takes the same choice. Decode always takes BF16 activations.
+
+- `bf16`, the default, decodes the NVFP4 and MXFP8 weights exactly to BF16 and multiplies them with the BF16 activations, as MLX does.
+- `quantized` quantizes each expert input row as the checkpoint's `hf_quant_config.json` declares (`required_activation_quantization`) and multiplies the raw weights on the block-scaled tensor cores (`mma.sync ... kind::mxf4nvf4.block_scale` and `kind::mxf8f6f4.block_scale`).
+
+The quantized path lowers precision on purpose. `Experts::quantize_rows` quantizes each row of the `w13` input (one per token) and of the `w2` input (one per token and expert) once:
+
+- Layers 0 to 19, NVFP4: E2M1 values in blocks of 16 with E4M3 block scales, under a per-row outer scale `amax / 1536`. Each block tries the scale that maps its largest value to 6 and the one that maps it to 4, and keeps the one with the smaller sum of absolute errors ("Four Over Six", 6 on ties).
+- Layers 20 to 23, MXFP8: E4M3 values in blocks of 32 with a UE8M0 scale, the block's `amax / 448` rounded up to a power of two.
+
+Both round to nearest even. The rules follow vLLM's Inkling kernels (`vllm/models/inkling2/nvidia/ops/nvfp4.py` and `mxfp8.py`) bit for bit; `tests/experts.rs` checks the quantizer against a CPU model of them, and the products against an F64 reference over the dequantized inputs. vLLM multiplies the routing weight into the `w2` input before quantizing it. The engine applies the routing weight after `w2`, as the BF16 path does. The products sum in F32 and round to BF16 where the BF16 path rounds.
+
+mma.sync with F32 accumulators on the RTX 5090: BF16 254 TFLOP/s, FP8 1,015 and FP4 2,030. The quantized products are then bound by memory, mostly L2: each 64-pair tile re-reads its expert's weights. Per call at 2048-row chunks, with the floor that reading the weights and scales once and writing the outputs sets at 1.70 TB/s:
+
+| Projection | `bf16` | `quantized` | Memory floor |
+| --- | ---: | ---: | ---: |
+| NVFP4 `w13` with SwiGLU | 955 us | 374 us | 250 us |
+| NVFP4 `w2` | 484 us | 189 us | 162 us |
+| MXFP8 `w13` with SwiGLU | 995 us | 613 us | 437 us |
+| MXFP8 `w2` | 507 us | 326 us | 262 us |
+
+Quantizing one projection's inputs takes 14 us. Time to first token falls from 262 to 183 ms at 4,096 tokens, from 2.34 to 1.72 s at 32,768 and from 12.78 to 10.28 s at 131,072.
+
+Prefill in chunks of 2048 with the BF16 cache, against the F32 captures of `anyhow`, `half` and `regex-readme`: KL at the sampled positions, the rest over all positions:
+
+| Expert activations | Mean KL | \|log-prob difference\| | Top-1 |
+| --- | --- | --- | --- |
+| `bf16` | 2.0e-3, 6.4e-4, 9.7e-4 | 0.024, 0.027, 0.027 | 99.0%, 98.9%, 98.6% |
+| `quantized` | 3.3e-3, 2.1e-3, 3.3e-3 | 0.038, 0.048, 0.051 | 98.3%, 97.5%, 97.6% |
+
+The NVFP4 activations cause the difference: quantizing only the MXFP8 layers stays close to the `bf16` numbers (0.024, 0.027, 0.028), and quantizing only the NVFP4 layers gives all of it, about half from each projection. Always taking the scale that maps each block's maximum to 6 is worse on all three texts (0.039, 0.051, 0.053). Perplexity stays within 0.3% of the F32 captures'. The greedy continuation still matches all 32 tokens after `anyhow` and `half`, and 12 after `regex-readme` against 26 with `bf16`. The mean |log-prob difference| exceeds the gate's 0.045 on some position ranges, so `eval` fails with `quantized` on 6 of the 7 captures tried.
 
 ## References
 

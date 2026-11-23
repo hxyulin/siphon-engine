@@ -31,7 +31,7 @@ use crate::{
         attention::{self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat},
         conv::Conv,
         elementwise::Elementwise,
-        experts::{self, Experts},
+        experts::{self, ExpertActivations, Experts},
         linear::{Gemm, Gemv, Linear, Prefetch, Start},
         linear_fp8::{Fp8Gemv, LinearFp8},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
@@ -304,6 +304,8 @@ struct Ctx {
     weights: Weights,
     kernels: Kernels,
     stream: Arc<CudaStream>,
+    /// How prefill's expert products take their activations.
+    expert_activations: ExpertActivations,
 }
 
 impl std::fmt::Debug for Model {
@@ -431,6 +433,7 @@ impl Model {
                 weights,
                 kernels,
                 stream,
+                expert_activations: ExpertActivations::Bf16,
             },
             passes,
             visits,
@@ -443,6 +446,12 @@ impl Model {
     }
 
     /// Starts a new sequence: zeroes every KV cache and conv state and moves to position 0.
+    /// Makes [`Model::prefill`] run its expert products with `activations`. Decode always
+    /// takes BF16 activations.
+    pub fn set_expert_activations(&mut self, activations: ExpertActivations) {
+        self.ctx.expert_activations = activations;
+    }
+
     pub fn reset(&mut self) -> anyhow::Result<()> {
         for visit in &mut self.visits {
             visit.kv.clear(&self.ctx.stream)?;
@@ -1396,18 +1405,43 @@ impl Ctx {
     /// for all 8 experts) or `[m, 8, k]` (one per expert), routed by the indices that
     /// [`Ctx::group_rows`] grouped into `scratch`.
     ///
-    /// Runs [`Experts::expert_matmul_grouped`], which multiplies each expert's pairs as one
-    /// matrix product so each expert's weights are read once per call.
+    /// With `swiglu`, `weights` is `w13` and `out` `[m, 8, n / 2]` receives the softcapped
+    /// SwiGLU of the products instead.
+    ///
+    /// Runs [`Experts::expert_matmul_grouped`] or [`Experts::expert_matmul_swiglu_grouped`],
+    /// which multiply each expert's pairs as one matrix product so each expert's weights are
+    /// read once per call. With [`ExpertActivations::Quantized`], it first quantizes `x` into
+    /// `quantized` and runs the quantized forms instead.
     fn moe_rows(
         &self,
         x: &CudaView<'_, bf16>,
         weights: &experts::ExpertWeights<'_>,
         out: &mut CudaViewMut<'_, bf16>,
         scratch: &experts::ExpertScratch,
+        swiglu: bool,
+        quantized: &mut experts::QuantizedRows,
     ) -> anyhow::Result<()> {
-        self.kernels
-            .experts
-            .expert_matmul_grouped(&self.stream, x, weights, out, scratch)
+        let experts = &self.kernels.experts;
+        let caps = (self.config.mlp_gate_softcap, self.config.mlp_up_softcap);
+        let stream = &self.stream;
+        match (self.expert_activations, swiglu) {
+            (ExpertActivations::Bf16, true) => experts
+                .expert_matmul_swiglu_grouped(stream, x, weights, out, scratch, caps.0, caps.1),
+            (ExpertActivations::Bf16, false) => {
+                experts.expert_matmul_grouped(stream, x, weights, out, scratch)
+            }
+            (ExpertActivations::Quantized, _) => {
+                experts.quantize_rows(stream, x, weights.k, weights.format, quantized)?;
+                if swiglu {
+                    experts.expert_matmul_quantized_swiglu_grouped(
+                        stream, quantized, weights, out, scratch, caps.0, caps.1,
+                    )
+                } else {
+                    experts
+                        .expert_matmul_quantized_grouped(stream, quantized, weights, out, scratch)
+                }
+            }
+        }
     }
 
     /// Appends the keys `k` and values `v` (`[m, 8, 128]`) of `m` rows to `cache` and

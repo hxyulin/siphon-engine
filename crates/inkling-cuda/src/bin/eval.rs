@@ -2,7 +2,7 @@
 //! still computes the same model as MLX-LM, within a multiple of MLX's own noise.
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
-//!        [--weights bf16|fp8] [--prefill CHUNK]
+//!        [--weights bf16|fp8] [--prefill CHUNK] [--expert-activations bf16|quantized]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -14,6 +14,8 @@
 //! text match MLX. It exits with status 1 if a check fails. `--weights fp8` makes the
 //! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
 //! the BF16 weights.
+//! `--expert-activations quantized` runs prefill's expert products on quantized
+//! activations (see `ExpertActivations`); stepping stays BF16.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -35,7 +37,7 @@ mod linux {
     use inkling_cuda::{
         Gpu,
         model::{MAX_PREFILL_CHUNK, Model, PrefillLogits},
-        ops::attention::KvFormat,
+        ops::{attention::KvFormat, experts::ExpertActivations},
         weights::{WeightFormat, Weights},
     };
     use safetensors::{Dtype, SafeTensors};
@@ -66,6 +68,7 @@ mod linux {
         weights: WeightFormat,
         /// Chunk size for `Model::prefill`, or `None` to step token by token.
         prefill: Option<usize>,
+        expert_activations: ExpertActivations,
     }
 
     fn args() -> anyhow::Result<Args> {
@@ -74,6 +77,7 @@ mod linux {
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
         let mut prefill = None;
+        let mut expert_activations = ExpertActivations::Bf16;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if arg == "--passes" {
@@ -82,6 +86,11 @@ mod linux {
                 kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
             } else if arg == "--weights" {
                 weights = it.next().context("--weights needs bf16 or fp8")?.parse()?;
+            } else if arg == "--expert-activations" {
+                expert_activations = it
+                    .next()
+                    .context("--expert-activations needs bf16 or quantized")?
+                    .parse()?;
             } else if arg == "--prefill" {
                 let chunk: usize = it.next().context("--prefill needs a chunk size")?.parse()?;
                 ensure!(
@@ -95,7 +104,7 @@ mod linux {
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
-             [--weights bf16|fp8] [--prefill CHUNK]",
+             [--weights bf16|fp8] [--prefill CHUNK] [--expert-activations bf16|quantized]",
         )?;
         Ok(Args {
             model,
@@ -104,6 +113,7 @@ mod linux {
             kv,
             weights,
             prefill,
+            expert_activations,
         })
     }
 
@@ -337,6 +347,7 @@ mod linux {
             args.kv,
             args.weights,
         )?;
+        model.set_expert_activations(args.expert_activations);
 
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)
@@ -409,7 +420,12 @@ mod linux {
 
         let engine_mode = args.prefill.map_or_else(
             || "token by token".to_owned(),
-            |chunk| format!("prefill in chunks of {chunk}"),
+            |chunk| {
+                format!(
+                    "prefill in chunks of {chunk}, {} expert activations",
+                    args.expert_activations
+                )
+            },
         );
         println!(
             "{n} tokens; MLX capture mode: {}; engine: {engine_mode}",

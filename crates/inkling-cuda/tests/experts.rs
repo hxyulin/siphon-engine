@@ -22,7 +22,7 @@ use inkling_cuda::{
     Gpu,
     ops::{
         elementwise::Elementwise,
-        experts::{ExpertFormat, ExpertScratch, ExpertWeights, Experts},
+        experts::{ExpertFormat, ExpertScratch, ExpertWeights, Experts, QuantizedRows},
     },
 };
 use safetensors::{Dtype, SafeTensors};
@@ -149,7 +149,7 @@ fn check_fixture(format: &str) -> anyhow::Result<()> {
         };
         let inputs_per_row = if x_shape.len() == 3 { SLOTS } else { 1 };
         let label = format!("{format} {name}");
-        let worst = check_reference(&label, &host, &x, &indices, inputs_per_row, &got);
+        let worst = check_reference(&label, &host, &to_f64(&x), &indices, inputs_per_row, &got);
         report_ulps(
             &format!("{label}: worst error {worst:.3} of bound; against MLX"),
             &got,
@@ -524,7 +524,7 @@ impl HostProjection<'_> {
 fn check_reference(
     label: &str,
     host: &HostProjection<'_>,
-    x: &[bf16],
+    x: &[f64],
     indices: &[i32],
     inputs_per_row: usize,
     got: &[bf16],
@@ -555,7 +555,7 @@ fn check_reference(
                                 let (mut dot, mut sum) = (0.0f64, 0.0f64);
                                 let row = &decoded[col * k..(col + 1) * k];
                                 for (xi, wi) in xin.iter().zip(row) {
-                                    let product = f64::from(xi.to_f32()) * wi;
+                                    let product = xi * wi;
                                     dot += product;
                                     sum += product.abs();
                                 }
@@ -584,6 +584,10 @@ fn check_reference(
             .map(|h| h.join().expect("reference thread panicked"))
             .fold(0.0, f64::max)
     })
+}
+
+fn to_f64(x: &[bf16]) -> Vec<f64> {
+    x.iter().map(|v| f64::from(v.to_f32())).collect()
 }
 
 /// Deterministic pseudo-random numbers (SplitMix64).
@@ -775,15 +779,16 @@ fn compare_kernels(
         "{label}: some outputs were not written"
     );
 
+    let x64 = to_f64(x);
     let worst_matvec = check_reference(
         &format!("{label} matvec"),
         host,
-        x,
+        &x64,
         indices,
         inputs_per_row,
         &matvec,
     );
-    let worst = check_reference(label, host, x, indices, inputs_per_row, got);
+    let worst = check_reference(label, host, &x64, indices, inputs_per_row, got);
     let mut ulps = [0usize; 4];
     let mut max_ulps = 0;
     for (a, b) in got.iter().zip(&matvec) {
@@ -986,6 +991,75 @@ fn matmul_grouped_reuses_grouping() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `expert_matmul_swiglu_grouped` equals `expert_matmul_grouped` on `w13` followed by
+/// `softcapped_swiglu`, bit for bit, unknown ids included.
+#[test]
+fn matmul_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let elementwise = Elementwise::load(s.gpu.context())?;
+    let mut scratch = ExpertScratch::new(stream, 2048, EXPERTS)?;
+    for fp4 in [true, false] {
+        let w13 = Synthetic::new(&s, fp4, 2 * INTERMEDIATE, HIDDEN, 41)?;
+        let weights = w13.gpu.weights();
+        for (rows, kind, x_scale) in [
+            (7, Routing::Uniform, 1.0),
+            (300, Routing::Skewed, 8.0),
+            (2048, Routing::Uniform, 4.0),
+        ] {
+            let mut ids = routing(rows, kind, rows as u32 + 3);
+            ids[5] = -3;
+            ids[rows * SLOTS - 1] = 128;
+            let indices = stream.clone_htod(&ids)?;
+            let x = stream.clone_htod(&common::pseudo_random_bf16(
+                rows * HIDDEN,
+                rows as u32,
+                x_scale,
+                0.0,
+            ))?;
+            let pairs = rows * SLOTS;
+            s.experts
+                .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
+            let mut gate_up = stream.alloc_zeros::<bf16>(pairs * 2 * INTERMEDIATE)?;
+            s.experts
+                .expert_matmul_grouped(stream, &x, &weights, &mut gate_up, &scratch)?;
+            let mut want = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+            elementwise.softcapped_swiglu(stream, &gate_up, &mut want, GATE_SOFTCAP, UP_SOFTCAP)?;
+            let mut got =
+                stream.clone_htod(&vec![bf16::from_f32(SENTINEL); pairs * INTERMEDIATE])?;
+            s.experts.expert_matmul_swiglu_grouped(
+                stream,
+                &x,
+                &weights,
+                &mut got,
+                &scratch,
+                GATE_SOFTCAP,
+                UP_SOFTCAP,
+            )?;
+            let (got, want) = (stream.clone_dtoh(&got)?, stream.clone_dtoh(&want)?);
+            let differing = got
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()))
+                .count();
+            eprintln!("fp4 {fp4} rows {rows}: {differing} of {} differ", got.len());
+            assert_eq!(differing, 0, "fused and separate SwiGLU differ");
+            assert!(
+                got[5 * INTERMEDIATE..6 * INTERMEDIATE]
+                    .iter()
+                    .all(|v| v.is_nan())
+            );
+            assert!(got[(pairs - 1) * INTERMEDIATE..].iter().all(|v| v.is_nan()));
+            assert!(
+                !got[6 * INTERMEDIATE..(pairs - 1) * INTERMEDIATE]
+                    .iter()
+                    .any(|v| v.is_nan())
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `expert_matmul_grouped` refuses a scratch without a grouping and weights whose expert
 /// count differs from the grouping's.
 #[test]
@@ -1153,6 +1227,471 @@ fn bench_expert_matmul() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+// Quantized activations: `quantize_rows` against a CPU model of vLLM's Inkling activation
+// quantizers (`vllm/models/inkling2/nvidia/ops/nvfp4.py` and `mxfp8.py`), bit for bit, and
+// the block-scaled products against the F64 reference on the dequantized inputs.
+
+/// Positive finite E4M3 values by code, 0 to 0x7e.
+fn e4m3_table() -> Vec<f64> {
+    (0..=0x7eu8).map(e4m3).collect()
+}
+
+/// The value of E4M3 bits, exact in F32.
+fn e4m3_f32(bits: u8) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "E4M3 values are exact in F32"
+    )]
+    let value = e4m3(bits) as f32;
+    value
+}
+
+/// E4M3 bits of `x` rounded to nearest even, saturating at 448 (`cvt.rn.satfinite`).
+fn to_e4m3(table: &[f64], x: f32) -> u8 {
+    if x.is_nan() {
+        return 0x7f;
+    }
+    let sign = if x.is_sign_negative() { 0x80 } else { 0 };
+    let a = f64::from(x.abs());
+    let above = table.partition_point(|&v| v < a).min(table.len() - 1);
+    let below = above.saturating_sub(1);
+    let (d_above, d_below) = (table[above] - a, a - table[below]);
+    let code = match d_below.total_cmp(&d_above) {
+        std::cmp::Ordering::Less => below,
+        std::cmp::Ordering::Equal if below % 2 == 0 => below,
+        _ => above,
+    };
+    sign | u8::try_from(code).expect("E4M3 codes fit in u8")
+}
+
+/// The E2M1 code (sign in bit 3) of `x` rounded to nearest even with saturation, and its
+/// value: vLLM's `_e2m1`.
+fn to_e2m1(x: f32) -> (u8, f32) {
+    let a = x.abs();
+    let code: u8 = if a <= 0.25 {
+        0
+    } else if a < 0.75 {
+        1
+    } else if a <= 1.25 {
+        2
+    } else if a < 1.75 {
+        3
+    } else if a <= 2.5 {
+        4
+    } else if a < 3.5 {
+        5
+    } else if a <= 5.0 {
+        6
+    } else {
+        7
+    };
+    let value = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][usize::from(code)];
+    if x.is_sign_negative() {
+        (code | 8, -value)
+    } else {
+        (code, value)
+    }
+}
+
+/// The position of word `w` of a 32-byte step in `QuantizedRows`' stored order.
+fn stored_word(w: usize) -> usize {
+    if w < 4 { 2 * w } else { 2 * (w - 4) + 1 }
+}
+
+/// One row quantized as the GPU stores it: values, block scales and outer scale.
+struct QuantizedRow {
+    values: Vec<u8>,
+    scales: Vec<u8>,
+    outer: f32,
+}
+
+/// One 16-value NVFP4 block candidate: its 8 bytes and its error, summed pairwise.
+fn fp4_candidate(x: &[f32], scale: f32, inverse: f32, outer: f32) -> ([u8; 8], f32) {
+    let mut bytes = [0u8; 8];
+    let mut error = [0f32; 16];
+    for i in 0..16 {
+        let (code, value) = to_e2m1(x[i] * inverse);
+        bytes[i / 2] |= code << (4 * (i % 2));
+        error[i] = ((value * scale) * outer - x[i]).abs();
+    }
+    let mut width = 8;
+    while width > 0 {
+        for i in 0..width {
+            error[i] = error[2 * i] + error[2 * i + 1];
+        }
+        width /= 2;
+    }
+    (bytes, error[0])
+}
+
+/// vLLM's `_quantize_row`: per-row amax, 4-over-6 block scales chosen by absolute error.
+fn quantize_nvfp4(table: &[f64], x: &[f32]) -> QuantizedRow {
+    let k = x.len();
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let encoder = (1536.0 / amax).min(f32::MAX);
+    let decoder = 1.0 / encoder;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the F32 constants vLLM uses"
+    )]
+    let (sixth, inv_1536) = ((1.0f64 / 6.0) as f32, (1.0f64 / 1536.0) as f32);
+    let outer = amax * inv_1536;
+    let (encoder6, encoder4) = (encoder * sixth, encoder * 0.25);
+    let mut values = vec![0u8; k / 2];
+    let mut block_scales = vec![0u8; k / 16];
+    for (b, block) in x.chunks(16).enumerate() {
+        let block_max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let round = |v: f32| e4m3_f32(to_e4m3(table, v));
+        let scale6 = round((block_max * encoder6).min(448.0));
+        let scale4 = round((block_max * encoder4).min(448.0));
+        let inverse6 = (1.0 / (scale6 * decoder)).min(f32::MAX);
+        let inverse4 = (1.0 / (scale4 * decoder)).min(f32::MAX);
+        let (bytes6, error6) = fp4_candidate(block, scale6, inverse6, outer);
+        let (bytes4, error4) = fp4_candidate(block, scale4, inverse4, outer);
+        let (bytes, scale) = if error4 < error6 {
+            (bytes4, scale4)
+        } else {
+            (bytes6, scale6)
+        };
+        block_scales[b] = to_e4m3(table, scale);
+        for (half, word) in bytes.chunks(4).enumerate() {
+            let w = stored_word(2 * (b % 4) + half);
+            let at = b / 4 * 32 + 4 * w;
+            values[at..at + 4].copy_from_slice(word);
+        }
+    }
+    QuantizedRow {
+        values,
+        scales: block_scales,
+        outer,
+    }
+}
+
+/// vLLM's `_mxfp8_block` on each 32-value block.
+fn quantize_mxfp8(table: &[f64], x: &[f32]) -> QuantizedRow {
+    let k = x.len();
+    let mut values = vec![0u8; k];
+    let mut scales = vec![0u8; k / 32];
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the F32 constant vLLM uses"
+    )]
+    let inv_448 = (1.0f64 / 448.0) as f32;
+    let min_scale = 2f32.powi(-127);
+    for (b, block) in x.chunks(32).enumerate() {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let raw = amax * inv_448;
+        let mut exponent = (raw.to_bits().wrapping_add(0x007f_ffff) & 0x7f80_0000) >> 23;
+        exponent = if raw <= min_scale {
+            0
+        } else {
+            exponent.min(254)
+        };
+        let scale = f32::from_bits(exponent << 23).max(min_scale);
+        let inverse = if exponent == 0 {
+            2f32.powi(127)
+        } else {
+            1.0 / scale
+        };
+        scales[b] = u8::try_from(exponent).expect("exponents fit in u8");
+        for w in 0..8 {
+            for i in 0..4 {
+                let v = (block[4 * w + i] * inverse).clamp(-448.0, 448.0);
+                values[b * 32 + 4 * stored_word(w) + i] = to_e4m3(table, v);
+            }
+        }
+    }
+    QuantizedRow {
+        values,
+        scales,
+        outer: 0.0,
+    }
+}
+
+/// Rows that exercise the quantizers: uniform values at several magnitudes, outliers, a
+/// zero row, zero blocks inside a row, tiny and huge values.
+fn quantizer_inputs(rows: usize, k: usize, seed: u32) -> Vec<bf16> {
+    let mut x = common::pseudo_random(rows * k, seed, 1.0);
+    let mut random = SplitMix(u64::from(seed));
+    for (r, row) in x.chunks_mut(k).enumerate() {
+        let scale = match r % 8 {
+            0 => 1.0,
+            1 => 1e-3,
+            2 => 30.0,
+            3 => 0.0,
+            4 => 1e-30,
+            5 => 1e30,
+            _ => 2f32.powi(i32::try_from(random.below(20)).expect("small") - 10),
+        };
+        for v in row.iter_mut() {
+            *v *= scale;
+        }
+        if r % 8 >= 6 {
+            // A few outliers and a zero block.
+            for _ in 0..4 {
+                row[random.below(k)] *= 64.0;
+            }
+            let block = random.below(k / 32) * 32;
+            row[block..block + 32].fill(0.0);
+        }
+    }
+    x.into_iter().map(bf16::from_f32).collect()
+}
+
+/// Runs `quantize_rows` on `x` and returns its values, scales and outer scales.
+fn gpu_quantize(
+    s: &Setup,
+    x: &[bf16],
+    k: usize,
+    format: ExpertFormat<'_>,
+    out: &mut QuantizedRows,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<f32>)> {
+    let stream = s.stream();
+    let rows = x.len() / k;
+    let x_gpu = stream.clone_htod(x)?;
+    s.experts.quantize_rows(stream, &x_gpu, k, format, out)?;
+    let fp4 = matches!(format, ExpertFormat::Nvfp4 { .. });
+    let (value_bytes, scale_bytes) = if fp4 {
+        (rows * k / 2, rows * k / 16)
+    } else {
+        (rows * k, rows * k / 32)
+    };
+    Ok((
+        stream.clone_dtoh(&out.values().slice(..value_bytes))?,
+        stream.clone_dtoh(&out.scales().slice(..scale_bytes))?,
+        stream.clone_dtoh(&out.outer().slice(..rows))?,
+    ))
+}
+
+#[test]
+fn quantize_rows_matches_cpu_model() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let table = e4m3_table();
+    let dummy = s.stream().clone_htod(&[1f32])?;
+    let mut out = QuantizedRows::new(s.stream(), 400 * HIDDEN, 400)?;
+    for fp4 in [true, false] {
+        let format = if fp4 {
+            ExpertFormat::Nvfp4 {
+                global_scale: &dummy,
+            }
+        } else {
+            ExpertFormat::Mxfp8
+        };
+        for (k, rows) in [(HIDDEN, 400), (INTERMEDIATE, 333)] {
+            let x = quantizer_inputs(rows, k, u32::try_from(k + rows).expect("small"));
+            let (values, scales, outer) = gpu_quantize(&s, &x, k, format, &mut out)?;
+            let (row_values, row_scales) = (values.len() / rows, scales.len() / rows);
+            let mut chose4 = 0;
+            for (r, row) in x.chunks(k).enumerate() {
+                let row: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
+                let want = if fp4 {
+                    quantize_nvfp4(&table, &row)
+                } else {
+                    quantize_mxfp8(&table, &row)
+                };
+                let got_values = &values[r * row_values..(r + 1) * row_values];
+                let got_scales = &scales[r * row_scales..(r + 1) * row_scales];
+                if let Some(i) = (0..row_values).find(|&i| got_values[i] != want.values[i]) {
+                    panic!(
+                        "fp4 {fp4} k {k} row {r}: value byte {i} is {:#04x}, want {:#04x}",
+                        got_values[i], want.values[i]
+                    );
+                }
+                if let Some(i) = (0..row_scales).find(|&i| got_scales[i] != want.scales[i]) {
+                    panic!(
+                        "fp4 {fp4} k {k} row {r}: scale {i} is {:#04x}, want {:#04x}",
+                        got_scales[i], want.scales[i]
+                    );
+                }
+                if fp4 {
+                    assert_eq!(
+                        outer[r].to_bits(),
+                        want.outer.to_bits(),
+                        "k {k} row {r}: outer scale"
+                    );
+                    // Count blocks where the 4-based scale won, to show the rule is live.
+                    let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let encoder = (1536.0 / amax).min(f32::MAX);
+                    chose4 += row
+                        .chunks(16)
+                        .zip(&want.scales)
+                        .filter(|&(block, &scale)| {
+                            let block_max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                            let round =
+                                |v: f32| to_e4m3(&table, (block_max * (encoder * v)).min(448.0));
+                            block_max > 0.0 && scale == round(0.25) && scale != round(1.0 / 6.0)
+                        })
+                        .count();
+                }
+            }
+            let detail = if fp4 {
+                format!(
+                    "; {chose4} of {} blocks took the 4-based scale",
+                    rows * k / 16
+                )
+            } else {
+                String::new()
+            };
+            let name = if fp4 { "nvfp4" } else { "mxfp8" };
+            eprintln!("quantize {name} k {k}: {rows} rows equal the CPU model{detail}");
+        }
+    }
+    Ok(())
+}
+
+/// The F64 values of quantized rows (`QuantizedRow` layout), outer scale included.
+fn dequantize(row: &QuantizedRow, k: usize, fp4: bool) -> Vec<f64> {
+    (0..k)
+        .map(|i| {
+            // Value i sits in word i / 4 (FP8) or i / 8 (FP4) of its 32-byte step.
+            let (step, within) = if fp4 {
+                (i / 64, i % 64)
+            } else {
+                (i / 32, i % 32)
+            };
+            let per_word = if fp4 { 8 } else { 4 };
+            let word = stored_word(within / per_word);
+            let offset = step * 32 + 4 * word;
+            if fp4 {
+                let byte = row.values[offset + within % 8 / 2];
+                let nibble = if i % 2 == 0 { byte & 15 } else { byte >> 4 };
+                e2m1(nibble) * e4m3(row.scales[i / 16]) * f64::from(row.outer)
+            } else {
+                let byte = row.values[offset + within % 4];
+                e4m3(byte) * 2f64.powi(i32::from(row.scales[i / 32]) - 127)
+            }
+        })
+        .collect()
+}
+
+/// `expert_matmul_quantized_grouped` against the F64 reference on the dequantized inputs,
+/// with every output written and two runs equal.
+fn check_quantized(fp4: bool) -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let table = e4m3_table();
+    let mut scratch = ExpertScratch::new(stream, 2048, EXPERTS)?;
+    let mut xq = QuantizedRows::new(stream, 2048 * SLOTS * INTERMEDIATE, 2048 * SLOTS)?;
+    let n = 320;
+    let label = if fp4 { "nvfp4" } else { "mxfp8" };
+    for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
+        let projection = Synthetic::new(&s, fp4, n, k, 11 + k as u32)?;
+        let host = projection.host();
+        let weights = projection.gpu.weights();
+        for (rows, kind) in [
+            (1, Routing::Uniform),
+            (64, Routing::Subset),
+            (512, Routing::Skewed),
+            (2048, Routing::Uniform),
+        ] {
+            let indices = routing(rows, kind, rows as u32 * 7 + 1);
+            let x = common::pseudo_random_bf16(rows * inputs_per_row * k, rows as u32, 2.0, 0.0);
+            let x_gpu = stream.clone_htod(&x)?;
+            s.experts
+                .quantize_rows(stream, &x_gpu, k, weights.format, &mut xq)?;
+            let x64: Vec<f64> = x
+                .chunks(k)
+                .flat_map(|row| {
+                    let row: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
+                    let q = if fp4 {
+                        quantize_nvfp4(&table, &row)
+                    } else {
+                        quantize_mxfp8(&table, &row)
+                    };
+                    dequantize(&q, k, fp4)
+                })
+                .collect();
+            let indices_gpu = stream.clone_htod(&indices)?;
+            s.experts
+                .expert_group(stream, &indices_gpu, EXPERTS, &mut scratch)?;
+            let mut runs = Vec::new();
+            for _ in 0..2 {
+                let mut out =
+                    stream.clone_htod(&vec![bf16::from_f32(SENTINEL); rows * SLOTS * n])?;
+                s.experts
+                    .expert_matmul_quantized_grouped(stream, &xq, &weights, &mut out, &scratch)?;
+                runs.push(stream.clone_dtoh(&out)?);
+            }
+            let got = &runs[0];
+            assert!(
+                runs[0]
+                    .iter()
+                    .zip(&runs[1])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "two runs differ"
+            );
+            assert!(!got.iter().any(|v| v.to_f32() == SENTINEL));
+            let case = format!("quantized {label} {name} rows {rows} {kind:?}");
+            let worst = check_reference(&case, &host, &x64, &indices, inputs_per_row, got);
+            eprintln!("{case}: worst error {worst:.3} of bound");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn matmul_quantized_nvfp4_matches_reference() -> anyhow::Result<()> {
+    check_quantized(true)
+}
+
+#[test]
+fn matmul_quantized_mxfp8_matches_reference() -> anyhow::Result<()> {
+    check_quantized(false)
+}
+
+/// `expert_matmul_quantized_swiglu_grouped` equals `expert_matmul_quantized_grouped`
+/// followed by `softcapped_swiglu`, bit for bit, unknown ids included.
+#[test]
+fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let elementwise = Elementwise::load(s.gpu.context())?;
+    let rows = 700;
+    let pairs = rows * SLOTS;
+    let mut scratch = ExpertScratch::new(stream, rows, EXPERTS)?;
+    let mut xq = QuantizedRows::new(stream, rows * HIDDEN, rows)?;
+    let mut ids = routing(rows, Routing::Skewed, 5);
+    ids[9] = -1;
+    let indices = stream.clone_htod(&ids)?;
+    let x = stream.clone_htod(&common::pseudo_random_bf16(rows * HIDDEN, 9, 4.0, 0.0))?;
+    s.experts
+        .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
+    for fp4 in [true, false] {
+        let w13 = Synthetic::new(&s, fp4, 2 * INTERMEDIATE, HIDDEN, 43)?;
+        let weights = w13.gpu.weights();
+        s.experts
+            .quantize_rows(stream, &x, HIDDEN, weights.format, &mut xq)?;
+        let mut gate_up = stream.alloc_zeros::<bf16>(pairs * 2 * INTERMEDIATE)?;
+        s.experts
+            .expert_matmul_quantized_grouped(stream, &xq, &weights, &mut gate_up, &scratch)?;
+        let mut want = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+        elementwise.softcapped_swiglu(stream, &gate_up, &mut want, GATE_SOFTCAP, UP_SOFTCAP)?;
+        let mut got = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+        s.experts.expert_matmul_quantized_swiglu_grouped(
+            stream,
+            &xq,
+            &weights,
+            &mut got,
+            &scratch,
+            GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        let (got, want) = (stream.clone_dtoh(&got)?, stream.clone_dtoh(&want)?);
+        let differing = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()))
+            .count();
+        assert_eq!(differing, 0, "fp4 {fp4}: fused and separate SwiGLU differ");
+        assert!(
+            got[9 * INTERMEDIATE..10 * INTERMEDIATE]
+                .iter()
+                .all(|v| v.is_nan())
+        );
     }
     Ok(())
 }

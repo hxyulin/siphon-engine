@@ -3,12 +3,14 @@
 //! usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps N]
 //!        [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 //!        bench <model-dir> --prefill 512,4096,32768 [--chunk N] [--passes N]
-//!        [--kv bf16|fp8] [--json]
+//!        [--kv bf16|fp8] [--expert-activations bf16|quantized] [--json]
 //!
 //! With `--prefill`, each prompt length runs once through `Model::prefill` in chunks of
 //! `--chunk` rows from an empty cache, after one warmup chunk, and the time to the first
 //! token is the time `prefill` takes to return the greedy next token. The prompt tokens
-//! are arbitrary ids, so expert routing differs from real text.
+//! are arbitrary ids, so expert routing differs from real text. `--expert-activations
+//! quantized` runs prefill's expert products on quantized activations (see
+//! `ExpertActivations`).
 //!
 //! For each context length the runner skips its caches to that length without computing
 //! the skipped tokens, runs `--warmup` steps, then times `--steps` steps. The tokens it
@@ -40,7 +42,7 @@ mod linux {
     use inkling_cuda::{
         Gpu,
         model::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits},
-        ops::attention::KvFormat,
+        ops::{attention::KvFormat, experts::ExpertActivations},
         weights::{WeightFormat, Weights},
     };
 
@@ -72,6 +74,7 @@ mod linux {
         warmup: usize,
         kv: KvFormat,
         weights: WeightFormat,
+        expert_activations: ExpertActivations,
         json: bool,
         /// Prompt lengths to time prefill at, instead of timing decode.
         prefill: Option<Vec<usize>>,
@@ -94,6 +97,7 @@ mod linux {
         let mut warmup = 10;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut expert_activations = ExpertActivations::Bf16;
         let mut json = false;
         let mut prefill = None;
         let mut chunk = DEFAULT_PREFILL_CHUNK;
@@ -109,6 +113,7 @@ mod linux {
                 "--warmup" => warmup = value()?.parse()?,
                 "--kv" => kv = value()?.parse()?,
                 "--weights" => weights = value()?.parse()?,
+                "--expert-activations" => expert_activations = value()?.parse()?,
                 "--json" => json = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
@@ -134,6 +139,7 @@ mod linux {
             warmup,
             kv,
             weights,
+            expert_activations,
             json,
             prefill,
             chunk,
@@ -264,6 +270,7 @@ mod linux {
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         let longest = lengths.iter().copied().max().unwrap_or(0).max(args.chunk);
         let mut model = Model::with_kv_format(&gpu, config, weights, passes, longest, args.kv)?;
+        model.set_expert_activations(args.expert_activations);
         // Arbitrary ids spread over the vocabulary.
         let prompt: Vec<u32> = (0..longest as u32)
             .map(|i| (i.wrapping_mul(7919) + 13) % vocab)
@@ -308,12 +315,14 @@ mod linux {
                 .collect();
             println!(
                 "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"processes_before_load\":[{}],\
-                 \"passes\":{passes},\"kv\":{},\"chunk\":{},\"rows\":[{}]}}",
+                 \"passes\":{passes},\"kv\":{},\"expert_activations\":{},\"chunk\":{},\
+                 \"rows\":[{}]}}",
                 quote(&before.timestamp),
                 quote(&before.name),
                 quote(&before.driver),
                 processes.join(","),
                 quote(&args.kv.to_string()),
+                quote(&args.expert_activations.to_string()),
                 args.chunk,
                 rows.join(","),
             );

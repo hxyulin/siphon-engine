@@ -20,7 +20,7 @@ use super::{Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, VisitState, 
 use crate::{
     ops::{
         attention,
-        experts::ExpertScratch,
+        experts::{ExpertScratch, QuantizedRows},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{NormDest, Partial, RouterRowsScratch},
     },
@@ -79,13 +79,15 @@ struct MoeRows {
     router: RouterRowsScratch,
     indices: CudaSlice<i32>,
     weights: CudaSlice<f32>,
-    gate_up: CudaSlice<bf16>,
     act: CudaSlice<bf16>,
     down: CudaSlice<bf16>,
     /// The combined expert outputs, the post-MLP conv's input.
     combined: CudaSlice<bf16>,
     /// Grouping of the (row, slot) pairs by expert, shared by w13 and w2.
     experts: ExpertScratch,
+    /// The quantized expert inputs of `ExpertActivations::Quantized`, one projection's at a
+    /// time: up to `rows * 8` rows of 1152 values.
+    quantized: QuantizedRows,
 }
 
 /// Every intermediate of a chunk of up to `rows` rows. Names follow [`Scratch`].
@@ -191,11 +193,15 @@ impl PrefillScratch {
                 router: RouterRowsScratch::new(stream, rows)?,
                 indices: zeros(stream, rows * top_k)?,
                 weights: zeros(stream, rows * top_k)?,
-                gate_up: zeros(stream, rows * top_k * 2 * width)?,
                 act: zeros(stream, rows * top_k * width)?,
                 down: zeros(stream, rows * top_k * hidden)?,
                 combined: zeros(stream, rows * hidden)?,
                 experts: ExpertScratch::new(stream, rows, cfg.n_routed_experts)?,
+                quantized: QuantizedRows::new(
+                    stream,
+                    rows * top_k * width.max(hidden / top_k),
+                    rows * top_k,
+                )?,
             },
             final_hidden: zeros(stream, rows * hidden)?,
             head_logits: zeros(stream, HEAD_ROWS * cfg.vocab_size)?,
@@ -983,21 +989,18 @@ impl Ctx {
         self.moe_rows(
             &rows(x, m, hidden),
             &w13,
-            &mut rows_mut(&mut t.gate_up, m, top_k * 2 * width),
-            &t.experts,
-        )?;
-        self.kernels.elementwise.softcapped_swiglu(
-            &self.stream,
-            &rows(&t.gate_up, m, top_k * 2 * width),
             &mut rows_mut(&mut t.act, m, top_k * width),
-            cfg.mlp_gate_softcap,
-            cfg.mlp_up_softcap,
+            &t.experts,
+            true,
+            &mut t.quantized,
         )?;
         self.moe_rows(
             &rows(&t.act, m, top_k * width),
             &w2,
             &mut rows_mut(&mut t.down, m, top_k * hidden),
             &t.experts,
+            false,
+            &mut t.quantized,
         )
     }
 }
