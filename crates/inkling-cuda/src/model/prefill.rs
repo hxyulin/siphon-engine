@@ -22,7 +22,7 @@ use crate::{
         attention,
         experts::ExpertScratch,
         norm::{AttentionPostRows, KvConvWeights},
-        routing::{NormDest, Partial},
+        routing::{NormDest, Partial, RouterRowsScratch},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -49,7 +49,6 @@ struct GateRows {
     /// Per slot, the normalized state and message side by side, BF16 `[rows, 2 * hidden]`.
     inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
     down: CudaSlice<bf16>,
-    counters: CudaSlice<u32>,
 }
 
 /// Intermediates of attention for a chunk, `[rows, ...]` versions of `AttentionTemps`.
@@ -76,7 +75,7 @@ struct AttentionRows {
 /// Intermediates of the MoE block for a chunk.
 struct MoeRows {
     logits: CudaSlice<f32>,
-    counters: CudaSlice<u32>,
+    router: RouterRowsScratch,
     indices: CudaSlice<i32>,
     weights: CudaSlice<f32>,
     gate_up: CudaSlice<bf16>,
@@ -158,7 +157,6 @@ impl PrefillScratch {
                     zeros(stream, rows * 2 * hidden)?,
                 ],
                 down: zeros(stream, rows * cfg.loop_config.gate_rank)?,
-                counters: zeros(stream, rows)?,
             },
             qkv_in: [
                 zeros(stream, rows * hidden)?,
@@ -189,7 +187,7 @@ impl PrefillScratch {
             mlp_x: zeros(stream, rows * hidden)?,
             moe: MoeRows {
                 logits: zeros(stream, rows * cfg.n_routed_experts)?,
-                counters: zeros(stream, rows)?,
+                router: RouterRowsScratch::new(stream, rows)?,
                 indices: zeros(stream, rows * top_k)?,
                 weights: zeros(stream, rows * top_k)?,
                 gate_up: zeros(stream, rows * top_k * 2 * width)?,
@@ -932,15 +930,10 @@ impl Ctx {
             }],
             m,
         )?;
-        let mut counters = rows_mut(&mut t.counters, m, 1);
         let mut norm = norm;
-        let norm = norm.as_mut().map(|(weight, normed)| {
-            (
-                *weight,
-                normed as &mut dyn crate::DeviceOut<bf16>,
-                &mut counters as &mut dyn crate::DeviceOut<u32>,
-            )
-        });
+        let norm = norm
+            .as_mut()
+            .map(|(weight, normed)| (*weight, normed as &mut dyn crate::DeviceOut<bf16>));
         self.kernels.misc.message_gate_out_rows(
             &self.stream,
             &rows(&t.down, m, rank),
@@ -980,7 +973,7 @@ impl Ctx {
             &mut rows_mut(&mut t.logits, m, cfg.n_routed_experts),
             &mut rows_mut(&mut t.indices, m, top_k),
             &mut rows_mut(&mut t.weights, m, top_k),
-            &mut rows_mut(&mut t.counters, m, 1),
+            &mut t.router,
             cfg.route_scale,
             m,
         )?;

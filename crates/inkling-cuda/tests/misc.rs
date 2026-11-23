@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{Fixture, assert_bf16_close, assert_f32_close};
+use common::{Fixture, assert_bf16_close, assert_f32_close, pseudo_random, pseudo_random_bf16};
 use cudarc::driver::{CudaSlice, CudaStream};
 use half::bf16;
 use inkling_cuda::{
@@ -286,6 +286,97 @@ fn message_gate_out_matches_mlx() -> anyhow::Result<()> {
             [0],
             "the kernel resets its counter"
         );
+    }
+    Ok(())
+}
+
+/// The chunked message gate against single-row calls, bit for bit, with and without the
+/// norm. 45 rows cover a full row tile of 32 and a partial one; h and m rows sit 2 x 2304
+/// floats apart, as in the model.
+#[test]
+fn message_gate_out_rows_matches_single_row() -> anyhow::Result<()> {
+    const ROWS: usize = 45;
+    const STRIDE: usize = 2 * HIDDEN;
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let fixture = &s.fixture;
+    let (forget, _) = fixture.bf16("gate.forget_weight")?;
+    let (gain, _) = fixture.bf16("gate.gain_weight")?;
+    let (forget, gain) = (stream.clone_htod(&forget)?, stream.clone_htod(&gain)?);
+    let h_host = pseudo_random(ROWS * STRIDE, 800, 3.0);
+    let m_host = pseudo_random(ROWS * STRIDE, 801, 3.0);
+    let down_host = pseudo_random_bf16(ROWS * GATE_RANK, 802, 2.0, 0.0);
+    let (h, m) = (stream.clone_htod(&h_host)?, stream.clone_htod(&m_host)?);
+    let down = stream.clone_htod(&down_host)?;
+    let weight: Vec<bf16> = (0..HIDDEN)
+        .map(|i| bf16::from_f32(0.5 + (i % 97) as f32 / 97.0))
+        .collect();
+    let weight = stream.clone_htod(&weight)?;
+
+    let mut out = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+    let mut normed = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    s.misc.message_gate_out_rows(
+        stream,
+        &down,
+        &forget,
+        &gain,
+        (&h, STRIDE),
+        (&m, STRIDE),
+        &mut out,
+        Some((&weight, &mut normed)),
+        EPS,
+        ROWS,
+    )?;
+    let mut out_plain = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+    s.misc.message_gate_out_rows(
+        stream,
+        &down,
+        &forget,
+        &gain,
+        (&h, STRIDE),
+        (&m, STRIDE),
+        &mut out_plain,
+        None,
+        EPS,
+        ROWS,
+    )?;
+    let (out, normed) = (stream.clone_dtoh(&out)?, stream.clone_dtoh(&normed)?);
+    let out_plain = stream.clone_dtoh(&out_plain)?;
+
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    for row in 0..ROWS {
+        let h_row = stream.clone_htod(&h_host[row * STRIDE..row * STRIDE + HIDDEN])?;
+        let m_row = stream.clone_htod(&m_host[row * STRIDE..row * STRIDE + HIDDEN])?;
+        let down_row = stream.clone_htod(&down_host[row * GATE_RANK..(row + 1) * GATE_RANK])?;
+        let mut out_want = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut normed_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        s.misc.message_gate_out(
+            stream,
+            &down_row,
+            &forget,
+            &gain,
+            &h_row,
+            &m_row,
+            &mut out_want,
+            Some((&weight, &mut normed_want, &mut counter)),
+            EPS,
+        )?;
+        let out_want = bits(&stream.clone_dtoh(&out_want)?);
+        let range = row * HIDDEN..(row + 1) * HIDDEN;
+        assert_eq!(bits(&out[range.clone()]), out_want, "row {row}: out");
+        assert_eq!(
+            bits(&out_plain[range.clone()]),
+            out_want,
+            "row {row}: out without the norm"
+        );
+        let normed_bits: Vec<u16> = normed[range].iter().map(|x| x.to_bits()).collect();
+        let want_bits: Vec<u16> = stream
+            .clone_dtoh(&normed_want)?
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert_eq!(normed_bits, want_bits, "row {row}: normed");
     }
     Ok(())
 }

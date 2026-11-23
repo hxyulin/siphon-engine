@@ -23,7 +23,10 @@ use inkling_cuda::{
     ops::{
         misc::Misc,
         norm::Norm,
-        routing::{EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul, Routing, TOP_K},
+        routing::{
+            EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul, RouterRowsScratch,
+            Routing, TOP_K,
+        },
     },
 };
 
@@ -522,6 +525,96 @@ fn moe_router_matches_separate_kernels() -> anyhow::Result<()> {
             stream.clone_dtoh(&counter)?,
             [0],
             "the kernel resets its counter"
+        );
+    }
+    Ok(())
+}
+
+/// The chunked router against single-row calls, bit for bit: the norm, the logits (a tiled
+/// product that keeps the single-row sums), the experts and their weights. 130 rows cover
+/// two full row tiles of 64 and a partial one.
+#[test]
+fn moe_router_rows_matches_single_row() -> anyhow::Result<()> {
+    const ROWS: usize = 130;
+    let fixture = Fixture::load("routing")?;
+    let (bias, _) = fixture.f32("router.bias")?;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let router = stream.clone_htod(&router_weight())?;
+    let bias_dev = stream.clone_htod(&bias)?;
+    let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 400, 0.5, 1.0))?;
+    let x_host = pseudo_random(ROWS * HIDDEN, 700, 4.0);
+    let x = stream.clone_htod(&x_host)?;
+
+    let mut x_out = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    let mut logits = stream.alloc_zeros::<f32>(ROWS * EXPERTS)?;
+    let mut indices = stream.alloc_zeros::<i32>(ROWS * TOP_K)?;
+    let mut weights = stream.alloc_zeros::<f32>(ROWS * TOP_K)?;
+    // More rows than the call uses, as in a short last chunk.
+    let mut scratch = RouterRowsScratch::new(stream, ROWS + 7)?;
+    routing.moe_router_rows(
+        stream,
+        &x,
+        &weight,
+        EPS,
+        &router,
+        &bias_dev,
+        &mut x_out,
+        &mut logits,
+        &mut indices,
+        &mut weights,
+        &mut scratch,
+        ROUTE_SCALE,
+        ROWS,
+    )?;
+    let x_out = stream.clone_dtoh(&x_out)?;
+    let logits = stream.clone_dtoh(&logits)?;
+    let indices = stream.clone_dtoh(&indices)?;
+    let weights = stream.clone_dtoh(&weights)?;
+
+    let f32_bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    let bf16_bits = |v: &[bf16]| -> Vec<u16> { v.iter().map(|x| x.to_bits()).collect() };
+    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    for row in 0..ROWS {
+        let x_row = stream.clone_htod(&x_host[row * HIDDEN..(row + 1) * HIDDEN])?;
+        let mut x_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut logits_want = stream.alloc_zeros::<f32>(EXPERTS)?;
+        let mut indices_want = stream.alloc_zeros::<i32>(TOP_K)?;
+        let mut weights_want = stream.alloc_zeros::<f32>(TOP_K)?;
+        routing.moe_router(
+            stream,
+            &x_row,
+            &weight,
+            EPS,
+            &router,
+            &bias_dev,
+            &mut x_want,
+            &mut logits_want,
+            &mut indices_want,
+            &mut weights_want,
+            &mut counter,
+            ROUTE_SCALE,
+        )?;
+        assert_eq!(
+            bf16_bits(&x_out[row * HIDDEN..(row + 1) * HIDDEN]),
+            bf16_bits(&stream.clone_dtoh(&x_want)?),
+            "row {row}: input"
+        );
+        assert_eq!(
+            f32_bits(&logits[row * EXPERTS..(row + 1) * EXPERTS]),
+            f32_bits(&stream.clone_dtoh(&logits_want)?),
+            "row {row}: logits"
+        );
+        assert_eq!(
+            indices[row * TOP_K..(row + 1) * TOP_K],
+            stream.clone_dtoh(&indices_want)?,
+            "row {row}: experts"
+        );
+        assert_eq!(
+            f32_bits(&weights[row * TOP_K..(row + 1) * TOP_K]),
+            f32_bits(&stream.clone_dtoh(&weights_want)?),
+            "row {row}: weights"
         );
     }
     Ok(())

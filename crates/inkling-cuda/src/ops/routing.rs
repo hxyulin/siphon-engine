@@ -31,6 +31,15 @@ pub const FUSED_DESTS: usize = 4;
 /// Blocks and threads of `moe_router_2304`.
 const ROUTER_BLOCKS: u32 = 64;
 const ROUTER_THREADS: u32 = 288;
+/// Partial sums per logit of the chunked router: 4 subtrees of the shuffle tree of each
+/// of the 8 warps of `router_logits_2304`.
+const ROUTER_SUBTREES: usize = 32;
+/// Tile of `moe_router_logits_rows_2304`: rows by experts, with 256 threads.
+const ROUTER_TILE_ROWS: usize = 64;
+const ROUTER_TILE_EXPERTS: usize = 32;
+const ROUTER_TILE_THREADS: u32 = 128;
+/// Rows per block of `moe_router_norm_rows_2304`, one per warp.
+const ROUTER_NORM_ROWS: usize = 8;
 
 /// The partial candidate of [`Routing::depth_attention_fused`].
 pub enum Partial<'a> {
@@ -64,6 +73,25 @@ pub enum RouterMatmul {
     Tf32,
 }
 
+/// Scratch of [`Routing::moe_router_rows`] for chunks of up to `rows` rows.
+pub struct RouterRowsScratch {
+    rows: usize,
+    /// The subtree sums of each logit, F32 `[32, rows, 128]`.
+    partials: CudaSlice<f32>,
+    /// The normed rows, permuted for the logits kernel.
+    x_perm: CudaSlice<bf16>,
+}
+
+impl RouterRowsScratch {
+    pub fn new(stream: &Arc<CudaStream>, rows: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            rows,
+            partials: stream.alloc_zeros(ROUTER_SUBTREES * rows * EXPERTS)?,
+            x_perm: stream.alloc_zeros(rows * HIDDEN)?,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Routing {
     router_logits_2304: CudaFunction,
@@ -72,7 +100,9 @@ pub struct Routing {
     depth_attention_fused_2304: CudaFunction,
     depth_attention_fused_rows_2304: CudaFunction,
     moe_router_2304: CudaFunction,
-    moe_router_rows_2304: CudaFunction,
+    moe_router_norm_rows_2304: CudaFunction,
+    moe_router_logits_rows_2304: CudaFunction,
+    moe_router_route_rows_2304: CudaFunction,
 }
 
 impl Routing {
@@ -86,7 +116,9 @@ impl Routing {
             depth_attention_fused_rows_2304: module
                 .load_function("depth_attention_fused_rows_2304")?,
             moe_router_2304: module.load_function("moe_router_2304")?,
-            moe_router_rows_2304: module.load_function("moe_router_rows_2304")?,
+            moe_router_norm_rows_2304: module.load_function("moe_router_norm_rows_2304")?,
+            moe_router_logits_rows_2304: module.load_function("moe_router_logits_rows_2304")?,
+            moe_router_route_rows_2304: module.load_function("moe_router_route_rows_2304")?,
         })
     }
 
@@ -532,9 +564,9 @@ impl Routing {
 
     /// [`Routing::moe_router`] for each of the `rows` rows of a chunk: `x` and `x_out`
     /// `[rows, 2304]`, `logits` `[rows, 128]`, `indices` and `weights` `[rows, 8]`, and
-    /// `counters` `[rows]`, each holding 0 and left at 0. Each row's results equal a
-    /// single-row call's bit for bit.
-    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    /// `scratch` for at least `rows` rows. Each row's results equal a single-row call's bit
+    /// for bit: the logits run as a tiled matrix product that keeps the single-row sums.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signatures")]
     pub fn moe_router_rows(
         &self,
         stream: &CudaStream,
@@ -547,17 +579,16 @@ impl Routing {
         logits: &mut impl DeviceOut<f32>,
         indices: &mut impl DeviceOut<i32>,
         weights: &mut impl DeviceOut<f32>,
-        counters: &mut impl DeviceOut<u32>,
+        scratch: &mut RouterRowsScratch,
         route_scale: f32,
         rows: usize,
     ) -> anyhow::Result<()> {
         let x = x.view();
-        let (mut x_out, mut logits, mut indices, mut weights, mut counters) = (
+        let (mut x_out, mut logits, mut indices, mut weights) = (
             x_out.view_mut(),
             logits.view_mut(),
             indices.view_mut(),
             weights.view_mut(),
-            counters.view_mut(),
         );
         ensure!(rows > 0, "no rows");
         ensure!(
@@ -576,31 +607,73 @@ impl Routing {
             indices.len() == rows * TOP_K && weights.len() == rows * TOP_K,
             "indices or weights length"
         );
-        ensure!(counters.len() == rows, "counters length");
-        let config = LaunchConfig {
-            grid_dim: (
-                ROUTER_BLOCKS,
-                u32::try_from(rows).context("too many rows")?,
-                1,
-            ),
-            block_dim: (ROUTER_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        ensure!(
+            rows <= scratch.rows,
+            "scratch holds {} rows, not {rows}",
+            scratch.rows
+        );
+        let mut partials = scratch
+            .partials
+            .slice_mut(..ROUTER_SUBTREES * rows * EXPERTS);
+        let mut x_perm = scratch.x_perm.slice_mut(..rows * HIDDEN);
+        let grid_rows = u32::try_from(rows).context("too many rows")?;
+        let rows_i32 = i32::try_from(rows).context("too many rows")?;
+
         let mut args = KernelArgs::default();
         args.ptr(&x, stream)
             .ptr(norm_weight, stream)
             .f32(eps)
-            .ptr(router, stream)
-            .ptr(bias, stream)
             .ptr_mut(&mut x_out, stream)
+            .ptr_mut(&mut x_perm, stream)
+            .i32(rows_i32);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows.div_ceil(ROUTER_NORM_ROWS))?, 1, 1),
+            block_dim: (u32::try_from(ROUTER_NORM_ROWS * 32)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `moe_router_norm_rows_2304(const float*, const bf16*,
+        // float, bf16*, uint2*, int)`, x, x_out and x_perm hold `rows` rows, the grid has a
+        // warp per row in blocks of 8 (the kernel skips rows past `rows`), and the kernel
+        // reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_norm_rows_2304, config) }?;
+
+        let mut args = KernelArgs::default();
+        args.ptr(&x_perm, stream)
+            .ptr(router, stream)
+            .ptr_mut(&mut partials, stream)
+            .i32(rows_i32);
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(rows.div_ceil(ROUTER_TILE_ROWS))?,
+                u32::try_from(EXPERTS / ROUTER_TILE_EXPERTS)?,
+                u32::try_from(ROUTER_SUBTREES)?,
+            ),
+            block_dim: (ROUTER_TILE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `moe_router_logits_rows_2304(const uint2*, const float*,
+        // float*, int)`, x_perm holds `rows` rows and partials 32 x `rows` x 128 floats, the
+        // grid covers the rows in tiles of 64 (the kernel skips rows past `rows`), and the
+        // kernel reads only the router before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_logits_rows_2304, config) }?;
+
+        let mut args = KernelArgs::default();
+        args.ptr(&partials, stream)
+            .ptr(bias, stream)
             .ptr_mut(&mut logits, stream)
             .ptr_mut(&mut indices, stream)
             .ptr_mut(&mut weights, stream)
-            .ptr_mut(&mut counters, stream)
+            .i32(rows_i32)
             .f32(route_scale);
-        // SAFETY: the arguments match `moe_router_rows_2304`, which is `moe_router_2304`
-        // with one counter per row; every buffer holds `rows` rows as checked above, the grid
-        // has one y index per row, and the kernel reads only weights before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.moe_router_rows_2304, config) }
+        let config = LaunchConfig {
+            grid_dim: (grid_rows, 1, 1),
+            block_dim: (u32::try_from(EXPERTS)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `moe_router_route_rows_2304(const float*, const float*,
+        // float*, int*, float*, int, float)`, every buffer holds `rows` rows as checked
+        // above, the grid has one block of 128 threads per row, and the kernel reads nothing
+        // before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_router_route_rows_2304, config) }
     }
 }

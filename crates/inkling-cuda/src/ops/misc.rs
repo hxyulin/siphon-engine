@@ -22,14 +22,13 @@ const GATE_RANK: usize = 64;
 /// Blocks and threads of `message_gate_out_2304`: 72 output rows per block.
 const GATE_OUT_BLOCKS: u32 = (HIDDEN / 72) as u32;
 const GATE_OUT_THREADS: u32 = 288;
+/// Tile of `message_gate_out_rows_2304`: rows by output columns, with 256 threads.
+const GATE_TILE_ROWS: usize = 32;
+const GATE_TILE_COLS: usize = 64;
+const GATE_TILE_THREADS: u32 = 256;
 
-/// The norm of [`Misc::message_gate_out_rows`]: its weight, the normalized rows and one
-/// counter per row.
-pub type GateNorm<'a> = (
-    &'a CudaSlice<bf16>,
-    &'a mut dyn DeviceOut<bf16>,
-    &'a mut dyn DeviceOut<u32>,
-);
+/// The norm of [`Misc::message_gate_out_rows`]: its weight and the normalized rows.
+pub type GateNorm<'a> = (&'a CudaSlice<bf16>, &'a mut dyn DeviceOut<bf16>);
 
 #[derive(Debug)]
 pub struct Misc {
@@ -39,6 +38,7 @@ pub struct Misc {
     argmax_f32: CudaFunction,
     message_gate_out_2304: CudaFunction,
     message_gate_out_rows_2304: CudaFunction,
+    message_gate_norm_rows_2304: CudaFunction,
 }
 
 /// Launch shape for a grid-stride loop over `n` elements.
@@ -66,6 +66,7 @@ impl Misc {
             argmax_f32: module.load_function("argmax_f32")?,
             message_gate_out_2304: module.load_function("message_gate_out_2304")?,
             message_gate_out_rows_2304: module.load_function("message_gate_out_rows_2304")?,
+            message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
         })
     }
 
@@ -231,9 +232,8 @@ impl Misc {
 
     /// [`Misc::message_gate_out`] for each of the `rows` rows of a chunk: `down`
     /// `[rows, 64]`, `out` `[rows, 2304]`, and the rows of `h` and `m` `h_stride` and
-    /// `m_stride` elements apart. With `norm` set to `(weight, normed, counters)`, `normed`
-    /// is `[rows, 2304]` and `counters` `[rows]`, each holding 0 and left at 0. Each row's
-    /// results equal a single-row call's bit for bit.
+    /// `m_stride` elements apart. With `norm` set to `(weight, normed)`, `normed` is
+    /// `[rows, 2304]`. Each row's results equal a single-row call's bit for bit.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
     pub fn message_gate_out_rows(
         &self,
@@ -258,15 +258,17 @@ impl Misc {
                 stride >= HIDDEN && len >= (rows - 1) * stride + HIDDEN,
                 "{name} has {len} elements, too few for {rows} rows {stride} apart"
             );
+            // The kernel reads pairs of floats.
+            ensure!(stride.is_multiple_of(2), "{name} stride {stride} is odd");
         }
         check_len("out", out.len(), rows * HIDDEN)?;
         let config = LaunchConfig {
             grid_dim: (
-                GATE_OUT_BLOCKS,
-                u32::try_from(rows).context("too many rows")?,
+                u32::try_from(HIDDEN / GATE_TILE_COLS)?,
+                u32::try_from(rows.div_ceil(GATE_TILE_ROWS)).context("too many rows")?,
                 1,
             ),
-            block_dim: (GATE_OUT_THREADS, 1, 1),
+            block_dim: (GATE_TILE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
@@ -277,27 +279,33 @@ impl Misc {
             .i32(i32::try_from(h_stride)?)
             .ptr(&m, stream)
             .i32(i32::try_from(m_stride)?)
-            .ptr_mut(&mut out, stream);
-        match norm {
-            Some((weight, normed, counters)) => {
-                let (mut normed, mut counters) = (normed.view_mut(), counters.view_mut());
-                check_len("norm weight", weight.len(), HIDDEN)?;
-                check_len("normed", normed.len(), rows * HIDDEN)?;
-                check_len("counters", counters.len(), rows)?;
-                args.ptr(weight, stream)
-                    .ptr_mut(&mut normed, stream)
-                    .ptr_mut(&mut counters, stream);
-            }
-            None => {
-                args.u64(0).u64(0).u64(0);
-            }
-        }
-        args.f32(eps);
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(rows).context("too many rows")?);
         // SAFETY: the arguments match `message_gate_out_rows_2304(const bf16*, const bf16*,
-        // const bf16*, const float*, int, const float*, int, float*, const bf16*, bf16*,
-        // unsigned*, float)`, every buffer holds `rows` rows as checked above, the grid has
-        // one y index per row, a null `normed` makes the kernel skip the norm and its
-        // buffers, and it reads only weights before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.message_gate_out_rows_2304, config) }
+        // const bf16*, const float*, int, const float*, int, float*, int)`, every buffer
+        // holds `rows` rows as checked above, the grid covers the rows in tiles of 32 (the
+        // kernel skips rows past `rows`), and it reads only weights before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.message_gate_out_rows_2304, config) }?;
+
+        let Some((weight, normed)) = norm else {
+            return Ok(());
+        };
+        let mut normed = normed.view_mut();
+        check_len("norm weight", weight.len(), HIDDEN)?;
+        check_len("normed", normed.len(), rows * HIDDEN)?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&out, stream)
+            .ptr(weight, stream)
+            .ptr_mut(&mut normed, stream)
+            .f32(eps);
+        // SAFETY: the arguments match `message_gate_norm_rows_2304(const float*, const bf16*,
+        // bf16*, float)`, out and normed hold `rows` rows of 2304, the grid has one block per
+        // row, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.message_gate_norm_rows_2304, config) }
     }
 }

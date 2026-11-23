@@ -657,6 +657,52 @@ constexpr int kGemvChunks = (kHidden + kLogitsThreads * 4 - 1) / (kLogitsThreads
 
 }  // namespace
 
+namespace {
+
+// The top-8 routing of expert_routing_128_top8 for one row of 128 logits, with the
+// sigmoid through CUDA's expf. Every thread of the block must call it.
+__device__ __forceinline__ void route_top8(const float* logits, const float* __restrict__ bias, int32_t* indices,
+                                           float* weights, float route_scale) {
+    // Each expert's rank among the biased scores, ties to the lower index, picks the top 8
+    // without sequential rounds.
+    __shared__ float biased[kExperts];
+    __shared__ float score[kExperts];
+    __shared__ float top[kTopK];
+    const int e = threadIdx.x;
+    if (e < kExperts) {
+        const float l = __ldcg(logits + e);
+        // Metal's form of the sigmoid: exp of |x| cannot overflow to inf/inf.
+        const float y = 1.f / (1.f + expf(fabsf(l)));
+        score[e] = l < 0 ? y : 1.f - y;
+        biased[e] = score[e] + bias[e];
+    }
+    __syncthreads();
+    if (e < kExperts) {
+        const float mine = biased[e];
+        int rank = 0;
+#pragma unroll 8
+        for (int other = 0; other < kExperts; ++other) {
+            const float b = biased[other];
+            rank += b > mine || (b == mine && other < e);
+        }
+        if (rank < kTopK) {
+            indices[rank] = e;
+            top[rank] = score[e];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < kTopK) {
+        float total = 0.f;
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            total = top[k] + total;
+        }
+        weights[threadIdx.x] = top[threadIdx.x] / (total + kScoreEps) * route_scale;
+    }
+}
+
+}  // namespace
+
 // The MoE input norm and router for one row: x_out = bf16(rms_norm(x) * norm_weight),
 // logits = F32(x_out) @ router.T, then the top-8 routing of expert_routing_128_top8.
 // The norm and the logits sum as rms_norm_f32_2304 and router_logits_2304 do; the
@@ -765,42 +811,7 @@ moe_router_row(const float* __restrict__ x, const __nv_bfloat16* __restrict__ no
     }
     __threadfence();
 
-    // Each expert's rank among the biased scores, ties to the lower index, picks the top 8
-    // without sequential rounds.
-    __shared__ float biased[kExperts];
-    __shared__ float score[kExperts];
-    __shared__ float top[kTopK];
-    const int e = threadIdx.x;
-    if (e < kExperts) {
-        const float l = __ldcg(logits + e);
-        // Metal's form of the sigmoid: exp of |x| cannot overflow to inf/inf.
-        const float y = 1.f / (1.f + expf(fabsf(l)));
-        score[e] = l < 0 ? y : 1.f - y;
-        biased[e] = score[e] + bias[e];
-    }
-    __syncthreads();
-    if (e < kExperts) {
-        const float mine = biased[e];
-        int rank = 0;
-#pragma unroll 8
-        for (int other = 0; other < kExperts; ++other) {
-            const float b = biased[other];
-            rank += b > mine || (b == mine && other < e);
-        }
-        if (rank < kTopK) {
-            indices[rank] = e;
-            top[rank] = score[e];
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x < kTopK) {
-        float total = 0.f;
-#pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            total = top[k] + total;
-        }
-        weights[threadIdx.x] = top[threadIdx.x] / (total + kScoreEps) * route_scale;
-    }
+    route_top8(logits, bias, indices, weights, route_scale);
     if (threadIdx.x == 0) {
         *counter = 0;
     }
@@ -816,15 +827,329 @@ moe_router_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ n
     moe_router_row(x, norm_weight, eps, router, bias, x_out, logits, indices, weights, counter, route_scale);
 }
 
-// moe_router_2304 for each row (blockIdx.y) of a chunk: x and x_out [rows, 2304], logits
-// [rows, 128], indices and weights [rows, 8], and one counter per row, each holding 0.
-extern "C" __global__ void __launch_bounds__(kRouterThreads)
-moe_router_rows_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
-                     const float* __restrict__ router, const float* __restrict__ bias,
-                     __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
-                     unsigned* counters, float route_scale) {
-    const size_t row = blockIdx.y;
-    moe_router_row(x + row * kHidden, norm_weight, eps, router, bias, x_out + row * kHidden,
-                   logits + row * kExperts, indices + row * kTopK, weights + row * kTopK, counters + row,
-                   route_scale);
+// ---------------------------------------------------------------------------
+// moe_router_2304 for the rows of a chunk, in three kernels: the norm, the logits as a
+// tiled F32 matrix product split along the inner dimension, and the routing. Every sum
+// keeps moe_router_2304's order, so each row's results equal a single-row call's bit
+// for bit.
+//
+// router_logits_2304's order for one logit: thread t < 256 of the block (warp w = t / 32,
+// lane l = t % 32) chains fmaf over its columns 4t + 1024c + 0..3 for c = 0, 1 and, if
+// t < 64, 2. Each warp then adds its 32 lane sums with a shuffle-down tree, pairing lanes
+// 16 apart, then 8, 4, 2 and 1. The 8 warp sums are added in order.
+//
+// Visiting the lanes in bit-reversed order, lane = rev5(j) for j = 0..31, makes the
+// tree's pairs adjacent: the tree adds steps 2i and 2i + 1, then adjacent pairs, and so
+// on. Steps j = 8g .. 8g + 7 (g = 0..3) are the lanes r + 4k (k = 0..7) for r = rev2(g),
+// and form one subtree T(w, g); the warp's sum is (T0 + T1) + (T2 + T3).
+//
+// moe_router_logits_rows_2304 computes one subtree for a tile of rows and experts, and
+// moe_router_route_rows_2304 adds the 32 subtrees of each logit.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kSplits = kLogitsThreads / 32;
+constexpr int kLanes = 32;
+constexpr int kQuarters = 4;
+constexpr int kSubtrees = kSplits * kQuarters;
+constexpr int kSubtreeLanes = kLanes / kQuarters;
+constexpr int kMaxChunks = 3;
+constexpr int kTileRows = 64;
+constexpr int kTileExperts = 32;
+constexpr int kTileThreads = 128;
+// Each thread holds 4 rows by 4 experts: the row pairs (2 p, 2 p + 1) for p = tr + 16 i
+// and the experts te + 8 i. One 16-byte shared-memory read gives a row pair's x. A warp
+// spans 8 values of tr and 4 of te, so its reads stay within 128 and 64 bytes.
+constexpr int kThreadPairs = 2;
+constexpr int kThreadRows = 2 * kThreadPairs;
+constexpr int kThreadExperts = 4;
+constexpr int kPairGroups = kTileRows / kThreadRows;
+constexpr int kExpertGroups = kTileExperts / kThreadExperts;
+static_assert(kPairGroups * kExpertGroups == kTileThreads, "threads cover the tile");
+// Rows per block of moe_router_norm_rows_2304: one per warp.
+constexpr int kNormRows = 8;
+constexpr int kRuns = kHidden / 4;
+
+// Columns of chunk c exist for warps w < 2 only (t < 64).
+__host__ __device__ constexpr int chunks_of(int w) { return w < 2 ? 3 : 2; }
+
+// The permuted copy of the normed rows that moe_router_norm_rows_2304 writes for the
+// logits kernel holds runs of 4 BF16 values. Run (w, g, k, c) of every row comes
+// before the next run, so that a subtree's runs for consecutive rows are contiguous:
+// run index (subtree_base(w, g) + k * chunks_of(w) + c) * rows + row.
+__device__ __forceinline__ int subtree_base(int w, int g) {
+    const int before = w < 2 ? w * kQuarters * kSubtreeLanes * 3
+                             : 2 * kQuarters * kSubtreeLanes * 3 + (w - 2) * kQuarters * kSubtreeLanes * 2;
+    return before + g * kSubtreeLanes * chunks_of(w);
+}
+
+__device__ __forceinline__ int rev2(int g) { return ((g & 1) << 1) | (g >> 1); }
+
+__device__ __forceinline__ int rev3(int m) { return ((m & 1) << 2) | (m & 2) | (m >> 2); }
+
+// The run of the permuted copy that holds columns col .. col + 3 (col a multiple of 4).
+__device__ __forceinline__ int permuted_run(int col) {
+    const int t = col % 1024 / 4;
+    const int c = col / 1024;
+    const int w = t / kLanes;
+    const int lane = t % kLanes;
+    const int g = rev2(lane % kQuarters);
+    const int k = lane / kQuarters;
+    return subtree_base(w, g) + k * chunks_of(w) + c;
+}
+
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+template <int Bytes>
+__device__ __forceinline__ void cp_async(uint32_t dst, const void* src, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::"r"(dst), "l"(src), "n"(Bytes),
+                 "r"(valid ? Bytes : 0));
+}
+
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
+
+__device__ __forceinline__ void bf16x4_to_f32(uint2 p, float (&v)[4]) {
+    v[0] = __uint_as_float(p.x << 16);
+    v[1] = __uint_as_float(p.x & 0xffff0000u);
+    v[2] = __uint_as_float(p.y << 16);
+    v[3] = __uint_as_float(p.y & 0xffff0000u);
+}
+
+template <int Chunks>
+__device__ __forceinline__ void router_subtree_tile(const uint2* __restrict__ xp, const float* __restrict__ router,
+                                                    float* partials, int rows, int w, int g, uint2* xs,
+                                                    float4* ws) {
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int tr = warp / 2 * 8 + lane / 4;
+    const int te = warp % 2 * 4 + lane % 4;
+    const int r0 = blockIdx.x * kTileRows;
+    const int e0 = blockIdx.y * kTileExperts;
+    const int r = rev2(g);
+
+    for (int idx = tid; idx < kSubtreeLanes * Chunks * kTileExperts; idx += kTileThreads) {
+        const int e = idx % kTileExperts;
+        const int kc = idx / kTileExperts;
+        const int t = w * kLanes + r + kQuarters * (kc / Chunks);
+        const float* src = router + size_t(e0 + e) * kHidden + 4 * t + 1024 * (kc % Chunks);
+        cp_async<16>(smem_addr(&ws[kc * kTileExperts + e]), src, true);
+    }
+    pdl_trigger();
+    pdl_wait();
+    const uint2* xsub = xp + size_t(subtree_base(w, g)) * rows;
+    for (int idx = tid; idx < kSubtreeLanes * Chunks * kTileRows; idx += kTileThreads) {
+        const int row = idx % kTileRows;
+        const int kc = idx / kTileRows;
+        const bool valid = r0 + row < rows;
+        const uint2* src = xsub + size_t(kc) * rows + (valid ? r0 + row : 0);
+        cp_async<8>(smem_addr(&xs[kc * kTileRows + row]), src, valid);
+    }
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+
+    // level[b] holds the sum of the last 2^b steps that closed a subtree of that size.
+    float level[3][kThreadRows][kThreadExperts];
+#pragma unroll 1
+    for (int m = 0; m < kSubtreeLanes; ++m) {
+        const int k = rev3(m);
+        float acc[kThreadRows][kThreadExperts] = {};
+#pragma unroll
+        for (int c = 0; c < Chunks; ++c) {
+            float xv[kThreadRows][4];
+            float wv[kThreadExperts][4];
+#pragma unroll
+            for (int i = 0; i < kThreadPairs; ++i) {
+                const uint4 pair =
+                    *reinterpret_cast<const uint4*>(&xs[(k * Chunks + c) * kTileRows + 2 * (tr + kPairGroups * i)]);
+                bf16x4_to_f32(make_uint2(pair.x, pair.y), xv[2 * i]);
+                bf16x4_to_f32(make_uint2(pair.z, pair.w), xv[2 * i + 1]);
+            }
+#pragma unroll
+            for (int i = 0; i < kThreadExperts; ++i) {
+                const float4 v = ws[(k * Chunks + c) * kTileExperts + te + kExpertGroups * i];
+                wv[i][0] = v.x;
+                wv[i][1] = v.y;
+                wv[i][2] = v.z;
+                wv[i][3] = v.w;
+            }
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+#pragma unroll
+                for (int a = 0; a < kThreadRows; ++a) {
+#pragma unroll
+                    for (int b = 0; b < kThreadExperts; ++b) {
+                        acc[a][b] = fmaf(wv[b][n], xv[a][n], acc[a][b]);
+                    }
+                }
+            }
+        }
+        // Fold step m into the subtree: a binary counter over m. The branches are uniform
+        // and every array index is a constant.
+        const auto store = [&](float (&dst)[kThreadRows][kThreadExperts]) {
+#pragma unroll
+            for (int a = 0; a < kThreadRows; ++a) {
+#pragma unroll
+                for (int b = 0; b < kThreadExperts; ++b) {
+                    dst[a][b] = acc[a][b];
+                }
+            }
+        };
+        const auto add = [&](const float (&src)[kThreadRows][kThreadExperts]) {
+#pragma unroll
+            for (int a = 0; a < kThreadRows; ++a) {
+#pragma unroll
+                for (int b = 0; b < kThreadExperts; ++b) {
+                    acc[a][b] = src[a][b] + acc[a][b];
+                }
+            }
+        };
+        if (!(m & 1)) {
+            store(level[0]);
+        } else {
+            add(level[0]);
+            if (!(m & 2)) {
+                store(level[1]);
+            } else {
+                add(level[1]);
+                if (!(m & 4)) {
+                    store(level[2]);
+                } else {
+                    add(level[2]);
+                    store(level[0]);
+                }
+            }
+        }
+    }
+
+    float* out = partials + size_t(w * kQuarters + g) * rows * kExperts;
+#pragma unroll
+    for (int a = 0; a < kThreadRows; ++a) {
+        const int row = r0 + 2 * (tr + kPairGroups * (a / 2)) + a % 2;
+        if (row < rows) {
+#pragma unroll
+            for (int b = 0; b < kThreadExperts; ++b) {
+                out[size_t(row) * kExperts + e0 + te + kExpertGroups * b] = level[0][a][b];
+            }
+        }
+    }
+}
+
+}  // namespace
+
+// Step 1 of 3: x_out = bf16(rms_norm(x) * norm_weight) for each row of x and x_out
+// ([rows, 2304]), as moe_router_2304 computes it, and the same values permuted for the
+// logits kernel into x_perm ([rows * 2304], see subtree_base). One warp per row, 8 rows
+// per block (256 threads). The warp repeats the norm's sums: virtual warp v of the 576
+// virtual threads (lanes l, columns 4 (32 v + l) ..) is the warp's step v, and lane v
+// keeps that step's sum for the final butterfly.
+extern "C" __global__ void __launch_bounds__(kNormRows * 32)
+moe_router_norm_rows_2304(const float* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
+                          __nv_bfloat16* x_out, uint2* x_perm, int rows) {
+    constexpr int kSteps = kRuns / 32;
+    // The block's rows by permuted run, padded so that consecutive rows fall on
+    // different banks.
+    __shared__ uint2 ys[kNormRows][kRuns + 1];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int r0 = blockIdx.x * kNormRows;
+    const int row = r0 + warp;
+    pdl_trigger();
+    pdl_wait();
+    if (row < rows) {
+        const size_t at = size_t(row) * kHidden;
+        float v[kSteps][4];
+#pragma unroll
+        for (int s = 0; s < kSteps; ++s) {
+            load4(x + at + 4 * (32 * s + lane), v[s]);
+        }
+        float mine = 0.f;
+#pragma unroll
+        for (int s = 0; s < kSteps; ++s) {
+            float p = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                p = fmaf(v[s][i], v[s][i], p);
+            }
+            p = warp_sum(p);
+            if (lane == s) {
+                mine = p;
+            }
+        }
+        static_assert(kSteps == kNormVirtualWarps, "one step per virtual warp");
+        const float inv = inv_rms_f32(warp_sum(mine), eps);
+#pragma unroll
+        for (int s = 0; s < kSteps; ++s) {
+            const int col = 4 * (32 * s + lane);
+            float w[4];
+            float y[4];
+            load4(norm_weight + col, w);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                y[i] = (v[s][i] * inv) * w[i];
+            }
+            store4(x_out + at + col, y);
+            store4(reinterpret_cast<__nv_bfloat16*>(&ys[warp][permuted_run(col)]), y);
+        }
+    }
+    __syncthreads();
+    // Each run's 8 rows are 64 contiguous bytes of x_perm.
+    for (int idx = threadIdx.x; idx < kRuns * kNormRows; idx += blockDim.x) {
+        const int j = idx % kNormRows;
+        const int run = idx / kNormRows;
+        if (r0 + j < rows) {
+            x_perm[size_t(run) * rows + r0 + j] = ys[j][run];
+        }
+    }
+}
+
+// Step 2 of 3: partials[w * 4 + g, row, e] = subtree T(w, g) of logit (row, e) of
+// F32(x) @ router.T, from the permuted rows x_perm and the [128, 2304] F32 router.
+// Grid: (ceil(rows / 64), 4, 32), 128 threads.
+extern "C" __global__ void __launch_bounds__(kTileThreads, 4)
+moe_router_logits_rows_2304(const uint2* __restrict__ x_perm, const float* __restrict__ router, float* partials,
+                            int rows) {
+    // Runs of 4: x at [k][c][row] (BF16), the router at [k][c][expert] (F32).
+    __shared__ __align__(16) uint2 xs[kSubtreeLanes * kMaxChunks * kTileRows];
+    __shared__ float4 ws[kSubtreeLanes * kMaxChunks * kTileExperts];
+    const int w = blockIdx.z / kQuarters;
+    const int g = blockIdx.z % kQuarters;
+    if (w < 2) {
+        router_subtree_tile<3>(x_perm, router, partials, rows, w, g, xs, ws);
+    } else {
+        router_subtree_tile<2>(x_perm, router, partials, rows, w, g, xs, ws);
+    }
+}
+
+// Step 3 of 3: for each row (blockIdx.x), logits[row, e] = the sum of warps
+// (T0 + T1) + (T2 + T3), added in warp order, then moe_router_2304's top-8 routing into
+// indices and weights ([rows, 8]). 128 threads.
+extern "C" __global__ void __launch_bounds__(kExperts)
+moe_router_route_rows_2304(const float* __restrict__ partials, const float* __restrict__ bias, float* logits,
+                           int32_t* indices, float* weights, int rows, float route_scale) {
+    const size_t row = blockIdx.x;
+    const int e = threadIdx.x;
+    pdl_trigger();
+    pdl_wait();
+    float p[kSubtrees];
+#pragma unroll
+    for (int s = 0; s < kSubtrees; ++s) {
+        p[s] = partials[(size_t(s) * rows + row) * kExperts + e];
+    }
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kSplits; ++w) {
+        const float* q = p + w * kQuarters;
+        const float warp_sum = (q[0] + q[1]) + (q[2] + q[3]);
+        total = w == 0 ? warp_sum : total + warp_sum;
+    }
+    logits[row * kExperts + e] = total;
+    // route_top8 reads each logit back in the thread that wrote it.
+    route_top8(logits + row * kExperts, bias, indices + row * kTopK, weights + row * kTopK, route_scale);
 }
