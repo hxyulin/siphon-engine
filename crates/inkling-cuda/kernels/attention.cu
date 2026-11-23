@@ -1,5 +1,4 @@
-// Decode attention with relative-position bias, attention sinks and KV caches,
-// following MLX 0.32.4 on the M5 Max that made the reference fixtures.
+// Decode attention with relative-position bias, attention sinks and KV caches.
 //
 // Shapes are those of every Inkling layer: 24 query heads, 8 KV heads (GQA
 // groups of 3), head dim 128, relative width 16.
@@ -13,40 +12,20 @@
 // distance (p - s) mod slots. This matches MLX's RotatingKVCache and KVCache
 // when they are fed one token at a time.
 //
-// Arithmetic follows the Metal kernels it replaces:
+// `relative_bias` is bit-exact with MLX: its BF16 matmul for M = 24, K = 16
+// sums the 16 exact products as a fixed tree, found by probing it with
+// cancelling inputs: pairs (k, k + 1), then pair k with pair k + 8, then the
+// four results in order. The PTX .rn.ftz helpers keep nvcc from fusing or
+// reordering that tree; .ftz because MLX flushes subnormals.
 //
-// - `relative_bias`: MLX's BF16 matmul for M = 24, K = 16 sums the 16 exact
-//   products as a fixed tree, found by probing it with cancelling inputs:
-//   pairs (k, k + 1), then pair k with pair k + 8, then the four results in
-//   order. With that tree the output is bit-exact.
-// - `decode_attention_*`: `sdpa_vector` (one pass, fewer than 1024 keys) and
-//   `sdpa_vector_2pass_1/2` (two passes, 1024 keys or more) in
-//   kernels/sdpa_vector.h. Both split the keys into `blocks` interleaved
-//   strides, key s going to block s mod blocks, keep an online softmax per
-//   block and then combine the blocks. The one-pass kernel is the two-pass
-//   structure with 32 blocks whose partial outputs stay in F32; the two-pass
-//   kernel on an M5 Max uses 64 blocks for this GQA factor and rounds the
-//   unnormalized partial outputs to BF16. The kernels pick the same split from
-//   the position they read on the device; the launcher always starts 64 blocks
-//   and blocks past the split exit, so a captured graph serves every position.
-//   Within a block:
-//     q' = scale * q                        (scale applied to q, in F32)
-//     score = sum over the lane's 4 dims    (FMA chain), then simd_sum
-//     score += mask                         (BF16 bias, or 0 past the table)
-//     m' = max(m, score)
-//     factor = exp(m - m'), e = exp(score - m')
-//     sum = sum * factor + e                (FMA)
-//     o = o * factor + e * v                (FMA onto the rounded product)
-//   Block 0 starts from the sink: m = sink, sum = 1. Other blocks start from
-//   m = -FLT_MAX, sum = 0. exp is Metal's fast::exp, exp2(x * log2(e)), and is
-//   not correctly rounded on Apple GPUs; exp2f stands in for it, so results
-//   differ from MLX by rounding.
-//
-// The Metal compiler contracts `a += b * c` into an FMA even with
-// -fno-fast-math (see norm.cu's RMSNorm). Against the fixtures, the FMA forms
-// above leave 1 differing BF16 output in 55296 and unfused forms leave 8. The
-// kernels spell every operation as a PTX .rn.ftz instruction so that nvcc
-// cannot fuse or split them; .ftz because MLX flushes subnormals.
+// `decode_attention_bf16` computes, for each query head h with KV head g:
+//   q' = scale * q                          (F32)
+//   score_s = q' . k_s + bias[h, d_s]       (bias only for distance d_s < extent)
+//   out = sum_s e^(score_s) v_s / (e^sink + sum_s e^(score_s))
+// over the keys with distance below the window (all of them for a global
+// layer). It is memory bound, so it reads each KV head once for its 3 query
+// heads and keeps enough loads in flight to stream the cache at DRAM speed.
+// Only the summation order differs from MLX's sdpa_vector; every sum is F32.
 
 #include <cuda_bf16.h>
 #include <cfloat>
@@ -59,24 +38,26 @@ constexpr int kKvHeads = 8;
 constexpr int kGroup = kHeads / kKvHeads;
 constexpr int kHeadDim = 128;
 constexpr int kRelDim = 16;
-// Elements of a 128-wide head each lane owns, MLX's qk_per_thread.
-constexpr int kVec = kHeadDim / 32;
 constexpr int kKvRow = kKvHeads * kHeadDim;
-// MLX on an M5 Max switches from its one-pass to its two-pass kernel at this
-// many keys, and their block counts.
-constexpr unsigned kTwoPassKeys = 1024;
-constexpr int kOnePassBlocks = 32;
-constexpr int kTwoPassBlocks = 64;
+
+// Decode attention tiling. A block of 4 warps handles one KV head over one
+// contiguous range of cache slots (a split), in tiles of 32 keys.
+constexpr int kWarps = 4;
+constexpr int kThreads = kWarps * 32;
+constexpr int kTile = 32;
+// 16-byte chunks in one key or value head of 128 BF16 values.
+constexpr int kChunks = kHeadDim / 8;
+// Dims of a key each warp multiplies in the score phase.
+constexpr int kWarpDims = kHeadDim / kWarps;
+// Keys of a tile each warp accumulates in the value phase.
+constexpr int kWarpKeys = kTile / kWarps;
+// Split rows the partial buffers hold per query head. The launcher keeps the
+// grid's split count at or below this.
+constexpr int kMaxSplits = 64;
 
 __device__ __forceinline__ float fadd(float a, float b) {
     float r;
     asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-__device__ __forceinline__ float fsub(float a, float b) {
-    float r;
-    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
     return r;
 }
 
@@ -86,57 +67,92 @@ __device__ __forceinline__ float fmul(float a, float b) {
     return r;
 }
 
-__device__ __forceinline__ float ffma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
-}
-
-__device__ __forceinline__ float fdiv(float a, float b) {
-    float r;
-    asm("div.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-// Metal's fast::exp: exp2 of the F32 product x * log2(e).
 __device__ __forceinline__ float fast_exp(float x) {
-    return exp2f(fmul(x, 1.4426950408889634f));
+    return exp2f(x * 1.4426950408889634f);
 }
 
-// simd_sum on Apple GPUs: an xor butterfly over lane offsets 1, 2, 4, 8, 16.
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int offset = 1; offset < 32; offset *= 2) {
-        v = fadd(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    for (int offset = 16; offset > 0; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
     }
     return v;
 }
 
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
-    for (int offset = 1; offset < 32; offset *= 2) {
+    for (int offset = 16; offset > 0; offset /= 2) {
         v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
     }
     return v;
 }
 
-__device__ __forceinline__ void load_bf16x4(const __nv_bfloat16* p, float (&v)[kVec]) {
-    const uint2 packed = *reinterpret_cast<const uint2*>(p);
-    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+// The 8 BF16 values packed in a 16-byte word, as F32.
+__device__ __forceinline__ void unpack_bf16x8(uint4 raw, float (&v)[8]) {
+    const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
 #pragma unroll
-    for (int i = 0; i < kVec; ++i) {
-        v[i] = __bfloat162float(vals[i]);
+    for (int i = 0; i < 4; ++i) {
+        v[2 * i] = __uint_as_float(words[i] << 16);
+        v[2 * i + 1] = __uint_as_float(words[i] & 0xffff0000u);
     }
 }
 
-__device__ __forceinline__ float round_bf16(float x) {
-    return __bfloat162float(__float2bfloat16(x));
+__device__ __forceinline__ void unpack_bf16x4(uint2 raw, float (&v)[4]) {
+    v[0] = __uint_as_float(raw.x << 16);
+    v[1] = __uint_as_float(raw.x & 0xffff0000u);
+    v[2] = __uint_as_float(raw.y << 16);
+    v[3] = __uint_as_float(raw.y & 0xffff0000u);
 }
 
-// Key blocks of the split MLX uses for a query at `position` over a cache of
-// `slots`: one pass below kTwoPassKeys keys, two passes from there on.
-__device__ __forceinline__ int split_blocks(unsigned position, unsigned slots) {
-    return min(position + 1, slots) < kTwoPassKeys ? kOnePassBlocks : kTwoPassBlocks;
+// Copies 16 bytes from global to shared memory without blocking, or writes 16
+// zero bytes when `valid` is false.
+__device__ __forceinline__ void copy_async16(void* dst, const void* src, bool valid) {
+    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(shared), "l"(src), "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void copy_async_commit() {
+    asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void copy_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+struct alignas(16) DecodeShared {
+    // Two stages of key and value tiles, [kTile, 128] each. Key rows are
+    // swizzled: logical chunk c of row r sits at chunk c ^ (r % 16), so that 32
+    // lanes reading the same logical chunk of 32 rows hit distinct banks.
+    __nv_bfloat16 k[2][kTile * kHeadDim];
+    __nv_bfloat16 v[2][kTile * kHeadDim];
+    // Per-warp partial scores over each warp's quarter of the dims.
+    float scores[kWarps][kGroup][kTile];
+    // Softmax weights of the tile's keys for the 3 heads, padded to 4.
+    float4 weights[kTile];
+    // Rescale factor of each head's accumulators for the current tile.
+    float factor[kGroup];
+    // Combined softmax denominator of each head, in the combining block.
+    float total[kGroup];
+    bool last;
+};
+
+// Starts copying the key and value tile that begins at slot `first`. Slots at
+// or past `end` read as zeros.
+__device__ __forceinline__ void load_tile(DecodeShared& sm, int stage, const __nv_bfloat16* k_cache,
+                                          const __nv_bfloat16* v_cache, int kv_head, unsigned first,
+                                          unsigned end) {
+#pragma unroll
+    for (int k = 0; k < kTile * kChunks / kThreads; ++k) {
+        const int i = threadIdx.x + k * kThreads;
+        const int row = i / kChunks;
+        const int chunk = i % kChunks;
+        const unsigned slot = first + row;
+        const bool valid = slot < end;
+        const size_t offset = size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * 8;
+        copy_async16(&sm.k[stage][row * kHeadDim + (chunk ^ (row % 16)) * 8], k_cache + offset, valid);
+        copy_async16(&sm.v[stage][row * kHeadDim + chunk * 8], v_cache + offset, valid);
+    }
+    copy_async_commit();
 }
 
 }  // namespace
@@ -181,140 +197,264 @@ kv_append_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* k_
     *reinterpret_cast<uint4*>(v_cache + dst) = *reinterpret_cast<const uint4*>(v + i);
 }
 
-// First pass: for query head h = blockIdx.x and block b = blockIdx.y, an online
-// softmax over cache slots b, b + blocks, ... below n, where `blocks` is the
-// split for this position and blocks b >= blocks exit. One warp; lane l owns
-// dims 4l..4l+3. Writes the unnormalized output to partial_out[h, b, 128]
-// (rounded to BF16 values in the two-pass split), and the running max and sum
-// to partial_max[h, b] and partial_sum[h, b].
+
+// Decode attention of one token over a KV cache, for all 24 query heads.
 //
-// `*position_ptr` is the query's absolute position p, `slots` the cache size,
-// `window` the sliding window (0 for none) and `extent` the bias table width.
-extern "C" __global__ void __launch_bounds__(32)
-decode_attention_partial_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                              const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out,
-                              float* partial_max, float* partial_sum, const unsigned* position_ptr,
-                              unsigned slots, unsigned window, unsigned extent, float scale) {
+// Block (g, j) handles KV head g = blockIdx.x and its query heads 3g..3g+2
+// over split j = blockIdx.y of the cache slots. The n = min(p + 1, slots) live
+// slots are cut into gridDim.y contiguous splits of whole tiles; splits past
+// the last live slot hold no keys. The launch therefore stays the same at every
+// position p = *position_ptr, and a captured graph serves them all.
+//
+// Within a block, for each tile of 32 keys:
+// 1. Warp w multiplies dims 32w..32w+31 of the 3 queries with the 32 keys,
+//    lane l taking key l.
+// 2. Warp h < 3 adds the 4 partial scores and the bias of head h, and updates
+//    head h's running max over the split. Lane l keeps a running sum over its
+//    own keys.
+// 3. Every warp rescales its accumulators [3 heads, 4 dims per lane] by the
+//    change in each head's max, then adds the weighted values of 8 of the
+//    tile's keys.
+// The next tile's copy runs during the current tile's arithmetic.
+//
+// Each block writes its unnormalized output, max and sum per head to
+// partial_out[h, j, 128], partial_max[h, j] and partial_sum[h, j] (F32). The
+// last block of KV head g to finish, counted in counters[g], combines the
+// splits of heads 3g..3g+2 into out[h, 128] and resets counters[g] to zero for
+// the next call. The sink enters split 0 as a key with score sinks[h] and a
+// zero value.
+//
+// `slots` is the cache size, `window` the sliding window (0 for none) and
+// `extent` the bias table width.
+extern "C" __global__ void __launch_bounds__(kThreads)
+decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                      const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
+                      float* partial_sum, unsigned* counters, __nv_bfloat16* out, const unsigned* position_ptr,
+                      unsigned slots, unsigned window, unsigned extent, float scale) {
+    __shared__ DecodeShared sm;
     const unsigned position = *position_ptr;
-    const int h = blockIdx.x;
-    const int block = blockIdx.y;
-    const int blocks = split_blocks(position, slots);
-    if (block >= blocks) {
-        return;
-    }
-    const bool round_partials = blocks == kTwoPassBlocks;
-    const int lane = threadIdx.x;
-    const int kv_head = h / kGroup;
-    const unsigned n = min(position + 1, slots);
-    const unsigned newest = position % slots;
-
-    float qs[kVec];
-    load_bf16x4(q + h * kHeadDim + lane * kVec, qs);
-#pragma unroll
-    for (int i = 0; i < kVec; ++i) {
-        qs[i] = fmul(scale, qs[i]);
-    }
-
-    float m = -FLT_MAX;
-    float sum = 0.f;
-    float o[kVec] = {0.f, 0.f, 0.f, 0.f};
-    if (block == 0) {
-        m = __bfloat162float(sinks[h]);
-        sum = 1.f;
-    }
-
-    for (unsigned s = block; s < n; s += blocks) {
-        const unsigned distance = (newest + slots - s) % slots;
-        if (window != 0 && distance >= window) {
-            continue;
-        }
-        const size_t offset = size_t(s) * kKvRow + kv_head * kHeadDim + lane * kVec;
-        float kv[kVec];
-        load_bf16x4(k_cache + offset, kv);
-        float score = 0.f;
-#pragma unroll
-        for (int i = 0; i < kVec; ++i) {
-            score = ffma(qs[i], kv[i], score);
-        }
-        score = warp_sum(score);
-        if (distance < extent) {
-            score = fadd(score, __bfloat162float(bias[h * extent + distance]));
-        }
-
-        const float new_m = fmaxf(m, score);
-        const float factor = fast_exp(fsub(m, new_m));
-        const float e = fast_exp(fsub(score, new_m));
-        m = new_m;
-        sum = ffma(sum, factor, e);
-        load_bf16x4(v_cache + offset, kv);
-#pragma unroll
-        for (int i = 0; i < kVec; ++i) {
-            o[i] = ffma(o[i], factor, fmul(e, kv[i]));
-        }
-    }
-
-    const size_t row = size_t(h) * blocks + block;
-#pragma unroll
-    for (int i = 0; i < kVec; ++i) {
-        partial_out[row * kHeadDim + lane * kVec + i] = round_partials ? round_bf16(o[i]) : o[i];
-    }
-    if (lane == 0) {
-        partial_max[row] = m;
-        partial_sum[row] = sum;
-    }
-}
-
-// Second pass, MLX's sdpa_vector_2pass_2: combines the `blocks` partials of
-// query head h = blockIdx.x into out[h, 128], with `blocks` the split for
-// *position over `slots`, as in the first pass. 32 warps; warp w sums blocks
-// w, w + 32, ... for dims 4l..4l+3 of lane l, then a transpose through shared
-// memory lets each warp add up one group of 4 dims across the 32 warps. With 32
-// blocks this is also exactly the end of MLX's one-pass kernel.
-extern "C" __global__ void __launch_bounds__(1024)
-decode_attention_combine_bf16(const float* partial_out, const float* partial_max, const float* partial_sum,
-                              __nv_bfloat16* out, const unsigned* position, unsigned slots) {
-    __shared__ float outputs[32 * 32];
-    const int blocks = split_blocks(*position, slots);
-    const int h = blockIdx.x;
+    const int kv_head = blockIdx.x;
+    const int split = blockIdx.y;
+    const int splits = gridDim.y;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const float* maxs = partial_max + size_t(h) * blocks;
-    const float* sums = partial_sum + size_t(h) * blocks;
+    const unsigned n = min(position + 1, slots);
+    const unsigned newest = position % slots;
+    // Slots per split: an even share of n, rounded up to whole tiles.
+    const unsigned share = (n + splits - 1) / splits;
+    const unsigned chunk = (share + kTile - 1) / kTile * kTile;
+    const int used = (n + chunk - 1) / chunk;
+    // The 3 query heads of this block are rows head0..head0+2.
+    const int head0 = kv_head * kGroup;
+    // Score and softmax state of head h = warp, for warps 0..2.
+    const int head = head0 + min(warp, kGroup - 1);
 
-    float m = -FLT_MAX;
-    for (int b = lane; b < blocks; b += 32) {
-        m = fmaxf(m, maxs[b]);
-    }
-    m = warp_max(m);
+    if (split < used) {
+        const unsigned begin = split * chunk;
+        const unsigned end = min(begin + chunk, n);
+        const int tiles = (end - begin + kTile - 1) / kTile;
+        load_tile(sm, 0, k_cache, v_cache, kv_head, begin, end);
 
-    float sum = 0.f;
-    for (int b = lane; b < blocks; b += 32) {
-        sum = ffma(fast_exp(fsub(maxs[b], m)), sums[b], sum);
-    }
-    sum = warp_sum(sum);
-
-    float o[kVec] = {0.f, 0.f, 0.f, 0.f};
-    for (int b = warp; b < blocks; b += 32) {
-        const float factor = fast_exp(fsub(maxs[b], m));
-        const float* p = partial_out + (size_t(h) * blocks + b) * kHeadDim + lane * kVec;
+        // This warp's quarter of the 3 scaled queries.
+        float qs[kGroup][kWarpDims];
 #pragma unroll
-        for (int i = 0; i < kVec; ++i) {
-            o[i] = ffma(factor, p[i], o[i]);
+        for (int h = 0; h < kGroup; ++h) {
+#pragma unroll
+            for (int c = 0; c < kWarpDims / 8; ++c) {
+                const uint4 raw =
+                    *reinterpret_cast<const uint4*>(q + (head0 + h) * kHeadDim + warp * kWarpDims + c * 8);
+                float vals[8];
+                unpack_bf16x8(raw, vals);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    qs[h][c * 8 + i] = scale * vals[i];
+                }
+            }
+        }
+
+        float m = -FLT_MAX;
+        float sum = 0.f;
+        if (split == 0) {
+            m = __bfloat162float(sinks[head]);
+            sum = lane == 0 ? 1.f : 0.f;
+        }
+        float o[kGroup][4] = {};
+
+        for (int t = 0; t < tiles; ++t) {
+            const int stage = t % 2;
+            copy_async_wait_all();
+            __syncthreads();
+            if (t + 1 < tiles) {
+                load_tile(sm, 1 - stage, k_cache, v_cache, kv_head, begin + (t + 1) * kTile, end);
+            }
+
+            // 1. Partial scores of key `lane` over this warp's dims.
+            const __nv_bfloat16* keys = sm.k[stage] + lane * kHeadDim;
+            float acc[kGroup] = {};
+#pragma unroll
+            for (int c = 0; c < kWarpDims / 8; ++c) {
+                const int chunk_index = warp * (kWarpDims / 8) + c;
+                const uint4 raw = *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (lane % 16)) * 8);
+                float kv[8];
+                unpack_bf16x8(raw, kv);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+#pragma unroll
+                    for (int h = 0; h < kGroup; ++h) {
+                        acc[h] = fmaf(qs[h][c * 8 + i], kv[i], acc[h]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                sm.scores[warp][h][lane] = acc[h];
+            }
+            __syncthreads();
+
+            // 2. Softmax weights of head `warp`.
+            if (warp < kGroup) {
+                const unsigned slot = begin + t * kTile + lane;
+                const unsigned distance = (newest + slots - slot) % slots;
+                float score = -INFINITY;
+                if (slot < end && (window == 0 || distance < window)) {
+                    score = (sm.scores[0][warp][lane] + sm.scores[1][warp][lane]) +
+                            (sm.scores[2][warp][lane] + sm.scores[3][warp][lane]);
+                    if (distance < extent) {
+                        score += __bfloat162float(bias[head * extent + distance]);
+                    }
+                }
+                const float new_m = fmaxf(m, warp_max(score));
+                const float factor = fast_exp(m - new_m);
+                const float weight = fast_exp(score - new_m);
+                m = new_m;
+                sum = fmaf(sum, factor, weight);
+                reinterpret_cast<float*>(&sm.weights[lane])[warp] = weight;
+                if (lane == 0) {
+                    sm.factor[warp] = factor;
+                }
+            }
+            __syncthreads();
+
+            // 3. Weighted values of keys 8w..8w+7, dims 4l..4l+3.
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                const float factor = sm.factor[h];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    o[h][i] *= factor;
+                }
+            }
+            const __nv_bfloat16* values = sm.v[stage];
+#pragma unroll
+            for (int r = warp * kWarpKeys; r < (warp + 1) * kWarpKeys; ++r) {
+                float v[4];
+                unpack_bf16x4(*reinterpret_cast<const uint2*>(values + r * kHeadDim + lane * 4), v);
+                const float4 w = sm.weights[r];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    o[0][i] = fmaf(w.x, v[i], o[0][i]);
+                    o[1][i] = fmaf(w.y, v[i], o[1][i]);
+                    o[2][i] = fmaf(w.z, v[i], o[2][i]);
+                }
+            }
+        }
+
+        // Sum the 4 warps' accumulators and write this split's partials.
+        __syncthreads();
+        auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                reduce[warp][h][lane * 4 + i] = o[h][i];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+            const float* r = &reduce[0][h][threadIdx.x];
+            const float value = (r[0] + r[kGroup * kHeadDim]) + (r[2 * kGroup * kHeadDim] + r[3 * kGroup * kHeadDim]);
+            partial_out[(size_t(head0 + h) * kMaxSplits + split) * kHeadDim + threadIdx.x] = value;
+        }
+        if (warp < kGroup) {
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                partial_max[head * kMaxSplits + split] = m;
+                partial_sum[head * kMaxSplits + split] = sum;
+            }
         }
     }
 
-#pragma unroll
-    for (int i = 0; i < kVec; ++i) {
-        outputs[lane * 32 + warp] = o[i];
-        __syncthreads();
-        o[i] = warp_sum(outputs[warp * 32 + lane]);
-        o[i] = sum == 0.f ? o[i] : fdiv(o[i], sum);
-        __syncthreads();
+    // Count finished blocks; the last one of this KV head combines.
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        sm.last = atomicAdd(&counters[kv_head], 1u) == unsigned(splits - 1);
     }
-    if (lane == 0) {
+    __syncthreads();
+    if (!sm.last) {
+        return;
+    }
+    __threadfence();
+
+    // Rescale factors of the used splits, per head, and the combined sums.
+    auto* factors = reinterpret_cast<float(*)[kMaxSplits]>(sm.v[0]);
+    if (warp < kGroup) {
+        float maxs[2];
+        float sums[2];
 #pragma unroll
-        for (int i = 0; i < kVec; ++i) {
-            out[h * kHeadDim + warp * kVec + i] = __float2bfloat16(o[i]);
+        for (int i = 0; i < 2; ++i) {
+            const int j = lane + 32 * i;
+            maxs[i] = j < used ? __ldcg(&partial_max[head * kMaxSplits + j]) : -FLT_MAX;
+            sums[i] = j < used ? __ldcg(&partial_sum[head * kMaxSplits + j]) : 0.f;
         }
+        const float m = warp_max(fmaxf(maxs[0], maxs[1]));
+        float sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const float factor = lane + 32 * i < used ? fast_exp(maxs[i] - m) : 0.f;
+            factors[warp][lane + 32 * i] = factor;
+            sum = fmaf(factor, sums[i], sum);
+        }
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            sm.total[warp] = sum;
+        }
+    }
+    __syncthreads();
+
+    // Warp w sums splits w, w + 4, ... for dims 4l..4l+3 of each head.
+    float o[kGroup][4] = {};
+    for (int j = warp; j < used; j += kWarps) {
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+            const float4 p =
+                __ldcg(reinterpret_cast<const float4*>(partial_out + (size_t(head0 + h) * kMaxSplits + j) * kHeadDim) +
+                       lane);
+            const float factor = factors[h][j];
+            o[h][0] = fmaf(factor, p.x, o[h][0]);
+            o[h][1] = fmaf(factor, p.y, o[h][1]);
+            o[h][2] = fmaf(factor, p.z, o[h][2]);
+            o[h][3] = fmaf(factor, p.w, o[h][3]);
+        }
+    }
+    auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
+#pragma unroll
+    for (int h = 0; h < kGroup; ++h) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            reduce[warp][h][lane * 4 + i] = o[h][i];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < kGroup; ++h) {
+        const float* r = &reduce[0][h][threadIdx.x];
+        const float value = (r[0] + r[kGroup * kHeadDim]) + (r[2 * kGroup * kHeadDim] + r[3 * kGroup * kHeadDim]);
+        const float total = sm.total[h];
+        out[(head0 + h) * kHeadDim + threadIdx.x] = __float2bfloat16(total == 0.f ? value : value / total);
+    }
+    if (threadIdx.x == 0) {
+        counters[kv_head] = 0;
     }
 }

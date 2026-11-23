@@ -20,7 +20,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{DeviceIn, cubin, load_module};
 
 /// Query heads.
 pub const HEADS: usize = 24;
@@ -34,9 +34,15 @@ pub const REL_DIM: usize = 16;
 const SCALE: f32 = 0.088_388_346;
 /// Keys per cache slot row: one token's `[KV_HEADS, HEAD_DIM]`.
 const KV_ROW: usize = KV_HEADS * HEAD_DIM;
-/// Key blocks of MLX's two-pass kernel on an M5 Max with 3 query heads per KV head. Below
-/// 1024 keys MLX's one-pass kernel uses 32; the kernels pick between them from the position.
-const TWO_PASS_BLOCKS: usize = 64;
+/// Split rows the partial buffers hold per query head, `kMaxSplits` in the kernel.
+const MAX_SPLITS: usize = 64;
+/// Splits of a large cache: 8 KV heads times 40 splits is 320 blocks, two per SM on an
+/// RTX 5090's 170 SMs, so one wave covers the cache.
+const SPLITS: usize = 40;
+/// Fewest cache slots per split, two 32-key tiles, so that small caches use fewer blocks.
+const MIN_SPLIT_SLOTS: usize = 64;
+/// Threads per decode attention block.
+const DECODE_BLOCK: u32 = 128;
 /// Threads per block of the relative-bias kernel.
 const BIAS_BLOCK: u32 = 256;
 
@@ -108,32 +114,43 @@ impl KvCache {
     }
 }
 
-/// Per-block partial results of [`Attention::decode_attention`], reused across calls and
-/// layers.
+/// Per-split partial results of [`Attention::decode_attention`] and the per-KV-head counts of
+/// finished splits, reused across calls and layers.
+///
+/// The kernel returns every count to zero, so calls must not overlap.
 #[derive(Debug)]
 pub struct AttentionScratch {
     out: CudaSlice<f32>,
     max: CudaSlice<f32>,
     sum: CudaSlice<f32>,
+    counters: CudaSlice<u32>,
 }
 
 impl AttentionScratch {
     pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
-        let rows = HEADS * TWO_PASS_BLOCKS;
+        let rows = HEADS * MAX_SPLITS;
         Ok(Self {
             out: stream.alloc_zeros(rows * HEAD_DIM)?,
             max: stream.alloc_zeros(rows)?,
             sum: stream.alloc_zeros(rows)?,
+            counters: stream.alloc_zeros(KV_HEADS)?,
         })
     }
+}
+
+/// Splits of the cache slots that [`Attention::decode_attention`] launches for a cache of
+/// `slots`: [`SPLITS`], or fewer so that each covers at least [`MIN_SPLIT_SLOTS`].
+fn splits(slots: usize) -> u32 {
+    let splits = slots.div_ceil(MIN_SPLIT_SLOTS).clamp(1, SPLITS);
+    debug_assert!(splits <= MAX_SPLITS);
+    splits as u32
 }
 
 #[derive(Debug)]
 pub struct Attention {
     relative_bias: CudaFunction,
     kv_append: CudaFunction,
-    decode_partial: CudaFunction,
-    decode_combine: CudaFunction,
+    decode: CudaFunction,
 }
 
 fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
@@ -156,8 +173,7 @@ impl Attention {
         Ok(Self {
             relative_bias: module.load_function("relative_bias_bf16")?,
             kv_append: module.load_function("kv_append_bf16")?,
-            decode_partial: module.load_function("decode_attention_partial_bf16")?,
-            decode_combine: module.load_function("decode_attention_combine_bf16")?,
+            decode: module.load_function("decode_attention_bf16")?,
         })
     }
 
@@ -199,9 +215,10 @@ impl Attention {
         stream: &CudaStream,
         cache: &mut KvCache,
         position: &CudaSlice<u32>,
-        k: &CudaSlice<bf16>,
-        v: &CudaSlice<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
     ) -> anyhow::Result<()> {
+        let (k, v) = (k.view(), v.view());
         check_len("k", k.len(), KV_ROW)?;
         check_len("v", v.len(), KV_ROW)?;
         check_len("position", position.len(), 1)?;
@@ -213,8 +230,8 @@ impl Attention {
         };
         let mut launch = stream.launch_builder(&self.kv_append);
         launch
-            .arg(k)
-            .arg(v)
+            .arg(&k)
+            .arg(&v)
             .arg(&mut cache.keys)
             .arg(&mut cache.values)
             .arg(position)
@@ -232,9 +249,10 @@ impl Attention {
     ///
     /// `bias` `[24, extent]` comes from [`Attention::relative_bias`]; a key at distance `d`
     /// gets `bias[h, d]` when `d < extent` and nothing otherwise. `sinks` `[24]` are the sink
-    /// logits. Splits the keys as MLX does on an M5 Max: 32 blocks with F32 partials below 1024
-    /// keys, 64 blocks with BF16 partials from 1024 keys on. The kernels choose the split from
-    /// `position`, so the launch is the same at every position.
+    /// logits. One launch: each block reads one KV head over one split of the cache for its 3
+    /// query heads, and the last block of each KV head combines the splits. The kernel cuts
+    /// the live slots into splits from `position`, so the launch is the same at every
+    /// position.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
     pub fn decode_attention(
         &self,
@@ -255,7 +273,7 @@ impl Attention {
         let slots = u32::try_from(cache.slots)?;
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
 
-        let mut launch = stream.launch_builder(&self.decode_partial);
+        let mut launch = stream.launch_builder(&self.decode);
         launch
             .arg(q)
             .arg(&cache.keys)
@@ -265,40 +283,25 @@ impl Attention {
             .arg(&mut scratch.out)
             .arg(&mut scratch.max)
             .arg(&mut scratch.sum)
+            .arg(&mut scratch.counters)
+            .arg(out)
             .arg(position)
             .arg(&slots)
             .arg(&window)
             .arg(&extent)
             .arg(&SCALE);
         let config = LaunchConfig {
-            grid_dim: (HEADS as u32, TWO_PASS_BLOCKS as u32, 1),
-            block_dim: (32, 1, 1),
+            grid_dim: (KV_HEADS as u32, splits(cache.slots), 1),
+            block_dim: (DECODE_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: the arguments match `decode_attention_partial_bf16(const bf16* q, const bf16*
-        // k_cache, const bf16* v_cache, const bf16* bias, const bf16* sinks, float*, float*,
-        // float*, const unsigned* position, unsigned slots, unsigned window, unsigned extent,
-        // float)`. The kernel reads slots below min(position + 1, slots) of the caches, bias
-        // columns below `extent`, and writes 24 x at most 64 partial rows, which the scratch
-        // holds.
-        unsafe { launch.launch(config) }?;
-
-        let mut launch = stream.launch_builder(&self.decode_combine);
-        launch
-            .arg(&scratch.out)
-            .arg(&scratch.max)
-            .arg(&scratch.sum)
-            .arg(out)
-            .arg(position)
-            .arg(&slots);
-        let config = LaunchConfig {
-            grid_dim: (HEADS as u32, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: the arguments match `decode_attention_combine_bf16(const float*, const float*,
-        // const float*, bf16*, const unsigned*, unsigned)`. It reads the partial rows written
-        // above, for the same split, and writes `out`, checked to hold 24 x 128 values.
+        // SAFETY: the arguments match `decode_attention_bf16(const bf16* q, const bf16* k_cache,
+        // const bf16* v_cache, const bf16* bias, const bf16* sinks, float* partial_out, float*
+        // partial_max, float* partial_sum, unsigned* counters, bf16* out, const unsigned*
+        // position, unsigned slots, unsigned window, unsigned extent, float scale)`. The kernel
+        // reads slots below min(position + 1, slots) of the caches and bias columns below
+        // `extent`. It writes partial rows for 24 heads x at most `MAX_SPLITS` splits and 8
+        // counters, which the scratch holds, and `out`, checked to hold 24 x 128 values.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
