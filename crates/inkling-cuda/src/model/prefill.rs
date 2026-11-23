@@ -271,18 +271,22 @@ impl Model {
                 rows,
             )?);
         }
-        let mut next = 0;
-        for piece in tokens.chunks(chunk) {
-            next = self.prefill_chunk(piece, &mut logits)?;
+        let pieces = tokens.chunks(chunk);
+        let count = pieces.len();
+        for (i, piece) in pieces.enumerate() {
+            self.prefill_chunk(piece, &mut logits, i + 1 == count)?;
         }
-        Ok(next)
+        let next = self.ctx.stream.clone_dtoh(&self.scratch.next)?[0];
+        u32::try_from(next).context("argmax returned a negative index")
     }
 
+    /// Enqueues one chunk. Only the final chunk computes the last row's logits.
     fn prefill_chunk(
         &mut self,
         tokens: &[u32],
         logits: &mut PrefillLogits<'_>,
-    ) -> anyhow::Result<u32> {
+        final_chunk: bool,
+    ) -> anyhow::Result<()> {
         let m = tokens.len();
         let start = self.position;
         let Self {
@@ -305,10 +309,19 @@ impl Model {
         ctx.stream
             .memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, m, 1))?;
         ctx.stream.memcpy_htod(&[first], &mut p.start)?;
-        ctx.prefill_enqueue(p, visits, *passes, *max_blocks, scratch, m, start, logits)?;
-        let next = ctx.stream.clone_dtoh(&scratch.next)?[0];
+        ctx.prefill_enqueue(
+            p,
+            visits,
+            *passes,
+            *max_blocks,
+            scratch,
+            m,
+            start,
+            logits,
+            final_chunk,
+        )?;
         self.position += m;
-        u32::try_from(next).context("argmax returned a negative index")
+        Ok(())
     }
 }
 
@@ -325,8 +338,10 @@ struct AttentionInputsRows<'a> {
 }
 
 impl Ctx {
-    /// One chunk of `m` rows through the model, as `Model::enqueue` for one row. The last
-    /// row's logits and greedy token go to the decode scratch's `capped` and `next`.
+    /// One chunk of `m` rows through the model, as `Model::enqueue` for one row. On the
+    /// final chunk, the last row's logits and greedy token go to the decode scratch's
+    /// `capped` and `next`. Other chunks skip the final norm and the LM head unless
+    /// `logits` asks for every row.
     #[expect(clippy::too_many_arguments, reason = "the parts of Model a chunk uses")]
     #[expect(
         clippy::too_many_lines,
@@ -342,6 +357,7 @@ impl Ctx {
         m: usize,
         start: usize,
         logits: &mut PrefillLogits<'_>,
+        final_chunk: bool,
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
@@ -424,6 +440,9 @@ impl Ctx {
         }
         for layer in core_end..cfg.num_hidden_layers {
             self.visit_rows(p, next_visit()?, layer, &mut blocks, false, m)?;
+        }
+        if !final_chunk && matches!(logits, PrefillLogits::Last) {
+            return Ok(());
         }
 
         self.kernels.routing.depth_attention_fused_rows(

@@ -998,8 +998,6 @@ impl Ctx {
         }
         self.kernels.linear.gemv_bf16(&self.stream, &mut products)?;
         drop(products);
-        // The output projection's weight streams into L2 while attention runs.
-        self.kernels.linear.prefetch(&self.stream, &[&a.o])?;
 
         let conv = match &a.kv_conv {
             KvConv::Static { k, v } => KvConvWeights::Static { k, v },
