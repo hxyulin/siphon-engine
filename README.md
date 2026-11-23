@@ -199,7 +199,7 @@ Engine stepping with the BF16 cache, against the F32 captures of `anyhow`, `half
 
 The FP8 path's mean KL is 1.5 to 2.0 times the BF16 path's, and its \|log-prob difference\| 1.3 to 1.4 times. It still passes the gate against MLX's BF16 captures.
 
-The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` is pinned to 2025.3, the last release built for CUDA 13.0, which the pinned `nvcc` requires. A kernel trace of 20 steps:
+The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` 2026.4 is the release for the pinned CUDA 13.5 toolkit. A kernel trace of 20 steps:
 
 ```sh
 pixi run nsys profile -t cuda --cuda-memory-usage=false -o decode \
@@ -259,9 +259,9 @@ The measured control is Ingine with FP8 outer attention: 547, 439 and 286 tok/s 
 
 ## Milestones
 
-1. Text-only, single-stream decode with the original per-visit KV layout, and token and logit parity against a pinned reference.
-2. Chunked prefill and prefix restore.
-3. Stock DSpark speculation.
+1. Text-only, single-stream decode with the original per-visit KV layout, and token and logit parity against a pinned reference. Done.
+2. Chunked prefill and prefix restore. Chunked prefill is done; prefix restore is not started.
+3. Stock DSpark speculation. Greedy acceptance is done; probabilistic acceptance is not started.
 
 ## Reference captures
 

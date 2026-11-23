@@ -737,7 +737,10 @@ fn routing(rows: usize, routing: Routing, seed: u32) -> Vec<i32> {
 /// Runs `expert_matvec` and `expert_matmul` on the same inputs, checks both against the F64
 /// reference, checks that `expert_matmul` writes every output and repeats bit for bit, and
 /// reports how far the two kernels are apart.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the kernels' inputs are separate buffers"
+)]
 fn compare_kernels(
     s: &Setup,
     scratch: &mut ExpertScratch,
