@@ -15,6 +15,7 @@ use inkling_cuda::{
     Gpu,
     ops::{
         linear::{Gemv, Linear, Start},
+        linear_fp8::{Fp8Matrix, LinearFp8},
         misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, GateStepScratch, Misc},
         norm::Norm,
     },
@@ -613,6 +614,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
                 input: inputs[0].as_view(),
                 forget: &forgets[0],
                 gain: &gains[0],
+                fp8: None,
                 norm: Some((&norm_weights[0], n0.as_view_mut())),
             },
             GateStep {
@@ -620,6 +622,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
                 input: inputs[1].as_view(),
                 forget: &forgets[1],
                 gain: &gains[1],
+                fp8: None,
                 norm: Some((&norm_weights[1], n1.as_view_mut())),
             },
             GateStep {
@@ -627,6 +630,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
                 input: inputs[2].as_view(),
                 forget: &forgets[2],
                 gain: &gains[2],
+                fp8: None,
                 norm: None,
             },
         ];
@@ -690,6 +694,181 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
                     1,
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// The value of an E4M3 code.
+fn e4m3_value(bits: u8) -> f64 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 3) & 0xf);
+    let mantissa = f64::from(bits & 7);
+    let magnitude = if exponent == 0 {
+        mantissa / 8.0 * 2f64.powi(-6)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f64.powi(exponent - 7)
+    };
+    sign * magnitude
+}
+
+/// An FP8 matrix's rows dequantized to F64: each E4M3 value times its row's scale.
+fn dequantize(stream: &std::sync::Arc<CudaStream>, m: &Fp8Matrix) -> anyhow::Result<Vec<f64>> {
+    let bytes = stream.clone_dtoh(&m.values())?;
+    let scales: Vec<f32> = stream
+        .clone_dtoh(&m.scales())?
+        .as_chunks()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    Ok(bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &q)| e4m3_value(q) * f64::from(scales[i / m.k()]))
+        .collect())
+}
+
+/// Checks one FP8 gate's results against an F64 model over its dequantized weights: the
+/// down projection within one BF16 ulp, the output from the kernel's own down projection
+/// within 1e-5 relative to |h| + |m|, and with a norm weight the normalized output within
+/// one BF16 ulp of the model's norm of the kernel's output.
+#[expect(clippy::too_many_arguments, reason = "one gate's inputs and outputs")]
+fn check_fp8_gate(
+    stream: &std::sync::Arc<CudaStream>,
+    label: &str,
+    weights: &[Fp8Matrix; 3],
+    input: &[bf16],
+    (h_row, m_row): (&[f32], &[f32]),
+    down: &[bf16],
+    out: &[f32],
+    normed: Option<(&[bf16], &[bf16])>,
+) -> anyhow::Result<()> {
+    let down_w = dequantize(stream, &weights[0])?;
+    let forget_w = dequantize(stream, &weights[1])?;
+    let gain_w = dequantize(stream, &weights[2])?;
+    let input: Vec<f64> = input.iter().map(|v| v.to_f64()).collect();
+    let down_want: Vec<bf16> = (0..GATE_RANK)
+        .map(|r| {
+            let row = &down_w[r * 2 * HIDDEN..(r + 1) * 2 * HIDDEN];
+            bf16::from_f64(row.iter().zip(&input).map(|(w, x)| w * x).sum())
+        })
+        .collect();
+    assert_bf16_close(&format!("{label}: down"), down, &down_want, 1);
+
+    let own_down: Vec<f64> = down.iter().map(|v| v.to_f64()).collect();
+    let dot = |w: &[f64], row: usize| -> f64 {
+        w[row * GATE_RANK..(row + 1) * GATE_RANK]
+            .iter()
+            .zip(&own_down)
+            .map(|(w, d)| w * d)
+            .sum()
+    };
+    for row in 0..HIDDEN {
+        let (hv, mv) = (f64::from(h_row[row]), f64::from(m_row[row]));
+        let want = (1.0 - dot(&forget_w, row).tanh()) * hv + dot(&gain_w, row).tanh() * mv;
+        let err = (f64::from(out[row]) - want).abs();
+        assert!(
+            err <= 1e-5 * (hv.abs() + mv.abs()),
+            "{label}: out[{row}] = {}, want {want}",
+            out[row]
+        );
+    }
+    if let Some((normed, norm_weight)) = normed {
+        let mean = out.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / HIDDEN as f64;
+        let inv = 1.0 / (mean + f64::from(EPS)).sqrt();
+        let normed_want: Vec<bf16> = out
+            .iter()
+            .zip(norm_weight)
+            .map(|(&o, w)| bf16::from_f64(f64::from(o) * inv * w.to_f64()))
+            .collect();
+        assert_bf16_close(&format!("{label}: normed"), normed, &normed_want, 1);
+    }
+    Ok(())
+}
+
+/// The gate with FP8 weights against [`check_fp8_gate`]'s model, for two gates in one
+/// launch (the second without a norm), twice so the barrier counters cycle.
+#[test]
+fn message_gate_step_fp8_matches_reference() -> anyhow::Result<()> {
+    const GATES: usize = 2;
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let fp8 = LinearFp8::load(setup.gpu.context())?;
+    let mut gates_fp8 = Vec::new();
+    let mut bf16_weights = Vec::new();
+    let mut inputs = Vec::new();
+    for k in 0..GATES {
+        let seed = 960 + 10 * u32::try_from(k)?;
+        let down =
+            stream.clone_htod(&pseudo_random_bf16(GATE_RANK * 2 * HIDDEN, seed, 0.05, 0.0))?;
+        let forget =
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, seed + 1, 0.3, 0.0))?;
+        let gain =
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, seed + 2, 0.3, 0.0))?;
+        gates_fp8.push([
+            fp8.quantize_any(stream, &down, GATE_RANK, 2 * HIDDEN)?,
+            fp8.quantize_any(stream, &forget, HIDDEN, GATE_RANK)?,
+            fp8.quantize_any(stream, &gain, HIDDEN, GATE_RANK)?,
+        ]);
+        bf16_weights.push([down, forget, gain]);
+        inputs.push(pseudo_random_bf16(2 * HIDDEN, seed + 3, 2.0, 0.0));
+    }
+    let input_dev: Vec<CudaSlice<bf16>> = inputs
+        .iter()
+        .map(|x| Ok(stream.clone_htod(x)?))
+        .collect::<anyhow::Result<_>>()?;
+    let norm_host = pseudo_random_bf16(HIDDEN, 980, 0.5, 1.0);
+    let norm_weight = stream.clone_htod(&norm_host)?;
+    let h_host = pseudo_random(GATES * HIDDEN, 981, 3.0);
+    let m_host = pseudo_random(GATES * HIDDEN, 982, 3.0);
+    let (h_dev, m_dev) = (stream.clone_htod(&h_host)?, stream.clone_htod(&m_host)?);
+    let mut scratch = GateStepScratch::new(stream)?;
+
+    for run in 0..2 {
+        let mut out = stream.alloc_zeros::<f32>(GATES * HIDDEN)?;
+        let mut down = stream.alloc_zeros::<bf16>(GATES * GATE_RANK)?;
+        let mut normed = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut gates: Vec<GateStep<'_>> = (0..GATES)
+            .map(|k| GateStep {
+                down_weight: &bf16_weights[k][0],
+                input: input_dev[k].as_view(),
+                forget: &bf16_weights[k][1],
+                gain: &bf16_weights[k][2],
+                fp8: Some(&gates_fp8[k]),
+                norm: None,
+            })
+            .collect();
+        gates[0].norm = Some((&norm_weight, normed.as_view_mut()));
+        setup.misc.message_gate_step(
+            stream,
+            &mut gates,
+            &h_dev,
+            HIDDEN,
+            &m_dev,
+            &mut out,
+            Some(&mut down),
+            &mut scratch,
+            EPS,
+        )?;
+        drop(gates);
+        let (out, down, normed) = (
+            stream.clone_dtoh(&out)?,
+            stream.clone_dtoh(&down)?,
+            stream.clone_dtoh(&normed)?,
+        );
+        for k in 0..GATES {
+            let rows = k * HIDDEN..(k + 1) * HIDDEN;
+            check_fp8_gate(
+                stream,
+                &format!("run {run}, gate {k}"),
+                &gates_fp8[k],
+                &inputs[k],
+                (&h_host[rows.clone()], &m_host[rows.clone()]),
+                &down[k * GATE_RANK..(k + 1) * GATE_RANK],
+                &out[rows],
+                (k == 0).then_some((normed.as_slice(), norm_host.as_slice())),
+            )?;
         }
     }
     Ok(())

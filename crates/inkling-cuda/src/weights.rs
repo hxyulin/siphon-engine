@@ -11,8 +11,8 @@
 //! The depthwise convolution weights need no transpose: the checkpoint's `[dims, 1, 4]`
 //! and MLX's `[dims, 4, 1]` have the same bytes.
 //!
-//! [`Weights::quantize_fp8`] adds FP8 copies of the large matrices decode reads, for
-//! [`WeightFormat::Fp8`]; the BF16 originals stay for prefill.
+//! [`Weights::quantize_fp8`] adds FP8 copies of the large matrices decode reads, and of the
+//! message gates, for [`WeightFormat::Fp8`]; the BF16 originals stay for prefill.
 
 use std::{fmt, str::FromStr, sync::Arc};
 
@@ -22,7 +22,10 @@ use half::bf16;
 use inkling::{Checkpoint, TextConfig};
 use safetensors::Dtype;
 
-use crate::ops::linear_fp8::{Fp8Matrix, LinearFp8};
+use crate::ops::{
+    linear::Prefetch,
+    linear_fp8::{Fp8Matrix, LinearFp8},
+};
 
 pub mod draft;
 
@@ -193,6 +196,9 @@ pub struct MessageGateWeights {
     pub forget: CudaSlice<bf16>,
     /// `[hidden, rank]`, multiplied with an F32 input.
     pub gain: CudaSlice<bf16>,
+    /// FP8 copies of `down`, `forget` and `gain` for decode, after
+    /// [`Weights::quantize_fp8`].
+    pub fp8: Option<[Fp8Matrix; 3]>,
 }
 
 /// Reads tensors from the checkpoint and uploads them.
@@ -293,8 +299,9 @@ impl Weights {
         })
     }
 
-    /// Quantizes every layer's attention input and output projections and the LM head to
-    /// FP8 copies, which decode then reads. Returns the bytes the copies take.
+    /// Quantizes every layer's attention input and output projections, its message gates
+    /// and the LM head to FP8 copies, which decode then reads. Returns the bytes the copies
+    /// take.
     pub fn quantize_fp8(
         &mut self,
         linear: &LinearFp8,
@@ -316,6 +323,18 @@ impl Weights {
             let o = quantize(&a.o, a.o.len() / hidden)?;
             bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>() + o.bytes();
             layer.fp8 = Some(Fp8Projections { inputs, o });
+            for gate in layer.message_gates.iter_mut().flatten() {
+                let quantize_gate =
+                    |w: &CudaSlice<bf16>, k: usize| linear.quantize_any(stream, w, w.len() / k, k);
+                let rank = gate.forget.len() / hidden;
+                let copies = [
+                    quantize_gate(&gate.down, 2 * hidden)?,
+                    quantize_gate(&gate.forget, rank)?,
+                    quantize_gate(&gate.gain, rank)?,
+                ];
+                bytes += copies.iter().map(Fp8Matrix::bytes).sum::<usize>();
+                gate.fp8 = Some(copies);
+            }
         }
         let lm_head = quantize(&self.lm_head, hidden)?;
         bytes += lm_head.bytes();
@@ -550,6 +569,16 @@ impl MessageGateWeights {
         [&self.down, &self.forget, &self.gain]
     }
 
+    /// The matrices decode reads, in the order the gate reads them: the FP8 copies if
+    /// there are any.
+    #[must_use]
+    pub fn decode_matrices(&self) -> [&dyn Prefetch; 3] {
+        match &self.fp8 {
+            Some([down, forget, gain]) => [down, forget, gain],
+            None => [&self.down, &self.forget, &self.gain],
+        }
+    }
+
     fn load(loader: &Loader<'_>, config: &TextConfig, p: &str) -> anyhow::Result<Self> {
         let hidden = config.hidden_size;
         let rank = config.loop_config.gate_rank;
@@ -557,6 +586,7 @@ impl MessageGateWeights {
             down: loader.bf16(&format!("{p}.down_weight"), &[rank, 2 * hidden])?,
             forget: loader.bf16(&format!("{p}.forget_weight"), &[hidden, rank])?,
             gain: loader.bf16(&format!("{p}.gain_weight"), &[hidden, rank])?,
+            fp8: None,
         })
     }
 }

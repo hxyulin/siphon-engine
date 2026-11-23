@@ -13,6 +13,9 @@
 //   every number, so the first NaN wins when there is one.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <type_traits>
 #include <cfloat>
 #include <climits>
 #include <cstdint>
@@ -455,17 +458,24 @@ __device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
     return v;
 }
 
+__device__ __forceinline__ unsigned atom_add_release(unsigned* p, unsigned v) {
+    unsigned old;
+    asm volatile("atom.add.release.gpu.global.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
+}
+
 // Waits until all `blocks` blocks sharing `counter` have arrived. Every thread of the
-// block must call it; writes before it are visible to every block after it.
+// block must call it; writes before it are visible to every block after it. The block
+// barrier orders the block's writes before thread 0's release add, and the acquire load
+// that sees every block's add orders the reads after the second block barrier; a full
+// fence on either side cost more.
 __device__ __forceinline__ void grid_barrier(unsigned* counter, unsigned blocks) {
     __syncthreads();
     if (threadIdx.x == 0) {
-        __threadfence();
-        const unsigned old = atomicAdd(counter, 1u);
+        const unsigned old = atom_add_release(counter, 1u);
         const unsigned target = old - old % blocks + blocks;
         while (static_cast<int>(ld_acquire(counter) - target) < 0) {
         }
-        __threadfence();
     }
     __syncthreads();
 }
@@ -481,25 +491,74 @@ __device__ __forceinline__ float dot8_bf16(uint4 w, uint4 x) {
     return acc;
 }
 
-}  // namespace
+// The weights of message_gate_step for one gate: BF16, or E4M3 bytes with one F32 scale
+// per row (the layout of linear_fp8.cu).
+template <bool kFp8>
+struct GateWeights {
+    using Elem = std::conditional_t<kFp8, uint8_t, __nv_bfloat16>;
+    const Elem* down;
+    const float* down_scale;
+    const Elem* forget;
+    const float* forget_scale;
+    const Elem* gain;
+    const float* gain_scale;
+};
 
-// Gate s reads down_weight_s ([64, 4608] BF16), input_s ([4608] BF16: the normalized
-// state and message), forget_s and gain_s, h + s * h_stride and m + 2304 s, and writes
-// out + 2304 s and, with a norm weight, normed_s = bf16(rms_norm(out) * norm_weight_s).
-// `down`, if not null, receives each gate's BF16 down projection ([slots, 64]).
-// `partials` holds 32 * 65 floats per gate.
-extern "C" __global__ void __launch_bounds__(kGateThreads)
-message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __nv_bfloat16* __restrict__ down_weight1,
-                       const __nv_bfloat16* __restrict__ down_weight2, const __nv_bfloat16* input0,
-                       const __nv_bfloat16* input1, const __nv_bfloat16* input2,
-                       const __nv_bfloat16* __restrict__ forget0, const __nv_bfloat16* __restrict__ forget1,
-                       const __nv_bfloat16* __restrict__ forget2, const __nv_bfloat16* __restrict__ gain0,
-                       const __nv_bfloat16* __restrict__ gain1, const __nv_bfloat16* __restrict__ gain2,
-                       const float* h, int h_stride, const float* m, float* out,
-                       const __nv_bfloat16* __restrict__ norm_weight0, const __nv_bfloat16* __restrict__ norm_weight1,
-                       const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
-                       __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float* partials,
-                       unsigned* counters, float eps) {
+// Two E4M3 values, widened exactly through F16.
+__device__ __forceinline__ float2 e4m3x2_to_float2(uint32_t pair) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3);
+    return __half22float2(__half2(h));
+}
+
+// 8 down weights of one (row, chunk) item: a uint4 of BF16 or a uint2 of E4M3.
+template <bool kFp8>
+using DownChunk = std::conditional_t<kFp8, uint2, uint4>;
+// 4 forget or gain weights: a uint2 of BF16 or a uint32 of E4M3.
+template <bool kFp8>
+using RowChunk = std::conditional_t<kFp8, uint32_t, uint2>;
+
+__device__ __forceinline__ float dot8(uint4 w, uint4 x) { return dot8_bf16(w, x); }
+
+__device__ __forceinline__ float dot8(uint2 w, uint4 x) {
+    const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&x);
+    const uint32_t words[2] = {w.x, w.y};
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const float2 a = e4m3x2_to_float2(words[i] & 0xffffu);
+        const float2 b = e4m3x2_to_float2(words[i] >> 16);
+        acc = fmaf(a.x, __bfloat162float(xv[4 * i]), acc);
+        acc = fmaf(a.y, __bfloat162float(xv[4 * i + 1]), acc);
+        acc = fmaf(b.x, __bfloat162float(xv[4 * i + 2]), acc);
+        acc = fmaf(b.y, __bfloat162float(xv[4 * i + 3]), acc);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ void unpack4(uint2 w, float (&v)[4]) {
+    const auto* wv = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        v[k] = __bfloat162float(wv[k]);
+    }
+}
+
+__device__ __forceinline__ void unpack4(uint32_t w, float (&v)[4]) {
+    const float2 a = e4m3x2_to_float2(w & 0xffffu);
+    const float2 b = e4m3x2_to_float2(w >> 16);
+    v[0] = a.x;
+    v[1] = a.y;
+    v[2] = b.x;
+    v[3] = b.y;
+}
+
+// Gate g = blockIdx.y of message_gate_step_2304 or message_gate_step_fp8_2304.
+template <bool kFp8>
+__device__ __forceinline__ void
+message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const float* h, const float* m,
+                  float* out, const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
+                  __nv_bfloat16* down, float* part, unsigned* counter, float eps) {
+    using Elem = typename GateWeights<kFp8>::Elem;
     __shared__ float item_sums[kDownItems];
     __shared__ __align__(16) __nv_bfloat16 down_s[kGateRank];
     __shared__ float warp_ss[kGateWarps];
@@ -508,54 +567,37 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
     const int t = threadIdx.x;
     const int lane = t % 32;
     const int warp = t / 32;
-    // An explicit branch rather than a generic lambda, which nvcc 13.0 miscompiled here.
-    const __nv_bfloat16* down_weight = down_weight0;
-    const __nv_bfloat16* input = input0;
-    const __nv_bfloat16* forget = forget0;
-    const __nv_bfloat16* gain = gain0;
-    const __nv_bfloat16* norm_weight = norm_weight0;
-    __nv_bfloat16* normed = normed0;
-    if (g == 1) {
-        down_weight = down_weight1;
-        input = input1;
-        forget = forget1;
-        gain = gain1;
-        norm_weight = norm_weight1;
-        normed = normed1;
-    } else if (g == 2) {
-        down_weight = down_weight2;
-        input = input2;
-        forget = forget2;
-        gain = gain2;
-        norm_weight = norm_weight2;
-        normed = normed2;
-    }
-    float* part = partials + size_t(g) * kGateBlocks * (kGateRank + 1);
-    unsigned* counter = counters + g;
-    h += size_t(g) * h_stride;
-    m += size_t(g) * kHidden;
-    out += size_t(g) * kHidden;
 
     // Weights first: this block's slice of the down projection, its gate rows and their
-    // norm weights.
+    // norm weights, and with E4M3 weights their scales.
     const int col0 = blk * kDownCols;
-    uint4 dw[kDownPerThread];
+    DownChunk<kFp8> dw[kDownPerThread];
 #pragma unroll
     for (int i = 0; i < kDownPerThread; ++i) {
         const int item = t + i * kGateThreads;
         const int k = item / kDownChunks;
         const int c = item % kDownChunks;
-        dw[i] = *reinterpret_cast<const uint4*>(down_weight + size_t(k) * 2 * kHidden + col0 + 8 * c);
+        dw[i] = *reinterpret_cast<const DownChunk<kFp8>*>(wt.down + size_t(k) * 2 * kHidden + col0 + 8 * c);
     }
     const int sub = lane % kLanesPerRow;
     const int row = blk * kGateRowsPerBlock + warp * kRowsPerWarp + lane / kLanesPerRow;
-    uint2 fw[kGateSteps];
-    uint2 gw[kGateSteps];
+    RowChunk<kFp8> fw[kGateSteps];
+    RowChunk<kFp8> gw[kGateSteps];
 #pragma unroll
     for (int i = 0; i < kGateSteps; ++i) {
         const int col = i * 4 * kLanesPerRow + sub * 4;
-        fw[i] = *reinterpret_cast<const uint2*>(forget + size_t(row) * kGateRank + col);
-        gw[i] = *reinterpret_cast<const uint2*>(gain + size_t(row) * kGateRank + col);
+        fw[i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.forget + size_t(row) * kGateRank + col);
+        gw[i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.gain + size_t(row) * kGateRank + col);
+    }
+    float down_scale = 1.f;
+    float forget_scale = 1.f;
+    float gain_scale = 1.f;
+    if constexpr (kFp8) {
+        if (t < kGateRank) {
+            down_scale = wt.down_scale[t];
+        }
+        forget_scale = wt.forget_scale[row];
+        gain_scale = wt.gain_scale[row];
     }
     const float nw = norm_weight != nullptr ? __bfloat162float(norm_weight[row]) : 0.f;
     pdl_trigger();
@@ -573,7 +615,7 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
         const int item = t + i * kGateThreads;
         const int c = item % kDownChunks;
         const uint4 x = *reinterpret_cast<const uint4*>(input + col0 + 8 * c);
-        item_sums[item] = dot8_bf16(dw[i], x);
+        item_sums[item] = dot8(dw[i], x);
     }
     __syncthreads();
     if (t < kGateRank) {
@@ -591,7 +633,8 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
         for (int b = 0; b < kGateBlocks; ++b) {
             acc += __ldcg(part + b * (kGateRank + 1) + t);
         }
-        down_s[t] = __float2bfloat16(acc);
+        // An E4M3 row's scale multiplies its sum once, before the rounding to BF16.
+        down_s[t] = __float2bfloat16(kFp8 ? down_scale * acc : acc);
         if (down != nullptr && blk == 0) {
             down[g * kGateRank + t] = down_s[t];
         }
@@ -606,19 +649,25 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
         const int col = i * 4 * kLanesPerRow + sub * 4;
         const uint2 packed = *reinterpret_cast<const uint2*>(down_s + col);
         const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&packed);
-        const auto* fv = reinterpret_cast<const __nv_bfloat16*>(&fw[i]);
-        const auto* gv = reinterpret_cast<const __nv_bfloat16*>(&gw[i]);
+        float fv[4];
+        float gv[4];
+        unpack4(fw[i], fv);
+        unpack4(gw[i], gv);
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const float x = __bfloat162float(xv[k]);
-            f = ffma(__bfloat162float(fv[k]), x, f);
-            gg = ffma(__bfloat162float(gv[k]), x, gg);
+            f = ffma(fv[k], x, f);
+            gg = ffma(gv[k], x, gg);
         }
     }
 #pragma unroll
     for (int offset = kLanesPerRow / 2; offset > 0; offset /= 2) {
         f = fadd(f, __shfl_down_sync(0xffffffffu, f, offset));
         gg = fadd(gg, __shfl_down_sync(0xffffffffu, gg, offset));
+    }
+    if constexpr (kFp8) {
+        f = fmul(forget_scale, f);
+        gg = fmul(gain_scale, gg);
     }
     float o = 0.f;
     if (sub == 0) {
@@ -652,6 +701,90 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
     if (sub == 0) {
         normed[row] = __float2bfloat16((o * inv) * nw);
     }
+}
+
+}  // namespace
+
+// Gate s reads down_weight_s ([64, 4608] BF16), input_s ([4608] BF16: the normalized
+// state and message), forget_s and gain_s, h + s * h_stride and m + 2304 s, and writes
+// out + 2304 s and, with a norm weight, normed_s = bf16(rms_norm(out) * norm_weight_s).
+// `down`, if not null, receives each gate's BF16 down projection ([slots, 64]).
+// `partials` holds 32 * 65 floats per gate.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __nv_bfloat16* __restrict__ down_weight1,
+                       const __nv_bfloat16* __restrict__ down_weight2, const __nv_bfloat16* input0,
+                       const __nv_bfloat16* input1, const __nv_bfloat16* input2,
+                       const __nv_bfloat16* __restrict__ forget0, const __nv_bfloat16* __restrict__ forget1,
+                       const __nv_bfloat16* __restrict__ forget2, const __nv_bfloat16* __restrict__ gain0,
+                       const __nv_bfloat16* __restrict__ gain1, const __nv_bfloat16* __restrict__ gain2,
+                       const float* h, int h_stride, const float* m, float* out,
+                       const __nv_bfloat16* __restrict__ norm_weight0, const __nv_bfloat16* __restrict__ norm_weight1,
+                       const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
+                       __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float* partials,
+                       unsigned* counters, float eps) {
+    const int g = blockIdx.y;
+    // An explicit branch rather than a generic lambda, which nvcc 13.0 miscompiled here.
+    GateWeights<false> wt{down_weight0, nullptr, forget0, nullptr, gain0, nullptr};
+    const __nv_bfloat16* input = input0;
+    const __nv_bfloat16* norm_weight = norm_weight0;
+    __nv_bfloat16* normed = normed0;
+    if (g == 1) {
+        wt = {down_weight1, nullptr, forget1, nullptr, gain1, nullptr};
+        input = input1;
+        norm_weight = norm_weight1;
+        normed = normed1;
+    } else if (g == 2) {
+        wt = {down_weight2, nullptr, forget2, nullptr, gain2, nullptr};
+        input = input2;
+        norm_weight = norm_weight2;
+        normed = normed2;
+    }
+    message_gate_step<false>(wt, input, h + size_t(g) * h_stride, m + size_t(g) * kHidden,
+                             out + size_t(g) * kHidden, norm_weight, normed, down,
+                             partials + size_t(g) * kGateBlocks * (kGateRank + 1), counters + g, eps);
+}
+
+// message_gate_step_2304 with E4M3 weights: down_s, forget_s and gain_s are the bytes of
+// each matrix in the layout of linear_fp8.cu, and *_scale_s their F32 row scales. Each
+// product sums the exactly widened weights in F32 and multiplies the row's scale into the
+// sum once.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __restrict__ down1,
+                           const uint8_t* __restrict__ down2, const float* __restrict__ down_scale0,
+                           const float* __restrict__ down_scale1, const float* __restrict__ down_scale2,
+                           const __nv_bfloat16* input0, const __nv_bfloat16* input1, const __nv_bfloat16* input2,
+                           const uint8_t* __restrict__ forget0, const uint8_t* __restrict__ forget1,
+                           const uint8_t* __restrict__ forget2, const float* __restrict__ forget_scale0,
+                           const float* __restrict__ forget_scale1, const float* __restrict__ forget_scale2,
+                           const uint8_t* __restrict__ gain0, const uint8_t* __restrict__ gain1,
+                           const uint8_t* __restrict__ gain2, const float* __restrict__ gain_scale0,
+                           const float* __restrict__ gain_scale1, const float* __restrict__ gain_scale2,
+                           const float* h, int h_stride, const float* m, float* out,
+                           const __nv_bfloat16* __restrict__ norm_weight0,
+                           const __nv_bfloat16* __restrict__ norm_weight1,
+                           const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
+                           __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float* partials,
+                           unsigned* counters, float eps) {
+    const int g = blockIdx.y;
+    // An explicit branch, as in message_gate_step_2304.
+    GateWeights<true> wt{down0, down_scale0, forget0, forget_scale0, gain0, gain_scale0};
+    const __nv_bfloat16* input = input0;
+    const __nv_bfloat16* norm_weight = norm_weight0;
+    __nv_bfloat16* normed = normed0;
+    if (g == 1) {
+        wt = {down1, down_scale1, forget1, forget_scale1, gain1, gain_scale1};
+        input = input1;
+        norm_weight = norm_weight1;
+        normed = normed1;
+    } else if (g == 2) {
+        wt = {down2, down_scale2, forget2, forget_scale2, gain2, gain_scale2};
+        input = input2;
+        norm_weight = norm_weight2;
+        normed = normed2;
+    }
+    message_gate_step<true>(wt, input, h + size_t(g) * h_stride, m + size_t(g) * kHidden,
+                            out + size_t(g) * kHidden, norm_weight, normed, down,
+                            partials + size_t(g) * kGateBlocks * (kGateRank + 1), counters + g, eps);
 }
 
 // ---------------------------------------------------------------------------

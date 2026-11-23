@@ -91,12 +91,12 @@ The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RM
 
 ## Dense weight format
 
-Decode reads 3.51 GB of BF16 dense weights per token: every visit's attention input and output projections, and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
+Decode reads 3.62 GB of BF16 dense weights per token: every visit's attention input and output projections, the looped layers' message gates (113 MB), and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
 
 - `bf16`, the default, reads the checkpoint's weights.
-- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.76 GB for them. Prefill keeps the BF16 weights, since its GEMMs are compute-bound. The copies take 1.11 GB of device memory: one per layer, since the looped layers' three visits share theirs.
+- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights, since its GEMMs are compute-bound. The copies take about 1.17 GB of device memory: one per layer, since the looped layers' three visits share theirs.
 
-The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The message gates, the router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
+The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
 
 Engine stepping with the BF16 cache, against the F32 captures of `anyhow`, `half` and `regex-readme`, over all positions:
 

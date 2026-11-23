@@ -171,6 +171,22 @@ impl LinearFp8 {
         k: usize,
     ) -> anyhow::Result<Fp8Matrix> {
         ensure!(self.supports(k), "no FP8 product for k = {k}");
+        self.quantize_any(stream, weight, rows, k)
+    }
+
+    /// [`Self::quantize`] for any `k` that is a multiple of 16, for kernels other than
+    /// [`Self::gemv`] that read the same layout.
+    pub fn quantize_any(
+        &self,
+        stream: &Arc<CudaStream>,
+        weight: &CudaSlice<bf16>,
+        rows: usize,
+        k: usize,
+    ) -> anyhow::Result<Fp8Matrix> {
+        ensure!(
+            k > 0 && k.is_multiple_of(16),
+            "k = {k} is not a positive multiple of 16"
+        );
         ensure!(rows > 0, "no rows to quantize");
         ensure!(
             weight.len() == rows * k,

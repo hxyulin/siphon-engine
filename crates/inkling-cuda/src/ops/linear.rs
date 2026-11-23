@@ -383,10 +383,24 @@ impl<T: DeviceRepr> Prefetch for CudaSlice<T> {
     }
 }
 
+/// How [`Linear::prefetch`] pulls weights into L2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pace {
+    /// Real loads from [`PREFETCH_BLOCKS`] blocks, which slow down while other kernels
+    /// load from DRAM.
+    Loads,
+    /// TMA bulk prefetches issued at a fixed rate in TB/s, which leave the SMs and the
+    /// L2-to-SM bandwidth to the main stream but keep their rate whatever else reads DRAM.
+    Rate(f32),
+}
+
 /// Blocks of the L2 prefetch kernel. A decode step took 3.98 ms with 80, 3.90 ms with 88
 /// to 112 and 3.95 ms with 128: fewer fetch too slowly, more take SMs from the main stream.
 /// Alone, 64 blocks stream 1.38 TB/s and 96 blocks 1.49 TB/s.
 const PREFETCH_BLOCKS: u32 = 96;
+/// One-warp blocks of the paced prefetch kernel: 16 issued too slowly at 1.6 TB/s (3.681
+/// ms per BF16 step against 3.657); 32 and 64 were equal.
+const PACED_BLOCKS: u32 = 32;
 
 #[derive(Debug)]
 pub struct Linear {
@@ -395,6 +409,7 @@ pub struct Linear {
     gemm_bf16: GemmKernels,
     gemm_f32: GemmKernels,
     prefetch_l2: CudaFunction,
+    prefetch_l2_paced: CudaFunction,
     /// Runs prefetches beside the main stream.
     side: Arc<CudaStream>,
     fork: CudaEvent,
@@ -426,17 +441,24 @@ impl Linear {
             gemm_bf16: GemmKernels::load::<bf16>(ctx, &module, &GEMM_BF16_TILES)?,
             gemm_f32: GemmKernels::load::<f32>(ctx, &module, &GEMM_F32_TILES)?,
             prefetch_l2: f("prefetch_l2")?,
+            prefetch_l2_paced: f("prefetch_l2_paced")?,
             side: ctx.new_stream()?,
             fork: ctx.new_event(None)?,
             join: ctx.new_event(None)?,
         })
     }
 
-    /// Starts pulling `weights` into L2, in order, on a side stream, once the work enqueued
-    /// on `stream` so far is done. Prefetches run one after another; a later
+    /// Starts pulling `weights` into L2, in order, on a side stream at `pace`, once the work
+    /// enqueued on `stream` so far is done. Prefetches run one after another; a later
     /// [`Self::join_prefetch`] must rejoin them, also inside a graph capture. They only read,
-    /// so they race with nothing.
-    pub fn prefetch(&self, stream: &CudaStream, weights: &[&dyn Prefetch]) -> anyhow::Result<()> {
+    /// so they race with nothing. A paced prefetch ends once it has issued its requests,
+    /// before the data arrives.
+    pub fn prefetch(
+        &self,
+        stream: &CudaStream,
+        weights: &[&dyn Prefetch],
+        pace: Pace,
+    ) -> anyhow::Result<()> {
         ensure!(
             (1..=MAX_PREFETCH).contains(&weights.len()),
             "{} weights to prefetch, expected 1 to {MAX_PREFETCH}",
@@ -455,16 +477,35 @@ impl Linear {
         }
         self.fork.record(stream)?;
         self.side.wait(&self.fork)?;
-        let config = LaunchConfig {
-            grid_dim: (PREFETCH_BLOCKS, 1, 1),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch = self.side.launch_builder(&self.prefetch_l2);
-        launch.arg(&ranges);
-        // SAFETY: `ranges` has the kernel's `Ranges` layout, and the kernel reads only the
-        // whole 16-byte vectors inside each weight.
-        unsafe { launch.launch(config) }?;
+        match pace {
+            Pace::Loads => {
+                let config = LaunchConfig {
+                    grid_dim: (PREFETCH_BLOCKS, 1, 1),
+                    block_dim: (THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut launch = self.side.launch_builder(&self.prefetch_l2);
+                launch.arg(&ranges);
+                // SAFETY: `ranges` has the kernel's `Ranges` layout, and the kernel reads
+                // only the whole 16-byte vectors inside each weight.
+                unsafe { launch.launch(config) }?;
+            }
+            Pace::Rate(tb_per_s) => {
+                ensure!(tb_per_s > 0.0, "the prefetch rate must be positive");
+                let config = LaunchConfig {
+                    grid_dim: (PACED_BLOCKS, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let bytes_per_ns = tb_per_s * 1000.0;
+                let mut launch = self.side.launch_builder(&self.prefetch_l2_paced);
+                launch.arg(&ranges).arg(&bytes_per_ns);
+                // SAFETY: `ranges` has the kernel's `Ranges` layout, the kernel prefetches
+                // only the whole 16-byte vectors inside each weight, and the rate is
+                // positive.
+                unsafe { launch.launch(config) }?;
+            }
+        }
         self.join.record(&self.side)?;
         Ok(())
     }

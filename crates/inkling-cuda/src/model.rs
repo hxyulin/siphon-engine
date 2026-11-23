@@ -32,7 +32,7 @@ use crate::{
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, ExpertActivations, Experts},
-        linear::{Gemm, Gemv, Linear, Prefetch, Start},
+        linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
         linear_fp8::{Fp8Gemv, LinearFp8},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
         norm::{KvConvWeights, Norm},
@@ -580,8 +580,8 @@ impl Model {
         let hidden = ctx.hidden();
         let mut visits = self.visits.iter_mut();
         let mut next_visit = || visits.next().context("fewer visit caches than visits");
-        // Each visit's layer and whether it takes messages: the next visit's weights stream
-        // into L2 during the MoE half of the current one.
+        // Each visit's layer and whether it takes messages: each visit starts prefetching the
+        // next one's weights, which need the visit after that.
         let looped = core_end - core_start;
         let plan: Vec<(usize, bool)> = cfg
             .visit_layers(self.passes)
@@ -595,7 +595,11 @@ impl Model {
             })
             .collect();
         let mut upcoming = plan.iter().skip(1).map(|&p| Some(p)).chain([None]);
-        let mut next_plan = || upcoming.next().flatten();
+        let mut after = plan.iter().skip(2).map(|&p| Some(p)).chain([None, None]);
+        let mut next_plan = || Upcoming {
+            next: upcoming.next().flatten(),
+            after: after.next().flatten(),
+        };
 
         ctx.kernels.elementwise.embedding(
             &ctx.stream,
@@ -615,9 +619,11 @@ impl Model {
             len: 0,
             max: self.max_blocks,
         };
-        ctx.kernels
-            .linear
-            .prefetch(&ctx.stream, &ctx.visit_prefetch(plan[0].0, plan[0].1))?;
+        ctx.kernels.linear.prefetch(
+            &ctx.stream,
+            &ctx.visit_prefetch(plan[0].0, plan[0].1),
+            ctx.prefetch_pace(plan[0].0),
+        )?;
         for layer in 0..core_start {
             ctx.visit(
                 s,
@@ -755,6 +761,11 @@ impl Model {
 /// more.
 const LM_HEAD_PREFETCH_BYTES: usize = 32 << 20;
 
+/// The rate of the paced prefetches with FP8 weights, in TB/s. At 1.3 a step took 2.861,
+/// 3.769 and 5.660 ms at contexts 0, 32K and 128K, against 2.885, 3.796 and 5.688 ms with
+/// loads; 1.5 took 2.847 ms at context 0 but 3.782 ms at 32K.
+const PREFETCH_TB_PER_S: f32 = 1.3;
+
 /// The first bytes of a buffer to prefetch, at most its whole length.
 struct PrefetchStart<'a>(&'a dyn Prefetch, usize);
 
@@ -772,8 +783,16 @@ struct VisitPlan {
     /// The layer's index among the looped layers, on passes after the first, which take
     /// messages.
     looped: Option<usize>,
+    next: Upcoming,
+}
+
+/// The visits after one, whose weights it prefetches.
+#[derive(Clone, Copy)]
+struct Upcoming {
     /// The next visit's layer and whether it takes messages.
     next: Option<(usize, bool)>,
+    /// The same for the visit after the next.
+    after: Option<(usize, bool)>,
 }
 
 /// The count of block states in use, the leading rows of `Scratch::blocks`.
@@ -833,7 +852,7 @@ impl Ctx {
         let mut weights: Vec<&dyn Prefetch> = Vec::new();
         if let Some(gates) = w.message_gates.as_ref().filter(|_| messages) {
             for g in &gates[..3] {
-                weights.extend(g.matrices().map(|m| m as &dyn Prefetch));
+                weights.extend(g.decode_matrices());
             }
         }
         let a = &w.attention;
@@ -852,6 +871,55 @@ impl Ctx {
             weights.extend([k as &dyn Prefetch, v]);
         }
         weights
+    }
+
+    /// Starts prefetching what a visit of `layer` reads after its projections: the output
+    /// projection, the MLP message gate if `gated`, then the projections of the visit
+    /// after it, `next`, or the start of the LM head after the last visit.
+    fn prefetch_rest(
+        &self,
+        layer: usize,
+        gated: bool,
+        next: Option<(usize, bool)>,
+    ) -> anyhow::Result<()> {
+        let w = &self.weights.layers[layer];
+        let mut prefetch: Vec<&dyn Prefetch> = match &w.fp8 {
+            Some(fp8) => vec![&fp8.o],
+            None => vec![&w.attention.o],
+        };
+        if let Some(gates) = w.message_gates.as_ref().filter(|_| gated) {
+            prefetch.extend(gates[3].decode_matrices());
+        }
+        let lm_head_start;
+        if let Some((layer, messages)) = next {
+            prefetch.extend(self.visit_prefetch(layer, messages));
+        } else {
+            // The last visit's experts leave DRAM bandwidth to spare for the start of the
+            // LM head, which the step reads next.
+            let lm_head: &dyn Prefetch = match &self.weights.lm_head_fp8 {
+                Some(fp8) => fp8,
+                None => &self.weights.lm_head,
+            };
+            lm_head_start = PrefetchStart(lm_head, LM_HEAD_PREFETCH_BYTES);
+            prefetch.push(&lm_head_start);
+        }
+        self.kernels
+            .linear
+            .prefetch(&self.stream, &prefetch, self.prefetch_pace(layer))
+    }
+
+    /// The pace of a prefetch that runs beside a visit of `layer`. With FP8 weights a
+    /// visit prefetches half the bytes, so a fixed rate leaves DRAM bandwidth to the main
+    /// stream. With BF16 weights the prefetch uses loads, which yield to the main stream:
+    /// paced at 1.5 TB/s beside sliding layers, a step took 3.669 instead of 3.767 ms at
+    /// context 0 but 4.934 instead of 4.777 ms at 32K, where it slowed the attention's
+    /// reads of the window's cache. At 1.2 TB/s it took 3.831 ms at context 0.
+    fn prefetch_pace(&self, layer: usize) -> Pace {
+        if self.weights.layers[layer].fp8.is_some() {
+            Pace::Rate(PREFETCH_TB_PER_S)
+        } else {
+            Pace::Loads
+        }
     }
 
     /// One decoder-layer visit, as MLX-LM's `DecoderLayer.__call__`, from `s.hidden` to
@@ -882,35 +950,13 @@ impl Ctx {
             "more block states than planned"
         );
         let gates = w.message_gates.as_ref().zip(looped);
-        // The previous visit (or the step, for the first) started prefetching this visit's
-        // projection weights. The output projection's and the MLP gate's weights follow,
-        // then the next visit's projection weights, which stream during the MoE half of
-        // this visit while its experts leave DRAM bandwidth to spare. The first visit does
-        // not wait for its prefetch: its projections read from DRAM alongside it.
-        if layer > 0 {
-            self.kernels.linear.join_prefetch(&self.stream)?;
+        // The previous visit started prefetching this visit's weights once its experts
+        // finished, and the step started the first visit's projections. The first visit
+        // starts the rest of its own here, and does not wait for its projections: they read
+        // from DRAM alongside the prefetch.
+        if layer == 0 {
+            self.prefetch_rest(layer, gates.is_some(), next.next)?;
         }
-        let mut prefetch: Vec<&dyn Prefetch> = match &w.fp8 {
-            Some(fp8) => vec![&fp8.o],
-            None => vec![&w.attention.o],
-        };
-        if let Some((gates, _)) = gates {
-            prefetch.extend(gates[3].matrices().map(|m| m as &dyn Prefetch));
-        }
-        let lm_head_start;
-        if let Some((layer, messages)) = next {
-            prefetch.extend(self.visit_prefetch(layer, messages));
-        } else {
-            // The last visit's experts leave DRAM bandwidth to spare for the start of the
-            // LM head, which the step reads next.
-            let lm_head: &dyn Prefetch = match &self.weights.lm_head_fp8 {
-                Some(fp8) => fp8,
-                None => &self.weights.lm_head,
-            };
-            lm_head_start = PrefetchStart(lm_head, LM_HEAD_PREFETCH_BYTES);
-            prefetch.push(&lm_head_start);
-        }
-        self.kernels.linear.prefetch(&self.stream, &prefetch)?;
 
         // The normalized visit input goes straight into the new block state at a block start.
         let (states, mut rest) = s.blocks.split_at_mut(blocks.len * hidden);
@@ -999,6 +1045,16 @@ impl Ctx {
             )?;
         }
         self.moe(w, &mut s.moe, &s.mlp_x)?;
+        // The experts are the visit's last DRAM stream, so the next visit's weights start
+        // as soon as they finish, beside the conv and the next visit's depth attention.
+        // Forking after the conv took a step from 3.767 to 3.829 ms with BF16 weights and
+        // from 2.883 to 2.897 ms with FP8 weights. Forking before the router, so that the
+        // prefetch overlaps the experts, took 4.02 and 3.33 ms. The main stream first waits
+        // for this visit's prefetch, which has usually finished by then.
+        if let Some((layer, messages)) = next.next {
+            self.kernels.linear.join_prefetch(&self.stream)?;
+            self.prefetch_rest(layer, messages, next.after)?;
+        }
 
         self.kernels.conv.moe_conv_residual(
             &self.stream,
@@ -1274,6 +1330,7 @@ impl Ctx {
                 input: input.slice(row.clone()),
                 forget: &g.forget,
                 gain: &g.gain,
+                fp8: g.fp8.as_ref(),
                 norm,
             })
             .collect();

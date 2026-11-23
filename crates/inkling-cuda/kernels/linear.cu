@@ -258,6 +258,43 @@ prefetch_l2(const __grid_constant__ Ranges r) {
     }
 }
 
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// The ranges as TMA bulk prefetches into L2 of up to kChunk bytes, in order, chunk i due
+// i * kChunk / bytes_per_ns after the block starts, spread round robin over the lanes of
+// the grid. Bulk prefetches return nothing to the SM, so the main stream keeps the L2
+// bandwidth to the SMs, but they do not slow down when other kernels read DRAM:
+// unpaced, they flooded the memory system and took a BF16 step from 3.83 to 4.21 ms.
+extern "C" __global__ void __launch_bounds__(32)
+prefetch_l2_paced(const __grid_constant__ Ranges r, float bytes_per_ns) {
+    constexpr long long kChunk = 4096;
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    const unsigned long long t0 = global_ns();
+    const long long lanes = (long long)gridDim.x * 32;
+    const long long lane = blockIdx.x * 32ll + threadIdx.x;
+    long long chunk_base = 0;
+    for (int s = 0; s < r.count; ++s) {
+        const char* p = reinterpret_cast<const char*>(r.p[s]);
+        const long long bytes = r.vecs[s] * 16;
+        const long long chunks = (bytes + kChunk - 1) / kChunk;
+        for (long long c = (lane - chunk_base % lanes + lanes) % lanes; c < chunks; c += lanes) {
+            const unsigned long long due = t0 + (unsigned long long)(float(chunk_base + c) * kChunk / bytes_per_ns);
+            while (global_ns() < due) {
+                __nanosleep(100);
+            }
+            const unsigned n = unsigned(min(kChunk, bytes - c * kChunk));
+            asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;"
+                         ::"l"(p + c * kChunk), "r"(n), "l"(policy) : "memory");
+        }
+        chunk_base += chunks;
+    }
+}
+
 // Matrix products `out = x @ W^T` on tensor cores, for prefill: x is [m, k], W is [n, k]
 // as stored in the checkpoint, out is [m, n], all row-major. BF16 weights, F32
 // accumulation.

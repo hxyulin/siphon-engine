@@ -9,7 +9,10 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::{
+    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    ops::linear_fp8::Fp8Matrix,
+};
 
 /// Threads per block for the elementwise kernels.
 const BLOCK: u32 = 256;
@@ -52,6 +55,9 @@ pub struct GateStep<'a> {
     pub input: CudaView<'a, bf16>,
     pub forget: &'a CudaSlice<bf16>,
     pub gain: &'a CudaSlice<bf16>,
+    /// FP8 copies of the down, forget and gain weights, which the gate then reads instead.
+    /// Every gate of a launch has them or none does.
+    pub fp8: Option<&'a [Fp8Matrix; 3]>,
     pub norm: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
 }
 
@@ -104,6 +110,7 @@ pub struct Misc {
     message_gate_norm_rows_2304: CudaFunction,
     argmax_wide_f32: CudaFunction,
     message_gate_step_2304: CudaFunction,
+    message_gate_step_fp8_2304: CudaFunction,
 }
 
 /// Launch shape for a grid-stride loop over `n` elements.
@@ -134,6 +141,7 @@ impl Misc {
             message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
             message_gate_step_2304: module.load_function("message_gate_step_2304")?,
+            message_gate_step_fp8_2304: module.load_function("message_gate_step_fp8_2304")?,
         })
     }
 
@@ -368,6 +376,15 @@ impl Misc {
             check_len("input", gate.input.len(), 2 * HIDDEN)?;
             check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
             check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
+            if let Some([down, forget, gain]) = gate.fp8 {
+                ensure!(
+                    (down.rows(), down.k()) == (GATE_RANK, 2 * HIDDEN)
+                        && [forget, gain]
+                            .iter()
+                            .all(|m| (m.rows(), m.k()) == (HIDDEN, GATE_RANK)),
+                    "FP8 gate weight shapes"
+                );
+            }
             if let Some((weight, normed)) = &gate.norm {
                 check_len("norm weight", weight.len(), HIDDEN)?;
                 check_len("normed", normed.len(), HIDDEN)?;
@@ -379,18 +396,7 @@ impl Misc {
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
-        for k in 0..GATE_SLOTS {
-            args.ptr(gates[k.min(n - 1)].down_weight, stream);
-        }
-        for k in 0..GATE_SLOTS {
-            args.ptr(&gates[k.min(n - 1)].input, stream);
-        }
-        for k in 0..GATE_SLOTS {
-            args.ptr(gates[k.min(n - 1)].forget, stream);
-        }
-        for k in 0..GATE_SLOTS {
-            args.ptr(gates[k.min(n - 1)].gain, stream);
-        }
+        let fp8 = push_gate_weights(&mut args, gates, stream)?;
         args.ptr(&h, stream)
             .i32(i32::try_from(h_stride).context("h_stride too large")?)
             .ptr(&m, stream)
@@ -414,12 +420,18 @@ impl Misc {
             .ptr_mut(&mut scratch.partials, stream)
             .ptr_mut(&mut scratch.counters, stream)
             .f32(eps);
-        // SAFETY: the arguments match `message_gate_step_2304`'s signature, every buffer has
-        // the length checked above for the `n` gates of the grid's y dimension, the scratch
-        // holds 32 x 65 partial sums and a barrier counter per gate, a null `normed` makes a
-        // gate skip the norm, and the kernel reads only weights before `pdl_wait`. Its
-        // barriers need every block resident, which 32 blocks of 288 threads per gate are.
-        unsafe { args.launch_pdl(stream, &self.message_gate_step_2304, config) }
+        let function = if fp8 {
+            &self.message_gate_step_fp8_2304
+        } else {
+            &self.message_gate_step_2304
+        };
+        // SAFETY: the arguments match `message_gate_step_2304`'s signature, or with FP8
+        // weights `message_gate_step_fp8_2304`'s, every buffer has the length checked above
+        // for the `n` gates of the grid's y dimension, the scratch holds 32 x 65 partial sums
+        // and a barrier counter per gate, a null `normed` makes a gate skip the norm, and the
+        // kernel reads only weights before `pdl_wait`. Its barriers need every block
+        // resident, which 32 blocks of 288 threads per gate are.
+        unsafe { args.launch_pdl(stream, function, config) }
     }
 
     /// The index of the largest of the values of one long F32 row `x`, as
@@ -535,4 +547,52 @@ impl Misc {
         // row, and the kernel reads nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.message_gate_norm_rows_2304, config) }
     }
+}
+
+/// The weight and input arguments of `message_gate_step_2304`, or of
+/// `message_gate_step_fp8_2304` if the gates have FP8 weights, which it returns. Slots past
+/// the last gate repeat it.
+fn push_gate_weights(
+    args: &mut KernelArgs,
+    gates: &[GateStep<'_>],
+    stream: &CudaStream,
+) -> anyhow::Result<bool> {
+    let n = gates.len();
+    let fp8 = gates[0].fp8.is_some();
+    ensure!(
+        gates.iter().all(|g| g.fp8.is_some() == fp8),
+        "every gate of a launch has FP8 weights or none does"
+    );
+    let slot = |k: usize| &gates[k.min(n - 1)];
+    if fp8 {
+        // Each matrix's E4M3 values, then its row scales; the inputs follow the down
+        // projection's.
+        for matrix in 0..3 {
+            for k in 0..GATE_SLOTS {
+                args.ptr(&slot(k).fp8.context("FP8 gate")?[matrix].values(), stream);
+            }
+            for k in 0..GATE_SLOTS {
+                args.ptr(&slot(k).fp8.context("FP8 gate")?[matrix].scales(), stream);
+            }
+            if matrix == 0 {
+                for k in 0..GATE_SLOTS {
+                    args.ptr(&slot(k).input, stream);
+                }
+            }
+        }
+    } else {
+        for k in 0..GATE_SLOTS {
+            args.ptr(slot(k).down_weight, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(&slot(k).input, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(slot(k).forget, stream);
+        }
+        for k in 0..GATE_SLOTS {
+            args.ptr(slot(k).gain, stream);
+        }
+    }
+    Ok(fp8)
 }
