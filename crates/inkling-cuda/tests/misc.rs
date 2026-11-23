@@ -14,7 +14,7 @@ use half::bf16;
 use inkling_cuda::{
     Gpu,
     ops::{
-        linear::{Gemv, Linear},
+        linear::{Gemv, Linear, Start},
         misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, GateStepScratch, Misc},
         norm::Norm,
     },
@@ -191,6 +191,7 @@ fn message_gate_chain_matches_mlx() -> anyhow::Result<()> {
     linear.gemv_bf16(
         stream,
         &mut [Gemv::new(&down_weight, &states_bf16, &mut down)],
+        Start::Serial,
     )?;
     // The linear kernels sum in another order than MLX; tests/linear.rs bounds the error.
     let (want, _) = fixture.bf16("gate.down")?;
@@ -210,6 +211,7 @@ fn message_gate_chain_matches_mlx() -> anyhow::Result<()> {
             Gemv::new(&forget, &down_f32, &mut f_pre),
             Gemv::new(&gain, &down_f32, &mut g_pre),
         ],
+        Start::Serial,
     )?;
     let (want, _) = fixture.f32("gate.f_pre")?;
     assert_f32_close("gate.f_pre", &stream.clone_dtoh(&f_pre)?, &want, 1e-5, 1e-6);
@@ -647,6 +649,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
             linear.gemv_bf16(
                 stream,
                 &mut [Gemv::new(&downs[k], &inputs[k], &mut down_want)],
+                Start::Serial,
             )?;
             let own_down = &down[k * GATE_RANK..(k + 1) * GATE_RANK];
             assert_bf16_close(

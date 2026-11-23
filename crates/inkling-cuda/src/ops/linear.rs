@@ -99,10 +99,8 @@ struct Batch {
     seg: [Segment; MAX_PRODUCTS],
     count: i32,
     k: i32,
+    pdl: i32,
 }
-
-// SAFETY: plain integers with the layout of the kernel's `Batch`, passed by value.
-unsafe impl DeviceRepr for Batch {}
 
 /// Kernel parameter: one product of a GEMM batch, as `gemm::Product` in the kernel.
 #[repr(C)]
@@ -385,9 +383,10 @@ impl<T: DeviceRepr> Prefetch for CudaSlice<T> {
     }
 }
 
-/// Blocks of the L2 prefetch kernel. In the decode step 64 beat 32, 48, 80, 96, 128 and 170:
-/// fewer fetch too slowly, more take SMs and bandwidth from the main stream.
-const PREFETCH_BLOCKS: u32 = 64;
+/// Blocks of the L2 prefetch kernel. A decode step took 3.98 ms with 80, 3.90 ms with 88
+/// to 112 and 3.95 ms with 128: fewer fetch too slowly, more take SMs from the main stream.
+/// Alone, 64 blocks stream 1.38 TB/s and 96 blocks 1.49 TB/s.
+const PREFETCH_BLOCKS: u32 = 96;
 
 #[derive(Debug)]
 pub struct Linear {
@@ -483,8 +482,9 @@ impl Linear {
         &self,
         stream: &CudaStream,
         products: &mut [Gemv<'_, bf16>],
+        start: Start,
     ) -> anyhow::Result<()> {
-        launch(&self.bf16, stream, products)
+        launch(&self.bf16, stream, products, start)
     }
 
     /// Runs every product in one launch with F32 inputs and outputs. The BF16 weights widen
@@ -493,8 +493,9 @@ impl Linear {
         &self,
         stream: &CudaStream,
         products: &mut [Gemv<'_, f32>],
+        start: Start,
     ) -> anyhow::Result<()> {
-        launch(&self.f32, stream, products)
+        launch(&self.f32, stream, products, start)
     }
 
     /// Runs every product over `m` rows in one launch on tensor cores: BF16 inputs and
@@ -510,7 +511,7 @@ impl Linear {
         m: usize,
     ) -> anyhow::Result<()> {
         if m == 1 && fits_gemv::<bf16>(products) {
-            return self.gemv_bf16(stream, &mut as_gemv(products));
+            return self.gemv_bf16(stream, &mut as_gemv(products), Start::Serial);
         }
         launch_gemm(&self.gemm_bf16, stream, products, m)
     }
@@ -527,16 +528,34 @@ impl Linear {
         m: usize,
     ) -> anyhow::Result<()> {
         if m == 1 && fits_gemv::<f32>(products) {
-            return self.gemv_f32(stream, &mut as_gemv(products));
+            return self.gemv_f32(stream, &mut as_gemv(products), Start::Serial);
         }
         launch_gemm(&self.gemm_f32, stream, products, m)
     }
 }
 
-fn launch<T: DeviceRepr>(
+/// When a GEMV launch may start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// Once the previous kernel on the stream has finished.
+    Serial,
+    /// With programmatic dependent launch, once the previous kernel triggers. The GEMV
+    /// issues its first weight loads, then waits for that kernel to finish before it
+    /// reads its input. Either way the GEMV triggers once past its wait, so a next kernel
+    /// launched with PDL may start early.
+    ///
+    /// In the BF16 decode step this saved 0.04 ms per step for the output projection,
+    /// after the attention step. The projection batch at the start of a visit launched
+    /// early cost 0.14 ms: its blocks take the SMs the visit's prefetch needs. With FP8
+    /// weights the same early batch saved 0.15 ms. The LM head gained nothing either way.
+    Early,
+}
+
+fn launch<T>(
     kernels: &Kernels,
     stream: &CudaStream,
     products: &mut [Gemv<'_, T>],
+    start: Start,
 ) -> anyhow::Result<()> {
     ensure!(
         (1..=MAX_PRODUCTS).contains(&products.len()),
@@ -557,6 +576,7 @@ fn launch<T: DeviceRepr>(
     let mut batch = Batch {
         count: i32::try_from(products.len())?,
         k: i32::try_from(k)?,
+        pdl: i32::from(start == Start::Early),
         ..Batch::default()
     };
     let mut blocks = 0usize;
@@ -597,14 +617,73 @@ fn launch<T: DeviceRepr>(
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: u32::try_from(x_bytes)?,
     };
-    let mut launch = stream.launch_builder(kernels.get(shape));
-    launch.arg(&batch);
     // SAFETY: `batch` has the kernel's `Batch` layout. The checks above size each weight
     // as [rows, k], each input as [k] and each output as [rows]; the kernel reads only
-    // rows below `rows` and columns below k. The views stay borrowed until the launch is
-    // enqueued, and the stream orders the kernel before any later use of the buffers.
-    unsafe { launch.launch(config) }?;
+    // rows below `rows` and columns below k, and before `pdl_wait` only weights. The views stay
+    // borrowed until the launch is enqueued, and the stream orders the kernel before any
+    // later use of the buffers.
+    unsafe {
+        launch_by_value(
+            stream,
+            kernels.get(shape),
+            config,
+            &batch,
+            start == Start::Early,
+        )
+    }?;
     drop(guards);
+    Ok(())
+}
+
+/// Launches `function`, whose only parameter is `batch` passed by value, with
+/// programmatic dependent launch when `pdl` is set, so it may start before the previous
+/// kernel on `stream` ends.
+///
+/// # Safety
+///
+/// `batch` must match the kernel's only parameter, every pointer in it must stay valid
+/// until the kernel finishes, and with `pdl` the kernel must call `pdl_wait()` before it
+/// reads anything an earlier kernel writes.
+pub(crate) unsafe fn launch_by_value<B>(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    cfg: LaunchConfig,
+    batch: &B,
+    pdl: bool,
+) -> anyhow::Result<()> {
+    // SAFETY: zero is a valid bit pattern for the attribute value union.
+    let mut value: sys::CUlaunchAttributeValue = unsafe { std::mem::zeroed() };
+    value.programmaticStreamSerializationAllowed = i32::from(pdl);
+    let mut attr = sys::CUlaunchAttribute {
+        id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+        pad: [0; 4],
+        value,
+    };
+    let config = sys::CUlaunchConfig {
+        gridDimX: cfg.grid_dim.0,
+        gridDimY: cfg.grid_dim.1,
+        gridDimZ: cfg.grid_dim.2,
+        blockDimX: cfg.block_dim.0,
+        blockDimY: cfg.block_dim.1,
+        blockDimZ: cfg.block_dim.2,
+        sharedMemBytes: cfg.shared_mem_bytes,
+        hStream: stream.cu_stream(),
+        attrs: &raw mut attr,
+        numAttrs: 1,
+    };
+    let mut params = [ptr::from_ref(batch).cast_mut().cast::<c_void>()];
+    stream.context().bind_to_thread()?;
+    // SAFETY: `params` points at `batch`, which outlives the call that copies it; the
+    // caller vouches for its contents and for the kernel.
+    unsafe {
+        sys::cuLaunchKernelEx(
+            &raw const config,
+            function.cu_function(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    }
+    .result()?;
     Ok(())
 }
 

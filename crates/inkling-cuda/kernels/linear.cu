@@ -12,9 +12,19 @@
 // loads in order. A row's lanes reduce with a butterfly shuffle, and its S warps through
 // shared memory. The sum order therefore differs from MLX's; tests/linear.rs bounds the
 // error.
+//
+// Programmatic dependent launch (pdl.cuh): a block issues its first batch of weight
+// loads, calls pdl_wait, then pdl_trigger, and only then reads x. The launcher picks per
+// call whether this kernel itself starts early; without PDL the wait returns at once. The
+// trigger lets a next kernel launched with PDL start as soon as the last block of this
+// grid has passed its wait, which saved 0.06 ms per decode step. Triggering before the
+// wait cost 0.08 ms: the kernels after a PDL-launched GEMV, up to the persistent expert
+// grid, then launch and take SMs while it still waits.
 
 #include <cuda_bf16.h>
 #include <cstdint>
+
+#include "pdl.cuh"
 
 namespace {
 
@@ -35,6 +45,8 @@ struct Batch {
     Segment seg[kMaxSegments];
     int count;
     int k;
+    // Nonzero when launched with programmatic dependent launch.
+    int pdl;
 };
 
 // Streams weights past L1: each byte is read once per step.
@@ -107,19 +119,27 @@ __device__ void gemv(const Batch& b, Tx* x_smem) {
     const bool live = row < seg.rows;
     const auto* w_row = reinterpret_cast<const uint4*>(seg.w + size_t(live ? row : 0) * k);
 
-    // Weight loads go out first, so x staging hides under their latency.
+    // Weight loads go out first: no kernel writes them, so they may run ahead of
+    // pdl_wait. ptxas moves read-only loads freely across griddepcontrol.wait, and with an
+    // unconditional wait it placed the wait first. A branch keeps the wait after the
+    // loads. The trigger comes after the wait.
     uint4 wv[V];
 #pragma unroll
     for (int v = 0; v < V; ++v) {
         const int i = v * kStride + sub;
         wv[v] = live && i < vecs ? load_weight(w_row + i) : make_uint4(0, 0, 0, 0);
     }
+    if (b.pdl) {
+        pdl_wait();
+    }
+    pdl_trigger();
 
-    // k is a multiple of 8, so x is whole 16-byte vectors.
+    // k is a multiple of 8, so x is whole 16-byte vectors. Plain loads, not the read-only
+    // path: with PDL the kernel that writes x may still have run when this one started.
     const auto* x = static_cast<const uint4*>(seg.x);
     constexpr int kXPerVec = 16 / sizeof(Tx);
     for (int i = threadIdx.x; i < k / kXPerVec; i += kThreads) {
-        reinterpret_cast<uint4*>(x_smem)[i] = __ldg(x + i);
+        reinterpret_cast<uint4*>(x_smem)[i] = x[i];
     }
     __syncthreads();
 

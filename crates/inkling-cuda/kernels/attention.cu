@@ -670,6 +670,9 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
     float4 state[2][conv_step::kKernel - 1];
     uint2 dynamic_raw[2];
     if constexpr (kStep) {
+        // The output projection after this kernel launches with PDL; triggering here lets
+        // it launch once every block has started, 0.04 ms per decode step.
+        pdl_trigger();
         pdl_wait();
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) {

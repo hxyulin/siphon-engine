@@ -20,7 +20,7 @@ use common::{Fixture, bf16_ulps};
 use half::bf16;
 use inkling_cuda::{
     Gpu,
-    ops::linear::{Gemm, Gemv, Linear},
+    ops::linear::{Gemm, Gemv, Linear, Start},
 };
 
 const BF16_CASES: &[&str] = &[
@@ -194,7 +194,7 @@ fn gemv_bf16_matches_reference_and_mlx() -> anyhow::Result<()> {
             .zip(&mut outs)
             .map(|(x, out)| Gemv::new(&weight_dev, x, out))
             .collect();
-        linear.gemv_bf16(stream, &mut products)?;
+        linear.gemv_bf16(stream, &mut products, Start::Serial)?;
         drop(products);
         let mut worst = 0.0f64;
         let mut differ = 0;
@@ -248,7 +248,7 @@ fn gemv_f32_matches_reference_and_mlx() -> anyhow::Result<()> {
             .zip(&mut outs)
             .map(|(x, out)| Gemv::new(&weight_dev, x, out))
             .collect();
-        linear.gemv_f32(stream, &mut products)?;
+        linear.gemv_f32(stream, &mut products, Start::Serial)?;
         drop(products);
         let mut worst = 0.0f64;
         for (r, out) in outs.iter().enumerate() {
@@ -325,7 +325,8 @@ fn gemv_batch_of_eight() -> anyhow::Result<()> {
         .zip(&shapes)
         .map(|((w, out), &(_, input))| Gemv::new(w, &inputs_dev[input], out))
         .collect();
-    linear.gemv_bf16(stream, &mut products)?;
+    // An early start runs the same kernel with programmatic dependent launch.
+    linear.gemv_bf16(stream, &mut products, Start::Early)?;
     drop(products);
     for (i, (out, &(n, input))) in outs.iter().zip(&shapes).enumerate() {
         let got = widen(&stream.clone_dtoh(out)?);
@@ -359,7 +360,11 @@ fn gemv_generic_k() -> anyhow::Result<()> {
 
     let x_dev = stream.clone_htod(&x)?;
     let mut out = stream.alloc_zeros::<bf16>(N)?;
-    linear.gemv_bf16(stream, &mut [Gemv::new(&weight_dev, &x_dev, &mut out)])?;
+    linear.gemv_bf16(
+        stream,
+        &mut [Gemv::new(&weight_dev, &x_dev, &mut out)],
+        Start::Serial,
+    )?;
     let worst = check(
         "bf16",
         &widen(&stream.clone_dtoh(&out)?),
@@ -372,7 +377,11 @@ fn gemv_generic_k() -> anyhow::Result<()> {
     let x_f32: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
     let x_dev = stream.clone_htod(&x_f32)?;
     let mut out = stream.alloc_zeros::<f32>(N)?;
-    linear.gemv_f32(stream, &mut [Gemv::new(&weight_dev, &x_dev, &mut out)])?;
+    linear.gemv_f32(
+        stream,
+        &mut [Gemv::new(&weight_dev, &x_dev, &mut out)],
+        Start::Serial,
+    )?;
     let got: Vec<f64> = stream
         .clone_dtoh(&out)?
         .into_iter()
@@ -486,14 +495,14 @@ fn time_case(gpu: &Gpu, linear: &Linear, case: &TimedCase) -> anyhow::Result<f64
                 .zip(&mut outs_f32)
                 .map(|(w, out)| Gemv::new(w, &x_f32, out))
                 .collect();
-            linear.gemv_f32(stream, &mut products)?;
+            linear.gemv_f32(stream, &mut products, Start::Serial)?;
         } else {
             let mut products: Vec<_> = w
                 .iter()
                 .zip(&mut outs_bf16)
                 .map(|(w, out)| Gemv::new(w, &x_bf16, out))
                 .collect();
-            linear.gemv_bf16(stream, &mut products)?;
+            linear.gemv_bf16(stream, &mut products, Start::Serial)?;
         }
     }
     let graph = stream

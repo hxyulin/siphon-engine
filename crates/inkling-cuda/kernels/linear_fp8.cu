@@ -17,8 +17,9 @@
 // sums in F32 in order; a row's lanes then reduce with a butterfly shuffle, and the row's
 // scale multiplies the F32 sum once before it rounds to BF16.
 //
-// The kernel launches with programmatic dependent launch: it issues its weight and scale
-// loads, which no kernel writes, before pdl_wait, and reads x only after it.
+// With programmatic dependent launch (the launcher picks it per call), the kernel issues
+// its weight and scale loads, which no kernel writes, before pdl_wait, and reads x only
+// after it. It triggers after the wait, as linear.cu's GEMV does.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -49,6 +50,8 @@ struct Segment {
 struct Batch {
     Segment seg[kMaxSegments];
     int count;
+    // Nonzero when launched with programmatic dependent launch.
+    int pdl;
 };
 
 // Streams weights past L1: each byte is read once per step.
@@ -126,8 +129,12 @@ __device__ void gemv_fp8(const Batch& b, __nv_bfloat16* x_smem) {
     const float scale = lane < R ? load_scale(seg.scale + row0 + lane) : 0.f;
 
     // Triggering before the wait cost 50 us per step: the next kernel's blocks then take
-    // SM slots while this one still needs them.
-    pdl_wait();
+    // SM slots while this one still needs them. ptxas moves read-only loads freely across
+    // griddepcontrol.wait and placed an unconditional wait before them; a branch keeps it
+    // after the loads.
+    if (b.pdl) {
+        pdl_wait();
+    }
     pdl_trigger();
 
     const auto* x = reinterpret_cast<const uint4*>(seg.x);

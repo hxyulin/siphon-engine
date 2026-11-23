@@ -3,22 +3,22 @@
 //! [`LinearFp8::quantize`] turns a BF16 weight into an [`Fp8Matrix`]: E4M3 values with one
 //! F32 scale per row, `amax / 448`. [`LinearFp8::gemv`] then runs a batch of products
 //! `out = weight @ x` as [`crate::ops::linear::Linear::gemv_bf16`] does, with BF16 inputs
-//! and outputs and F32 accumulation, reading half the weight bytes. The products launch
-//! with programmatic dependent launch, so their weight loads overlap the previous kernel.
+//! and outputs and F32 accumulation, reading half the weight bytes. A [`Start`] picks
+//! whether a launch overlaps the previous kernel, as for the BF16 GEMV.
 
-use std::{ffi::c_void, ptr, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
-    DevicePtrMut as _, LaunchConfig, PushKernelArg as _, sys,
+    DevicePtrMut as _, LaunchConfig, PushKernelArg as _,
 };
 use half::bf16;
 
 use crate::{
     DeviceIn, DeviceOut,
     gpu::{cubin, load_module},
-    ops::linear::Prefetch,
+    ops::linear::{Prefetch, Start, launch_by_value},
 };
 
 /// Products one launch accepts, `kMaxSegments` in the kernel.
@@ -121,6 +121,7 @@ struct Segment {
 struct Batch {
     seg: [Segment; MAX_PRODUCTS],
     count: i32,
+    pdl: i32,
 }
 
 /// One entry point and the `k` it serves.
@@ -203,7 +204,12 @@ impl LinearFp8 {
     /// Runs every product in one launch: BF16 inputs and outputs, F32 accumulation, and
     /// each row's scale applied once to its F32 sum before the output rounds to nearest
     /// even. All weights have the same `k`, one [`Self::supports`].
-    pub fn gemv(&self, stream: &CudaStream, products: &mut [Fp8Gemv<'_>]) -> anyhow::Result<()> {
+    pub fn gemv(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Fp8Gemv<'_>],
+        start: Start,
+    ) -> anyhow::Result<()> {
         ensure!(
             (1..=MAX_PRODUCTS).contains(&products.len()),
             "{} products, expected 1 to {MAX_PRODUCTS}",
@@ -217,6 +223,7 @@ impl LinearFp8 {
             .with_context(|| format!("no FP8 product for k = {k}"))?;
         let mut batch = Batch {
             count: i32::try_from(products.len())?,
+            pdl: i32::from(start == Start::Early),
             ..Batch::default()
         };
         let mut blocks = 0usize;
@@ -266,59 +273,16 @@ impl LinearFp8 {
         // below `rows`, the output length checked above, and reads k inputs. The buffers
         // outlive the borrow of `products`, and the stream orders later work after the
         // kernel. The kernel reads x only after `pdl_wait`.
-        unsafe { launch_pdl(stream, &entry.function, config, &batch) }
+        unsafe {
+            launch_by_value(
+                stream,
+                &entry.function,
+                config,
+                &batch,
+                start == Start::Early,
+            )
+        }
     }
-}
-
-/// Launches `function` with one by-value parameter `batch`, allowing it to start before
-/// the previous kernel on `stream` ends, as `KernelArgs::launch_pdl` does for kernels
-/// whose parameters are pointers and scalars.
-///
-/// # Safety
-///
-/// `batch` must match the kernel's only parameter, every pointer in it must stay valid
-/// until the kernel finishes, and the kernel must call `pdl_wait()` before it reads
-/// anything an earlier kernel writes.
-unsafe fn launch_pdl(
-    stream: &CudaStream,
-    function: &CudaFunction,
-    cfg: LaunchConfig,
-    batch: &Batch,
-) -> anyhow::Result<()> {
-    // SAFETY: zero is a valid bit pattern for the attribute value union.
-    let mut value: sys::CUlaunchAttributeValue = unsafe { std::mem::zeroed() };
-    value.programmaticStreamSerializationAllowed = 1;
-    let mut attr = sys::CUlaunchAttribute {
-        id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
-        pad: [0; 4],
-        value,
-    };
-    let config = sys::CUlaunchConfig {
-        gridDimX: cfg.grid_dim.0,
-        gridDimY: cfg.grid_dim.1,
-        gridDimZ: cfg.grid_dim.2,
-        blockDimX: cfg.block_dim.0,
-        blockDimY: cfg.block_dim.1,
-        blockDimZ: cfg.block_dim.2,
-        sharedMemBytes: cfg.shared_mem_bytes,
-        hStream: stream.cu_stream(),
-        attrs: &raw mut attr,
-        numAttrs: 1,
-    };
-    let mut params = [ptr::from_ref(batch).cast_mut().cast::<c_void>()];
-    stream.context().bind_to_thread()?;
-    // SAFETY: `params` points at `batch`, which outlives the call that copies it; the
-    // caller vouches for its contents and for the kernel.
-    unsafe {
-        sys::cuLaunchKernelEx(
-            &raw const config,
-            function.cu_function(),
-            params.as_mut_ptr(),
-            ptr::null_mut(),
-        )
-    }
-    .result()?;
-    Ok(())
 }
 
 impl Prefetch for Fp8Matrix {

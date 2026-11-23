@@ -32,7 +32,7 @@ use crate::{
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
-        linear::{Gemm, Gemv, Linear, Prefetch},
+        linear::{Gemm, Gemv, Linear, Prefetch, Start},
         linear_fp8::{Fp8Gemv, LinearFp8},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
         norm::{KvConvWeights, Norm},
@@ -712,6 +712,7 @@ impl Model {
             ctx.kernels.linear_fp8.gemv(
                 &ctx.stream,
                 &mut [Fp8Gemv::new(lm_head, &s.final_hidden, &mut s.logits)],
+                Start::Serial,
             )?;
         } else {
             ctx.kernels.linear.gemv_bf16(
@@ -721,6 +722,7 @@ impl Model {
                     &s.final_hidden,
                     &mut s.logits,
                 )],
+                Start::Serial,
             )?;
         }
         ctx.kernels.elementwise.logit_softcap(
@@ -736,6 +738,21 @@ impl Model {
             t.logits = ctx.stream.clone_dtoh(&s.capped)?;
         }
         Ok(())
+    }
+}
+
+/// Bytes of the LM head the last visit prefetches. 32 MiB took a step from 3.865 to 3.853 ms
+/// with BF16 weights and from 2.935 to 2.931 ms with FP8 weights; 16 and 48 MiB gained no
+/// more.
+const LM_HEAD_PREFETCH_BYTES: usize = 32 << 20;
+
+/// The first bytes of a buffer to prefetch, at most its whole length.
+struct PrefetchStart<'a>(&'a dyn Prefetch, usize);
+
+impl Prefetch for PrefetchStart<'_> {
+    fn device_bytes(&self, stream: &CudaStream) -> (u64, usize) {
+        let (p, n) = self.0.device_bytes(stream);
+        (p, n.min(self.1))
     }
 }
 
@@ -871,8 +888,18 @@ impl Ctx {
         if let Some((gates, _)) = gates {
             prefetch.extend(gates[3].matrices().map(|m| m as &dyn Prefetch));
         }
+        let lm_head_start;
         if let Some((layer, messages)) = next {
             prefetch.extend(self.visit_prefetch(layer, messages));
+        } else {
+            // The last visit's experts leave DRAM bandwidth to spare for the start of the
+            // LM head, which the step reads next.
+            let lm_head: &dyn Prefetch = match &self.weights.lm_head_fp8 {
+                Some(fp8) => fp8,
+                None => &self.weights.lm_head,
+            };
+            lm_head_start = PrefetchStart(lm_head, LM_HEAD_PREFETCH_BYTES);
+            prefetch.push(&lm_head_start);
         }
         self.kernels.linear.prefetch(&self.stream, &prefetch)?;
 
@@ -1126,6 +1153,9 @@ impl Ctx {
             outs.push((k_in, &mut t.k_dynamic));
             outs.push((v_in, &mut t.v_dynamic));
         }
+        // Early starts measured faster with FP8 weights (2.94 ms per step against 3.08) and
+        // slower with BF16 weights (4.00 against 3.87), whose early blocks take the SMs the
+        // prefetch at the start of the visit needs.
         if let Some(fp8) = &w.fp8 {
             let mut products: Vec<_> = fp8
                 .inputs
@@ -1133,7 +1163,9 @@ impl Ctx {
                 .zip(&mut outs)
                 .map(|(weight, (x, out))| Fp8Gemv::new(weight, *x, *out))
                 .collect();
-            self.kernels.linear_fp8.gemv(&self.stream, &mut products)?;
+            self.kernels
+                .linear_fp8
+                .gemv(&self.stream, &mut products, Start::Early)?;
         } else {
             let mut products: Vec<_> = a
                 .input_projections()
@@ -1141,7 +1173,9 @@ impl Ctx {
                 .zip(&mut outs)
                 .map(|(weight, (x, out))| Gemv::new(weight, *x, *out))
                 .collect();
-            self.kernels.linear.gemv_bf16(&self.stream, &mut products)?;
+            self.kernels
+                .linear
+                .gemv_bf16(&self.stream, &mut products, Start::Serial)?;
         }
         drop(outs);
 
@@ -1185,15 +1219,19 @@ impl Ctx {
                 out: &mut t.gated,
             },
         )?;
+        // decode_step triggers early, and no prefetch starts here.
         if let Some(fp8) = &w.fp8 {
             self.kernels.linear_fp8.gemv(
                 &self.stream,
                 &mut [Fp8Gemv::new(&fp8.o, &t.gated, &mut t.proj)],
+                Start::Early,
             )
         } else {
-            self.kernels
-                .linear
-                .gemv_bf16(&self.stream, &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)])
+            self.kernels.linear.gemv_bf16(
+                &self.stream,
+                &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)],
+                Start::Early,
+            )
         }
     }
 

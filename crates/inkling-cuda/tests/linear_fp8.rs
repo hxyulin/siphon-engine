@@ -15,7 +15,7 @@ use half::bf16;
 use inkling_cuda::{
     Gpu,
     ops::{
-        linear::{Gemv, Linear},
+        linear::{Gemv, Linear, Start},
         linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
     },
 };
@@ -270,14 +270,14 @@ fn gemv_matches_reference() -> anyhow::Result<()> {
                 .zip(&mut outs)
                 .map(|((m, x), out)| Fp8Gemv::new(m, x, out))
                 .collect();
-            fp8.gemv(stream, &mut products)?;
+            fp8.gemv(stream, &mut products, Start::Early)?;
             let mut products: Vec<_> = dev_w
                 .iter()
                 .zip(&dev_x)
                 .zip(&mut bf16_outs)
                 .map(|((w, x), out)| Gemv::new(w, x, out))
                 .collect();
-            linear.gemv_bf16(stream, &mut products)?;
+            linear.gemv_bf16(stream, &mut products, Start::Serial)?;
         }
         let got = outs
             .iter()
@@ -397,14 +397,14 @@ fn time_case(
                     .zip(&mut outs)
                     .map(|(w, out)| Fp8Gemv::new(w, &x, out))
                     .collect();
-                fp8.gemv(stream, &mut products)?;
+                fp8.gemv(stream, &mut products, Start::Early)?;
             } else {
                 let mut products: Vec<_> = bf16_weights[i % bf16_copies]
                     .iter()
                     .zip(&mut outs)
                     .map(|(w, out)| Gemv::new(w, &x, out))
                     .collect();
-                linear.gemv_bf16(stream, &mut products)?;
+                linear.gemv_bf16(stream, &mut products, Start::Serial)?;
             }
         }
         let graph = stream
