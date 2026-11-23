@@ -1,7 +1,7 @@
 //! Runs the engine token by token over an MLX-LM capture and reports how far each layer
 //! visit and the logits are from MLX.
 //!
-//! usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP]
+//! usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP] [--kv bf16|fp8]
 //!
 //! `--detail` prints every visit of one step, with the number of BF16 values that differ.
 //!
@@ -29,6 +29,7 @@ mod linux {
     use inkling_cuda::{
         Gpu,
         model::{Model, Trace},
+        ops::attention::KvFormat,
         weights::Weights,
     };
     use safetensors::{Dtype, SafeTensors};
@@ -41,30 +42,36 @@ mod linux {
         capture: PathBuf,
         passes: Option<usize>,
         detail: Option<String>,
+        kv: KvFormat,
     }
 
     fn args() -> anyhow::Result<Args> {
         let mut positional = Vec::new();
         let mut passes = None;
         let mut detail = None;
+        let mut kv = KvFormat::Bf16;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if arg == "--passes" {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
             } else if arg == "--detail" {
                 detail = Some(it.next().context("--detail needs a step name")?);
+            } else if arg == "--kv" {
+                kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
             } else {
                 positional.push(PathBuf::from(arg));
             }
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
-            "usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP]",
+            "usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP] \
+             [--kv bf16|fp8]",
         )?;
         Ok(Args {
             model,
             capture,
             passes,
             detail,
+            kv,
         })
     }
 
@@ -146,7 +153,7 @@ mod linux {
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         gpu.stream().synchronize()?;
         eprintln!("loaded weights in {:.1} s", start.elapsed().as_secs_f64());
-        let mut model = Model::new(&gpu, config, weights, passes, CAPACITY)?;
+        let mut model = Model::with_kv_format(&gpu, config, weights, passes, CAPACITY, args.kv)?;
 
         let mut trace = Trace::default();
         let mut matches = 0;

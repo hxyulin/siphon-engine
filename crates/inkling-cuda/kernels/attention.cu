@@ -3,8 +3,9 @@
 // Shapes are those of every Inkling layer: 24 query heads, 8 KV heads (GQA
 // groups of 3), head dim 128, relative width 16.
 //
-// KV cache layout: keys and values are separate BF16 buffers of shape
-// [slots, 8, 128], so appending one token writes 2 KiB contiguously into each.
+// KV cache layout: keys and values are separate buffers of shape [slots, 8, 128],
+// so appending one token writes one contiguous row into each. The elements are
+// BF16, or E4M3 for an FP8 global cache (see `kv_append_fp8`).
 // A sliding layer's cache is a ring of `slots` = window entries and position p
 // lives in slot p mod slots. A global layer's cache stores position p in slot p
 // and never wraps. Both cases share one rule: at query position p the cache
@@ -18,7 +19,8 @@
 // four results in order. The PTX .rn.ftz helpers keep nvcc from fusing or
 // reordering that tree; .ftz because MLX flushes subnormals.
 //
-// `decode_attention_bf16` computes, for each query head h with KV head g:
+// `decode_attention_bf16` and `decode_attention_fp8` compute, for each query
+// head h with KV head g:
 //   q' = scale * q                          (F32)
 //   score_s = q' . k_s + bias[h, d_s]       (bias only for distance d_s < extent)
 //   out = sum_s e^(score_s) v_s / (e^sink + sum_s e^(score_s))
@@ -26,8 +28,12 @@
 // layer). It is memory bound, so it reads each KV head once for its 3 query
 // heads and keeps enough loads in flight to stream the cache at DRAM speed.
 // Only the summation order differs from MLX's sdpa_vector; every sum is F32.
+// The FP8 variant runs the same arithmetic on the cache values decoded exactly
+// to F32, over tiles of 64 keys so that a tile holds the same 16 KiB.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cfloat>
 #include <cstdint>
 
@@ -41,16 +47,12 @@ constexpr int kRelDim = 16;
 constexpr int kKvRow = kKvHeads * kHeadDim;
 
 // Decode attention tiling. A block of 4 warps handles one KV head over one
-// contiguous range of cache slots (a split), in tiles of 32 keys.
+// contiguous range of cache slots (a split), in tiles of 32 BF16 or 64 E4M3
+// keys.
 constexpr int kWarps = 4;
 constexpr int kThreads = kWarps * 32;
-constexpr int kTile = 32;
-// 16-byte chunks in one key or value head of 128 BF16 values.
-constexpr int kChunks = kHeadDim / 8;
 // Dims of a key each warp multiplies in the score phase.
 constexpr int kWarpDims = kHeadDim / kWarps;
-// Keys of a tile each warp accumulates in the value phase.
-constexpr int kWarpKeys = kTile / kWarps;
 // Split rows the partial buffers hold per query head. The launcher keeps the
 // grid's split count at or below this.
 constexpr int kMaxSplits = 64;
@@ -104,6 +106,66 @@ __device__ __forceinline__ void unpack_bf16x4(uint2 raw, float (&v)[4]) {
     v[3] = __uint_as_float(raw.y & 0xffff0000u);
 }
 
+// Two E4M3 values (the low byte is the first) as F32, exact: the hardware
+// converts E4M3 pairs to F16 pairs.
+__device__ __forceinline__ float2 e4m3x2_to_float2(uint32_t pair) {
+    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
+}
+
+__device__ __forceinline__ void unpack_e4m3x4(uint32_t raw, float (&v)[4]) {
+    const float2 a = e4m3x2_to_float2(raw & 0xffffu);
+    const float2 b = e4m3x2_to_float2(raw >> 16);
+    v[0] = a.x;
+    v[1] = a.y;
+    v[2] = b.x;
+    v[3] = b.y;
+}
+
+// The 16 E4M3 values packed in a 16-byte word, as F32.
+__device__ __forceinline__ void unpack_e4m3x16(uint4 raw, float (&v)[16]) {
+    const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float w[4];
+        unpack_e4m3x4(words[i], w);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[4 * i + j] = w[j];
+        }
+    }
+}
+
+// Four floats rounded to E4M3 (nearest even, saturated to +-448), first value
+// in the low byte.
+__device__ __forceinline__ uint32_t pack_e4m3x4(float a, float b, float c, float d) {
+    const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+    const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+    return lo | hi << 16;
+}
+
+// Cache element formats of decode attention. `Elem` is the stored type, `kTile`
+// the keys per tile and `kChunkElems` the elements in 16 bytes. `unpack_chunk`
+// decodes 16 bytes and `unpack4` the 4 elements at `p`.
+struct Bf16Format {
+    using Elem = __nv_bfloat16;
+    static constexpr int kTile = 32;
+    static constexpr int kChunkElems = 8;
+    __device__ static void unpack_chunk(uint4 raw, float (&v)[kChunkElems]) { unpack_bf16x8(raw, v); }
+    __device__ static void unpack4(const Elem* p, float (&v)[4]) {
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(p), v);
+    }
+};
+
+struct Fp8Format {
+    using Elem = uint8_t;
+    static constexpr int kTile = 64;
+    static constexpr int kChunkElems = 16;
+    __device__ static void unpack_chunk(uint4 raw, float (&v)[kChunkElems]) { unpack_e4m3x16(raw, v); }
+    __device__ static void unpack4(const Elem* p, float (&v)[4]) {
+        unpack_e4m3x4(*reinterpret_cast<const uint32_t*>(p), v);
+    }
+};
+
 // Copies 16 bytes from global to shared memory without blocking, or writes 16
 // zero bytes when `valid` is false.
 __device__ __forceinline__ void copy_async16(void* dst, const void* src, bool valid) {
@@ -119,12 +181,17 @@ __device__ __forceinline__ void copy_async_wait_all() {
     asm volatile("cp.async.wait_group 0;" ::: "memory");
 }
 
+template <class F>
 struct alignas(16) DecodeShared {
+    static constexpr int kTile = F::kTile;
+    // 16-byte chunks in one key or value head.
+    static constexpr int kChunks = kHeadDim / F::kChunkElems;
     // Two stages of key and value tiles, [kTile, 128] each. Key rows are
-    // swizzled: logical chunk c of row r sits at chunk c ^ (r % 16), so that 32
-    // lanes reading the same logical chunk of 32 rows hit distinct banks.
-    __nv_bfloat16 k[2][kTile * kHeadDim];
-    __nv_bfloat16 v[2][kTile * kHeadDim];
+    // swizzled: logical chunk c of row r sits at chunk c ^ (r % kChunks), so
+    // that the lanes of a quarter warp, reading the same logical chunk of
+    // consecutive rows, hit distinct banks.
+    typename F::Elem k[2][kTile * kHeadDim];
+    typename F::Elem v[2][kTile * kHeadDim];
     // Per-warp partial scores over each warp's quarter of the dims.
     float scores[kWarps][kGroup][kTile];
     // Softmax weights of the tile's keys for the 3 heads, padded to 4.
@@ -138,9 +205,13 @@ struct alignas(16) DecodeShared {
 
 // Starts copying the key and value tile that begins at slot `first`. Slots at
 // or past `end` read as zeros.
-__device__ __forceinline__ void load_tile(DecodeShared& sm, int stage, const __nv_bfloat16* k_cache,
-                                          const __nv_bfloat16* v_cache, int kv_head, unsigned first,
+template <class F>
+__device__ __forceinline__ void load_tile(DecodeShared<F>& sm, int stage, const typename F::Elem* k_cache,
+                                          const typename F::Elem* v_cache, int kv_head, unsigned first,
                                           unsigned end) {
+    constexpr int kTile = F::kTile;
+    constexpr int kChunks = DecodeShared<F>::kChunks;
+    constexpr int kElems = F::kChunkElems;
 #pragma unroll
     for (int k = 0; k < kTile * kChunks / kThreads; ++k) {
         const int i = threadIdx.x + k * kThreads;
@@ -148,9 +219,9 @@ __device__ __forceinline__ void load_tile(DecodeShared& sm, int stage, const __n
         const int chunk = i % kChunks;
         const unsigned slot = first + row;
         const bool valid = slot < end;
-        const size_t offset = size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * 8;
-        copy_async16(&sm.k[stage][row * kHeadDim + (chunk ^ (row % 16)) * 8], k_cache + offset, valid);
-        copy_async16(&sm.v[stage][row * kHeadDim + chunk * 8], v_cache + offset, valid);
+        const size_t offset = size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * kElems;
+        copy_async16(&sm.k[stage][row * kHeadDim + (chunk ^ (row % kChunks)) * kElems], k_cache + offset, valid);
+        copy_async16(&sm.v[stage][row * kHeadDim + chunk * kElems], v_cache + offset, valid);
     }
     copy_async_commit();
 }
@@ -197,6 +268,26 @@ kv_append_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* k_
     *reinterpret_cast<uint4*>(v_cache + dst) = *reinterpret_cast<const uint4*>(v + i);
 }
 
+// The FP8 variant of `kv_append_bf16`: rounds each BF16 value to E4M3, nearest
+// even and saturated to +-448, without a scale. Keys are L2-clipped to norm
+// sqrt(512) and values RMS-normed per head, so no element exceeds 22.7 and
+// saturation never happens. E4M3 keeps 3 mantissa bits (relative error at most
+// 2^-4) down to 2^-6; smaller elements round to multiples of 2^-9.
+extern "C" __global__ void __launch_bounds__(128)
+kv_append_fp8(const __nv_bfloat16* k, const __nv_bfloat16* v, uint8_t* k_cache, uint8_t* v_cache,
+              const unsigned* position, unsigned slots) {
+    const size_t i = threadIdx.x * 8;
+    const size_t dst = size_t(*position % slots) * kKvRow + i;
+    float x[8];
+    unpack_bf16x8(*reinterpret_cast<const uint4*>(k + i), x);
+    *reinterpret_cast<uint2*>(k_cache + dst) =
+        make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
+    unpack_bf16x8(*reinterpret_cast<const uint4*>(v + i), x);
+    *reinterpret_cast<uint2*>(v_cache + dst) =
+        make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
+}
+
+namespace {
 
 // Decode attention of one token over a KV cache, for all 24 query heads.
 //
@@ -206,14 +297,14 @@ kv_append_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* k_
 // the last live slot hold no keys. The launch therefore stays the same at every
 // position p = *position_ptr, and a captured graph serves them all.
 //
-// Within a block, for each tile of 32 keys:
-// 1. Warp w multiplies dims 32w..32w+31 of the 3 queries with the 32 keys,
-//    lane l taking key l.
+// Within a block, for each tile of T = 32 (BF16) or 64 (E4M3) keys:
+// 1. Warp w multiplies dims 32w..32w+31 of the 3 queries with the T keys,
+//    lane l taking keys l, l + 32, ...
 // 2. Warp h < 3 adds the 4 partial scores and the bias of head h, and updates
 //    head h's running max over the split. Lane l keeps a running sum over its
 //    own keys.
 // 3. Every warp rescales its accumulators [3 heads, 4 dims per lane] by the
-//    change in each head's max, then adds the weighted values of 8 of the
+//    change in each head's max, then adds the weighted values of T / 4 of the
 //    tile's keys.
 // The next tile's copy runs during the current tile's arithmetic.
 //
@@ -226,12 +317,21 @@ kv_append_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* k_
 //
 // `slots` is the cache size, `window` the sliding window (0 for none) and
 // `extent` the bias table width.
-extern "C" __global__ void __launch_bounds__(kThreads)
-decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                      const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
-                      float* partial_sum, unsigned* counters, __nv_bfloat16* out, const unsigned* position_ptr,
-                      unsigned slots, unsigned window, unsigned extent, float scale) {
-    __shared__ DecodeShared sm;
+template <class F>
+__device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const typename F::Elem* k_cache,
+                                                 const typename F::Elem* v_cache, const __nv_bfloat16* bias,
+                                                 const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
+                                                 float* partial_sum, unsigned* counters, __nv_bfloat16* out,
+                                                 const unsigned* position_ptr, unsigned slots, unsigned window,
+                                                 unsigned extent, float scale) {
+    constexpr int kTile = F::kTile;
+    // Keys of a tile each lane scores, and each warp accumulates in the value
+    // phase.
+    constexpr int kLaneKeys = kTile / 32;
+    constexpr int kWarpKeys = kTile / kWarps;
+    constexpr int kElems = F::kChunkElems;
+    constexpr int kChunks = DecodeShared<F>::kChunks;
+    __shared__ DecodeShared<F> sm;
     const unsigned position = *position_ptr;
     const int kv_head = blockIdx.x;
     const int split = blockIdx.y;
@@ -288,47 +388,64 @@ decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, cons
                 load_tile(sm, 1 - stage, k_cache, v_cache, kv_head, begin + (t + 1) * kTile, end);
             }
 
-            // 1. Partial scores of key `lane` over this warp's dims.
-            const __nv_bfloat16* keys = sm.k[stage] + lane * kHeadDim;
-            float acc[kGroup] = {};
+            // 1. Partial scores of keys `lane + 32 j` over this warp's dims.
 #pragma unroll
-            for (int c = 0; c < kWarpDims / 8; ++c) {
-                const int chunk_index = warp * (kWarpDims / 8) + c;
-                const uint4 raw = *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (lane % 16)) * 8);
-                float kv[8];
-                unpack_bf16x8(raw, kv);
+            for (int j = 0; j < kLaneKeys; ++j) {
+                const int row = lane + 32 * j;
+                const typename F::Elem* keys = sm.k[stage] + row * kHeadDim;
+                float acc[kGroup] = {};
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
+                for (int c = 0; c < kWarpDims / kElems; ++c) {
+                    const int chunk_index = warp * (kWarpDims / kElems) + c;
+                    const uint4 raw = *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (row % kChunks)) * kElems);
+                    float kv[kElems];
+                    F::unpack_chunk(raw, kv);
 #pragma unroll
-                    for (int h = 0; h < kGroup; ++h) {
-                        acc[h] = fmaf(qs[h][c * 8 + i], kv[i], acc[h]);
+                    for (int i = 0; i < kElems; ++i) {
+#pragma unroll
+                        for (int h = 0; h < kGroup; ++h) {
+                            acc[h] = fmaf(qs[h][c * kElems + i], kv[i], acc[h]);
+                        }
                     }
                 }
-            }
 #pragma unroll
-            for (int h = 0; h < kGroup; ++h) {
-                sm.scores[warp][h][lane] = acc[h];
+                for (int h = 0; h < kGroup; ++h) {
+                    sm.scores[warp][h][row] = acc[h];
+                }
             }
             __syncthreads();
 
             // 2. Softmax weights of head `warp`.
             if (warp < kGroup) {
-                const unsigned slot = begin + t * kTile + lane;
-                const unsigned distance = (newest + slots - slot) % slots;
-                float score = -INFINITY;
-                if (slot < end && (window == 0 || distance < window)) {
-                    score = (sm.scores[0][warp][lane] + sm.scores[1][warp][lane]) +
-                            (sm.scores[2][warp][lane] + sm.scores[3][warp][lane]);
-                    if (distance < extent) {
-                        score += __bfloat162float(bias[head * extent + distance]);
+                float score[kLaneKeys];
+#pragma unroll
+                for (int j = 0; j < kLaneKeys; ++j) {
+                    const int row = lane + 32 * j;
+                    const unsigned slot = begin + t * kTile + row;
+                    const unsigned distance = (newest + slots - slot) % slots;
+                    score[j] = -INFINITY;
+                    if (slot < end && (window == 0 || distance < window)) {
+                        score[j] = (sm.scores[0][warp][row] + sm.scores[1][warp][row]) +
+                                   (sm.scores[2][warp][row] + sm.scores[3][warp][row]);
+                        if (distance < extent) {
+                            score[j] += __bfloat162float(bias[head * extent + distance]);
+                        }
                     }
                 }
-                const float new_m = fmaxf(m, warp_max(score));
+                float tile_max = score[0];
+#pragma unroll
+                for (int j = 1; j < kLaneKeys; ++j) {
+                    tile_max = fmaxf(tile_max, score[j]);
+                }
+                const float new_m = fmaxf(m, warp_max(tile_max));
                 const float factor = fast_exp(m - new_m);
-                const float weight = fast_exp(score - new_m);
+#pragma unroll
+                for (int j = 0; j < kLaneKeys; ++j) {
+                    const float weight = fast_exp(score[j] - new_m);
+                    sum = j == 0 ? fmaf(sum, factor, weight) : sum + weight;
+                    reinterpret_cast<float*>(&sm.weights[lane + 32 * j])[warp] = weight;
+                }
                 m = new_m;
-                sum = fmaf(sum, factor, weight);
-                reinterpret_cast<float*>(&sm.weights[lane])[warp] = weight;
                 if (lane == 0) {
                     sm.factor[warp] = factor;
                 }
@@ -344,11 +461,11 @@ decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, cons
                     o[h][i] *= factor;
                 }
             }
-            const __nv_bfloat16* values = sm.v[stage];
+            const typename F::Elem* values = sm.v[stage];
 #pragma unroll
             for (int r = warp * kWarpKeys; r < (warp + 1) * kWarpKeys; ++r) {
                 float v[4];
-                unpack_bf16x4(*reinterpret_cast<const uint2*>(values + r * kHeadDim + lane * 4), v);
+                F::unpack4(values + r * kHeadDim + lane * 4, v);
                 const float4 w = sm.weights[r];
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
@@ -361,6 +478,7 @@ decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, cons
 
         // Sum the 4 warps' accumulators and write this split's partials.
         __syncthreads();
+        static_assert(sizeof(sm.k[0]) >= kWarps * kGroup * kHeadDim * sizeof(float));
         auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) {
@@ -457,4 +575,25 @@ decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, cons
     if (threadIdx.x == 0) {
         counters[kv_head] = 0;
     }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kThreads)
+decode_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                      const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
+                      float* partial_sum, unsigned* counters, __nv_bfloat16* out, const unsigned* position_ptr,
+                      unsigned slots, unsigned window, unsigned extent, float scale) {
+    decode_attention<Bf16Format>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, counters,
+                                 out, position_ptr, slots, window, extent, scale);
+}
+
+// `decode_attention_bf16` over E4M3 caches written by `kv_append_fp8`.
+extern "C" __global__ void __launch_bounds__(kThreads)
+decode_attention_fp8(const __nv_bfloat16* q, const uint8_t* k_cache, const uint8_t* v_cache,
+                     const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
+                     float* partial_sum, unsigned* counters, __nv_bfloat16* out, const unsigned* position_ptr,
+                     unsigned slots, unsigned window, unsigned extent, float scale) {
+    decode_attention<Fp8Format>(q, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, counters,
+                                out, position_ptr, slots, window, extent, scale);
 }

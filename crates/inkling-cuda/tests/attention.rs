@@ -5,16 +5,25 @@
 //! MLX's decode attention at a few positions across the window and the bias table width. The
 //! host reference covers what the fixture is too short for: a global cache of 40,000 keys cut
 //! into the full number of splits, and a sliding ring that has wrapped several times.
+//!
+//! FP8 global caches are checked against the same F64 reference applied to the E4M3 values
+//! the cache holds, with the BF16 tolerance: decoding E4M3 is exact, so only the rounding of
+//! the cache differs. The tests also print the error against the reference on the BF16
+//! values, which is the quantization error.
 
 #![cfg(target_os = "linux")]
 
 mod common;
 
+use std::sync::OnceLock;
+
 use common::{Fixture, assert_bf16_close, bf16_ulps};
 use half::bf16;
 use inkling_cuda::{
     Gpu,
-    ops::attention::{Attention, AttentionScratch, HEAD_DIM, HEADS, KV_HEADS, KvCache},
+    ops::attention::{
+        Attention, AttentionScratch, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData, KvFormat,
+    },
 };
 
 const WINDOW: usize = 1024;
@@ -66,8 +75,8 @@ struct Query {
 /// absolute values, the scale of the terms whose rounding errors add up in the output.
 fn reference(
     query: &Query,
-    keys: &[bf16],
-    values: &[bf16],
+    keys: &[f32],
+    values: &[f32],
     window: Option<usize>,
     position: usize,
 ) -> (Vec<f64>, Vec<f64>) {
@@ -89,7 +98,7 @@ fn reference(
                 continue;
             }
             let k = &keys[s * ROW + kv..s * ROW + kv + HEAD_DIM];
-            let mut score: f64 = q.iter().zip(k).map(|(&a, &b)| a * b.to_f64()).sum();
+            let mut score: f64 = q.iter().zip(k).map(|(&a, &b)| a * f64::from(b)).sum();
             if distance < EXTENT {
                 score += query.bias[h * EXTENT + distance].to_f64();
             }
@@ -109,8 +118,8 @@ fn reference(
                 .zip(head_magnitude.iter_mut())
                 .zip(value)
             {
-                *o += weight * v.to_f64();
-                *m += weight * v.to_f64().abs();
+                *o += weight * f64::from(*v);
+                *m += weight * f64::from(v.abs());
             }
         }
         for (o, m) in head_out.iter_mut().zip(head_magnitude.iter_mut()) {
@@ -155,6 +164,69 @@ fn assert_within(label: &str, got: &[bf16], want: &[f64], magnitude: &[f64], rel
     );
 }
 
+/// The value of E4M3 code `bits` (no NaN codes reach it).
+fn e4m3_value(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 3) & 0xf);
+    let mantissa = f32::from(bits & 7);
+    let magnitude = if exponent == 0 {
+        mantissa / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    };
+    sign * magnitude
+}
+
+/// `x` rounded to E4M3: nearest, ties to the even code, saturated to +-448. Codes 0..=126
+/// are the non-negative finite values in increasing order.
+fn e4m3_from_f32(x: f32) -> u8 {
+    static VALUES: OnceLock<Vec<f32>> = OnceLock::new();
+    let values = VALUES.get_or_init(|| (0..=126).map(e4m3_value).collect());
+    let sign = if x.is_sign_negative() { 0x80 } else { 0 };
+    let a = x.abs();
+    // The last code whose value is at most `a`; code 0 is zero.
+    let below = values.partition_point(|&v| v <= a) - 1;
+    let code = if below == 126 {
+        126
+    } else {
+        let (low, high) = (values[below], values[below + 1]);
+        match (a - low).total_cmp(&(high - a)) {
+            std::cmp::Ordering::Less => below,
+            std::cmp::Ordering::Greater => below + 1,
+            std::cmp::Ordering::Equal => below + (below & 1),
+        }
+    };
+    sign | u8::try_from(code).expect("codes fit in a byte")
+}
+
+/// The value `format`'s cache stores for `x`.
+fn stored(format: KvFormat, x: bf16) -> f32 {
+    match format {
+        KvFormat::Bf16 => x.to_f32(),
+        KvFormat::Fp8 => e4m3_value(e4m3_from_f32(x.to_f32())),
+    }
+}
+
+/// Prints how far `got` is from `want`, the reference on the unquantized cache: the RMS error
+/// over the RMS output, and the largest error over the largest output.
+fn report_quantization_error(label: &str, got: &[bf16], want: &[f64]) {
+    let (mut err2, mut want2) = (0.0f64, 0.0f64);
+    let (mut max_err, mut max_want) = (0.0f64, 0.0f64);
+    for (&g, &w) in got.iter().zip(want) {
+        let err = g.to_f64() - w;
+        err2 += err * err;
+        want2 += w * w;
+        max_err = max_err.max(err.abs());
+        max_want = max_want.max(w.abs());
+    }
+    eprintln!(
+        "{label} vs unquantized F64: RMS error {:.2e} of the RMS output, largest error {:.2e} \
+         of the largest output",
+        (err2 / want2).sqrt(),
+        max_err / max_want
+    );
+}
+
 #[test]
 fn relative_bias_matches_mlx() -> anyhow::Result<()> {
     let setup = Setup::new()?;
@@ -181,6 +253,16 @@ fn relative_bias_matches_mlx() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Host copy of a cache, `[slots, 8, 128]` each.
+struct HostCache {
+    /// The values the cache stores.
+    keys: Vec<f32>,
+    values: Vec<f32>,
+    /// The BF16 values appended, before any rounding to the cache format.
+    exact_keys: Vec<f32>,
+    exact_values: Vec<f32>,
+}
+
 /// Appends `k` and `v` (`[tokens, 8, 128]`) to `cache` one token at a time and, at each
 /// position that `query` returns inputs for, runs decode attention and passes the output and
 /// the host copy of the cache to `check`.
@@ -191,12 +273,17 @@ fn run_decode(
     k: &[bf16],
     v: &[bf16],
     mut query: impl FnMut(usize) -> anyhow::Result<Option<Query>>,
-    mut check: impl FnMut(usize, &Query, &[bf16], &[bf16], &[bf16]) -> anyhow::Result<()>,
+    mut check: impl FnMut(usize, &Query, &HostCache, &[bf16]) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let stream = gpu.stream();
     let slots = cache.slots();
-    let mut keys = vec![bf16::ZERO; slots * ROW];
-    let mut values = vec![bf16::ZERO; slots * ROW];
+    let format = cache.format();
+    let mut host = HostCache {
+        keys: vec![0.0; slots * ROW],
+        values: vec![0.0; slots * ROW],
+        exact_keys: vec![0.0; slots * ROW],
+        exact_values: vec![0.0; slots * ROW],
+    };
     let k_dev = stream.clone_htod(k)?;
     let v_dev = stream.clone_htod(v)?;
     let mut scratch = AttentionScratch::new(stream)?;
@@ -206,8 +293,13 @@ fn run_decode(
         assert!(cache.holds(position));
         let token = position * ROW..(position + 1) * ROW;
         let slot = (position % slots) * ROW;
-        keys[slot..slot + ROW].copy_from_slice(&k[token.clone()]);
-        values[slot..slot + ROW].copy_from_slice(&v[token.clone()]);
+        for i in 0..ROW {
+            let (key, value) = (k[token.start + i], v[token.start + i]);
+            host.keys[slot + i] = stored(format, key);
+            host.values[slot + i] = stored(format, value);
+            host.exact_keys[slot + i] = key.to_f32();
+            host.exact_values[slot + i] = value.to_f32();
+        }
         stream.memcpy_htod(&[u32::try_from(position)?], &mut position_dev)?;
         attention.append(
             stream,
@@ -233,7 +325,7 @@ fn run_decode(
             &mut out_dev,
         )?;
         let got = stream.clone_dtoh(&out_dev)?;
-        check(position, &inputs, &keys, &values, &got)?;
+        check(position, &inputs, &host, &got)?;
     }
     Ok(())
 }
@@ -246,6 +338,7 @@ fn check_fixture(setup: &Setup, case: &str, cache: KvCache) -> anyhow::Result<()
     let (v, _) = fixture.bf16("v")?;
     let checks = setup.checks()?;
     let window = cache.window();
+    let format = cache.format();
     run_decode(
         &setup.gpu,
         &setup.attention,
@@ -263,9 +356,9 @@ fn check_fixture(setup: &Setup, case: &str, cache: KvCache) -> anyhow::Result<()
                 sinks: fixture.bf16(&format!("{prefix}.sinks"))?.0,
             }))
         },
-        |position, query, keys, values, got| {
+        |position, query, host, got| {
             let prefix = format!("{case}.{position}");
-            let (want, magnitude) = reference(query, keys, values, window, position);
+            let (want, magnitude) = reference(query, &host.keys, &host.values, window, position);
             assert_within(
                 &format!("{prefix} vs F64"),
                 got,
@@ -273,6 +366,17 @@ fn check_fixture(setup: &Setup, case: &str, cache: KvCache) -> anyhow::Result<()
                 &magnitude,
                 F32_ERROR,
             );
+            if format == KvFormat::Fp8 {
+                let (exact, _) = reference(
+                    query,
+                    &host.exact_keys,
+                    &host.exact_values,
+                    window,
+                    position,
+                );
+                report_quantization_error(&prefix, got, &exact);
+                return Ok(());
+            }
             let (mlx, _) = fixture.bf16(&format!("{prefix}.out"))?;
             let mlx: Vec<f64> = mlx.iter().map(|x| x.to_f64()).collect();
             let relative = F32_ERROR + MLX_PARTIAL_ERROR;
@@ -293,6 +397,14 @@ fn sliding_decode_attention_matches_mlx() -> anyhow::Result<()> {
 fn global_decode_attention_matches_mlx() -> anyhow::Result<()> {
     let setup = Setup::new()?;
     let cache = KvCache::global(setup.gpu.stream(), CAPACITY)?;
+    check_fixture(&setup, "global", cache)
+}
+
+/// The fixture's global case on an FP8 cache, against F64 on the E4M3 values.
+#[test]
+fn fp8_global_decode_attention_matches_reference() -> anyhow::Result<()> {
+    let setup = Setup::new()?;
+    let cache = KvCache::global_with_format(setup.gpu.stream(), CAPACITY, KvFormat::Fp8)?;
     check_fixture(&setup, "global", cache)
 }
 
@@ -352,10 +464,11 @@ fn check_random(cache: KvCache, tokens: usize, checks: &[usize], seed: u64) -> a
     let k = rng.heads(tokens * KV_HEADS, &topics);
     let v = rng.normals(tokens * ROW, 1.0);
     let window = cache.window();
-    let label = if window.is_some() {
-        "sliding"
-    } else {
-        "global"
+    let format = cache.format();
+    let label = match (window, format) {
+        (Some(_), _) => "sliding",
+        (None, KvFormat::Bf16) => "global",
+        (None, KvFormat::Fp8) => "fp8 global",
     };
     run_decode(
         &gpu,
@@ -370,15 +483,20 @@ fn check_random(cache: KvCache, tokens: usize, checks: &[usize], seed: u64) -> a
                 sinks: rng.normals(HEADS, 2.0),
             }))
         },
-        |position, query, keys, values, got| {
-            let (want, magnitude) = reference(query, keys, values, window, position);
-            assert_within(
-                &format!("{label}.{position}"),
-                got,
-                &want,
-                &magnitude,
-                F32_ERROR,
-            );
+        |position, query, host, got| {
+            let label = format!("{label}.{position}");
+            let (want, magnitude) = reference(query, &host.keys, &host.values, window, position);
+            assert_within(&label, got, &want, &magnitude, F32_ERROR);
+            if format == KvFormat::Fp8 {
+                let (exact, _) = reference(
+                    query,
+                    &host.exact_keys,
+                    &host.exact_values,
+                    window,
+                    position,
+                );
+                report_quantization_error(&label, got, &exact);
+            }
             Ok(())
         },
     )
@@ -391,6 +509,100 @@ fn long_global_decode_attention_matches_reference() -> anyhow::Result<()> {
     let cache = KvCache::global(gpu.stream(), 40_960)?;
     let checks = [0, 1, 31, 32, 33, 1023, 1024, 2561, 8191, 20_000, tokens - 1];
     check_random(cache, tokens, &checks, 1)
+}
+
+#[test]
+fn long_fp8_global_decode_attention_matches_reference() -> anyhow::Result<()> {
+    let tokens = 40_000;
+    let gpu = Gpu::new(0)?;
+    let cache = KvCache::global_with_format(gpu.stream(), 40_960, KvFormat::Fp8)?;
+    let checks = [
+        0,
+        1,
+        31,
+        32,
+        33,
+        63,
+        64,
+        65,
+        1023,
+        1024,
+        2561,
+        8191,
+        20_000,
+        tokens - 1,
+    ];
+    check_random(cache, tokens, &checks, 1)
+}
+
+/// The FP8 append stores every BF16 value rounded to E4M3 as the host does it: nearest, ties
+/// to even, saturated to +-448, including zeros, subnormals, ties and out-of-range values.
+#[test]
+fn fp8_append_rounds_to_nearest_even() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let tokens = 64;
+    let mut cache = KvCache::global_with_format(stream, tokens, KvFormat::Fp8)?;
+    let mut rng = Rng(3);
+    let edges: Vec<bf16> = [
+        0.0,
+        -0.0,
+        448.0,
+        -448.0,
+        464.0,
+        480.0,
+        1e4,
+        -1e4,
+        0.015_625,
+        0.001_953_125,
+        0.000_976_562_5,
+        0.002_929_687_5,
+        -0.002_929_687_5,
+        1.0625,
+        1.1875,
+        22.627,
+        -22.627,
+        11.3,
+        3e-5,
+    ]
+    .into_iter()
+    .map(bf16::from_f32)
+    .collect();
+    let mut k = rng.normals(tokens * ROW, 4.0);
+    let mut v = rng.normals(tokens * ROW, 1.0);
+    k[..edges.len()].copy_from_slice(&edges);
+    v[ROW..ROW + edges.len()].copy_from_slice(&edges);
+    let k_dev = stream.clone_htod(&k)?;
+    let v_dev = stream.clone_htod(&v)?;
+    let mut position_dev = stream.alloc_zeros::<u32>(1)?;
+    for position in 0..tokens {
+        let token = position * ROW..(position + 1) * ROW;
+        stream.memcpy_htod(&[u32::try_from(position)?], &mut position_dev)?;
+        attention.append(
+            stream,
+            &mut cache,
+            &position_dev,
+            &k_dev.slice(token.clone()),
+            &v_dev.slice(token),
+        )?;
+    }
+    let KvData::Fp8 { keys, values } = cache.data() else {
+        anyhow::bail!("the cache is not FP8");
+    };
+    for (name, got, want) in [
+        ("keys", stream.clone_dtoh(keys)?, &k),
+        ("values", stream.clone_dtoh(values)?, &v),
+    ] {
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let expected = e4m3_from_f32(w.to_f32());
+            assert_eq!(
+                g, expected,
+                "{name}[{i}]: {w} stored as {g:#04x}, want {expected:#04x}"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Quality gate: runs the engine teacher-forced over a long text and checks that it
 //! still computes the same model as MLX-LM, within a multiple of MLX's own noise.
 //!
-//! usage: eval <model-dir> <capture.safetensors> [--passes N]
+//! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. The gate
@@ -27,7 +27,7 @@ mod linux {
 
     use anyhow::{Context as _, ensure};
     use inkling::{Checkpoint, TextConfig};
-    use inkling_cuda::{Gpu, model::Model, weights::Weights};
+    use inkling_cuda::{Gpu, model::Model, ops::attention::KvFormat, weights::Weights};
     use safetensors::{Dtype, SafeTensors};
 
     // Thresholds, from MLX's disagreement with itself between its chunked (multi-row)
@@ -52,26 +52,31 @@ mod linux {
         model: PathBuf,
         capture: PathBuf,
         passes: Option<usize>,
+        kv: KvFormat,
     }
 
     fn args() -> anyhow::Result<Args> {
         let mut positional = Vec::new();
         let mut passes = None;
+        let mut kv = KvFormat::Bf16;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if arg == "--passes" {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
+            } else if arg == "--kv" {
+                kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
             } else {
                 positional.push(PathBuf::from(arg));
             }
         }
-        let [model, capture] = <[PathBuf; 2]>::try_from(positional)
-            .ok()
-            .context("usage: eval <model-dir> <capture.safetensors> [--passes N]")?;
+        let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
+            "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]",
+        )?;
         Ok(Args {
             model,
             capture,
             passes,
+            kv,
         })
     }
 
@@ -283,7 +288,7 @@ mod linux {
         gpu.stream().synchronize()?;
         eprintln!("loaded weights in {:.1} s", start.elapsed().as_secs_f64());
         let capacity = n + capture.continuation.len();
-        let mut model = Model::new(&gpu, config, weights, passes, capacity)?;
+        let mut model = Model::with_kv_format(&gpu, config, weights, passes, capacity, args.kv)?;
 
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)

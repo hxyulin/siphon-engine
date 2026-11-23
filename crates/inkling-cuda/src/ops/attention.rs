@@ -11,8 +11,12 @@
 //! Append and attention read the token's position from a one-element device buffer, so a
 //! captured CUDA graph can replay them at any position. The caller tracks the position on
 //! the host and checks [`KvCache::holds`] before each token.
+//!
+//! A global cache stores BF16 or, with [`KvFormat::Fp8`], E4M3 keys and values. Each cache
+//! picks its kernels when they are launched, so a captured graph holds the variant of each
+//! cache and nothing branches when it replays.
 
-use std::sync::Arc;
+use std::{fmt, str::FromStr, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
@@ -46,9 +50,67 @@ const DECODE_BLOCK: u32 = 128;
 /// Threads per block of the relative-bias kernel.
 const BIAS_BLOCK: u32 = 256;
 
+/// Element format of the global-layer KV caches. Sliding caches are always BF16.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvFormat {
+    /// BF16, the projections' own values.
+    #[default]
+    Bf16,
+    /// E4M3 without a scale: each BF16 value rounded to the nearest E4M3 value, which halves
+    /// the bytes attention reads. Keys are L2-clipped to norm `sqrt(512)` and values are
+    /// RMS-normed, so every element lies far inside E4M3's range of +-448.
+    Fp8,
+}
+
+impl KvFormat {
+    /// Bytes of one stored key or value element.
+    #[must_use]
+    pub fn element_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::Fp8 => 1,
+        }
+    }
+}
+
+impl FromStr for KvFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "bf16" => Ok(Self::Bf16),
+            "fp8" => Ok(Self::Fp8),
+            _ => anyhow::bail!("unknown KV cache format {s:?}; expected bf16 or fp8"),
+        }
+    }
+}
+
+impl fmt::Display for KvFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
+}
+
+/// The key and value buffers of a [`KvCache`], each of shape `[slots, 8, 128]`.
+#[derive(Debug)]
+pub enum KvData {
+    Bf16 {
+        keys: CudaSlice<bf16>,
+        values: CudaSlice<bf16>,
+    },
+    /// E4M3 bytes.
+    Fp8 {
+        keys: CudaSlice<u8>,
+        values: CudaSlice<u8>,
+    },
+}
+
 /// One layer's keys and values.
 ///
-/// `keys` and `values` are BF16 buffers of shape `[slots, 8, 128]`. A sliding cache is a ring:
+/// The keys and values are buffers of shape `[slots, 8, 128]`. A sliding cache is a ring:
 /// position `p` lives in slot `p % slots`. A global cache stores position `p` in slot `p` and
 /// holds positions below its capacity. The layout matches MLX's `RotatingKVCache` and
 /// `KVCache` fed one token at a time.
@@ -57,29 +119,53 @@ const BIAS_BLOCK: u32 = 256;
 /// cache at position `p` holds the tokens at positions below `p`.
 #[derive(Debug)]
 pub struct KvCache {
-    keys: CudaSlice<bf16>,
-    values: CudaSlice<bf16>,
+    data: KvData,
     slots: usize,
     window: Option<usize>,
 }
 
 impl KvCache {
-    /// A ring of `window` slots for a sliding-window layer, which sees the last `window` keys.
+    /// A BF16 ring of `window` slots for a sliding-window layer, which sees the last `window`
+    /// keys.
     pub fn sliding(stream: &Arc<CudaStream>, window: usize) -> anyhow::Result<Self> {
-        Self::new(stream, window, Some(window))
+        Self::new(stream, window, Some(window), KvFormat::Bf16)
     }
 
-    /// A cache of `capacity` slots for a global layer, which sees every earlier key.
+    /// A BF16 cache of `capacity` slots for a global layer, which sees every earlier key.
     pub fn global(stream: &Arc<CudaStream>, capacity: usize) -> anyhow::Result<Self> {
-        Self::new(stream, capacity, None)
+        Self::global_with_format(stream, capacity, KvFormat::Bf16)
     }
 
-    fn new(stream: &Arc<CudaStream>, slots: usize, window: Option<usize>) -> anyhow::Result<Self> {
+    /// [`KvCache::global`] storing `format` elements.
+    pub fn global_with_format(
+        stream: &Arc<CudaStream>,
+        capacity: usize,
+        format: KvFormat,
+    ) -> anyhow::Result<Self> {
+        Self::new(stream, capacity, None, format)
+    }
+
+    fn new(
+        stream: &Arc<CudaStream>,
+        slots: usize,
+        window: Option<usize>,
+        format: KvFormat,
+    ) -> anyhow::Result<Self> {
         ensure!(slots > 0, "a KV cache needs at least one slot");
         u32::try_from(slots).context("too many KV cache slots")?;
+        let len = slots * KV_ROW;
+        let data = match format {
+            KvFormat::Bf16 => KvData::Bf16 {
+                keys: stream.alloc_zeros(len)?,
+                values: stream.alloc_zeros(len)?,
+            },
+            KvFormat::Fp8 => KvData::Fp8 {
+                keys: stream.alloc_zeros(len)?,
+                values: stream.alloc_zeros(len)?,
+            },
+        };
         Ok(Self {
-            keys: stream.alloc_zeros(slots * KV_ROW)?,
-            values: stream.alloc_zeros(slots * KV_ROW)?,
+            data,
             slots,
             window,
         })
@@ -104,13 +190,16 @@ impl KvCache {
     }
 
     #[must_use]
-    pub fn keys(&self) -> &CudaSlice<bf16> {
-        &self.keys
+    pub fn format(&self) -> KvFormat {
+        match self.data {
+            KvData::Bf16 { .. } => KvFormat::Bf16,
+            KvData::Fp8 { .. } => KvFormat::Fp8,
+        }
     }
 
     #[must_use]
-    pub fn values(&self) -> &CudaSlice<bf16> {
-        &self.values
+    pub fn data(&self) -> &KvData {
+        &self.data
     }
 }
 
@@ -150,7 +239,9 @@ fn splits(slots: usize) -> u32 {
 pub struct Attention {
     relative_bias: CudaFunction,
     kv_append: CudaFunction,
+    kv_append_fp8: CudaFunction,
     decode: CudaFunction,
+    decode_fp8: CudaFunction,
 }
 
 fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
@@ -173,7 +264,9 @@ impl Attention {
         Ok(Self {
             relative_bias: module.load_function("relative_bias_bf16")?,
             kv_append: module.load_function("kv_append_bf16")?,
+            kv_append_fp8: module.load_function("kv_append_fp8")?,
             decode: module.load_function("decode_attention_bf16")?,
+            decode_fp8: module.load_function("decode_attention_fp8")?,
         })
     }
 
@@ -207,7 +300,8 @@ impl Attention {
     }
 
     /// Writes one token's key `k` and value `v` (`[8, 128]` each) into `cache` at the token's
-    /// position, the one value in `position`.
+    /// position, the one value in `position`. An FP8 cache stores each value rounded to the
+    /// nearest E4M3 value, ties to even.
     ///
     /// The caller checks [`KvCache::holds`] for that position first.
     pub fn append(
@@ -228,18 +322,22 @@ impl Attention {
             block_dim: ((KV_ROW / 8) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.kv_append);
-        launch
-            .arg(&k)
-            .arg(&v)
-            .arg(&mut cache.keys)
-            .arg(&mut cache.values)
-            .arg(position)
-            .arg(&slots);
+        let function = match cache.data {
+            KvData::Bf16 { .. } => &self.kv_append,
+            KvData::Fp8 { .. } => &self.kv_append_fp8,
+        };
+        let mut launch = stream.launch_builder(function);
+        launch.arg(&k).arg(&v);
+        match &mut cache.data {
+            KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
+        };
+        launch.arg(position).arg(&slots);
         // SAFETY: the arguments match `kv_append_bf16(const bf16*, const bf16*, bf16*, bf16*,
-        // const unsigned*, unsigned)`. `k` and `v` hold one 1024-element row, `position` the one
-        // value the kernel reads, and the kernel writes slot `position % slots`, inside the
-        // `[slots, 1024]` caches.
+        // const unsigned*, unsigned)`, or `kv_append_fp8` with `uint8_t*` caches for an FP8
+        // cache. `k` and `v` hold one 1024-element row, `position` the one value the kernel
+        // reads, and the kernel writes slot `position % slots`, inside the `[slots, 1024]`
+        // caches.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -249,7 +347,8 @@ impl Attention {
     ///
     /// `bias` `[24, extent]` comes from [`Attention::relative_bias`]; a key at distance `d`
     /// gets `bias[h, d]` when `d < extent` and nothing otherwise. `sinks` `[24]` are the sink
-    /// logits. One launch: each block reads one KV head over one split of the cache for its 3
+    /// logits. An FP8 cache's E4M3 values are decoded exactly, so only the cache rounding
+    /// differs from BF16. One launch: each block reads one KV head over one split of the cache for its 3
     /// query heads, and the last block of each KV head combines the splits. The kernel cuts
     /// the live slots into splits from `position`, so the launch is the same at every
     /// position.
@@ -273,11 +372,17 @@ impl Attention {
         let slots = u32::try_from(cache.slots)?;
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
 
-        let mut launch = stream.launch_builder(&self.decode);
+        let function = match cache.data {
+            KvData::Bf16 { .. } => &self.decode,
+            KvData::Fp8 { .. } => &self.decode_fp8,
+        };
+        let mut launch = stream.launch_builder(function);
+        launch.arg(q);
+        match &cache.data {
+            KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
+        };
         launch
-            .arg(q)
-            .arg(&cache.keys)
-            .arg(&cache.values)
             .arg(bias)
             .arg(sinks)
             .arg(&mut scratch.out)
@@ -298,7 +403,8 @@ impl Attention {
         // SAFETY: the arguments match `decode_attention_bf16(const bf16* q, const bf16* k_cache,
         // const bf16* v_cache, const bf16* bias, const bf16* sinks, float* partial_out, float*
         // partial_max, float* partial_sum, unsigned* counters, bf16* out, const unsigned*
-        // position, unsigned slots, unsigned window, unsigned extent, float scale)`. The kernel
+        // position, unsigned slots, unsigned window, unsigned extent, float scale)`, or
+        // `decode_attention_fp8` with `uint8_t*` caches for an FP8 cache. The kernel
         // reads slots below min(position + 1, slots) of the caches and bias columns below
         // `extent`. It writes partial rows for 24 heads x at most `MAX_SPLITS` splits and 8
         // counters, which the scratch holds, and `out`, checked to hold 24 x 128 values.

@@ -36,10 +36,19 @@ The `bench` binary times greedy decode at several context lengths. For each leng
 
 ```sh
 pixi run cargo build --release -p inkling-cuda --bin bench
-target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps 100] [--warmup 10] [--json]
+target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps 100] [--warmup 10] [--kv bf16|fp8] [--json]
 ```
 
-Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token, plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
+Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token, 16 KiB with `--kv fp8`) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token, plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
+
+## KV cache format
+
+The global layers (5, 11, 17 and 23, 8 of the 48 layer visits) keep every earlier key and value, so at long context their attention reads most of the bytes of a step. `bench`, `eval` and `parity` take `--kv bf16|fp8`, and `Model::with_kv_format` takes the same choice:
+
+- `bf16`, the default, stores the keys and values as computed.
+- `fp8` stores the global caches as E4M3, which halves the bytes global attention reads. The sliding-window caches stay BF16.
+
+The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RMS-normed per head, so no element exceeds 22.7, far inside E4M3's ±448. The append kernel rounds each BF16 value to the nearest E4M3 value, ties to even. Attention decodes E4M3 exactly with the hardware converter, so it differs from BF16 only by that rounding. Ingine stores its FP8 global caches the same way.
 
 The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` is pinned to 2025.3, the last release built for CUDA 13.0, which the pinned `nvcc` requires. A kernel trace of 20 steps:
 
@@ -82,7 +91,7 @@ uv run --project reference python -I reference/capture.py <model-dir> reference/
 With `--token-by-token`, the prompt goes through one token per step, so MLX runs the same single-row decode path as the engine. The `parity` binary replays such a capture on the GPU and reports, per step, the logit difference, the KL divergence from MLX, whether the greedy token matches, and the layer visit furthest from MLX:
 
 ```sh
-cargo run --release -p inkling-cuda --bin parity -- <model-dir> reference/out/<name>.safetensors [--detail step016]
+cargo run --release -p inkling-cuda --bin parity -- <model-dir> reference/out/<name>.safetensors [--detail step016] [--kv bf16|fp8]
 ```
 
 `--detail` prints every visit of one step with the number of differing BF16 values.
@@ -101,7 +110,7 @@ uv run --project reference python -I reference/capture_eval.py compare reference
 The `eval` binary runs the engine over a capture on the GPU. It reports top-1 agreement, the mean absolute difference of the next-token log-probability, and perplexity, per range of positions. It also reports KL(MLX || engine) at the sampled positions, with the worst positions, and the greedy continuation match. It prints a verdict and exits with status 1 on failure:
 
 ```sh
-cargo run --release -p inkling-cuda --bin eval -- <model-dir> reference/out/anyhow-chunked.safetensors
+cargo run --release -p inkling-cuda --bin eval -- <model-dir> reference/out/anyhow-chunked.safetensors [--kv bf16|fp8]
 ```
 
 The thresholds are about 1.5 to 2 times MLX's disagreement between its chunked and token-by-token paths on the three texts:

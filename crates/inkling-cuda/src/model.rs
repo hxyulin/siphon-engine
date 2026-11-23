@@ -22,7 +22,7 @@ use inkling::TextConfig;
 use crate::{
     DeviceIn, Gpu,
     ops::{
-        attention::{Attention, AttentionScratch, KvCache},
+        attention::{Attention, AttentionScratch, KvCache, KvFormat},
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
@@ -308,7 +308,7 @@ fn block_starts(config: &TextConfig, layers: Range<usize>) -> usize {
 }
 
 impl Model {
-    /// Builds a runner with the looped core run `passes` times and caches for
+    /// Builds a runner with the looped core run `passes` times and BF16 caches for
     /// `capacity` tokens in the global layers.
     pub fn new(
         gpu: &Gpu,
@@ -316,6 +316,18 @@ impl Model {
         weights: Weights,
         passes: usize,
         capacity: usize,
+    ) -> anyhow::Result<Self> {
+        Self::with_kv_format(gpu, config, weights, passes, capacity, KvFormat::Bf16)
+    }
+
+    /// [`Model::new`] with the global-layer KV caches in `kv_format`.
+    pub fn with_kv_format(
+        gpu: &Gpu,
+        config: TextConfig,
+        weights: Weights,
+        passes: usize,
+        capacity: usize,
+        kv_format: KvFormat,
     ) -> anyhow::Result<Self> {
         let ctx = gpu.context();
         let stream = Arc::clone(gpu.stream());
@@ -339,7 +351,7 @@ impl Model {
                 let kv = if config.is_sliding(layer) {
                     KvCache::sliding(&stream, config.sliding_window_size)?
                 } else {
-                    KvCache::global(&stream, capacity)?
+                    KvCache::global_with_format(&stream, capacity, kv_format)?
                 };
                 Ok(VisitState {
                     kv,

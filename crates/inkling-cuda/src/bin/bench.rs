@@ -1,12 +1,13 @@
 //! Times greedy decode at several context lengths.
 //!
 //! usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps N]
-//!        [--warmup N] [--json]
+//!        [--warmup N] [--kv bf16|fp8] [--json]
 //!
 //! For each context length the runner skips its caches to that length without computing
 //! the skipped tokens, runs `--warmup` steps, then times `--steps` steps. The tokens it
 //! produces are meaningless, but each step does the same work as a real one. Without
 //! `--contexts`, it runs 0, 4096 and 32768, and 131072 if the cache fits in free memory.
+//! `--kv fp8` stores the global-layer KV caches as E4M3 instead of BF16.
 //!
 //! Results are comparable only on an otherwise idle GPU, so the output records the GPU
 //! clocks, the processes on the GPU and the time.
@@ -28,7 +29,7 @@ mod linux {
 
     use anyhow::{Context as _, ensure};
     use inkling::{Checkpoint, TextConfig};
-    use inkling_cuda::{Gpu, model::Model, weights::Weights};
+    use inkling_cuda::{Gpu, model::Model, ops::attention::KvFormat, weights::Weights};
 
     /// Bytes of weights one decode step reads.
     const WEIGHT_BYTES_PER_TOKEN: f64 = 5.5e9;
@@ -40,7 +41,7 @@ mod linux {
     /// Free memory to leave for the runner's per-step buffers.
     const HEADROOM: usize = 2 << 30;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
-                         [--steps N] [--warmup N] [--json]";
+                         [--steps N] [--warmup N] [--kv bf16|fp8] [--json]";
 
     struct Args {
         model: PathBuf,
@@ -48,6 +49,7 @@ mod linux {
         passes: Option<usize>,
         steps: usize,
         warmup: usize,
+        kv: KvFormat,
         json: bool,
     }
 
@@ -57,6 +59,7 @@ mod linux {
         let mut passes = None;
         let mut steps = 100;
         let mut warmup = 10;
+        let mut kv = KvFormat::Bf16;
         let mut json = false;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -74,6 +77,7 @@ mod linux {
                 "--passes" => passes = Some(value()?.parse()?),
                 "--steps" => steps = value()?.parse()?,
                 "--warmup" => warmup = value()?.parse()?,
+                "--kv" => kv = value()?.parse()?,
                 "--json" => json = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
@@ -89,6 +93,7 @@ mod linux {
             passes,
             steps,
             warmup,
+            kv,
             json,
         })
     }
@@ -204,9 +209,12 @@ mod linux {
             .into_iter()
             .filter(|&layer| !config.is_sliding(layer))
             .count();
-        // BF16 keys and values in every global visit.
-        let kv_bytes_per_token =
-            global_visits * 2 * 2 * config.num_key_value_heads * config.head_dim;
+        // Keys and values in every global visit.
+        let kv_bytes_per_token = global_visits
+            * 2
+            * args.kv.element_bytes()
+            * config.num_key_value_heads
+            * config.head_dim;
         let tail = args.warmup + args.steps;
 
         let gpu = Gpu::new(0)?;
@@ -233,7 +241,7 @@ mod linux {
             c
         };
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
-        let mut model = Model::new(&gpu, config, weights, passes, capacity)?;
+        let mut model = Model::with_kv_format(&gpu, config, weights, passes, capacity, args.kv)?;
 
         let mut rows = Vec::new();
         let mut token = 1;
@@ -297,8 +305,8 @@ mod linux {
         );
         let _ = writeln!(
             s,
-            "passes {passes}, {} warmup steps, {} timed steps\n",
-            args.warmup, args.steps
+            "passes {passes}, {} global KV cache, {} warmup steps, {} timed steps\n",
+            args.kv, args.warmup, args.steps
         );
         let _ = writeln!(
             s,
@@ -352,7 +360,7 @@ mod linux {
         format!(
             "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"max_sm_mhz\":{},\"max_mem_mhz\":{},\
              \"temperature_c_before_load\":{},\"power_w_before_load\":{},\"processes_before_load\":[{}],\
-             \"passes\":{passes},\"warmup\":{},\"steps\":{},\"rows\":[{}]}}",
+             \"passes\":{passes},\"kv\":{},\"warmup\":{},\"steps\":{},\"rows\":[{}]}}",
             quote(&gpu.timestamp),
             quote(&gpu.name),
             quote(&gpu.driver),
@@ -361,6 +369,7 @@ mod linux {
             quote(&gpu.temperature_c),
             quote(&gpu.power_w),
             processes.join(","),
+            quote(&args.kv.to_string()),
             args.warmup,
             args.steps,
             rows.join(","),
