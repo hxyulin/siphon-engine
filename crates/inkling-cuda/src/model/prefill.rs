@@ -20,6 +20,7 @@ use super::{Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, VisitState, 
 use crate::{
     ops::{
         attention::AttentionScratch,
+        experts::ExpertScratch,
         norm::{AttentionPostRows, KvConvWeights},
         routing::{NormDest, Partial},
     },
@@ -83,6 +84,8 @@ struct MoeRows {
     down: CudaSlice<bf16>,
     /// The combined expert outputs, the post-MLP conv's input.
     combined: CudaSlice<bf16>,
+    /// Grouping of the (row, slot) pairs by expert, shared by w13 and w2.
+    experts: ExpertScratch,
 }
 
 /// Every intermediate of a chunk of up to `rows` rows. Names follow [`Scratch`].
@@ -195,6 +198,7 @@ impl PrefillScratch {
                 act: zeros(stream, rows * top_k * width)?,
                 down: zeros(stream, rows * top_k * hidden)?,
                 combined: zeros(stream, rows * hidden)?,
+                experts: ExpertScratch::new(stream, rows, cfg.n_routed_experts)?,
             },
             final_hidden: zeros(stream, rows * hidden)?,
             head_logits: zeros(stream, HEAD_ROWS * cfg.vocab_size)?,
@@ -975,6 +979,7 @@ impl Ctx {
             &indices,
             &w13,
             &mut rows_mut(&mut t.gate_up, m, top_k * 2 * width),
+            &mut t.experts,
             m,
         )?;
         self.kernels.elementwise.softcapped_swiglu(
@@ -989,6 +994,7 @@ impl Ctx {
             &indices,
             &w2,
             &mut rows_mut(&mut t.down, m, top_k * hidden),
+            &mut t.experts,
             m,
         )
     }
