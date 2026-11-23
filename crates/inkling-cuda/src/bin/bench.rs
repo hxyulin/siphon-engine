@@ -2,7 +2,7 @@
 //!
 //! usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps N]
 //!        [--warmup N] [--kv bf16|fp8] [--json]
-//!        bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--passes N]
+//!        bench <model-dir> --prefill 512,4096,32768 [--chunk N] [--passes N]
 //!        [--kv bf16|fp8] [--json]
 //!
 //! With `--prefill`, each prompt length runs once through `Model::prefill` in chunks of
@@ -54,7 +54,7 @@ mod linux {
     const HEADROOM: usize = 2 << 30;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
                          [--steps N] [--warmup N] [--kv bf16|fp8] [--json]\n       \
-                         bench <model-dir> --prefill 512,4096 [--chunk 512] [--passes N] \
+                         bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--json]";
 
     struct Args {

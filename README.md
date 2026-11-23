@@ -34,7 +34,7 @@ cd reference/fixtures && uv run --project .. python <group>.py
 
 `Model::step` runs one token. `Model::prefill(tokens, chunk, logits)` runs a whole prompt from the current position in chunks of up to `chunk` rows: every layer visit for a chunk, then the next chunk. It fills every KV cache and conv state as stepping the tokens would, advances the position by `tokens.len()`, and returns the greedy next token, so `step` continues from there.
 
-- `chunk` is 1 to 2048 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 512, the chunk MLX's chunked captures use. The first call allocates buffers for its chunk size: about 0.28 GB at 512 rows, 0.5 GB at 1024 and 0.95 GB at 2048.
+- `chunk` is 1 to 2048 (`MAX_PREFILL_CHUNK`). The default, `DEFAULT_PREFILL_CHUNK`, is 2048, the fastest measured: bigger chunks read each expert weight once for more rows. MLX's chunked captures use 512. The first call allocates buffers for its chunk size: about 0.28 GB at 512 rows, 0.5 GB at 1024 and 0.95 GB at 2048.
 - `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
 - `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
 
