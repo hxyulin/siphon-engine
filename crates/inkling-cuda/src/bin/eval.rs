@@ -2,7 +2,8 @@
 //! still computes the same model as MLX-LM, within a multiple of MLX's own noise.
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
-//!        [--weights bf16|fp8] [--prefill CHUNK] [--expert-activations bf16|quantized]
+//!        [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
+//!        [--expert-activations bf16|quantized]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -15,7 +16,9 @@
 //! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
 //! the BF16 weights.
 //! `--expert-activations quantized` runs prefill's expert products on quantized
-//! activations (see `ExpertActivations`); stepping stays BF16.
+//! activations (see `ExpertActivations`); stepping stays BF16. With `--verify`, the text
+//! runs through `Model::verify` in passes of WIDTH rows (1 to 8), each keeping every row,
+//! as speculative decoding verifies the anchor and drafts.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -36,8 +39,8 @@ mod linux {
     use inkling::{Checkpoint, TextConfig};
     use inkling_cuda::{
         Gpu,
-        model::{MAX_PREFILL_CHUNK, Model, PrefillLogits},
-        ops::{attention::KvFormat, experts::ExpertActivations},
+        model::{Accept, MAX_PREFILL_CHUNK, Model, PrefillLogits, VerifyTokens},
+        ops::{attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         weights::{WeightFormat, Weights},
     };
     use safetensors::{Dtype, SafeTensors};
@@ -68,6 +71,8 @@ mod linux {
         weights: WeightFormat,
         /// Chunk size for `Model::prefill`, or `None` to step token by token.
         prefill: Option<usize>,
+        /// Rows per `Model::verify` pass, instead of stepping or prefill.
+        verify: Option<usize>,
         expert_activations: ExpertActivations,
     }
 
@@ -77,6 +82,7 @@ mod linux {
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
         let mut prefill = None;
+        let mut verify = None;
         let mut expert_activations = ExpertActivations::Bf16;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -98,14 +104,26 @@ mod linux {
                     "--prefill takes 1 to {MAX_PREFILL_CHUNK} rows"
                 );
                 prefill = Some(chunk);
+            } else if arg == "--verify" {
+                let width: usize = it.next().context("--verify needs a width")?.parse()?;
+                ensure!(
+                    (1..=VERIFY_ROWS).contains(&width),
+                    "--verify takes 1 to {VERIFY_ROWS} rows"
+                );
+                verify = Some(width);
             } else {
                 positional.push(PathBuf::from(arg));
             }
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
-             [--weights bf16|fp8] [--prefill CHUNK] [--expert-activations bf16|quantized]",
+             [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH] \
+             [--expert-activations bf16|quantized]",
         )?;
+        ensure!(
+            prefill.is_none() || verify.is_none(),
+            "--prefill and --verify exclude each other"
+        );
         Ok(Args {
             model,
             capture,
@@ -113,6 +131,7 @@ mod linux {
             kv,
             weights,
             prefill,
+            verify,
             expert_activations,
         })
     }
@@ -397,6 +416,15 @@ mod linux {
         if let Some(chunk) = args.prefill {
             let mut callback = |i: usize, logits: &[f32]| score(i, logits, argmax(logits));
             next = model.prefill(&capture.tokens, chunk, PrefillLogits::All(&mut callback))?;
+        } else if let Some(width) = args.verify {
+            for (c, rows) in capture.tokens.chunks(width).enumerate() {
+                let verdict = model.verify(VerifyTokens::Host(rows), Accept::Rows(rows.len()))?;
+                let logits = model.verify_logits()?;
+                for (i, row) in logits.chunks_exact(vocab).enumerate() {
+                    score(c * width + i, row, verdict.argmax[i])?;
+                }
+                next = verdict.next();
+            }
         } else {
             for (i, &token) in capture.tokens.iter().enumerate() {
                 next = model.step(token, None)?;
@@ -418,15 +446,17 @@ mod linux {
             .count();
         let seconds = started.elapsed().as_secs_f64();
 
-        let engine_mode = args.prefill.map_or_else(
-            || "token by token".to_owned(),
-            |chunk| {
-                format!(
-                    "prefill in chunks of {chunk}, {} expert activations",
-                    args.expert_activations
-                )
-            },
-        );
+        let engine_mode = match (args.prefill, args.verify) {
+            (Some(chunk), _) => format!(
+                "prefill in chunks of {chunk}, {} expert activations",
+                args.expert_activations
+            ),
+            (None, Some(width)) => format!(
+                "verify passes of {width} rows, {} expert activations",
+                args.expert_activations
+            ),
+            (None, None) => "token by token".to_owned(),
+        };
         println!(
             "{n} tokens; MLX capture mode: {}; engine: {engine_mode}",
             capture.mode

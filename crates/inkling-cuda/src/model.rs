@@ -10,10 +10,14 @@
 //! captured on the first untraced step.
 //!
 //! [`Model::prefill`] runs a prompt in chunks of many rows instead; see [`prefill`].
+//! [`Model::verify`] runs the anchor and drafts of a speculative round through the same
+//! multi-row path; see [`verify`].
 
 mod prefill;
+mod verify;
 
 pub use prefill::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits};
+pub use verify::{Accept, Verdict, VerifyTokens};
 
 use std::{ops::Range, sync::Arc};
 
@@ -37,6 +41,7 @@ use crate::{
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
         norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
+        spec::{Spec, VERIFY_ROWS},
     },
     weights::{
         ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, WeightFormat, Weights,
@@ -57,6 +62,7 @@ struct Kernels {
     misc: Misc,
     norm: Norm,
     routing: Routing,
+    spec: Spec,
 }
 
 /// The caches one layer visit keeps across tokens.
@@ -96,6 +102,13 @@ fn e4m3_to_f32(b: u8) -> f32 {
         (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
     };
     sign * magnitude
+}
+
+/// A device copy of everything a sequence keeps across tokens, from [`Model::save_state`]:
+/// every KV cache, every conv state and the position.
+pub struct SavedState {
+    visits: Vec<(KvData, Vec<CudaSlice<f32>>)>,
+    position: usize,
 }
 
 /// Inputs and outputs of each visit, read back for parity checks.
@@ -296,6 +309,12 @@ pub struct Model {
     position: usize,
     /// Buffers of [`Model::prefill`], allocated on its first call.
     prefill: Option<prefill::PrefillScratch>,
+    /// Buffers of [`Model::verify`], allocated on its first call.
+    verify: Option<prefill::PrefillScratch>,
+    /// The captured verify pass of each width from 1 to [`VERIFY_ROWS`].
+    verify_graphs: Vec<Option<StepGraph>>,
+    /// Rows of the last verify.
+    verify_rows: usize,
 }
 
 /// Everything a step reads but does not change.
@@ -382,6 +401,7 @@ impl Model {
             misc: Misc::load(ctx)?,
             norm: Norm::load(ctx)?,
             routing: Routing::load(ctx)?,
+            spec: Spec::load(ctx)?,
         };
         if weight_format == WeightFormat::Fp8 {
             weights.quantize_fp8(&kernels.linear_fp8, &stream)?;
@@ -442,7 +462,43 @@ impl Model {
             graph: None,
             position: 0,
             prefill: None,
+            verify: None,
+            verify_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
+            verify_rows: 0,
         })
+    }
+
+    /// Replaces every sliding-window ring with one of `slots` slots, at least the window,
+    /// and starts a new sequence. The kernels still see only the window. Captured graphs
+    /// are dropped, since they hold the old rings.
+    pub fn set_ring_slots(&mut self, slots: usize) -> anyhow::Result<()> {
+        let window = self.ctx.config.sliding_window_size;
+        for v in &mut self.visits {
+            if v.kv.window().is_some() {
+                v.kv = KvCache::sliding_ring(&self.ctx.stream, window, slots)?;
+            }
+        }
+        self.graph = None;
+        self.verify = None;
+        self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.reset()
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &TextConfig {
+        &self.ctx.config
+    }
+
+    /// The stream every kernel of the model runs on.
+    #[must_use]
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.ctx.stream
+    }
+
+    /// The target tensors the draft shares: the embedding, `embed_norm` and the LM head.
+    #[must_use]
+    pub fn draft_shared(&self) -> crate::weights::draft::SharedWeights<'_> {
+        crate::weights::draft::SharedWeights::from(&self.ctx.weights)
     }
 
     /// Starts a new sequence: zeroes every KV cache and conv state and moves to position 0.
@@ -499,6 +555,70 @@ impl Model {
                 })
             })
             .collect()
+    }
+
+    /// Copies every KV cache, conv state and the position on the device, so that
+    /// [`Model::restore_state`] can return to them exactly.
+    pub fn save_state(&self) -> anyhow::Result<SavedState> {
+        let stream = &self.ctx.stream;
+        let visits = self
+            .visits
+            .iter()
+            .map(|v| {
+                let kv = match v.kv.data() {
+                    KvData::Bf16 { keys, values } => KvData::Bf16 {
+                        keys: stream.clone_dtod(keys)?,
+                        values: stream.clone_dtod(values)?,
+                    },
+                    KvData::Fp8 { keys, values } => KvData::Fp8 {
+                        keys: stream.clone_dtod(keys)?,
+                        values: stream.clone_dtod(values)?,
+                    },
+                };
+                let conv = v
+                    .conv
+                    .iter()
+                    .map(|c| stream.clone_dtod(c))
+                    .collect::<Result<_, _>>()?;
+                Ok((kv, conv))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(SavedState {
+            visits,
+            position: self.position,
+        })
+    }
+
+    /// Returns every KV cache, conv state and the position to `state`, which
+    /// [`Model::save_state`] took from this model.
+    pub fn restore_state(&mut self, state: &SavedState) -> anyhow::Result<()> {
+        let stream = &self.ctx.stream;
+        ensure!(
+            state.visits.len() == self.visits.len(),
+            "the state has {} visits, the model {}",
+            state.visits.len(),
+            self.visits.len()
+        );
+        for (v, (kv, conv)) in self.visits.iter_mut().zip(&state.visits) {
+            match (v.kv.data_mut(), kv) {
+                (KvData::Bf16 { keys, values }, KvData::Bf16 { keys: k, values: x }) => {
+                    ensure!(keys.len() == k.len(), "the cache sizes differ");
+                    stream.memcpy_dtod(k, keys)?;
+                    stream.memcpy_dtod(x, values)?;
+                }
+                (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: x }) => {
+                    ensure!(keys.len() == k.len(), "the cache sizes differ");
+                    stream.memcpy_dtod(k, keys)?;
+                    stream.memcpy_dtod(x, values)?;
+                }
+                _ => anyhow::bail!("the cache formats differ"),
+            }
+            for (dst, src) in v.conv.iter_mut().zip(conv) {
+                stream.memcpy_dtod(src, dst)?;
+            }
+        }
+        self.position = state.position;
+        Ok(())
     }
 
     /// Position of the next token.
@@ -1422,8 +1542,14 @@ impl Ctx {
     /// `out [m, n] = x [m, k] @ weight [n, k]^T` for every product, all with the same `m`
     /// and `k`, as one batch.
     ///
-    /// Runs the tensor-core GEMM, which hands `m = 1` to the batched GEMV.
-    fn gemm_rows(&self, products: &mut [RowProduct<'_>], m: usize) -> anyhow::Result<()> {
+    /// Runs the tensor-core GEMM, which hands `m = 1` to the batched GEMV unless `tiled`.
+    /// With `tiled`, each row sums in the same order for any `m` up to 16.
+    fn gemm_rows(
+        &self,
+        products: &mut [RowProduct<'_>],
+        m: usize,
+        tiled: bool,
+    ) -> anyhow::Result<()> {
         ensure!(m > 0, "no rows");
         for (i, p) in products.iter().enumerate() {
             ensure!(
@@ -1437,7 +1563,13 @@ impl Ctx {
             .iter_mut()
             .map(|p| Gemm::new(p.weight, &p.x, &mut p.out))
             .collect();
-        self.kernels.linear.gemm_bf16(&self.stream, &mut gemms, m)?;
+        if tiled {
+            self.kernels
+                .linear
+                .gemm_bf16_tiled(&self.stream, &mut gemms, m)?;
+        } else {
+            self.kernels.linear.gemm_bf16(&self.stream, &mut gemms, m)?;
+        }
         Ok(())
     }
 
@@ -1539,6 +1671,58 @@ impl Ctx {
             scratch,
             out,
         )
+    }
+
+    /// [`Ctx::attention_rows`] one row at a time, as `m` decode steps would: row `i`
+    /// appends its key and value at `positions[i]`, then attends from there with
+    /// [`Attention::decode_attention`]. Each row's result then depends only on its
+    /// position and the cache, not on where the chunk starts or on its other rows, and
+    /// repeats exactly from run to run. The prefill kernel tiles the keys from the chunk's
+    /// start and splits the work by the row count, so its sum order has neither property.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the attention inputs and outputs"
+    )]
+    fn attention_by_position(
+        &self,
+        q: &CudaView<'_, bf16>,
+        k: &CudaView<'_, bf16>,
+        v: &CudaView<'_, bf16>,
+        cache: &mut KvCache,
+        positions: &CudaSlice<u32>,
+        m: usize,
+        bias: &CudaView<'_, bf16>,
+        sinks: &CudaView<'_, bf16>,
+        scratch: &mut AttentionScratch,
+        out: &mut CudaViewMut<'_, bf16>,
+    ) -> anyhow::Result<()> {
+        /// Row `i` of the `m` rows of `x`.
+        fn row<'a>(x: &'a CudaView<'_, bf16>, i: usize, m: usize) -> CudaView<'a, bf16> {
+            let width = x.len() / m;
+            x.slice(i * width..(i + 1) * width)
+        }
+        ensure!(
+            positions.len() >= m,
+            "{m} rows, {} positions",
+            positions.len()
+        );
+        let attention = &self.kernels.attention;
+        let q_width = out.len() / m;
+        for i in 0..m {
+            let position = positions.slice(i..=i);
+            attention.append(&self.stream, cache, &position, &row(k, i, m), &row(v, i, m))?;
+            attention.decode_attention(
+                &self.stream,
+                &row(q, i, m),
+                cache,
+                &position,
+                &row(bias, i, m),
+                &row(sinks, i, m),
+                scratch,
+                &mut out.slice_mut(i * q_width..(i + 1) * q_width),
+            )?;
+        }
+        Ok(())
     }
 
     fn hidden(&self) -> usize {

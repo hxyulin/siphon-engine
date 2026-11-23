@@ -557,6 +557,18 @@ impl Linear {
         launch_gemm(&self.gemm_bf16, stream, products, m)
     }
 
+    /// [`Self::gemm_bf16`] on tensor cores for every `m`, a single row included. Up to 16
+    /// rows use the same tile and split, so each row sums in the same order for any `m`
+    /// from 1 to 16.
+    pub fn gemm_bf16_tiled(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Gemm<'_, bf16>],
+        m: usize,
+    ) -> anyhow::Result<()> {
+        launch_gemm(&self.gemm_bf16, stream, products, m)
+    }
+
     /// Runs every product over `m` rows in one launch with F32 inputs and outputs. Each
     /// input value runs as three BF16 parts holding about 24 of its bits, so this matches
     /// an F32 product with the widened weights up to sum order and about 2^-25 of each

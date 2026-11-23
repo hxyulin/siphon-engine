@@ -18,7 +18,10 @@ use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut};
 use half::bf16;
 use inkling::TextConfig;
 
-use super::{Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, VisitState, zeros};
+use super::{
+    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, VisitState, verify::VerifyBuffers,
+    zeros,
+};
 use crate::{
     ops::{
         attention,
@@ -26,6 +29,7 @@ use crate::{
         misc::{GATE_SLOTS, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsPartial},
+        spec::{TAPS, VERIFY_ROWS, VISIT_CHANNELS},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -38,6 +42,13 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 /// Rows the LM head runs at once when every row's logits are wanted: 32 rows of 201,024
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
+/// The visits whose input partial block is a feature tap of the draft, in tap order:
+/// `target_layer_ids` 5, 23 and 41 of the checkpoint's `mtp_config`. The fourth tap is the
+/// final normed hidden state.
+const TAP_VISITS: [usize; TAPS - 1] = [5, 23, 41];
+
+/// Receives each chunk's feature taps and the position of its first row.
+type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
 /// Which logits [`Model::prefill`] produces.
 pub enum PrefillLogits<'a> {
@@ -50,6 +61,9 @@ pub enum PrefillLogits<'a> {
 
 /// Intermediates of the message gates for a chunk.
 struct GateRows {
+    /// Whether the products run in a fixed order for any row count (see
+    /// [`PrefillScratch::new`]).
+    invariant: bool,
     /// Per slot, the normalized state and message side by side, BF16 `[rows, 2 * hidden]`.
     inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
     /// The down projections, BF16 `[slots, rows, rank]`.
@@ -60,6 +74,13 @@ struct GateRows {
 
 /// Intermediates of attention for a chunk, `[rows, ...]` versions of `AttentionTemps`.
 struct AttentionRows {
+    /// Whether the products and attention run in a fixed order for any row count (see
+    /// [`PrefillScratch::new`]).
+    invariant: bool,
+    /// Each row's position, for attention one row at a time.
+    positions: CudaSlice<u32>,
+    /// The decode attention scratch, for attention one row at a time.
+    decode: attention::AttentionScratch,
     k_raw: CudaSlice<bf16>,
     v_raw: CudaSlice<bf16>,
     k_dynamic: CudaSlice<bf16>,
@@ -98,10 +119,17 @@ struct MoeRows {
 
 /// Every intermediate of a chunk of up to `rows` rows. Names follow [`Scratch`].
 pub(super) struct PrefillScratch {
-    rows: usize,
-    tokens: CudaSlice<i32>,
+    pub(super) rows: usize,
+    /// Whether a chunk records its feature taps into `taps`.
+    pub(super) record_taps: bool,
+    /// The feature taps of every row, BF16 `[rows, 4, hidden]`: the partial block entering
+    /// each visit of [`TAP_VISITS`], then the final normed hidden state.
+    pub(super) taps: Option<CudaSlice<bf16>>,
+    /// The verify pass's own state, in the verify scratch only.
+    pub(super) verify: Option<VerifyBuffers>,
+    pub(super) tokens: CudaSlice<i32>,
     /// The position of the chunk's first row.
-    start: CudaSlice<u32>,
+    pub(super) start: CudaSlice<u32>,
     embedded: CudaSlice<bf16>,
     hidden: CudaSlice<bf16>,
     out: CudaSlice<bf16>,
@@ -125,17 +153,24 @@ pub(super) struct PrefillScratch {
     moe: MoeRows,
     final_hidden: CudaSlice<bf16>,
     head_logits: CudaSlice<bf16>,
-    head_capped: CudaSlice<f32>,
+    pub(super) head_capped: CudaSlice<f32>,
     /// Host copy of `head_capped`.
     head_host: Vec<f32>,
 }
 
 impl PrefillScratch {
-    fn new(
+    /// Buffers for chunks of up to `rows` rows. With `invariant`, each row's results depend
+    /// only on its position, its token and the state before it, bit for bit: not on the
+    /// chunk's start, its row count up to 16 or its other rows. The GEMMs then run on
+    /// tensor cores at one row too, and attention runs one row at a time with the decode
+    /// kernels. The verify pass sets it, so that each of its rows equals a verify of that
+    /// row alone.
+    pub(super) fn new(
         stream: &Arc<CudaStream>,
         cfg: &TextConfig,
         max_blocks: usize,
         rows: usize,
+        invariant: bool,
     ) -> anyhow::Result<Self> {
         let hidden = cfg.hidden_size;
         let heads = cfg.num_attention_heads;
@@ -146,6 +181,9 @@ impl PrefillScratch {
         let width = cfg.intermediate_size;
         Ok(Self {
             rows,
+            record_taps: false,
+            taps: None,
+            verify: None,
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
             embedded: zeros(stream, rows * hidden)?,
@@ -159,6 +197,7 @@ impl PrefillScratch {
             message_probs: zeros(stream, rows * MESSAGE_SLOTS * FUSED_MAX_CANDIDATES)?,
             attention_inputs: zeros(stream, rows * 3 * hidden)?,
             gate: GateRows {
+                invariant,
                 inputs: [
                     zeros(stream, rows * 2 * hidden)?,
                     zeros(stream, rows * 2 * hidden)?,
@@ -174,6 +213,9 @@ impl PrefillScratch {
                 zeros(stream, rows * hidden)?,
             ],
             attention: AttentionRows {
+                invariant,
+                positions: zeros(stream, rows)?,
+                decode: attention::AttentionScratch::new(stream)?,
                 k_raw: zeros(stream, rows * kv_dims)?,
                 v_raw: zeros(stream, rows * kv_dims)?,
                 k_dynamic: zeros(stream, rows * dynamic)?,
@@ -249,7 +291,32 @@ impl Model {
         &mut self,
         tokens: &[u32],
         chunk: usize,
+        logits: PrefillLogits<'_>,
+    ) -> anyhow::Result<u32> {
+        self.prefill_chunks(tokens, chunk, logits, None)
+    }
+
+    /// [`Model::prefill`] that also records every row's feature taps for the draft, BF16
+    /// `[rows, 4, 2304]`: the partial block entering visits 5, 23 and 41, and the final
+    /// normed hidden state. After enqueueing each chunk it passes the chunk's taps and the
+    /// position of its first row to `taps`. Work that `taps` enqueues on the model's stream
+    /// runs before the next chunk overwrites them.
+    pub fn prefill_with_taps(
+        &mut self,
+        tokens: &[u32],
+        chunk: usize,
+        logits: PrefillLogits<'_>,
+        taps: TapsCallback<'_>,
+    ) -> anyhow::Result<u32> {
+        self.prefill_chunks(tokens, chunk, logits, Some(taps))
+    }
+
+    fn prefill_chunks(
+        &mut self,
+        tokens: &[u32],
+        chunk: usize,
         mut logits: PrefillLogits<'_>,
+        mut taps: Option<TapsCallback<'_>>,
     ) -> anyhow::Result<u32> {
         ensure!(!tokens.is_empty(), "nothing to prefill");
         ensure!(
@@ -262,21 +329,40 @@ impl Model {
             "the global KV caches cannot hold position {last}"
         );
         u32::try_from(last).context("position does not fit the kernels")?;
-        let rows = chunk.min(tokens.len());
-        if self.prefill.as_ref().is_none_or(|p| p.rows < rows) {
+        let chunk_rows = chunk.min(tokens.len());
+        if self.prefill.as_ref().is_none_or(|p| p.rows < chunk_rows) {
             // Free the smaller buffers before allocating the new ones.
             self.prefill = None;
             self.prefill = Some(PrefillScratch::new(
                 &self.ctx.stream,
                 &self.ctx.config,
                 self.max_blocks,
-                rows,
+                chunk_rows,
+                false,
             )?);
+        }
+        let hidden = self.ctx.hidden();
+        let p = self
+            .prefill
+            .as_mut()
+            .context("the prefill buffers are missing")?;
+        p.record_taps = taps.is_some();
+        if p.record_taps && p.taps.is_none() {
+            p.taps = Some(zeros(&self.ctx.stream, p.rows * TAPS * hidden)?);
         }
         let pieces = tokens.chunks(chunk);
         let count = pieces.len();
         for (i, piece) in pieces.enumerate() {
+            let start = self.position;
             self.prefill_chunk(piece, &mut logits, i + 1 == count)?;
+            if let Some(taps) = taps.as_mut() {
+                let p = self
+                    .prefill
+                    .as_ref()
+                    .context("the prefill buffers are missing")?;
+                let buffer = p.taps.as_ref().context("the taps buffer is missing")?;
+                taps(start, rows(buffer, piece.len(), TAPS * hidden))?;
+            }
         }
         let next = self.ctx.stream.clone_dtoh(&self.scratch.next)?[0];
         u32::try_from(next).context("argmax returned a negative index")
@@ -351,13 +437,18 @@ impl Ctx {
     /// One chunk of `m` rows through the model, as `Model::enqueue` for one row. On the
     /// final chunk, the last row's logits and greedy token go to the decode scratch's
     /// `capped` and `next`. Other chunks skip the final norm and the LM head unless
-    /// `logits` asks for every row.
+    /// `logits` asks for every row or the chunk records its taps.
+    ///
+    /// In the verify scratch, the chunk is a verify pass instead: it backs up the conv
+    /// states and the ring slots it will overwrite, records each visit's conv inputs, and
+    /// ends with every row's logits and greedy token, the acceptance and the rollback (see
+    /// `kernels/spec.cu`). The decode scratch is left alone.
     #[expect(clippy::too_many_arguments, reason = "the parts of Model a chunk uses")]
     #[expect(
         clippy::too_many_lines,
         reason = "one chunk reads top to bottom like _run_loop"
     )]
-    fn prefill_enqueue(
+    pub(super) fn prefill_enqueue(
         &self,
         p: &mut PrefillScratch,
         visits: &mut [VisitState],
@@ -373,9 +464,28 @@ impl Ctx {
         let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
         let hidden = self.hidden();
         let mh = m * hidden;
-        let mut visits = visits.iter_mut();
+        let mut visits = visits.iter_mut().enumerate();
         let mut next_visit = || visits.next().context("fewer visit caches than visits");
 
+        if let Some(v) = p.verify.as_mut() {
+            self.kernels.spec.row_positions(
+                &self.stream,
+                &p.start,
+                &mut p.attention.positions,
+                m,
+            )?;
+            self.kernels
+                .spec
+                .conv_backup(&self.stream, &v.states, &mut v.conv_backup)?;
+            self.kernels.spec.ring_backup(
+                &self.stream,
+                &v.rings,
+                v.ring_slots,
+                &p.start,
+                m,
+                &mut v.ring_backup,
+            )?;
+        }
         self.kernels.elementwise.embedding(
             &self.stream,
             &rows(&p.tokens, m, 1),
@@ -464,7 +574,9 @@ impl Ctx {
         for layer in core_end..cfg.num_hidden_layers {
             self.visit_rows(p, next_visit()?, layer, &mut blocks, false, m)?;
         }
-        if !final_chunk && matches!(logits, PrefillLogits::Last) {
+        let verify = p.verify.is_some();
+        let skip_logits = !final_chunk && matches!(logits, PrefillLogits::Last);
+        if skip_logits && !verify && !p.record_taps {
             return Ok(());
         }
 
@@ -491,6 +603,21 @@ impl Ctx {
             },
             self.eps(),
         )?;
+        if p.record_taps {
+            let taps = p.taps.as_mut().context("the taps buffer is missing")?;
+            self.kernels.spec.copy_tap(
+                &self.stream,
+                &rows(&p.final_hidden, m, hidden),
+                &mut rows_mut(taps, m, TAPS * hidden),
+                TAPS - 1,
+            )?;
+        }
+        if verify {
+            return self.verify_head(p, m);
+        }
+        if skip_logits {
+            return Ok(());
+        }
 
         // The last row's logits and greedy token, in the decode buffers.
         self.gemm_rows(
@@ -500,6 +627,7 @@ impl Ctx {
                 out: s.logits.as_view_mut(),
             }],
             1,
+            false,
         )?;
         self.kernels.elementwise.logit_softcap(
             &self.stream,
@@ -527,6 +655,7 @@ impl Ctx {
                     out: rows_mut(&mut p.head_logits, n, padded),
                 }],
                 n,
+                false,
             )?;
             self.kernels.elementwise.logit_softcap(
                 &self.stream,
@@ -544,6 +673,64 @@ impl Ctx {
         Ok(())
     }
 
+    /// The end of a verify pass of `m` rows: every row's logits and greedy token, the
+    /// acceptance, and the rollback of the conv states and ring slots of rejected rows.
+    fn verify_head(&self, p: &mut PrefillScratch, m: usize) -> anyhow::Result<()> {
+        let cfg = &self.config;
+        let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
+        self.gemm_rows(
+            &mut [RowProduct {
+                weight: &self.weights.lm_head,
+                x: rows(&p.final_hidden, m, self.hidden()),
+                out: rows_mut(&mut p.head_logits, m, padded),
+            }],
+            m,
+            true,
+        )?;
+        self.kernels.elementwise.logit_softcap(
+            &self.stream,
+            &rows(&p.head_logits, m, padded),
+            &mut rows_mut(&mut p.head_capped, m, vocab),
+            cfg.final_logit_softcapping,
+        )?;
+        let v = p
+            .verify
+            .as_mut()
+            .context("the verify buffers are missing")?;
+        let spec = &self.kernels.spec;
+        self.kernels.misc.argmax_f32(
+            &self.stream,
+            &rows(&p.head_capped, m, vocab),
+            &mut v.argmax.slice_mut(..m),
+            vocab,
+        )?;
+        spec.accept_greedy(
+            &self.stream,
+            &rows(&p.tokens, m, 1),
+            &v.argmax.slice(..m),
+            &v.keep,
+            m,
+            &mut v.result,
+            &mut v.anchor,
+        )?;
+        spec.conv_rollback(
+            &self.stream,
+            &v.states,
+            &v.conv_backup,
+            &v.inputs,
+            &v.result,
+        )?;
+        spec.ring_restore(
+            &self.stream,
+            &v.rings,
+            v.ring_slots,
+            &p.start,
+            m,
+            &v.ring_backup,
+            &v.result,
+        )
+    }
+
     /// One decoder-layer visit for a chunk, as [`Ctx::visit`] for one row, from
     /// `p.hidden` to `p.out`; the two then swap.
     #[expect(
@@ -553,7 +740,7 @@ impl Ctx {
     fn visit_rows(
         &self,
         p: &mut PrefillScratch,
-        state: &mut VisitState,
+        (index, state): (usize, &mut VisitState),
         layer: usize,
         blocks: &mut Blocks,
         messages: bool,
@@ -562,7 +749,19 @@ impl Ctx {
         let w = &self.weights.layers[layer];
         let sliding = self.config.is_sliding(layer);
         let hidden = self.hidden();
+        let kv_dims = self.config.num_key_value_heads * self.config.head_dim;
         let mh = m * hidden;
+        if p.record_taps
+            && let Some(tap) = TAP_VISITS.iter().position(|&v| v == index)
+        {
+            let taps = p.taps.as_mut().context("the taps buffer is missing")?;
+            self.kernels.spec.copy_tap(
+                &self.stream,
+                &rows(&p.hidden, m, hidden),
+                &mut rows_mut(taps, m, TAPS * hidden),
+                tap,
+            )?;
+        }
         let block_start = layer.is_multiple_of(self.config.n_layers_per_attn_res_block);
         ensure!(
             !block_start || blocks.len < blocks.max,
@@ -705,6 +904,19 @@ impl Ctx {
             &mut rows_mut(&mut p.out, m, hidden),
             m,
         )?;
+        if let Some(v) = p.verify.as_mut() {
+            let len = VERIFY_ROWS * VISIT_CHANNELS;
+            self.kernels.spec.conv_inputs_rows(
+                &self.stream,
+                &rows(&p.attention.k_raw, m, kv_dims),
+                &rows(&p.attention.v_raw, m, kv_dims),
+                &rows(&p.attention.proj, m, hidden),
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
+                &mut v.inputs.slice_mut(index * len..(index + 1) * len),
+                m,
+            )?;
+        }
         std::mem::swap(&mut p.hidden, &mut p.out);
         Ok(())
     }
@@ -867,6 +1079,7 @@ impl Ctx {
         let rel_dims = cfg.num_attention_heads * cfg.d_rel;
         let heads = cfg.num_attention_heads;
         let taps = cfg.num_key_value_heads * cfg.sconv_kernel_size;
+        let invariant = t.invariant;
 
         let mut products = vec![
             product(&a.q, &q_in, rows_mut(&mut t.q_raw, m, q_dims)),
@@ -880,7 +1093,7 @@ impl Ctx {
             products.push(product(k_proj, &k_in, rows_mut(&mut t.k_dynamic, m, taps)));
             products.push(product(v_proj, &v_in, rows_mut(&mut t.v_dynamic, m, taps)));
         }
-        self.gemm_rows(&mut products, m)?;
+        self.gemm_rows(&mut products, m, invariant)?;
         drop(products);
 
         let conv = match &a.kv_conv {
@@ -943,18 +1156,33 @@ impl Ctx {
             &mut rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
         )?;
 
-        self.attention_rows(
-            &rows(&t.q, m, q_dims),
-            &rows(&t.k, m, kv_dims),
-            &rows(&t.v, m, kv_dims),
-            &mut state.kv,
-            start,
-            m,
-            &rows(&t.bias, m, heads * cfg.rel_extent),
-            &rows(&t.sinks, m, heads),
-            &mut t.partials,
-            &mut rows_mut(&mut t.out, m, q_dims),
-        )?;
+        if invariant {
+            self.attention_by_position(
+                &rows(&t.q, m, q_dims),
+                &rows(&t.k, m, kv_dims),
+                &rows(&t.v, m, kv_dims),
+                &mut state.kv,
+                &t.positions,
+                m,
+                &rows(&t.bias, m, heads * cfg.rel_extent),
+                &rows(&t.sinks, m, heads),
+                &mut t.decode,
+                &mut rows_mut(&mut t.out, m, q_dims),
+            )?;
+        } else {
+            self.attention_rows(
+                &rows(&t.q, m, q_dims),
+                &rows(&t.k, m, kv_dims),
+                &rows(&t.v, m, kv_dims),
+                &mut state.kv,
+                start,
+                m,
+                &rows(&t.bias, m, heads * cfg.rel_extent),
+                &rows(&t.sinks, m, heads),
+                &mut t.partials,
+                &mut rows_mut(&mut t.out, m, q_dims),
+            )?;
+        }
         self.kernels.elementwise.attention_gate(
             &self.stream,
             &rows(&t.out, m, q_dims),
@@ -968,6 +1196,7 @@ impl Ctx {
                 out: rows_mut(&mut t.proj, m, hidden),
             }],
             m,
+            invariant,
         )
     }
 
@@ -990,6 +1219,7 @@ impl Ctx {
         let rank = self.config.loop_config.gate_rank;
         let mr = m * rank;
         let n = weights.len();
+        let invariant = t.invariant;
         ensure!(n == norms.len(), "{n} gates with {} norms", norms.len());
         let mut down = t.down.slice_mut(first * mr..(first + n) * mr);
         match n {
@@ -1000,6 +1230,7 @@ impl Ctx {
                     out: down.slice_mut(..),
                 }],
                 m,
+                invariant,
             )?,
             3 => {
                 let (d0, mut rest) = down.split_at_mut(mr);
@@ -1024,6 +1255,7 @@ impl Ctx {
                         },
                     ],
                     m,
+                    invariant,
                 )?;
             }
             _ => anyhow::bail!("{n} gates; one or three run at once"),

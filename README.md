@@ -63,6 +63,59 @@ INKLING_MODEL=<model-dir> INKLING_DSPARK_REF=reference/out cargo test --release 
 
 `reference/dspark.py routing` reads captures made with `capture.py --routing` and reports the distinct experts that m consecutive positions route to at each visit, which sets the expert bytes of a verify of m rows.
 
+## Speculative decoding
+
+`spec::Speculator` runs greedy speculative decoding with the draft and a fixed number k of drafts per round (1 to 7):
+
+1. `Model::verify` runs the anchor and the first k drafts as one pass of k + 1 rows through the chunked-prefill code, keeps the anchor and the longest run of drafts that each equal the previous row's greedy token, and rolls back the rest. It synchronizes once, to read the verdict.
+2. The draft commits the feature taps of the kept rows and runs its block from the next anchor, which the verify left on the device.
+
+A round emits the kept drafts and the target's greedy token after them. `Model::prefill_with_taps` records the draft's taps of every prompt row, so the draft's cache covers the prompt.
+
+The verify pass has one CUDA graph per width, captured on first use, with the tokens, the start position and the acceptance mode in device buffers. `kernels/spec.cu` holds its own kernels:
+
+- Before the pass, it copies every conv state (3.7 MB) and the sliding-ring slots the pass will overwrite (40 visits, 4 KiB per row each). During the pass, each visit records its conv inputs: the raw keys and values, the attention output projection, and the MoE combine.
+- After the pass, every row's greedy token, then the acceptance. Each conv state becomes the last 3 rows of its old state followed by the kept rows' inputs. The rejected rows' ring slots get their old keys and values back. The global caches need nothing: attention reads only slots below each row's position, and later rows overwrite the stale ones.
+
+The rings keep 1024 slots. A ring of 1032 slots would make the backup unnecessary, but decode attention splits its cache by slot, so its results change with the ring size.
+
+Each verify row gives the same logits, bit for bit, as a verify of that row alone at its position, whatever the other rows hold. So speculation emits exactly the tokens of greedy decoding through the verify pass one row at a time, whatever the draft proposes. Two choices make this hold:
+
+- The GEMMs run on tensor cores at one row too: up to 16 rows share one tile and split, so a row's sum order does not depend on the row count.
+- Attention runs one row at a time: each row appends its key and value and attends with the decode kernel at its own position, as a step does. The prefill attention kernel tiles the keys from the chunk's start, so a row's sum order depends on where its chunk starts.
+
+The verify pass computes the same model as `Model::step` but sums in other orders, so the two greedy outputs split at the first near-tie: after 247 to 817 of 1024 tokens on the three texts.
+
+`tests/verify.rs` checks the taps against MLX, a verify against stepping, the rollback against a shorter verify (bit for bit), the ring size, and row invariance. `tests/spec.rs` checks exactness with the draft at k = 1, 3 and 7 and with random drafts, 1024 tokens after each text. Both need the checkpoint:
+
+```sh
+INKLING_MODEL=<model-dir> INKLING_TAPS=reference/out/regex-readme-taps.safetensors \
+    cargo test --release -p inkling-cuda --test verify --test spec -- --ignored --nocapture --test-threads 1
+```
+
+`eval --verify WIDTH` teacher-forces a capture through verify passes of WIDTH rows, and passes the quality gate at widths 1 and 4. `bench --prompt <capture> --spec K` compares speculation with plain decode from one prefilled state, and `--verify-widths` times one pass of each width.
+
+The verify pass is slow at small widths, since prefill's kernels are built for many rows. With BF16 weights, one pass takes:
+
+| Rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Context 2,286, ms | 7.57 | 8.44 | 9.24 | 10.14 | 11.18 | 12.08 | 12.77 | 13.26 |
+| Context 32,768, ms | 8.19 | 9.75 | 11.17 | 12.57 | 14.14 | 15.66 | 16.96 | 18.18 |
+| Bandwidth model, ms | 3.82 | 4.49 | 5.03 | 5.49 | 5.92 | 6.31 | 6.68 | 7.02 |
+
+The bandwidth model reads the dense weights once and 8 m^0.6 distinct experts per visit at 84% of 1.70 TB/s, without KV. At 4 rows and context 2,286, the pass spends 2.7 ms in the dense GEMMs, 4.3 ms in the expert GEMMs, 1.05 ms in attention, 0.9 ms in the router logits and 1.8 ms in about 1,100 small kernels. At context 32,768, every row reads the global caches on its own.
+
+`bench --spec 3` with BF16 weights, 512 tokens after each text, on one RTX 5090:
+
+| Text, context | Plain decode | Speculation | Tokens per round | Acceptance by position | Round: verify + draft + host |
+| --- | ---: | ---: | ---: | --- | --- |
+| `regex-readme`, 2,286 | 255.9 tok/s | 239.4 tok/s | 3.08 | 84.3%, 67.5%, 56.6% | 11.14 + 1.73 + 0.01 ms |
+| `half`, 2,273 | 253.0 tok/s | 278.9 tok/s | 3.63 | 92.9%, 86.5%, 83.7% | 11.28 + 1.73 + 0.01 ms |
+| `anyhow`, 10,674 | 239.3 tok/s | 288.4 tok/s | 3.89 | 97.7%, 97.0%, 93.9% | 11.61 + 1.85 + 0.02 ms |
+| `anyhow`, 32,768 | 208.7 tok/s | 246.9 tok/s | 3.96 | 99.2%, 99.2%, 97.7% | 13.84 + 2.18 + 0.03 ms |
+
+The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At that acceptance, 2.1 tokens per round of 12.9 ms would give 163 tok/s. With `--weights fp8`, plain decode runs at 304 to 324 tok/s, while the verify and the draft stay on BF16 weights.
+
 ## Benchmarks and profiling
 
 The `bench` binary times greedy decode at several context lengths. For each length it marks every cache as full to that length without computing it, runs warmup steps, then times `--steps` steps. It prints one markdown table row per context length, or JSON with `--json`, along with the time, the GPU clocks and the processes on the GPU. Numbers are comparable only on an otherwise idle GPU.

@@ -21,6 +21,22 @@
 //!
 //! Results are comparable only on an otherwise idle GPU, so the output records the GPU
 //! clocks, the processes on the GPU and the time.
+//!
+//! Speculative decoding, from the tokens of a capture (`--prompt`, a safetensors file
+//! with a `tokens` tensor such as `reference/capture_eval.py` writes):
+//!
+//!        bench <model-dir> --prompt <capture> --spec K [--contexts 0,32768] [--steps N]
+//!        [--weights bf16|fp8] [--kv bf16|fp8]
+//!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
+//!
+//! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
+//! as verify rows. A context longer than the prompt puts arbitrary token ids before it.
+//! `--spec K` prefills the prompt once, then from that same state generates `--steps`
+//! tokens with plain decode and with greedy speculation verifying K drafts per round,
+//! and reports both rates, the rounds, tokens per round, per-position acceptance and the
+//! split of a round between verify, draft and host. The verify always runs on BF16
+//! weights. `--verify-widths` times one verify pass of each width from 1 to 8, each
+//! keeping one row, so the next starts one position later.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -79,6 +95,11 @@ mod linux {
         /// Prompt lengths to time prefill at, instead of timing decode.
         prefill: Option<Vec<usize>>,
         chunk: usize,
+        /// The capture whose tokens `--spec` and `--verify-widths` use.
+        prompt: Option<PathBuf>,
+        /// Drafts per round for speculative decoding.
+        spec: Option<usize>,
+        verify_widths: bool,
     }
 
     fn token_counts(arg: &str, value: &str) -> anyhow::Result<Vec<usize>> {
@@ -101,6 +122,9 @@ mod linux {
         let mut json = false;
         let mut prefill = None;
         let mut chunk = DEFAULT_PREFILL_CHUNK;
+        let mut prompt = None;
+        let mut spec = None;
+        let mut verify_widths = false;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             let mut value = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -115,6 +139,9 @@ mod linux {
                 "--weights" => weights = value()?.parse()?,
                 "--expert-activations" => expert_activations = value()?.parse()?,
                 "--json" => json = true,
+                "--prompt" => prompt = Some(PathBuf::from(value()?)),
+                "--spec" => spec = Some(value()?.parse()?),
+                "--verify-widths" => verify_widths = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -143,6 +170,9 @@ mod linux {
             json,
             prefill,
             chunk,
+            prompt,
+            spec,
+            verify_widths,
         })
     }
 
@@ -368,6 +398,9 @@ mod linux {
         if let Some(lengths) = args.prefill.take() {
             return bench_prefill(&args, &lengths);
         }
+        if args.spec.is_some() || args.verify_widths {
+            return speculation::run(&args);
+        }
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let global_visits = config
@@ -558,5 +591,282 @@ mod linux {
             args.steps,
             rows.join(","),
         )
+    }
+
+    /// `--spec` and `--verify-widths`.
+    mod speculation {
+        use std::{fs, time::Instant};
+
+        use anyhow::{Context as _, ensure};
+        use inkling::{Checkpoint, TextConfig};
+        use inkling_cuda::{
+            Gpu,
+            model::{Accept, DEFAULT_PREFILL_CHUNK, Model, VerifyTokens},
+            spec::{Drafts, Speculator},
+            weights::{WeightFormat, Weights},
+        };
+        use safetensors::{Dtype, SafeTensors};
+
+        use super::{Args, gpu_state};
+
+        /// Tokens at the end of the capture kept out of the prompt, for verify rows.
+        const RESERVED: usize = 512;
+        /// Default tokens generated per context.
+        const DEFAULT_STEPS: usize = 256;
+        /// Timed verify passes per width.
+        const VERIFY_REPEATS: usize = 40;
+        /// Bytes the byte model of a verify uses: BF16 dense weights, and one expert's
+        /// `w13` and `w2` with scales in NVFP4 (44 visits) and MXFP8 (4 visits).
+        const DENSE_BYTES: f64 = 3.62e9;
+        const NVFP4_EXPERT: f64 = 4.48e6;
+        const MXFP8_EXPERT: f64 = 8.21e6;
+        /// DRAM bandwidth times plain decode's efficiency, as the design's cost model.
+        const EFFECTIVE_BANDWIDTH: f64 = 1.70e12 * 0.84;
+
+        fn tokens(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
+            let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let capture = SafeTensors::deserialize(&bytes)?;
+            let view = capture.tensor("tokens")?;
+            ensure!(view.dtype() == Dtype::I32, "tokens are {:?}", view.dtype());
+            view.data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| Ok(u32::try_from(i32::from_le_bytes(*b))?))
+                .collect()
+        }
+
+        /// The prompt for `context`: arbitrary ids, then `text`, `context` tokens in all, or
+        /// `text` alone when it is longer.
+        fn prompt(text: &[u32], context: usize, vocab: u32) -> Vec<u32> {
+            let filler = context.saturating_sub(text.len());
+            (0..filler as u32)
+                .map(|i| (i.wrapping_mul(7919) + 13) % vocab)
+                .chain(text.iter().copied())
+                .collect()
+        }
+
+        /// The design's byte model of a verify of `m` rows: dense weights once and each
+        /// distinct expert once per visit, with `8 m^0.6` distinct experts per visit.
+        fn modeled_ms(m: usize) -> f64 {
+            let distinct = 8.0 * (m as f64).powf(0.6);
+            let bytes = DENSE_BYTES + distinct * (44.0 * NVFP4_EXPERT + 4.0 * MXFP8_EXPERT);
+            bytes / EFFECTIVE_BANDWIDTH * 1e3
+        }
+
+        pub fn run(args: &Args) -> anyhow::Result<()> {
+            let path = args
+                .prompt
+                .as_ref()
+                .context("--spec and --verify-widths need --prompt")?;
+            let all = tokens(path)?;
+            ensure!(all.len() > RESERVED + 16, "the capture is too short");
+            let (text, rows) = all.split_at(all.len() - RESERVED);
+            let config = TextConfig::load(&args.model)?;
+            let passes = args.passes.unwrap_or(config.loop_config.num_passes);
+            let vocab = u32::try_from(config.unpadded_vocab_size)?;
+            let contexts = args.contexts.clone().unwrap_or_else(|| vec![0, 32768]);
+            let steps = if args.steps == 100 {
+                DEFAULT_STEPS
+            } else {
+                args.steps
+            };
+            let longest = contexts.iter().copied().max().unwrap_or(0).max(text.len());
+            let capacity = longest + steps + RESERVED + 64;
+
+            let gpu = Gpu::new(0)?;
+            let before = gpu_state()?;
+            eprintln!("loading weights");
+            let checkpoint = Checkpoint::open(&args.model)?;
+            let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+            let mut model = Model::with_formats(
+                &gpu,
+                config,
+                weights,
+                passes,
+                capacity,
+                args.kv,
+                args.weights,
+            )?;
+            println!(
+                "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
+                 before load: {}",
+                before.timestamp,
+                before.name,
+                before.driver,
+                before.max_sm_mhz,
+                before.max_mem_mhz,
+                if before.processes.is_empty() {
+                    "none".to_owned()
+                } else {
+                    before.processes.join(" ")
+                },
+            );
+            println!(
+                "passes {passes}, {} global KV cache, {} decode weights (verify and draft BF16), \
+                 prompt {} ({} tokens)\n",
+                args.kv,
+                args.weights,
+                path.display(),
+                text.len()
+            );
+            if args.verify_widths {
+                verify_widths(&mut model, text, rows, &contexts, vocab)?;
+            }
+            if let Some(k) = args.spec {
+                let mut speculator = Speculator::new(&model, &checkpoint, capacity, k)?;
+                spec(
+                    &mut model,
+                    &mut speculator,
+                    text,
+                    &contexts,
+                    steps,
+                    vocab,
+                    args,
+                )?;
+            }
+            Ok(())
+        }
+
+        fn verify_widths(
+            model: &mut Model,
+            text: &[u32],
+            rows: &[u32],
+            contexts: &[usize],
+            vocab: u32,
+        ) -> anyhow::Result<()> {
+            println!(
+                "| context | rows | min ms | median ms | byte model ms | min ms per row | SM MHz \
+                 | mem MHz |"
+            );
+            println!("|---:|---:|---:|---:|---:|---:|---:|---:|");
+            for &context in contexts {
+                let prompt = prompt(text, context, vocab);
+                model.reset()?;
+                model.prefill(
+                    &prompt,
+                    DEFAULT_PREFILL_CHUNK,
+                    inkling_cuda::model::PrefillLogits::Last,
+                )?;
+                let saved = model.save_state()?;
+                for m in 1..=8 {
+                    model.restore_state(&saved)?;
+                    let mut times = Vec::with_capacity(VERIFY_REPEATS);
+                    // Three untimed passes first: the first captures the graph.
+                    for i in 0..VERIFY_REPEATS + 3 {
+                        let window = &rows[i..i + m];
+                        model.stream().synchronize()?;
+                        let t = Instant::now();
+                        model.verify(VerifyTokens::Host(window), Accept::Rows(1))?;
+                        if i >= 3 {
+                            times.push(t.elapsed().as_secs_f64() * 1e3);
+                        }
+                    }
+                    times.sort_by(f64::total_cmp);
+                    let after = gpu_state()?;
+                    println!(
+                        "| {} | {m} | {:.3} | {:.3} | {:.2} | {:.3} | {} | {} |",
+                        prompt.len(),
+                        times[0],
+                        times[times.len() / 2],
+                        modeled_ms(m),
+                        times[0] / m as f64,
+                        after.sm_mhz,
+                        after.mem_mhz
+                    );
+                }
+            }
+            println!();
+            Ok(())
+        }
+
+        fn spec(
+            model: &mut Model,
+            speculator: &mut Speculator,
+            text: &[u32],
+            contexts: &[usize],
+            steps: usize,
+            vocab: u32,
+            args: &Args,
+        ) -> anyhow::Result<()> {
+            let k = speculator.k();
+            for &context in contexts {
+                let prompt = prompt(text, context, vocab);
+                model.reset()?;
+                let first = speculator.prefill(model, &prompt, DEFAULT_PREFILL_CHUNK)?;
+                let saved = model.save_state()?;
+
+                // Plain decode from the same state.
+                let mut plain = Vec::with_capacity(steps);
+                let mut token = first;
+                for _ in 0..args.warmup.min(steps) {
+                    token = model.step(token, None)?;
+                }
+                model.restore_state(&saved)?;
+                token = first;
+                model.stream().synchronize()?;
+                let started = Instant::now();
+                for _ in 0..steps {
+                    token = model.step(token, None)?;
+                    plain.push(token);
+                }
+                let plain_seconds = started.elapsed().as_secs_f64();
+                let plain_clocks = gpu_state()?;
+
+                // Speculation from the same state, after one warmup run that captures the
+                // graphs.
+                model.restore_state(&saved)?;
+                speculator.restart(model, first)?;
+                speculator.generate(model, 16, Drafts::Dspark)?;
+                model.restore_state(&saved)?;
+                speculator.restart(model, first)?;
+                let out = speculator.generate(model, steps, Drafts::Dspark)?;
+                let spec_clocks = gpu_state()?;
+                let stats = speculator.stats();
+                let agree = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
+                let spec_rate = stats.emitted as f64 / stats.wall.as_secs_f64();
+                let plain_rate = steps as f64 / plain_seconds;
+                let per_round =
+                    |d: std::time::Duration| d.as_secs_f64() * 1e3 / stats.rounds as f64;
+                let acceptance: Vec<String> = stats
+                    .acceptance()
+                    .iter()
+                    .map(|a| format!("{:.1}%", a * 100.0))
+                    .collect();
+                println!("context {} tokens, {steps} generated:", prompt.len());
+                println!(
+                    "  plain decode: {plain_rate:.1} tok/s ({:.3} ms per token), SM {} MHz, mem {} MHz",
+                    plain_seconds * 1e3 / steps as f64,
+                    plain_clocks.sm_mhz,
+                    plain_clocks.mem_mhz
+                );
+                println!(
+                    "  speculation k = {k}: {spec_rate:.1} tok/s ({:.2}x), {} rounds, {:.3} tokens \
+                     per round, acceptance by position [{}], SM {} MHz, mem {} MHz",
+                    spec_rate / plain_rate,
+                    stats.rounds,
+                    stats.tokens_per_round(),
+                    acceptance.join(", "),
+                    spec_clocks.sm_mhz,
+                    spec_clocks.mem_mhz
+                );
+                println!(
+                    "  per round: {:.3} ms = verify {:.3} + draft {:.3} + host {:.3}",
+                    per_round(stats.wall),
+                    per_round(stats.verify),
+                    per_round(stats.draft),
+                    per_round(stats.host())
+                );
+                println!(
+                    "  agreement with plain decode: first {agree} of {steps} tokens{}",
+                    if args.weights == WeightFormat::Fp8 {
+                        " (decode reads FP8 weights)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
     }
 }

@@ -153,7 +153,21 @@ impl KvCache {
     /// A BF16 ring of `window` slots for a sliding-window layer, which sees the last `window`
     /// keys.
     pub fn sliding(stream: &Arc<CudaStream>, window: usize) -> anyhow::Result<Self> {
-        Self::new(stream, window, Some(window), KvFormat::Bf16)
+        Self::sliding_ring(stream, window, window)
+    }
+
+    /// [`KvCache::sliding`] with a ring of `slots`, at least `window`. The kernels find each
+    /// key by its distance modulo `slots` and still see only the last `window` keys.
+    pub fn sliding_ring(
+        stream: &Arc<CudaStream>,
+        window: usize,
+        slots: usize,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            slots >= window,
+            "a ring of {slots} slots cannot hold a window of {window}"
+        );
+        Self::new(stream, slots, Some(window), KvFormat::Bf16)
     }
 
     /// A BF16 cache of `capacity` slots for a global layer, which sees every earlier key.
@@ -225,6 +239,11 @@ impl KvCache {
     #[must_use]
     pub fn data(&self) -> &KvData {
         &self.data
+    }
+
+    /// The key and value buffers, for copying a saved cache back.
+    pub fn data_mut(&mut self) -> &mut KvData {
+        &mut self.data
     }
 
     /// Zeroes every slot.

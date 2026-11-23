@@ -9,6 +9,7 @@ pub mod draft;
 mod gpu;
 pub mod model;
 pub mod ops;
+pub mod spec;
 pub mod weights;
 
 pub use gpu::{DeviceIn, DeviceOut, Gpu};

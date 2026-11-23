@@ -10,3 +10,4 @@ pub mod linear_fp8;
 pub mod misc;
 pub mod norm;
 pub mod routing;
+pub mod spec;
