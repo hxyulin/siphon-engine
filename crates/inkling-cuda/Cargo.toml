@@ -13,5 +13,8 @@ half.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 safetensors.workspace = true
 
+[dev-dependencies]
+inkling = { path = "../inkling" }
+
 [lints]
 workspace = true
