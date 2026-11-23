@@ -86,3 +86,36 @@ cargo run --release -p inkling-cuda --bin parity -- <model-dir> reference/out/<n
 ```
 
 `--detail` prints every visit of one step with the number of differing BF16 values.
+
+## Quality gate
+
+Optimized kernels change summation order, so the engine will not stay bit-exact with MLX. The gate checks instead that the engine computes the same model: it runs the engine teacher-forced over long texts and compares it with MLX within a multiple of MLX's own noise. The texts in `reference/prompts` run past the sliding-window wrap at position 1024. The longest also runs past 8192, where the global layers start scaling queries.
+
+`reference/capture_eval.py capture` runs MLX over a text on the Mac. It saves the token ids, MLX's log-probability of each actual next token, its top-1 token at every position, full logits at about 80 sampled positions, and 32 greedy tokens after the text. MLX runs the text in chunks of 512 by default, or one token per step with `--token-by-token`. `compare` reports how far two captures of the same text are apart:
+
+```sh
+uv run --project reference python -I reference/capture_eval.py capture <model-dir> reference/prompts/anyhow.txt reference/out/anyhow-chunked.safetensors
+uv run --project reference python -I reference/capture_eval.py compare reference/out/anyhow-chunked.safetensors reference/out/anyhow-tbt.safetensors
+```
+
+The `eval` binary runs the engine over a capture on the GPU. It reports top-1 agreement, the mean absolute difference of the next-token log-probability, and perplexity, per range of positions. It also reports KL(MLX || engine) at the sampled positions, with the worst positions, and the greedy continuation match. It prints a verdict and exits with status 1 on failure:
+
+```sh
+cargo run --release -p inkling-cuda --bin eval -- <model-dir> reference/out/anyhow-chunked.safetensors
+```
+
+The thresholds are about 1.5 to 2 times MLX's disagreement between its chunked and token-by-token paths on the three texts:
+
+| Check | MLX chunked vs token-by-token | Threshold |
+| --- | --- | --- |
+| Mean KL at sampled positions | 6.2e-4 to 2.0e-3 | 4e-3 |
+| Max KL at sampled positions | 4.1e-3 to 5.9e-2 | 0.12 |
+| Top-1 agreement, per range | 98.05% to 99.08% | 97% |
+| Mean \|log-prob difference\|, per range | 0.021 to 0.031 | 0.045 |
+| \|Perplexity ratio - 1\| | 6.8e-4 to 2.5e-3 | 5e-3 |
+
+The greedy continuation is reported but not checked: one near-tie splits it, and MLX's two paths agree on only 12 of 32 tokens after `regex-readme.txt`.
+
+The gate catches a sliding window that is not enforced. Run that way, MLX alone gives a mean KL of 9.5e-3 and a max KL of 0.21 on `anyhow.txt`. It cannot see query log-scaling: at 11,186 tokens the scale is at most 1.031, and MLX with log-scaling removed differs from MLX by less than its own noise (mean |log-prob difference| 0.006). A sliding window off by one position is also below the noise. A unit test covers log-scaling (`log_scale_matches_mlx`).
+
+On the current runner every capture passes. Against `anyhow-tbt`, the engine's mean KL is 1.2e-3 and its max KL 2.4e-2. Top-1 agreement is 98.6% to 99.1% per range and the mean |log-prob difference| 0.021 to 0.026. Perplexity is 1.7358 against MLX's 1.7355, and all 32 continuation tokens match. The run takes 23 ms per token, 4.3 minutes for `anyhow.txt`, because it copies a trace of every layer visit each step.
