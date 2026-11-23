@@ -28,7 +28,7 @@ use inkling::TextConfig;
 use crate::{
     DeviceIn, Gpu,
     ops::{
-        attention::{Attention, AttentionScratch, KvCache, KvData, KvFormat},
+        attention::{self, Attention, AttentionScratch, KvCache, KvData, KvFormat},
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
@@ -1223,14 +1223,11 @@ impl Ctx {
     /// Appends the keys `k` and values `v` (`[m, 8, 128]`) of `m` rows to `cache` and
     /// attends causally from each row's query (`q` `[m, 24, 128]`) into `out`
     /// (`[m, 24, 128]`). Row `i` sits at position `start + i`, where `start` holds one
-    /// value; `positions` holds `start, start + 1, ...` for at least `m` rows. `bias`
-    /// `[m, 24, extent]` and `sinks` `[m, 24]` are each row's relative bias and sink
-    /// logits.
+    /// value. `bias` `[m, 24, extent]` and `sinks` `[m, 24]` are each row's relative bias
+    /// and sink logits. The caller checks that `cache` holds the chunk's last position.
     ///
-    /// Fallback: for each row, [`Attention::append`] and [`Attention::decode_attention`]
-    /// with that row's position from `positions`. The fast version is
-    /// `Attention::prefill_attention(stream, q, k, v, cache, start, m, bias, sinks,
-    /// scratch, out)`, which reads neither `positions` nor the decode `scratch` layout.
+    /// Runs [`Attention::prefill_attention`], a tensor-core flash attention over the cache
+    /// and the chunk. A single row goes to the decode kernels.
     #[expect(
         clippy::too_many_arguments,
         reason = "the attention inputs and outputs"
@@ -1241,44 +1238,26 @@ impl Ctx {
         k: &CudaView<'_, bf16>,
         v: &CudaView<'_, bf16>,
         cache: &mut KvCache,
-        _start: &CudaSlice<u32>,
-        positions: &CudaSlice<u32>,
+        start: &CudaSlice<u32>,
         m: usize,
         bias: &CudaView<'_, bf16>,
         sinks: &CudaView<'_, bf16>,
-        scratch: &mut AttentionScratch,
+        scratch: &mut attention::PrefillScratch,
         out: &mut CudaViewMut<'_, bf16>,
     ) -> anyhow::Result<()> {
-        fn row<'a>(x: &'a CudaView<'_, bf16>, i: usize, m: usize) -> CudaView<'a, bf16> {
-            let n = x.len() / m;
-            x.slice(i * n..(i + 1) * n)
-        }
-        ensure!(
-            m > 0 && positions.len() >= m,
-            "positions must cover {m} rows"
-        );
-        let q_width = out.len() / m;
-        for i in 0..m {
-            let position = positions.slice(i..=i);
-            self.kernels.attention.append(
-                &self.stream,
-                cache,
-                &position,
-                &row(k, i, m),
-                &row(v, i, m),
-            )?;
-            self.kernels.attention.decode_attention(
-                &self.stream,
-                &row(q, i, m),
-                cache,
-                &position,
-                &row(bias, i, m),
-                &row(sinks, i, m),
-                scratch,
-                &mut out.slice_mut(i * q_width..(i + 1) * q_width),
-            )?;
-        }
-        Ok(())
+        self.kernels.attention.prefill_attention(
+            &self.stream,
+            q,
+            k,
+            v,
+            cache,
+            start,
+            m,
+            bias,
+            sinks,
+            scratch,
+            out,
+        )
     }
 
     fn hidden(&self) -> usize {

@@ -19,7 +19,7 @@ use inkling::TextConfig;
 use super::{Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, VisitState, zeros};
 use crate::{
     ops::{
-        attention::AttentionScratch,
+        attention,
         experts::ExpertScratch,
         norm::{AttentionPostRows, KvConvWeights},
         routing::{NormDest, Partial},
@@ -67,7 +67,7 @@ struct AttentionRows {
     v: CudaSlice<bf16>,
     r: CudaSlice<bf16>,
     bias: CudaSlice<bf16>,
-    partials: AttentionScratch,
+    partials: attention::PrefillScratch,
     out: CudaSlice<bf16>,
     gated: CudaSlice<bf16>,
     proj: CudaSlice<bf16>,
@@ -92,9 +92,8 @@ struct MoeRows {
 pub(super) struct PrefillScratch {
     rows: usize,
     tokens: CudaSlice<i32>,
-    /// The position of the chunk's first row, and of each row.
+    /// The position of the chunk's first row.
     start: CudaSlice<u32>,
-    positions: CudaSlice<u32>,
     embedded: CudaSlice<bf16>,
     hidden: CudaSlice<bf16>,
     out: CudaSlice<bf16>,
@@ -140,7 +139,6 @@ impl PrefillScratch {
             rows,
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
-            positions: zeros(stream, rows)?,
             embedded: zeros(stream, rows * hidden)?,
             hidden: zeros(stream, rows * hidden)?,
             out: zeros(stream, rows * hidden)?,
@@ -181,7 +179,7 @@ impl PrefillScratch {
                 v: zeros(stream, rows * kv_dims)?,
                 r: zeros(stream, rows * heads * cfg.d_rel)?,
                 bias: zeros(stream, rows * heads * cfg.rel_extent)?,
-                partials: AttentionScratch::new(stream)?,
+                partials: attention::PrefillScratch::new(stream, rows)?,
                 out: zeros(stream, rows * q_dims)?,
                 gated: zeros(stream, rows * q_dims)?,
                 proj: zeros(stream, rows * hidden)?,
@@ -304,12 +302,9 @@ impl Model {
             .map(|&t| Ok(i32::try_from(t)?))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let first = u32::try_from(start)?;
-        let positions: Vec<u32> = (first..).take(m).collect();
         ctx.stream
             .memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, m, 1))?;
         ctx.stream.memcpy_htod(&[first], &mut p.start)?;
-        ctx.stream
-            .memcpy_htod(&positions, &mut rows_mut(&mut p.positions, m, 1))?;
         ctx.prefill_enqueue(p, visits, *passes, *max_blocks, scratch, m, start, logits)?;
         let next = ctx.stream.clone_dtoh(&scratch.next)?[0];
         self.position += m;
@@ -568,7 +563,7 @@ impl Ctx {
         self.attention_block_rows(
             state,
             &mut p.attention,
-            (&p.start, &p.positions),
+            &p.start,
             w,
             sliding,
             [q_in, k_in, v_in].map(|x| rows(x, m, hidden)),
@@ -755,8 +750,7 @@ impl Ctx {
         Ok(false)
     }
 
-    /// [`Ctx::attention`] for a chunk of `m` rows. `start` holds the first row's position
-    /// and `positions` every row's.
+    /// [`Ctx::attention`] for a chunk of `m` rows. `start` holds the first row's position.
     #[expect(
         clippy::too_many_arguments,
         reason = "the attention inputs and outputs"
@@ -766,7 +760,7 @@ impl Ctx {
         &self,
         state: &mut VisitState,
         t: &mut AttentionRows,
-        (start, positions): (&CudaSlice<u32>, &CudaSlice<u32>),
+        start: &CudaSlice<u32>,
         w: &LayerWeights,
         sliding: bool,
         [q_in, k_in, v_in]: [CudaView<'_, bf16>; 3],
@@ -873,7 +867,6 @@ impl Ctx {
             &rows(&t.v, m, kv_dims),
             &mut state.kv,
             start,
-            positions,
             m,
             &rows(&t.bias, m, heads * cfg.rel_extent),
             &rows(&t.sinks, m, heads),
