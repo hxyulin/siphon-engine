@@ -7,6 +7,10 @@
 //!    head.
 //! 2. [`Attention::append`] writes the token's key and value into the layer's [`KvCache`].
 //! 3. [`Attention::decode_attention`] attends from the token's query over the cache.
+//!
+//! Append and attention read the token's position from a one-element device buffer, so a
+//! captured CUDA graph can replay them at any position. The caller tracks the position on
+//! the host and checks [`KvCache::holds`] before each token.
 
 use std::sync::Arc;
 
@@ -30,11 +34,8 @@ pub const REL_DIM: usize = 16;
 const SCALE: f32 = 0.088_388_346;
 /// Keys per cache slot row: one token's `[KV_HEADS, HEAD_DIM]`.
 const KV_ROW: usize = KV_HEADS * HEAD_DIM;
-/// MLX on an M5 Max switches from its one-pass to its two-pass decode kernel at this many keys.
-const TWO_PASS_KEYS: usize = 1024;
-/// Key blocks of MLX's one-pass kernel (its 32 simdgroups).
-const ONE_PASS_BLOCKS: usize = 32;
-/// Key blocks of MLX's two-pass kernel on an M5 Max with 3 query heads per KV head.
+/// Key blocks of MLX's two-pass kernel on an M5 Max with 3 query heads per KV head. Below
+/// 1024 keys MLX's one-pass kernel uses 32; the kernels pick between them from the position.
 const TWO_PASS_BLOCKS: usize = 64;
 /// Threads per block of the relative-bias kernel.
 const BIAS_BLOCK: u32 = 256;
@@ -43,15 +44,17 @@ const BIAS_BLOCK: u32 = 256;
 ///
 /// `keys` and `values` are BF16 buffers of shape `[slots, 8, 128]`. A sliding cache is a ring:
 /// position `p` lives in slot `p % slots`. A global cache stores position `p` in slot `p` and
-/// refuses to append past its capacity. The layout matches MLX's `RotatingKVCache` and
+/// holds positions below its capacity. The layout matches MLX's `RotatingKVCache` and
 /// `KVCache` fed one token at a time.
+///
+/// The cache does not count its tokens: append and attention take the position, and a
+/// cache at position `p` holds the tokens at positions below `p`.
 #[derive(Debug)]
 pub struct KvCache {
     keys: CudaSlice<bf16>,
     values: CudaSlice<bf16>,
     slots: usize,
     window: Option<usize>,
-    len: usize,
 }
 
 impl KvCache {
@@ -73,34 +76,14 @@ impl KvCache {
             values: stream.alloc_zeros(slots * KV_ROW)?,
             slots,
             window,
-            len: 0,
         })
     }
 
-    /// Tokens appended so far; the next token's position.
+    /// Whether the token at `position` fits: always for a sliding cache, below the capacity
+    /// for a global one.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Marks `len` tokens as appended without writing them, so a benchmark can measure
-    /// decode at a long context without running the prefill. The skipped slots keep
-    /// whatever they held, so attention outputs are meaningless afterwards.
-    pub fn skip_to(&mut self, len: usize) -> anyhow::Result<()> {
-        if self.window.is_none() {
-            ensure!(
-                len <= self.slots,
-                "global cache holds {} tokens, asked to skip to {len}",
-                self.slots
-            );
-        }
-        self.len = len;
-        Ok(())
+    pub fn holds(&self, position: usize) -> bool {
+        self.window.is_some() || position < self.slots
     }
 
     #[must_use]
@@ -125,7 +108,8 @@ impl KvCache {
     }
 }
 
-/// Per-block partial results of [`Attention::decode_attention`], reused across calls.
+/// Per-block partial results of [`Attention::decode_attention`], reused across calls and
+/// layers.
 #[derive(Debug)]
 pub struct AttentionScratch {
     out: CudaSlice<f32>,
@@ -206,27 +190,22 @@ impl Attention {
         Ok(())
     }
 
-    /// Appends one token's key `k` and value `v` (`[8, 128]` each) to `cache` and returns the
-    /// token's position.
+    /// Writes one token's key `k` and value `v` (`[8, 128]` each) into `cache` at the token's
+    /// position, the one value in `position`.
     ///
-    /// Fails when a global cache is full.
+    /// The caller checks [`KvCache::holds`] for that position first.
     pub fn append(
         &self,
         stream: &CudaStream,
         cache: &mut KvCache,
+        position: &CudaSlice<u32>,
         k: &CudaSlice<bf16>,
         v: &CudaSlice<bf16>,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<()> {
         check_len("k", k.len(), KV_ROW)?;
         check_len("v", v.len(), KV_ROW)?;
-        let position = cache.len;
-        ensure!(
-            cache.window.is_some() || position < cache.slots,
-            "global KV cache is full at {} tokens",
-            cache.slots
-        );
-        u32::try_from(position).context("position does not fit the kernels")?;
-        let slot = u32::try_from(position % cache.slots)?;
+        check_len("position", position.len(), 1)?;
+        let slots = u32::try_from(cache.slots)?;
         let config = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: ((KV_ROW / 8) as u32, 1, 1),
@@ -238,28 +217,31 @@ impl Attention {
             .arg(v)
             .arg(&mut cache.keys)
             .arg(&mut cache.values)
-            .arg(&slot);
+            .arg(position)
+            .arg(&slots);
         // SAFETY: the arguments match `kv_append_bf16(const bf16*, const bf16*, bf16*, bf16*,
-        // unsigned)`. `k` and `v` hold one 1024-element row and `slot < slots`, so the write stays
-        // inside the `[slots, 1024]` caches.
+        // const unsigned*, unsigned)`. `k` and `v` hold one 1024-element row, `position` the one
+        // value the kernel reads, and the kernel writes slot `position % slots`, inside the
+        // `[slots, 1024]` caches.
         unsafe { launch.launch(config) }?;
-        cache.len += 1;
-        Ok(position)
+        Ok(())
     }
 
-    /// Attention output `out` `[24, 128]` of the most recently appended token, whose query is
-    /// `q` `[24, 128]`, over `cache`.
+    /// Attention output `out` `[24, 128]` of the token at `position` (one value), whose query
+    /// is `q` `[24, 128]`, over `cache` after the token's append.
     ///
     /// `bias` `[24, extent]` comes from [`Attention::relative_bias`]; a key at distance `d`
     /// gets `bias[h, d]` when `d < extent` and nothing otherwise. `sinks` `[24]` are the sink
     /// logits. Splits the keys as MLX does on an M5 Max: 32 blocks with F32 partials below 1024
-    /// keys, 64 blocks with BF16 partials from 1024 keys on.
+    /// keys, 64 blocks with BF16 partials from 1024 keys on. The kernels choose the split from
+    /// `position`, so the launch is the same at every position.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
     pub fn decode_attention(
         &self,
         stream: &CudaStream,
         q: &CudaSlice<bf16>,
         cache: &KvCache,
+        position: &CudaSlice<u32>,
         bias: &CudaSlice<bf16>,
         sinks: &CudaSlice<bf16>,
         scratch: &mut AttentionScratch,
@@ -268,19 +250,8 @@ impl Attention {
         check_len("q", q.len(), HEADS * HEAD_DIM)?;
         check_len("sinks", sinks.len(), HEADS)?;
         check_len("out", out.len(), HEADS * HEAD_DIM)?;
+        check_len("position", position.len(), 1)?;
         let extent = extent("bias", bias.len(), HEADS)?;
-        ensure!(
-            !cache.is_empty(),
-            "decode attention needs an appended token"
-        );
-        let position = cache.len - 1;
-        let keys = (position + 1).min(cache.slots);
-        let (blocks, round_partials) = if keys < TWO_PASS_KEYS {
-            (ONE_PASS_BLOCKS, 0i32)
-        } else {
-            (TWO_PASS_BLOCKS, 1i32)
-        };
-        let position = u32::try_from(position)?;
         let slots = u32::try_from(cache.slots)?;
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
 
@@ -294,40 +265,40 @@ impl Attention {
             .arg(&mut scratch.out)
             .arg(&mut scratch.max)
             .arg(&mut scratch.sum)
-            .arg(&position)
+            .arg(position)
             .arg(&slots)
             .arg(&window)
             .arg(&extent)
-            .arg(&SCALE)
-            .arg(&round_partials);
+            .arg(&SCALE);
         let config = LaunchConfig {
-            grid_dim: (HEADS as u32, blocks as u32, 1),
+            grid_dim: (HEADS as u32, TWO_PASS_BLOCKS as u32, 1),
             block_dim: (32, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `decode_attention_partial_bf16(const bf16* q, const bf16*
         // k_cache, const bf16* v_cache, const bf16* bias, const bf16* sinks, float*, float*,
-        // float*, unsigned position, unsigned slots, unsigned window, unsigned extent, float,
-        // int)`. The kernel reads slots below min(position + 1, slots) of the caches, bias
-        // columns below `extent`, and writes 24 x `blocks` partial rows, which the scratch holds.
+        // float*, const unsigned* position, unsigned slots, unsigned window, unsigned extent,
+        // float)`. The kernel reads slots below min(position + 1, slots) of the caches, bias
+        // columns below `extent`, and writes 24 x at most 64 partial rows, which the scratch
+        // holds.
         unsafe { launch.launch(config) }?;
 
-        let blocks = i32::try_from(blocks)?;
         let mut launch = stream.launch_builder(&self.decode_combine);
         launch
             .arg(&scratch.out)
             .arg(&scratch.max)
             .arg(&scratch.sum)
             .arg(out)
-            .arg(&blocks);
+            .arg(position)
+            .arg(&slots);
         let config = LaunchConfig {
             grid_dim: (HEADS as u32, 1, 1),
             block_dim: (1024, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `decode_attention_combine_bf16(const float*, const float*,
-        // const float*, bf16*, int)`. It reads the 24 x `blocks` partial rows written above and
-        // writes `out`, checked to hold 24 x 128 values.
+        // const float*, bf16*, const unsigned*, unsigned)`. It reads the partial rows written
+        // above, for the same split, and writes `out`, checked to hold 24 x 128 values.
         unsafe { launch.launch(config) }?;
         Ok(())
     }

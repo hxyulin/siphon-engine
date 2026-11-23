@@ -8,7 +8,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -101,16 +101,17 @@ impl Norm {
     pub fn rms_norm_f32(
         &self,
         stream: &CudaStream,
-        x: &CudaSlice<f32>,
+        x: &impl DeviceIn<f32>,
         weight: &CudaSlice<bf16>,
         out: &mut CudaSlice<bf16>,
         eps: f32,
     ) -> anyhow::Result<()> {
+        let x = x.view();
         check_weight(weight.len())?;
         let rows = rows(x.len(), HIDDEN)?;
         check_out(out.len(), x.len())?;
         let mut launch = stream.launch_builder(&self.rms_norm_f32_2304);
-        launch.arg(x).arg(weight).arg(out).arg(&eps);
+        launch.arg(&x).arg(weight).arg(out).arg(&eps);
         // SAFETY: the arguments match `rms_norm_f32_2304(const float*, const bf16*, bf16*, float)`,
         // and the checks above keep every row inside `x` and `out`.
         unsafe { launch.launch(row_config(rows)) }?;
@@ -121,14 +122,15 @@ impl Norm {
     pub fn unweighted_rms_norm(
         &self,
         stream: &CudaStream,
-        x: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
+        x: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<f32>,
         eps: f32,
     ) -> anyhow::Result<()> {
+        let (x, mut out) = (x.view(), out.view_mut());
         let rows = rows(x.len(), HIDDEN)?;
         check_out(out.len(), x.len())?;
         let mut launch = stream.launch_builder(&self.unweighted_rms_norm_f32_2304);
-        launch.arg(x).arg(out).arg(&eps);
+        launch.arg(&x).arg(&mut out).arg(&eps);
         // SAFETY: the arguments match `unweighted_rms_norm_f32_2304(const float*, float*, float)`,
         // and the checks above keep every row inside `x` and `out`.
         unsafe { launch.launch(row_config(rows)) }?;

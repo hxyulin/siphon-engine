@@ -167,26 +167,30 @@ impl Elementwise {
     }
 
     /// Multiplies each `row_width`-element row of `x` in place by the log-scaling factor
-    /// of its position. Row `i` is at position `start_position + i`. Used on the query
-    /// states (`row_width` 24 * 128) and relative states (24 * 16) of full attention.
+    /// of its position. Row `i` is at position `start + i`, where `start` is the one value
+    /// in `start_position`, read on the device so a captured graph can replay at any
+    /// position. Used on the query states (`row_width` 24 * 128) and relative states
+    /// (24 * 16) of full attention.
     pub fn log_scale(
         &self,
         stream: &CudaStream,
         x: &mut CudaSlice<bf16>,
         row_width: usize,
-        start_position: u32,
+        start_position: &CudaSlice<u32>,
         alpha: f32,
         n_floor: f32,
     ) -> anyhow::Result<()> {
         ensure!(row_width > 0, "row_width is zero");
+        ensure!(
+            start_position.len() == 1,
+            "start_position has {} elements, expected 1",
+            start_position.len()
+        );
         let rows = ensure_rows("x", x.len(), row_width)?;
         if rows == 0 {
             return Ok(());
         }
         let rows = u32::try_from(rows).context("too many rows")?;
-        start_position
-            .checked_add(rows)
-            .context("positions overflow u32")?;
         let row_width = u32::try_from(row_width).context("row_width too large")?;
         let config = LaunchConfig {
             grid_dim: (rows, 1, 1),
@@ -197,11 +201,11 @@ impl Elementwise {
         launch
             .arg(x)
             .arg(&row_width)
-            .arg(&start_position)
+            .arg(start_position)
             .arg(&alpha)
             .arg(&n_floor);
-        // SAFETY: the arguments match `log_scale_bf16(bf16*, uint32_t, uint32_t, float,
-        // float)`, and `x` holds `rows` rows of `row_width` elements, one block per row.
+        // SAFETY: the arguments match `log_scale_bf16(bf16*, uint32_t, const uint32_t*, float,
+        // float)`, `start_position` holds the one value the kernel reads, and `x` holds `rows` rows of `row_width` elements, one block per row.
         unsafe { launch.launch(config) }?;
         Ok(())
     }

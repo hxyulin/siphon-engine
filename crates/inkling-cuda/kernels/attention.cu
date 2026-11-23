@@ -26,7 +26,9 @@
 //   block and then combine the blocks. The one-pass kernel is the two-pass
 //   structure with 32 blocks whose partial outputs stay in F32; the two-pass
 //   kernel on an M5 Max uses 64 blocks for this GQA factor and rounds the
-//   unnormalized partial outputs to BF16. The launcher picks the same split.
+//   unnormalized partial outputs to BF16. The kernels pick the same split from
+//   the position they read on the device; the launcher always starts 64 blocks
+//   and blocks past the split exit, so a captured graph serves every position.
 //   Within a block:
 //     q' = scale * q                        (scale applied to q, in F32)
 //     score = sum over the lane's 4 dims    (FMA chain), then simd_sum
@@ -60,6 +62,11 @@ constexpr int kRelDim = 16;
 // Elements of a 128-wide head each lane owns, MLX's qk_per_thread.
 constexpr int kVec = kHeadDim / 32;
 constexpr int kKvRow = kKvHeads * kHeadDim;
+// MLX on an M5 Max switches from its one-pass to its two-pass kernel at this
+// many keys, and their block counts.
+constexpr unsigned kTwoPassKeys = 1024;
+constexpr int kOnePassBlocks = 32;
+constexpr int kTwoPassBlocks = 64;
 
 __device__ __forceinline__ float fadd(float a, float b) {
     float r;
@@ -126,6 +133,12 @@ __device__ __forceinline__ float round_bf16(float x) {
     return __bfloat162float(__float2bfloat16(x));
 }
 
+// Key blocks of the split MLX uses for a query at `position` over a cache of
+// `slots`: one pass below kTwoPassKeys keys, two passes from there on.
+__device__ __forceinline__ int split_blocks(unsigned position, unsigned slots) {
+    return min(position + 1, slots) < kTwoPassKeys ? kOnePassBlocks : kTwoPassBlocks;
+}
+
 }  // namespace
 
 // bias[h, r] = sum_k rel[h, k] * table[k, r] for rel [24, 16] and table
@@ -157,33 +170,39 @@ relative_bias_bf16(const __nv_bfloat16* rel, const __nv_bfloat16* table, __nv_bf
     bias[h * extent + r] = __float2bfloat16(acc);
 }
 
-// Writes one token's k and v ([8, 128] each) into `slot` of the caches
-// ([slots, 8, 128]). One block of 128 threads, 8 elements per thread.
+// Writes one token's k and v ([8, 128] each) into the caches ([slots, 8, 128])
+// at slot *position mod slots. One block of 128 threads, 8 elements per thread.
 extern "C" __global__ void __launch_bounds__(128)
 kv_append_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
-               unsigned slot) {
+               const unsigned* position, unsigned slots) {
     const size_t i = threadIdx.x * 8;
-    const size_t dst = size_t(slot) * kKvRow + i;
+    const size_t dst = size_t(*position % slots) * kKvRow + i;
     *reinterpret_cast<uint4*>(k_cache + dst) = *reinterpret_cast<const uint4*>(k + i);
     *reinterpret_cast<uint4*>(v_cache + dst) = *reinterpret_cast<const uint4*>(v + i);
 }
 
 // First pass: for query head h = blockIdx.x and block b = blockIdx.y, an online
-// softmax over cache slots b, b + blocks, ... below n. One warp; lane l owns
-// dims 4l..4l+3. Writes the unnormalized output to
-// partial_out[h, b, 128] (rounded to BF16 values if `round_partials`), and the
-// running max and sum to partial_max[h, b] and partial_sum[h, b].
+// softmax over cache slots b, b + blocks, ... below n, where `blocks` is the
+// split for this position and blocks b >= blocks exit. One warp; lane l owns
+// dims 4l..4l+3. Writes the unnormalized output to partial_out[h, b, 128]
+// (rounded to BF16 values in the two-pass split), and the running max and sum
+// to partial_max[h, b] and partial_sum[h, b].
 //
-// `position` is the query's absolute position p, `slots` the cache size,
+// `*position_ptr` is the query's absolute position p, `slots` the cache size,
 // `window` the sliding window (0 for none) and `extent` the bias table width.
 extern "C" __global__ void __launch_bounds__(32)
 decode_attention_partial_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                               const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out,
-                              float* partial_max, float* partial_sum, unsigned position, unsigned slots,
-                              unsigned window, unsigned extent, float scale, int round_partials) {
+                              float* partial_max, float* partial_sum, const unsigned* position_ptr,
+                              unsigned slots, unsigned window, unsigned extent, float scale) {
+    const unsigned position = *position_ptr;
     const int h = blockIdx.x;
     const int block = blockIdx.y;
-    const int blocks = gridDim.y;
+    const int blocks = split_blocks(position, slots);
+    if (block >= blocks) {
+        return;
+    }
+    const bool round_partials = blocks == kTwoPassBlocks;
     const int lane = threadIdx.x;
     const int kv_head = h / kGroup;
     const unsigned n = min(position + 1, slots);
@@ -246,14 +265,16 @@ decode_attention_partial_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_cac
 }
 
 // Second pass, MLX's sdpa_vector_2pass_2: combines the `blocks` partials of
-// query head h = blockIdx.x into out[h, 128]. 32 warps; warp w sums blocks
+// query head h = blockIdx.x into out[h, 128], with `blocks` the split for
+// *position over `slots`, as in the first pass. 32 warps; warp w sums blocks
 // w, w + 32, ... for dims 4l..4l+3 of lane l, then a transpose through shared
 // memory lets each warp add up one group of 4 dims across the 32 warps. With 32
 // blocks this is also exactly the end of MLX's one-pass kernel.
 extern "C" __global__ void __launch_bounds__(1024)
 decode_attention_combine_bf16(const float* partial_out, const float* partial_max, const float* partial_sum,
-                              __nv_bfloat16* out, int blocks) {
+                              __nv_bfloat16* out, const unsigned* position, unsigned slots) {
     __shared__ float outputs[32 * 32];
+    const int blocks = split_blocks(*position, slots);
     const int h = blockIdx.x;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;

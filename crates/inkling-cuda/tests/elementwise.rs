@@ -127,8 +127,9 @@ fn log_scale_matches_mlx() -> anyhow::Result<()> {
         for (part, width) in [("query", 24 * 128), ("relative", 24 * 16)] {
             let (want, _) = s.fixture.bf16(&format!("{name}.{part}_out"))?;
             let mut x = s.bf16(&format!("{name}.{part}"))?;
+            let start = s.stream().clone_htod(&[start])?;
             s.ops
-                .log_scale(s.stream(), &mut x, width, start, 0.1, 8192.0)?;
+                .log_scale(s.stream(), &mut x, width, &start, 0.1, 8192.0)?;
             let got = s.stream().clone_dtoh(&x)?;
             assert_bf16_close(&format!("{name}.{part}"), &got, &want, 1);
         }

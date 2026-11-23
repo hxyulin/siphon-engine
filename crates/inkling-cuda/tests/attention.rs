@@ -87,13 +87,13 @@ fn check_decode(setup: &Setup, case: &str, mut cache: KvCache) -> anyhow::Result
     let checks = setup.checks()?;
     let mut scratch = AttentionScratch::new(stream)?;
     let mut out_dev = stream.alloc_zeros::<bf16>(HEADS * HEAD_DIM)?;
+    let mut position_dev = stream.alloc_zeros::<u32>(1)?;
     for position in 0..k_shape[0] {
+        assert!(cache.holds(position));
+        stream.memcpy_htod(&[u32::try_from(position)?], &mut position_dev)?;
         let k_dev = stream.clone_htod(&k[position * row..(position + 1) * row])?;
         let v_dev = stream.clone_htod(&v[position * row..(position + 1) * row])?;
-        assert_eq!(
-            attention.append(stream, &mut cache, &k_dev, &v_dev)?,
-            position
-        );
+        attention.append(stream, &mut cache, &position_dev, &k_dev, &v_dev)?;
         if !checks.contains(&position) {
             continue;
         }
@@ -109,6 +109,7 @@ fn check_decode(setup: &Setup, case: &str, mut cache: KvCache) -> anyhow::Result
             stream,
             &q_dev,
             &cache,
+            &position_dev,
             &bias_dev,
             &sinks_dev,
             &mut scratch,
@@ -135,14 +136,12 @@ fn global_decode_attention_matches_mlx() -> anyhow::Result<()> {
 }
 
 #[test]
-fn global_cache_refuses_overflow() -> anyhow::Result<()> {
-    let Setup { gpu, attention, .. } = Setup::new()?;
-    let stream = gpu.stream();
-    let mut cache = KvCache::global(stream, 2)?;
-    let kv = stream.alloc_zeros::<bf16>(KV_HEADS * HEAD_DIM)?;
-    attention.append(stream, &mut cache, &kv, &kv)?;
-    attention.append(stream, &mut cache, &kv, &kv)?;
-    assert!(attention.append(stream, &mut cache, &kv, &kv).is_err());
-    assert_eq!(cache.len(), 2);
+fn global_cache_holds_its_capacity() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let global = KvCache::global(gpu.stream(), 2)?;
+    assert!(global.holds(0) && global.holds(1));
+    assert!(!global.holds(2));
+    let sliding = KvCache::sliding(gpu.stream(), 2)?;
+    assert!(sliding.holds(2) && sliding.holds(1 << 20));
     Ok(())
 }

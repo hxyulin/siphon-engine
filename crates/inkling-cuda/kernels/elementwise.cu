@@ -118,13 +118,13 @@ extern "C" __global__ void attention_gate_bf16(const __nv_bfloat16* attn,
     }
 }
 
-// In-place x = bf16(f32(x) * tau) for rows at positions start, start + 1, ..., with
+// In-place x = bf16(f32(x) * tau) for rows at positions *start, *start + 1, ..., with
 // tau = 1 + alpha * log(max((position + 1) / n_floor, 1)) as `FullAttention` computes
 // it in F32. One block per row. __logf (hardware log2 times ln 2) agrees with Metal's
 // log for 96.5% of positions below 2^21, logf for 86.7%.
 extern "C" __global__ void log_scale_bf16(__nv_bfloat16* x, uint32_t row_width,
-                                          uint32_t start, float alpha, float n_floor) {
-    const float position = float(start + blockIdx.x);
+                                          const uint32_t* start, float alpha, float n_floor) {
+    const float position = float(*start + blockIdx.x);
     const float ratio = fmaxf(fdiv(fadd(position, 1.f), n_floor), 1.f);
     const float tau = fadd(1.f, fmul(alpha, __logf(ratio)));
     __nv_bfloat16* row = x + size_t(blockIdx.x) * row_width;

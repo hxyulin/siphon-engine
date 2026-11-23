@@ -8,7 +8,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -161,11 +161,12 @@ impl Routing {
     pub fn depth_attention(
         &self,
         stream: &CudaStream,
-        blocks: &CudaSlice<f32>,
+        blocks: &impl DeviceIn<f32>,
         partial: &CudaSlice<f32>,
         queries: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
+        out: &mut impl DeviceOut<f32>,
     ) -> anyhow::Result<()> {
+        let (blocks, mut out) = (blocks.view(), out.view_mut());
         ensure!(
             !partial.is_empty() && partial.len().is_multiple_of(HIDDEN),
             "partial has {} elements, not a positive multiple of {HIDDEN}",
@@ -203,10 +204,10 @@ impl Routing {
         let nq = i32::try_from(nq).context("too many queries")?;
         let mut launch = stream.launch_builder(&self.depth_attention_2304);
         launch
-            .arg(blocks)
+            .arg(&blocks)
             .arg(partial)
             .arg(queries)
-            .arg(out)
+            .arg(&mut out)
             .arg(&nb)
             .arg(&nq)
             .arg(&scale);

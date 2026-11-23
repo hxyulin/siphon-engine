@@ -10,4 +10,4 @@ pub mod model;
 pub mod ops;
 pub mod weights;
 
-pub use gpu::Gpu;
+pub use gpu::{DeviceIn, DeviceOut, Gpu};

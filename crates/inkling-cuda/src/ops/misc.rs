@@ -8,7 +8,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{cubin, load_module};
+use crate::gpu::{DeviceIn, cubin, load_module};
 
 /// Threads per block for the elementwise kernels.
 const BLOCK: u32 = 256;
@@ -58,19 +58,26 @@ impl Misc {
     pub fn message_gate_combine(
         &self,
         stream: &CudaStream,
-        h: &CudaSlice<f32>,
-        m: &CudaSlice<f32>,
+        h: &impl DeviceIn<f32>,
+        m: &impl DeviceIn<f32>,
         f_pre: &CudaSlice<f32>,
         g_pre: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> anyhow::Result<()> {
+        let (h, m) = (h.view(), m.view());
         let n = h.len();
         check_len("m", m.len(), n)?;
         check_len("f_pre", f_pre.len(), n)?;
         check_len("g_pre", g_pre.len(), n)?;
         check_len("out", out.len(), n)?;
         let mut launch = stream.launch_builder(&self.message_gate_combine_f32);
-        launch.arg(h).arg(m).arg(f_pre).arg(g_pre).arg(out).arg(&n);
+        launch
+            .arg(&h)
+            .arg(&m)
+            .arg(f_pre)
+            .arg(g_pre)
+            .arg(out)
+            .arg(&n);
         // SAFETY: the arguments match `message_gate_combine_f32(const float*, const float*,
         // const float*, const float*, float*, size_t)`, and every slice holds `n` elements.
         unsafe { launch.launch(grid_stride(n)) }?;
