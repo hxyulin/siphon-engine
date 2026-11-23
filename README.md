@@ -57,3 +57,11 @@ The measured control is Ingine with FP8 outer attention: 547, 439 and 286 tok/s 
 ```sh
 uv run --project reference python -I reference/capture.py <model-dir> reference/out/<name>.safetensors
 ```
+
+With `--token-by-token`, the prompt goes through one token per step, so MLX runs the same single-row decode path as the engine. The `parity` binary replays such a capture on the GPU and reports, per step, the logit difference, the KL divergence from MLX, whether the greedy token matches, and the layer visit furthest from MLX:
+
+```sh
+cargo run --release -p inkling-cuda --bin parity -- <model-dir> reference/out/<name>.safetensors [--detail step016]
+```
+
+`--detail` prints every visit of one step with the number of differing BF16 values.

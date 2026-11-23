@@ -15,7 +15,7 @@ use inkling::TextConfig;
 use crate::{
     Gpu,
     ops::{
-        attention::{Attention, KvCache},
+        attention::{Attention, AttentionScratch, KvCache},
         conv::Conv,
         elementwise::Elementwise,
         experts::{self, Experts},
@@ -46,6 +46,8 @@ struct Kernels {
 #[derive(Debug)]
 struct VisitState {
     kv: KvCache,
+    /// Per-visit so the visit borrows nothing else mutably; 48 copies of about 400 KB.
+    scratch: AttentionScratch,
     /// Short-conv input history, F32 `[kernel - 1, dims]`: keys, values, post-attention
     /// and post-MLP, as in MLX-LM's `ArraysCache(4)`.
     conv: [CudaSlice<f32>; 4],
@@ -132,6 +134,7 @@ impl Model {
                 };
                 Ok(VisitState {
                     kv,
+                    scratch: AttentionScratch::new(&stream)?,
                     conv: [
                         stream.alloc_zeros(history * kv_dims)?,
                         stream.alloc_zeros(history * kv_dims)?,
@@ -161,6 +164,10 @@ impl Model {
     }
 
     /// Runs one token and returns the greedy next token. Fills `trace` if given.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one step reads top to bottom like _run_loop"
+    )]
     pub fn step(&mut self, token: u32, mut trace: Option<&mut Trace>) -> anyhow::Result<u32> {
         let ctx = &self.ctx;
         let cfg = &ctx.config;
@@ -275,15 +282,18 @@ impl Model {
             ctx.config.final_logit_softcapping,
         )?;
         let mut next = ctx.zeros::<i32>(1)?;
-        ctx.kernels
-            .misc
-            .argmax_f32(&ctx.stream, &capped, &mut next, ctx.config.unpadded_vocab_size)?;
+        ctx.kernels.misc.argmax_f32(
+            &ctx.stream,
+            &capped,
+            &mut next,
+            ctx.config.unpadded_vocab_size,
+        )?;
         if let Some(t) = trace {
             t.logits = ctx.stream.clone_dtoh(&capped)?;
         }
         let next = ctx.stream.clone_dtoh(&next)?[0];
         self.position += 1;
-        Ok(u32::try_from(next).context("argmax returned a negative index")?)
+        u32::try_from(next).context("argmax returned a negative index")
     }
 }
 
@@ -425,6 +435,11 @@ impl Ctx {
         clippy::too_many_arguments,
         reason = "the three attention inputs stay separate"
     )]
+    #[expect(clippy::too_many_lines, reason = "follows Attention._attend op by op")]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "q, k, v and r are MLX-LM's names"
+    )]
     fn attention(
         &self,
         state: &mut VisitState,
@@ -563,19 +578,22 @@ impl Ctx {
             .attention
             .relative_bias(&self.stream, &r, &a.rel_table, &mut bias)?;
 
-        let window = if sliding { cfg.sliding_window_size } else { 0 };
         let mut out = self.zeros::<bf16>(heads * head_dim)?;
-        self.kernels
+        let appended = self
+            .kernels
             .attention
-            .append(&self.stream, &mut state.kv, &k, &v, position)?;
+            .append(&self.stream, &mut state.kv, &k, &v)?;
+        ensure!(
+            appended == position,
+            "visit cache is at position {appended}, the step at {position}"
+        );
         self.kernels.attention.decode_attention(
             &self.stream,
             &q,
             &state.kv,
             &bias,
             &sinks,
-            position,
-            window,
+            &mut state.scratch,
             &mut out,
         )?;
         let mut gated = self.zeros::<bf16>(heads * head_dim)?;

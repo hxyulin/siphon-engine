@@ -275,13 +275,13 @@ impl LayerWeights {
         let p = format!("model.llm.layers.{layer}");
         let conv_k = config.sconv_kernel_size;
 
-        let attention_query = match layer {
-            0 => None,
-            _ => {
-                let name = format!("model.llm.attn_res.attn_queries.{}", layer - 1);
-                let shape: &[usize] = if sliding { &[hidden] } else { &[3, hidden] };
-                Some(loader.f32(&name, shape)?)
-            }
+        // Layer 0 has no attention input, so query i belongs to layer i + 1.
+        let attention_query = if layer == 0 {
+            None
+        } else {
+            let name = format!("model.llm.attn_res.attn_queries.{}", layer - 1);
+            let shape: &[usize] = if sliding { &[hidden] } else { &[3, hidden] };
+            Some(loader.f32(&name, shape)?)
         };
         let input_norms = if sliding {
             InputNorms::Shared(loader.bf16(&format!("{p}.attn_norm.weight"), &[hidden])?)

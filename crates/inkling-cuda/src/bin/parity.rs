@@ -1,7 +1,9 @@
 //! Runs the engine token by token over an MLX-LM capture and reports how far each layer
 //! visit and the logits are from MLX.
 //!
-//! usage: parity <model-dir> <capture.safetensors> [--passes N]
+//! usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP]
+//!
+//! `--detail` prints every visit of one step, with the number of BF16 values that differ.
 //!
 //! The capture comes from `reference/capture.py --token-by-token`. Every step feeds the
 //! captured token, so a wrong prediction does not change later inputs.
@@ -38,26 +40,31 @@ mod linux {
         model: PathBuf,
         capture: PathBuf,
         passes: Option<usize>,
+        detail: Option<String>,
     }
 
     fn args() -> anyhow::Result<Args> {
         let mut positional = Vec::new();
         let mut passes = None;
+        let mut detail = None;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if arg == "--passes" {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
+            } else if arg == "--detail" {
+                detail = Some(it.next().context("--detail needs a step name")?);
             } else {
                 positional.push(PathBuf::from(arg));
             }
         }
-        let [model, capture] = <[PathBuf; 2]>::try_from(positional)
-            .ok()
-            .context("usage: parity <model-dir> <capture.safetensors> [--passes N]")?;
+        let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
+            "usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP]",
+        )?;
         Ok(Args {
             model,
             capture,
             passes,
+            detail,
         })
     }
 
@@ -169,6 +176,18 @@ mod linux {
                         .zip(&want)
                         .map(|(g, w)| (g.to_f32(), w.to_f32())),
                 );
+                if args.detail.as_deref() == Some(name.as_str()) {
+                    let differing = visit
+                        .output
+                        .iter()
+                        .zip(&want)
+                        .filter(|(g, w)| g != w)
+                        .count();
+                    println!(
+                        "  visit {v:02}: {differing:>4} of {} differ, max diff {diff:.4}, cos {cos:.7}",
+                        want.len()
+                    );
+                }
                 if cos < worst_visit.2 {
                     worst_visit = (v, diff, cos);
                 }
