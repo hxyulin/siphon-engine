@@ -39,3 +39,11 @@ The measured control is Ingine with FP8 outer attention: 547, 439 and 286 tok/s 
 1. Text-only, single-stream decode with the original per-visit KV layout, and token and logit parity against a pinned reference.
 2. Chunked prefill and prefix restore.
 3. Stock DSpark speculation.
+
+## Reference captures
+
+`reference/capture.py` runs MLX-LM on a Mac and records every layer visit's inputs and outputs, plus logits, for one prefill and a few greedy decode steps. The engine's parity tests compare against these files.
+
+```sh
+uv run --project reference python -I reference/capture.py <model-dir> reference/out/<name>.safetensors
+```

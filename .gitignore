@@ -8,3 +8,6 @@ __pycache__/
 /releases/
 /BENCHMARKS.md
 /EXPERIMENT_LOG.md
+
+# Reference captures are regenerated, not committed.
+/reference/out/

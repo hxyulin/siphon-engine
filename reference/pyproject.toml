@@ -1,0 +1,18 @@
+[project]
+name = "inkling-reference"
+version = "0.1.0"
+description = "MLX-LM reference captures for engine parity tests"
+requires-python = "==3.12.*"
+dependencies = [
+    "mlx==0.32.4",
+    "mlx-lm",
+    # 5.24 rejects the checkpoint config during tokenizer loading.
+    "transformers==5.8.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+# MLX-LM #2086, which adds Inkling 2 Mini.
+mlx-lm = { git = "https://github.com/ml-explore/mlx-lm", rev = "0c4c99192230f1943dd468d297f0b8a64ae7b7c2" }
