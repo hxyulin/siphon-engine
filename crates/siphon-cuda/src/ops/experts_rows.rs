@@ -38,12 +38,13 @@ const WARPS: usize = 4;
 /// Ring slots per warp of the two kernels of each format: the deeper ring for up to
 /// [`DEEP_RING_ROWS`] rows. On an RTX 5090, one step's expert MLPs with real routing took
 /// 1517 instead of 1663 us at 1 row and 2182 instead of 2228 at 2, but 3198 instead of
-/// 3139 at 4, where the 3 blocks per SM of the deeper ring held too few warps.
+/// 3139 at 4, where the 2 blocks per SM of the deeper ring held too few warps.
 const RINGS: [usize; 2] = [3, 4];
 const DEEP_RING_ROWS: usize = 3;
-/// Dynamic shared memory per block: `kWarps` warps of `ring` slots of 16 rows of 128 bytes.
+/// Dynamic shared memory per block: `kWarps` warps of `ring` slots, each 16 rows of 128
+/// weight bytes and 16 bytes of block scales.
 const fn smem(ring: usize) -> usize {
-    WARPS * ring * 16 * 128
+    WARPS * ring * 16 * (128 + 16)
 }
 
 #[derive(Debug)]

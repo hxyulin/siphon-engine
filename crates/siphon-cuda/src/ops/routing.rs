@@ -22,6 +22,9 @@ pub const TOP_K: usize = 8;
 pub const STEP_ROUTER_ROWS: usize = 8;
 /// Blocks of `moe_router_step_2304`, one cluster, `kRouterCluster` in the kernel.
 const STEP_ROUTER_CLUSTER: u32 = 16;
+/// Threads per block of `moe_router_step_rows_2304`, `kRowsRouterThreads` in the kernel:
+/// one warp per virtual warp of the step router's 288-thread sum order.
+const STEP_ROUTER_ROWS_THREADS: u32 = 288;
 /// Threads per block of `router_logits_2304`, which fixes its summation order.
 const LOGITS_THREADS: u32 = 256;
 /// Threads per block of `expert_routing_128_top8`: one warp per row.
@@ -873,7 +876,7 @@ impl Routing {
         );
         let config = LaunchConfig {
             grid_dim: (STEP_ROUTER_CLUSTER, 1, 1),
-            block_dim: (EXPERTS as u32 / STEP_ROUTER_CLUSTER * 32, 1, 1),
+            block_dim: (STEP_ROUTER_ROWS_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
@@ -888,7 +891,7 @@ impl Routing {
         // SAFETY: the arguments match `moe_router_step_rows_2304(const bf16*, int, const
         // float*, const float*, float*, int32_t*, float*, float)`, every buffer has the
         // length the kernel reads or writes for `rows` rows, the grid is the kernel's one
-        // cluster of 16 blocks of one warp per expert, and the kernel reads only the router
+        // cluster of 16 blocks of 288 threads, and the kernel reads only the router
         // and the bias before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_step_rows_2304, config) }
     }
