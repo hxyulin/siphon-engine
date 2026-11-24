@@ -16,10 +16,12 @@
 
 mod batch;
 mod prefill;
+mod prefix;
 mod verify;
 
 pub use batch::BATCH_ROWS;
 pub use prefill::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits};
+pub use prefix::LocalState;
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
 use std::{ops::Range, sync::Arc};
@@ -316,6 +318,9 @@ pub struct Model {
     step_taps: Option<CudaSlice<bf16>>,
     /// Position of the next token.
     position: usize,
+    /// Counts the sequences slot 0 has held: [`Model::reset`], [`Model::restore_state`]
+    /// and [`Model::move_slot`] into it start a new one (see [`LocalState`]).
+    sequence: u64,
     /// Buffers of [`Model::prefill`], allocated on its first call.
     prefill: Option<prefill::PrefillScratch>,
     /// Buffers of [`Model::verify`], allocated on its first call.
@@ -484,6 +489,7 @@ impl Model {
             tap_graph: None,
             step_taps: None,
             position: 0,
+            sequence: 0,
             prefill: None,
             verify: None,
             verify_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
@@ -585,6 +591,7 @@ impl Model {
             }
         }
         self.position = 0;
+        self.sequence += 1;
         Ok(())
     }
 
@@ -705,6 +712,7 @@ impl Model {
             }
         }
         self.position = state.position;
+        self.sequence += 1;
         Ok(())
     }
 

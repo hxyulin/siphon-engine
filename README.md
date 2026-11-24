@@ -39,10 +39,10 @@ The speedup depends on how predictable the text is. The DSpark draft's first tok
 - Opt-in FP8 copies of the dense weights (`--weights fp8`), an FP8 global KV cache (`--kv fp8`) and quantized expert activations for prefill (`--expert-activations quantized`).
 - Greedy speculative decoding with the DSpark draft. The verify pass gives each row the same result at every width, so speculation returns exactly the tokens that verifying one row at a time would. Each round picks its width from the drafts' confidences. With `--fallback` the speculator runs plain steps where the draft cannot predict the text, such as free prose; the output is then greedy along its own path and can differ between runs. `--drafter DIR` runs Inco AI's DFlash 2 drafter or a DFlash draft exported by the 2DSD project instead.
 - Batched greedy decode of up to 8 sequences, each in its own KV cache, through the verify pass's multi-row kernels. Each sequence gets the same tokens as with speculation alone ([docs/batching.md](docs/batching.md)).
-- An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions, with continuous batching.
+- An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions, with continuous batching and a one-entry prefix cache.
 - A quality gate that compares the engine with MLX over long texts, and parity tests per layer visit.
 
-Not yet: sampling other than greedy, probabilistic acceptance, speculation for more than one sequence at a time, prefix caching.
+Not yet: sampling other than greedy, probabilistic acceptance, speculation for more than one sequence at a time, a prefix cache with more than one entry.
 
 ## Build
 
@@ -71,12 +71,12 @@ docker run --gpus all -p 8000:8000 -v <model-dir>:/models/inkling-2-mini:ro siph
 SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
 ```
 
-Before loading anything, it plans the GPU memory from the config and the checkpoint headers. Without `--context`, it takes the longest context that fits the free memory less a 0.5 GiB margin, up to the model's 1,048,576 positions; `--memory <GiB>` caps the total it plans for. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines at startup. On a 32 GB RTX 5090 with 0.45 GiB taken by the desktop, the longest contexts are:
+Before loading anything, it plans the GPU memory from the config and the checkpoint headers. Without `--context`, it takes the longest context that fits the free memory less a 0.5 GiB margin, up to the model's 1,048,576 positions; `--memory <GiB>` caps the total it plans for. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines at startup. On a 32 GB RTX 5090 with 30.45 GiB free after the CUDA context, the plan gives these longest contexts, with the prefix cache's copies counted:
 
 | Dense weights, KV cache | DSpark draft | DFlash 2 |
 | --- | ---: | ---: |
-| FP8, FP8 | 466,944 | 563,200 |
-| BF16, BF16 | 290,816 | 316,416 |
+| FP8, FP8 | 457,728 | 549,888 |
+| BF16, BF16 | 285,696 | 309,248 |
 
 After warmup, it compares what the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the rest, the module images and the CUDA graphs, from the change in free memory. It checks the pool's peak again after each job and warns if it goes past the plan.
 
@@ -106,6 +106,15 @@ With `--streams N` (1 to 8, default 1), up to N requests run at once and up to `
 | 32,768 | 254 | 373, 186 | 513, 128 | 683, 85 |
 
 A batch of one runs about 23% slower than plain decode, and a request that speculates alone runs at 490 to 800 tok/s, so batching pays from about three streams on.
+
+Chat clients and agents resend the whole conversation each turn. The server keeps the state of the last prompt that ran alone at that prompt's last multiple of 2,048 tokens. A request whose prompt starts with those tokens prefills only the rest, and gets the same tokens and logits as without the cache. The usage object reports the reused tokens as `prompt_tokens_details.cached_tokens`. Time to the first token of a follow-up turn over HTTP, FP8:
+
+| History | Without the cache | With it |
+| ---: | ---: | ---: |
+| 8,174 tokens | 0.53 s | 0.14 s |
+| 90,607 tokens | 7.63 s | 0.11 s |
+
+A request that runs batched prefills its whole prompt and leaves the cache alone, unless it takes slot 0 (see [docs/engine.md](docs/engine.md#prefix-cache)). The copies take 171 MiB with the bundled draft and 203 MiB with DFlash 2, whatever the context. `--no-prefix-cache` turns the cache off and gives that memory to the KV cache.
 
 Chat requests take these fields:
 

@@ -8,6 +8,12 @@
 //! chunks between the batch's steps. Batched steps and speculation give each sequence the
 //! same tokens, so a request's output does not depend on what else runs (see
 //! `docs/batching.md`).
+//!
+//! A request that runs alone prefills through the speculator's prefix cache
+//! (`Speculator::prefill_cached`): when its prompt starts with the tokens of the last such
+//! prompt up to that prompt's last multiple of the prefill chunk, it prefills only the
+//! rest. Batched requests prefill whole. Taking slot 0 for another sequence or rebuilding
+//! the draft's state empties the cache.
 
 use std::{
     path::PathBuf,
@@ -41,14 +47,16 @@ pub enum Finish {
     Length,
 }
 
-/// What the engine reports for a job, in order: `Tokens` any number of times, then
-/// `Done` or `Failed`.
+/// What the engine reports for a job, in order: `Cached` at most once, `Tokens` any number
+/// of times, then `Done` or `Failed`.
 #[cfg_attr(
     not(target_os = "linux"),
     expect(dead_code, reason = "only the Linux engine runs jobs")
 )]
 #[derive(Debug)]
 pub enum Event {
+    /// Prompt tokens whose state came from the prefix cache.
+    Cached(usize),
     Tokens(Vec<u32>),
     Done(Finish),
     Failed(String),
@@ -58,6 +66,10 @@ pub enum Event {
 #[cfg_attr(
     not(target_os = "linux"),
     expect(dead_code, reason = "only the Linux engine runs jobs")
+)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent switches from the command line"
 )]
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -81,6 +93,8 @@ pub struct Options {
     pub draft: String,
     /// Whether the speculator falls back to plain steps (`WidthPolicy::with_plain`).
     pub fallback: bool,
+    /// Whether requests that run alone prefill through a prefix cache.
+    pub prefix_cache: bool,
 }
 
 /// Sends jobs to the engine thread.
@@ -324,6 +338,7 @@ mod cuda {
                 }),
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             streams: options.streams,
+            prefix_cache: options.prefix_cache,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
@@ -376,6 +391,10 @@ mod cuda {
             eprintln!("serving up to {} requests at once", options.streams);
         }
         drop(saved);
+        if options.prefix_cache {
+            let bytes = speculator.enable_prefix_cache(&model)?;
+            eprintln!("prefix cache: {} MiB of copies", bytes >> 20);
+        }
         // The full chunk's buffers now, so that the check below sees every planned buffer
         // and a plan that undercounts fails here rather than on the first long prompt.
         // After pricing, so that they reuse the memory pricing freed, as a long prompt's
@@ -396,6 +415,8 @@ mod cuda {
         started: Instant,
         /// Prompt tokens prefilled so far.
         prefilled: usize,
+        /// Prompt tokens whose state came from the prefix cache.
+        cached: usize,
         prefill_s: f64,
         /// The token to feed next, once the prompt is prefilled.
         next: Option<u32>,
@@ -422,6 +443,7 @@ mod cuda {
                 slot,
                 started: Instant::now(),
                 prefilled: 0,
+                cached: 0,
                 prefill_s: 0.0,
                 next: None,
                 output: Vec::new(),
@@ -467,9 +489,10 @@ mod cuda {
             let decode_s = self.started.elapsed().as_secs_f64() - self.prefill_s;
             let events = &self.job.events;
             eprintln!(
-                "job: {} prompt tokens, prefill {:.0} ms, {} tokens in {:.2} s ({:.1} tok/s, \
-                 {} speculated, {} batched steps{detail}), {}",
+                "job: {} prompt tokens ({} cached), prefill {:.0} ms, {} tokens in {:.2} s \
+                 ({:.1} tok/s, {} speculated, {} batched steps{detail}), {}",
                 self.job.prompt.len(),
+                self.cached,
                 self.prefill_s * 1e3,
                 self.output.len(),
                 decode_s,
@@ -577,8 +600,10 @@ mod cuda {
         let go_on = if request.next.is_some() {
             true
         } else {
-            model.reset()?;
-            let first = speculator.prefill(model, &request.job.prompt, DEFAULT_PREFILL_CHUNK)?;
+            let (first, cached) =
+                speculator.prefill_cached(model, &request.job.prompt, DEFAULT_PREFILL_CHUNK)?;
+            request.cached = cached;
+            let _ = request.job.events.send(Event::Cached(cached));
             request.prefilled = request.job.prompt.len();
             request.prefill_s = request.started.elapsed().as_secs_f64();
             request.next = Some(first);
@@ -712,7 +737,11 @@ mod cuda {
                 if job.events.is_closed() {
                     continue;
                 }
-                let Some(slot) = (0..streams).find(|s| active.iter().all(|r| r.slot != *s)) else {
+                // Slot 0 last, since a new sequence there empties the prefix cache.
+                let Some(slot) = (1..streams)
+                    .chain([0])
+                    .find(|s| active.iter().all(|r| r.slot != *s))
+                else {
                     break;
                 };
                 let mut request = Request::new(job, slot);

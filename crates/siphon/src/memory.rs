@@ -121,6 +121,9 @@ pub struct PlanInputs<'a> {
     /// Sequence slots, each with its own caches of the capacity, 1 to [`VERIFY_ROWS`].
     /// More than one adds the batched step's buffers.
     pub streams: usize,
+    /// Whether the speculator keeps a prefix cache: copies of one slot's sliding rings and
+    /// conv states and of the draft's rings.
+    pub prefix_cache: bool,
 }
 
 /// Device bytes of one configuration at one capacity, by what holds them.
@@ -148,6 +151,8 @@ pub struct Plan {
     pub draft: usize,
     /// The draft's global KV caches.
     pub draft_kv: usize,
+    /// The prefix cache's copies of the rings and conv states.
+    pub prefix: usize,
     /// [`RUNTIME_BYTES`].
     pub runtime: usize,
 }
@@ -166,6 +171,7 @@ impl Plan {
             + self.verify
             + self.draft
             + self.draft_kv
+            + self.prefix
             + self.runtime
     }
 }
@@ -197,6 +203,7 @@ impl fmt::Display for Plan {
             ("verify", self.verify),
             ("draft", self.draft),
             ("draft KV", self.draft_kv),
+            ("prefix", self.prefix),
             ("runtime", self.runtime),
         ];
         let listed: Vec<String> = parts
@@ -275,11 +282,10 @@ impl Planner {
             (1..=VERIFY_ROWS).contains(&streams),
             "{streams} streams; 1 to {VERIFY_ROWS} fit a batched step"
         );
-        let rings = streams
-            * (sliding_visits * c.sliding_window_size * 2 * kv_dims * 2
-                + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4)
-            + c.vocab_size * 2
-            + c.unpadded_vocab_size * 4;
+        // One slot's sliding rings and conv states.
+        let slot_rings = sliding_visits * c.sliding_window_size * 2 * kv_dims * 2
+            + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4;
+        let rings = streams * slot_rings + c.vocab_size * 2 + c.unpadded_vocab_size * 4;
         let prefill = if inputs.prefill_chunk == 0 {
             0
         } else {
@@ -314,6 +320,10 @@ impl Planner {
         } else {
             0
         };
+        let prefix = match &draft {
+            Some((d, _)) if inputs.prefix_cache => slot_rings + draft_ring_bytes(c, d),
+            _ => 0,
+        };
         let fixed = Plan {
             capacity: 0,
             streams,
@@ -329,6 +339,7 @@ impl Planner {
             verify,
             draft: draft_bytes,
             draft_kv: (DRAFT_STEPS + 1) * draft_kv_per_position,
+            prefix,
             runtime: RUNTIME_BYTES,
         };
         Ok(Self {
@@ -597,6 +608,12 @@ fn dflash_shape(dir: &Path, hidden: usize) -> anyhow::Result<DraftShape> {
     })
 }
 
+/// The draft's sliding rings.
+fn draft_ring_bytes(c: &TextConfig, d: &DraftShape) -> usize {
+    let kv_dims = c.num_key_value_heads * c.head_dim;
+    (d.layers - d.global_layers) * d.ring_slots * 2 * kv_dims * 2
+}
+
 /// The draft's bytes that do not grow with the capacity: its weights, the bundled draft's
 /// fold, the copies its approximations make, its rings and its larger buffers.
 fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usize {
@@ -653,8 +670,7 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
             bytes += fp8_rows(vocab, MARKOV_RANK);
         }
     }
-    let ring_layers = d.layers - d.global_layers;
-    bytes += ring_layers * d.ring_slots * 2 * kv_dims * 2;
+    bytes += draft_ring_bytes(c, d);
     // Base logits, the commit's mixes and context keys and values, and a DFlash draft's
     // context rows.
     bytes += DRAFT_STEPS * padded * 2 + COMMIT_ROWS * (hidden + 2 * kv_dims) * 2;

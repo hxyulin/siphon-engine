@@ -509,6 +509,7 @@ mod linux {
             draft: DraftChoice::None,
             prefill_chunk: 0,
             streams: 1,
+            prefix_cache: false,
         })?;
         let contexts = args
             .contexts

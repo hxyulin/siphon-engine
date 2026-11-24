@@ -500,7 +500,7 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
         return_token_ids,
         mut output,
     } = prepared;
-    let reply = Reply::new(&app, prompt.len(), kind);
+    let mut reply = Reply::new(&app, prompt.len(), kind);
     let prompt_ids = return_token_ids.then(|| prompt.clone());
     let mut results = submit(&app, prompt, max_tokens)?;
     if streaming {
@@ -517,6 +517,7 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
     let mut message = Delta::default();
     let finish = loop {
         match next(&mut results).await {
+            Event::Cached(n) => reply.cached_tokens = n,
             Event::Tokens(ids) => {
                 append(&mut message, output.push(&app.vocab, &ids));
                 if output.done {
@@ -703,6 +704,8 @@ struct Reply {
     created: u64,
     model: String,
     prompt_tokens: usize,
+    /// Prompt tokens whose state came from the prefix cache.
+    cached_tokens: usize,
     kind: Kind,
 }
 
@@ -720,6 +723,7 @@ impl Reply {
             created,
             model: app.name.clone(),
             prompt_tokens,
+            cached_tokens: 0,
             kind,
         }
     }
@@ -828,6 +832,7 @@ impl Reply {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": self.prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": self.cached_tokens},
             "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
         })
     }
@@ -896,6 +901,10 @@ async fn stream(
     let mut sent = 0;
     let finish = loop {
         let delta = match next(&mut results).await {
+            Event::Cached(n) => {
+                chunks.reply.cached_tokens = n;
+                continue;
+            }
             Event::Tokens(ids) => output.push(&app.vocab, &ids),
             Event::Done(finish) => break Ok(finish),
             Event::Failed(e) => break Err(e),
@@ -1100,6 +1109,7 @@ mod tests {
             created: 1,
             model: "m".to_owned(),
             prompt_tokens: 3,
+            cached_tokens: 0,
             kind: Kind::Chat,
         };
         let delta = Delta {

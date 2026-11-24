@@ -180,6 +180,12 @@ fn parts(app: &App) -> Vec<Part> {
             "windows, conv states",
         ),
         Part::new(
+            "Prefix cache",
+            plan.prefix,
+            Color::Rgb(148, 226, 213),
+            "copies of rings, conv",
+        ),
+        Part::new(
             "Runtime",
             plan.runtime,
             Color::Rgb(170, 174, 182),

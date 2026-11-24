@@ -35,8 +35,8 @@ use half::bf16;
 use siphon::Checkpoint;
 
 use crate::{
-    draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
-    model::{Accept, Model, PrefillLogits, SavedState, VerifyTokens},
+    draft::{CONTEXT_ROWS, Draft, DraftOptions, DraftRings, STEPS, WINDOW},
+    model::{Accept, LocalState, Model, PrefillLogits, SavedState, VerifyTokens},
     ops::{linear::Linear, spec::VERIFY_ROWS},
     weights::{
         dflash::DflashWeights,
@@ -394,6 +394,21 @@ pub struct Speculator {
     stats: SpecStats,
     /// The sequence the draft follows through batched steps, if any.
     batched: Option<Batched>,
+    /// The state of the last prompt's prefix, with [`Self::enable_prefix_cache`].
+    prefix: Option<PrefixCache>,
+}
+
+/// What [`Speculator::prefill_cached`] keeps of the last prompt it prefilled: the state at
+/// the prompt's last chunk boundary below its end. With the global caches of slot 0 and of
+/// the draft, which later tokens do not write below that boundary, it lets the next prompt
+/// that starts with the same tokens prefill only the rest.
+struct PrefixCache {
+    /// The prompt's tokens below the boundary; empty when nothing is kept.
+    tokens: Vec<u32>,
+    /// The prefill chunk the state was prefilled with.
+    chunk: usize,
+    model: LocalState,
+    draft: DraftRings,
 }
 
 /// A sequence that left speculation for batched steps ([`Speculator::follow`]): the draft
@@ -531,6 +546,7 @@ impl Speculator {
             prompt_len: 0,
             stats: SpecStats::default(),
             batched: None,
+            prefix: None,
         })
     }
 
@@ -563,9 +579,115 @@ impl Speculator {
             model.position() == 0,
             "the speculator prefills from position 0"
         );
+        // The draft's global caches now take another sequence.
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.tokens.clear();
+        }
+        self.start_prompt(model, prompt)?;
+        let first = self.prefill_rows(model, prompt, chunk)?;
+        self.end_prompt(model, prompt.len(), first)
+    }
+
+    /// Keeps a prefix cache for [`Self::prefill_cached`] from now on. Allocates copies of
+    /// slot 0's sliding rings and conv states and of the draft's rings, and returns their
+    /// bytes.
+    pub fn enable_prefix_cache(&mut self, model: &Model) -> anyhow::Result<usize> {
+        let cache = PrefixCache {
+            tokens: Vec::new(),
+            chunk: 0,
+            model: model.local_state()?,
+            draft: self.draft.rings(model.stream())?,
+        };
+        let bytes = cache.model.bytes() + cache.draft.bytes();
+        self.prefix = Some(cache);
+        Ok(bytes)
+    }
+
+    /// Prompt tokens whose state the prefix cache holds, 0 if none.
+    #[must_use]
+    pub fn cached_prefix(&self) -> usize {
+        self.prefix.as_ref().map_or(0, |c| c.tokens.len())
+    }
+
+    /// [`Self::prefill`] of `prompt` into slot 0, whatever it holds, through the prompt
+    /// cache ([`Self::enable_prefix_cache`]). Returns the first anchor and the prompt tokens
+    /// whose state came from the cache.
+    ///
+    /// The cache holds the state of the last prompt this prefilled at that prompt's last
+    /// multiple of `chunk` below its end: slot 0's sliding rings and conv states and the
+    /// draft's rings. When `prompt` is longer and starts with the tokens below that
+    /// boundary, and neither slot 0 nor the draft has taken another sequence since, this
+    /// restores that state and prefills only the rest. The rest is prefilled in the same
+    /// chunks as a whole prompt from position 0, so the results equal [`Self::prefill`]'s
+    /// bit for bit. Then the cache takes `prompt`'s state at its own last boundary.
+    /// Without a cache this prefills the whole prompt.
+    pub fn prefill_cached(
+        &mut self,
+        model: &mut Model,
+        prompt: &[u32],
+        chunk: usize,
+    ) -> anyhow::Result<(u32, usize)> {
+        ensure!(!prompt.is_empty(), "nothing to prefill");
+        let Some(mut cache) = self.prefix.take() else {
+            model.reset()?;
+            return Ok((self.prefill(model, prompt, chunk)?, 0));
+        };
+        let result = self.prefill_through(model, prompt, chunk, &mut cache);
+        self.prefix = Some(cache);
+        result
+    }
+
+    fn prefill_through(
+        &mut self,
+        model: &mut Model,
+        prompt: &[u32],
+        chunk: usize,
+        cache: &mut PrefixCache,
+    ) -> anyhow::Result<(u32, usize)> {
+        // Nothing is kept until the new state is saved, in case this fails midway.
+        let held = std::mem::take(&mut cache.tokens);
+        let start = if !held.is_empty()
+            && cache.chunk == chunk
+            && prompt.len() > held.len()
+            && prompt.starts_with(&held)
+            && model.can_restore_local_state(&cache.model)
+        {
+            held.len()
+        } else {
+            0
+        };
+        self.start_prompt(model, prompt)?;
+        if start > 0 {
+            model.restore_local_state(&cache.model)?;
+            self.draft.restore_rings(model.stream(), &cache.draft)?;
+        } else {
+            model.reset()?;
+        }
+        // The last chunk boundary below the end, so at least one row remains for the
+        // logits. `start` is such a boundary of a shorter prompt, so it is at most this.
+        let boundary = (prompt.len() - 1) / chunk * chunk;
+        if boundary > start {
+            // Prefill splits a chunk only at the end of its tokens, so the chunks match a
+            // prefill of the whole prompt.
+            self.prefill_rows(model, &prompt[start..boundary], chunk)?;
+            model.save_local_state(&mut cache.model)?;
+            self.draft.save_rings(model.stream(), &mut cache.draft)?;
+            cache.tokens = prompt[..boundary].to_vec();
+        } else if start > 0 {
+            cache.tokens = held;
+        }
+        cache.chunk = chunk;
+        let first = self.prefill_rows(model, &prompt[boundary..], chunk)?;
+        Ok((self.end_prompt(model, prompt.len(), first)?, start))
+    }
+
+    /// Readies the draft for a new prompt: forgets its committed positions and the
+    /// sequence it followed, and notes the prompt's last tokens for a shortlist head.
+    fn start_prompt(&mut self, model: &Model, prompt: &[u32]) -> anyhow::Result<()> {
         self.draft.reset();
         self.batched = None;
-        let stream = Arc::clone(model.stream());
+        self.tail_rows = 0;
+        self.prompt_len = 0;
         // A shortlist head takes the tokens of the prompt's last positions, latest first,
         // and keeps room for the tokens the rounds emit.
         let latest: Vec<i32> = prompt
@@ -575,8 +697,19 @@ impl Speculator {
             .map(|&t| i32::try_from(t))
             .collect::<Result<_, _>>()?;
         self.draft
-            .note_tokens(&stream, model.draft_shared(), &latest)?;
-        self.tail_rows = 0;
+            .note_tokens(model.stream(), model.draft_shared(), &latest)
+    }
+
+    /// Prefills `tokens` from the model's position in chunks of `chunk` rows, commits every
+    /// row's taps to the draft and keeps the last [`TAIL`] rows' taps. Returns the greedy
+    /// next token.
+    fn prefill_rows(
+        &mut self,
+        model: &mut Model,
+        tokens: &[u32],
+        chunk: usize,
+    ) -> anyhow::Result<u32> {
+        let stream = Arc::clone(model.stream());
         let Self {
             draft,
             linear,
@@ -607,9 +740,13 @@ impl Speculator {
             *tail_rows = old + new;
             Ok(())
         };
-        let first = model.prefill_with_taps(prompt, chunk, PrefillLogits::Last, &mut commit)?;
+        model.prefill_with_taps(tokens, chunk, PrefillLogits::Last, &mut commit)
+    }
+
+    /// Ends a prompt of `len` tokens whose prefill returned `first`: makes it the anchor.
+    fn end_prompt(&mut self, model: &mut Model, len: usize, first: u32) -> anyhow::Result<u32> {
         model.set_verify_anchor(first)?;
-        self.prompt_len = prompt.len();
+        self.prompt_len = len;
         Ok(first)
     }
 
@@ -621,6 +758,12 @@ impl Speculator {
     /// restores the draft. A shortlist head keeps the tokens noted since the prefill.
     pub fn restart(&mut self, model: &mut Model, first: u32) -> anyhow::Result<()> {
         ensure!(self.prompt_len > 0, "nothing was prefilled");
+        ensure!(
+            self.tail_rows == TAIL.min(self.prompt_len),
+            "the draft kept {} of the prompt's last rows, too few to restart after a \
+             cached prefill",
+            self.tail_rows
+        );
         ensure!(
             model.position() == self.prompt_len,
             "the model is at {}, the prompt ends at {}",

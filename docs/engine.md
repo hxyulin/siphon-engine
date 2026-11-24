@@ -442,6 +442,43 @@ SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test batch -- --i
 
 `bench --batch 1,2,4,8 --prompt <capture>` times batched steps at each context against a plain step and a one-row verify. Row r feeds the capture's tokens from offset r / 8 of its length on, so the rows route their experts as different texts do: 8 rows from 8 texts touch about 50 distinct experts per visit, against 29 for 8 consecutive rows of one text.
 
+## Prefix cache
+
+Chat clients and agents resend the whole conversation each turn. Without a cache, a follow-up turn on 90,607 tokens of history prefills all of them again in 7.6 s. HTTP, the chat template and the tokenizer take about 37 ms of a 97K-token request.
+
+`Speculator::prefill_cached` keeps the state of the last prompt it prefilled, and a prompt that starts with the same tokens prefills only the rest. The state of a sequence at position `p` is:
+
+| State | After later tokens |
+| --- | --- |
+| Global KV caches of slot 0, slots below `p` | Unchanged: later tokens write slots from their own position on |
+| Sliding rings and conv states of slot 0 | Overwritten |
+| The draft's global caches, positions below `p` | Unchanged: commits and rounds write from the committed position on |
+| The draft's rings | Overwritten |
+| The draft's Markov context, the shortlist's noted tokens, the speculator's prompt tail | Rebuilt by every prefill |
+
+So the cache copies only what later tokens overwrite: slot 0's rings and conv states (`Model::save_local_state`, 164 MiB) and the draft's rings (`Draft::save_rings`, 8 MiB for the bundled draft, 40 MiB for DFlash 2, none for a 2DSD DFlash draft). The global caches stay where they are. A hit restores the copies, and the draft starts committing from the cached position. A miss resets slot 0 and prefills from position 0.
+
+Prefill sums differ with the chunk boundaries, so the copies are taken at a chunk boundary: the last multiple of the prefill chunk (2,048) below the prompt's end, so at least one row remains for the logits. The speculator prefills up to that boundary, saves the copies and prefills the rest. Prefill splits chunks only at the end of its tokens, so both halves run the chunks of one prefill from position 0, and the only extra work is the first half's last-row logits. A later prompt that starts with the cached tokens restores them and prefills from the boundary in the same chunks. Its caches, logits, tokens and drafts equal those of a prefill from position 0 bit for bit. The cost is that a follow-up prefills up to 2,047 tokens of the previous prompt again, plus the previous reply and its own new tokens.
+
+Only the last prompt is kept, and only slot 0's. The copies remember which sequence slot 0 held: `Model::reset`, `restore_state` and a `move_slot` into slot 0 start a new one, and a restore needs slot 0 to hold the same sequence (`Model::can_restore_local_state`). A plain `Speculator::prefill`, and so a `rebuild`, empties the cache, since the draft then holds another sequence. In siphon-serve, a request that runs alone prefills through the cache. A request that joins a batch takes slot 0 only when the other slots are busy, so a batch of up to `--streams` - 1 new requests leaves the cache in place. A request that left speculation for a batch keeps slot 0, and its prompt stays cached.
+
+`tests/prefix.rs` checks a cached prefill against a prefill from position 0 with the bundled draft and with the drafter in `SIPHON_DFLASH`: the first token's logits, 97 tokens and the draft's acceptance per round must all match. It covers a miss, a hit, a prompt that diverges after the cached boundary, an exact repeat whose remainder is shorter than the 1,024-slot window, a batch beside slot 0, a batch that takes slot 0 and a rebuild. Skipping the restore of slot 0's rings makes the first token's logits differ, and skipping the draft's rings changes the rounds from 16 to 44 with the same tokens:
+
+```sh
+SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test prefix -- --ignored --nocapture --test-threads 1
+```
+
+Time to the first token of a follow-up chat turn through the HTTP API, FP8 weights and cache, `--context 131072`, the bundled draft, under the GPU lock with no other compute process. The history is the repo's source files as user messages, each with a short assistant reply; the follow-up adds the reply to a question and a new question. "Without" is the same request right after a short unrelated request, which empties the cache. The median of three repetitions, which spread by at most 35 ms; the cached and uncached replies were identical. In the same holds, a server with `--no-prefix-cache` took 0.53 s and 7.66 to 7.70 s for the 8,174 and 90,607 rows, so a miss costs nothing extra:
+
+| Follow-up prompt | Cached tokens | Without | With | Server prefill with |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,174 | 6,144 | 0.53 s | 0.14 s | 2,030 tokens |
+| 12,453 | 12,288 | 0.82 s | 0.044 s | 165 tokens |
+| 90,607 | 90,112 | 7.63 s | 0.11 s | 495 tokens |
+| 101,718 | 100,352 | 8.81 s | 0.20 s | 1,366 tokens |
+
+More entries would help several conversations that alternate. Each entry needs its own global caches, which slot 0 provides for the one entry. With `--streams` above 1 the idle slots could hold more entries, moved to slot 0 on a hit (`Model::move_slot`, 16 KiB per position with an FP8 cache).
+
 ## Benchmarks and profiling
 
 The `bench` binary times greedy decode at several context lengths. For each length it marks every cache as full to that length without computing it, runs warmup steps, then times `--steps` steps. It prints one markdown table row per context length, or JSON with `--json`, along with the time, the GPU clocks and the processes on the GPU. Numbers are comparable only on an otherwise idle GPU.
@@ -470,6 +507,7 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 - the prefill buffers, 0.38 MB per chunk row plus 64 MB, and the verify pass's;
 - the draft's tensors, the bundled draft's fold, the copies its approximations make (the shortlist rows of the LM head, the FP8 backbone), its rings, its buffers and the speculator's tap tails;
 - the draft's global caches, 4 KiB per position and layer: one layer of the bundled draft, every layer of a 2DSD DFlash draft, none of DFlash 2, which keeps rings of 2,056 slots;
+- the prefix cache's copies of one slot's rings and conv states and of the draft's rings (see [Prefix cache](#prefix-cache)), 171 MiB with the bundled draft and 203 MiB with DFlash 2;
 - `RUNTIME_BYTES`, 128 MiB for the module images, the CUDA graphs, the small buffers and the allocator's rounding. It was measured with a thread that sampled `cuMemGetInfo` every millisecond while `siphon-serve` loaded, prefilled more than a chunk and generated speculatively; the uncounted part came to 69 to 87 MiB.
 
 The CUDA context itself takes 507 MiB. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less a 0.5 GiB margin. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.

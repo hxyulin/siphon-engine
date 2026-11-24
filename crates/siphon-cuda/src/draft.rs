@@ -253,6 +253,27 @@ pub struct Draft {
     head: Option<Head>,
 }
 
+/// Copies of a draft's sliding rings at one committed position, from
+/// [`Draft::save_rings`]. Rounds and commits after that position overwrite ring slots,
+/// but not the global layers' slots below it.
+pub struct DraftRings {
+    /// Each ring layer's keys and values; `None` for a global layer.
+    caches: Vec<Option<KvCache>>,
+    committed: usize,
+}
+
+impl DraftRings {
+    /// Device bytes the copies take.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.caches
+            .iter()
+            .flatten()
+            .map(|c| (c.k.len() + c.v.len()) * 2)
+            .sum()
+    }
+}
+
 /// The weights of one of the two draft architectures.
 #[expect(
     clippy::large_enum_variant,
@@ -971,6 +992,70 @@ impl Draft {
         if list.bucket() != bucket {
             self.graphs = Default::default();
         }
+    }
+
+    /// Allocates a [`DraftRings`] for the sliding rings, holding nothing yet.
+    pub fn rings(&self, stream: &Arc<CudaStream>) -> anyhow::Result<DraftRings> {
+        let caches = self
+            .caches
+            .iter()
+            .map(|c| {
+                (c.slots < self.capacity)
+                    .then(|| KvCache::new(stream, c.slots))
+                    .transpose()
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(DraftRings {
+            caches,
+            committed: 0,
+        })
+    }
+
+    /// Copies the sliding rings and the committed position into `rings`, on the stream.
+    pub fn save_rings(
+        &self,
+        stream: &Arc<CudaStream>,
+        rings: &mut DraftRings,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            rings.caches.len() == self.caches.len(),
+            "the copies have {} layers, the draft {}",
+            rings.caches.len(),
+            self.caches.len()
+        );
+        for (cache, copy) in self.caches.iter().zip(&mut rings.caches) {
+            if let Some(copy) = copy {
+                stream.memcpy_dtod(&cache.k, &mut copy.k)?;
+                stream.memcpy_dtod(&cache.v, &mut copy.v)?;
+            }
+        }
+        rings.committed = self.committed;
+        Ok(())
+    }
+
+    /// Returns to the committed position of `rings`: copies back the sliding rings. The
+    /// global layers must still hold the positions below it, so the draft must not have
+    /// committed or drafted below it since, nor served another sequence. The Markov head's
+    /// context stays the last commit's, so a commit must come before the next round.
+    pub fn restore_rings(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        rings: &DraftRings,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            rings.caches.len() == self.caches.len(),
+            "the copies have {} layers, the draft {}",
+            rings.caches.len(),
+            self.caches.len()
+        );
+        for (cache, copy) in self.caches.iter_mut().zip(&rings.caches) {
+            if let Some(copy) = copy {
+                stream.memcpy_dtod(&copy.k, &mut cache.k)?;
+                stream.memcpy_dtod(&copy.v, &mut cache.v)?;
+            }
+        }
+        self.committed = rings.committed;
+        Ok(())
     }
 
     /// Uploads the shortlist's row count after a [`Self::reset`].

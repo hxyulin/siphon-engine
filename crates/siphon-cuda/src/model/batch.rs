@@ -38,6 +38,8 @@ pub const BATCH_ROWS: usize = VERIFY_ROWS;
 pub(super) struct Slot {
     visits: Vec<VisitState>,
     position: usize,
+    /// [`Model::sequence`] while the slot stands in for slot 0 ([`Model::with_slot`]).
+    sequence: u64,
 }
 
 /// What a batched step keeps besides a chunk's intermediates.
@@ -131,6 +133,7 @@ impl Model {
             self.slots.push(Slot {
                 visits,
                 position: 0,
+                sequence: 0,
             });
         }
         Ok(())
@@ -172,6 +175,7 @@ impl Model {
             let s = &mut m.slots[slot - 1];
             std::mem::swap(&mut m.visits, &mut s.visits);
             std::mem::swap(&mut m.position, &mut s.position);
+            std::mem::swap(&mut m.sequence, &mut s.sequence);
         };
         swap(self);
         let out = f(self);
@@ -229,6 +233,7 @@ impl Model {
         }
         if to == 0 {
             self.position = position;
+            self.sequence += 1;
         } else {
             self.slots[to - 1].position = position;
         }
