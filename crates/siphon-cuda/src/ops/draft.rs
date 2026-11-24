@@ -82,6 +82,9 @@ pub struct DraftKernels {
     markov_exact: CudaFunction,
     gemm_fp8: CudaFunction,
     markov_fold_any: CudaFunction,
+    markov_fold_raw: CudaFunction,
+    dflash_commit_rope_store: CudaFunction,
+    dflash_step: CudaFunction,
 }
 
 /// A matrix `[rows, k]` of E4M3 values with one F32 scale per row, `amax / 448`, as
@@ -153,6 +156,24 @@ struct F8Batch {
     count: i32,
     m: i32,
     k: i32,
+}
+
+/// Most layers of a DFlash draft, `kDflashMaxLayers` in the kernel.
+pub const DFLASH_MAX_LAYERS: usize = 16;
+
+/// Kernel parameter of `draft_dflash_commit_rope_store`, as `DflashCommit` in the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DflashCommit {
+    ctx_k: u64,
+    ctx_v: u64,
+    control: u64,
+    inv_freq: u64,
+    k_norm: [u64; DFLASH_MAX_LAYERS],
+    cache_k: [u64; DFLASH_MAX_LAYERS],
+    cache_v: [u64; DFLASH_MAX_LAYERS],
+    slots: [i32; DFLASH_MAX_LAYERS],
+    eps: f32,
 }
 
 /// Where a block attention takes its keys from.
@@ -336,6 +357,9 @@ impl DraftKernels {
             gather_rows: f("draft_gather_rows")?,
             gemm_fp8: f("draft_gemm_fp8")?,
             markov_fold_any: f("draft_markov_fold_any")?,
+            markov_fold_raw: f("draft_markov_fold_raw")?,
+            dflash_commit_rope_store: f("draft_dflash_commit_rope_store")?,
+            dflash_step: f("draft_dflash_step")?,
         })
     }
 
@@ -455,6 +479,27 @@ impl DraftKernels {
         start: usize,
         eps: f32,
     ) -> anyhow::Result<()> {
+        self.head_norm_rope_table(
+            stream, x, rows, heads, row_stride, weight, inv_freq, start, eps, false,
+        )
+    }
+
+    /// [`Self::head_norm_rope`], with the cosine and sine rounded to BF16 first when
+    /// `bf16_rope` is set, as a BF16 RoPE table holds them.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn head_norm_rope_table(
+        &self,
+        stream: &CudaStream,
+        x: &mut impl DeviceOut<bf16>,
+        rows: usize,
+        heads: usize,
+        row_stride: usize,
+        weight: &CudaSlice<bf16>,
+        inv_freq: &CudaSlice<f32>,
+        start: usize,
+        eps: f32,
+        bf16_rope: bool,
+    ) -> anyhow::Result<()> {
         let mut x = x.view_mut();
         ensure!(
             heads * HEAD_DIM <= row_stride,
@@ -481,6 +526,7 @@ impl DraftKernels {
             block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
+        let bf16_rope = i32::from(bf16_rope);
         let mut launch = stream.launch_builder(&self.head_norm_rope);
         launch
             .arg(&mut x)
@@ -488,9 +534,10 @@ impl DraftKernels {
             .arg(weight)
             .arg(inv_freq)
             .arg(&start)
-            .arg(&eps);
+            .arg(&eps)
+            .arg(&bf16_rope);
         // SAFETY: the arguments match `draft_head_norm_rope(bf16*, int, const bf16*, const
-        // float*, int, float)`. The check above keeps every head of every row inside `x`, and
+        // float*, int, float, int)`. The check above keeps every head of every row inside `x`, and
         // every position fits an i32.
         unsafe { launch.launch(config) }?;
         Ok(())
@@ -1056,7 +1103,8 @@ impl DraftKernels {
     /// Norm and RoPE of the block's queries `q` (BF16 `[8, 3072]`, in place) and keys `k`
     /// (BF16 `[8, 1024]`) at the round's position, and the cache stores of the keys and
     /// the values `v` (see `draft_block_rope_store`). With `limit`, positions at or past
-    /// the cache's slots are skipped, for a cache that is not a ring.
+    /// the cache's slots are skipped, for a cache that is not a ring. With `bf16_rope` the
+    /// cosine and sine are rounded to BF16 first.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn block_rope_store(
         &self,
@@ -1071,6 +1119,7 @@ impl DraftKernels {
         k_norm: &CudaSlice<bf16>,
         cache: &mut KvCache,
         limit: bool,
+        bf16_rope: bool,
     ) -> anyhow::Result<()> {
         check_len("q", q.len(), BLOCK * KV_HEADS * GROUP * HEAD_DIM)?;
         check_len("k", k.len(), BLOCK * KV_WIDTH)?;
@@ -1092,7 +1141,8 @@ impl DraftKernels {
             .ptr_mut(&mut cache.k, stream)
             .ptr_mut(&mut cache.v, stream)
             .i32(slots)
-            .i32(i32::from(limit));
+            .i32(i32::from(limit))
+            .i32(i32::from(bf16_rope));
         let config = LaunchConfig {
             grid_dim: (BLOCK as u32, (KV_HEADS * (GROUP + 1)) as u32, 1),
             block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
@@ -1100,7 +1150,7 @@ impl DraftKernels {
         };
         // SAFETY: the arguments match `draft_block_rope_store(bf16*, const bf16*, const
         // bf16*, const int*, const float*, float, const bf16*, const bf16*, bf16*, bf16*, int,
-        // int)`. The buffers have the checked sizes and every cache slot index is below
+        // int, int)`. The buffers have the checked sizes and every cache slot index is below
         // `slots`.
         unsafe { args.launch_pdl(stream, &self.block_rope_store, config) }?;
         Ok(())
@@ -1418,6 +1468,171 @@ impl DraftKernels {
         // int*, float*)`. With `count`, the caller keeps *count at most `rows`, which the buffers
         // hold; the kernel writes FOLD_BLOCKS partials.
         unsafe { args.launch_pdl(stream, &self.markov_fold_any, config) }?;
+        Ok(())
+    }
+
+    /// [`Self::markov_fold_any`] without the softcap (see `draft_markov_fold_raw`): the
+    /// partials' values are the uncapped logits and their sums zero.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn markov_fold_raw(
+        &self,
+        stream: &CudaStream,
+        weight: FoldRows<'_>,
+        fold_bias: &CudaSlice<bf16>,
+        base: &CudaView<'_, bf16>,
+        latent: &CudaSlice<f32>,
+        rows: usize,
+        count: Option<&CudaSlice<i32>>,
+        map: Option<&CudaSlice<i32>>,
+        partials: &mut ArgmaxPartials,
+    ) -> anyhow::Result<()> {
+        let capacity = match weight {
+            FoldRows::Bf16(w) => rows_of("fold weight", w.len(), RANK)?,
+            FoldRows::Fp8(w) => {
+                ensure!(w.k == RANK, "FP8 fold rows have k = {}", w.k);
+                w.rows()
+            }
+        };
+        ensure!(
+            rows <= capacity && rows <= fold_bias.len() && rows <= base.len(),
+            "{rows} rows exceed the fold, its bias or the base logits"
+        );
+        check_len("latent", latent.len(), RANK)?;
+        if let Some(map) = map {
+            ensure!(map.len() >= rows, "the map is too short");
+        }
+        let mut args = KernelArgs::default();
+        match weight {
+            FoldRows::Bf16(w) => args.ptr(w, stream).u64(0),
+            FoldRows::Fp8(w) => args.ptr(&w.values, stream).ptr(&w.scales, stream),
+        };
+        args.ptr(fold_bias, stream)
+            .ptr(base, stream)
+            .ptr(latent, stream)
+            .i32(i32_arg("rows", rows)?)
+            .opt(count, stream)
+            .opt(map, stream)
+            .ptr_mut(&mut partials.value, stream)
+            .ptr_mut(&mut partials.index, stream)
+            .ptr_mut(&mut partials.sum, stream);
+        let config = LaunchConfig {
+            grid_dim: (FOLD_BLOCKS as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_markov_fold_raw(const void*, const float*, const
+        // bf16*, const bf16*, const float*, int, const int*, const int*, float*, int*,
+        // float*)`. With `count`, the caller keeps *count at most `rows`, which the buffers
+        // hold; the kernel writes FOLD_BLOCKS partials.
+        unsafe { args.launch_pdl(stream, &self.markov_fold_raw, config) }?;
+        Ok(())
+    }
+
+    /// Norm, RoPE and cache stores of a DFlash draft round's context keys and values (see
+    /// `draft_dflash_commit_rope_store`): `ctx_k` and `ctx_v` are BF16 `[layers, 8, 1024]`,
+    /// the projections of the round's context rows by each layer's `k_proj` and `v_proj`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn dflash_commit_rope_store(
+        &self,
+        stream: &CudaStream,
+        ctx_k: &CudaSlice<bf16>,
+        ctx_v: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        inv_freq: &CudaSlice<f32>,
+        eps: f32,
+        k_norms: &[&CudaSlice<bf16>],
+        caches: &mut [KvCache],
+    ) -> anyhow::Result<()> {
+        let layers = caches.len();
+        ensure!(
+            (1..=DFLASH_MAX_LAYERS).contains(&layers) && k_norms.len() == layers,
+            "{layers} caches and {} norms, expected 1 to {DFLASH_MAX_LAYERS} of each",
+            k_norms.len()
+        );
+        check_len("ctx_k", ctx_k.len(), layers * BLOCK * KV_WIDTH)?;
+        check_len("ctx_v", ctx_v.len(), layers * BLOCK * KV_WIDTH)?;
+        check_len("control", control.len(), CONTROL)?;
+        check_len("inv_freq", inv_freq.len(), HEAD_DIM / 2)?;
+        let mut c = DflashCommit {
+            ctx_k: ctx_k.device_ptr(stream).0,
+            ctx_v: ctx_v.device_ptr(stream).0,
+            control: control.device_ptr(stream).0,
+            inv_freq: inv_freq.device_ptr(stream).0,
+            eps,
+            ..DflashCommit::default()
+        };
+        for (l, (norm, cache)) in k_norms.iter().zip(caches.iter_mut()).enumerate() {
+            check_len("k_norm", norm.len(), HEAD_DIM)?;
+            c.k_norm[l] = norm.device_ptr(stream).0;
+            c.cache_k[l] = cache.k.device_ptr_mut(stream).0;
+            c.cache_v[l] = cache.v.device_ptr_mut(stream).0;
+            c.slots[l] = i32_arg("slots", cache.slots)?;
+        }
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, KV_HEADS as u32, u32::try_from(layers)?),
+            block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: `c` has the kernel's `DflashCommit` layout. The buffers have the checked
+        // sizes; the kernel writes cache slots below each cache's `slots`, skipping
+        // positions past them and below zero, and reads `ctx_k` and `ctx_v` after
+        // `pdl_wait`.
+        unsafe { launch_by_value(stream, &self.dflash_commit_rope_store, config, &c, true) }?;
+        Ok(())
+    }
+
+    /// One step of a DFlash draft's vanilla Markov head (see `draft_dflash_step`), or with
+    /// `step == steps` only the pick of the last step's id. Reads the partials of
+    /// [`Self::markov_fold_raw`]; writes the step's latent (F32 `[256]`) and the
+    /// confidence of the draft it picks.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn dflash_step(
+        &self,
+        stream: &CudaStream,
+        step: usize,
+        steps: usize,
+        partials: &ArgmaxPartials,
+        control: &CudaSlice<i32>,
+        ids: &mut CudaSlice<i32>,
+        w1: &CudaSlice<bf16>,
+        y: &CudaSlice<bf16>,
+        conf_w: &CudaSlice<bf16>,
+        conf_b: f32,
+        latent: &mut CudaSlice<f32>,
+        confidence: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            step <= steps && steps < BLOCK && steps <= ids.len() && confidence.len() == ids.len(),
+            "step {step} of {steps} with {} ids and {} confidences",
+            ids.len(),
+            confidence.len()
+        );
+        check_len("control", control.len(), CONTROL)?;
+        let vocab = i32_arg("vocab", rows_of("w1", w1.len(), RANK)?)?;
+        check_len("y", y.len(), BLOCK * HIDDEN)?;
+        check_len("conf_w", conf_w.len(), HIDDEN + RANK)?;
+        check_len("latent", latent.len(), RANK)?;
+        let mut args = KernelArgs::default();
+        args.i32(i32_arg("step", step)?)
+            .i32(i32_arg("steps", steps)?)
+            .ptr(&partials.value, stream)
+            .ptr(&partials.index, stream)
+            .i32(i32_arg("partials", FOLD_BLOCKS)?)
+            .ptr(control, stream)
+            .ptr_mut(ids, stream)
+            .ptr(w1, stream)
+            .i32(vocab)
+            .ptr(y, stream)
+            .ptr(conf_w, stream)
+            .f32(conf_b)
+            .ptr_mut(latent, stream)
+            .ptr_mut(confidence, stream);
+        // SAFETY: the arguments match `draft_dflash_step(int, int, const float*, const int*,
+        // int, const int*, int*, const bf16*, int, const bf16*, const bf16*, float, float*,
+        // float*)`. The kernel reads everything after `pdl_wait`, bounds-checks the token
+        // against `vocab`, reads row step + 1 of the 8 rows of `y`, and writes ids and
+        // confidences below `steps`.
+        unsafe { args.launch_pdl(stream, &self.dflash_step, one_block(256)) }?;
         Ok(())
     }
 

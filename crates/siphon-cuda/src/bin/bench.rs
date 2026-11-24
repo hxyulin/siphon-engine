@@ -27,7 +27,7 @@
 //!
 //!        bench <model-dir> --prompt <capture> --spec K|auto [--widths 2,4,8]
 //!        [--draft SPEC] [--shortlist FILE] [--sweep FILE] [--contexts 0,32768]
-//!        [--steps N] [--weights bf16|fp8] [--kv bf16|fp8]
+//!        [--steps N] [--weights bf16|fp8] [--kv bf16|fp8] [--drafter DIR]
 //!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
 //!
 //! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
@@ -41,6 +41,8 @@
 //! takes a variant of the draft as `dspark` does: `fast` (the default, every
 //! approximation), `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`
 //! and `shortlist`, which ranks tokens by id unless `--shortlist` names a ranking file.
+//! `--drafter DIR` runs a DFlash draft with DSpark heads exported by the 2DSD project
+//! (`DflashWeights`) instead of the bundled draft, with the same variants.
 //! `--sweep FILE` also decodes `--steps` tokens one verify row at a time with a draft
 //! round of 7 at every anchor, and writes the tokens and every anchor's drafts and
 //! confidences to FILE as JSON lines, one per context. The verify and the draft's
@@ -114,6 +116,8 @@ mod linux {
         /// The draft variant and the shortlist ranking file.
         draft: String,
         shortlist: Option<PathBuf>,
+        /// A DFlash draft's export directory, in place of the bundled draft.
+        drafter: Option<PathBuf>,
         /// Where `--spec` writes the sweep, if anywhere.
         sweep: Option<PathBuf>,
         verify_widths: bool,
@@ -144,6 +148,7 @@ mod linux {
         let mut widths = (1..=8).collect();
         let mut draft = "fast".to_owned();
         let mut shortlist = None;
+        let mut drafter = None;
         let mut sweep = None;
         let mut verify_widths = false;
         let mut it = env::args().skip(1);
@@ -168,6 +173,7 @@ mod linux {
                 "--widths" => widths = token_counts(&arg, &value()?)?,
                 "--draft" => draft = value()?,
                 "--shortlist" => shortlist = Some(PathBuf::from(value()?)),
+                "--drafter" => drafter = Some(PathBuf::from(value()?)),
                 "--sweep" => sweep = Some(PathBuf::from(value()?)),
                 "--verify-widths" => verify_widths = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
@@ -203,6 +209,7 @@ mod linux {
             widths,
             draft,
             shortlist,
+            drafter,
             sweep,
             verify_widths,
         })
@@ -637,7 +644,10 @@ mod linux {
             draft::{DraftOptions, read_ranking},
             model::{DEFAULT_PREFILL_CHUNK, Model, SavedState},
             ops::spec::VERIFY_ROWS,
-            spec::{Drafts, Speculator, SweepRow, Width, WidthPolicy, price, verify_times},
+            spec::{
+                DraftSource, Drafts, Speculator, SweepRow, Width, WidthPolicy, load_draft, price,
+                verify_times,
+            },
             weights::{WeightFormat, Weights},
         };
 
@@ -745,9 +755,12 @@ mod linux {
             );
             println!(
                 "passes {passes}, {} global KV cache, {} weights for decode, verify and the \
-                 draft's LM head, draft {}, prompt {} ({} tokens)\n",
+                 draft's LM head, draft {} {}, prompt {} ({} tokens)\n",
                 args.kv,
                 args.weights,
+                args.drafter
+                    .as_ref()
+                    .map_or_else(|| "bundled".to_owned(), |d| d.display().to_string()),
                 args.draft,
                 path.display(),
                 text.len()
@@ -764,8 +777,12 @@ mod linux {
                 } else {
                     Width::Fixed(k)
                 };
-                let mut speculator =
-                    Speculator::with_options(&model, &checkpoint, capacity, width, &options)?;
+                let source = args
+                    .drafter
+                    .as_deref()
+                    .map_or(DraftSource::Bundled, DraftSource::Dflash);
+                let draft = load_draft(&mut model, &checkpoint, source, capacity, &options)?;
+                let mut speculator = Speculator::with_draft(&model, draft, width)?;
                 spec(
                     &mut model,
                     &mut speculator,

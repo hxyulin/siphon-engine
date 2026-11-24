@@ -17,18 +17,24 @@
 //!   orders, without a pass criterion.
 //! - `random_drafts_change_nothing` (test B): the same with uniformly random drafts at
 //!   k = 3 and with widths cycling from 1 to 8; the target almost never accepts them.
+//! - `dflash_speculation_is_exact` (test C): test A's widths with the DFlash draft in
+//!   `SIPHON_DFLASH`, an export of the 2DSD project (see `DflashWeights`).
 
 #![cfg(target_os = "linux")]
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, ensure};
 use safetensors::{Dtype, SafeTensors};
 use siphon::{Checkpoint, TextConfig};
 use siphon_cuda::{
     Gpu,
+    draft::DraftOptions,
     model::Model,
-    spec::{Drafts, Speculator, Width, WidthPolicy, greedy_by_verify},
+    spec::{DraftSource, Drafts, Speculator, Width, WidthPolicy, greedy_by_verify, load_draft},
     weights::Weights,
 };
 
@@ -89,8 +95,8 @@ fn every_width() -> anyhow::Result<Width> {
 }
 
 /// Runs every text: the reference, then each `(width, drafts)` from the same state, and
-/// checks that each emits the reference's tokens.
-fn check(runs: &[(Width, Drafts)], with_step: bool) -> anyhow::Result<()> {
+/// checks that each emits the reference's tokens. `dflash` replaces the bundled draft.
+fn check(runs: &[(Width, Drafts)], with_step: bool, dflash: Option<&Path>) -> anyhow::Result<()> {
     let prompts = TEXTS
         .iter()
         .map(|t| tokens(t))
@@ -101,7 +107,19 @@ fn check(runs: &[(Width, Drafts)], with_step: bool) -> anyhow::Result<()> {
         mut model,
         capacity,
     } = load(&prompts)?;
-    let mut speculator = Speculator::new(&model, &checkpoint, capacity, 1)?;
+    let mut speculator = match dflash {
+        None => Speculator::new(&model, &checkpoint, capacity, 1)?,
+        Some(dir) => {
+            let draft = load_draft(
+                &mut model,
+                &checkpoint,
+                DraftSource::Dflash(dir),
+                capacity,
+                &DraftOptions::fast(),
+            )?;
+            Speculator::with_draft(&model, draft, Width::Fixed(1))?
+        }
+    };
     let mut failures = Vec::new();
     for (text, prompt) in TEXTS.iter().zip(&prompts) {
         model.reset()?;
@@ -177,6 +195,7 @@ fn speculation_is_exact() -> anyhow::Result<()> {
             (every_width()?, Drafts::Dspark),
         ],
         true,
+        None,
     )
 }
 
@@ -189,5 +208,23 @@ fn random_drafts_change_nothing() -> anyhow::Result<()> {
             (every_width()?, Drafts::Random(0x5eed)),
         ],
         false,
+        None,
+    )
+}
+
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL), a DFlash draft (SIPHON_DFLASH), the captures \
+            and about 22 GB of GPU memory"]
+fn dflash_speculation_is_exact() -> anyhow::Result<()> {
+    let dir = PathBuf::from(env::var_os("SIPHON_DFLASH").context("set SIPHON_DFLASH")?);
+    check(
+        &[
+            (Width::Fixed(1), Drafts::Dspark),
+            (Width::Fixed(3), Drafts::Dspark),
+            (Width::Fixed(7), Drafts::Dspark),
+            (every_width()?, Drafts::Dspark),
+        ],
+        false,
+        Some(&dir),
     )
 }

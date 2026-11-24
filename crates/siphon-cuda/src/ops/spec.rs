@@ -20,9 +20,48 @@ use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
 pub const HIDDEN: usize = 2304;
 /// Width of the key and value projections.
 pub const KV_DIMS: usize = 1024;
-/// Feature taps per row: the partial block entering visits 5, 23 and 41, and the final
-/// normed hidden state.
+/// Feature taps per row of the bundled draft: the partial block entering visits 5, 23 and
+/// 41, and the final normed hidden state.
 pub const TAPS: usize = 4;
+/// Most feature taps per row that a [`TapLayout`] may ask for.
+pub const MAX_TAPS: usize = 8;
+
+/// The hidden states a draft reads for each row: the partial block entering each visit of
+/// `visits`, in order, then the final normed hidden state if `final_hidden` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapLayout {
+    pub visits: Vec<usize>,
+    pub final_hidden: bool,
+}
+
+impl TapLayout {
+    /// The bundled draft's taps (`target_layer_ids [5, 23, 41, 48]` of `mtp_config`).
+    #[must_use]
+    pub fn stock() -> Self {
+        Self {
+            visits: vec![5, 23, 41],
+            final_hidden: true,
+        }
+    }
+
+    /// Taps per row.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.visits.len() + usize::from(self.final_hidden)
+    }
+
+    /// Whether the layout records nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for TapLayout {
+    fn default() -> Self {
+        Self::stock()
+    }
+}
 /// Most rows one verify takes: the anchor and up to 7 drafts.
 pub const VERIFY_ROWS: usize = 8;
 /// Conv state rows per stream.
@@ -71,33 +110,40 @@ impl Spec {
         })
     }
 
-    /// Copies the rows of `src` `[rows, 2304]` into tap `tap` of `taps` `[rows, 4, 2304]`.
+    /// Copies the rows of `src` `[rows, 2304]` into tap `tap` of `taps`
+    /// `[rows, count, 2304]`.
     pub fn copy_tap(
         &self,
         stream: &CudaStream,
         src: &impl DeviceIn<bf16>,
         taps: &mut impl DeviceOut<bf16>,
         tap: usize,
+        count: usize,
     ) -> anyhow::Result<()> {
         let (src, mut taps) = (src.view(), taps.view_mut());
-        ensure!(tap < TAPS, "tap {tap} of {TAPS}");
+        ensure!(
+            tap < count && count <= MAX_TAPS,
+            "tap {tap} of {count}, at most {MAX_TAPS}"
+        );
         ensure!(
             src.len().is_multiple_of(HIDDEN) && !src.is_empty(),
             "src has {} elements, not rows of {HIDDEN}",
             src.len()
         );
         let rows = src.len() / HIDDEN;
-        check_len("taps", taps.len(), rows * TAPS * HIDDEN)?;
+        check_len("taps", taps.len(), rows * count * HIDDEN)?;
         let tap = i32::try_from(tap)?;
+        let count = i32::try_from(count)?;
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
             block_dim: (u32::try_from(HIDDEN / 8)?, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut launch = stream.launch_builder(&self.copy_tap);
-        launch.arg(&src).arg(&mut taps).arg(&tap);
-        // SAFETY: the arguments match `copy_tap(const bf16*, bf16*, int)`; block `r` reads
-        // row `r` of `src` and writes row `r`, tap `tap` of `taps`, both checked to exist.
+        launch.arg(&src).arg(&mut taps).arg(&tap).arg(&count);
+        // SAFETY: the arguments match `copy_tap(const bf16*, bf16*, int, int)`; block `r`
+        // reads row `r` of `src` and writes row `r`, tap `tap` of `taps`, both checked to
+        // exist.
         unsafe { launch.launch(config) }?;
         Ok(())
     }

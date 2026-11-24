@@ -89,6 +89,57 @@ SIPHON_MODEL=<model-dir> SIPHON_DSPARK_REF=reference/out cargo test --release -p
 
 `reference/dspark.py routing` reads captures made with `capture.py --routing` and reports the distinct experts that m consecutive positions route to at each visit, which sets the expert bytes of a verify of m rows.
 
+## DFlash draft
+
+`Draft::dflash` runs a second kind of draft in place of the bundled one: the 2DSD project's DFlash drafter with DSpark heads, as its exporter writes it (`config.json` with `architectures: DFlashDraftModel` and a `loopedtf_drafter.dspark` section, and `model.safetensors`). `DflashWeights` checks the config against what the kernels run. The released drafter for the research checkpoint (`minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter`) has this shape:
+
+- 5 taps, the partial block entering visits 2, 31, 36, 41 and 46 (`dflash_config.target_layer_ids`). `Model::set_tap_layout` makes prefill and verify record them in place of the bundled draft's 4.
+- `fc` (`[2304, 11520]`) over the concatenated taps, then `hidden_norm`: one context row per position, which every layer projects with the same `k_proj` and `v_proj` as the block's rows.
+- 5 layers, every one attending to every position. The cache takes 20 KiB per position, against 4 KiB for the bundled draft's one global layer.
+- A vanilla Markov head: draft j adds `w2 · w1[t]`, with t the token before it, to its base logits, and the step takes the argmax of the uncapped BF16 sum, as the 2DSD runner does. The softcap is monotone, but in BF16 it maps neighbouring logits to one value and changes the tie-break.
+- A confidence head, `sigmoid(proj · [y_j; w1[t]] + bias)`, which `WidthPolicy` reads as each draft's acceptance chance.
+- A learned mask vector in `mask_embedding.pt`, a pickle. Convert it once in a trusted Python environment with `torch.load(path, weights_only=True)` and save its `embedding` as BF16 `mask_embedding` in `mask_embedding.safetensors` beside `model.safetensors`.
+
+RoPE reads its cosine and sine rounded to BF16, as the runner's table and Transformers' rotary embedding in training hold them. Everything else reuses the bundled draft's kernels, approximations (`DraftOptions`) and CUDA graphs. `bench`, `siphon-serve` and `tests/spec.rs` take the export directory (`--drafter DIR`, `SIPHON_DFLASH`).
+
+`tests/dflash.rs` compares the drafts with the runner's (`vllm/v1/spec_decode/looped_dflash_context.py` of the 2DSD vLLM fork) given the same taps, at each of 1,891 anchors of one core prompt and its greedy continuation on the research checkpoint. The exact draft gives the runner's 7 drafts in 1,827 rounds. In the other 64 the first different draft falls on a near-tie, a top-2 gap of at most 0.25, and the confidences differ by at most 0.011. The runner's own BF16 and F32 paths agree in 94.5% of rounds, the engine and the F32 path in 95.5%, and the engine's decoder output is as far from the F32 path (median relative error 0.0080) as the runner's BF16 output is (0.0087).
+
+On this checkpoint the shortlist in token id order costs both drafts acceptance: 46% of the tokens the target generates on the core prompts lie outside the first 32,768 ids and the special tokens. The runs below without a shortlist keep the FP8 backbone, head and fold.
+
+The 32 core prompts of 2DSD's 1d-last run (math, code and science), and 4 prose and chat requests, BF16 weights and KV, verify width 8. Every run emitted the same 19,552 tokens on the core prompts:
+
+| Draft | Variant | Core tokens per round | Core tok/s | Chat tokens per round | Chat tok/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Bundled | `fast` | 3.365 | 320.1 | 1.662 | 156.9 |
+| Bundled | no shortlist | 3.629 | 331.6 | 1.769 | 160.9 |
+| Bundled | `exact` | 3.626 | 319.6 | 1.769 | 155.3 |
+| DFlash | `fast` | 3.907 | 360.3 | 1.738 | 159.3 |
+| DFlash | no shortlist | 4.474 | 395.3 | 1.929 | 170.3 |
+| DFlash | no shortlist, BF16 backbone | 4.474 | 390.2 | 1.934 | 167.6 |
+| DFlash | `exact` | 4.467 | 375.0 | 1.932 | 161.5 |
+
+The 2DSD runner keeps 4.25 tokens per round with this drafter on the same prompts.
+
+The same with FP8 weights and KV and adaptive widths from 1 to 8. Every run emitted the same 19,089 tokens on the core prompts. A DFlash round priced 0.26 to 0.31 ms more than a bundled one at every width:
+
+| Draft | Variant | Core tokens per round | Core tok/s | Chat tokens per round | Chat tok/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Bundled | `fast` | 3.275 | 368.4 | 1.678 | 215.9 |
+| Bundled | no shortlist | 3.482 | 379.4 | 1.804 | 229.7 |
+| DFlash | `fast` | 3.690 | 419.6 | 1.687 | 230.0 |
+| DFlash | no shortlist | 4.144 | 420.1 | 1.836 | 236.9 |
+
+A draft round of 7 drafts with BF16 weights (`bench --spec 7`, the round's commit included), after the core prompt above (1,403 tokens) and with arbitrary ids before it up to 10,240 and 32,768 tokens:
+
+| Draft | Variant | 1,403 | 10,240 | 32,768 |
+| --- | --- | ---: | ---: | ---: |
+| Bundled | `fast` | 0.522 ms | 0.569 ms | 0.646 ms |
+| Bundled | no shortlist | 0.958 ms | 0.997 ms | 1.074 ms |
+| DFlash | `fast` | 0.773 ms | 0.963 ms | 1.339 ms |
+| DFlash | no shortlist | 1.218 ms | 1.392 ms | 1.767 ms |
+
+The two extra layers and `fc` cost about 0.25 ms. The rest of the gap grows with the context: 5 layers read every position's keys and values, 0.64 GB at 32,768.
+
 ## Speculative decoding
 
 `spec::Speculator` runs greedy speculative decoding with the draft. Each round verifies the anchor and its leading drafts, a width of 1 to 8 rows that `spec::Width` sets: a fixed k drafts (`Width::Fixed`), or a width per round from the drafts' confidences (`Width::Adaptive`).

@@ -25,7 +25,6 @@ namespace {
 constexpr int kHidden = 2304;
 constexpr int kKvDims = 1024;
 constexpr int kTopK = 8;
-constexpr int kTaps = 4;
 constexpr int kVerifyRows = 8;
 constexpr int kStateRows = 3;
 constexpr int kStreams = 4;
@@ -43,13 +42,13 @@ __device__ __forceinline__ int stream_offset(int s) {
 
 }  // namespace
 
-// Copies rows of src [rows, 2304] into tap `tap` of taps [rows, 4, 2304]. One block of 288
-// threads per row, 8 values per thread.
+// Copies rows of src [rows, 2304] into tap `tap` of taps [rows, count, 2304]. One block of
+// 288 threads per row, 8 values per thread.
 extern "C" __global__ void __launch_bounds__(288)
-copy_tap(const __nv_bfloat16* src, __nv_bfloat16* taps, int tap) {
+copy_tap(const __nv_bfloat16* src, __nv_bfloat16* taps, int tap, int count) {
     const size_t r = blockIdx.x;
     const int c = threadIdx.x * 8;
-    *reinterpret_cast<uint4*>(taps + (r * kTaps + tap) * kHidden + c) =
+    *reinterpret_cast<uint4*>(taps + (r * count + tap) * kHidden + c) =
         *reinterpret_cast<const uint4*>(src + r * kHidden + c);
 }
 

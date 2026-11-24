@@ -30,7 +30,7 @@ use crate::{
         misc::{GATE_SLOTS, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsPartial},
-        spec::{TAPS, VERIFY_ROWS, VISIT_CHANNELS},
+        spec::{TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -43,11 +43,6 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 /// Rows the LM head runs at once when every row's logits are wanted: 32 rows of 201,024
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
-/// The visits whose input partial block is a feature tap of the draft, in tap order:
-/// `target_layer_ids` 5, 23 and 41 of the checkpoint's `mtp_config`. The fourth tap is the
-/// final normed hidden state.
-const TAP_VISITS: [usize; TAPS - 1] = [5, 23, 41];
-
 /// Receives each chunk's feature taps and the position of its first row.
 type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
@@ -127,8 +122,10 @@ pub(super) struct PrefillScratch {
     pub(super) rows: usize,
     /// Whether a chunk records its feature taps into `taps`.
     pub(super) record_taps: bool,
-    /// The feature taps of every row, BF16 `[rows, 4, hidden]`: the partial block entering
-    /// each visit of [`TAP_VISITS`], then the final normed hidden state.
+    /// Which feature taps `taps` holds.
+    pub(super) tap_layout: TapLayout,
+    /// The feature taps of every row, BF16 `[rows, taps, hidden]`: the partial block
+    /// entering each visit of the layout, then the final normed hidden state if it asks.
     pub(super) taps: Option<CudaSlice<bf16>>,
     /// The verify pass's own state, in the verify scratch only.
     pub(super) verify: Option<VerifyBuffers>,
@@ -188,6 +185,7 @@ impl PrefillScratch {
         Ok(Self {
             rows,
             record_taps: false,
+            tap_layout: TapLayout::stock(),
             taps: None,
             verify: None,
             tokens: zeros(stream, rows)?,
@@ -305,8 +303,7 @@ impl Model {
     }
 
     /// [`Model::prefill`] that also records every row's feature taps for the draft, BF16
-    /// `[rows, 4, 2304]`: the partial block entering visits 5, 23 and 41, and the final
-    /// normed hidden state. After enqueueing each chunk it passes the chunk's taps and the
+    /// `[rows, taps, 2304]` in the order of [`Model::tap_layout`]. After enqueueing each chunk it passes the chunk's taps and the
     /// position of its first row to `taps`. Work that `taps` enqueues on the model's stream
     /// runs before the next chunk overwrites them.
     pub fn prefill_with_taps(
@@ -355,9 +352,15 @@ impl Model {
             .as_mut()
             .context("the prefill buffers are missing")?;
         p.record_taps = taps.is_some();
-        if p.record_taps && p.taps.is_none() {
-            p.taps = Some(zeros(&self.ctx.stream, p.rows * TAPS * hidden)?);
+        if p.record_taps && (p.taps.is_none() || p.tap_layout != self.tap_layout) {
+            p.taps = None;
+            p.tap_layout = self.tap_layout.clone();
+            p.taps = Some(zeros(
+                &self.ctx.stream,
+                p.rows * p.tap_layout.len() * hidden,
+            )?);
         }
+        let row_len = p.tap_layout.len() * hidden;
         let pieces = tokens.chunks(chunk);
         let count = pieces.len();
         for (i, piece) in pieces.enumerate() {
@@ -369,7 +372,7 @@ impl Model {
                     .as_ref()
                     .context("the prefill buffers are missing")?;
                 let buffer = p.taps.as_ref().context("the taps buffer is missing")?;
-                taps(start, rows(buffer, piece.len(), TAPS * hidden))?;
+                taps(start, rows(buffer, piece.len(), row_len))?;
             }
         }
         let next = self.ctx.stream.clone_dtoh(&self.scratch.next)?[0];
@@ -605,13 +608,15 @@ impl Ctx {
             },
             self.eps(),
         )?;
-        if p.record_taps {
+        if p.record_taps && p.tap_layout.final_hidden {
+            let count = p.tap_layout.len();
             let taps = p.taps.as_mut().context("the taps buffer is missing")?;
             self.kernels.spec.copy_tap(
                 &self.stream,
                 &rows(&p.final_hidden, m, hidden),
-                &mut rows_mut(taps, m, TAPS * hidden),
-                TAPS - 1,
+                &mut rows_mut(taps, m, count * hidden),
+                count - 1,
+                count,
             )?;
         }
         if verify {
@@ -757,14 +762,16 @@ impl Ctx {
         let kv_dims = self.config.num_key_value_heads * self.config.head_dim;
         let mh = m * hidden;
         if p.record_taps
-            && let Some(tap) = TAP_VISITS.iter().position(|&v| v == index)
+            && let Some(tap) = p.tap_layout.visits.iter().position(|&v| v == index)
         {
+            let count = p.tap_layout.len();
             let taps = p.taps.as_mut().context("the taps buffer is missing")?;
             self.kernels.spec.copy_tap(
                 &self.stream,
                 &rows(&p.hidden, m, hidden),
-                &mut rows_mut(taps, m, TAPS * hidden),
+                &mut rows_mut(taps, m, count * hidden),
                 tap,
+                count,
             )?;
         }
         let block_start = layer.is_multiple_of(self.config.n_layers_per_attn_res_block);

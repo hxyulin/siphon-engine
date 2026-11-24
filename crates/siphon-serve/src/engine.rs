@@ -62,6 +62,10 @@ pub struct Options {
     pub widths: Vec<usize>,
     /// Jobs that wait while one runs.
     pub queue: usize,
+    /// A DFlash draft's export directory, in place of the bundled draft.
+    pub drafter: Option<PathBuf>,
+    /// The draft's approximations, as `DraftOptions::parse` takes them.
+    pub draft: String,
 }
 
 /// Sends jobs to the engine thread.
@@ -116,7 +120,7 @@ mod cuda {
         draft::DraftOptions,
         model::{DEFAULT_PREFILL_CHUNK, Model},
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
-        spec::{Drafts, Speculator, Width, WidthPolicy, price},
+        spec::{DraftSource, Drafts, Speculator, Width, WidthPolicy, load_draft, price},
         weights::{WeightFormat, Weights},
     };
 
@@ -181,13 +185,18 @@ mod cuda {
             },
         )?;
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
-        let mut speculator = Speculator::with_options(
-            &model,
+        let source = options
+            .drafter
+            .as_deref()
+            .map_or(DraftSource::Bundled, DraftSource::Dflash);
+        let draft = load_draft(
+            &mut model,
             &checkpoint,
+            source,
             options.capacity,
-            width,
-            &DraftOptions::fast(),
+            &DraftOptions::parse(&options.draft, None)?,
         )?;
+        let mut speculator = Speculator::with_draft(&model, draft, width)?;
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
 
         // Price each width at the warmup prompt, which also captures the graphs.

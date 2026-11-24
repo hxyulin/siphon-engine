@@ -34,6 +34,7 @@ use siphon::TextConfig;
 
 use crate::{
     DeviceIn,
+    ops::spec::TapLayout,
     ops::{
         draft::{
             ArgmaxPartials, AttentionKeys, AttentionScratch, BLOCK, CONTROL, DraftKernels,
@@ -41,8 +42,12 @@ use crate::{
         },
         linear::{Gemm, Linear},
     },
-    weights::draft::{
-        DraftWeights, HEAD_DIM, HEADS, HIDDEN, LAYERS, MLP_WIDTH, RANK, SharedWeights, TAPS,
+    weights::{
+        dflash::{DflashLayerWeights, DflashWeights},
+        draft::{
+            DraftLayerWeights, DraftWeights, HEAD_DIM, HEADS, HIDDEN, LAYERS, MLP_WIDTH, RANK,
+            SharedWeights, TAPS,
+        },
     },
 };
 
@@ -173,11 +178,7 @@ pub fn rope_inv_freq() -> Vec<f32> {
 /// The draft's weights, its LM-head fold, its cache and its scratch buffers.
 pub struct Draft {
     kernels: DraftKernels,
-    weights: DraftWeights,
-    /// `lm_head · hidden_out` and its copies for the pruned argmax.
-    fold: Fold,
-    /// `softmax(fuse_weight)`, F32 `[4, 4]`.
-    alpha: CudaSlice<f32>,
+    arch: Arch,
     /// RoPE frequencies `theta^(-2i/128)`, F32 `[64]`.
     inv_freq: CudaSlice<f32>,
     caches: Vec<KvCache>,
@@ -198,7 +199,146 @@ pub struct Draft {
     head: Option<Head>,
 }
 
-/// FP8 copies of one layer's projections.
+/// The weights of one of the two draft architectures.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per draft, never moved after load"
+)]
+enum Arch {
+    /// The DSpark draft bundled with the checkpoint (`mtp.safetensors`).
+    Stock {
+        weights: DraftWeights,
+        /// `lm_head · hidden_out` and its copies for the pruned argmax.
+        fold: Fold,
+        /// `softmax(fuse_weight)`, F32 `[4, 4]`.
+        alpha: CudaSlice<f32>,
+    },
+    /// A DFlash draft with DSpark heads ([`DflashWeights`]): `fc` over the concatenated
+    /// taps, every layer global, a vanilla Markov head and a confidence head.
+    Dflash {
+        weights: DflashWeights,
+        /// Zeros over the vocabulary: the vanilla head's bias has no constant term.
+        zero_bias: CudaSlice<bf16>,
+        /// An FP8 copy of `fc`, with [`DraftOptions::fp8_backbone`].
+        fc_fp8: Option<Fp8Rows>,
+    },
+}
+
+/// The weights of one decoder layer's block forward, which both architectures share.
+struct LayerRefs<'a> {
+    input_norm: &'a CudaSlice<bf16>,
+    post_attention_norm: &'a CudaSlice<bf16>,
+    q: &'a CudaSlice<bf16>,
+    k: &'a CudaSlice<bf16>,
+    v: &'a CudaSlice<bf16>,
+    o: &'a CudaSlice<bf16>,
+    q_norm: &'a CudaSlice<bf16>,
+    k_norm: &'a CudaSlice<bf16>,
+    gate: &'a CudaSlice<bf16>,
+    up: &'a CudaSlice<bf16>,
+    down: &'a CudaSlice<bf16>,
+}
+
+impl<'a> From<&'a DraftLayerWeights> for LayerRefs<'a> {
+    fn from(w: &'a DraftLayerWeights) -> Self {
+        Self {
+            input_norm: &w.input_norm,
+            post_attention_norm: &w.post_attention_norm,
+            q: &w.q,
+            k: &w.k,
+            v: &w.v,
+            o: &w.o,
+            q_norm: &w.q_norm,
+            k_norm: &w.k_norm,
+            gate: &w.gate,
+            up: &w.up,
+            down: &w.down,
+        }
+    }
+}
+
+impl<'a> From<&'a DflashLayerWeights> for LayerRefs<'a> {
+    fn from(w: &'a DflashLayerWeights) -> Self {
+        Self {
+            input_norm: &w.input_norm,
+            post_attention_norm: &w.post_attention_norm,
+            q: &w.q,
+            k: &w.k,
+            v: &w.v,
+            o: &w.o,
+            q_norm: &w.q_norm,
+            k_norm: &w.k_norm,
+            gate: &w.gate,
+            up: &w.up,
+            down: &w.down,
+        }
+    }
+}
+
+impl Arch {
+    fn layers(&self) -> usize {
+        match self {
+            Self::Stock { weights, .. } => weights.layers.len(),
+            Self::Dflash { weights, .. } => weights.layers.len(),
+        }
+    }
+
+    fn layer(&self, layer: usize) -> LayerRefs<'_> {
+        match self {
+            Self::Stock { weights, .. } => (&weights.layers[layer]).into(),
+            Self::Dflash { weights, .. } => (&weights.layers[layer]).into(),
+        }
+    }
+
+    /// Whether `layer` attends to every position rather than a window.
+    fn global(&self, layer: usize) -> bool {
+        match self {
+            Self::Stock { .. } => layer == 1,
+            Self::Dflash { .. } => true,
+        }
+    }
+
+    fn mask_embed(&self) -> &CudaSlice<bf16> {
+        match self {
+            Self::Stock { weights, .. } => &weights.mask_embed,
+            Self::Dflash { weights, .. } => &weights.mask_embed,
+        }
+    }
+
+    fn norm(&self) -> &CudaSlice<bf16> {
+        match self {
+            Self::Stock { weights, .. } => &weights.norm,
+            Self::Dflash { weights, .. } => &weights.norm,
+        }
+    }
+
+    /// The rows a shortlist head gathers for its Markov bias, and their bias.
+    fn fold_rows(&self) -> (&CudaSlice<bf16>, &CudaSlice<bf16>) {
+        match self {
+            Self::Stock { fold, .. } => (&fold.weight, &fold.bias),
+            Self::Dflash {
+                weights, zero_bias, ..
+            } => (&weights.w2, zero_bias),
+        }
+    }
+
+    fn taps(&self) -> TapLayout {
+        match self {
+            Self::Stock { .. } => TapLayout::stock(),
+            Self::Dflash { weights, .. } => weights.taps.clone(),
+        }
+    }
+
+    /// Taps per position.
+    fn tap_count(&self) -> usize {
+        match self {
+            Self::Stock { .. } => TAPS,
+            Self::Dflash { weights, .. } => weights.taps.len(),
+        }
+    }
+}
+
+/// FP8 copies of one layer's projections. Only the stock draft has context projections.
 struct Fp8Layer {
     q: Fp8Rows,
     k: Fp8Rows,
@@ -207,8 +347,8 @@ struct Fp8Layer {
     gate: Fp8Rows,
     up: Fp8Rows,
     down: Fp8Rows,
-    k_ctx: Fp8Rows,
-    v_ctx: Fp8Rows,
+    k_ctx: Option<Fp8Rows>,
+    v_ctx: Option<Fp8Rows>,
 }
 
 enum Matrix {
@@ -255,7 +395,7 @@ impl Shortlist {
 
 /// A round's inputs in device memory, for [`Draft::run_round`] and [`Draft::replay_round`].
 pub struct RoundInputs {
-    /// Taps of the positions to commit, BF16 `[8, 4, 2304]`; rows past the count are unused.
+    /// Taps of the positions to commit, BF16 `[8, taps, 2304]`; rows past the count are unused.
     pub taps: CudaSlice<bf16>,
     /// I32 `[3]`: the first position to commit, the number of positions to commit (0 to 8)
     /// and the anchor token. The block sits right after the committed positions.
@@ -311,6 +451,67 @@ struct Scratch {
     confidence: CudaSlice<f32>,
     /// Each step's Markov logits, BF16 `[7, vocab]`, when recorded.
     logits: Option<CudaSlice<bf16>>,
+    /// The context rows of a DFlash draft.
+    dflash: Option<DflashScratch>,
+}
+
+/// The context rows of a DFlash draft: `fc` of the taps, then `hidden_norm`.
+struct DflashScratch {
+    /// [`Draft::commit`]'s, BF16 `[512, 2304]` each.
+    raw: CudaSlice<bf16>,
+    normed: CudaSlice<bf16>,
+    /// A round's, BF16 `[8, 2304]` each.
+    round_raw: CudaSlice<bf16>,
+    round_normed: CudaSlice<bf16>,
+}
+
+impl Scratch {
+    fn new(stream: &Arc<CudaStream>, config: &TextConfig, arch: &Arch) -> anyhow::Result<Self> {
+        let z = |n: usize| stream.alloc_zeros::<bf16>(n);
+        let zf = |n: usize| stream.alloc_zeros::<f32>(n);
+        let dflash = match arch {
+            Arch::Stock { .. } => None,
+            Arch::Dflash { .. } => Some(DflashScratch {
+                raw: z(COMMIT_ROWS * HIDDEN)?,
+                normed: z(COMMIT_ROWS * HIDDEN)?,
+                round_raw: z(BLOCK * HIDDEN)?,
+                round_normed: z(BLOCK * HIDDEN)?,
+            }),
+        };
+        Ok(Self {
+            mixed: z(COMMIT_ROWS * HIDDEN)?,
+            ctx_k: z(COMMIT_ROWS * KV_WIDTH)?,
+            ctx_v: z(COMMIT_ROWS * KV_WIDTH)?,
+            round_mixed: z(LAYERS * BLOCK * HIDDEN)?,
+            round_k: z(arch.layers() * BLOCK * KV_WIDTH)?,
+            round_v: z(arch.layers() * BLOCK * KV_WIDTH)?,
+            f: z(HIDDEN)?,
+            residual: z(BLOCK * HIDDEN)?,
+            h: z(BLOCK * HIDDEN)?,
+            q: z(BLOCK * HEADS * HEAD_DIM)?,
+            k: z(BLOCK * KV_WIDTH)?,
+            v: z(BLOCK * KV_WIDTH)?,
+            attn: z(BLOCK * HEADS * HEAD_DIM)?,
+            o: z(BLOCK * HIDDEN)?,
+            gate: z(BLOCK * MLP_WIDTH)?,
+            up: z(BLOCK * MLP_WIDTH)?,
+            act: z(BLOCK * MLP_WIDTH)?,
+            mlp: z(BLOCK * HIDDEN)?,
+            y: z(BLOCK * HIDDEN)?,
+            attention: AttentionScratch::new(stream)?,
+            base: z(STEPS * config.vocab_size)?,
+            context_in: zf(STEPS * 2 * HIDDEN)?,
+            context: zf(STEPS * 3 * RANK)?,
+            state: [zf(RANK)?, zf(RANK)?],
+            latent: zf(RANK)?,
+            partials: ArgmaxPartials::new(stream)?,
+            bounds: LogitBounds::new(stream, config.unpadded_vocab_size)?,
+            ids: stream.alloc_zeros(STEPS)?,
+            confidence: stream.alloc_zeros(STEPS)?,
+            logits: None,
+            dflash,
+        })
+    }
 }
 
 impl Draft {
@@ -342,6 +543,64 @@ impl Draft {
         capacity: usize,
         options: &DraftOptions,
     ) -> anyhow::Result<Self> {
+        let kernels = DraftKernels::load(stream.context())?;
+        check_lm_head(config, shared)?;
+        let fold = fold(
+            stream,
+            &kernels,
+            &weights,
+            shared,
+            config.vocab_size,
+            config.unpadded_vocab_size,
+        )?;
+        let alpha: Vec<f32> = weights.alpha.iter().flatten().copied().collect();
+        let alpha = stream.clone_htod(&alpha)?;
+        let arch = Arch::Stock {
+            weights,
+            fold,
+            alpha,
+        };
+        Self::build(stream, config, kernels, arch, shared, capacity, options)
+    }
+
+    /// A DFlash draft with DSpark heads ([`DflashWeights`]) in place of the bundled one,
+    /// with the approximations in `options`. Every layer keeps `capacity` positions, 4 KiB
+    /// each. Its taps are [`Self::tap_layout`], which the target must record.
+    pub fn dflash(
+        stream: &Arc<CudaStream>,
+        config: &TextConfig,
+        weights: DflashWeights,
+        shared: SharedWeights<'_>,
+        capacity: usize,
+        options: &DraftOptions,
+    ) -> anyhow::Result<Self> {
+        let kernels = DraftKernels::load(stream.context())?;
+        check_lm_head(config, shared)?;
+        let fc_fp8 = if options.fp8_backbone {
+            let k = weights.taps.len() * HIDDEN;
+            let mut out = Fp8Rows::new(stream, HIDDEN, k)?;
+            kernels.quantize_rows(stream, &weights.fc, None, HIDDEN, 0, &mut out)?;
+            Some(out)
+        } else {
+            None
+        };
+        let arch = Arch::Dflash {
+            weights,
+            zero_bias: stream.alloc_zeros(config.vocab_size)?,
+            fc_fp8,
+        };
+        Self::build(stream, config, kernels, arch, shared, capacity, options)
+    }
+
+    fn build(
+        stream: &Arc<CudaStream>,
+        config: &TextConfig,
+        kernels: DraftKernels,
+        arch: Arch,
+        shared: SharedWeights<'_>,
+        capacity: usize,
+        options: &DraftOptions,
+    ) -> anyhow::Result<Self> {
         ensure!(
             capacity >= LOCAL_SLOTS,
             "capacity {capacity} is below the {LOCAL_SLOTS} positions of a window and a block"
@@ -350,78 +609,41 @@ impl Draft {
             config.final_logit_softcapping > 0.0,
             "the draft's confidences need a positive logit softcap"
         );
-        let kernels = DraftKernels::load(stream.context())?;
         let padded_vocab = config.vocab_size;
-        ensure!(
-            shared.lm_head.len() == padded_vocab * HIDDEN,
-            "the LM head has {} elements, expected {padded_vocab} x {HIDDEN}",
-            shared.lm_head.len()
-        );
-        let fold = fold(
-            stream,
-            &kernels,
-            &weights,
-            shared,
-            padded_vocab,
-            config.unpadded_vocab_size,
-        )?;
-        let alpha: Vec<f32> = weights.alpha.iter().flatten().copied().collect();
         let inv_freq = rope_inv_freq();
-        let caches = (0..LAYERS)
-            .map(|layer| KvCache::new(stream, if layer == 1 { capacity } else { LOCAL_SLOTS }))
+        let layers = arch.layers();
+        let caches = (0..layers)
+            .map(|layer| {
+                KvCache::new(
+                    stream,
+                    if arch.global(layer) {
+                        capacity
+                    } else {
+                        LOCAL_SLOTS
+                    },
+                )
+            })
             .collect::<anyhow::Result<_>>()?;
+        let s = Scratch::new(stream, config, &arch)?;
         let z = |n: usize| stream.alloc_zeros::<bf16>(n);
-        let zf = |n: usize| stream.alloc_zeros::<f32>(n);
-        let s = Scratch {
-            mixed: z(COMMIT_ROWS * HIDDEN)?,
-            ctx_k: z(COMMIT_ROWS * KV_WIDTH)?,
-            ctx_v: z(COMMIT_ROWS * KV_WIDTH)?,
-            round_mixed: z(LAYERS * BLOCK * HIDDEN)?,
-            round_k: z(LAYERS * BLOCK * KV_WIDTH)?,
-            round_v: z(LAYERS * BLOCK * KV_WIDTH)?,
-            f: z(HIDDEN)?,
-            residual: z(BLOCK * HIDDEN)?,
-            h: z(BLOCK * HIDDEN)?,
-            q: z(BLOCK * HEADS * HEAD_DIM)?,
-            k: z(BLOCK * KV_WIDTH)?,
-            v: z(BLOCK * KV_WIDTH)?,
-            attn: z(BLOCK * HEADS * HEAD_DIM)?,
-            o: z(BLOCK * HIDDEN)?,
-            gate: z(BLOCK * MLP_WIDTH)?,
-            up: z(BLOCK * MLP_WIDTH)?,
-            act: z(BLOCK * MLP_WIDTH)?,
-            mlp: z(BLOCK * HIDDEN)?,
-            y: z(BLOCK * HIDDEN)?,
-            attention: AttentionScratch::new(stream)?,
-            base: z(STEPS * padded_vocab)?,
-            context_in: zf(STEPS * 2 * HIDDEN)?,
-            context: zf(STEPS * 3 * RANK)?,
-            state: [zf(RANK)?, zf(RANK)?],
-            latent: zf(RANK)?,
-            partials: ArgmaxPartials::new(stream)?,
-            bounds: LogitBounds::new(stream, config.unpadded_vocab_size)?,
-            ids: stream.alloc_zeros(STEPS)?,
-            confidence: stream.alloc_zeros(STEPS)?,
-            logits: None,
-        };
         let backbone = options
             .fp8_backbone
-            .then(|| quantize_backbone(stream, &kernels, &weights))
+            .then(|| quantize_backbone(stream, &kernels, &arch))
             .transpose()?;
+        let round_taps = z(BLOCK * arch.tap_count() * HIDDEN)?;
+        let (fold_weight, fold_bias) = arch.fold_rows();
         let head = Head::new(
             stream,
             &kernels,
             shared,
-            &fold.weight,
-            &fold.bias,
+            fold_weight,
+            fold_bias,
             config.unpadded_vocab_size,
             options,
         )?;
         Ok(Self {
             kernels,
-            weights,
-            fold,
-            alpha: stream.clone_htod(&alpha)?,
+            arch,
             inv_freq: stream.clone_htod(&inv_freq)?,
             caches,
             capacity,
@@ -431,13 +653,24 @@ impl Draft {
             softcap: config.final_logit_softcapping,
             s,
             inputs: RoundInputs {
-                taps: z(BLOCK * TAPS * HIDDEN)?,
+                taps: round_taps,
                 control: stream.alloc_zeros(CONTROL)?,
             },
             graphs: Default::default(),
             backbone,
             head,
         })
+    }
+
+    /// The target hidden states the draft reads per position, in order.
+    #[must_use]
+    pub fn tap_layout(&self) -> TapLayout {
+        self.arch.taps()
+    }
+
+    /// Elements of one position's taps: taps times the hidden width.
+    fn row_len(&self) -> usize {
+        self.arch.tap_count() * HIDDEN
     }
 
     /// Positions the global layer's cache holds.
@@ -520,12 +753,13 @@ impl Draft {
         list.stale = false;
         let changed = list.bucket() != bucket;
         let ids = stream.clone_htod(&ids)?;
+        let (fold_weight, fold_bias) = self.arch.fold_rows();
         head.gather(
             stream,
             &self.kernels,
             shared,
-            &self.fold.weight,
-            &self.fold.bias,
+            fold_weight,
+            fold_bias,
             &ids.slice(..),
             first,
         )?;
@@ -535,8 +769,13 @@ impl Draft {
         Ok(())
     }
 
-    /// Keeps each step's Markov logits from the next round on, for tests.
+    /// Keeps each step's Markov logits from the next round on, for tests. Only the
+    /// bundled draft records them.
     pub fn record_logits(&mut self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        ensure!(
+            matches!(self.arch, Arch::Stock { .. }),
+            "only the bundled draft records its Markov logits"
+        );
         if self.s.logits.is_none() {
             self.s.logits = Some(stream.alloc_zeros(STEPS * self.vocab)?);
             self.graphs = Default::default();
@@ -551,7 +790,7 @@ impl Draft {
     }
 
     /// Fills [`Self::round_inputs`] from the host: the taps of positions
-    /// `start..start + rows` (BF16 `[rows, 4, 2304]`, `rows` up to 8, possibly none) and
+    /// `start..start + rows` (BF16 `[rows, taps, 2304]` in the order of [`Self::tap_layout`], `rows` up to 8, possibly none) and
     /// the anchor token in `anchor` (one I32 on the device). The next round commits those
     /// positions and runs the block at `start + rows`. Like [`Self::commit`], `start` must
     /// not skip positions.
@@ -563,7 +802,7 @@ impl Draft {
         anchor: &impl DeviceIn<i32>,
     ) -> anyhow::Result<()> {
         let taps = taps.view();
-        let row_len = TAPS * HIDDEN;
+        let row_len = self.row_len();
         ensure!(
             taps.len().is_multiple_of(row_len) && taps.len() <= BLOCK * row_len,
             "taps have {} elements, not a multiple of {row_len} up to {BLOCK} rows",
@@ -593,7 +832,7 @@ impl Draft {
     }
 
     /// Fills [`Self::round_inputs`] after a verify pass without reading its verdict: `taps`
-    /// holds the verify's rows at positions `start..` (BF16 `[rows, 4, 2304]`, up to 8 rows),
+    /// holds the verify's rows at positions `start..` (BF16 `[rows, taps, 2304]`, up to 8 rows),
     /// `kept` the number of drafts it kept (one I32 on the device) and `anchor` the next
     /// anchor. The next round commits the kept rows `0..=kept` and runs the block right
     /// after them. The host does not learn the new position; [`Self::committed`] becomes
@@ -608,7 +847,7 @@ impl Draft {
         anchor: &impl DeviceIn<i32>,
     ) -> anyhow::Result<()> {
         let taps = taps.view();
-        let row_len = TAPS * HIDDEN;
+        let row_len = self.row_len();
         ensure!(
             taps.len().is_multiple_of(row_len) && (1..=BLOCK).contains(&(taps.len() / row_len)),
             "taps have {} elements, not 1 to {BLOCK} rows of {row_len}",
@@ -677,9 +916,10 @@ impl Draft {
     }
 
     /// Writes the draft cache entries of target positions `start..start + rows` from their
-    /// taps, BF16 `[rows, 4, 2304]`: the partial block entering visits 5, 23 and 41, and the
-    /// final normed hidden state. The last row's taps also become the Markov head's context
-    /// for the round anchored right after it. `start` may go back to rewrite positions, but
+    /// taps, BF16 `[rows, taps, 2304]` in the order of [`Self::tap_layout`]. For the bundled
+    /// draft these are the partial block entering visits 5, 23 and 41 and the final normed
+    /// hidden state, and the last row's taps also become the Markov head's context for the
+    /// round anchored right after it. `start` may go back to rewrite positions, but
     /// must not skip any.
     pub fn commit(
         &mut self,
@@ -689,7 +929,7 @@ impl Draft {
         start: usize,
     ) -> anyhow::Result<()> {
         let taps = taps.view();
-        let row_len = TAPS * HIDDEN;
+        let row_len = self.row_len();
         ensure!(
             taps.len().is_multiple_of(row_len) && !taps.is_empty(),
             "taps have {} elements, not a positive multiple of {row_len}",
@@ -707,60 +947,130 @@ impl Draft {
             start + rows,
             self.capacity
         );
+        match &self.arch {
+            Arch::Stock { weights, alpha, .. } => {
+                let s = &mut self.s;
+                for offset in (0..rows).step_by(COMMIT_ROWS) {
+                    let n = COMMIT_ROWS.min(rows - offset);
+                    let chunk = taps.slice(offset * row_len..(offset + n) * row_len);
+                    let position = start + offset;
+                    for (layer, (w, cache)) in
+                        weights.layers.iter().zip(&mut self.caches).enumerate()
+                    {
+                        let mut mixed = s.mixed.slice_mut(..n * HIDDEN);
+                        let alpha = alpha.slice(layer * TAPS..(layer + 1) * TAPS);
+                        self.kernels.mix_rms_norm(
+                            stream,
+                            &chunk,
+                            &alpha,
+                            &w.dflare_norm,
+                            &mut mixed,
+                            EPS,
+                        )?;
+                        let mixed = s.mixed.slice(..n * HIDDEN);
+                        let mut k = s.ctx_k.slice_mut(..n * KV_WIDTH);
+                        let mut v = s.ctx_v.slice_mut(..n * KV_WIDTH);
+                        linear.gemm_bf16(
+                            stream,
+                            &mut [
+                                Gemm::new(&w.k_ctx, &mixed, &mut k),
+                                Gemm::new(&w.v_ctx, &mixed, &mut v),
+                            ],
+                            n,
+                        )?;
+                        self.kernels.head_norm_rope(
+                            stream,
+                            &mut s.ctx_k,
+                            n,
+                            KV_WIDTH / HEAD_DIM,
+                            KV_WIDTH,
+                            &w.k_norm_ctx,
+                            &self.inv_freq,
+                            position,
+                            EPS,
+                        )?;
+                        self.kernels
+                            .store_kv(stream, &s.ctx_k, &s.ctx_v, n, KV_WIDTH, cache, position)?;
+                    }
+                }
+                let last = taps.slice((rows - 1) * row_len..);
+                let alpha = alpha.slice(LAYERS * TAPS..);
+                self.kernels.mix_rms_norm(
+                    stream,
+                    &last,
+                    &alpha,
+                    &weights.markov.dflare_norm,
+                    &mut s.f,
+                    EPS,
+                )?;
+            }
+            Arch::Dflash { .. } => self.commit_dflash(stream, linear, &taps, start, rows)?,
+        }
+        self.committed = start + rows;
+        Ok(())
+    }
+
+    /// [`Self::commit`]'s work for a DFlash draft: `fc` and `hidden_norm` of each position's
+    /// taps, then every layer's keys and values of that context row.
+    fn commit_dflash(
+        &mut self,
+        stream: &CudaStream,
+        linear: &Linear,
+        taps: &CudaView<'_, bf16>,
+        start: usize,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let Arch::Dflash { weights, .. } = &self.arch else {
+            anyhow::bail!("not a DFlash draft");
+        };
+        let row_len = self.arch.tap_count() * HIDDEN;
         let s = &mut self.s;
+        let dfl = s
+            .dflash
+            .as_mut()
+            .context("the DFlash buffers are missing")?;
         for offset in (0..rows).step_by(COMMIT_ROWS) {
             let n = COMMIT_ROWS.min(rows - offset);
             let chunk = taps.slice(offset * row_len..(offset + n) * row_len);
             let position = start + offset;
-            for (layer, (w, cache)) in self.weights.layers.iter().zip(&mut self.caches).enumerate()
-            {
-                let mut mixed = s.mixed.slice_mut(..n * HIDDEN);
-                let alpha = self.alpha.slice(layer * TAPS..(layer + 1) * TAPS);
-                self.kernels.mix_rms_norm(
-                    stream,
-                    &chunk,
-                    &alpha,
-                    &w.dflare_norm,
-                    &mut mixed,
-                    EPS,
-                )?;
-                let mixed = s.mixed.slice(..n * HIDDEN);
-                let mut k = s.ctx_k.slice_mut(..n * KV_WIDTH);
-                let mut v = s.ctx_v.slice_mut(..n * KV_WIDTH);
+            let mut raw = dfl.raw.slice_mut(..n * HIDDEN);
+            linear.gemm_bf16(stream, &mut [Gemm::new(&weights.fc, &chunk, &mut raw)], n)?;
+            self.kernels.add_rms_norm(
+                stream,
+                None,
+                &mut dfl.raw,
+                &weights.hidden_norm,
+                &mut dfl.normed,
+                EPS,
+            )?;
+            let normed = dfl.normed.slice(..n * HIDDEN);
+            for (lw, cache) in weights.layers.iter().zip(&mut self.caches) {
+                let mut ck = s.ctx_k.slice_mut(..n * KV_WIDTH);
+                let mut cv = s.ctx_v.slice_mut(..n * KV_WIDTH);
                 linear.gemm_bf16(
                     stream,
                     &mut [
-                        Gemm::new(&w.k_ctx, &mixed, &mut k),
-                        Gemm::new(&w.v_ctx, &mixed, &mut v),
+                        Gemm::new(&lw.k, &normed, &mut ck),
+                        Gemm::new(&lw.v, &normed, &mut cv),
                     ],
                     n,
                 )?;
-                self.kernels.head_norm_rope(
+                self.kernels.head_norm_rope_table(
                     stream,
                     &mut s.ctx_k,
                     n,
                     KV_WIDTH / HEAD_DIM,
                     KV_WIDTH,
-                    &w.k_norm_ctx,
+                    &lw.k_norm,
                     &self.inv_freq,
                     position,
                     EPS,
+                    true,
                 )?;
                 self.kernels
                     .store_kv(stream, &s.ctx_k, &s.ctx_v, n, KV_WIDTH, cache, position)?;
             }
         }
-        let last = taps.slice((rows - 1) * row_len..);
-        let alpha = self.alpha.slice(LAYERS * TAPS..);
-        self.kernels.mix_rms_norm(
-            stream,
-            &last,
-            &alpha,
-            &self.weights.markov.dflare_norm,
-            &mut s.f,
-            EPS,
-        )?;
-        self.committed = start + rows;
         Ok(())
     }
 
@@ -851,54 +1161,122 @@ impl Draft {
     fn commit_round(&mut self, stream: &CudaStream, linear: &Linear) -> anyhow::Result<()> {
         let k = &self.kernels;
         let s = &mut self.s;
-        let w = &self.weights;
         let control = &self.inputs.control;
-        k.commit_mix(
+        match &self.arch {
+            Arch::Stock {
+                weights: w, alpha, ..
+            } => {
+                k.commit_mix(
+                    stream,
+                    &self.inputs.taps,
+                    control,
+                    alpha,
+                    [
+                        &w.layers[0].dflare_norm,
+                        &w.layers[1].dflare_norm,
+                        &w.layers[2].dflare_norm,
+                        &w.markov.dflare_norm,
+                    ],
+                    &mut s.round_mixed,
+                    &mut s.f,
+                    EPS,
+                )?;
+                for (layer, lw) in w.layers.iter().enumerate() {
+                    let mixed = s
+                        .round_mixed
+                        .slice(layer * BLOCK * HIDDEN..(layer + 1) * BLOCK * HIDDEN);
+                    let kv = layer * BLOCK * KV_WIDTH..(layer + 1) * BLOCK * KV_WIDTH;
+                    let ck = s.round_k.slice_mut(kv.clone());
+                    let cv = s.round_v.slice_mut(kv);
+                    let f = self.backbone.as_ref().map(|b| &b[layer]);
+                    project(
+                        linear,
+                        k,
+                        stream,
+                        &mixed,
+                        &mut [
+                            (&lw.k_ctx, f.and_then(|f| f.k_ctx.as_ref()), ck),
+                            (&lw.v_ctx, f.and_then(|f| f.v_ctx.as_ref()), cv),
+                        ],
+                    )?;
+                }
+                k.commit_rope_store(
+                    stream,
+                    &s.round_k,
+                    &s.round_v,
+                    control,
+                    &self.inv_freq,
+                    EPS,
+                    [
+                        &w.layers[0].k_norm_ctx,
+                        &w.layers[1].k_norm_ctx,
+                        &w.layers[2].k_norm_ctx,
+                    ],
+                    &mut self.caches,
+                )
+            }
+            Arch::Dflash { .. } => self.commit_round_dflash(stream, linear),
+        }
+    }
+
+    /// [`Self::commit_round`]'s work for a DFlash draft.
+    fn commit_round_dflash(&mut self, stream: &CudaStream, linear: &Linear) -> anyhow::Result<()> {
+        let Arch::Dflash {
+            weights: dw,
+            fc_fp8,
+            ..
+        } = &self.arch
+        else {
+            anyhow::bail!("not a DFlash draft");
+        };
+        let k = &self.kernels;
+        let s = &mut self.s;
+        let control = &self.inputs.control;
+        let dfl = s
+            .dflash
+            .as_mut()
+            .context("the DFlash buffers are missing")?;
+        // Every row of the 8 runs; the store keeps only the committed ones.
+        project(
+            linear,
+            k,
             stream,
-            &self.inputs.taps,
-            control,
-            &self.alpha,
-            [
-                &w.layers[0].dflare_norm,
-                &w.layers[1].dflare_norm,
-                &w.layers[2].dflare_norm,
-                &w.markov.dflare_norm,
-            ],
-            &mut s.round_mixed,
-            &mut s.f,
+            &self.inputs.taps.slice(..),
+            &mut [(&dw.fc, fc_fp8.as_ref(), dfl.round_raw.slice_mut(..))],
+        )?;
+        k.add_rms_norm(
+            stream,
+            None,
+            &mut dfl.round_raw,
+            &dw.hidden_norm,
+            &mut dfl.round_normed,
             EPS,
         )?;
-        for (layer, lw) in w.layers.iter().enumerate() {
-            let mixed = s
-                .round_mixed
-                .slice(layer * BLOCK * HIDDEN..(layer + 1) * BLOCK * HIDDEN);
+        for (layer, lw) in dw.layers.iter().enumerate() {
             let kv = layer * BLOCK * KV_WIDTH..(layer + 1) * BLOCK * KV_WIDTH;
             let ck = s.round_k.slice_mut(kv.clone());
             let cv = s.round_v.slice_mut(kv);
-            let f = self.backbone.as_ref().map(|b| &b[layer]);
+            let fp8 = self.backbone.as_ref().map(|b| &b[layer]);
             project(
                 linear,
                 k,
                 stream,
-                &mixed,
+                &dfl.round_normed.slice(..),
                 &mut [
-                    (&lw.k_ctx, f.map(|f| &f.k_ctx), ck),
-                    (&lw.v_ctx, f.map(|f| &f.v_ctx), cv),
+                    (&lw.k, fp8.map(|f| &f.k), ck),
+                    (&lw.v, fp8.map(|f| &f.v), cv),
                 ],
             )?;
         }
-        k.commit_rope_store(
+        let norms: Vec<&CudaSlice<bf16>> = dw.layers.iter().map(|l| &l.k_norm).collect();
+        k.dflash_commit_rope_store(
             stream,
             &s.round_k,
             &s.round_v,
             control,
             &self.inv_freq,
             EPS,
-            [
-                &w.layers[0].k_norm_ctx,
-                &w.layers[1].k_norm_ctx,
-                &w.layers[2].k_norm_ctx,
-            ],
+            &norms,
             &mut self.caches,
         )
     }
@@ -913,18 +1291,20 @@ impl Draft {
         let k = &self.kernels;
         let s = &mut self.s;
         let control = &self.inputs.control;
+        let arch = &self.arch;
         k.block_input(
             stream,
             &control.slice(2..3),
             shared.embed,
             shared.embed_norm,
-            &self.weights.mask_embed,
+            arch.mask_embed(),
             &mut s.residual,
             EPS,
         )?;
-        for (layer, (w, cache)) in self.weights.layers.iter().zip(&mut self.caches).enumerate() {
+        for (layer, cache) in self.caches.iter_mut().enumerate() {
+            let lw = arch.layer(layer);
             let x = (layer > 0).then_some(&s.mlp);
-            k.add_rms_norm(stream, x, &mut s.residual, &w.input_norm, &mut s.h, EPS)?;
+            k.add_rms_norm(stream, x, &mut s.residual, lw.input_norm, &mut s.h, EPS)?;
             let f = self.backbone.as_ref().map(|b| &b[layer]);
             project(
                 linear,
@@ -932,12 +1312,12 @@ impl Draft {
                 stream,
                 &s.h.slice(..),
                 &mut [
-                    (&w.q, f.map(|f| &f.q), s.q.slice_mut(..)),
-                    (&w.k, f.map(|f| &f.k), s.k.slice_mut(..)),
-                    (&w.v, f.map(|f| &f.v), s.v.slice_mut(..)),
+                    (lw.q, f.map(|f| &f.q), s.q.slice_mut(..)),
+                    (lw.k, f.map(|f| &f.k), s.k.slice_mut(..)),
+                    (lw.v, f.map(|f| &f.v), s.v.slice_mut(..)),
                 ],
             )?;
-            let global = layer == 1;
+            let global = arch.global(layer);
             k.block_rope_store(
                 stream,
                 &mut s.q,
@@ -946,10 +1326,11 @@ impl Draft {
                 control,
                 &self.inv_freq,
                 EPS,
-                &w.q_norm,
-                &w.k_norm,
+                lw.q_norm,
+                lw.k_norm,
                 cache,
                 global,
+                matches!(arch, Arch::Dflash { .. }),
             )?;
             let keys = AttentionKeys::Device {
                 control,
@@ -962,13 +1343,13 @@ impl Draft {
                 k,
                 stream,
                 &s.attn.slice(..),
-                &mut [(&w.o, f.map(|f| &f.o), s.o.slice_mut(..))],
+                &mut [(lw.o, f.map(|f| &f.o), s.o.slice_mut(..))],
             )?;
             k.add_rms_norm(
                 stream,
                 Some(&s.o),
                 &mut s.residual,
-                &w.post_attention_norm,
+                lw.post_attention_norm,
                 &mut s.h,
                 EPS,
             )?;
@@ -978,8 +1359,8 @@ impl Draft {
                 stream,
                 &s.h.slice(..),
                 &mut [
-                    (&w.gate, f.map(|f| &f.gate), s.gate.slice_mut(..)),
-                    (&w.up, f.map(|f| &f.up), s.up.slice_mut(..)),
+                    (lw.gate, f.map(|f| &f.gate), s.gate.slice_mut(..)),
+                    (lw.up, f.map(|f| &f.up), s.up.slice_mut(..)),
                 ],
             )?;
             k.silu_mul(stream, &s.gate, &s.up, &mut s.act)?;
@@ -988,14 +1369,14 @@ impl Draft {
                 k,
                 stream,
                 &s.act.slice(..),
-                &mut [(&w.down, f.map(|f| &f.down), s.mlp.slice_mut(..))],
+                &mut [(lw.down, f.map(|f| &f.down), s.mlp.slice_mut(..))],
             )?;
         }
         k.add_rms_norm(
             stream,
             Some(&s.mlp),
             &mut s.residual,
-            &self.weights.norm,
+            arch.norm(),
             &mut s.y,
             EPS,
         )
@@ -1009,42 +1390,28 @@ impl Draft {
         shared: SharedWeights<'_>,
         steps: usize,
     ) -> anyhow::Result<()> {
+        let Arch::Stock { weights, fold, .. } = &self.arch else {
+            return self.markov_dflash(stream, linear, shared, steps);
+        };
         let k = &self.kernels;
-        let mw = &self.weights.markov;
+        let mw = &weights.markov;
         let s = &mut self.s;
         let control = &self.inputs.control;
         let head = self.head.as_ref();
-        let list = head.and_then(|h| h.shortlist.as_ref());
         // At least two rows for the BF16 GEMMs: a single row would run as a GEMV, which
         // sums in another order.
         let m_rows = steps.max(2);
-        // Rows of the base logits, each `ld` elements.
-        let (rows, ld) = match list {
-            Some(list) => (list.bucket(), list.bucket()),
-            None => (self.vocab, self.padded_vocab),
-        };
-        match head.and_then(|h| h.lm.as_ref()) {
-            None => {
-                let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
-                let mut base = s.base.slice_mut(..m_rows * ld);
-                linear.gemm_bf16(
-                    stream,
-                    &mut [Gemm::new(shared.lm_head, &y, &mut base)],
-                    m_rows,
-                )?;
-            }
-            Some(Matrix::Bf16(w)) => {
-                let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
-                let w = w.slice(..rows * HIDDEN);
-                let mut base = s.base.slice_mut(..m_rows * rows);
-                linear.gemm_bf16(stream, &mut [Gemm::new(&w, &y, &mut base)], m_rows)?;
-            }
-            Some(Matrix::Fp8(w)) => {
-                let y = s.y.slice(HIDDEN..(steps + 1) * HIDDEN);
-                let base = s.base.slice_mut(..);
-                k.gemm_fp8(stream, &y, steps, &mut [fp8_rows(w, rows, base, ld)])?;
-            }
-        }
+        let (rows, ld) = base_logits(
+            linear,
+            k,
+            stream,
+            shared,
+            head,
+            s,
+            steps,
+            self.vocab,
+            self.padded_vocab,
+        )?;
         k.markov_context_input(stream, &s.y, &s.f, &mut s.context_in)?;
         let context_in = s.context_in.slice(..m_rows * 2 * HIDDEN);
         let mut context = s.context.slice_mut(..m_rows * 3 * RANK);
@@ -1087,7 +1454,7 @@ impl Draft {
                     .map(|l| l.slice_mut(step * self.vocab..(step + 1) * self.vocab));
                 let step_argmax = StepArgmax {
                     kernels: k,
-                    fold: &self.fold,
+                    fold,
                     head,
                     vocab: self.vocab,
                     softcap: self.softcap,
@@ -1105,6 +1472,134 @@ impl Draft {
         }
         Ok(())
     }
+}
+
+impl Draft {
+    /// The base logits and `steps` greedy steps of a DFlash draft's vanilla Markov head
+    /// over the block in [`Self::y`]. Step `j` adds the bias `w2 · w1[t]` of the token `t`
+    /// before draft `j` to the base logits of row `j + 1` and takes the argmax of the
+    /// uncapped sum, as the 2DSD runner does; its confidence is the confidence head's.
+    fn markov_dflash(
+        &mut self,
+        stream: &CudaStream,
+        linear: &Linear,
+        shared: SharedWeights<'_>,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        let Arch::Dflash {
+            weights, zero_bias, ..
+        } = &self.arch
+        else {
+            anyhow::bail!("not a DFlash draft");
+        };
+        let k = &self.kernels;
+        let s = &mut self.s;
+        let control = &self.inputs.control;
+        let head = self.head.as_ref();
+        let list = head.and_then(|h| h.shortlist.as_ref());
+        let (rows, ld) = base_logits(
+            linear,
+            k,
+            stream,
+            shared,
+            head,
+            s,
+            steps,
+            self.vocab,
+            self.padded_vocab,
+        )?;
+        let (weight, bias) = match head {
+            None => (FoldRows::Bf16(&weights.w2), zero_bias),
+            Some(h) => (
+                match &h.fold {
+                    None => FoldRows::Bf16(&weights.w2),
+                    Some(Matrix::Bf16(w)) => FoldRows::Bf16(w),
+                    Some(Matrix::Fp8(w)) => FoldRows::Fp8(w),
+                },
+                h.fold_bias.as_ref().unwrap_or(zero_bias),
+            ),
+        };
+        for step in 0..=steps {
+            k.dflash_step(
+                stream,
+                step,
+                steps,
+                &s.partials,
+                control,
+                &mut s.ids,
+                &weights.w1,
+                &s.y,
+                &weights.confidence,
+                weights.confidence_bias,
+                &mut s.latent,
+                &mut s.confidence,
+            )?;
+            if step < steps {
+                let base = s.base.slice(step * ld..step * ld + rows);
+                k.markov_fold_raw(
+                    stream,
+                    weight,
+                    bias,
+                    &base,
+                    &s.latent,
+                    rows,
+                    list.map(|l| &l.count),
+                    list.map(|l| &l.map),
+                    &mut s.partials,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Rows 1 to `steps` of the block output [`Scratch::y`] through the LM head, or through
+/// the approximate head's rows, into [`Scratch::base`]. Returns the rows of each step's
+/// base logits and the elements between steps.
+#[expect(clippy::too_many_arguments, reason = "the head and the buffers")]
+fn base_logits(
+    linear: &Linear,
+    k: &DraftKernels,
+    stream: &CudaStream,
+    shared: SharedWeights<'_>,
+    head: Option<&Head>,
+    s: &mut Scratch,
+    steps: usize,
+    vocab: usize,
+    padded_vocab: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let list = head.and_then(|h| h.shortlist.as_ref());
+    // At least two rows for the BF16 GEMMs: a single row would run as a GEMV, which sums
+    // in another order.
+    let m_rows = steps.max(2);
+    // Rows of the base logits, each `ld` elements.
+    let (rows, ld) = match list {
+        Some(list) => (list.bucket(), list.bucket()),
+        None => (vocab, padded_vocab),
+    };
+    match head.and_then(|h| h.lm.as_ref()) {
+        None => {
+            let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
+            let mut base = s.base.slice_mut(..m_rows * ld);
+            linear.gemm_bf16(
+                stream,
+                &mut [Gemm::new(shared.lm_head, &y, &mut base)],
+                m_rows,
+            )?;
+        }
+        Some(Matrix::Bf16(w)) => {
+            let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
+            let w = w.slice(..rows * HIDDEN);
+            let mut base = s.base.slice_mut(..m_rows * rows);
+            linear.gemm_bf16(stream, &mut [Gemm::new(&w, &y, &mut base)], m_rows)?;
+        }
+        Some(Matrix::Fp8(w)) => {
+            let y = s.y.slice(HIDDEN..(steps + 1) * HIDDEN);
+            let base = s.base.slice_mut(..);
+            k.gemm_fp8(stream, &y, steps, &mut [fp8_rows(w, rows, base, ld)])?;
+        }
+    }
+    Ok((rows, ld))
 }
 
 /// The LM-head fold and its copies for the pruned argmax.
@@ -1152,11 +1647,22 @@ fn fold(
     })
 }
 
+/// Checks that the target's LM head covers the padded vocabulary.
+fn check_lm_head(config: &TextConfig, shared: SharedWeights<'_>) -> anyhow::Result<()> {
+    ensure!(
+        shared.lm_head.len() == config.vocab_size * HIDDEN,
+        "the LM head has {} elements, expected {} x {HIDDEN}",
+        shared.lm_head.len(),
+        config.vocab_size
+    );
+    Ok(())
+}
+
 /// FP8 copies of every layer's projections.
 fn quantize_backbone(
     stream: &Arc<CudaStream>,
     kernels: &DraftKernels,
-    weights: &DraftWeights,
+    arch: &Arch,
 ) -> anyhow::Result<Vec<Fp8Layer>> {
     let quantize = |w: &CudaSlice<bf16>, k: usize| -> anyhow::Result<Fp8Rows> {
         let rows = w.len() / k;
@@ -1164,20 +1670,29 @@ fn quantize_backbone(
         kernels.quantize_rows(stream, w, None, rows, 0, &mut out)?;
         Ok(out)
     };
-    weights
-        .layers
-        .iter()
-        .map(|w| {
+    (0..arch.layers())
+        .map(|layer| {
+            let w = arch.layer(layer);
+            let (k_ctx, v_ctx) = match arch {
+                Arch::Stock { weights, .. } => {
+                    let c = &weights.layers[layer];
+                    (
+                        Some(quantize(&c.k_ctx, HIDDEN)?),
+                        Some(quantize(&c.v_ctx, HIDDEN)?),
+                    )
+                }
+                Arch::Dflash { .. } => (None, None),
+            };
             Ok(Fp8Layer {
-                q: quantize(&w.q, HIDDEN)?,
-                k: quantize(&w.k, HIDDEN)?,
-                v: quantize(&w.v, HIDDEN)?,
-                o: quantize(&w.o, HEADS * HEAD_DIM)?,
-                gate: quantize(&w.gate, HIDDEN)?,
-                up: quantize(&w.up, HIDDEN)?,
-                down: quantize(&w.down, MLP_WIDTH)?,
-                k_ctx: quantize(&w.k_ctx, HIDDEN)?,
-                v_ctx: quantize(&w.v_ctx, HIDDEN)?,
+                q: quantize(w.q, HIDDEN)?,
+                k: quantize(w.k, HIDDEN)?,
+                v: quantize(w.v, HIDDEN)?,
+                o: quantize(w.o, HEADS * HEAD_DIM)?,
+                gate: quantize(w.gate, HIDDEN)?,
+                up: quantize(w.up, HIDDEN)?,
+                down: quantize(w.down, MLP_WIDTH)?,
+                k_ctx,
+                v_ctx,
             })
         })
         .collect()

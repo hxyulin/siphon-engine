@@ -178,10 +178,12 @@ namespace {
 
 // Per-head RMSNorm of the 128 values at `in` with `weight`, rounded to BF16, then NeoX
 // RoPE at `position`, written to `out`, which may equal `in`. A block of 64 threads:
-// thread i rotates elements i and i + 64.
+// thread i rotates elements i and i + 64. With `bf16_table` the cosine and sine are
+// rounded to BF16 first, as a BF16 RoPE table holds them (the 2DSD runner's DFlash
+// draft, and Transformers' Qwen3 rotary embedding it was trained with).
 __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
                                const __nv_bfloat16* weight, const float* inv_freq,
-                               int32_t position, float eps) {
+                               int32_t position, float eps, bool bf16_table = false) {
     __shared__ float partial[kHalf / 32];
     const int i = threadIdx.x;
     const float x1 = bf(in[i]);
@@ -196,6 +198,10 @@ __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
     const float n2 = round_bf16(__fmul_rn(__fmul_rn(x2, inv), bf(weight[i + kHalf])));
     float sin_f, cos_f;
     sincosf(__fmul_rn(static_cast<float>(position), inv_freq[i]), &sin_f, &cos_f);
+    if (bf16_table) {
+        sin_f = round_bf16(sin_f);
+        cos_f = round_bf16(cos_f);
+    }
     out[i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(n1, cos_f), __fmul_rn(n2, sin_f)));
     out[i + kHalf] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(n2, cos_f), __fmul_rn(n1, sin_f)));
 }
@@ -204,13 +210,15 @@ __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
 
 // In place on the leading `heads` 128-wide heads of each row of x (row stride
 // `row_stride` elements): per-head RMSNorm with `weight`, rounded to BF16, then NeoX
-// RoPE at position `start + row`. inv_freq is F32 [64], theta^(-2i/128). Grid (rows,
+// RoPE at position `start + row`. inv_freq is F32 [64], theta^(-2i/128). With
+// `bf16_rope` the cosine and sine are rounded to BF16 (see norm_rope_head). Grid (rows,
 // heads), 64 threads: thread i rotates elements i and i + 64.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_head_norm_rope(__nv_bfloat16* x, int32_t row_stride, const __nv_bfloat16* weight,
-                     const float* inv_freq, int32_t start, float eps) {
+                     const float* inv_freq, int32_t start, float eps, int32_t bf16_rope) {
     __nv_bfloat16* head = x + size_t(blockIdx.x) * row_stride + blockIdx.y * kHeadDim;
-    norm_rope_head(head, head, weight, inv_freq, start + static_cast<int32_t>(blockIdx.x), eps);
+    norm_rope_head(head, head, weight, inv_freq, start + static_cast<int32_t>(blockIdx.x), eps,
+                   bf16_rope != 0);
 }
 
 // Copies rows of keys and values (BF16 [rows, 1024] with row stride `row_stride`) into
@@ -852,13 +860,14 @@ draft_commit_rope_store(const __nv_bfloat16* ctx_k, const __nv_bfloat16* ctx_v,
 // query heads of each row of q get draft_head_norm_rope's norm and RoPE at P + row in
 // place; the 8 key heads of each row of k get them on their way to cache slot
 // (P + row) mod slots, with the value heads of v beside them. With `limit` set,
-// positions at or past `slots` are skipped. Grid (8 rows, 32 heads), 64 threads.
+// positions at or past `slots` are skipped. With `bf16_rope` the cosine and sine are
+// rounded to BF16 (see norm_rope_head). Grid (8 rows, 32 heads), 64 threads.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_block_rope_store(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
                        const int32_t* control, const float* inv_freq, float eps,
                        const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
                        __nv_bfloat16* cache_k, __nv_bfloat16* cache_v, int32_t slots,
-                       int32_t limit) {
+                       int32_t limit, int32_t bf16_rope) {
     constexpr int kWidth = kKvHeads * kHeadDim;
     constexpr int kQWidth = kKvHeads * kGroup * kHeadDim;
     pdl_wait();
@@ -867,7 +876,7 @@ draft_block_rope_store(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bflo
     const int32_t position = control[0] + control_rows(control) + row;
     if (head < kKvHeads * kGroup) {
         __nv_bfloat16* x = q + size_t(row) * kQWidth + head * kHeadDim;
-        norm_rope_head(x, x, q_norm, inv_freq, position, eps);
+        norm_rope_head(x, x, q_norm, inv_freq, position, eps, bf16_rope != 0);
         return;
     }
     const int g = head - kKvHeads * kGroup;
@@ -876,9 +885,52 @@ draft_block_rope_store(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bflo
     }
     const size_t src = size_t(row) * kWidth + g * kHeadDim;
     const size_t dst = size_t(position % slots) * kWidth + g * kHeadDim;
-    norm_rope_head(k + src, cache_k + dst, k_norm, inv_freq, position, eps);
+    norm_rope_head(k + src, cache_k + dst, k_norm, inv_freq, position, eps, bf16_rope != 0);
     for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
         cache_v[dst + i] = v[src + i];
+    }
+}
+
+// The layers of draft_dflash_commit_rope_store, as `DflashCommit` in src/ops/draft.rs.
+constexpr int kDflashMaxLayers = 16;
+struct DflashCommit {
+    const __nv_bfloat16* ctx_k;
+    const __nv_bfloat16* ctx_v;
+    const int32_t* control;
+    const float* inv_freq;
+    const __nv_bfloat16* k_norm[kDflashMaxLayers];
+    __nv_bfloat16* cache_k[kDflashMaxLayers];
+    __nv_bfloat16* cache_v[kDflashMaxLayers];
+    int32_t slots[kDflashMaxLayers];
+    float eps;
+};
+
+// The round's context keys and values of a DFlash draft, whose layers all keep every
+// position: for row r below control[1], KV head h and layer l, the key head of
+// ctx_k[l, r] gets draft_head_norm_rope's norm (layer l's k_norm) and RoPE from a BF16
+// table at position start + r and lands in slot start + r of layer l's cache, with the value head of
+// ctx_v[l, r] beside it. Positions at or past a cache's slots are skipped. Grid (8 rows,
+// 8 heads, layers), 64 threads.
+extern "C" __global__ void __launch_bounds__(kHalf)
+draft_dflash_commit_rope_store(const __grid_constant__ DflashCommit c) {
+    constexpr int kWidth = kKvHeads * kHeadDim;
+    pdl_wait();
+    pdl_trigger();
+    const int rows = control_rows(c.control);
+    const int row = blockIdx.x, head = blockIdx.y, layer = blockIdx.z;
+    if (row >= rows) {
+        return;
+    }
+    const int32_t position = c.control[0] + row;
+    if (position < 0 || position >= c.slots[layer]) {
+        return;
+    }
+    const size_t src = (size_t(layer) * kBlock + row) * kWidth + head * kHeadDim;
+    const size_t dst = size_t(position) * kWidth + head * kHeadDim;
+    norm_rope_head(c.ctx_k + src, c.cache_k[layer] + dst, c.k_norm[layer], c.inv_freq,
+                   position, c.eps, true);
+    for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
+        c.cache_v[layer][dst + i] = c.ctx_v[src + i];
     }
 }
 
@@ -918,6 +970,69 @@ __device__ __forceinline__ void block_partial_sum(float v, float* shared, float*
 }
 
 }  // namespace
+
+static_assert(kRank == kRowThreads, "draft_dflash_step: one thread per Markov rank");
+
+// One step of a DFlash draft's vanilla Markov head, or with step == steps only the last
+// pick. Picks the previous token: the anchor (control[2]) at step 0, otherwise the argmax
+// of `count` partials from draft_markov_fold_raw, written to ids[step - 1]. Below `steps`
+// it then writes latent = w1[token] widened to F32, and confidence[step], the confidence
+// head's acceptance probability of the draft this step picks: sigmoid(bf16(bf16(conf_w ·
+// [y[step + 1]; w1[token]]) + conf_b)), as the 2DSD runner rounds it. A token outside
+// [0, vocab) has a zero embedding. One block of 256 threads.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_dflash_step(int32_t step, int32_t steps, const float* partial_value,
+                  const int32_t* partial_index, int32_t count, const int32_t* control,
+                  int32_t* ids, const __nv_bfloat16* w1, int32_t vocab, const __nv_bfloat16* y,
+                  const __nv_bfloat16* conf_w, float conf_b, float* latent, float* confidence) {
+    __shared__ int32_t picked;
+    pdl_wait();
+    pdl_trigger();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (warp == 0) {
+        int32_t token;
+        if (step == 0) {
+            token = control[2];
+        } else {
+            float value = -INFINITY;
+            int32_t index = INT32_MAX;
+            for (int i = lane; i < count; i += 32) {
+                if (better(partial_value[i], partial_index[i], value, index)) {
+                    value = partial_value[i];
+                    index = partial_index[i];
+                }
+            }
+            warp_best(value, index);
+            token = index == INT32_MAX ? 0 : index;
+        }
+        if (lane == 0) {
+            picked = token >= 0 && token < vocab ? token : -1;
+            if (step > 0) {
+                ids[step - 1] = token;
+            }
+        }
+    }
+    __syncthreads();
+    if (step >= steps) {
+        return;
+    }
+    const int32_t token = picked;
+    const int t = threadIdx.x;
+    const float e = token >= 0 ? bf(w1[size_t(token) * kRank + t]) : 0.f;
+    latent[t] = e;
+    const __nv_bfloat16* row = y + size_t(step + 1) * kHidden;
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        const int c = t + i * kRowThreads;
+        acc = fmaf(bf(row[c]), bf(conf_w[c]), acc);
+    }
+    acc = fmaf(e, bf(conf_w[kHidden + t]), acc);
+    const float logit = round_bf16(__fadd_rn(round_bf16(block_sum(acc)), conf_b));
+    if (t == 0) {
+        confidence[step] = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-logit)));
+    }
+}
 
 // One Markov step, or with step == steps only the last pick. Picks the previous step's
 // token: the anchor (control[2]) at step 0, otherwise the argmax of `count` partials
@@ -1399,18 +1514,18 @@ __device__ void fold_partial(float value, int32_t index, float* best_value, int3
 
 }  // namespace
 
-// One Markov step's logits and the first pass of their argmax over head rows that are
-// FP8, a shortlist, or both: row n's fold product is sum_j w[n, j] latent[j], times
-// scale[n] when the weights are E4M3 (`scale` not null), else BF16. Then logit =
-// bf16(cap tanh(bf16(base[n] + bf16(fold_bias[n] + acc)) / cap)). The rows are
-// `rows` or, with `count` not null, *count; row n stands for token map[n], or n without
-// a map. Each block writes its best (value, token) pair and its sum of exp(logit - cap)
-// to the partials.
-extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
-draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat16* fold_bias,
-                      const __nv_bfloat16* base, const float* latent, int32_t rows,
-                      const int32_t* count, const int32_t* map, float softcap,
-                      float* partial_value, int32_t* partial_index, float* partial_sum) {
+namespace {
+
+// The body of draft_markov_fold_any and draft_markov_fold_raw. Without kCapped the logit
+// is the uncapped bf16(base[n] + bf16(fold_bias[n] + acc)) and the sums stay zero.
+template <bool kCapped>
+__device__ __forceinline__ void fold_any(const void* weight, const float* scale,
+                                         const __nv_bfloat16* fold_bias,
+                                         const __nv_bfloat16* base, const float* latent,
+                                         int32_t rows, const int32_t* count,
+                                         const int32_t* map, float softcap,
+                                         float* partial_value, int32_t* partial_index,
+                                         float* partial_sum) {
     __shared__ __align__(16) float z[kRank];
     __shared__ float warp_sums[kFoldWarps];
     __shared__ float best_value[kFoldWarps];
@@ -1485,8 +1600,11 @@ draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat1
             }
             const float bias = round_bf16(__fadd_rn(bf(fold_bias[n]), mine));
             const float total = round_bf16(__fadd_rn(bf(base[n]), bias));
-            const float logit = step_logit(total, softcap);
-            sum += __expf(logit - softcap);
+            float logit = total;
+            if constexpr (kCapped) {
+                logit = step_logit(total, softcap);
+                sum += __expf(logit - softcap);
+            }
             const int32_t token = map != nullptr ? map[n] : n;
             if (better(logit, token, value, index)) {
                 value = logit;
@@ -1496,6 +1614,37 @@ draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat1
     }
     block_partial_sum(sum, warp_sums, partial_sum);
     fold_partial(value, index, best_value, best_index, partial_value, partial_index);
+}
+
+}  // namespace
+
+// One Markov step's logits and the first pass of their argmax over head rows that are
+// FP8, a shortlist, or both: row n's fold product is sum_j w[n, j] latent[j], times
+// scale[n] when the weights are E4M3 (`scale` not null), else BF16. Then logit =
+// bf16(cap tanh(bf16(base[n] + bf16(fold_bias[n] + acc)) / cap)). The rows are
+// `rows` or, with `count` not null, *count; row n stands for token map[n], or n without
+// a map. Each block writes its best (value, token) pair and its sum of exp(logit - cap)
+// to the partials.
+extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
+draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat16* fold_bias,
+                      const __nv_bfloat16* base, const float* latent, int32_t rows,
+                      const int32_t* count, const int32_t* map, float softcap,
+                      float* partial_value, int32_t* partial_index, float* partial_sum) {
+    fold_any<true>(weight, scale, fold_bias, base, latent, rows, count, map, softcap,
+                   partial_value, partial_index, partial_sum);
+}
+
+// draft_markov_fold_any without the softcap, for a head whose argmax reads the uncapped
+// logits (the 2DSD runner's DSpark drafts): logit = bf16(base[n] + bf16(fold_bias[n] +
+// acc)). The softcap is monotone, but in BF16 it maps neighbouring logits to one value,
+// which changes the first-index tie-break. The partial sums are zero.
+extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
+draft_markov_fold_raw(const void* weight, const float* scale, const __nv_bfloat16* fold_bias,
+                      const __nv_bfloat16* base, const float* latent, int32_t rows,
+                      const int32_t* count, const int32_t* map, float* partial_value,
+                      int32_t* partial_index, float* partial_sum) {
+    fold_any<false>(weight, scale, fold_bias, base, latent, rows, count, map, 1.f,
+                    partial_value, partial_index, partial_sum);
 }
 
 // ---------------------------------------------------------------------------------------

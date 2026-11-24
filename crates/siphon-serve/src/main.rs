@@ -12,7 +12,10 @@ use serde_json::json;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context 65536] [--weights fp8|bf16] [--kv fp8|bf16] [--queue 8] \
-                     [--widths 1,2,...,8] [--name inkling-2-mini]
+                     [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast]
+--drafter runs a DFlash draft exported by the 2DSD project instead of the bundled draft.
+--draft picks the draft's approximations as bench does: fast, exact, or a +-joined set of
+fp8-backbone, fp8-head, fp8-fold and shortlist.
 Set SIPHON_API_KEY to require `Authorization: Bearer <key>` on /v1 routes.";
 
 /// The prompt that prices the verify widths at startup.
@@ -37,6 +40,8 @@ fn args() -> anyhow::Result<Args> {
     let mut fp8_kv = true;
     let mut queue = 8;
     let mut widths: Vec<usize> = (1..=8).collect();
+    let mut drafter = None;
+    let mut draft = "fast".to_owned();
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -51,6 +56,8 @@ fn args() -> anyhow::Result<Args> {
             "--weights" => fp8_weights = fp8(&value()?)?,
             "--kv" => fp8_kv = fp8(&value()?)?,
             "--queue" => queue = value()?.parse()?,
+            "--drafter" => drafter = Some(PathBuf::from(value()?)),
+            "--draft" => draft = value()?,
             "--widths" => {
                 widths = value()?
                     .split(',')
@@ -81,6 +88,8 @@ fn args() -> anyhow::Result<Args> {
             fp8_kv,
             widths,
             queue,
+            drafter,
+            draft,
         },
         model_dir,
         address,

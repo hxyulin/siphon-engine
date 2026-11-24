@@ -318,6 +318,8 @@ pub struct Model {
     verify_graphs: Vec<Option<StepGraph>>,
     /// Rows of the last verify.
     verify_rows: usize,
+    /// The feature taps that prefill with taps and verify record for the draft.
+    tap_layout: crate::ops::spec::TapLayout,
 }
 
 /// Everything a step reads but does not change.
@@ -470,6 +472,7 @@ impl Model {
             verify: None,
             verify_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
             verify_rows: 0,
+            tap_layout: crate::ops::spec::TapLayout::stock(),
         })
     }
 
@@ -487,6 +490,36 @@ impl Model {
         self.verify = None;
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
         self.reset()
+    }
+
+    /// The feature taps that [`Model::prefill_with_taps`] and verify passes record for the
+    /// draft: by default the bundled draft's ([`crate::ops::spec::TapLayout::stock`]).
+    #[must_use]
+    pub fn tap_layout(&self) -> &crate::ops::spec::TapLayout {
+        &self.tap_layout
+    }
+
+    /// Records the taps of `layout` from now on. Drops the verify buffers and graphs when
+    /// the layout changes, since they hold the old taps.
+    pub fn set_tap_layout(&mut self, layout: crate::ops::spec::TapLayout) -> anyhow::Result<()> {
+        let visits = self.visits.len();
+        ensure!(
+            !layout.is_empty() && layout.len() <= crate::ops::spec::MAX_TAPS,
+            "{} taps, expected 1 to {}",
+            layout.len(),
+            crate::ops::spec::MAX_TAPS
+        );
+        ensure!(
+            layout.visits.iter().all(|&v| v < visits),
+            "tap visits {:?} reach past the {visits} visits",
+            layout.visits
+        );
+        if layout != self.tap_layout {
+            self.tap_layout = layout;
+            self.verify = None;
+            self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        }
+        Ok(())
     }
 
     #[must_use]

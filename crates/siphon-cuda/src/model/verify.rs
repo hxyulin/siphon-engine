@@ -28,7 +28,7 @@ use half::bf16;
 use super::{Model, PrefillLogits, StepGraph, VisitState, prefill::PrefillScratch, zeros};
 use crate::ops::{
     attention::KvData,
-    spec::{RESULT_LEN, STATE_ROWS, STREAM_DIMS, STREAMS, TAPS, VERIFY_ROWS, VISIT_CHANNELS},
+    spec::{RESULT_LEN, STATE_ROWS, STREAM_DIMS, STREAMS, VERIFY_ROWS, VISIT_CHANNELS},
 };
 
 /// Where the tokens of a verify come from.
@@ -311,11 +311,13 @@ impl Model {
         Ok(self.ctx.stream.clone_dtoh(&p.head_capped.slice(..n))?)
     }
 
-    /// The feature taps of the last verify's rows, BF16 `[rows, 4, 2304]`, for the draft.
+    /// The feature taps of the last verify's rows, BF16 `[rows, taps, 2304]` in the order
+    /// of [`Model::tap_layout`], for the draft.
     pub fn verify_taps(&self) -> anyhow::Result<CudaView<'_, bf16>> {
         let p = self.verify.as_ref().context("no verify has run")?;
         let taps = p.taps.as_ref().context("the taps buffer is missing")?;
-        Ok(taps.slice(..self.verify_rows * TAPS * self.ctx.hidden()))
+        let row_len = p.tap_layout.len() * self.ctx.hidden();
+        Ok(taps.slice(..self.verify_rows * row_len))
     }
 
     fn ensure_verify(&mut self) -> anyhow::Result<()> {
@@ -326,7 +328,11 @@ impl Model {
         let mut p =
             PrefillScratch::new(stream, &self.ctx.config, self.max_blocks, VERIFY_ROWS, true)?;
         p.record_taps = true;
-        p.taps = Some(zeros(stream, VERIFY_ROWS * TAPS * self.ctx.hidden())?);
+        p.tap_layout = self.tap_layout.clone();
+        p.taps = Some(zeros(
+            stream,
+            VERIFY_ROWS * p.tap_layout.len() * self.ctx.hidden(),
+        )?);
         p.verify = Some(VerifyBuffers::new(stream, &self.visits)?);
         self.verify = Some(p);
         Ok(())

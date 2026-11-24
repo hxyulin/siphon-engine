@@ -30,11 +30,11 @@ use siphon::Checkpoint;
 use crate::{
     draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
     model::{Accept, Model, PrefillLogits, SavedState, VerifyTokens},
-    ops::{
-        linear::Linear,
-        spec::{TAPS, VERIFY_ROWS},
+    ops::{linear::Linear, spec::VERIFY_ROWS},
+    weights::{
+        dflash::DflashWeights,
+        draft::{DraftWeights, HIDDEN},
     },
-    weights::draft::{DraftWeights, HIDDEN},
 };
 
 /// Prompt rows whose taps [`Speculator::restart`] commits again: the slots of the draft's
@@ -226,8 +226,58 @@ pub struct Speculator {
     tail: CudaSlice<bf16>,
     spare: CudaSlice<bf16>,
     tail_rows: usize,
+    /// Elements of one position's taps.
+    row_len: usize,
     prompt_len: usize,
     stats: SpecStats,
+}
+
+/// Which draft a [`Speculator`] runs.
+#[derive(Clone, Copy, Debug)]
+pub enum DraftSource<'a> {
+    /// The DSpark draft bundled with the checkpoint (`mtp.safetensors`).
+    Bundled,
+    /// A DFlash draft with DSpark heads exported by the 2DSD project, in this directory
+    /// (see [`DflashWeights`]).
+    Dflash(&'a std::path::Path),
+}
+
+/// Loads the draft `source` names for `model`, with room for `capacity` positions and the
+/// approximations in `options`, and makes the model record the draft's taps.
+pub fn load_draft(
+    model: &mut Model,
+    checkpoint: &Checkpoint,
+    source: DraftSource<'_>,
+    capacity: usize,
+    options: &DraftOptions,
+) -> anyhow::Result<Draft> {
+    let stream = Arc::clone(model.stream());
+    let draft = match source {
+        DraftSource::Bundled => {
+            let weights = DraftWeights::load(checkpoint, model.config(), &stream)?;
+            Draft::with_options(
+                &stream,
+                model.config(),
+                weights,
+                model.draft_shared(),
+                capacity + STEPS + 1,
+                options,
+            )?
+        }
+        DraftSource::Dflash(dir) => {
+            let weights = DflashWeights::load(dir, model.config(), &stream)?;
+            Draft::dflash(
+                &stream,
+                model.config(),
+                weights,
+                model.draft_shared(),
+                capacity + STEPS + 1,
+                options,
+            )?
+        }
+    };
+    model.set_tap_layout(draft.tap_layout())?;
+    Ok(draft)
 }
 
 impl Speculator {
@@ -268,14 +318,29 @@ impl Speculator {
             capacity + STEPS + 1,
             options,
         )?;
+        Self::with_draft(model, draft, width)
+    }
+
+    /// A speculator around `draft` (see [`load_draft`]), whose taps `model` must record.
+    pub fn with_draft(model: &Model, draft: Draft, width: Width) -> anyhow::Result<Self> {
+        width.check()?;
+        ensure!(
+            *model.tap_layout() == draft.tap_layout(),
+            "the model records taps {:?}, the draft reads {:?}",
+            model.tap_layout(),
+            draft.tap_layout()
+        );
+        let stream = model.stream();
+        let row_len = draft.tap_layout().len() * HIDDEN;
         Ok(Self {
             draft,
             linear: Linear::load(stream.context())?,
             width,
             random: stream.alloc_zeros(STEPS)?,
-            tail: stream.alloc_zeros(TAIL * TAPS * HIDDEN)?,
-            spare: stream.alloc_zeros(TAIL * TAPS * HIDDEN)?,
+            tail: stream.alloc_zeros(TAIL * row_len)?,
+            spare: stream.alloc_zeros(TAIL * row_len)?,
             tail_rows: 0,
+            row_len,
             prompt_len: 0,
             stats: SpecStats::default(),
         })
@@ -329,9 +394,10 @@ impl Speculator {
             tail,
             spare,
             tail_rows,
+            row_len,
             ..
         } = self;
-        let row = TAPS * HIDDEN;
+        let row = *row_len;
         let mut commit = |start: usize, taps: CudaView<'_, bf16>| {
             draft.commit(&stream, linear, &taps, start)?;
             // Keep the last TAIL rows: the newest of the old tail, then this chunk's.
@@ -373,7 +439,7 @@ impl Speculator {
             self.prompt_len
         );
         let stream = Arc::clone(model.stream());
-        let row = TAPS * HIDDEN;
+        let row = self.row_len;
         self.draft.commit(
             &stream,
             &self.linear,

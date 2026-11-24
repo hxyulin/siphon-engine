@@ -12,6 +12,7 @@ cudarc.workspace = true
 half.workspace = true
 siphon = { path = "../siphon" }
 safetensors.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 siphon = { path = "../siphon" }

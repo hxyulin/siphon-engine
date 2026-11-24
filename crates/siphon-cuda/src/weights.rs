@@ -27,6 +27,7 @@ use crate::ops::{
     linear_fp8::{Fp8Matrix, LinearFp8},
 };
 
+pub mod dflash;
 pub mod draft;
 
 /// Largest E2M1 value, from MLX-LM's `sanitize`.
