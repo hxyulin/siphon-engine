@@ -13,8 +13,9 @@
 //! `SIPHON_CAPTURE`). Each check runs at a position before the sliding-window wrap at
 //! 1024, at one whose rows cross it, and at 2500.
 //!
-//! - `taps_match_mlx` (test A) compares the prefill taps with the MLX capture of
-//!   `reference/capture.py --taps` in `SIPHON_TAPS`.
+//! - `taps_match_mlx` (test A) compares the taps of prefill, and of plain steps
+//!   (`Model::step_with_taps`) for the last positions against the prefill's there, with
+//!   the MLX capture of `reference/capture.py --taps` in `SIPHON_TAPS`.
 //! - `verify_matches_stepping` (test B): a verify of m rows against m steps, within the
 //!   tolerances of `tests/prefill.rs`.
 //! - `rollback_matches_shorter_verify` (test C): a verify of 8 rows whose rows after `a`
@@ -191,52 +192,92 @@ fn taps_match_mlx() -> anyhow::Result<()> {
     ensure!(want.len() == tokens.len() * 4 * hidden, "taps shape");
 
     let (gpu, mut model) = load(tokens.len() + 16)?;
-    let mut got = vec![0f32; want.len()];
     let stream = gpu.stream().clone();
-    let mut copy = |start: usize, taps: cudarc::driver::CudaView<'_, bf16>| {
+    let copy_into = |got: &mut [f32], start: usize, taps: cudarc::driver::CudaView<'_, bf16>| {
         let host = stream.clone_dtoh(&taps)?;
         for (dst, v) in got[start * 4 * hidden..].iter_mut().zip(host) {
             *dst = v.to_f32();
         }
-        Ok(())
+        anyhow::Ok(())
     };
     // MLX ran the text in chunks of 512.
-    model.prefill_with_taps(&tokens, 512, PrefillLogits::Last, &mut copy)?;
-
-    // Per tap: relative RMS error and the worst position's cosine similarity.
-    let mut worst_error = 0.0f64;
-    for tap in 0..4 {
-        let (mut want_tap, mut got_tap) = (Vec::new(), Vec::new());
-        let mut worst_cos = (1.0f64, 0);
-        for p in 0..tokens.len() {
-            let range = (p * 4 + tap) * hidden..(p * 4 + tap + 1) * hidden;
-            let (w, g) = (&want[range.clone()], &got[range]);
-            want_tap.extend_from_slice(w);
-            got_tap.extend_from_slice(g);
-            let dot: f64 = w
-                .iter()
-                .zip(g)
-                .map(|(a, b)| f64::from(*a) * f64::from(*b))
-                .sum();
-            let nw: f64 = w.iter().map(|a| f64::from(*a).powi(2)).sum();
-            let ng: f64 = g.iter().map(|a| f64::from(*a).powi(2)).sum();
-            let cos = dot / (nw.sqrt() * ng.sqrt()).max(f64::MIN_POSITIVE);
-            if cos < worst_cos.0 {
-                worst_cos = (cos, p);
-            }
-        }
-        let error = relative_error(&want_tap, &got_tap);
-        worst_error = worst_error.max(error);
-        println!(
-            "tap {tap}: relative RMS error {error:.3e}, worst position {} with cosine {:.6}",
-            worst_cos.1, worst_cos.0
-        );
+    let mut prefilled = vec![0f32; want.len()];
+    model.prefill_with_taps(&tokens, 512, PrefillLogits::Last, &mut |start, taps| {
+        copy_into(&mut prefilled, start, taps)
+    })?;
+    // Again with the last STEPPED positions as plain steps.
+    let split = tokens.len() - STEPPED;
+    let mut stepped = vec![0f32; want.len()];
+    model.reset()?;
+    model.prefill_with_taps(
+        &tokens[..split],
+        512,
+        PrefillLogits::Last,
+        &mut |start, taps| copy_into(&mut stepped, start, taps),
+    )?;
+    for (p, &token) in tokens.iter().enumerate().skip(split) {
+        model.step_with_taps(token)?;
+        copy_into(&mut stepped, p, model.step_taps()?)?;
     }
-    ensure!(
-        worst_error <= TAP_ERROR,
-        "a tap differs from MLX by {worst_error:.3e}"
-    );
+
+    // Per tap: the prefill's relative RMS error and worst cosine over every position, and
+    // over the stepped positions the steps' error against the prefill's there.
+    let mut failures = Vec::new();
+    for tap in 0..4 {
+        let (error, worst) = tap_error(&want, &prefilled, tap, 0..tokens.len());
+        println!(
+            "tap {tap}, prefill: relative RMS error {error:.3e}, worst position {} with cosine \
+             {:.6}",
+            worst.1, worst.0
+        );
+        if error > TAP_ERROR {
+            failures.push(format!("prefill tap {tap}: {error:.3e}"));
+        }
+        let (step_error, _) = tap_error(&want, &stepped, tap, split..tokens.len());
+        let (prefill_error, _) = tap_error(&want, &prefilled, tap, split..tokens.len());
+        println!(
+            "tap {tap}, last {STEPPED} positions: plain steps {step_error:.3e}, prefill \
+             {prefill_error:.3e}"
+        );
+        if step_error > STEP_TAP_RATIO * prefill_error.max(TAP_FLOOR) {
+            failures.push(format!(
+                "stepped tap {tap}: {step_error:.3e} against prefill {prefill_error:.3e}"
+            ));
+        }
+    }
+    ensure!(failures.is_empty(), "taps differ from MLX: {failures:?}");
     Ok(())
+}
+
+/// The relative RMS error of tap `tap` of `got` against `want` over `positions`, and the
+/// worst position's cosine similarity and position.
+fn tap_error(
+    want: &[f32],
+    got: &[f32],
+    tap: usize,
+    positions: std::ops::Range<usize>,
+) -> (f64, (f64, usize)) {
+    let hidden = 2304;
+    let (mut want_tap, mut got_tap) = (Vec::new(), Vec::new());
+    let mut worst = (1.0f64, 0);
+    for p in positions {
+        let range = (p * 4 + tap) * hidden..(p * 4 + tap + 1) * hidden;
+        let (w, g) = (&want[range.clone()], &got[range]);
+        want_tap.extend_from_slice(w);
+        got_tap.extend_from_slice(g);
+        let dot: f64 = w
+            .iter()
+            .zip(g)
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        let nw: f64 = w.iter().map(|a| f64::from(*a).powi(2)).sum();
+        let ng: f64 = g.iter().map(|a| f64::from(*a).powi(2)).sum();
+        let cos = dot / (nw.sqrt() * ng.sqrt()).max(f64::MIN_POSITIVE);
+        if cos < worst.0 {
+            worst = (cos, p);
+        }
+    }
+    (relative_error(&want_tap, &got_tap), worst)
 }
 
 /// Largest relative RMS error of a tap against MLX's chunked capture. Engine prefill and
@@ -244,6 +285,14 @@ fn taps_match_mlx() -> anyhow::Result<()> {
 /// (tap 2), where `tests/prefill.rs` sees relative state errors of about 0.2 against
 /// stepping.
 const TAP_ERROR: f64 = 0.25;
+/// Positions at the end of the text that test A runs again as plain steps.
+const STEPPED: usize = 32;
+/// How far the plain steps' taps may differ from MLX, as a multiple of the prefill's
+/// error at the same positions (at least [`TAP_FLOOR`]). Decode sums in other orders than
+/// prefill, and the loop amplifies the difference as it does prefill's: on `anyhow` the
+/// steps' error was 0.49 to 1.09 times the prefill's, tap 2 the highest at 0.257.
+const STEP_TAP_RATIO: f64 = 1.5;
+const TAP_FLOOR: f64 = 0.01;
 
 #[test]
 #[ignore = "needs the checkpoint (SIPHON_MODEL) and about 20 GB of GPU memory"]

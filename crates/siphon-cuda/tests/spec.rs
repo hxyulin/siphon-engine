@@ -14,9 +14,12 @@
 //!   and with an adaptive width over every width from 1 to 8 must emit the tokens of
 //!   verifying one row at a time, every one. The test also prints the acceptance and how
 //!   many leading tokens agree with plain `Model::step` decoding, which sums in other
-//!   orders, without a pass criterion.
+//!   orders, without a pass criterion. An adaptive width that also falls back to plain
+//!   steps must emit the tokens of the same path one token at a time: a plain step for
+//!   each token it stepped, a verify of one row for the others (`greedy_by_path`).
 //! - `random_drafts_change_nothing` (test B): the same with uniformly random drafts at
-//!   k = 3 and with widths cycling from 1 to 8; the target almost never accepts them.
+//!   k = 3, with widths cycling from 1 to 8, and with widths and runs of plain steps
+//!   cycling; the target almost never accepts them.
 //! - `dflash_speculation_is_exact` (test C): test A's widths with the drafter in
 //!   `SIPHON_DFLASH`: an export of the 2DSD project (see `DflashWeights`, with its research
 //!   checkpoint) or Inco AI's DFlash 2 drafter (see `Dflash2Weights`, with the official
@@ -35,8 +38,11 @@ use siphon::{Checkpoint, TextConfig};
 use siphon_cuda::{
     Gpu,
     draft::DraftOptions,
-    model::Model,
-    spec::{DraftSource, Drafts, Speculator, Width, WidthPolicy, greedy_by_verify, load_draft},
+    model::{Model, SavedState},
+    spec::{
+        DraftSource, Drafts, Plain, Speculator, Width, WidthPolicy, greedy_by_path,
+        greedy_by_verify, load_draft,
+    },
     weights::Weights,
 };
 
@@ -96,6 +102,48 @@ fn every_width() -> anyhow::Result<Width> {
     )?))
 }
 
+/// [`every_width`] that also falls back to plain steps of 3.5 ms with a 0.5 ms draft
+/// round after each run: a run of one step wins over width 2 below a first confidence of
+/// 0.75 and over width 8 below 2.5 tokens.
+fn with_fallback() -> anyhow::Result<Width> {
+    let Width::Adaptive(policy) = every_width()? else {
+        unreachable!("every_width is adaptive")
+    };
+    Ok(Width::Adaptive(policy.with_plain(Some(Plain {
+        step_ms: 3.5,
+        probe_ms: 0.5,
+    }))?))
+}
+
+/// Prints how many leading tokens of `want`, the verify path's, agree with plain
+/// `Model::step` decoding from `saved`.
+fn compare_with_step(
+    model: &mut Model,
+    saved: &SavedState,
+    first: u32,
+    want: &[u32],
+    text: &str,
+) -> anyhow::Result<()> {
+    model.restore_state(saved)?;
+    let mut token = first;
+    let mut stepped = Vec::with_capacity(GENERATED);
+    for _ in 0..GENERATED {
+        token = model.step(token, None)?;
+        stepped.push(token);
+    }
+    let agree = want
+        .iter()
+        .zip(&stepped)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let same = want.iter().zip(&stepped).filter(|(a, b)| a == b).count();
+    println!(
+        "{text}: verify-path greedy against Model::step: first {agree} of {GENERATED} agree, \
+         {same} positions equal"
+    );
+    Ok(())
+}
+
 /// Runs every text: the reference, then each `(width, drafts)` from the same state, and
 /// checks that each emits the reference's tokens. `dflash` replaces the bundled draft.
 fn check(runs: &[(Width, Drafts)], with_step: bool, dflash: Option<&Path>) -> anyhow::Result<()> {
@@ -123,29 +171,15 @@ fn check(runs: &[(Width, Drafts)], with_step: bool, dflash: Option<&Path>) -> an
         }
     };
     let mut failures = Vec::new();
+    // Plain steps and verify rounds of the runs that may fall back, over every text.
+    let mut mixed = (0, 0);
     for (text, prompt) in TEXTS.iter().zip(&prompts) {
         model.reset()?;
         let first = speculator.prefill(&mut model, prompt, 2048)?;
         let saved = model.save_state()?;
         let want = greedy_by_verify(&mut model, first, GENERATED)?;
         if with_step {
-            model.restore_state(&saved)?;
-            let mut token = first;
-            let mut stepped = Vec::with_capacity(GENERATED);
-            for _ in 0..GENERATED {
-                token = model.step(token, None)?;
-                stepped.push(token);
-            }
-            let agree = want
-                .iter()
-                .zip(&stepped)
-                .take_while(|(a, b)| a == b)
-                .count();
-            let same = want.iter().zip(&stepped).filter(|(a, b)| a == b).count();
-            println!(
-                "{text}: verify-path greedy against Model::step: first {agree} of {GENERATED} \
-                 agree, {same} positions equal"
-            );
+            compare_with_step(&mut model, &saved, first, &want, text)?;
         }
         for (width, drafts) in runs {
             let drafts = *drafts;
@@ -153,7 +187,16 @@ fn check(runs: &[(Width, Drafts)], with_step: bool, dflash: Option<&Path>) -> an
             speculator.set_width(width.clone())?;
             speculator.restart(&mut model, first)?;
             let got = speculator.generate(&mut model, GENERATED, drafts)?;
-            let stats = speculator.stats();
+            let stats = speculator.stats().clone();
+            // A run that stepped follows its own path; the others follow the verify's.
+            let path;
+            let want = if stats.stepped.is_empty() {
+                &want
+            } else {
+                model.restore_state(&saved)?;
+                path = greedy_by_path(&mut model, first, got.len(), &stats.stepped)?;
+                &path
+            };
             let agree = want.iter().zip(&got).take_while(|(a, b)| a == b).count();
             let acceptance: Vec<String> = stats
                 .acceptance()
@@ -162,22 +205,39 @@ fn check(runs: &[(Width, Drafts)], with_step: bool, dflash: Option<&Path>) -> an
                 .collect();
             let name = match width {
                 Width::Fixed(k) => format!("k = {k}"),
+                Width::Adaptive(p) if p.plain().is_some() => "adaptive, fallback".to_owned(),
                 Width::Adaptive(_) => "adaptive".to_owned(),
             };
             println!(
                 "{text}, {name}, {drafts:?}: {agree} of {GENERATED} tokens match, {} rounds, \
-                 {:.3} tokens per round, rounds by width {:?}, acceptance by position [{}]",
+                 {:.3} tokens per round, rounds by width {:?}, {} plain steps, {} probes, \
+                 acceptance by position [{}]",
                 stats.rounds,
                 stats.tokens_per_round(),
                 stats.widths,
+                stats.stepped.len(),
+                stats.probes,
                 acceptance.join(", ")
             );
+            if matches!(width, Width::Adaptive(p) if p.plain().is_some()) {
+                mixed.0 += stats.stepped.len();
+                mixed.1 += stats.rounds;
+            }
             if agree < GENERATED {
                 failures.push(format!(
                     "{text} {name} {drafts:?}: first mismatch at {agree}"
                 ));
             }
         }
+    }
+    let falls_back = runs
+        .iter()
+        .any(|(w, _)| matches!(w, Width::Adaptive(p) if p.plain().is_some()));
+    if falls_back && (mixed.0 == 0 || mixed.1 == 0) {
+        failures.push(format!(
+            "the fallback runs took {} plain steps and {} rounds, expected both",
+            mixed.0, mixed.1
+        ));
     }
     ensure!(
         failures.is_empty(),
@@ -195,6 +255,7 @@ fn speculation_is_exact() -> anyhow::Result<()> {
             (Width::Fixed(3), Drafts::Dspark),
             (Width::Fixed(7), Drafts::Dspark),
             (every_width()?, Drafts::Dspark),
+            (with_fallback()?, Drafts::Dspark),
         ],
         true,
         None,
@@ -208,6 +269,7 @@ fn random_drafts_change_nothing() -> anyhow::Result<()> {
         &[
             (Width::Fixed(3), Drafts::Random(0x5eed)),
             (every_width()?, Drafts::Random(0x5eed)),
+            (with_fallback()?, Drafts::Random(0x5eed)),
         ],
         false,
         None,
@@ -225,6 +287,7 @@ fn dflash_speculation_is_exact() -> anyhow::Result<()> {
             (Width::Fixed(3), Drafts::Dspark),
             (Width::Fixed(7), Drafts::Dspark),
             (every_width()?, Drafts::Dspark),
+            (with_fallback()?, Drafts::Dspark),
         ],
         false,
         Some(&dir),

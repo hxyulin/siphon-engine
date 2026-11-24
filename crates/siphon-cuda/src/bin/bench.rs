@@ -28,6 +28,7 @@
 //!        bench <model-dir> --prompt <capture> --spec K|auto [--widths 2,4,8]
 //!        [--draft SPEC] [--shortlist FILE] [--sweep FILE] [--contexts 0,32768]
 //!        [--steps N] [--weights bf16|fp8] [--kv bf16|fp8] [--drafter DIR]
+//!        [--fallback]
 //!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
 //!
 //! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
@@ -37,12 +38,12 @@
 //! and reports both rates, the rounds, tokens per round, per-position acceptance and the
 //! split of a round between verify, draft and host. `--spec auto` picks each round's
 //! width from the drafts' confidences (`WidthPolicy`), among `--widths` (default 1 to
-//! 8), priced by verify passes of each width timed at that context first. `--draft`
-//! takes a variant of the draft as `dspark` does: `fast` (the default, the three FP8
-//! approximations and the shortlist), `fp8` (no shortlist), `exact`, or a `+`-joined set
-//! of `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`. The shortlist ranks tokens by
-//! `draft::counted_ranking` unless `--shortlist` names a ranking file (with `fp8`, the
-//! file adds the shortlist).
+//! 8), priced by verify passes of each width timed at that context first. With
+//! `--fallback` it also runs plain steps when no width is expected to be faster. `--draft` takes a variant of the draft as `dspark` does: `fast` (the
+//! default, the three FP8 approximations and the shortlist), `fp8` (no shortlist),
+//! `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and
+//! `shortlist`. The shortlist ranks tokens by `draft::counted_ranking` unless
+//! `--shortlist` names a ranking file (with `fp8`, the file adds the shortlist).
 //! `--drafter DIR` runs the drafter in DIR instead of the bundled draft, with the same
 //! variants: Inco AI's DFlash 2 drafter (`Dflash2Weights`) or a DFlash draft with DSpark
 //! heads exported by the 2DSD project (`DflashWeights`), told apart by its `config.json`.
@@ -124,6 +125,8 @@ mod linux {
         /// Where `--spec` writes the sweep, if anywhere.
         sweep: Option<PathBuf>,
         verify_widths: bool,
+        /// Whether `--spec auto` falls back to plain steps.
+        fallback: bool,
     }
 
     fn token_counts(arg: &str, value: &str) -> anyhow::Result<Vec<usize>> {
@@ -154,6 +157,7 @@ mod linux {
         let mut drafter = None;
         let mut sweep = None;
         let mut verify_widths = false;
+        let mut fallback = false;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             let mut value = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -179,6 +183,7 @@ mod linux {
                 "--drafter" => drafter = Some(PathBuf::from(value()?)),
                 "--sweep" => sweep = Some(PathBuf::from(value()?)),
                 "--verify-widths" => verify_widths = true,
+                "--fallback" => fallback = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -215,6 +220,7 @@ mod linux {
             drafter,
             sweep,
             verify_widths,
+            fallback,
         })
     }
 
@@ -842,8 +848,9 @@ mod linux {
             Ok(())
         }
 
-        /// Prices an adaptive width at the state `saved` (see [`price`]) and returns the
-        /// label of the speculator's width.
+        /// Prices an adaptive width at the state `saved` (see [`price`]), with the plain
+        /// fallback if `fallback`, and returns the label of the speculator's
+        /// width.
         fn set_price(
             model: &mut Model,
             speculator: &mut Speculator,
@@ -851,22 +858,33 @@ mod linux {
             rows: &[u32],
             first: u32,
             context: usize,
+            fallback: bool,
         ) -> anyhow::Result<String> {
             Ok(match speculator.width().clone() {
-                Width::Adaptive(policy) => {
-                    let round_ms = price(model, speculator, saved, rows, first)?;
+                Width::Adaptive(_) => {
+                    let mut policy = price(model, speculator, saved, rows, first)?;
                     let priced = policy
                         .widths()
                         .iter()
-                        .map(|&w| format!("{w}: {:.3}", round_ms[w - 1]))
+                        .map(|&w| format!("{w}: {:.3}", policy.round_ms()[w - 1]))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    println!("round ms by width at context {context}: {priced}");
-                    speculator.set_width(Width::Adaptive(WidthPolicy::new(
+                    println!(
+                        "round ms by width at context {context}: {priced}; plain step {:.3}, \
+                         probe {:.3}",
+                        policy.plain().map_or(f64::NAN, |p| p.step_ms),
+                        policy.plain().map_or(f64::NAN, |p| p.probe_ms)
+                    );
+                    if !fallback {
+                        policy = policy.with_plain(None)?;
+                    }
+                    let label = format!(
+                        "auto {:?}{}",
                         policy.widths(),
-                        round_ms,
-                    )?))?;
-                    format!("auto {:?}", policy.widths())
+                        if fallback { ", fallback" } else { "" }
+                    );
+                    speculator.set_width(Width::Adaptive(policy))?;
+                    label
                 }
                 Width::Fixed(k) => format!("k = {k}"),
             })
@@ -922,7 +940,15 @@ mod linux {
                 model.reset()?;
                 let first = speculator.prefill(model, &prompt, DEFAULT_PREFILL_CHUNK)?;
                 let saved = model.save_state()?;
-                let label = set_price(model, speculator, &saved, rows, first, prompt.len())?;
+                let label = set_price(
+                    model,
+                    speculator,
+                    &saved,
+                    rows,
+                    first,
+                    prompt.len(),
+                    args.fallback,
+                )?;
 
                 // Plain decode from the same state.
                 let mut plain = Vec::with_capacity(steps);
@@ -982,8 +1008,15 @@ mod linux {
                 );
                 println!("  rounds by width 1 to 8: {:?}", stats.widths);
                 println!(
+                    "  plain steps: {} of {} tokens, {} probes, {:.3} ms per step",
+                    stats.stepped.len(),
+                    stats.emitted,
+                    stats.probes,
+                    stats.plain.as_secs_f64() * 1e3 / stats.stepped.len().max(1) as f64
+                );
+                println!(
                     "  per round: {:.3} ms = verify {:.3} + draft {:.3} + host {:.3}",
-                    per_round(stats.wall),
+                    per_round(stats.wall.saturating_sub(stats.plain)),
                     per_round(stats.verify),
                     per_round(stats.draft),
                     per_round(stats.host())

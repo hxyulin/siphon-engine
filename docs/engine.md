@@ -256,7 +256,7 @@ The policy was chosen by simulation over sweeps (`bench --spec K --sweep FILE`),
 | Most expected tokens per ms, widths 1 to 8 (`WidthPolicy`) | 441 | 698 |
 | Oracle: the width of the accepted run | 489 | 765 |
 
-Thresholds from 0.5 to 0.7 and the cost rule land within 2% of each other; the cost rule keeps that place when the verify cost per row changes, without retuning. Widths 2, 4 and 8 alone lose about 1.5%. The policy can pick width 1, a verify of one row, but plain `Model::step` decoding cannot stand in for it: decode sums in other orders than the verify path, so the output would depend on the policy.
+Thresholds from 0.5 to 0.7 and the cost rule land within 2% of each other; the cost rule keeps that place when the verify cost per row changes, without retuning. Widths 2, 4 and 8 alone lose about 1.5%. The policy can pick width 1, a verify of one row, which a plain step and a draft round beat (below).
 
 A round emits the kept drafts and the target's greedy token after them. `Model::prefill_with_taps` records the draft's taps of every prompt row, so the draft's cache covers the prompt.
 
@@ -288,7 +288,7 @@ None of these changes a result: the verify logits stay the same bit for bit, whi
 
 The verify pass computes the same model as `Model::step` but sums in other orders, so the two greedy outputs split at the first near-tie: after 247 to 817 of 1024 tokens on the three texts.
 
-`tests/verify.rs` checks the taps against MLX, a verify against stepping, the rollback against a shorter verify (bit for bit), the ring size, and row invariance. `tests/spec.rs` checks exactness with the draft at k = 1, 3 and 7 and at an adaptive width priced so that every width from 1 to 8 gets picked, and with random drafts at k = 3 and at widths cycling from 1 to 8, 1024 tokens after each text. Both need the checkpoint:
+`tests/verify.rs` checks the taps of prefill and of plain steps against MLX, a verify against stepping, the rollback against a shorter verify (bit for bit), the ring size, and row invariance. `tests/spec.rs` checks exactness with the draft at k = 1, 3 and 7 and at an adaptive width priced so that every width from 1 to 8 gets picked, and with random drafts at k = 3 and at widths cycling from 1 to 8, 1024 tokens after each text. The same adaptive width with plain prices, with the draft and with random drafts, must equal `greedy_by_path` along its own path. Both need the checkpoint:
 
 ```sh
 SIPHON_MODEL=<model-dir> SIPHON_TAPS=reference/out/regex-readme-taps.safetensors \
@@ -364,7 +364,65 @@ The same runs before and after the attention, router and visit-end changes above
 | `regex-readme`, 2,286 | BF16 | 256 | 379 | 407 (1.59x) | 3.37, 5.72 |
 | `regex-readme`, 32,768 | BF16 | 210 | 288 | 323 (1.54x) | 2.87, 5.24 |
 
-The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At low acceptance the policy verifies 2 to 4 rows; it cannot fall back to plain decode, whose output differs from the verify path's.
+The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At low acceptance the policy verifies 2 to 4 rows. With `--fallback` it falls back to plain steps on free prose (see below).
+
+### Falling back to plain steps
+
+On free prose the draft is wrong too often for any width to pay: a round of one row takes 4.6 ms for one token, against 2.8 ms for a plain step. `price` also times a plain step and the draft round that follows a run of them, and the policy then falls back to plain steps (`WidthPolicy::with_plain`). It is off by default; `bench --spec auto --fallback` and `siphon-serve --fallback` turn it on (see below for why):
+
+1. `Model::step_with_taps` runs a step that also copies the draft's taps of its row, through its own CUDA graph. The copies are four `copy_tap` launches of one row each. A step takes 2.941 ms with them against 2.935 ms without at context 2,273, and 3.318 against 3.317 ms at 32,768.
+2. The speculator keeps each step's taps. After a run of steps the draft commits all of them at once (`Draft::commit`), notes the tokens for its shortlist, and runs its round from the new anchor. That probe costs a draft round: 0.55 ms with the bundled draft and 0.86 ms with DFlash 2 at short context.
+3. The policy picks a run of `r` plain steps when `r` steps and the probe after them, `r * step + probe` ms for `r` tokens, beat the best width's expected tokens per ms. A run starts at one step, since a step and a probe (3.3 ms) already beat a verify of one row (4.6 ms). It doubles while the probes keep choosing plain steps, up to 32, and starts again at one once a verify wins. Longer runs need a larger loss before the speculator leaves the verifies, which gives the switch its hysteresis.
+
+The fallback decides by calibrated confidences. On prose the bundled draft's confidences run high: with the raw confidences, the essay's verifies kept 2.18 tokens per round at about 6.5 ms, slower than plain steps, and the essay ran at 329 tok/s against 355 for plain decode (before the counted shortlist, whose base ran it at 307). The speculator counts, for each tenth of the confidence range, the drafts the target kept against those it verified in this generation. The plain-or-verify test uses each bin's share kept, starting from the confidence itself with a weight of 4 drafts. The width still comes from the raw confidences, so a round verifies what it would without the fallback. Variants that lost or tied, at 512 tokens:
+
+- A first run of 4 steps, and probes left out of the price, before the counted shortlist: the essay at 339 tok/s against 306 for its base, and chat with the bundled draft at 446 against 465.
+- One share of the expected drafts kept over the last 20 or so rounds: it stayed low after a stretch of new tokens, into the repetitive stretch after it, and runs of plain steps never brought it back up. Code with the bundled draft fell from 501 to 451 tok/s, also with the share decaying back during plain steps.
+- Choosing the width by the calibrated confidences too: within noise of the kept version (geometric mean +2.6% against +2.2% over the 16 runs below), with the essay at 378 tok/s instead of 356 but DFlash 2 slower on chat and the story.
+
+Plain steps sum in other orders than the verify pass, so a generation that falls back no longer equals `greedy_by_verify`. It equals greedy decoding along its own path, a plain step for each token it stepped and a verify of one row for each other token (`spec::greedy_by_path` and `SpecStats::stepped`). Where the fallback steps depends on the measured prices, so the same request can come out differently on two servers at a near-tie. With fixed widths, or without plain prices, the output equals `greedy_by_verify` as before.
+
+`bench --spec auto`, FP8 weights and cache, 512 tokens after each prompt, tok/s and tokens per verify round. The base is main before the fallback, which a run without `--fallback` matches; a generation that falls back drifts from the base's text at a near-tie after its first plain step, so each comparison after that point is on a different continuation of the same prompt:
+
+| Prompt, tokens | Plain decode | Bundled, base | Bundled, fallback | Plain steps, probes | DFlash 2, base | DFlash 2, fallback | Plain steps, probes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Essay, 34 | 355 | 331 (1.92) | 356 (2.39) | 292, 41 | 399 (2.55) | 414 (2.88) | 52, 21 |
+| Story, 42 | 356 | 317 (1.74) | 354 (2.29) | 363, 66 | 392 (2.37) | 418 (2.74) | 50, 32 |
+| Chat question, 30 | 357 | 491 (3.21) | 536 (3.84) | 28, 15 | 543 (3.98) | 588 (4.53) | 15, 9 |
+| Coding request, 40 | 356 | 501 (3.33) | 534 (3.71) | 27, 15 | 594 (4.23) | 546 (4.14) | 23, 15 |
+| Document question, 32,765 | 301 | 554 (4.79) | 560 (4.83) | 1, 1 | 376 (3.15) | 377 (3.14) | 19, 13 |
+| `anyhow`, 10,674 | 324 | 799 (6.67) | 785 (6.65) | 1, 1 | 783 (6.83) | 771 (6.82) | 1, 1 |
+| `half`, 2,273 | 340 | 726 (5.67) | 726 (5.78) | 2, 2 | 596 (4.85) | 605 (5.05) | 4, 3 |
+| `regex-readme`, 2,286 | 340 | 528 (3.63) | 486 (3.41) | 17, 15 | 534 (4.03) | 538 (4.08) | 3, 3 |
+
+The geometric mean over the 16 runs is 2.2% above the base. Where a run took few plain steps, its swing against the base comes mostly from the different continuation: `regex-readme` with the bundled draft took 17 plain steps and 15 probes, at most about 2.5% of its time, yet its verify rounds kept 3.41 tokens instead of 3.63. At 2,048 tokens the same cases come out:
+
+| Prompt, draft | Plain decode | Base | Fallback | Plain steps, probes |
+| --- | ---: | ---: | ---: | ---: |
+| `regex-readme`, bundled | 323 | 529 (5.17) | 659 (5.38) | 17, 15 |
+| Coding request, bundled | 347 | 635 (4.59) | 613 (5.42) | 132, 58 |
+| Coding request, DFlash 2 | 347 | 700 (5.40) | 687 (5.50) | 35, 26 |
+| Chat question, bundled | 348 | 439 (3.02) | 402 (2.94) | 298, 172 |
+| Essay, bundled | 347 | 357 (2.07) | 397 (3.22) | 1,063, 189 |
+
+Through `siphon-serve` (FP8 weights and cache, `--context 16384`), a request for a 1,200-word essay at reasoning effort low, job log lines:
+
+| Draft | Base | Fallback |
+| --- | --- | --- |
+| Bundled | 1,623 tokens in 5.27 s (307.8 tok/s, 1.78 tokens per round) | 1,430 tokens in 4.16 s (343.9 tok/s, 2.07 tokens per round, 846 plain steps, 167 probes) |
+| DFlash 2 | 1,623 tokens in 4.39 s (369.3 tok/s, 2.24 tokens per round) | 1,436 tokens in 3.72 s (385.6 tok/s, 2.62 tokens per round, 315 plain steps, 119 probes) |
+
+The fallback is opt-in for two reasons, measured on one build (FP8 weights and cache, 512 tokens). First, where it steps depends on the step and round times `price` measures at startup, so two runs of the same build can take different paths, and a different path can resolve a near-tie differently: the chat question took 54 plain steps in one run and 28 in the next. Second, it costs the coding request about 4% with both drafters, repeatably:
+
+| Prompt, draft | Fallback, two runs | Without |
+| --- | ---: | ---: |
+| Chat question, bundled | 514, 542 | 488 |
+| Chat question, DFlash 2 | 553, 573 | 550 |
+| Coding request, bundled | 477, 482 | 498 |
+| Coding request, DFlash 2 | 571, 572 | 594 |
+| `regex-readme`, bundled | 486, 535 | 528 |
+
+Fixed prices instead of measured ones would make the paths reproducible; the coding request's loss needs a better plain-or-verify test.
 
 ## Benchmarks and profiling
 

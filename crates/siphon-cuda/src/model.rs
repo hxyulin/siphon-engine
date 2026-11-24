@@ -308,6 +308,10 @@ pub struct Model {
     /// Rows of `scratch.blocks` a step can fill.
     max_blocks: usize,
     graph: Option<StepGraph>,
+    /// The step that also records the draft's taps ([`Model::step_with_taps`]), and its
+    /// taps, BF16 `[taps, hidden]`.
+    tap_graph: Option<StepGraph>,
+    step_taps: Option<CudaSlice<bf16>>,
     /// Position of the next token.
     position: usize,
     /// Buffers of [`Model::prefill`], allocated on its first call.
@@ -467,6 +471,8 @@ impl Model {
             scratch,
             max_blocks,
             graph: None,
+            tap_graph: None,
+            step_taps: None,
             position: 0,
             prefill: None,
             verify: None,
@@ -487,6 +493,7 @@ impl Model {
             }
         }
         self.graph = None;
+        self.tap_graph = None;
         self.verify = None;
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
         self.reset()
@@ -516,6 +523,8 @@ impl Model {
         );
         if layout != self.tap_layout {
             self.tap_layout = layout;
+            self.tap_graph = None;
+            self.step_taps = None;
             self.verify = None;
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
         }
@@ -684,6 +693,36 @@ impl Model {
     /// Runs one token and returns the greedy next token. Fills `trace` if given; otherwise
     /// replays the step's CUDA graph, capturing it first if needed.
     pub fn step(&mut self, token: u32, trace: Option<&mut Trace>) -> anyhow::Result<u32> {
+        self.run_step(token, trace, false)
+    }
+
+    /// [`Self::step`] that also records the token's feature taps for the draft, which
+    /// [`Self::step_taps`] returns until the next step. The taps are copies, so the step's
+    /// results equal [`Self::step`]'s.
+    pub fn step_with_taps(&mut self, token: u32) -> anyhow::Result<u32> {
+        if self.step_taps.is_none() {
+            let len = self.tap_layout.len() * self.ctx.hidden();
+            self.step_taps = Some(self.ctx.stream.alloc_zeros(len)?);
+        }
+        self.run_step(token, None, true)
+    }
+
+    /// The feature taps of the last [`Self::step_with_taps`], BF16 `[taps, 2304]` in the
+    /// order of [`Self::tap_layout`].
+    pub fn step_taps(&self) -> anyhow::Result<CudaView<'_, bf16>> {
+        Ok(self
+            .step_taps
+            .as_ref()
+            .context("no step recorded taps")?
+            .as_view())
+    }
+
+    fn run_step(
+        &mut self,
+        token: u32,
+        trace: Option<&mut Trace>,
+        taps: bool,
+    ) -> anyhow::Result<u32> {
         let position = self.position;
         ensure!(
             self.visits.iter().all(|v| v.kv.holds(position)),
@@ -698,13 +737,23 @@ impl Model {
         )?;
         if let Some(trace) = trace {
             *trace = Trace::default();
-            self.enqueue(Some(trace))?;
+            self.enqueue(Some(trace), false)?;
         } else {
-            if self.graph.is_none() {
-                self.graph = Some(self.capture()?);
+            let captured = if taps { &self.tap_graph } else { &self.graph };
+            if captured.is_none() {
+                let graph = self.capture(taps)?;
+                *(if taps {
+                    &mut self.tap_graph
+                } else {
+                    &mut self.graph
+                }) = Some(graph);
             }
-            let graph = self.graph.as_ref().context("the step graph is missing")?;
-            graph.0.launch()?;
+            let graph = if taps { &self.tap_graph } else { &self.graph };
+            graph
+                .as_ref()
+                .context("the step graph is missing")?
+                .0
+                .launch()?;
         }
         let next = stream.clone_dtoh(&self.scratch.next)?[0];
         self.position += 1;
@@ -712,10 +761,10 @@ impl Model {
     }
 
     /// Records the untraced step as a CUDA graph.
-    fn capture(&mut self) -> anyhow::Result<StepGraph> {
+    fn capture(&mut self, taps: bool) -> anyhow::Result<StepGraph> {
         let stream = Arc::clone(&self.ctx.stream);
         stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-        let enqueued = self.enqueue(None);
+        let enqueued = self.enqueue(None, taps);
         // End the capture even when enqueueing failed, so the stream is usable again.
         let graph = stream.end_capture(CUgraphInstantiate_flags(0));
         enqueued.context("capturing the decode step")?;
@@ -724,15 +773,21 @@ impl Model {
         Ok(StepGraph(graph))
     }
 
-    /// Enqueues one step on the stream, for the token and position already uploaded.
-    /// Synchronizes only to fill `trace`.
+    /// Enqueues one step on the stream, for the token and position already uploaded, and
+    /// copies the draft's taps into `step_taps` if `taps`. Synchronizes only to fill
+    /// `trace`.
     #[expect(
         clippy::too_many_lines,
         reason = "one step reads top to bottom like _run_loop"
     )]
-    fn enqueue(&mut self, mut trace: Option<&mut Trace>) -> anyhow::Result<()> {
+    fn enqueue(&mut self, mut trace: Option<&mut Trace>, taps: bool) -> anyhow::Result<()> {
         let ctx = &self.ctx;
         let s = &mut self.scratch;
+        let mut taps = StepTaps {
+            layout: &self.tap_layout,
+            taps: if taps { self.step_taps.as_mut() } else { None },
+            visit: 0,
+        };
         let cfg = &ctx.config;
         let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
         let hidden = ctx.hidden();
@@ -774,6 +829,7 @@ impl Model {
             ctx.prefetch_pace(plan[0].0.0),
         )?;
         for layer in 0..core_start {
+            taps.visit(ctx, &s.hidden)?;
             ctx.visit(
                 s,
                 next_visit()?,
@@ -822,6 +878,7 @@ impl Model {
                 blocks.len = prelude_blocks;
             }
             for (i, layer) in (core_start..core_end).enumerate() {
+                taps.visit(ctx, &s.hidden)?;
                 ctx.visit(
                     s,
                     next_visit()?,
@@ -836,6 +893,7 @@ impl Model {
             }
         }
         for layer in core_end..cfg.num_hidden_layers {
+            taps.visit(ctx, &s.hidden)?;
             ctx.visit(
                 s,
                 next_visit()?,
@@ -872,6 +930,7 @@ impl Model {
             },
             ctx.eps(),
         )?;
+        taps.final_hidden(ctx, &s.final_hidden)?;
         if let Some(lm_head) = &ctx.weights.lm_head_fp8 {
             ctx.kernels.linear_fp8.gemv(
                 &ctx.stream,
@@ -904,6 +963,44 @@ impl Model {
             t.logits = ctx.stream.clone_dtoh(&s.capped)?;
         }
         Ok(())
+    }
+}
+
+/// Where a step copies the draft's feature taps, as prefill and verify record them: the
+/// partial block entering each tap visit, then the final normed hidden state.
+struct StepTaps<'a> {
+    layout: &'a crate::ops::spec::TapLayout,
+    taps: Option<&'a mut CudaSlice<bf16>>,
+    /// Visits enqueued so far.
+    visit: usize,
+}
+
+impl StepTaps<'_> {
+    /// Copies `hidden`, the input of the next visit, if that visit is tapped.
+    fn visit(&mut self, ctx: &Ctx, hidden: &CudaSlice<bf16>) -> anyhow::Result<()> {
+        let index = self.visit;
+        self.visit += 1;
+        let Some(taps) = self.taps.as_deref_mut() else {
+            return Ok(());
+        };
+        if let Some(tap) = self.layout.visits.iter().position(|&v| v == index) {
+            ctx.kernels
+                .spec
+                .copy_tap(&ctx.stream, hidden, taps, tap, self.layout.len())?;
+        }
+        Ok(())
+    }
+
+    fn final_hidden(&mut self, ctx: &Ctx, hidden: &CudaSlice<bf16>) -> anyhow::Result<()> {
+        let count = self.layout.len();
+        match self.taps.as_deref_mut() {
+            Some(taps) if self.layout.final_hidden => {
+                ctx.kernels
+                    .spec
+                    .copy_tap(&ctx.stream, hidden, taps, count - 1, count)
+            }
+            _ => Ok(()),
+        }
     }
 }
 

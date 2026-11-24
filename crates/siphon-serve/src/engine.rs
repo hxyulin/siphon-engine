@@ -66,6 +66,8 @@ pub struct Options {
     pub drafter: Option<PathBuf>,
     /// The draft's approximations, as `DraftOptions::parse` takes them.
     pub draft: String,
+    /// Whether the speculator falls back to plain steps (`WidthPolicy::with_plain`).
+    pub fallback: bool,
 }
 
 /// Sends jobs to the engine thread.
@@ -203,17 +205,24 @@ mod cuda {
         model.reset()?;
         let first = speculator.prefill(&mut model, warmup, DEFAULT_PREFILL_CHUNK)?;
         let saved = model.save_state()?;
-        let round_ms = price(&mut model, &mut speculator, &saved, warmup, first)?;
+        let policy = price(&mut model, &mut speculator, &saved, warmup, first)?;
         let priced: Vec<String> = options
             .widths
             .iter()
-            .map(|&w| format!("{w}: {:.3}", round_ms[w - 1]))
+            .map(|&w| format!("{w}: {:.3}", policy.round_ms()[w - 1]))
             .collect();
-        eprintln!("round ms by width: {}", priced.join(", "));
-        speculator.set_width(Width::Adaptive(WidthPolicy::new(
-            &options.widths,
-            round_ms,
-        )?))?;
+        eprintln!(
+            "round ms by width: {}; plain step {:.3}, probe {:.3}",
+            priced.join(", "),
+            policy.plain().map_or(f64::NAN, |p| p.step_ms),
+            policy.plain().map_or(f64::NAN, |p| p.probe_ms)
+        );
+        let policy = if options.fallback {
+            policy
+        } else {
+            policy.with_plain(None)?
+        };
+        speculator.set_width(Width::Adaptive(policy))?;
         Ok((model, speculator))
     }
 
@@ -235,14 +244,17 @@ mod cuda {
                         .collect();
                     eprintln!(
                         "job: {} prompt tokens, prefill {:.0} ms, {emitted} tokens in {:.2} s \
-                         ({:.1} tok/s, {:.2} tokens per round, draft {:.3} ms per round, \
-                         acceptance by position [{}]), {}",
+                         ({:.1} tok/s, {:.2} tokens per round, {} plain steps, {} probes, \
+                         draft {:.3} ms per round, acceptance by position [{}]), {}",
                         job.prompt.len(),
                         prefill_s * 1e3,
                         decode_s,
                         emitted as f64 / decode_s.max(1e-9),
                         stats.tokens_per_round(),
-                        stats.draft.as_secs_f64() * 1e3 / stats.rounds.max(1) as f64,
+                        stats.stepped.len(),
+                        stats.probes,
+                        stats.draft.as_secs_f64() * 1e3
+                            / (stats.rounds + stats.probes).max(1) as f64,
                         acceptance.join(", "),
                         if events.is_closed() {
                             "client left".to_owned()
