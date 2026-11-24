@@ -1,0 +1,9 @@
+target
+.pixi
+.git
+.claude
+experiments
+releases
+reference/out
+BENCHMARKS.md
+EXPERIMENT_LOG.md

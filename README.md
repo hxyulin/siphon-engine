@@ -42,7 +42,7 @@ The speedup depends on how predictable the text is. The DSpark draft's first tok
 - An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions, with continuous batching.
 - A quality gate that compares the engine with MLX over long texts, and parity tests per layer visit.
 
-Not yet: sampling other than greedy, probabilistic acceptance, speculation for more than one sequence at a time, prefix caching, stop sequences.
+Not yet: sampling other than greedy, probabilistic acceptance, speculation for more than one sequence at a time, prefix caching.
 
 ## Build
 
@@ -56,6 +56,14 @@ target/release/bench <model-dir> --prompt <capture> --spec auto --weights fp8 --
 ```
 
 `<model-dir>` holds the checkpoint from Hugging Face (`thinkingmachines/Inkling-2-Mini`).
+
+The `Dockerfile` builds an image with `siphon-serve` as its entrypoint. The driver comes from the host through the NVIDIA container toolkit:
+
+```sh
+docker build -t siphon .
+docker run --gpus all -p 8000:8000 -v <model-dir>:/models/inkling-2-mini:ro siphon \
+  /models/inkling-2-mini --host 0.0.0.0 --port 8000
+```
 
 ## Server
 
