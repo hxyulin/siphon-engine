@@ -4,11 +4,11 @@ from pathlib import Path
 
 import mlx.core as mx
 
-FIXTURES = Path(__file__).resolve().parents[2] / "crates/inkling-cuda/tests/fixtures"
+FIXTURES = Path(__file__).resolve().parents[2] / "crates/siphon-cuda/tests/fixtures"
 
 
 def save(name: str, tensors: dict[str, mx.array]) -> None:
-    """Writes `tensors` to `crates/inkling-cuda/tests/fixtures/<name>.safetensors`."""
+    """Writes `tensors` to `crates/siphon-cuda/tests/fixtures/<name>.safetensors`."""
     FIXTURES.mkdir(parents=True, exist_ok=True)
     path = FIXTURES / f"{name}.safetensors"
     mx.save_safetensors(str(path), tensors)

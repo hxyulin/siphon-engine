@@ -579,8 +579,8 @@ def audit_kernel(k: Kernel) -> tuple[list[LoadReport], list[LoadReport]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--kernels", default="crates/inkling-cuda/kernels")
-    ap.add_argument("--arch", default=os.environ.get("INKLING_CUDA_ARCH", "sm_120a"))
+    ap.add_argument("--kernels", default="crates/siphon-cuda/kernels")
+    ap.add_argument("--arch", default=os.environ.get("SIPHON_CUDA_ARCH", "sm_120a"))
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--params", action="store_true", help="list each kernel's parameters")
     ap.add_argument("only", nargs="*", help="kernel names to check (default: all)")

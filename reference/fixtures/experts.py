@@ -27,7 +27,7 @@ from common import save
 
 MODEL = Path(
     os.environ.get(
-        "INKLING_MODEL", "~/.cache/huggingface/local-models/Inkling-2-Mini"
+        "SIPHON_MODEL", "~/.cache/huggingface/local-models/Inkling-2-Mini"
     )
 ).expanduser()
 HIDDEN = 2304
@@ -168,7 +168,7 @@ def mlp_fixture() -> None:
 
 
 if not MODEL.is_dir():
-    sys.exit(f"{MODEL} not found; set INKLING_MODEL to the checkpoint directory")
+    sys.exit(f"{MODEL} not found; set SIPHON_MODEL to the checkpoint directory")
 mx.random.seed(0)
 matvec_fixture(0, "nvfp4")
 matvec_fixture(20, "mxfp8")

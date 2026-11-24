@@ -2,7 +2,7 @@
 # Sync this workspace to a Linux CUDA host and run a command there in the pixi environment.
 #
 # usage: scripts/remote.sh <ssh-host> <remote-dir> <command...>
-# example: scripts/remote.sh gpu-box dev/inkling-engine cargo test -p inkling-cuda
+# example: scripts/remote.sh gpu-box dev/siphon cargo test -p siphon-cuda
 set -euo pipefail
 
 if [ $# -lt 3 ]; then

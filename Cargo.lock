@@ -127,28 +127,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inkling"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "memmap2",
- "safetensors",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "inkling-cuda"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "inkling",
- "safetensors",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,6 +336,28 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "siphon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "memmap2",
+ "safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "siphon-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "safetensors",
+ "siphon",
 ]
 
 [[package]]
