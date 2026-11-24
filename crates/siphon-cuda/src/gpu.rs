@@ -40,6 +40,51 @@ impl Gpu {
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
+
+    /// The device's free memory and what this process's buffers take from the memory pool
+    /// that every allocation comes from (cudarc allocates with `cuMemAllocAsync`). The pool
+    /// leaves out the CUDA context, the module images and the CUDA graphs.
+    pub fn memory(&self) -> anyhow::Result<MemoryUse> {
+        use sys::CUmemPool_attribute as A;
+
+        self.ctx.bind_to_thread()?;
+        let (free, total) = self.ctx.mem_get_info()?;
+        // SAFETY: the device comes from a live context, and each attribute below is a u64.
+        let pool = unsafe { cudarc::driver::result::device::get_mem_pool(self.ctx.cu_device()) }?;
+        let attribute = |attr| -> anyhow::Result<usize> {
+            let mut value = 0u64;
+            // SAFETY: `pool` is the device's pool and `value` is the u64 the attribute
+            // writes.
+            unsafe {
+                sys::cuMemPoolGetAttribute(pool, attr, ptr::from_mut(&mut value).cast::<c_void>())
+            }
+            .result()
+            .context("reading a memory pool attribute")?;
+            Ok(usize::try_from(value)?)
+        };
+        Ok(MemoryUse {
+            free,
+            total,
+            pool_used: attribute(A::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+            pool_used_peak: attribute(A::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
+            pool_reserved: attribute(A::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+            pool_reserved_peak: attribute(A::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
+        })
+    }
+}
+
+/// Device memory as [`Gpu::memory`] reads it, in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryUse {
+    /// Free on the device, for every process.
+    pub free: usize,
+    pub total: usize,
+    /// In this process's live buffers, now and at most so far.
+    pub pool_used: usize,
+    pub pool_used_peak: usize,
+    /// Held by the pool from the driver, its rounding included, now and at most so far.
+    pub pool_reserved: usize,
+    pub pool_reserved_peak: usize,
 }
 
 /// Device memory a launcher reads: a whole buffer or a view of rows of one.

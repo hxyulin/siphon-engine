@@ -319,6 +319,28 @@ impl Model {
         self.prefill_chunks(tokens, chunk, logits, Some(taps))
     }
 
+    /// Allocates the prefill buffers for chunks of `rows` rows now, unless buffers at least
+    /// that large exist. Prefill otherwise allocates them on first use, sized by its first
+    /// chunk; a server reserves the full chunk at startup so that its memory is known.
+    pub fn reserve_prefill(&mut self, rows: usize) -> anyhow::Result<()> {
+        ensure!(
+            (1..=MAX_PREFILL_CHUNK).contains(&rows),
+            "rows is {rows}, expected 1 to {MAX_PREFILL_CHUNK}"
+        );
+        if self.prefill.as_ref().is_none_or(|p| p.rows < rows) {
+            // Free the smaller buffers before allocating the new ones.
+            self.prefill = None;
+            self.prefill = Some(PrefillScratch::new(
+                &self.ctx.stream,
+                &self.ctx.config,
+                self.max_blocks,
+                rows,
+                false,
+            )?);
+        }
+        Ok(())
+    }
+
     fn prefill_chunks(
         &mut self,
         tokens: &[u32],
@@ -338,17 +360,7 @@ impl Model {
         );
         u32::try_from(last).context("position does not fit the kernels")?;
         let chunk_rows = chunk.min(tokens.len());
-        if self.prefill.as_ref().is_none_or(|p| p.rows < chunk_rows) {
-            // Free the smaller buffers before allocating the new ones.
-            self.prefill = None;
-            self.prefill = Some(PrefillScratch::new(
-                &self.ctx.stream,
-                &self.ctx.config,
-                self.max_blocks,
-                chunk_rows,
-                false,
-            )?);
-        }
+        self.reserve_prefill(chunk_rows)?;
         let hidden = self.ctx.hidden();
         let p = self
             .prefill

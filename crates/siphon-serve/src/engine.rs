@@ -124,7 +124,7 @@ mod cuda {
         memory::{self, CONTEXT_BYTES, DraftChoice, PlanInputs, Planner, SAFETY_MARGIN, gib},
     };
     use siphon_cuda::{
-        Gpu,
+        Gpu, MemoryUse,
         draft::DraftOptions,
         model::{DEFAULT_PREFILL_CHUNK, Model},
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
@@ -148,9 +148,9 @@ mod cuda {
         thread::Builder::new()
             .name("engine".to_owned())
             .spawn(move || match load(&options, &warmup) {
-                Ok((model, speculator, capacity)) => {
+                Ok((model, speculator, capacity, check)) => {
                     let _ = ready.send(Ok(capacity));
-                    run(model, speculator, &queue, &stop);
+                    run(model, speculator, check, &queue, &stop);
                 }
                 Err(e) => {
                     let _ = ready.send(Err(e));
@@ -214,7 +214,75 @@ mod cuda {
         Ok(capacity)
     }
 
-    fn load(options: &Options, warmup: &[u32]) -> anyhow::Result<(Model, Speculator, usize)> {
+    /// Compares the memory the process uses with its plan: once after warmup, when every
+    /// buffer the plan counts exists, and again after each job.
+    struct MemoryCheck {
+        gpu: Gpu,
+        /// Bytes the plan allows after the CUDA context.
+        planned: usize,
+        /// Bytes outside the memory pool after warmup: module images and CUDA graphs.
+        outside_pool: usize,
+        /// Whether a job has already gone past the plan, so that it warns once.
+        warned: bool,
+    }
+
+    impl MemoryCheck {
+        /// Measures the use after warmup against `planned`, with `free` the device's free
+        /// memory right after creating the context.
+        fn new(gpu: Gpu, planned: usize, free: usize) -> anyhow::Result<Self> {
+            let now = gpu.memory()?;
+            // Other processes can change the free memory meanwhile; the pool is exact.
+            let used = free.saturating_sub(now.free);
+            let outside_pool = used.saturating_sub(now.pool_reserved);
+            let mut check = Self {
+                gpu,
+                planned,
+                outside_pool,
+                warned: false,
+            };
+            eprintln!(
+                "memory check: {} GiB of a planned {} GiB in use after warmup ({} GiB in \
+                 buffers, peak {} GiB; {} GiB in modules and graphs)",
+                gib(check.peak(&now)),
+                gib(planned),
+                gib(now.pool_reserved),
+                gib(now.pool_reserved_peak),
+                gib(outside_pool),
+            );
+            check.warn(&now);
+            Ok(check)
+        }
+
+        /// The process's peak use: the pool's peak and what lies outside it.
+        fn peak(&self, now: &MemoryUse) -> usize {
+            now.pool_reserved_peak + self.outside_pool
+        }
+
+        fn after_job(&mut self) {
+            match self.gpu.memory() {
+                Ok(now) => self.warn(&now),
+                Err(e) => eprintln!("memory check failed: {e:#}"),
+            }
+        }
+
+        fn warn(&mut self, now: &MemoryUse) {
+            let peak = self.peak(now);
+            if !self.warned && peak > self.planned {
+                self.warned = true;
+                eprintln!(
+                    "warning: memory use peaked at {} GiB, {} MiB past the plan; the plan \
+                     undercounts this configuration",
+                    gib(peak),
+                    (peak - self.planned) >> 20
+                );
+            }
+        }
+    }
+
+    fn load(
+        options: &Options,
+        warmup: &[u32],
+    ) -> anyhow::Result<(Model, Speculator, usize, MemoryCheck)> {
         let started = Instant::now();
         let config = TextConfig::load(&options.model_dir)?;
         let passes = config.loop_config.num_passes;
@@ -280,10 +348,23 @@ mod cuda {
             policy.with_plain(None)?
         };
         speculator.set_width(Width::Adaptive(policy))?;
-        Ok((model, speculator, capacity))
+        drop(saved);
+        // The full chunk's buffers now, so that the check below sees every planned buffer
+        // and a plan that undercounts fails here rather than on the first long prompt.
+        // After pricing, so that they reuse the memory pricing freed, as a long prompt's
+        // prefill would.
+        model.reserve_prefill(DEFAULT_PREFILL_CHUNK)?;
+        let check = MemoryCheck::new(gpu, planner.plan(capacity).total(), free)?;
+        Ok((model, speculator, capacity, check))
     }
 
-    fn run(mut model: Model, mut speculator: Speculator, queue: &Receiver<Job>, stop: &[u32]) {
+    fn run(
+        mut model: Model,
+        mut speculator: Speculator,
+        mut check: MemoryCheck,
+        queue: &Receiver<Job>,
+        stop: &[u32],
+    ) {
         for job in queue {
             if job.events.is_closed() {
                 continue;
@@ -326,6 +407,7 @@ mod cuda {
                     let _ = events.send(Event::Failed(format!("{e:#}")));
                 }
             }
+            check.after_job();
         }
     }
 
