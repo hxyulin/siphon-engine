@@ -216,12 +216,26 @@ GEMV_ENTRY(gemv_f32_l32_s8_v4, float, float, 32, 8, 4)
 
 constexpr int kMaxRanges = 32;
 
-// Up to kMaxRanges weights for prefetch_l2, each as 16-byte vectors.
+// Up to kMaxRanges weights for prefetch_l2, each as 16-byte vectors. The last `rings`
+// ranges are the key and value slots of sliding KV caches, ring_slot_vecs vectors per
+// slot, which fill one slot per position: they are prefetched only once *position fills
+// every slot.
 struct Ranges {
     const uint4* p[kMaxRanges];
     long long vecs[kMaxRanges];
     int count;
+    int rings;
+    long long ring_slot_vecs;
+    const unsigned* position;
 };
+
+// The vectors of range s to prefetch.
+__device__ __forceinline__ long long range_vecs(const Ranges& r, int s) {
+    if (s < r.count - r.rings) {
+        return r.vecs[s];
+    }
+    return (long long)(*r.position) * r.ring_slot_vecs < r.vecs[s] ? 0 : r.vecs[s];
+}
 
 // Pulls the ranges into L2, in order, for later kernels. Runs on a side stream beside
 // latency-bound kernels. Prefetch instructions are hints the memory system drops under
@@ -235,7 +249,7 @@ prefetch_l2(const __grid_constant__ Ranges r) {
     uint32_t seen = 0;
     for (int s = 0; s < r.count; ++s) {
         const uint4* p = r.p[s];
-        const long long vecs = r.vecs[s];
+        const long long vecs = range_vecs(r, s);
         for (long long base = blockIdx.x * kThreads + threadIdx.x; base < vecs;
              base += 8 * stride) {
 #pragma unroll
@@ -280,7 +294,7 @@ prefetch_l2_paced(const __grid_constant__ Ranges r, float bytes_per_ns) {
     long long chunk_base = 0;
     for (int s = 0; s < r.count; ++s) {
         const char* p = reinterpret_cast<const char*>(r.p[s]);
-        const long long bytes = r.vecs[s] * 16;
+        const long long bytes = range_vecs(r, s) * 16;
         const long long chunks = (bytes + kChunk - 1) / kChunk;
         for (long long c = (lane - chunk_base % lanes + lanes) % lanes; c < chunks; c += lanes) {
             const unsigned long long due = t0 + (unsigned long long)(float(chunk_base + c) * kChunk / bytes_per_ns);

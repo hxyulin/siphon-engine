@@ -17,7 +17,7 @@ use siphon_cuda::{
         elementwise::Elementwise,
         linear::{Gemv, Linear, Start},
         linear_fp8::{Fp8Matrix, LinearFp8},
-        misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, GateStepScratch, Misc},
+        misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, Misc},
         norm::Norm,
     },
 };
@@ -616,7 +616,6 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
     let h_host = pseudo_random(GATE_SLOTS * HIDDEN, 944, 3.0);
     let m_host = pseudo_random(GATE_SLOTS * HIDDEN, 945, 3.0);
     let (h, m) = (stream.clone_htod(&h_host)?, stream.clone_htod(&m_host)?);
-    let mut scratch = GateStepScratch::new(stream)?;
     let mut counter = stream.alloc_zeros::<u32>(GATE_SLOTS)?;
     let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
 
@@ -663,7 +662,6 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
             &m,
             &mut out,
             Some(&mut down),
-            &mut scratch,
             EPS,
         )?;
         let out = stream.clone_dtoh(&out)?;
@@ -844,8 +842,6 @@ fn message_gate_step_fp8_matches_reference() -> anyhow::Result<()> {
     let h_host = pseudo_random(GATES * HIDDEN, 981, 3.0);
     let m_host = pseudo_random(GATES * HIDDEN, 982, 3.0);
     let (h_dev, m_dev) = (stream.clone_htod(&h_host)?, stream.clone_htod(&m_host)?);
-    let mut scratch = GateStepScratch::new(stream)?;
-
     for run in 0..2 {
         let mut out = stream.alloc_zeros::<f32>(GATES * HIDDEN)?;
         let mut down = stream.alloc_zeros::<bf16>(GATES * GATE_RANK)?;
@@ -869,7 +865,6 @@ fn message_gate_step_fp8_matches_reference() -> anyhow::Result<()> {
             &m_dev,
             &mut out,
             Some(&mut down),
-            &mut scratch,
             EPS,
         )?;
         drop(gates);

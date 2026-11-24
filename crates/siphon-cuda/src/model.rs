@@ -23,7 +23,8 @@ use std::{ops::Range, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceRepr, ValidAsZeroBits,
+    CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _, DeviceRepr,
+    ValidAsZeroBits,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
@@ -43,7 +44,7 @@ use crate::{
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
         linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
         linear_rows::{self, LinearRows, RowsProduct},
-        misc::{ArgmaxScratch, GATE_SLOTS, GateStep, GateStepScratch, Misc},
+        misc::{ArgmaxScratch, GATE_SLOTS, GateStep, Misc},
         norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
         spec::{Spec, VERIFY_ROWS},
@@ -184,8 +185,6 @@ struct GateScratch {
     /// side, BF16 `[core layers, 2 * hidden]`: the down projections' inputs. Depth
     /// attention writes both halves, the messages for all layers at the start of a pass.
     inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
-    /// The gate kernel's cross-block sums and barrier counters.
-    step: GateStepScratch,
 }
 
 /// Intermediates of `SlidingAttention` and `FullAttention`.
@@ -252,7 +251,6 @@ impl Scratch {
                     zeros(stream, looped * 2 * hidden)?,
                     zeros(stream, looped * 2 * hidden)?,
                 ],
-                step: GateStepScratch::new(stream)?,
             },
             qkv_in: [
                 zeros(stream, hidden)?,
@@ -791,10 +789,27 @@ impl Model {
         let cfg = &ctx.config;
         let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
         let hidden = ctx.hidden();
+        let position = s.position.device_ptr(&ctx.stream).0;
+        let windows: Vec<Option<Window>> = self
+            .visits
+            .iter()
+            .map(|v| {
+                v.kv.ring_buffers(&ctx.stream)
+                    .map(|(buffers, slot_bytes)| Window {
+                        buffers,
+                        slot_bytes,
+                        position,
+                    })
+            })
+            .collect();
         let mut visits = self.visits.iter_mut();
         let mut next_visit = || visits.next().context("fewer visit caches than visits");
         let plan = visit_plan(cfg, self.passes);
-        let mut upcoming = plan.iter().map(|&(_, u)| u);
+        let mut upcoming = plan.iter().enumerate().map(|(v, &(_, u))| Upcoming {
+            next_window: windows.get(v + 1).copied().flatten(),
+            after_window: windows.get(v + 2).copied().flatten(),
+            ..u
+        });
         let mut next_plan = || upcoming.next().unwrap_or_default();
 
         // The embedding, its norm, and the first visit's attention inputs (see
@@ -823,11 +838,14 @@ impl Model {
             len: 0,
             max: self.max_blocks,
         };
-        ctx.kernels.linear.prefetch(
-            &ctx.stream,
-            &ctx.visit_prefetch(plan[0].0.0, plan[0].0.1, false),
-            ctx.prefetch_pace(plan[0].0.0),
-        )?;
+        let first_window = windows[0]
+            .filter(|_| ctx.weights.layers[plan[0].0.0].fp8.is_some())
+            .map(Window::prefetch);
+        let mut first = ctx.visit_prefetch(plan[0].0.0, plan[0].0.1, false);
+        first.extend(first_window.iter().flatten().map(|r| r as &dyn Prefetch));
+        ctx.kernels
+            .linear
+            .prefetch(&ctx.stream, &first, ctx.prefetch_pace(plan[0].0.0))?;
         for layer in 0..core_start {
             taps.visit(ctx, &s.hidden)?;
             ctx.visit(
@@ -842,7 +860,13 @@ impl Model {
                 trace.as_deref_mut(),
             )?;
         }
-        ctx.stream.memcpy_dtod(&s.hidden, &mut s.prelude_hidden)?;
+        // Each pass of the looped layers starts from the prelude's output, which stays in
+        // `prelude_hidden`. Instead of copying it into `hidden` before each pass, a graph
+        // memcpy node that also stops the next kernel from starting early, the buffers trade
+        // roles: the first visit of a pass reads `prelude_hidden` as its input, and the
+        // buffer it read becomes `prelude_hidden` again once its output is in `hidden`. With
+        // the copies, a step took 5 us longer at context 0 and 23 us longer at 32K.
+        std::mem::swap(&mut s.hidden, &mut s.prelude_hidden);
         let prelude_blocks = blocks.len;
         for pass in 0..self.passes {
             if pass > 0 {
@@ -874,10 +898,12 @@ impl Model {
                     },
                     ctx.eps(),
                 )?;
-                ctx.stream.memcpy_dtod(&s.prelude_hidden, &mut s.hidden)?;
                 blocks.len = prelude_blocks;
             }
             for (i, layer) in (core_start..core_end).enumerate() {
+                if i == 0 {
+                    std::mem::swap(&mut s.hidden, &mut s.prelude_hidden);
+                }
                 taps.visit(ctx, &s.hidden)?;
                 ctx.visit(
                     s,
@@ -890,6 +916,10 @@ impl Model {
                     &mut blocks,
                     trace.as_deref_mut(),
                 )?;
+                if i == 0 {
+                    // The visit swapped the buffer it read into `out`.
+                    std::mem::swap(&mut s.out, &mut s.prelude_hidden);
+                }
             }
         }
         for layer in core_end..cfg.num_hidden_layers {
@@ -1027,6 +1057,45 @@ impl Prefetch for PrefetchStart<'_> {
     }
 }
 
+/// A visit's sliding KV ring, for the prefetch: the key and value buffers, the bytes of one
+/// slot, and the device address of the step's position.
+#[derive(Clone, Copy)]
+struct Window {
+    buffers: [(u64, usize); 2],
+    slot_bytes: usize,
+    position: u64,
+}
+
+/// The filled slots of one buffer of a [`Window`].
+struct RingPrefetch {
+    ptr: u64,
+    bytes: usize,
+    slot_bytes: usize,
+    position: u64,
+}
+
+impl Prefetch for RingPrefetch {
+    fn device_bytes(&self, _stream: &CudaStream) -> (u64, usize) {
+        (self.ptr, self.bytes)
+    }
+
+    fn ring(&self, _stream: &CudaStream) -> Option<(usize, u64)> {
+        Some((self.slot_bytes, self.position))
+    }
+}
+
+impl Window {
+    /// The filled slots of the keys and the values.
+    fn prefetch(self) -> [RingPrefetch; 2] {
+        self.buffers.map(|(ptr, bytes)| RingPrefetch {
+            ptr,
+            bytes,
+            slot_bytes: self.slot_bytes,
+            position: self.position,
+        })
+    }
+}
+
 /// Which layer a visit runs, and whose weights it prefetches next.
 #[derive(Clone, Copy)]
 struct VisitPlan {
@@ -1058,6 +1127,8 @@ fn visit_plan(cfg: &TextConfig, passes: usize) -> Vec<((usize, bool), Upcoming)>
             (
                 plan[v],
                 Upcoming {
+                    next_window: None,
+                    after_window: None,
                     next: plan.get(v + 1).copied(),
                     after: plan.get(v + 2).copied(),
                 },
@@ -1069,6 +1140,9 @@ fn visit_plan(cfg: &TextConfig, passes: usize) -> Vec<((usize, bool), Upcoming)>
 /// The visits after one, whose weights it prefetches.
 #[derive(Clone, Copy, Default)]
 struct Upcoming {
+    /// The sliding KV rings of the next visit and of the one after it, if they slide.
+    next_window: Option<Window>,
+    after_window: Option<Window>,
     /// The next visit's layer and whether it takes messages.
     next: Option<(usize, bool)>,
     /// The same for the visit after the next.
@@ -1171,6 +1245,7 @@ impl Ctx {
         gated: bool,
         next: Option<(usize, bool)>,
         rows: bool,
+        window: Option<Window>,
     ) -> anyhow::Result<()> {
         let w = &self.weights.layers[layer];
         let mut prefetch: Vec<&dyn Prefetch> = match &w.fp8 {
@@ -1189,8 +1264,14 @@ impl Ctx {
             prefetch.push(&w.router);
         }
         let lm_head_start;
+        // With FP8 weights, the next visit's sliding KV ring too, once every slot is filled
+        // (see `Prefetch::ring`): at 32K its attention took 8.1 us with the window in DRAM.
+        let window = window
+            .filter(|_| !rows && w.fp8.is_some())
+            .map(Window::prefetch);
         if let Some((layer, messages)) = next {
             prefetch.extend(self.visit_prefetch(layer, messages, rows));
+            prefetch.extend(window.iter().flatten().map(|r| r as &dyn Prefetch));
         } else {
             // The last visit's experts leave DRAM bandwidth to spare for the start of the
             // LM head, which the step reads next.
@@ -1253,7 +1334,7 @@ impl Ctx {
         // starts the rest of its own here, and does not wait for its projections: they read
         // from DRAM alongside the prefetch.
         if layer == 0 {
-            self.prefetch_rest(layer, gates.is_some(), next.next, false)?;
+            self.prefetch_rest(layer, gates.is_some(), next.next, false, next.next_window)?;
         }
 
         // The normalized visit input goes straight into the new block state at a block start.
@@ -1362,7 +1443,7 @@ impl Ctx {
         // waits for this visit's prefetch, which has usually finished by then.
         if let Some((layer, messages)) = next.next {
             self.kernels.linear.join_prefetch(&self.stream)?;
-            self.prefetch_rest(layer, messages, next.after, false)?;
+            self.prefetch_rest(layer, messages, next.after, false, next.after_window)?;
         }
         if !fused {
             self.kernels.conv.moe_conv_residual(
@@ -1649,7 +1730,6 @@ impl Ctx {
             messages,
             &mut out.slice_mut(..n * hidden),
             None,
-            &mut t.step,
             self.eps(),
         )
     }

@@ -27,7 +27,8 @@ use std::{fmt, str::FromStr, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, DevicePtr as _, LaunchConfig,
+    PushKernelArg as _,
     sys::{CUdevice_attribute, CUfunction_attribute},
 };
 use half::bf16;
@@ -235,6 +236,26 @@ impl KvCache {
     #[must_use]
     pub fn slots(&self) -> usize {
         self.slots
+    }
+
+    /// For a sliding cache: the device address and length in bytes of its key and value
+    /// buffers, and the bytes of one slot of each. Position `p < slots` lives in slot `p`,
+    /// so the first `min(p, slots)` slots hold every key and value at position `p`.
+    #[must_use]
+    pub fn ring_buffers(&self, stream: &CudaStream) -> Option<([(u64, usize); 2], usize)> {
+        self.window?;
+        let (keys, values, elem) = match &self.data {
+            KvData::Bf16 { keys, values } => (
+                keys.device_ptr(stream).0,
+                values.device_ptr(stream).0,
+                size_of::<bf16>(),
+            ),
+            KvData::Fp8 { keys, values } => {
+                (keys.device_ptr(stream).0, values.device_ptr(stream).0, 1)
+            }
+        };
+        let bytes = self.slots * KV_ROW * elem;
+        Some(([(keys, bytes), (values, bytes)], KV_ROW * elem))
     }
 
     /// The sliding window, or `None` for a global layer.

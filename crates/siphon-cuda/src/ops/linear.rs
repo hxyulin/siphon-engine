@@ -131,6 +131,9 @@ struct Ranges {
     p: [u64; MAX_PREFETCH],
     vecs: [i64; MAX_PREFETCH],
     count: i32,
+    rings: i32,
+    ring_slot_vecs: i64,
+    position: u64,
 }
 
 // SAFETY: plain integers with the layout of the kernel's `Ranges`, passed by value.
@@ -375,6 +378,14 @@ pub trait Prefetch {
     /// The buffer's device address and length in bytes. Event tracking is off (see
     /// [`crate::Gpu`]), so the address needs no guard.
     fn device_bytes(&self, stream: &CudaStream) -> (u64, usize);
+
+    /// For a ring of slots that fills one slot per position, such as a sliding KV cache:
+    /// the bytes per slot and the device address of the position, a `u32`. The prefetch
+    /// reads the position on the device and pulls the ring in only once every slot is
+    /// filled. Rings come after every other buffer of a prefetch.
+    fn ring(&self, _stream: &CudaStream) -> Option<(usize, u64)> {
+        None
+    }
 }
 
 impl<T: DeviceRepr> Prefetch for CudaSlice<T> {
@@ -474,6 +485,24 @@ impl Linear {
             ranges.p[i] = ptr;
             // A trailing partial vector stays out of L2, which costs one load later.
             ranges.vecs[i] = i64::try_from(bytes / 16)?;
+            match w.ring(&self.side) {
+                Some((slot_bytes, position)) => {
+                    let slot_vecs = i64::try_from(slot_bytes / 16)?;
+                    ensure!(
+                        slot_bytes > 0 && slot_bytes.is_multiple_of(16),
+                        "ring {i} has slots of {slot_bytes} bytes, not a positive multiple of 16"
+                    );
+                    ensure!(
+                        ranges.rings == 0
+                            || (ranges.position, ranges.ring_slot_vecs) == (position, slot_vecs),
+                        "the rings of one prefetch must share their slots and position"
+                    );
+                    ranges.rings += 1;
+                    ranges.ring_slot_vecs = slot_vecs;
+                    ranges.position = position;
+                }
+                None => ensure!(ranges.rings == 0, "rings must come last"),
+            }
         }
         self.fork.record(stream)?;
         self.side.wait(&self.fork)?;
@@ -486,8 +515,9 @@ impl Linear {
                 };
                 let mut launch = self.side.launch_builder(&self.prefetch_l2);
                 launch.arg(&ranges);
-                // SAFETY: `ranges` has the kernel's `Ranges` layout, and the kernel reads
-                // only the whole 16-byte vectors inside each weight.
+                // SAFETY: `ranges` has the kernel's `Ranges` layout, the kernel reads only
+                // the whole 16-byte vectors inside each weight, and a ring's position, if
+                // any, is a live `u32`.
                 unsafe { launch.launch(config) }?;
             }
             Pace::Rate(tb_per_s) => {
@@ -501,8 +531,8 @@ impl Linear {
                 let mut launch = self.side.launch_builder(&self.prefetch_l2_paced);
                 launch.arg(&ranges).arg(&bytes_per_ns);
                 // SAFETY: `ranges` has the kernel's `Ranges` layout, the kernel prefetches
-                // only the whole 16-byte vectors inside each weight, and the rate is
-                // positive.
+                // only the whole 16-byte vectors inside each weight, a ring's position, if
+                // any, is a live `u32`, and the rate is positive.
                 unsafe { launch.launch(config) }?;
             }
         }

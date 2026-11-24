@@ -814,7 +814,7 @@ impl Ctx {
         if let Some(next) = upcoming
             && index == 0
         {
-            self.prefetch_rest(layer, gates.is_some(), next.next, true)?;
+            self.prefetch_rest(layer, gates.is_some(), next.next, true, None)?;
         }
 
         // The normalized visit input goes straight into the new block state at a block start.
@@ -945,10 +945,11 @@ impl Ctx {
         if let Some(Upcoming {
             next: Some((layer, messages)),
             after,
+            ..
         }) = upcoming
         {
             self.kernels.linear.join_prefetch(&self.stream)?;
-            self.prefetch_rest(layer, messages, after, true)?;
+            self.prefetch_rest(layer, messages, after, true, None)?;
         }
 
         if step {

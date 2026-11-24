@@ -433,15 +433,18 @@ message_gate_out_2304(const __nv_bfloat16* down, const __nv_bfloat16* __restrict
 
 // ---------------------------------------------------------------------------
 // The whole MessageGate for decode in one launch: the down projection and the end of
-// message_gate_out_2304, for up to three gates (blockIdx.y). The 32 blocks of a gate
-// each sum a slice of the down projection's inner dimension, meet at a barrier, then
-// compute their 72 output rows from the BF16 down projection. With a norm, a second
-// barrier shares the sums of squares and each block normalizes its own rows.
+// message_gate_out_2304, for up to three gates (blockIdx.y), one cluster of 16 blocks per
+// gate. Block r sums the down projection's partial products over two slices of its inner
+// dimension, then adds rows 4r .. 4r + 3 of all 32 partials, which every block sends it,
+// and sends the 4 BF16 results to every block. Each block then computes 144 output rows
+// from the BF16 down projection. With a norm, every block sends its two partial sums of
+// squares to every block, and each normalizes its own rows.
 //
-// The barriers spin on `counters` (one per gate, a multiple of 32 between launches,
-// starting at 0). Spinning is safe because every block of the grid is resident: the
-// grid is at most 96 small blocks, the blocks spin only after pdl_wait, when no earlier
-// kernel of the stream runs, and no later kernel starts before all of them have.
+// The exchanges are st.async stores into the receivers' shared memory that complete on
+// their mbarriers, a few per block: remote shared-memory stores are slow in volume on
+// this GPU, and an all-to-all of the partial projections took 10 us per launch. The
+// launch had 32 blocks per gate and two grid barriers on global counters before, and took
+// 4.5 us in the decode step instead of 3.5; the sums are the same, in the same order.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -451,34 +454,6 @@ constexpr int kDownChunks = kDownCols / 8;                    // of 8 BF16 each
 constexpr int kDownItems = kGateRank * kDownChunks;           // 1152 (row, chunk) pairs
 constexpr int kDownPerThread = kDownItems / kGateThreads;     // 4
 static_assert(kDownItems % kGateThreads == 0, "threads cover the down items");
-
-__device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
-    unsigned v;
-    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-}
-
-__device__ __forceinline__ unsigned atom_add_release(unsigned* p, unsigned v) {
-    unsigned old;
-    asm volatile("atom.add.release.gpu.global.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
-    return old;
-}
-
-// Waits until all `blocks` blocks sharing `counter` have arrived. Every thread of the
-// block must call it; writes before it are visible to every block after it. The block
-// barrier orders the block's writes before thread 0's release add, and the acquire load
-// that sees every block's add orders the reads after the second block barrier; a full
-// fence on either side cost more.
-__device__ __forceinline__ void grid_barrier(unsigned* counter, unsigned blocks) {
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        const unsigned old = atom_add_release(counter, 1u);
-        const unsigned target = old - old % blocks + blocks;
-        while (static_cast<int>(ld_acquire(counter) - target) < 0) {
-        }
-    }
-    __syncthreads();
-}
 
 __device__ __forceinline__ float dot8_bf16(uint4 w, uint4 x) {
     const auto* wv = reinterpret_cast<const __nv_bfloat16*>(&w);
@@ -552,154 +527,275 @@ __device__ __forceinline__ void unpack4(uint32_t w, float (&v)[4]) {
     v[3] = b.y;
 }
 
-// Gate g = blockIdx.y of message_gate_step_2304 or message_gate_step_fp8_2304.
+// Gate g = blockIdx.y of message_gate_step_2304 or message_gate_step_fp8_2304, as the
+// header above describes. Block r does the work that blocks 2r and 2r + 1 of 32 did, each
+// half with the same sums.
+constexpr int kGateCluster = 16;
+constexpr int kGateHalves = kGateBlocks / kGateCluster;
+constexpr int kGateRowsPerRank = kGateRank / kGateCluster;
+static_assert(kGateHalves * kGateCluster == kGateBlocks, "each block takes whole halves");
+static_assert(kGateRowsPerRank == 4, "each block adds one float4 of rows per partial");
+
+__device__ __forceinline__ uint32_t gate_smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ uint32_t gate_cluster_rank() {
+    uint32_t r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+    return r;
+}
+
+// Address `a` of this block's shared memory in block `rank` of the cluster.
+__device__ __forceinline__ uint32_t gate_cluster_addr(uint32_t a, uint32_t rank) {
+    uint32_t r;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank));
+    return r;
+}
+
+__device__ __forceinline__ void gate_expect(uint32_t barrier, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(barrier), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void gate_wait(uint32_t barrier) {
+    asm volatile(
+        "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
+        " @!p bra wait;\n}" ::"r"(barrier)
+        : "memory");
+}
+
 template <bool kFp8>
 __device__ __forceinline__ void
 message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const float* h, const float* m,
-                  float* out, const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
-                  __nv_bfloat16* down, float* part, unsigned* counter, float eps) {
-    using Elem = typename GateWeights<kFp8>::Elem;
-    __shared__ float item_sums[kDownItems];
+                     float* out, const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed,
+                     __nv_bfloat16* down, float eps) {
+    __shared__ float item_sums[kGateHalves][kDownItems];
+    __shared__ __align__(16) float mine[kGateHalves * kGateRank];
+    // Rows 4 rank .. of each of the 32 partial down projections.
+    __shared__ __align__(16) float gathered[kGateBlocks][kGateRowsPerRank];
     __shared__ __align__(16) __nv_bfloat16 down_s[kGateRank];
-    __shared__ float warp_ss[kGateWarps];
-    const int g = blockIdx.y;
-    const int blk = blockIdx.x;
+    __shared__ __align__(16) float norm_parts[kGateBlocks];
+    __shared__ float warp_ss[kGateHalves][kGateWarps];
+    __shared__ __align__(8) uint64_t arrived[3];
     const int t = threadIdx.x;
     const int lane = t % 32;
     const int warp = t / 32;
-
-    // Weights first: this block's slice of the down projection, its gate rows and their
-    // norm weights, and with E4M3 weights their scales.
-    const int col0 = blk * kDownCols;
-    DownChunk<kFp8> dw[kDownPerThread];
-#pragma unroll
-    for (int i = 0; i < kDownPerThread; ++i) {
-        const int item = t + i * kGateThreads;
-        const int k = item / kDownChunks;
-        const int c = item % kDownChunks;
-        dw[i] = *reinterpret_cast<const DownChunk<kFp8>*>(wt.down + size_t(k) * 2 * kHidden + col0 + 8 * c);
-    }
-    const int sub = lane % kLanesPerRow;
-    const int row = blk * kGateRowsPerBlock + warp * kRowsPerWarp + lane / kLanesPerRow;
-    RowChunk<kFp8> fw[kGateSteps];
-    RowChunk<kFp8> gw[kGateSteps];
-#pragma unroll
-    for (int i = 0; i < kGateSteps; ++i) {
-        const int col = i * 4 * kLanesPerRow + sub * 4;
-        fw[i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.forget + size_t(row) * kGateRank + col);
-        gw[i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.gain + size_t(row) * kGateRank + col);
-    }
-    float down_scale = 1.f;
-    float forget_scale = 1.f;
-    float gain_scale = 1.f;
-    if constexpr (kFp8) {
-        if (t < kGateRank) {
-            down_scale = wt.down_scale[t];
+    const uint32_t rank = gate_cluster_rank();
+    const uint32_t gather_barrier = gate_smem_addr(&arrived[0]);
+    const uint32_t down_barrier = gate_smem_addr(&arrived[1]);
+    const uint32_t norm_barrier = gate_smem_addr(&arrived[2]);
+    if (t == 0) {
+        for (int i = 0; i < 3; ++i) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(gate_smem_addr(&arrived[i])) : "memory");
         }
-        forget_scale = wt.forget_scale[row];
-        gain_scale = wt.gain_scale[row];
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        gate_expect(gather_barrier, sizeof(gathered));
+        gate_expect(down_barrier, sizeof(down_s));
+        if (normed != nullptr) {
+            gate_expect(norm_barrier, sizeof(norm_parts));
+        }
     }
-    const float nw = norm_weight != nullptr ? __bfloat162float(norm_weight[row]) : 0.f;
+    // Every block arrives now and waits before its first remote store, so the barriers of
+    // the whole cluster are ready by then.
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+
+    // Weights first, as message_gate_step loads them, for both halves.
+    DownChunk<kFp8> dw[kGateHalves][kDownPerThread];
+    RowChunk<kFp8> fw[kGateHalves][kGateSteps];
+    RowChunk<kFp8> gw[kGateHalves][kGateSteps];
+    float forget_scale[kGateHalves];
+    float gain_scale[kGateHalves];
+    float nw[kGateHalves];
+    int rows[kGateHalves];
+    const int sub = lane % kLanesPerRow;
+#pragma unroll
+    for (int half = 0; half < kGateHalves; ++half) {
+        const int blk = int(rank) * kGateHalves + half;
+        const int col0 = blk * kDownCols;
+#pragma unroll
+        for (int i = 0; i < kDownPerThread; ++i) {
+            const int item = t + i * kGateThreads;
+            const int k = item / kDownChunks;
+            const int c = item % kDownChunks;
+            dw[half][i] = *reinterpret_cast<const DownChunk<kFp8>*>(wt.down + size_t(k) * 2 * kHidden + col0 + 8 * c);
+        }
+        rows[half] = blk * kGateRowsPerBlock + warp * kRowsPerWarp + lane / kLanesPerRow;
+#pragma unroll
+        for (int i = 0; i < kGateSteps; ++i) {
+            const int col = i * 4 * kLanesPerRow + sub * 4;
+            fw[half][i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.forget + size_t(rows[half]) * kGateRank + col);
+            gw[half][i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.gain + size_t(rows[half]) * kGateRank + col);
+        }
+        forget_scale[half] = 1.f;
+        gain_scale[half] = 1.f;
+        if constexpr (kFp8) {
+            forget_scale[half] = wt.forget_scale[rows[half]];
+            gain_scale[half] = wt.gain_scale[rows[half]];
+        }
+        nw[half] = norm_weight != nullptr ? __bfloat162float(norm_weight[rows[half]]) : 0.f;
+    }
+    // Thread t < 4 finishes down projection row 4 rank + t.
+    float down_scale = 1.f;
+    if constexpr (kFp8) {
+        if (t < kGateRowsPerRank) {
+            down_scale = wt.down_scale[int(rank) * kGateRowsPerRank + t];
+        }
+    }
     pdl_trigger();
     pdl_wait();
 
-    // The down projection's partial sums over this block's columns.
-    float hv = 0.f;
-    float mv = 0.f;
+    float hv[kGateHalves] = {};
+    float mv[kGateHalves] = {};
     if (sub == 0) {
-        hv = h[row];
-        mv = m[row];
+#pragma unroll
+        for (int half = 0; half < kGateHalves; ++half) {
+            hv[half] = h[rows[half]];
+            mv[half] = m[rows[half]];
+        }
     }
 #pragma unroll
-    for (int i = 0; i < kDownPerThread; ++i) {
-        const int item = t + i * kGateThreads;
-        const int c = item % kDownChunks;
-        const uint4 x = *reinterpret_cast<const uint4*>(input + col0 + 8 * c);
-        item_sums[item] = dot8(dw[i], x);
+    for (int half = 0; half < kGateHalves; ++half) {
+        const int col0 = (int(rank) * kGateHalves + half) * kDownCols;
+#pragma unroll
+        for (int i = 0; i < kDownPerThread; ++i) {
+            const int item = t + i * kGateThreads;
+            const int c = item % kDownChunks;
+            const uint4 x = *reinterpret_cast<const uint4*>(input + col0 + 8 * c);
+            item_sums[half][item] = dot8(dw[half][i], x);
+        }
     }
     __syncthreads();
-    if (t < kGateRank) {
+    if (t < kGateHalves * kGateRank) {
+        const int half = t / kGateRank;
+        const int r = t % kGateRank;
         float acc = 0.f;
 #pragma unroll
         for (int c = 0; c < kDownChunks; ++c) {
-            acc += item_sums[t * kDownChunks + c];
+            acc += item_sums[half][r * kDownChunks + c];
         }
-        part[blk * (kGateRank + 1) + t] = acc;
-    }
-    grid_barrier(counter, kGateBlocks);
-    if (t < kGateRank) {
-        float acc = 0.f;
-#pragma unroll 8
-        for (int b = 0; b < kGateBlocks; ++b) {
-            acc += __ldcg(part + b * (kGateRank + 1) + t);
-        }
-        // An E4M3 row's scale multiplies its sum once, before the rounding to BF16.
-        down_s[t] = __float2bfloat16(kFp8 ? down_scale * acc : acc);
-        if (down != nullptr && blk == 0) {
-            down[g * kGateRank + t] = down_s[t];
-        }
+        mine[t] = acc;
     }
     __syncthreads();
-
-    // The end of message_gate_out_row, from the shared down projection.
-    float f = 0.f;
-    float gg = 0.f;
-#pragma unroll
-    for (int i = 0; i < kGateSteps; ++i) {
-        const int col = i * 4 * kLanesPerRow + sub * 4;
-        const uint2 packed = *reinterpret_cast<const uint2*>(down_s + col);
-        const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&packed);
-        float fv[4];
-        float gv[4];
-        unpack4(fw[i], fv);
-        unpack4(gw[i], gv);
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const float x = __bfloat162float(xv[k]);
-            f = ffma(fv[k], x, f);
-            gg = ffma(gv[k], x, gg);
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    // Thread q < 32 sends rows 4 d .. of this block's half h, q = 2 d + h, to block d, as
+    // partial 2 rank + h.
+    if (t < kGateCluster * kGateHalves) {
+        const uint32_t dst_rank = uint32_t(t / kGateHalves);
+        const int half = t % kGateHalves;
+        const float4 v = reinterpret_cast<const float4*>(mine + half * kGateRank)[dst_rank];
+        const uint32_t dst =
+            gate_cluster_addr(gate_smem_addr(&gathered[int(rank) * kGateHalves + half][0]), dst_rank);
+        asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(dst),
+                     "r"(__float_as_uint(v.x)), "r"(__float_as_uint(v.y)), "r"(__float_as_uint(v.z)),
+                     "r"(__float_as_uint(v.w)), "r"(gate_cluster_addr(gather_barrier, dst_rank))
+                     : "memory");
+    }
+    if (warp == 0) {
+        gate_wait(gather_barrier);
+        // Lane t < 4: row 4 rank + t, added over the 32 partials in order.
+        float acc = 0.f;
+        if (lane < kGateRowsPerRank) {
+#pragma unroll 8
+            for (int b = 0; b < kGateBlocks; ++b) {
+                acc += gathered[b][lane];
+            }
+        }
+        const __nv_bfloat16 d = __float2bfloat16(kFp8 ? down_scale * acc : acc);
+        const uint32_t bits = __bfloat16_as_ushort(d);
+        // Lane 0 packs the 4 values and lanes 0 .. 15 send them to every block.
+        const uint32_t b1 = __shfl_sync(0xffffffffu, bits, 1);
+        const uint32_t b2 = __shfl_sync(0xffffffffu, bits, 2);
+        const uint32_t b3 = __shfl_sync(0xffffffffu, bits, 3);
+        const uint32_t b0 = __shfl_sync(0xffffffffu, bits, 0);
+        if (down != nullptr && lane < kGateRowsPerRank) {
+            down[blockIdx.y * kGateRank + int(rank) * kGateRowsPerRank + lane] = d;
+        }
+        if (lane < kGateCluster) {
+            const uint32_t dst =
+                gate_cluster_addr(gate_smem_addr(down_s + int(rank) * kGateRowsPerRank), uint32_t(lane));
+            asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];" ::"r"(dst),
+                         "r"(b0 | (b1 << 16)), "r"(b2 | (b3 << 16)), "r"(gate_cluster_addr(down_barrier, uint32_t(lane)))
+                         : "memory");
         }
     }
+    gate_wait(down_barrier);
+
+    float o[kGateHalves];
 #pragma unroll
-    for (int offset = kLanesPerRow / 2; offset > 0; offset /= 2) {
-        f = fadd(f, __shfl_down_sync(0xffffffffu, f, offset));
-        gg = fadd(gg, __shfl_down_sync(0xffffffffu, gg, offset));
-    }
-    if constexpr (kFp8) {
-        f = fmul(forget_scale, f);
-        gg = fmul(gain_scale, gg);
-    }
-    float o = 0.f;
-    if (sub == 0) {
-        o = fadd(fmul(fsub(1.f, tanhf(f)), hv), fmul(tanhf(gg), mv));
-        out[row] = o;
+    for (int half = 0; half < kGateHalves; ++half) {
+        float f = 0.f;
+        float gg = 0.f;
+#pragma unroll
+        for (int i = 0; i < kGateSteps; ++i) {
+            const int col = i * 4 * kLanesPerRow + sub * 4;
+            const uint2 packed = *reinterpret_cast<const uint2*>(down_s + col);
+            const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&packed);
+            float fv[4];
+            float gv[4];
+            unpack4(fw[half][i], fv);
+            unpack4(gw[half][i], gv);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float x = __bfloat162float(xv[k]);
+                f = ffma(fv[k], x, f);
+                gg = ffma(gv[k], x, gg);
+            }
+        }
+#pragma unroll
+        for (int offset = kLanesPerRow / 2; offset > 0; offset /= 2) {
+            f = fadd(f, __shfl_down_sync(0xffffffffu, f, offset));
+            gg = fadd(gg, __shfl_down_sync(0xffffffffu, gg, offset));
+        }
+        if constexpr (kFp8) {
+            f = fmul(forget_scale[half], f);
+            gg = fmul(gain_scale[half], gg);
+        }
+        o[half] = 0.f;
+        if (sub == 0) {
+            o[half] = fadd(fmul(fsub(1.f, tanhf(f)), hv[half]), fmul(tanhf(gg), mv[half]));
+            out[rows[half]] = o[half];
+        }
     }
     if (normed == nullptr) {
         return;
     }
-    // The norm: this block's sum of squares, shared through the barrier.
-    float ss = warp_sum(o * o);
-    if (lane == 0) {
-        warp_ss[warp] = ss;
+#pragma unroll
+    for (int half = 0; half < kGateHalves; ++half) {
+        const float ss = warp_sum(o[half] * o[half]);
+        if (lane == 0) {
+            warp_ss[half][warp] = ss;
+        }
     }
     __syncthreads();
-    if (t == 0) {
+    if (warp == 0) {
+        // Lanes 0 and 1 add the two halves' warp sums in message_gate_step's order, and
+        // lanes 0 .. 15 send both to every block.
         float acc = 0.f;
+        if (lane < kGateHalves) {
 #pragma unroll
-        for (int w = 0; w < kGateWarps; ++w) {
-            acc += warp_ss[w];
+            for (int w = 0; w < kGateWarps; ++w) {
+                acc += warp_ss[lane][w];
+            }
         }
-        part[blk * (kGateRank + 1) + kGateRank] = acc;
+        const float s0 = __shfl_sync(0xffffffffu, acc, 0);
+        const float s1 = __shfl_sync(0xffffffffu, acc, 1);
+        if (lane < kGateCluster) {
+            const uint32_t dst =
+                gate_cluster_addr(gate_smem_addr(norm_parts + int(rank) * kGateHalves), uint32_t(lane));
+            asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];" ::"r"(dst),
+                         "r"(__float_as_uint(s0)), "r"(__float_as_uint(s1)),
+                         "r"(gate_cluster_addr(norm_barrier, uint32_t(lane)))
+                         : "memory");
+        }
     }
-    grid_barrier(counter, kGateBlocks);
-    float total = 0.f;
-    if (lane < kGateBlocks) {
-        total = __ldcg(part + lane * (kGateRank + 1) + kGateRank);
-    }
-    total = warp_sum(total);
+    gate_wait(norm_barrier);
+    const float total = warp_sum(norm_parts[lane]);
     const float inv = 1.f / sqrtf(total / static_cast<float>(kHidden) + eps);
     if (sub == 0) {
-        normed[row] = __float2bfloat16((o * inv) * nw);
+#pragma unroll
+        for (int half = 0; half < kGateHalves; ++half) {
+            normed[rows[half]] = __float2bfloat16((o[half] * inv) * nw[half]);
+        }
     }
 }
 
@@ -708,9 +804,9 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
 // Gate s reads down_weight_s ([64, 4608] BF16), input_s ([4608] BF16: the normalized
 // state and message), forget_s and gain_s, h + s * h_stride and m + 2304 s, and writes
 // out + 2304 s and, with a norm weight, normed_s = bf16(rms_norm(out) * norm_weight_s).
-// `down`, if not null, receives each gate's BF16 down projection ([slots, 64]).
-// `partials` holds 32 * 65 floats per gate.
-extern "C" __global__ void __launch_bounds__(kGateThreads)
+// `down`, if not null, receives each gate's BF16 down projection ([slots, 64]). The grid
+// is (16, gates) blocks, one cluster per gate.
+extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
 message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __nv_bfloat16* __restrict__ down_weight1,
                        const __nv_bfloat16* __restrict__ down_weight2, const __nv_bfloat16* input0,
                        const __nv_bfloat16* input1, const __nv_bfloat16* input2,
@@ -720,8 +816,7 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
                        const float* h, int h_stride, const float* m, float* out,
                        const __nv_bfloat16* __restrict__ norm_weight0, const __nv_bfloat16* __restrict__ norm_weight1,
                        const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
-                       __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float* partials,
-                       unsigned* counters, float eps) {
+                       __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float eps) {
     const int g = blockIdx.y;
     // An explicit branch rather than a generic lambda, which nvcc 13.0 miscompiled here.
     GateWeights<false> wt{down_weight0, nullptr, forget0, nullptr, gain0, nullptr};
@@ -740,15 +835,14 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
         normed = normed2;
     }
     message_gate_step<false>(wt, input, h + size_t(g) * h_stride, m + size_t(g) * kHidden,
-                             out + size_t(g) * kHidden, norm_weight, normed, down,
-                             partials + size_t(g) * kGateBlocks * (kGateRank + 1), counters + g, eps);
+                             out + size_t(g) * kHidden, norm_weight, normed, down, eps);
 }
 
 // message_gate_step_2304 with E4M3 weights: down_s, forget_s and gain_s are the bytes of
 // each matrix in the layout of linear_fp8.cu, and *_scale_s their F32 row scales. Each
 // product sums the exactly widened weights in F32 and multiplies the row's scale into the
 // sum once.
-extern "C" __global__ void __launch_bounds__(kGateThreads)
+extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
 message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __restrict__ down1,
                            const uint8_t* __restrict__ down2, const float* __restrict__ down_scale0,
                            const float* __restrict__ down_scale1, const float* __restrict__ down_scale2,
@@ -763,8 +857,7 @@ message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __r
                            const __nv_bfloat16* __restrict__ norm_weight0,
                            const __nv_bfloat16* __restrict__ norm_weight1,
                            const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
-                           __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float* partials,
-                           unsigned* counters, float eps) {
+                           __nv_bfloat16* normed1, __nv_bfloat16* normed2, __nv_bfloat16* down, float eps) {
     const int g = blockIdx.y;
     // An explicit branch, as in message_gate_step_2304.
     GateWeights<true> wt{down0, down_scale0, forget0, forget_scale0, gain0, gain_scale0};
@@ -783,8 +876,7 @@ message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __r
         normed = normed2;
     }
     message_gate_step<true>(wt, input, h + size_t(g) * h_stride, m + size_t(g) * kHidden,
-                            out + size_t(g) * kHidden, norm_weight, normed, down,
-                            partials + size_t(g) * kGateBlocks * (kGateRank + 1), counters + g, eps);
+                            out + size_t(g) * kHidden, norm_weight, normed, down, eps);
 }
 
 // ---------------------------------------------------------------------------

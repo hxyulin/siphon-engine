@@ -89,10 +89,18 @@ __device__ __forceinline__ float dot4(uint32_t w, uint32_t x01, uint32_t x23, fl
     return acc;
 }
 
-// acc + dot(16 E4M3 weights, 16 BF16 inputs at x).
-__device__ __forceinline__ float dot16(uint4 w, const __nv_bfloat16* x, float acc) {
-    const uint4 x0 = reinterpret_cast<const uint4*>(x)[0];
-    const uint4 x1 = reinterpret_cast<const uint4*>(x)[1];
+// Shared-memory slot of the input's 16-byte unit u. A lane reads the two units of its
+// segment, 32 bytes past the previous lane's, so plain slots put two lanes of each
+// quarter warp in one bank; swapping the units of every other group of 8 spreads them.
+// With the input's loads issued together (see gemv_fp8), a step took 2.737 instead of
+// 2.756 ms at context 0 and 3.261 instead of 3.286 ms at 32K.
+__device__ __forceinline__ int x_slot(int u) { return u ^ ((u >> 3) & 1); }
+
+// acc + dot(16 E4M3 weights, the 16 BF16 inputs of segment `seg` of `xs`, units 2 seg and
+// 2 seg + 1).
+__device__ __forceinline__ float dot16(uint4 w, const uint4* xs, int seg, float acc) {
+    const uint4 x0 = xs[x_slot(2 * seg)];
+    const uint4 x1 = xs[x_slot(2 * seg + 1)];
     acc = dot4(w.x, x0.x, x0.y, acc);
     acc = dot4(w.y, x0.z, x0.w, acc);
     acc = dot4(w.z, x1.x, x1.y, acc);
@@ -137,9 +145,25 @@ __device__ void gemv_fp8(const Batch& b, __nv_bfloat16* x_smem) {
     }
     pdl_trigger();
 
+    // Every load of x before any store, so the loads overlap.
     const auto* x = reinterpret_cast<const uint4*>(seg.x);
-    for (int i = threadIdx.x; i < K / 8; i += kThreads) {
-        reinterpret_cast<uint4*>(x_smem)[i] = x[i];
+    auto* xs = reinterpret_cast<uint4*>(x_smem);
+    constexpr int kXUnits = K / 8;
+    constexpr int kXPerThread = (kXUnits + kThreads - 1) / kThreads;
+    uint4 xv[kXPerThread];
+#pragma unroll
+    for (int i = 0; i < kXPerThread; ++i) {
+        const int u = threadIdx.x + i * kThreads;
+        if (u < kXUnits) {
+            xv[i] = x[u];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kXPerThread; ++i) {
+        const int u = threadIdx.x + i * kThreads;
+        if (u < kXUnits) {
+            xs[x_slot(u)] = xv[i];
+        }
     }
     __syncthreads();
 
@@ -148,8 +172,7 @@ __device__ void gemv_fp8(const Batch& b, __nv_bfloat16* x_smem) {
     for (int v = 0; v < V; ++v) {
         const int j = v * 32 + lane;
         const int r = j / kRowVecs;
-        const int col = (j - r * kRowVecs) * 16;
-        const float d = dot16(wv[v], x_smem + col, 0.f);
+        const float d = dot16(wv[v], xs, j - r * kRowVecs, 0.f);
 #pragma unroll
         for (int rr = 0; rr < R; ++rr) {
             // Rows this load touches: the select folds away where r is known.

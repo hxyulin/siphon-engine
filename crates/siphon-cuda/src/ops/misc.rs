@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
-    PushKernelArg as _,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
+    LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
 };
 use half::bf16;
 
@@ -26,6 +26,8 @@ const GATE_RANK: usize = 64;
 /// Blocks and threads of `message_gate_out_2304`: 72 output rows per block.
 const GATE_OUT_BLOCKS: u32 = (HIDDEN / 72) as u32;
 const GATE_OUT_THREADS: u32 = 288;
+/// Blocks per gate of `message_gate_step`, one cluster, `kGateCluster` in the kernel.
+const GATE_CLUSTER: u32 = 16;
 /// Tile of `message_gate_out_rows_2304`: rows by output columns, with 256 threads.
 const GATE_TILE_ROWS: usize = 64;
 const GATE_TILE_COLS: usize = 64;
@@ -61,23 +63,6 @@ pub struct GateStep<'a> {
     /// Every gate of a launch has them or none does.
     pub fp8: Option<&'a [Fp8Matrix; 3]>,
     pub norm: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
-}
-
-/// The cross-block sums and barrier counters of [`Misc::message_gate_step`].
-pub struct GateStepScratch {
-    partials: CudaSlice<f32>,
-    /// One per gate, a multiple of the blocks per gate between launches.
-    counters: CudaSlice<u32>,
-}
-
-impl GateStepScratch {
-    pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
-        Ok(Self {
-            partials: stream
-                .alloc_zeros(GATE_SLOTS * GATE_OUT_BLOCKS as usize * (GATE_RANK + 1))?,
-            counters: stream.alloc_zeros(GATE_SLOTS)?,
-        })
-    }
 }
 
 /// The partial results of [`Misc::argmax_wide_f32`].
@@ -136,6 +121,16 @@ fn grid_stride(n: usize) -> LaunchConfig {
     }
 }
 
+/// Loads a kernel compiled with a cluster of 16 blocks, above the portable limit of 8.
+fn cluster_function(module: &Arc<CudaModule>, name: &str) -> anyhow::Result<CudaFunction> {
+    let f = module.load_function(name)?;
+    f.set_attribute(
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+        1,
+    )?;
+    Ok(f)
+}
+
 fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
     ensure!(len == want, "{name} has {len} elements, expected {want}");
     Ok(())
@@ -153,8 +148,8 @@ impl Misc {
             message_gate_out_rows_2304: module.load_function("message_gate_out_rows_2304")?,
             message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
-            message_gate_step_2304: module.load_function("message_gate_step_2304")?,
-            message_gate_step_fp8_2304: module.load_function("message_gate_step_fp8_2304")?,
+            message_gate_step_2304: cluster_function(&module, "message_gate_step_2304")?,
+            message_gate_step_fp8_2304: cluster_function(&module, "message_gate_step_fp8_2304")?,
             decode_prologue_2304: module.load_function("decode_prologue_2304")?,
         })
     }
@@ -362,7 +357,6 @@ impl Misc {
         m: &impl DeviceIn<f32>,
         out: &mut impl DeviceOut<f32>,
         down: Option<&mut CudaSlice<bf16>>,
-        scratch: &mut GateStepScratch,
         eps: f32,
     ) -> anyhow::Result<()> {
         let (h, m, mut out) = (h.view(), m.view(), out.view_mut());
@@ -405,7 +399,7 @@ impl Misc {
             }
         }
         let config = LaunchConfig {
-            grid_dim: (GATE_OUT_BLOCKS, u32::try_from(n)?, 1),
+            grid_dim: (GATE_CLUSTER, u32::try_from(n)?, 1),
             block_dim: (GATE_OUT_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -430,10 +424,7 @@ impl Misc {
                 stream,
             );
         }
-        args.opt_mut(down, stream)
-            .ptr_mut(&mut scratch.partials, stream)
-            .ptr_mut(&mut scratch.counters, stream)
-            .f32(eps);
+        args.opt_mut(down, stream).f32(eps);
         let function = if fp8 {
             &self.message_gate_step_fp8_2304
         } else {
@@ -441,10 +432,9 @@ impl Misc {
         };
         // SAFETY: the arguments match `message_gate_step_2304`'s signature, or with FP8
         // weights `message_gate_step_fp8_2304`'s, every buffer has the length checked above
-        // for the `n` gates of the grid's y dimension, the scratch holds 32 x 65 partial sums
-        // and a barrier counter per gate, a null `normed` makes a gate skip the norm, and the
-        // kernel reads only weights before `pdl_wait`. Its barriers need every block
-        // resident, which 32 blocks of 288 threads per gate are.
+        // for the `n` gates of the grid's y dimension, the grid is one cluster of 16 blocks
+        // per gate as the kernel is compiled, a null `normed` makes a gate skip the norm, and
+        // the kernel reads only weights before `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
