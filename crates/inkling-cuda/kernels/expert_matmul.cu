@@ -8,8 +8,8 @@
 //
 // 1. `expert_group` counts the pairs per expert, takes a prefix sum, writes
 //    the pairs sorted by expert (`perm`) and a list of tiles of at most 64
-//    pairs of one expert. The grouping depends only on the ids, so one serves
-//    both projections of a layer.
+//    pairs of one expert (128 for the quantized products below). The grouping
+//    depends only on the ids, so one serves both projections of a layer.
 // 2. `expert_gemm_*` runs one CTA per (tile, 128 output columns). It streams
 //    its weight and scale tile into L2 ahead of use. Then, 64 input values
 //    at a time, it copies the raw weight bytes, their scales and the tile's
@@ -539,17 +539,10 @@ __device__ void expert_gemm(const __nv_bfloat16* __restrict__ x, const uint8_t* 
 //   448 rounded up to a power of two.
 // Both round to nearest even with saturation.
 //
-// Values are stored per row, 32 bytes (one MMA k step) at a time, with the
-// eight 4-byte words of each step in the order 0, 4, 1, 5, 2, 6, 3, 7, so that
-// a lane loads its two B registers with one 8-byte shared load. Scales are in
-// natural order: k / 16 E4M3 or k / 32 UE8M0 bytes per row.
+// Values and scales are stored per row in natural order: k / 2 (NVFP4) or k
+// (MXFP8) value bytes, and k / 16 E4M3 or k / 32 UE8M0 scale bytes.
 
 constexpr float kFp32Max = 3.4028234663852886e38f;
-
-// The position of word `w` of a 32-byte step in the stored order.
-__host__ __device__ constexpr int stored_word(int w) {
-    return w < 4 ? 2 * w : 2 * (w - 4) + 1;
-}
 
 __device__ float e4m3_round(float x) {
     const __nv_fp8_e4m3 q(x);  // cvt.rn.satfinite
@@ -664,10 +657,7 @@ __device__ void quantize_row_nvfp4(const __nv_bfloat16* __restrict__ row, int k,
         const uint2 packed = choose4 ? packed4 : packed6;
         const __nv_fp8_e4m3 scale(choose4 ? scale4 : scale6);
         scales[b] = scale.__x;
-        // Block b is words 2q and 2q + 1 of step b / 4, q = b % 4.
-        uint32_t* step = reinterpret_cast<uint32_t*>(values + b / 4 * 32);
-        step[stored_word(2 * (b % 4))] = packed.x;
-        step[stored_word(2 * (b % 4) + 1)] = packed.y;
+        *reinterpret_cast<uint2*>(values + b * 8) = packed;
     }
 }
 
@@ -705,7 +695,7 @@ __device__ void quantize_row_mxfp8(const __nv_bfloat16* __restrict__ row, int k,
                 const __nv_fp8_e4m3 q(v);
                 word |= uint32_t(q.__x) << (8 * i);
             }
-            words[stored_word(w)] = word;
+            words[w] = word;
         }
         uint4* dst = reinterpret_cast<uint4*>(values + b * 32);
         dst[0] = make_uint4(words[0], words[1], words[2], words[3]);
@@ -713,61 +703,85 @@ __device__ void quantize_row_mxfp8(const __nv_bfloat16* __restrict__ row, int k,
     }
 }
 
+// The quantized GEMM, structured like CUTLASS's sm_120 grouped block-scaled
+// GEMM: tiles of 128 pairs by 128 output columns, so that an expert's weights
+// stream from L2 about once per call instead of once per 64 pairs. 8 warps
+// split the tile 4 ways along the columns and 2 ways along the pairs; each
+// warp owns 32 columns and 64 pairs, and loads its fragments with `ldmatrix`.
+//
+// A pipeline stage holds two MMA k steps, 64 bytes, of each of the 128 weight
+// rows and 128 pairs: each L2 request then covers two sectors, and the L2's
+// request rate binds less. The four 16-byte units of each row are XOR-swizzled
+// so that the 8 rows one `ldmatrix` reads fall in distinct banks. Scales load
+// into a ring of 2 slots of 16 bytes per row, each slot covering 4 NVFP4 k
+// steps (4 E4M3 bytes per step) or 16 MXFP8 k steps (one E8M0 byte), in
+// pieces of 8 (NVFP4) or 4 (MXFP8) bytes as their steps come up. Two stages
+// and two CTAs per SM.
+constexpr int kQTileT = 128;
+constexpr int kQStages = 2;
+constexpr int kQRowBytes = 64;
+constexpr int kQStageSteps = kQRowBytes / 32;
+constexpr int kQRows = kTileN + kQTileT;
+constexpr int kQStageBytes = kQRows * kQRowBytes;
+constexpr int kQSlotRow = 16;
+constexpr int kQSlots = 2;
+constexpr int kQShared = kQStages * kQStageBytes + kQSlots * kQRows * kQSlotRow;
+static_assert(kQTileT * kOutStride * 2 <= kQShared, "the epilogue staging fits");
+
+template <bool kFp4>
+struct QFormat {
+    // k steps per scale slot; bytes and k steps of one scale piece per row;
+    // values per scale.
+    static constexpr int kSlotSteps = kFp4 ? 4 : 16;
+    static constexpr int kPiece = kFp4 ? 8 : 4;
+    static constexpr int kPieceSteps = kFp4 ? 2 : 4;
+    static constexpr int kGroup = kFp4 ? 16 : 32;
+};
+
+// Byte offset of 16-byte unit `u` (0 to 3) of row `row` in a stage.
+__device__ __forceinline__ int q_offset(int row, int u) {
+    return row * kQRowBytes + ((u ^ (row >> 1 & 3)) << 4);
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// Block-scaled FP4 and FP8 MMAs with F32 accumulation. Lanes t = 0 and 1 of
+// each quad pass the A scales of rows g and g + 8. The B scales of column g
+// come from lane `kThreadB` of each quad (NVFP4: four E4M3 bytes, one per 16
+// values), or from byte `kByte` of every lane's register (MXFP8: one E8M0
+// byte per 32 values, A scales too).
+template <int kThreadB>
 __device__ __forceinline__ void mma_fp4(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
-                                        uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
+                                            uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
     asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1."
         "e2m1.f32.ue4m3 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
         "{%13}, {%14,%15};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
-          "h"(uint16_t(0)), "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(0)), "h"(uint16_t(0)));
+          "h"(uint16_t(0)), "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(0)),
+          "h"(uint16_t(kThreadB)));
 }
 
+template <int kByte>
 __device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
-                                        uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
+                                            uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
     asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
         "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
         "{%13}, {%14,%15};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
-          "h"(uint16_t(0)), "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(0)), "h"(uint16_t(0)));
+          "h"(uint16_t(kByte)), "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(kByte)),
+          "h"(uint16_t(0)));
 }
 
-// Shared memory of the quantized GEMM. A pipeline stage holds 64 bytes (two
-// MMA k steps: 128 NVFP4 or 64 MXFP8 values) of each of the 128 weight rows
-// and 64 pairs. The 16-byte units of each row are XOR-swizzled so that the A
-// and B fragment loads are free of bank conflicts. The scales of a stage
-// (NVFP4: 8 bytes per row) or of an aligned pair of stages (MXFP8: 4 bytes per
-// row) load into a ring after the stages, as in `Stage`.
-template <bool kFp4, int kStages>
-struct QStage {
-    static constexpr int kRowBytes = 64;
-    static constexpr int kWeight = kTileN * kRowBytes;
-    static constexpr int kInput = kTileT * kRowBytes;
-    static constexpr int kBytes = kWeight + kInput;
-    // Input values per stage, and per scale byte.
-    static constexpr int kValues = kFp4 ? 128 : 64;
-    static constexpr int kGroup = kFp4 ? 16 : 32;
-    // Stages per scale load, and scale bytes per row and load.
-    static constexpr int kScaleChunks = kFp4 ? 1 : 2;
-    static constexpr int kScaleRow = kScaleChunks * kValues / kGroup;
-    static constexpr int kScaleSlots = kFp4 ? kStages : (kStages + 2) / 2;
-    static constexpr int kScaleSlot = (kTileN + kTileT) * kScaleRow;
-    static constexpr int kShared = kStages * kBytes + kScaleSlots * kScaleSlot;
-};
-
-// The stored 16-byte unit of unit u of weight row r and of pair p.
-__device__ __forceinline__ int weight_unit(int r, int u) {
-    return u ^ ((r >> 1) & 3);
-}
-__device__ __forceinline__ int input_unit(int p, int u) {
-    return u ^ ((p >> 1) & 1) * 2;
-}
-
-// One CTA of the quantized GEMM: 128 output columns of one tile of pairs, as
-// in `expert_gemm`. `xq`, `xq_scales` and `xq_outer` hold the quantized
+// One CTA of the quantized GEMM: 128 output columns of one tile of up to 128
+// pairs of one expert. `xq`, `xq_scales` and `xq_outer` hold the quantized
 // inputs; `xq_outer` (NVFP4 only) is each input row's outer scale.
-template <bool kFp4, int kStages, bool kSwiglu>
+template <bool kFp4, bool kSwiglu>
 __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xq_scales,
                               const float* __restrict__ xq_outer, const uint8_t* __restrict__ weight,
                               const uint8_t* __restrict__ scales,
@@ -776,7 +790,7 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
                               const int4* __restrict__ tiles, const int* __restrict__ group_counts,
                               int n, int k, int inputs_per_row, float gate_softcap,
                               float up_softcap) {
-    using S = QStage<kFp4, kStages>;
+    using F = QFormat<kFp4>;
     const int tile_count = group_counts[0];
     const int n0 = blockIdx.x * kTileN;
     const int tid = threadIdx.x;
@@ -793,90 +807,77 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
     const int count = tile.z;
 
     extern __shared__ __align__(16) uint8_t smem[];
-    uint8_t* const scale_ring = smem + kStages * S::kBytes;
-    __shared__ float pair_outer[kTileT];
+    uint8_t* const slots = smem + kQStages * kQStageBytes;
+    __shared__ float pair_outer[kQTileT];
 
     const int lane = tid % 32;
     const int warp = tid / 32;
     const int g = lane / 4;
     const int t = lane % 4;
+    // This warp's 32 columns and 64 pairs.
+    const int col0 = warp % 4 * 32;
+    const int pair0 = warp / 4 * 64;
 
     const size_t row_bytes = kFp4 ? k / 2 : k;
-    const size_t scale_row_bytes = k / S::kGroup;
-    const int fragments = (count + 7) / 8;
+    const size_t scale_row_bytes = k / F::kGroup;
     auto input_of = [&](int pair) {
         const int entry = perm[start + (pair < count ? pair : 0)];
         return inputs_per_row == 1 ? entry / kSlots : entry;
     };
 
-    // cp.async sources: 2 weight units and 1 input unit per thread per stage.
-    constexpr int kWeightUnits = S::kWeight / 16 / kThreads;
-    static_assert(S::kInput / 16 == kThreads);
-    const uint8_t* weight_src[kWeightUnits];
-    int weight_valid[kWeightUnits];
-    int weight_dst[kWeightUnits];
+    // Each thread copies unit tid % 4 of weight rows tid / 4 and tid / 4 + 64,
+    // and of pairs tid / 4 and tid / 4 + 64, per stage, and the scale pieces of
+    // row tid (weight rows, then pairs).
+    const int copy_unit = tid % 4;
+    const uint8_t* weight_src[2];
+    const uint8_t* input_src[2];
+    uint32_t weight_dst[2];
+    uint32_t input_dst[2];
+    int weight_bytes[2];
+    int input_bytes[2];
 #pragma unroll
-    for (int i = 0; i < kWeightUnits; ++i) {
-        const int unit = tid + i * kThreads;
-        const int row = unit / 4;
-        const int part = unit % 4;
+    for (int i = 0; i < 2; ++i) {
+        const int row = tid / 4 + 64 * i;
         const bool valid = n0 + row < n;
-        weight_valid[i] = valid ? 16 : 0;
-        weight_src[i] = valid ? weight + (size_t(expert) * n + n0 + row) * row_bytes + part * 16
-                              : weight;
-        weight_dst[i] = row * S::kRowBytes + weight_unit(row, part) * 16;
+        weight_bytes[i] = valid ? 16 : 0;
+        weight_src[i] = weight + (size_t(expert) * n + n0 + (valid ? row : 0)) * row_bytes + copy_unit * 16;
+        weight_dst[i] = q_offset(row, copy_unit);
+        input_src[i] = xq + size_t(input_of(row)) * row_bytes + copy_unit * 16;
+        input_dst[i] = q_offset(kTileN + row, copy_unit);
+        input_bytes[i] = row < count ? 16 : 0;
     }
-    const int input_pair = tid / 4;
-    const int input_part = tid % 4;
-    const uint8_t* input_src = xq + size_t(input_of(input_pair)) * row_bytes + input_part * 16;
-    const int input_dst = S::kWeight + input_pair * S::kRowBytes +
-                          input_unit(input_pair, input_part) * 16;
-    const int input_bytes = input_pair < count ? 16 : 0;
-    const bool input_load = input_pair < fragments * 8;
-    // Threads below 128 copy the scales of weight row `tid`, the next 64 those
-    // of pair `tid - 128`.
-    const bool weight_scale_load = tid < kTileN && n0 + tid < n;
-    const uint8_t* weight_scale_src =
-        scales + (size_t(expert) * n + n0 + min(tid, kTileN - 1)) * scale_row_bytes;
-    const bool input_scale_load = tid >= kTileN && tid < kTileN + kTileT;
-    const uint8_t* input_scale_src =
-        xq_scales + size_t(input_of(min(max(tid - kTileN, 0), kTileT - 1))) * scale_row_bytes;
-    if (kFp4 && tid < kTileT) {
+    const uint8_t* scale_src =
+        tid < kTileN ? scales + (size_t(expert) * n + n0 + (n0 + tid < n ? tid : 0)) * scale_row_bytes
+                     : xq_scales + size_t(input_of(tid - kTileN)) * scale_row_bytes;
+    if (kFp4 && tid < kQTileT) {
         pair_outer[tid] = xq_outer[input_of(tid)];
     }
 
-    auto load_stage = [&](int chunk, int stage) {
-        uint8_t* base = smem + stage * S::kBytes;
-        if (chunk % S::kScaleChunks == 0) {
-            const int load = chunk / S::kScaleChunks;
-            uint8_t* slot = scale_ring + load % S::kScaleSlots * S::kScaleSlot;
-            if (weight_scale_load) {
-                cp_async_small<S::kScaleRow>(slot + tid * S::kScaleRow,
-                                             weight_scale_src + load * S::kScaleRow);
-            } else if (input_scale_load) {
-                cp_async_small<S::kScaleRow>(slot + tid * S::kScaleRow,
-                                             input_scale_src + load * S::kScaleRow);
-            }
+    auto load_stage = [&](int index, int stage) {
+        uint8_t* base = smem + stage * kQStageBytes;
+        const int step = index * kQStageSteps;
+        if (step % F::kPieceSteps == 0) {
+            const int piece = step / F::kPieceSteps;
+            uint8_t* dst = slots + step / F::kSlotSteps % kQSlots * (kQRows * kQSlotRow) +
+                           tid * kQSlotRow + step % F::kSlotSteps / F::kPieceSteps * F::kPiece;
+            cp_async_small<F::kPiece>(dst, scale_src + piece * F::kPiece);
         }
-        const int offset = chunk * S::kRowBytes;
+        const int offset = index * kQRowBytes;
 #pragma unroll
-        for (int i = 0; i < kWeightUnits; ++i) {
-            cp_async16(base + weight_dst[i], weight_src[i] + offset, weight_valid[i]);
-        }
-        if (input_load) {
-            cp_async16(base + input_dst, input_src + offset, input_bytes);
+        for (int i = 0; i < 2; ++i) {
+            cp_async16(base + weight_dst[i], weight_src[i] + offset, weight_bytes[i]);
+            cp_async16(base + input_dst[i], input_src[i] + offset, input_bytes[i]);
         }
     };
 
-    // L2 prefetch of the weights, as in `expert_gemm`, but only by the CTAs of
-    // an expert's first tile. With a tensor core this fast the products are
-    // bound by L2 bandwidth, and the other tiles of the expert run at about
-    // the same time and find the weights in L2.
+    // MXFP8 only: L2 prefetch of the weights by the CTAs of an expert's first
+    // tile, as in `expert_gemm`; lane 0 of warp w prefetches rows 16w to
+    // 16w + 15. It took 591 us against 657 us without for MXFP8 `w13`, but
+    // 342 us against 334 us for NVFP4, whose weights take half the bytes.
     constexpr int kSegmentBytes = 256;
-    constexpr int kSegmentChunks = kSegmentBytes / S::kRowBytes;
-    const bool warp_active = n0 + warp * 16 < n;
-    const bool prefetch = (blockIdx.y == 0 || tiles[blockIdx.y - 1].x != expert) &&
-                          warp_active && lane == 0;
+    constexpr int kSegmentStages = kSegmentBytes / kQRowBytes;
+    const bool prefetch = !kFp4 && (blockIdx.y == 0 || tiles[blockIdx.y - 1].x != expert) &&
+                          n0 + warp * 16 < n && lane == 0;
     const size_t warp_first_row = size_t(expert) * n + n0 + warp * 16;
     auto prefetch_segment = [&](int segment) {
         const int offset = segment * kSegmentBytes;
@@ -894,91 +895,129 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
     prefetch_segment(0);
     prefetch_segment(1);
 
-    const int chunks = int(row_bytes) / S::kRowBytes;
-    float acc[kTileT / 8][4];
+    const int stages = int(row_bytes) / kQRowBytes;
+    float acc[2][8][4];
 #pragma unroll
-    for (int j = 0; j < kTileT / 8; ++j) {
+    for (int i = 0; i < 2; ++i)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            acc[j][i] = 0.f;
-        }
-    }
+        for (int j = 0; j < 8; ++j)
 #pragma unroll
-    for (int s = 0; s < kStages - 1; ++s) {
-        if (s < chunks) {
+            for (int v = 0; v < 4; ++v) {
+                acc[i][j][v] = 0.f;
+            }
+#pragma unroll
+    for (int s = 0; s < kQStages - 1; ++s) {
+        if (s < stages) {
             load_stage(s, s);
         }
         cp_async_commit();
     }
 
-    const int row0 = warp * 16 + g;
-    // The weight row whose scales this lane passes: lanes t = 0 and 1 of each
-    // quad give rows g and g + 8; the MMA ignores lanes 2 and 3.
-    const int scale_row = row0 + 8 * (t & 1);
+    const uint32_t smem0 = smem_addr(smem);
+    // ldmatrix rows: A rows col0 + 16i + lane % 8 + 8 (lane / 8 % 2), unit
+    // 2 sub + lane / 16; B pairs pair0 + 16q + lane % 8 + 8 (lane / 16), unit
+    // 2 sub + lane / 8 % 2, for k step `sub` of a stage.
+    const int a_row = col0 + lane % 8 + 8 * (lane / 8 % 2);
+    const int b_pair = kTileN + pair0 + lane % 8 + 8 * (lane / 16);
+    // The weight rows whose scales this lane passes: lanes t = 0 and 1 of each
+    // quad give rows g and g + 8 of each 16-row fragment.
+    const int scale_row = col0 + g + 8 * (t & 1);
+    // Pair whose scale row this lane addresses for ldmatrix: lane l gives row
+    // l % 8 of matrix l / 8, pairs 8m to 8m + 7 of each 32.
+    const int scale_pair = kTileN + pair0 + lane;
 
-    auto compute = [&]<int kFragments>(int chunk, int stage) {
-        const uint8_t* base = smem + stage * S::kBytes;
-        const uint8_t* slot = scale_ring + chunk / S::kScaleChunks % S::kScaleSlots * S::kScaleSlot;
-        // Scale bytes of this chunk within a row's scale load.
-        const int scale_offset = chunk % S::kScaleChunks * (S::kValues / S::kGroup);
-#pragma unroll
-        for (int step = 0; step < 2; ++step) {
-            uint32_t a[4];
-            const uint8_t* lo = base + row0 * S::kRowBytes + 4 * t;
-            const uint8_t* hi = lo + 8 * S::kRowBytes;
-            a[0] = *reinterpret_cast<const uint32_t*>(lo + weight_unit(row0, 2 * step) * 16);
-            a[1] = *reinterpret_cast<const uint32_t*>(hi + weight_unit(row0, 2 * step) * 16);
-            a[2] = *reinterpret_cast<const uint32_t*>(lo + weight_unit(row0, 2 * step + 1) * 16);
-            a[3] = *reinterpret_cast<const uint32_t*>(hi + weight_unit(row0, 2 * step + 1) * 16);
-            uint32_t scale_a;
-            if constexpr (kFp4) {
-                scale_a = *reinterpret_cast<const uint32_t*>(slot + scale_row * S::kScaleRow +
-                                                             scale_offset + 4 * step);
-            } else {
-                scale_a = slot[scale_row * S::kScaleRow + scale_offset + step];
+    // One k step, `step`, from stage buffer `stage`, unit pair `sub` of it.
+    auto compute = [&]<int kFragments, int kSub>(int step, int stage, int sub) {
+        const uint32_t base = smem0 + stage * kQStageBytes;
+        const uint8_t* slot = slots + step / F::kSlotSteps % kQSlots * (kQRows * kQSlotRow);
+        uint32_t a[2][4];
+        ldmatrix_x4(a[0], base + q_offset(a_row, 2 * sub + lane / 16));
+        ldmatrix_x4(a[1], base + q_offset(a_row + 16, 2 * sub + lane / 16));
+        uint32_t sa[2];
+        // The scale word of this step: NVFP4 steps take one each, MXFP8 steps
+        // one byte of word step % 16 / 4.
+        const int word = kFp4 ? step % 4 : step % 16 / 4;
+        sa[0] = *reinterpret_cast<const uint32_t*>(slot + scale_row * kQSlotRow + 4 * word);
+        sa[1] = *reinterpret_cast<const uint32_t*>(slot + (scale_row + 16) * kQSlotRow + 4 * word);
+        // B scales: NVFP4 lane (g, t) loads step t of the slot for pairs 8m + g
+        // (ldmatrix, 4 matrices per 32 pairs) and the MMA takes them from lane
+        // kSub; MXFP8 loads word `word` of pair 8j + g and takes byte kSub.
+        uint32_t sb[8];
+        if constexpr (kFp4) {
+            uint32_t r[4];
+            ldmatrix_x4(r, smem_addr(slot) + scale_pair * kQSlotRow);
+            sb[0] = r[0]; sb[1] = r[1]; sb[2] = r[2]; sb[3] = r[3];
+            if constexpr (kFragments > 4) {
+                ldmatrix_x4(r, smem_addr(slot) + (scale_pair + 32) * kQSlotRow);
+                sb[4] = r[0]; sb[5] = r[1]; sb[6] = r[2]; sb[7] = r[3];
             }
+        } else {
 #pragma unroll
             for (int j = 0; j < kFragments; ++j) {
-                const int pair = j * 8 + g;
-                const uint2 b = *reinterpret_cast<const uint2*>(
-                    base + S::kWeight + pair * S::kRowBytes +
-                    input_unit(pair, 2 * step + t / 2) * 16 + 8 * (t % 2));
-                const uint8_t* pair_scales = slot + (kTileN + pair) * S::kScaleRow + scale_offset;
-                if constexpr (kFp4) {
-                    const uint32_t scale_b =
-                        *reinterpret_cast<const uint32_t*>(pair_scales + 4 * step);
-                    mma_fp4(acc[j], a, b.x, b.y, scale_a, scale_b);
-                } else {
-                    mma_fp8(acc[j], a, b.x, b.y, scale_a, pair_scales[step]);
+                sb[j] = *reinterpret_cast<const uint32_t*>(
+                    slot + (kTileN + pair0 + 8 * j + g) * kQSlotRow + 4 * word);
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < (kFragments + 1) / 2; ++q) {
+            uint32_t b[4];
+            ldmatrix_x4(b, base + q_offset(b_pair + 16 * q, 2 * sub + lane / 8 % 2));
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int j = 2 * q + h;
+                if (j < kFragments) {
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        if constexpr (kFp4) {
+                            mma_fp4<kSub>(acc[i][j], a[i], b[2 * h], b[2 * h + 1], sa[i], sb[j]);
+                        } else {
+                            mma_fp8<kSub>(acc[i][j], a[i], b[2 * h], b[2 * h + 1], sa[i], sb[j]);
+                        }
+                    }
                 }
             }
         }
     };
 
+    // Pair fragments of this warp holding at least one real pair.
+    const int fragments = min(max((count - pair0 + 7) / 8, 0), 8);
     auto main_loop = [&]<int kFragments>() {
-        for (int chunk0 = 0; chunk0 < chunks; chunk0 += kStages) {
+        for (int index0 = 0; index0 < stages; index0 += kQStages) {
 #pragma unroll
-            for (int stage = 0; stage < kStages; ++stage) {
-                const int chunk = chunk0 + stage;
-                if (chunk < chunks) {
-                    cp_async_wait<kStages - 2>();
+            for (int stage = 0; stage < kQStages; ++stage) {
+                const int index = index0 + stage;
+                if (index < stages) {
+                    cp_async_wait<kQStages - 2>();
                     __syncthreads();
-                    const int next = chunk + kStages - 1;
-                    if (next < chunks) {
-                        load_stage(next, (stage + kStages - 1) % kStages);
+                    const int next = index + kQStages - 1;
+                    if (next < stages) {
+                        load_stage(next, (stage + kQStages - 1) % kQStages);
                     }
                     cp_async_commit();
-                    if (chunk % kSegmentChunks == 0 && chunk > 0) {
-                        prefetch_segment(chunk / kSegmentChunks + 1);
+                    if (index % kSegmentStages == 0 && index > 0) {
+                        prefetch_segment(index / kSegmentStages + 1);
                     }
-                    if (warp_active) {
-                        compute.template operator()<kFragments>(chunk, stage);
+                    if constexpr (kFragments > 0) {
+                        // A step's selector is step % 4 = (2 stage + sub) % 4,
+                        // since index0 is even; the switch folds away once the
+                        // loop unrolls.
+                        const int step = index * kQStageSteps;
+                        if (stage % 2 == 0) {
+                            compute.template operator()<kFragments, 0>(step, stage, 0);
+                            compute.template operator()<kFragments, 1>(step + 1, stage, 1);
+                        } else {
+                            compute.template operator()<kFragments, 2>(step, stage, 0);
+                            compute.template operator()<kFragments, 3>(step + 1, stage, 1);
+                        }
                     }
                 }
             }
         }
     };
+    static_assert(kQStages % 2 == 0 && kQStageSteps == 2,
+                  "the selectors take step % 4 from the stage");
     switch (fragments) {
+        case 0: main_loop.template operator()<0>(); break;
         case 1: main_loop.template operator()<1>(); break;
         case 2: main_loop.template operator()<2>(); break;
         case 3: main_loop.template operator()<3>(); break;
@@ -995,24 +1034,26 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
     // output scale is the weights' global scale times each input row's outer
     // scale (NVFP4), or 1 (MXFP8).
     __nv_bfloat16* staged = reinterpret_cast<__nv_bfloat16*>(smem);
-    if (warp_active) {
-        float w_scale = 1.f;
+    float w_scale = 1.f;
+    if constexpr (kFp4) {
+        w_scale = __fdiv_rn(global_scale[expert], kNvfp4ScaleEnc);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int pair = pair0 + j * 8 + 2 * t;
+        float s0 = 1.f;
+        float s1 = 1.f;
         if constexpr (kFp4) {
-            w_scale = __fdiv_rn(global_scale[expert], kNvfp4ScaleEnc);
+            s0 = __fmul_rn(pair_outer[pair], w_scale);
+            s1 = __fmul_rn(pair_outer[pair + 1], w_scale);
         }
 #pragma unroll
-        for (int j = 0; j < kTileT / 8; ++j) {
-            const int pair = j * 8 + 2 * t;
-            float s0 = 1.f;
-            float s1 = 1.f;
-            if constexpr (kFp4) {
-                s0 = __fmul_rn(pair_outer[pair], w_scale);
-                s1 = __fmul_rn(pair_outer[pair + 1], w_scale);
-            }
-            staged[pair * kOutStride + row0] = __float2bfloat16(acc[j][0] * s0);
-            staged[(pair + 1) * kOutStride + row0] = __float2bfloat16(acc[j][1] * s1);
-            staged[pair * kOutStride + row0 + 8] = __float2bfloat16(acc[j][2] * s0);
-            staged[(pair + 1) * kOutStride + row0 + 8] = __float2bfloat16(acc[j][3] * s1);
+        for (int i = 0; i < 2; ++i) {
+            const int col = col0 + 16 * i + g;
+            staged[pair * kOutStride + col] = __float2bfloat16(acc[i][j][0] * s0);
+            staged[(pair + 1) * kOutStride + col] = __float2bfloat16(acc[i][j][1] * s1);
+            staged[pair * kOutStride + col + 8] = __float2bfloat16(acc[i][j][2] * s0);
+            staged[(pair + 1) * kOutStride + col + 8] = __float2bfloat16(acc[i][j][3] * s1);
         }
     }
     __syncthreads();
@@ -1025,13 +1066,13 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
 //
 // Writes `perm[i]`, the flat index `row * 8 + slot` of the i-th pair in expert
 // order, and `tiles[i] = {expert, first position in perm, pairs, 0}` for each
-// run of at most 64 pairs of one expert, ordered by expert. Pairs with an id
-// outside `[0, experts)` come last in `perm`, in no particular order, and get
-// no tile. `group_counts` receives the number of tiles, the number of pairs
-// with known ids, and `entries`. One block of 1024 threads; at most 16,384
-// pairs and 1024 experts.
+// run of at most `tile_pairs` (64 or 128) pairs of one expert, ordered by
+// expert. Pairs with an id outside `[0, experts)` come last in `perm`, in no
+// particular order, and get no tile. `group_counts` receives the number of
+// tiles, the number of pairs with known ids, and `entries`. One block of 1024
+// threads; at most 16,384 pairs and 1024 experts.
 extern "C" __global__ void __launch_bounds__(kGroupThreads)
-    expert_group(const int32_t* __restrict__ indices, int entries, int experts,
+    expert_group(const int32_t* __restrict__ indices, int entries, int experts, int tile_pairs,
                  int32_t* __restrict__ perm, int4* __restrict__ tiles,
                  int32_t* __restrict__ group_counts) {
     __shared__ int count[kMaxExperts];
@@ -1077,7 +1118,7 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
     int expert_tiles = 0;
     if (tid < experts) {
         pairs = count[tid];
-        expert_tiles = (pairs + kTileT - 1) / kTileT;
+        expert_tiles = (pairs + tile_pairs - 1) / tile_pairs;
     }
     const int pair_end = block_scan(pairs, warp_sums);
     if (tid == kGroupThreads - 1) {
@@ -1091,7 +1132,7 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
         first[tid] = pair_start;
         for (int j = 0; j < expert_tiles; ++j) {
             tiles[tile_start + j] =
-                make_int4(tid, pair_start + j * kTileT, min(kTileT, pairs - j * kTileT), 0);
+                make_int4(tid, pair_start + j * tile_pairs, min(tile_pairs, pairs - j * tile_pairs), 0);
         }
     }
     if (tid == kGroupThreads - 1) {
@@ -1168,21 +1209,22 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 // The quantized GEMMs: `expert_gemm_*` with `quantize_rows_*` inputs (`xq`,
-// `xq_scales`, `xq_outer`) in place of `x`. Needs `QStage::kShared` bytes of
-// dynamic shared memory and k a multiple of 128.
-#define EXPERT_GEMM_Q(name, fp4, stages, swiglu)                                                  \
-    static_assert(QStage<fp4, stages>::kShared + kTileT * 4 <= 50176);                            \
+// `xq_scales`, `xq_outer`) in place of `x`, over a grouping with tiles of 128
+// pairs. Needs `kQShared` (40,960) bytes of dynamic shared memory and k a
+// multiple of 128.
+#define EXPERT_GEMM_Q(name, fp4, swiglu)                                                          \
+    static_assert(kQShared + kQTileT * 4 <= 50176);                                               \
     extern "C" __global__ void __launch_bounds__(kThreads, 2)                                     \
         name(const uint8_t* xq, const uint8_t* xq_scales, const float* xq_outer,                  \
              const uint8_t* weight, const uint8_t* scales, const float* global_scale,             \
              __nv_bfloat16* out, const int* perm, const int4* tiles, const int* group_counts,     \
              int n, int k, int inputs_per_row, float gate_softcap, float up_softcap) {            \
-        expert_gemm_q<fp4, stages, swiglu>(xq, xq_scales, xq_outer, weight, scales,              \
-                                           global_scale, out, perm, tiles, group_counts, n, k,   \
-                                           inputs_per_row, gate_softcap, up_softcap);            \
+        expert_gemm_q<fp4, swiglu>(xq, xq_scales, xq_outer, weight, scales, global_scale, out,   \
+                                   perm, tiles, group_counts, n, k, inputs_per_row,              \
+                                   gate_softcap, up_softcap);                                    \
     }
 
-EXPERT_GEMM_Q(expert_gemm_q_nvfp4, true, 3, false)
-EXPERT_GEMM_Q(expert_gemm_q_mxfp8, false, 3, false)
-EXPERT_GEMM_Q(expert_gemm_q_nvfp4_swiglu, true, 3, true)
-EXPERT_GEMM_Q(expert_gemm_q_mxfp8_swiglu, false, 3, true)
+EXPERT_GEMM_Q(expert_gemm_q_nvfp4, true, false)
+EXPERT_GEMM_Q(expert_gemm_q_mxfp8, false, false)
+EXPERT_GEMM_Q(expert_gemm_q_nvfp4_swiglu, true, true)
+EXPERT_GEMM_Q(expert_gemm_q_mxfp8_swiglu, false, true)

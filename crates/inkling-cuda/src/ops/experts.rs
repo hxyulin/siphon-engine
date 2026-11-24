@@ -35,6 +35,8 @@ const MLP_BLOCKS_PER_SM: [usize; 2] = [4, 7];
 /// and threads per block.
 const GEMM_COLUMNS: usize = 128;
 const GEMM_PAIRS: usize = 64;
+/// Pairs per tile of the quantized products, `kQTileT` in the kernel.
+const QUANTIZED_PAIRS: usize = 128;
 const GEMM_K: usize = 64;
 const GEMM_THREADS: u32 = 256;
 /// `expert_matmul` needs k a multiple of this: two pipeline stages, so that each scale copy is
@@ -120,16 +122,12 @@ impl ExpertFormat<'_> {
         }
     }
 
-    /// Dynamic shared memory of an `expert_gemm_q_*` block: 3 stages of 64 bytes for each of
-    /// the 128 weight rows and 64 pairs, then a ring of scales: 3 slots of 8 bytes per row
-    /// for NVFP4, 2 slots of 4 bytes for MXFP8 (`QStage` in `kernels/expert_matmul.cu`).
-    fn quantized_shared_bytes(self) -> usize {
-        let rows = GEMM_COLUMNS + GEMM_PAIRS;
-        let (slots, slot_row) = match self {
-            Self::Nvfp4 { .. } => (3, 8),
-            Self::Mxfp8 => (2, 4),
-        };
-        3 * rows * 64 + slots * rows * slot_row
+    /// Dynamic shared memory of an `expert_gemm_q_*` block, `kQShared` in
+    /// `kernels/expert_matmul.cu`: 2 stages of 64 bytes for each of the 128 weight rows and
+    /// 128 pairs, then 2 scale slots of 16 bytes per row. The same for both formats.
+    fn quantized_shared_bytes() -> usize {
+        let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
+        2 * rows * 64 + 2 * rows * 16
     }
 
     /// Dynamic shared memory of an `expert_gemm_*` block: per pipeline stage, the weight bytes
@@ -227,10 +225,8 @@ impl ExpertWeights<'_> {
 
 /// Activations quantized by [`Experts::quantize_rows`] for the quantized expert products.
 ///
-/// NVFP4 rows hold k / 2 bytes of E2M1 pairs, k / 16 E4M3 block scales and one F32 outer
-/// scale; MXFP8 rows k E4M3 bytes and k / 32 UE8M0 block scales. Within each 32-byte step
-/// of a row, the eight 4-byte words are stored in the order 0, 4, 1, 5, 2, 6, 3, 7, the
-/// order the GEMM's fragment loads want.
+/// NVFP4 rows hold k / 2 bytes of E2M1 pairs (low nibble first), k / 16 E4M3 block scales
+/// and one F32 outer scale; MXFP8 rows k E4M3 bytes and k / 32 UE8M0 block scales.
 #[derive(Debug)]
 pub struct QuantizedRows {
     values: CudaSlice<u8>,
@@ -264,7 +260,7 @@ impl QuantizedRows {
         })
     }
 
-    /// The packed values, in the stored word order.
+    /// The packed values, `[rows, k / 2]` E2M1 pairs or `[rows, k]` E4M3.
     #[must_use]
     pub fn values(&self) -> &CudaSlice<u8> {
         &self.values
@@ -290,7 +286,8 @@ pub struct ExpertScratch {
     /// Flat pair index `row * 8 + slot` of each pair, in expert order, then the pairs with
     /// unknown ids.
     perm: CudaSlice<i32>,
-    /// `{expert, first position in perm, pairs, 0}` per tile of at most 64 pairs.
+    /// `{expert, first position in perm, pairs, 0}` per tile of at most 64 pairs, or 128 for
+    /// the quantized products.
     tiles: CudaSlice<i32>,
     /// The number of tiles, of pairs with known ids, and of all pairs.
     group_counts: CudaSlice<i32>,
@@ -300,11 +297,13 @@ pub struct ExpertScratch {
     grouping: Option<Grouping>,
 }
 
-/// What [`Experts::expert_group`] grouped: the row and expert counts, and the stream it ran on.
+/// What [`Experts::expert_group`] grouped: the row and expert counts, the pairs per tile,
+/// and the stream it ran on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Grouping {
     rows: usize,
     experts: usize,
+    tile_pairs: usize,
     stream: usize,
 }
 
@@ -426,8 +425,12 @@ impl Experts {
             ],
         ];
         // MXFP8 needs the most: 3 stages of 16 KiB and 1 KiB of scales against NVFP4's 3 of
-        // 12 KiB and 2 KiB of scales, and the quantized kernels' 3 of 12 KiB.
-        let shared = i32::try_from(ExpertFormat::Mxfp8.gemm_shared_bytes())?;
+        // 12 KiB and 2 KiB of scales, and the quantized kernels' 2 of 16 KiB and 8 KiB.
+        let shared = i32::try_from(
+            ExpertFormat::Mxfp8
+                .gemm_shared_bytes()
+                .max(ExpertFormat::quantized_shared_bytes()),
+        )?;
         for function in gemm.iter().chain(&gemm_q).flatten() {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -665,6 +668,30 @@ impl Experts {
         experts: usize,
         scratch: &mut ExpertScratch,
     ) -> anyhow::Result<()> {
+        self.group(stream, indices, experts, GEMM_PAIRS, scratch)
+    }
+
+    /// [`Self::expert_group`] for the quantized products
+    /// ([`Self::expert_matmul_quantized_grouped`] and
+    /// [`Self::expert_matmul_quantized_swiglu_grouped`]), whose tiles take 128 pairs.
+    pub fn expert_group_quantized(
+        &self,
+        stream: &CudaStream,
+        indices: &impl DeviceIn<i32>,
+        experts: usize,
+        scratch: &mut ExpertScratch,
+    ) -> anyhow::Result<()> {
+        self.group(stream, indices, experts, QUANTIZED_PAIRS, scratch)
+    }
+
+    fn group(
+        &self,
+        stream: &CudaStream,
+        indices: &impl DeviceIn<i32>,
+        experts: usize,
+        tile_pairs: usize,
+        scratch: &mut ExpertScratch,
+    ) -> anyhow::Result<()> {
         let indices = indices.view();
         ensure!(
             indices.len().is_multiple_of(SLOTS),
@@ -683,11 +710,13 @@ impl Experts {
         if rows > 0 {
             let pairs_arg = i32::try_from(rows * SLOTS).context("too many rows")?;
             let experts_arg = i32::try_from(experts).context("too many experts")?;
+            let tile_arg = i32::try_from(tile_pairs)?;
             let mut launch = stream.launch_builder(&self.group);
             launch
                 .arg(&indices)
                 .arg(&pairs_arg)
                 .arg(&experts_arg)
+                .arg(&tile_arg)
                 .arg(&mut scratch.perm)
                 .arg(&mut scratch.tiles)
                 .arg(&mut scratch.group_counts);
@@ -696,16 +725,17 @@ impl Experts {
                 block_dim: (GROUP_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            // SAFETY: the arguments match `expert_group(const int*, int, int, int*, int4*,
-            // int*)`. `indices` holds `pairs` ids. The scratch was sized for at least `rows`
-            // rows and `experts` experts, at most 2048 and 1024 as the kernel needs, so `perm`
-            // holds `pairs` entries, `tiles` every tile the kernel can write, and
-            // `group_counts` 3 values.
+            // SAFETY: the arguments match `expert_group(const int*, int, int, int, int*,
+            // int4*, int*)`. `indices` holds `pairs` ids. The scratch was sized for at least
+            // `rows` rows and `experts` experts, at most 2048 and 1024 as the kernel needs, so
+            // `perm` holds `pairs` entries, `tiles` every tile the kernel can write with tiles
+            // of 64 pairs or more, and `group_counts` 3 values.
             unsafe { launch.launch(config) }?;
         }
         scratch.grouping = Some(Grouping {
             rows,
             experts,
+            tile_pairs,
             stream: stream_id(stream),
         });
         Ok(())
@@ -831,7 +861,7 @@ impl Experts {
     /// multiplies the E2M1 or E4M3 inputs with the raw weights on the block-scaled FP4 or FP8
     /// tensor cores, sums in F32, and rounds to BF16. `xq` must hold the grouping's rows (one
     /// input per row) or 8 times as many (one per pair), of the weights' k and format, queued
-    /// on this stream.
+    /// on this stream. The grouping must come from [`Self::expert_group_quantized`].
     pub fn expert_matmul_quantized_grouped(
         &self,
         stream: &CudaStream,
@@ -916,6 +946,16 @@ impl Experts {
             grouping.stream == stream_id(stream),
             "the grouping was queued on another stream"
         );
+        let tile_pairs = match input {
+            GemmInput::Bf16(_) => GEMM_PAIRS,
+            GemmInput::Quantized(_) => QUANTIZED_PAIRS,
+        };
+        ensure!(
+            grouping.tile_pairs == tile_pairs,
+            "the grouping has tiles of {} pairs, the product needs {tile_pairs}; group with \
+             expert_group for BF16 inputs and expert_group_quantized for quantized ones",
+            grouping.tile_pairs
+        );
         if rows == 0 {
             return Ok(());
         }
@@ -942,7 +982,7 @@ impl Experts {
             ),
             GemmInput::Quantized(_) => (
                 &self.gemm_q[format.index()][swiglu],
-                format.quantized_shared_bytes(),
+                ExpertFormat::quantized_shared_bytes(),
             ),
         };
         let null: u64 = 0;

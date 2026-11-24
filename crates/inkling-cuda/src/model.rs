@@ -1606,12 +1606,14 @@ impl Ctx {
         m: usize,
     ) -> anyhow::Result<()> {
         ensure!(indices.len() == m * 8, "indices must hold {m} x 8 ids");
-        self.kernels.experts.expert_group(
-            &self.stream,
-            indices,
-            self.config.n_routed_experts,
-            scratch,
-        )
+        let experts = &self.kernels.experts;
+        let n = self.config.n_routed_experts;
+        match self.expert_activations {
+            ExpertActivations::Bf16 => experts.expert_group(&self.stream, indices, n, scratch),
+            ExpertActivations::Quantized => {
+                experts.expert_group_quantized(&self.stream, indices, n, scratch)
+            }
+        }
     }
 
     /// The expert products of `m` rows: `out` `[m, 8, n]` from `x` `[m, 1, k]` (one input

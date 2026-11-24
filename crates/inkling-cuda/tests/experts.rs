@@ -1300,11 +1300,6 @@ fn to_e2m1(x: f32) -> (u8, f32) {
     }
 }
 
-/// The position of word `w` of a 32-byte step in `QuantizedRows`' stored order.
-fn stored_word(w: usize) -> usize {
-    if w < 4 { 2 * w } else { 2 * (w - 4) + 1 }
-}
-
 /// One row quantized as the GPU stores it: values, block scales and outer scale.
 struct QuantizedRow {
     values: Vec<u8>,
@@ -1361,11 +1356,7 @@ fn quantize_nvfp4(table: &[f64], x: &[f32]) -> QuantizedRow {
             (bytes6, scale6)
         };
         block_scales[b] = to_e4m3(table, scale);
-        for (half, word) in bytes.chunks(4).enumerate() {
-            let w = stored_word(2 * (b % 4) + half);
-            let at = b / 4 * 32 + 4 * w;
-            values[at..at + 4].copy_from_slice(word);
-        }
+        values[8 * b..8 * b + 8].copy_from_slice(&bytes);
     }
     QuantizedRow {
         values,
@@ -1401,11 +1392,9 @@ fn quantize_mxfp8(table: &[f64], x: &[f32]) -> QuantizedRow {
             1.0 / scale
         };
         scales[b] = u8::try_from(exponent).expect("exponents fit in u8");
-        for w in 0..8 {
-            for i in 0..4 {
-                let v = (block[4 * w + i] * inverse).clamp(-448.0, 448.0);
-                values[b * 32 + 4 * stored_word(w) + i] = to_e4m3(table, v);
-            }
+        for (i, x) in block.iter().enumerate() {
+            let v = (x * inverse).clamp(-448.0, 448.0);
+            values[b * 32 + i] = to_e4m3(table, v);
         }
     }
     QuantizedRow {
@@ -1550,22 +1539,12 @@ fn quantize_rows_matches_cpu_model() -> anyhow::Result<()> {
 fn dequantize(row: &QuantizedRow, k: usize, fp4: bool) -> Vec<f64> {
     (0..k)
         .map(|i| {
-            // Value i sits in word i / 4 (FP8) or i / 8 (FP4) of its 32-byte step.
-            let (step, within) = if fp4 {
-                (i / 64, i % 64)
-            } else {
-                (i / 32, i % 32)
-            };
-            let per_word = if fp4 { 8 } else { 4 };
-            let word = stored_word(within / per_word);
-            let offset = step * 32 + 4 * word;
             if fp4 {
-                let byte = row.values[offset + within % 8 / 2];
+                let byte = row.values[i / 2];
                 let nibble = if i % 2 == 0 { byte & 15 } else { byte >> 4 };
                 e2m1(nibble) * e4m3(row.scales[i / 16]) * f64::from(row.outer)
             } else {
-                let byte = row.values[offset + within % 4];
-                e4m3(byte) * 2f64.powi(i32::from(row.scales[i / 32]) - 127)
+                e4m3(row.values[i]) * 2f64.powi(i32::from(row.scales[i / 32]) - 127)
             }
         })
         .collect()
@@ -1610,7 +1589,7 @@ fn check_quantized(fp4: bool) -> anyhow::Result<()> {
                 .collect();
             let indices_gpu = stream.clone_htod(&indices)?;
             s.experts
-                .expert_group(stream, &indices_gpu, EXPERTS, &mut scratch)?;
+                .expert_group_quantized(stream, &indices_gpu, EXPERTS, &mut scratch)?;
             let mut runs = Vec::new();
             for _ in 0..2 {
                 let mut out =
@@ -1662,7 +1641,7 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
     let indices = stream.clone_htod(&ids)?;
     let x = stream.clone_htod(&common::pseudo_random_bf16(rows * HIDDEN, 9, 4.0, 0.0))?;
     s.experts
-        .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
+        .expert_group_quantized(stream, &indices, EXPERTS, &mut scratch)?;
     for fp4 in [true, false] {
         let w13 = Synthetic::new(&s, fp4, 2 * INTERMEDIATE, HIDDEN, 43)?;
         let weights = w13.gpu.weights();
