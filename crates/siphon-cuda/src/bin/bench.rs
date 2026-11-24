@@ -38,10 +38,11 @@
 //! split of a round between verify, draft and host. `--spec auto` picks each round's
 //! width from the drafts' confidences (`WidthPolicy`), among `--widths` (default 1 to
 //! 8), priced by verify passes of each width timed at that context first. `--draft`
-//! takes a variant of the draft as `dspark` does: `fp8` (the default, the three FP8
-//! approximations), `fast` (also the shortlist), `exact`, or a `+`-joined set of
-//! `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`, which ranks tokens by id unless
-//! `--shortlist` names a ranking file (with `fp8`, the file adds the shortlist).
+//! takes a variant of the draft as `dspark` does: `fast` (the default, the three FP8
+//! approximations and the shortlist), `fp8` (no shortlist), `exact`, or a `+`-joined set
+//! of `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`. The shortlist ranks tokens by
+//! `draft::counted_ranking` unless `--shortlist` names a ranking file (with `fp8`, the
+//! file adds the shortlist).
 //! `--drafter DIR` runs the drafter in DIR instead of the bundled draft, with the same
 //! variants: Inco AI's DFlash 2 drafter (`Dflash2Weights`) or a DFlash draft with DSpark
 //! heads exported by the 2DSD project (`DflashWeights`), told apart by its `config.json`.
@@ -148,7 +149,7 @@ mod linux {
         let mut prompt = None;
         let mut spec = None;
         let mut widths = (1..=8).collect();
-        let mut draft = "fp8".to_owned();
+        let mut draft = "fast".to_owned();
         let mut shortlist = None;
         let mut drafter = None;
         let mut sweep = None;

@@ -48,16 +48,18 @@ Round times at position 2790 (one committed position plus the round, graph repla
 
 At position 32768, where layer 1 attends over every position, the same steps take 2.169, 1.420, 1.354, 1.288 and 1.277 ms for 3 drafts, and 2.169, 1.660, 1.593, 1.450 and 1.419 ms for 7.
 
-`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond. `DraftOptions::fp8` turns on the three FP8 approximations and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon-serve`); `DraftOptions::fast` adds the shortlist in token id order, and `DraftOptions::default` stays exact:
+`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond. `DraftOptions::fast` turns on all four and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon-serve`); `DraftOptions::fp8` leaves out the shortlist, and `DraftOptions::default` stays exact:
 
 - `fp8_backbone`: E4M3 copies of the block's and the commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`).
 - `fp8_head`: base logits from an E4M3 copy of the LM head.
 - `fp8_fold`: the Markov logits from the E4M3 fold, without the exact correction.
-- `shortlist`: Ingine's shortlist head, off by default (see below). The base and Markov logits cover only the 32,768 highest-ranked tokens, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The speculator notes the tokens of the prompt's last 8,192 positions and each round's emitted tokens, so a long prompt cannot fill every context row and shut out the tokens that generation adds. The ranking defaults to token id order (`draft::id_ranking`): the tokenizer numbers its tokens in BPE merge order, so the first 32,768 ids are the earliest merges. A ranking file of little-endian u32 token ids, as Ingine's `draft_shortlist.bin`, can replace it.
+- `shortlist`: Ingine's shortlist head (see below). The base and Markov logits cover only the 32,768 highest-ranked tokens, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The speculator notes the tokens of the prompt's last 8,192 positions and each round's emitted tokens, so a long prompt cannot fill every context row and shut out the tokens that generation adds. The ranking is `draft::counted_ranking`, the tokens the target generates most often (`crates/siphon-cuda/data/shortlist.bin`). A ranking file of little-endian u32 token ids, as Ingine's `draft_shortlist.bin`, can replace it (`--shortlist`).
 
-The shortlist halves the round (0.51 against 0.96 ms) but costs acceptance wherever the text uses tokens above id 32,768 before they appear in the context: reasoning text opens with ids near 150,000. Noting each round's anchor on the device, so the next round can draft it, changed neither acceptance nor speed on any prompt below, so the loss is the ranking's coverage, not the one-round lag. `bench --spec auto`, 512 tokens, FP8 weights and KV, tok/s and tokens per round (chat, coding and 32K-document prompts from the Ingine comparison, then the three texts):
+The shortlist halves the round (0.51 against 0.96 ms). A shortlist in token id order (the tokenizer numbers tokens in BPE merge order) cost acceptance wherever the text used tokens above id 32,768 before they appeared in the context: reasoning text opens with ids near 150,000, and 46% of generated tokens lie above that id. Noting each round's anchor on the device, so the next round can draft it, changed neither acceptance nor speed on any prompt below, so the loss is the ranking's coverage, not the one-round lag. `bench --spec auto`, 512 tokens, FP8 weights and KV, tok/s and tokens per round (chat, coding and 32K-document prompts from the Ingine comparison, then the three texts):
 
-| Prompt | Bundled, `fp8` | Bundled, `fast` | DFlash 2, `fp8` | DFlash 2, `fast` |
+With the shortlist in id order:
+
+| Prompt | Bundled, `fp8` | Bundled, id order | DFlash 2, `fp8` | DFlash 2, id order |
 | --- | --- | --- | --- | --- |
 | Chat | 466, 3.27 | 405, 2.70 | 544, 4.21 | 407, 3.09 |
 | Coding task | 471, 3.36 | 424, 2.89 | 566, 4.20 | 465, 3.44 |
@@ -66,7 +68,26 @@ The shortlist halves the round (0.51 against 0.96 ms) but costs acceptance where
 | `half`, 2,273 | 683, 5.67 | 689, 5.43 | 585, 4.90 | 597, 4.90 |
 | `anyhow`, 10,674 | 761, 6.76 | 793, 6.68 | 759, 6.83 | 779, 6.83 |
 
-A frequency ranking would keep most of both: Ingine's file recovered 18 to 23% on the chat-style prompts with the shortlist on.
+The counted ranking keeps both. `scripts/shortlist/generate.py` sent 1,783 open-perfectblend prompts (`scripts/shortlist/download.py` and `prompts.py`, efforts none, low and medium in turn, at most 1,024 tokens) to `siphon-serve` with `return_token_ids` and stored the token ids: 1.0 million generated tokens in 40 minutes. `scripts/shortlist/rank.py` ranks output tokens by count, then prompt tokens by count, then the rest by id. Share of generated tokens in the first 32,768 ranked ids or the special tokens:
+
+| Ranking | Held-out prompts (107) | Chat | Coding | Instruction | Math | 2DSD core prompts (20,515 tokens) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Token id order | 44.5% | 38.2% | 46.2% | 41.0% | 48.8% | 54.0% |
+| Ingine's `draft_shortlist.bin` | 96.7% | 94.1% | 98.0% | 94.4% | 97.2% | 96.5% |
+| Counted | 98.9% | 98.2% | 99.3% | 96.5% | 99.4% | 99.2% |
+
+Same runs as above with the counted shortlist (`fast`), tok/s, tokens per round and draft ms per round:
+
+| Prompt | Bundled, `fp8` | Bundled, `fast` | DFlash 2, `fp8` | DFlash 2, `fast` |
+| --- | --- | --- | --- | --- |
+| Chat | 465, 3.27, 0.95 | 495, 3.23, 0.52 | 540, 4.17, 1.03 | 542, 3.98, 0.79 |
+| Coding task | 470, 3.36, 0.95 | 502, 3.34, 0.51 | 565, 4.20, 1.03 | 594, 4.23, 0.79 |
+| 32K document | 535, 4.89, 1.08 | 557, 4.79, 0.64 | 364, 3.13, 1.05 | 375, 3.13, 0.81 |
+| `regex-readme`, 2,286 | 494, 3.66, 0.97 | 527, 3.63, 0.53 | 518, 4.06, 1.05 | 534, 4.03, 0.80 |
+| `half`, 2,273 | 683, 5.67, 0.97 | 722, 5.67, 0.53 | 585, 4.90, 1.04 | 596, 4.85, 0.80 |
+| `anyhow`, 10,674 | 762, 6.76, 1.01 | 800, 6.68, 0.57 | 759, 6.83, 1.05 | 783, 6.83, 0.81 |
+
+DFlash 2 attends to only the last 2,048 positions (`sliding_window` in its config, every layer), so on the 32K document, whose answer restates code from far back, it keeps 3.13 tokens per round against the bundled draft's 4.79. Widening its window at inference made it worse: 326 tok/s at 8,192 and 264 at 32,768, against 366 at 2,048.
 
 `dspark accept` measures each variant's teacher-forced acceptance on the stage 0 taps against MLX's top-1 tokens, as `reference/dspark.py accept` counts it, and times its round of 7 drafts at position 2,790 and 32,768. Over all three texts (16,745 anchors):
 
@@ -80,7 +101,7 @@ A frequency ranking would keep most of both: Ingine's file recovered 18 to 23% o
 | Shortlist, ranked by counts over a code sample | 76.7, 56.3, 43.4% | 3.691 | 0.708 ms | 0.813 ms |
 | Fast: shortlist in id order, FP8 backbone, head and fold | 79.2, 58.6, 45.0% | 3.787 | 0.491 ms | 0.628 ms |
 
-FP8 fold alone saves nothing, since the pruned argmax already reads the E4M3 fold; it matters with a shortlist, which skips the pruning. The counted ranking took 72 million tokens of open-source Rust crates and the CPython standard library, the evaluation texts' crates left out. Code-heavy counts drop common prose tokens that the id order keeps.
+FP8 fold alone saves nothing, since the pruned argmax already reads the E4M3 fold; it matters with a shortlist, which skips the pruning. That earlier counted ranking took 72 million tokens of open-source Rust crates and the CPython standard library, the evaluation texts' crates left out. Code-heavy counts drop common prose tokens that the id order keeps.
 
 In a kernel trace of the round of 7 drafts at position 2,790 (each kernel from the previous one's end), the exact draft spends 918 of its 1,315 us in BF16 GEMMs, most of it the 7-row LM-head product over the full vocabulary, and 212 us in the pruned argmax's bound pass. The fast draft takes 494 us: 339 us in the FP8 GEMMs (16 products), 42 us in attention (138 us at 32,768), 34 us in the shortlist Markov fold and 20 us in the Markov steps.
 

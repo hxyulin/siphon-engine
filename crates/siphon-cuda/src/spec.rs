@@ -312,7 +312,7 @@ impl Speculator {
             checkpoint,
             capacity,
             Width::Fixed(k),
-            &DraftOptions::fp8(),
+            &DraftOptions::fast(),
         )
     }
 

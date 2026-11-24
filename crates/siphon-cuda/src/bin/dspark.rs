@@ -21,9 +21,9 @@
 //! tokens per millisecond against a verify-time model.
 //!
 //! A variant SPEC is `exact`, `fp8`, `fast` or a `+`-joined set of `fp8-backbone`, `fp8-head`,
-//! `fp8-fold` and `shortlist` (see `DraftOptions`). `shortlist` ranks tokens by id, or
-//! by `--shortlist`, a token ranking of little-endian u32 ids, as Ingine's
-//! `draft_shortlist.bin`.
+//! `fp8-fold` and `shortlist` (see `DraftOptions`). `shortlist` ranks tokens by
+//! `draft::counted_ranking`, or by `--shortlist`, a token ranking of little-endian u32 ids,
+//! as Ingine's `draft_shortlist.bin`.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {

@@ -90,18 +90,15 @@ pub struct DraftOptions {
     pub fp8_head: bool,
     /// An FP8 copy of the fold weight (or of its shortlist rows).
     pub fp8_fold: bool,
-    /// Token ids by rank, as Ingine's `draft_shortlist.bin`: the base and Markov logits
+    /// Token ids by rank, most frequent first: the base and Markov logits
     /// then cover only the first [`SHORTLIST_ROWS`] of them, the special tokens and up to
     /// [`CONTEXT_ROWS`] tokens passed to [`Draft::note_tokens`].
     pub shortlist: Option<Vec<u32>>,
 }
 
 impl DraftOptions {
-    /// The three FP8 approximations without a shortlist: the draft speculation uses unless
-    /// told otherwise. Its round takes about 0.96 ms against 0.51 ms for [`Self::fast`],
-    /// but on chat, coding and long-document prompts it keeps 16 to 22% more tokens per
-    /// round, since the id-order shortlist lacks the high ids of reasoning text until they
-    /// appear.
+    /// The three FP8 approximations without a shortlist. Its round takes about 0.96 ms
+    /// against 0.51 ms for [`Self::fast`], for about the same tokens per round.
     #[must_use]
     pub fn fp8() -> Self {
         Self {
@@ -112,23 +109,22 @@ impl DraftOptions {
         }
     }
 
-    /// Every approximation, with the shortlist in token id order ([`id_ranking`]). On
-    /// three texts its teacher-forced acceptance is within 0.2 points of the exact draft's
-    /// at every draft position, and its round takes about 40% of the time.
+    /// Every approximation, with the shortlist ranked by [`counted_ranking`]: the draft
+    /// speculation uses unless told otherwise.
     #[must_use]
     pub fn fast() -> Self {
         Self {
             fp8_backbone: true,
             fp8_head: true,
             fp8_fold: true,
-            shortlist: Some(id_ranking()),
+            shortlist: Some(counted_ranking()),
         }
     }
 
     /// The options of a variant `spec`: `exact`, `fp8` ([`Self::fp8`]), `fast`
     /// ([`Self::fast`]), or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and
-    /// `shortlist`, which takes `ranking`, or without one ranks tokens by id
-    /// ([`id_ranking`]). `fp8` and `fast` with a `ranking` use it as their shortlist.
+    /// `shortlist`, which takes `ranking`, or without one [`counted_ranking`]. `fp8` and
+    /// `fast` with a `ranking` use it as their shortlist.
     pub fn parse(spec: &str, ranking: Option<&[u32]>) -> anyhow::Result<Self> {
         let mut options = Self::default();
         match spec {
@@ -152,7 +148,7 @@ impl DraftOptions {
                 "fp8-head" => options.fp8_head = true,
                 "fp8-fold" => options.fp8_fold = true,
                 "shortlist" => {
-                    options.shortlist = Some(ranking.map_or_else(id_ranking, <[u32]>::to_vec));
+                    options.shortlist = Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
                 }
                 _ => anyhow::bail!("unknown draft variant part {part:?}"),
             }
@@ -161,26 +157,34 @@ impl DraftOptions {
     }
 }
 
-/// The first [`SHORTLIST_ROWS`] token ids in order, a ranking for
-/// [`DraftOptions::shortlist`]. The tokenizer numbers its tokens in the order of its BPE
-/// merges, so a lower id was merged earlier, from a pair that was more frequent in the
-/// tokenizer's training text.
+/// The [`SHORTLIST_ROWS`] tokens the target generated most often, most frequent first, a
+/// ranking for [`DraftOptions::shortlist`]. `scripts/shortlist/` counted them over 1.0
+/// million tokens that the target generated greedily for open-perfectblend prompts:
+/// output tokens by count, then prompt tokens by count, special tokens left out (the
+/// shortlist keeps them all). They cover 98.9% of the tokens the target generated for
+/// held-out prompts.
 #[must_use]
-pub fn id_ranking() -> Vec<u32> {
-    (0..SHORTLIST_ROWS as u32).collect()
+pub fn counted_ranking() -> Vec<u32> {
+    let ranking = ranking_from_bytes(include_bytes!("../data/shortlist.bin"));
+    debug_assert_eq!(ranking.len(), SHORTLIST_ROWS);
+    ranking
 }
 
 /// Reads a token ranking for [`DraftOptions::shortlist`]: little-endian u32 token ids,
-/// most frequent first, as Ingine's `draft_shortlist.bin`.
+/// most frequent first, as [`counted_ranking`]'s file or Ingine's `draft_shortlist.bin`.
 pub fn read_ranking(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     ensure!(bytes.len() % 4 == 0, "the ranking is not whole u32s");
-    Ok(bytes
+    Ok(ranking_from_bytes(&bytes))
+}
+
+fn ranking_from_bytes(bytes: &[u8]) -> Vec<u32> {
+    bytes
         .as_chunks()
         .0
         .iter()
         .map(|b| u32::from_le_bytes(*b))
-        .collect())
+        .collect()
 }
 
 /// The RoPE frequencies `1 / theta^(2i/128)` of the bundled draft (theta 1e6) as vLLM's
