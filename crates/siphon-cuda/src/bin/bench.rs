@@ -635,9 +635,9 @@ mod linux {
         use siphon_cuda::{
             Gpu,
             draft::{DraftOptions, read_ranking},
-            model::{Accept, DEFAULT_PREFILL_CHUNK, Model, SavedState, VerifyTokens},
+            model::{DEFAULT_PREFILL_CHUNK, Model, SavedState},
             ops::spec::VERIFY_ROWS,
-            spec::{Drafts, Speculator, SweepRow, Width, WidthPolicy},
+            spec::{Drafts, Speculator, SweepRow, Width, WidthPolicy, price, verify_times},
             weights::{WeightFormat, Weights},
         };
 
@@ -649,8 +649,6 @@ mod linux {
         const DEFAULT_STEPS: usize = 256;
         /// Timed verify passes per width.
         const VERIFY_REPEATS: usize = 40;
-        /// Timed verify passes per width that price `--spec auto`.
-        const PRICE_REPEATS: usize = 8;
         /// Bytes the byte model of a verify uses: dense weights in BF16 or with
         /// `--weights fp8` (the attention projections and LM head as E4M3 values and
         /// scales), and one expert's `w13` and `w2` with scales in NVFP4 (44 visits) and
@@ -822,57 +820,6 @@ mod linux {
             }
             println!();
             Ok(())
-        }
-
-        /// Times `repeats` verify passes of `m` rows from `saved`, each keeping one row,
-        /// after three untimed ones (the first captures the graph), in ms.
-        fn verify_times(
-            model: &mut Model,
-            saved: &SavedState,
-            rows: &[u32],
-            m: usize,
-            repeats: usize,
-        ) -> anyhow::Result<Vec<f64>> {
-            model.restore_state(saved)?;
-            let mut times = Vec::with_capacity(repeats);
-            for i in 0..repeats + 3 {
-                let window = &rows[i..i + m];
-                model.stream().synchronize()?;
-                let t = Instant::now();
-                model.verify(VerifyTokens::Host(window), Accept::Rows(1))?;
-                if i >= 3 {
-                    times.push(t.elapsed().as_secs_f64() * 1e3);
-                }
-            }
-            Ok(times)
-        }
-
-        /// Prices each width of an adaptive `speculator` at the state `saved`: the fastest
-        /// of a few verify passes of that width, plus the draft and host time per round of
-        /// a short warmup generation. Leaves the model at `saved`.
-        fn price(
-            model: &mut Model,
-            speculator: &mut Speculator,
-            saved: &SavedState,
-            rows: &[u32],
-            first: u32,
-        ) -> anyhow::Result<[f64; VERIFY_ROWS]> {
-            let Width::Adaptive(policy) = speculator.width().clone() else {
-                anyhow::bail!("only an adaptive width is priced");
-            };
-            let mut verify = [f64::INFINITY; VERIFY_ROWS];
-            for &w in policy.widths() {
-                let times = verify_times(model, saved, rows, w, PRICE_REPEATS)?;
-                verify[w - 1] = times.into_iter().fold(f64::INFINITY, f64::min);
-            }
-            model.restore_state(saved)?;
-            speculator.restart(model, first)?;
-            speculator.generate(model, 64, Drafts::Dspark)?;
-            let stats = speculator.stats();
-            let rounds = stats.rounds.max(1) as f64;
-            let other = (stats.draft + stats.host()).as_secs_f64() * 1e3 / rounds;
-            model.restore_state(saved)?;
-            Ok(verify.map(|v| if v.is_finite() { v + other } else { 1.0 }))
         }
 
         /// Prices an adaptive width at the state `saved` (see [`price`]) and returns the

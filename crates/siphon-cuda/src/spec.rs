@@ -17,6 +17,7 @@
 //! and whatever widths the rounds verify ([`greedy_by_verify`]).
 
 use std::{
+    ops::ControlFlow,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,7 +29,7 @@ use siphon::Checkpoint;
 
 use crate::{
     draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
-    model::{Accept, Model, PrefillLogits, VerifyTokens},
+    model::{Accept, Model, PrefillLogits, SavedState, VerifyTokens},
     ops::{
         linear::Linear,
         spec::{TAPS, VERIFY_ROWS},
@@ -395,6 +396,18 @@ impl Speculator {
         n: usize,
         drafts: Drafts,
     ) -> anyhow::Result<Vec<u32>> {
+        self.generate_with(model, n, drafts, |_| ControlFlow::Continue(()))
+    }
+
+    /// [`Self::generate`], calling `on_round` with each round's tokens as soon as the
+    /// round ends. Generation stops early when `on_round` breaks.
+    pub fn generate_with(
+        &mut self,
+        model: &mut Model,
+        n: usize,
+        drafts: Drafts,
+        mut on_round: impl FnMut(&[u32]) -> ControlFlow<()>,
+    ) -> anyhow::Result<Vec<u32>> {
         let stream = Arc::clone(model.stream());
         let vocab = model.config().unpadded_vocab_size as u64;
         let mut rng = match drafts {
@@ -471,7 +484,11 @@ impl Speculator {
                 self.draft
                     .note_tokens(&stream, model.draft_shared(), &ids)?;
             }
+            let stop = on_round(&emitted).is_break();
             out.extend(emitted);
+            if stop {
+                break;
+            }
             width = match drafts {
                 Drafts::Dspark => self.next_width(&stream, self.stats.rounds)?,
                 Drafts::Random(_) => self.next_width_blind(self.stats.rounds),
@@ -554,6 +571,68 @@ impl Speculator {
         }
         Ok((tokens, rows))
     }
+}
+
+/// Timed verify passes per width that [`price`] takes the fastest of.
+const PRICE_REPEATS: usize = 8;
+
+/// Times `repeats` verify passes of `m` rows from `saved`, each keeping one row, after
+/// three untimed ones (the first captures the graph), in ms. `rows` holds the tokens,
+/// at least `repeats + 2 + m` of them.
+pub fn verify_times(
+    model: &mut Model,
+    saved: &SavedState,
+    rows: &[u32],
+    m: usize,
+    repeats: usize,
+) -> anyhow::Result<Vec<f64>> {
+    ensure!(
+        rows.len() >= repeats + 2 + m,
+        "{} rows cannot time {repeats} verify passes of {m} rows",
+        rows.len()
+    );
+    model.restore_state(saved)?;
+    let mut times = Vec::with_capacity(repeats);
+    for i in 0..repeats + 3 {
+        let window = &rows[i..i + m];
+        model.stream().synchronize()?;
+        let t = Instant::now();
+        model.verify(VerifyTokens::Host(window), Accept::Rows(1))?;
+        if i >= 3 {
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    Ok(times)
+}
+
+/// Prices each width of an adaptive `speculator` at the state `saved`, which
+/// [`Speculator::prefill`] left with `first` as its result: the fastest of a few verify
+/// passes of that width, plus the draft and host time per round of a short warmup
+/// generation. `rows` holds tokens for the verify passes (see [`verify_times`]). Leaves
+/// the model at `saved`.
+pub fn price(
+    model: &mut Model,
+    speculator: &mut Speculator,
+    saved: &SavedState,
+    rows: &[u32],
+    first: u32,
+) -> anyhow::Result<[f64; VERIFY_ROWS]> {
+    let Width::Adaptive(policy) = speculator.width().clone() else {
+        anyhow::bail!("only an adaptive width is priced");
+    };
+    let mut verify = [f64::INFINITY; VERIFY_ROWS];
+    for &w in policy.widths() {
+        let times = verify_times(model, saved, rows, w, PRICE_REPEATS)?;
+        verify[w - 1] = times.into_iter().fold(f64::INFINITY, f64::min);
+    }
+    model.restore_state(saved)?;
+    speculator.restart(model, first)?;
+    speculator.generate(model, 64, Drafts::Dspark)?;
+    let stats = speculator.stats();
+    let rounds = stats.rounds.max(1) as f64;
+    let other = (stats.draft + stats.host()).as_secs_f64() * 1e3 / rounds;
+    model.restore_state(saved)?;
+    Ok(verify.map(|v| if v.is_finite() { v + other } else { 1.0 }))
 }
 
 /// Greedy decoding through the verify pass one row at a time: `n` tokens after `first`,
