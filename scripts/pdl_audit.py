@@ -65,6 +65,8 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     "decode_step_bf16": {"position"},
     "decode_step_fp8": {"position"},
     "attention_post_bf16": {"position"},
+    # The embedding norm and the first layer's input norm.
+    "decode_prologue_2304": {"embed_norm", "input_norm"},
 }
 
 # Pointer fields of struct parameters, by (kernel file, type name): the stride of the

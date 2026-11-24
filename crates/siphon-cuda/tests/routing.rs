@@ -1079,7 +1079,6 @@ fn moe_router_step_matches_moe_router() -> anyhow::Result<()> {
             &mut logits,
             &mut indices,
             &mut weights,
-            &mut counter,
             ROUTE_SCALE,
         )?;
         let label = format!("row {row}");
@@ -1141,7 +1140,6 @@ fn moe_router_step_rows_matches_step() -> anyhow::Result<()> {
             &mut logits,
             &mut indices,
             &mut weights,
-            &mut counter,
             ROUTE_SCALE,
         )?;
         want.0.extend(stream.clone_dtoh(&logits)?);

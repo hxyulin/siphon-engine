@@ -5,7 +5,7 @@
 //! outputs may differ from MLX in the last BF16 bit. Every output must stay within the F64
 //! bound described above `check_reference`, and the tests print how many differ from MLX.
 //! `expert_mlp` must equal `expert_matvec`, the softcapped SwiGLU and `expert_matvec`
-//! again bit for bit.
+//! again bit for bit, and with the end of the MoE block, also `moe_conv_residual`.
 
 #![cfg(target_os = "linux")]
 
@@ -22,8 +22,9 @@ use siphon::Checkpoint;
 use siphon_cuda::{
     Gpu,
     ops::{
+        conv::Conv,
         elementwise::Elementwise,
-        experts::{ExpertFormat, ExpertScratch, ExpertWeights, Experts, QuantizedRows},
+        experts::{ExpertFormat, ExpertScratch, ExpertWeights, Experts, MoeEnd, QuantizedRows},
     },
 };
 
@@ -356,6 +357,7 @@ fn check_mlp(
             &mut sync,
             GATE_SOFTCAP,
             UP_SOFTCAP,
+            None,
         )?;
         let same = |got: &[bf16], want: &[bf16]| {
             got.iter()
@@ -429,6 +431,154 @@ fn expert_mlp_matches_separate_kernels() -> anyhow::Result<()> {
                 &act,
                 &out,
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// The inputs of one decode row's MoE block in `expert_mlp_end_matches_moe_conv_residual`.
+struct MoeRow {
+    x: CudaSlice<bf16>,
+    indices: CudaSlice<i32>,
+    routing: CudaSlice<f32>,
+    residual: CudaSlice<f32>,
+}
+
+impl MoeRow {
+    fn new(stream: &Arc<CudaStream>, ids: &[i32], seed: u32) -> anyhow::Result<Self> {
+        let routing: Vec<f32> = common::pseudo_random(SLOTS, seed + 1, 1.0)
+            .iter()
+            .map(|v| v.abs())
+            .collect();
+        Ok(Self {
+            x: stream.clone_htod(&common::pseudo_random_bf16(HIDDEN, seed, 1.0, 0.0))?,
+            indices: stream.clone_htod(ids)?,
+            routing: stream.clone_htod(&routing)?,
+            residual: stream.clone_htod(&common::pseudo_random(HIDDEN, seed + 2, 4.0))?,
+        })
+    }
+}
+
+/// The activations, expert outputs and MoE block end of one row, through `expert_mlp` with
+/// the end when `fused`, or without it and then `moe_conv_residual`. `state` is the conv
+/// state, updated.
+fn moe_end(
+    s: &Setup,
+    conv: &Conv,
+    (w13, w2, conv_weight): (&ExpertWeights<'_>, &ExpertWeights<'_>, &CudaSlice<bf16>),
+    row: &MoeRow,
+    (state, sync): (&mut CudaSlice<f32>, &mut CudaSlice<u32>),
+    fused: bool,
+) -> anyhow::Result<[Vec<u16>; 3]> {
+    let stream = s.stream();
+    let mut act = stream.alloc_zeros::<bf16>(SLOTS * INTERMEDIATE)?;
+    let mut out = stream.alloc_zeros::<bf16>(SLOTS * HIDDEN)?;
+    let mut hidden = stream.alloc_zeros::<bf16>(HIDDEN)?;
+    let end = fused.then_some(MoeEnd {
+        weights: &row.routing,
+        conv_weight,
+        conv_state: &mut *state,
+        residual: &row.residual,
+        hidden: &mut hidden,
+    });
+    s.experts.expert_mlp(
+        stream,
+        &row.x,
+        &row.indices,
+        w13,
+        w2,
+        &mut act,
+        &mut out,
+        sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        end,
+    )?;
+    if !fused {
+        conv.moe_conv_residual(
+            stream,
+            &out,
+            &row.routing,
+            conv_weight,
+            state,
+            &row.residual,
+            &mut hidden,
+        )?;
+    }
+    let bits = |v: &CudaSlice<bf16>| -> anyhow::Result<Vec<u16>> {
+        Ok(stream
+            .clone_dtoh(v)?
+            .into_iter()
+            .map(bf16::to_bits)
+            .collect())
+    };
+    Ok([bits(&act)?, bits(&out)?, bits(&hidden)?])
+}
+
+/// `expert_mlp` with the end of the MoE block equals `expert_mlp` without it followed by
+/// `moe_conv_residual`, bit for bit, in its outputs, products and conv state, with a
+/// repeated and an unknown expert; two steps in a row check that the counters reset.
+#[test]
+fn expert_mlp_end_matches_moe_conv_residual() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let conv = Conv::load(s.gpu.context())?;
+    let stream = s.stream();
+    let experts = 10;
+    for fp4 in [true, false] {
+        let w13 = Synthetic::with_experts(&s, experts, fp4, 2 * INTERMEDIATE, HIDDEN, 51)?;
+        let w2 = Synthetic::with_experts(&s, experts, fp4, HIDDEN, INTERMEDIATE, 53)?;
+        let conv_weight =
+            stream.clone_htod(&common::pseudo_random_bf16(4 * HIDDEN, 7, 0.5, 0.0))?;
+        let weights = (&w13.gpu.weights(), &w2.gpu.weights(), &conv_weight);
+        let start = common::pseudo_random(3 * HIDDEN, 9, 2.0);
+        let mut state_want = stream.clone_htod(&start)?;
+        let mut state_got = stream.clone_htod(&start)?;
+        let mut sync_want = stream.alloc_zeros::<u32>(1 + SLOTS)?;
+        let mut sync_got = stream.alloc_zeros::<u32>(1 + SLOTS + HIDDEN / 16)?;
+        let steps: [&[i32]; 2] = [&[3, 1, 4, 1, 5, 9, 2, 6], &[0, 7, -1, 8, 2, 3, 3, 6]];
+        for (step, ids) in (0u32..).zip(steps) {
+            let row = MoeRow::new(stream, ids, 60 + 10 * step)?;
+            let label = format!("fp4 {fp4}, step {step}");
+            let want = moe_end(
+                &s,
+                &conv,
+                weights,
+                &row,
+                (&mut state_want, &mut sync_want),
+                false,
+            )?;
+            let got = moe_end(
+                &s,
+                &conv,
+                weights,
+                &row,
+                (&mut state_got, &mut sync_got),
+                true,
+            )?;
+            for (name, got, want) in ["act", "out", "hidden"]
+                .into_iter()
+                .zip(&got)
+                .zip(&want)
+                .map(|((n, g), w)| (n, g, w))
+            {
+                assert_eq!(got, want, "{label}: {name}");
+            }
+            let state = |v: &CudaSlice<f32>| -> anyhow::Result<Vec<u32>> {
+                Ok(stream
+                    .clone_dtoh(v)?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect())
+            };
+            assert_eq!(
+                state(&state_got)?,
+                state(&state_want)?,
+                "{label}: conv state"
+            );
+            assert!(
+                stream.clone_dtoh(&sync_got)?.iter().all(|&v| v == 0),
+                "{label}: sync not reset"
+            );
         }
     }
     Ok(())

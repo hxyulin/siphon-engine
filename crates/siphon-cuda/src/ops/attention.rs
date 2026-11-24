@@ -56,8 +56,12 @@ const MAX_SPLITS: usize = 64;
 /// Splits of a large cache: 8 KV heads times 40 splits is 320 blocks, two per SM on an
 /// RTX 5090's 170 SMs, so one wave covers the cache.
 const SPLITS: usize = 40;
-/// Fewest cache slots per split, two 32-key tiles, so that small caches use fewer blocks.
-const MIN_SPLIT_SLOTS: usize = 64;
+/// Fewest cache slots per split by default, two 32-key tiles, so that small caches use
+/// fewer blocks. [`DecodeStep::min_split_slots`] can lower it to [`ONE_TILE_SPLIT_SLOTS`].
+pub const MIN_SPLIT_SLOTS: usize = 64;
+/// Fewest cache slots per split of one 32-key tile: a full 1024-slot window then takes 32
+/// splits of one tile each.
+pub const ONE_TILE_SPLIT_SLOTS: usize = 32;
 /// Threads per decode attention block.
 const DECODE_BLOCK: u32 = 128;
 /// Threads per block of the relative-bias kernel.
@@ -325,12 +329,15 @@ pub struct DecodeStep<'a> {
     pub eps: f32,
     /// Receives the gated attention output `[24 * 128]`.
     pub out: &'a mut CudaSlice<bf16>,
+    /// Fewest cache slots per split, [`MIN_SPLIT_SLOTS`] or [`ONE_TILE_SPLIT_SLOTS`]. The
+    /// summation order depends on it.
+    pub min_split_slots: usize,
 }
 
 /// Splits of the cache slots that [`Attention::decode_attention`] launches for a cache of
-/// `slots`: [`SPLITS`], or fewer so that each covers at least [`MIN_SPLIT_SLOTS`].
-fn splits(slots: usize) -> u32 {
-    let splits = slots.div_ceil(MIN_SPLIT_SLOTS).clamp(1, SPLITS);
+/// `slots`: [`SPLITS`], or fewer so that each covers at least `min_slots`.
+fn splits(slots: usize, min_slots: usize) -> u32 {
+    let splits = slots.div_ceil(min_slots).clamp(1, SPLITS);
     debug_assert!(splits <= MAX_SPLITS);
     splits as u32
 }
@@ -768,7 +775,7 @@ impl Attention {
             .arg(&extent)
             .arg(&SCALE);
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, splits(cache.slots), 1),
+            grid_dim: (KV_HEADS as u32, splits(cache.slots, MIN_SPLIT_SLOTS), 1),
             block_dim: (DECODE_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -820,6 +827,11 @@ impl Attention {
         check_len("sinks", s.sinks.len(), HEADS)?;
         check_len("out", s.out.len(), HEADS * HEAD_DIM)?;
         check_len("position", position.len(), 1)?;
+        ensure!(
+            [MIN_SPLIT_SLOTS, ONE_TILE_SPLIT_SLOTS].contains(&s.min_split_slots),
+            "min_split_slots is {}, expected {MIN_SPLIT_SLOTS} or {ONE_TILE_SPLIT_SLOTS}",
+            s.min_split_slots
+        );
         let extent = extent("table", s.table.len(), REL_DIM)?;
         let slots = u32::try_from(cache.slots)?;
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
@@ -895,7 +907,7 @@ impl Attention {
             .f32(s.eps)
             .f32(SCALE);
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, splits(cache.slots), 1),
+            grid_dim: (KV_HEADS as u32, splits(cache.slots, s.min_split_slots), 1),
             block_dim: (DECODE_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };

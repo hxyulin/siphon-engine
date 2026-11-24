@@ -31,7 +31,7 @@ use siphon_cuda::{
     ops::{
         attention::{
             Attention, AttentionScratch, DecodeStep, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData,
-            KvFormat, MAX_PREFILL_ROWS, PrefillScratch, REL_DIM,
+            KvFormat, MAX_PREFILL_ROWS, MIN_SPLIT_SLOTS, PrefillScratch, REL_DIM,
         },
         elementwise::Elementwise,
         norm::{AttentionPost, KvConvWeights, Norm},
@@ -941,6 +941,7 @@ fn check_decode_step(
                 rel_threshold: REL_THRESHOLD,
                 eps: EPS,
                 out: &mut gated,
+                min_split_slots: MIN_SPLIT_SLOTS,
             },
         )?;
 
@@ -1636,6 +1637,7 @@ fn decode_step_timing() -> anyhow::Result<()> {
                                 rel_threshold: REL_THRESHOLD,
                                 eps: EPS,
                                 out: &mut gated,
+                                min_split_slots: MIN_SPLIT_SLOTS,
                             },
                         )?;
                     } else {

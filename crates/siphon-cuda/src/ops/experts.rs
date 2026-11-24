@@ -14,6 +14,23 @@ use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 
 /// Experts each token routes to.
 const SLOTS: usize = 8;
+/// The hidden size, which the end of the MoE block in `expert_mlp` needs as `w2.n`.
+const HIDDEN: usize = 2304;
+/// Taps of the post-MLP conv.
+const CONV_TAPS: usize = 4;
+
+/// The end of the MoE block for one row, which [`Experts::expert_mlp`] can run after its
+/// products, as `Conv::moe_conv_residual` does: `hidden = bf16(residual + conv(combine))`,
+/// where `combine` sums the 8 expert outputs times `weights` and `conv` is the post-MLP
+/// short conv with taps `conv_weight` (`[2304, 1, 4]`) and state `conv_state`
+/// (`[3, 2304]`, updated).
+pub struct MoeEnd<'a> {
+    pub weights: &'a CudaSlice<f32>,
+    pub conv_weight: &'a CudaSlice<bf16>,
+    pub conv_state: &'a mut CudaSlice<f32>,
+    pub residual: &'a CudaSlice<f32>,
+    pub hidden: &'a mut CudaSlice<bf16>,
+}
 /// `expert_matvec` and `expert_mlp`: warps per block, and 16-byte weight chunks per lane.
 const MATVEC_WARPS: usize = 4;
 const MATVEC_CHUNKS: usize = 9;
@@ -546,6 +563,10 @@ impl Experts {
     /// Equals [`Self::expert_matvec`], `Elementwise::softcapped_swiglu` and
     /// [`Self::expert_matvec`] again, bit for bit. The `w2` products of each slot start as
     /// soon as its activations are ready, so DRAM streams both projections without a gap.
+    ///
+    /// With `end`, which needs one row and `w2.n` = 2304, the kernel also ends the MoE block
+    /// as `Conv::moe_conv_residual` does from `out`, bit for bit, and `sync` holds at least
+    /// `1 + 8 + w2.n / 32` (NVFP4) or `1 + 8 + w2.n / 16` (MXFP8) zeros.
     #[expect(clippy::too_many_arguments, reason = "two projections and two caps")]
     pub fn expert_mlp(
         &self,
@@ -559,6 +580,7 @@ impl Experts {
         sync: &mut impl DeviceOut<u32>,
         gate_softcap: f32,
         up_softcap: f32,
+        end: Option<MoeEnd<'_>>,
     ) -> anyhow::Result<()> {
         let (x, indices, mut act, mut out, mut sync) = (
             x.view(),
@@ -596,6 +618,29 @@ impl Experts {
             "expert_mlp needs w2's n a multiple of {block_rows2}, got {}",
             w2.n
         );
+        if let Some(end) = &end {
+            ensure!(
+                pairs == SLOTS && w2.n == HIDDEN,
+                "ending the MoE block needs one row and w2.n = {HIDDEN}, got {pairs} pairs \
+                 and {}",
+                w2.n
+            );
+            ensure!(
+                sync.len() > pairs + w2.n / block_rows2,
+                "sync has {} elements, expected at least {}",
+                sync.len(),
+                1 + pairs + w2.n / block_rows2
+            );
+            ensure!(
+                end.weights.len() == SLOTS
+                    && end.conv_weight.len() == CONV_TAPS * HIDDEN
+                    && end.conv_state.len() == (CONV_TAPS - 1) * HIDDEN
+                    && end.residual.len() == HIDDEN
+                    && end.hidden.len() == HIDDEN,
+                "the MoE block's end needs 8 weights, [2304, 4] conv taps, a [3, 2304] conv \
+                 state, and 2304-wide residual and hidden"
+            );
+        }
         if pairs == 0 {
             return Ok(());
         }
@@ -616,6 +661,15 @@ impl Experts {
             .f32(gate_softcap)
             .f32(up_softcap)
             .ptr_mut(&mut sync, stream);
+        match end {
+            Some(end) => args
+                .ptr(end.weights, stream)
+                .ptr(end.conv_weight, stream)
+                .ptr_mut(end.conv_state, stream)
+                .ptr(end.residual, stream)
+                .ptr_mut(end.hidden, stream),
+            None => args.u64(0).u64(0).u64(0).u64(0).u64(0),
+        };
         let blocks = tasks.min(self.mlp_blocks[w13.format.index()]);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(blocks)?, 1, 1),
@@ -624,10 +678,12 @@ impl Experts {
         };
         // SAFETY: the arguments match `expert_mlp_*(const bf16*, const int*, const u8*,
         // const u8*, const float*, const u8*, const u8*, const float*, bf16*, bf16*, int, int,
-        // int, float, float, unsigned*)`. The checks above give `x` one 2304-wide input per
-        // row, `act` 1152 values and `out` w2.n values per pair, the weights the kernel's
-        // shapes and `experts` experts each, and `sync` room for its 1 + pairs counters,
-        // zero as the kernel leaves them. The grid has at most one block per task, and all
+        // int, float, float, unsigned*, const float*, const bf16*, float*, const float*,
+        // bf16*)`. The checks above give `x` one 2304-wide input per row, `act` 1152 values
+        // and `out` w2.n values per pair, the weights the kernel's shapes and `experts`
+        // experts each, and `sync` room for its 1 + pairs counters, and with `end` its
+        // per-tile counters, zero as the kernel leaves them; `end`'s buffers have the lengths
+        // checked above, and a null `hidden` makes the kernel read none of them. The grid has at most one block per task, and all
         // its blocks fit on the GPU at once (`mlp_blocks`), which the kernel's waits
         // need. Only the NVFP4 kernel reads the global scales, which then hold `experts`
         // values. The kernel reads nothing before `pdl_wait`.

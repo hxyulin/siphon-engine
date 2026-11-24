@@ -5,7 +5,8 @@ use std::{mem::size_of, sync::Arc};
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
-    PushKernelArg as _, sys::CUdevice_attribute,
+    PushKernelArg as _,
+    sys::{CUdevice_attribute, CUfunction_attribute},
 };
 use half::bf16;
 
@@ -19,6 +20,8 @@ pub const EXPERTS: usize = 128;
 pub const TOP_K: usize = 8;
 /// Most rows [`Routing::moe_router_step_rows`] takes, `kStepRouterRows` in the kernel.
 pub const STEP_ROUTER_ROWS: usize = 8;
+/// Blocks of `moe_router_step_2304`, one cluster, `kRouterCluster` in the kernel.
+const STEP_ROUTER_CLUSTER: u32 = 16;
 /// Threads per block of `router_logits_2304`, which fixes its summation order.
 const LOGITS_THREADS: u32 = 256;
 /// Threads per block of `expert_routing_128_top8`: one warp per row.
@@ -212,7 +215,15 @@ impl Routing {
             moe_router_logits_rows_2304: module.load_function("moe_router_logits_rows_2304")?,
             moe_router_route_rows_2304: module.load_function("moe_router_route_rows_2304")?,
             depth_attention_step_2304: module.load_function("depth_attention_step_2304")?,
-            moe_router_step_2304: module.load_function("moe_router_step_2304")?,
+            moe_router_step_2304: {
+                let f = module.load_function("moe_router_step_2304")?;
+                // Its compiled cluster of 16 blocks is above the portable limit of 8.
+                f.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                    1,
+                )?;
+                f
+            },
             moe_router_step_rows_2304: module.load_function("moe_router_step_rows_2304")?,
             depth_attention_rows_2304: ROWS_QUERY_COUNTS
                 .iter()
@@ -760,10 +771,8 @@ impl Routing {
     }
 
     /// The router for one BF16 row `x` that is already normalized: logits from `x`, then the
-    /// top-8 routing of [`Routing::moe_router`], in one launch. The logits sum in the order
-    /// of `moe_router_step_2304`.
-    ///
-    /// `counter` must hold 0; the kernel leaves it at 0.
+    /// top-8 routing of [`Routing::moe_router`], in one launch of one 16-block cluster. The
+    /// logits sum in the order of [`Self::moe_router_step_rows`].
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
     pub fn moe_router_step(
         &self,
@@ -774,7 +783,6 @@ impl Routing {
         logits: &mut CudaSlice<f32>,
         indices: &mut CudaSlice<i32>,
         weights: &mut CudaSlice<f32>,
-        counter: &mut CudaSlice<u32>,
         route_scale: f32,
     ) -> anyhow::Result<()> {
         ensure!(
@@ -795,10 +803,9 @@ impl Routing {
             indices.len() == TOP_K && weights.len() == TOP_K,
             "indices or weights length"
         );
-        ensure!(!counter.is_empty(), "counter is empty");
         let config = LaunchConfig {
-            grid_dim: (EXPERTS as u32, 1, 1),
-            block_dim: (ROUTER_THREADS, 1, 1),
+            grid_dim: (STEP_ROUTER_CLUSTER, 1, 1),
+            block_dim: (EXPERTS as u32 / STEP_ROUTER_CLUSTER * 32, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
@@ -808,12 +815,11 @@ impl Routing {
             .ptr_mut(logits, stream)
             .ptr_mut(indices, stream)
             .ptr_mut(weights, stream)
-            .ptr_mut(counter, stream)
             .f32(route_scale);
         // SAFETY: the arguments match `moe_router_step_2304(const bf16*, const float*, const
-        // float*, float*, int32_t*, float*, unsigned*, float)`, every buffer has the length
-        // the kernel reads or writes, the grid has one block per expert, and the kernel reads
-        // only the router before `pdl_wait`.
+        // float*, float*, int32_t*, float*, float)`, every buffer has the length the kernel
+        // reads or writes, the grid is the kernel's one cluster of 16 blocks of one warp per
+        // expert, and the kernel reads only the router and the bias before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_step_2304, config) }
     }
 

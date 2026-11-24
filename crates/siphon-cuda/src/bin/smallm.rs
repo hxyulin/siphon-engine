@@ -686,6 +686,7 @@ mod linux {
                                     &mut decode_sync,
                                     caps.0,
                                     caps.1,
+                                    None,
                                 )?;
                             }
                             Ok(())

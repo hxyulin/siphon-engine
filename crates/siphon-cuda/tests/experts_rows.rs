@@ -306,6 +306,7 @@ fn rows_against_decode_and_prefill() -> anyhow::Result<()> {
                 &mut decode_sync,
                 GATE_SOFTCAP,
                 UP_SOFTCAP,
+                None,
             )?;
             dec_act.extend(stream.clone_dtoh(&act_dec)?);
             dec_out.extend(stream.clone_dtoh(&out_dec)?);

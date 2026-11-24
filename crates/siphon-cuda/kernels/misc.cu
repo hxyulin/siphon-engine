@@ -1026,3 +1026,100 @@ message_gate_norm_rows_2304(const float* out, const __nv_bfloat16* __restrict__ 
     *reinterpret_cast<uint2*>(normed + at + ca) = na;
     *reinterpret_cast<uint2*>(normed + at + cb) = nb;
 }
+
+namespace prologue {
+
+constexpr int kVec = 4;
+constexpr int kThreads = kHidden / kVec;
+constexpr int kWarps = kThreads / 32;
+
+// The reductions and rounding of rms_norm_bf16_2304 and unweighted_rms_norm_bf16_f32_2304
+// in norm.cu, which this kernel must equal bit for bit.
+__device__ __forceinline__ float simd_sum(float v) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+__device__ __forceinline__ float row_sum_squares(const float (&v)[kVec], float* warp_sums) {
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        acc = fmaf(v[i], v[i], acc);
+    }
+    acc = simd_sum(acc);
+    const int lane = threadIdx.x % 32;
+    if (lane == 0) {
+        warp_sums[threadIdx.x / 32] = acc;
+    }
+    __syncthreads();
+    return simd_sum(lane < kWarps ? warp_sums[lane] : 0.f);
+}
+
+__device__ __forceinline__ float inv_rms(float sum_squares, float eps) {
+    const float mean_eps = sum_squares / static_cast<float>(kHidden) + eps;
+    return static_cast<float>(1.0 / sqrt(static_cast<double>(mean_eps)));
+}
+
+__device__ __forceinline__ void unpack(uint2 packed, float (&v)[kVec]) {
+    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        v[i] = __bfloat162float(vals[i]);
+    }
+}
+
+__device__ __forceinline__ uint2 pack(const float (&v)[kVec]) {
+    uint2 packed;
+    auto* vals = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        vals[i] = __float2bfloat16(v[i]);
+    }
+    return packed;
+}
+
+}  // namespace prologue
+
+// The start of a decode step, in one block: the embedding row of token ids[0] (a zero row
+// for an id outside [0, vocab)), its RMS norm with embed_norm into `hidden`, and the inputs
+// of the first layer's attention from `hidden`: its unweighted RMS norm into `normed` (F32)
+// and its RMS norm with input_norm into `input`. Equals embedding_bf16_2304 followed by
+// rms_norm_bf16_2304, unweighted_rms_norm_bf16_f32_2304 and rms_norm_bf16_2304, bit for bit.
+extern "C" __global__ void __launch_bounds__(prologue::kThreads)
+decode_prologue_2304(const int32_t* ids, const __nv_bfloat16* __restrict__ table, int32_t vocab,
+                     const __nv_bfloat16* __restrict__ embed_norm, const __nv_bfloat16* __restrict__ input_norm,
+                     __nv_bfloat16* hidden, float* normed, __nv_bfloat16* input, float eps) {
+    using namespace prologue;
+    __shared__ float warp_sums[2][kWarps];
+    const int col = threadIdx.x * kVec;
+    float we[kVec];
+    float wi[kVec];
+    unpack(*reinterpret_cast<const uint2*>(embed_norm + col), we);
+    unpack(*reinterpret_cast<const uint2*>(input_norm + col), wi);
+    pdl_trigger();
+    pdl_wait();
+    const int32_t id = ids[0];
+    float v[kVec] = {};
+    if (id >= 0 && id < vocab) {
+        unpack(*reinterpret_cast<const uint2*>(table + size_t(id) * kHidden + col), v);
+    }
+    const float scale = inv_rms(row_sum_squares(v, warp_sums[0]), eps);
+    float h[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        h[i] = __bfloat162float(__float2bfloat16(__bfloat162float(__float2bfloat16(v[i] * scale)) * we[i]));
+    }
+    *reinterpret_cast<uint2*>(hidden + col) = pack(h);
+    const float scale_h = inv_rms(row_sum_squares(h, warp_sums[1]), eps);
+    float y[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        y[i] = __bfloat162float(__float2bfloat16(h[i] * scale_h)) * wi[i];
+    }
+    *reinterpret_cast<float4*>(normed + col) =
+        make_float4(h[0] * scale_h, h[1] * scale_h, h[2] * scale_h, h[3] * scale_h);
+    *reinterpret_cast<uint2*>(input + col) = pack(y);
+}

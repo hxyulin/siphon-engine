@@ -123,6 +123,7 @@ pub struct Misc {
     argmax_wide_f32: CudaFunction,
     message_gate_step_2304: CudaFunction,
     message_gate_step_fp8_2304: CudaFunction,
+    decode_prologue_2304: CudaFunction,
 }
 
 /// Launch shape for a grid-stride loop over `n` elements.
@@ -154,6 +155,7 @@ impl Misc {
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
             message_gate_step_2304: module.load_function("message_gate_step_2304")?,
             message_gate_step_fp8_2304: module.load_function("message_gate_step_fp8_2304")?,
+            decode_prologue_2304: module.load_function("decode_prologue_2304")?,
         })
     }
 
@@ -444,6 +446,64 @@ impl Misc {
         // kernel reads only weights before `pdl_wait`. Its barriers need every block
         // resident, which 32 blocks of 288 threads per gate are.
         unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// The start of a decode step in one launch: the embedding row of token `ids[0]` from
+    /// `table` (`[vocab, 2304]`; a zero row for an id outside it), its RMS norm with
+    /// `embed_norm` into `hidden`, and from `hidden` the first layer's attention inputs: its
+    /// unweighted RMS norm into `normed` (F32) and its RMS norm with `input_norm` into
+    /// `input`. Equals `Elementwise::embedding`, then `Norm::rms_norm`,
+    /// `Norm::unweighted_rms_norm_bf16` and `Norm::rms_norm` again, bit for bit.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn decode_prologue(
+        &self,
+        stream: &CudaStream,
+        ids: &CudaSlice<i32>,
+        table: &CudaSlice<bf16>,
+        embed_norm: &CudaSlice<bf16>,
+        input_norm: &CudaSlice<bf16>,
+        hidden: &mut CudaSlice<bf16>,
+        normed: &mut impl DeviceOut<f32>,
+        input: &mut CudaSlice<bf16>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let mut normed = normed.view_mut();
+        ensure!(!ids.is_empty(), "no token id");
+        ensure!(
+            table.len().is_multiple_of(HIDDEN) && !table.is_empty(),
+            "table has {} elements, not whole rows of {HIDDEN}",
+            table.len()
+        );
+        let vocab = i32::try_from(table.len() / HIDDEN).context("table has too many rows")?;
+        for (name, len) in [
+            ("embed_norm", embed_norm.len()),
+            ("input_norm", input_norm.len()),
+            ("hidden", hidden.len()),
+            ("normed", normed.len()),
+            ("input", input.len()),
+        ] {
+            check_len(name, len, HIDDEN)?;
+        }
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: ((HIDDEN / 4) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(ids, stream)
+            .ptr(table, stream)
+            .i32(vocab)
+            .ptr(embed_norm, stream)
+            .ptr(input_norm, stream)
+            .ptr_mut(hidden, stream)
+            .ptr_mut(&mut normed, stream)
+            .ptr_mut(input, stream)
+            .f32(eps);
+        // SAFETY: the arguments match `decode_prologue_2304(const int*, const bf16*, int, const
+        // bf16*, const bf16*, bf16*, float*, bf16*, float)`, every buffer has the length
+        // checked above, the kernel reads only rows of `table` below `vocab`, and it reads
+        // only the norm weights before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.decode_prologue_2304, config) }
     }
 
     /// The index of the largest of the values of one long F32 row `x`, as

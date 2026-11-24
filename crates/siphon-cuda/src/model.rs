@@ -32,10 +32,13 @@ use siphon::TextConfig;
 use crate::{
     DeviceIn, Gpu,
     ops::{
-        attention::{self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat},
+        attention::{
+            self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat,
+            MIN_SPLIT_SLOTS, ONE_TILE_SPLIT_SLOTS,
+        },
         conv::Conv,
         elementwise::Elementwise,
-        experts::{self, ExpertActivations, Experts},
+        experts::{self, ExpertActivations, Experts, MoeEnd},
         experts_rows::ExpertsRows,
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
         linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
@@ -140,7 +143,6 @@ struct Scratch {
     position: CudaSlice<u32>,
     /// The greedy next token, read back after the step.
     next: CudaSlice<i32>,
-    embedded: CudaSlice<bf16>,
     /// The input of the current visit; `out` is its output, and the two swap after it.
     hidden: CudaSlice<bf16>,
     out: CudaSlice<bf16>,
@@ -205,8 +207,6 @@ struct AttentionTemps {
 /// Intermediates of `SparseMoeBlock`.
 struct MoeScratch {
     logits: CudaSlice<f32>,
-    /// The router kernel's block counter.
-    counter: CudaSlice<u32>,
     indices: CudaSlice<i32>,
     weights: CudaSlice<f32>,
     act: CudaSlice<bf16>,
@@ -236,7 +236,6 @@ impl Scratch {
             token: zeros(stream, 1)?,
             position: zeros(stream, 1)?,
             next: zeros(stream, 1)?,
-            embedded: zeros(stream, hidden)?,
             hidden: zeros(stream, hidden)?,
             out: zeros(stream, hidden)?,
             prelude_hidden: zeros(stream, hidden)?,
@@ -278,12 +277,12 @@ impl Scratch {
             mlp_x: zeros(stream, hidden)?,
             moe: MoeScratch {
                 logits: zeros(stream, cfg.n_routed_experts)?,
-                counter: zeros(stream, 1)?,
                 indices: zeros(stream, top_k)?,
                 weights: zeros(stream, top_k)?,
                 act: zeros(stream, top_k * width)?,
                 down: zeros(stream, top_k * hidden)?,
-                mlp_sync: zeros(stream, 1 + top_k)?,
+                // The pair counters, then one per row tile of `w2` (at most 16 rows).
+                mlp_sync: zeros(stream, 1 + top_k + hidden / 16)?,
             },
             final_hidden: zeros(stream, hidden)?,
             logits: zeros(stream, cfg.vocab_size)?,
@@ -727,17 +726,25 @@ impl Model {
             after: after.next().flatten(),
         };
 
-        ctx.kernels.elementwise.embedding(
+        // The embedding, its norm, and the first visit's attention inputs (see
+        // `attention_inputs`), which go into the first block state and `qkv_in[0]`.
+        let first = &ctx.weights.layers[0];
+        let InputNorms::Shared(input_norm) = &first.input_norms else {
+            anyhow::bail!("the first layer needs one shared input norm");
+        };
+        ensure!(
+            first.attention_query.is_none() && cfg.is_sliding(0),
+            "the first layer must have no depth attention and one shared input"
+        );
+        ctx.kernels.misc.decode_prologue(
             &ctx.stream,
             &s.token,
             &ctx.weights.embed,
-            &mut s.embedded,
-        )?;
-        ctx.kernels.norm.rms_norm(
-            &ctx.stream,
-            &s.embedded,
             &ctx.weights.embed_norm,
+            input_norm,
             &mut s.hidden,
+            &mut s.blocks.slice_mut(..hidden),
+            &mut s.qkv_in[0],
             ctx.eps(),
         )?;
 
@@ -866,6 +873,8 @@ impl Model {
                 Start::Serial,
             )?;
         }
+        // Folding the softcap into the FP8 product's epilogue made a step 4 us slower: its
+        // F64 tanh holds each block of the product longer.
         ctx.kernels.elementwise.logit_softcap(
             &ctx.stream,
             &s.logits,
@@ -887,10 +896,13 @@ impl Model {
 /// more.
 const LM_HEAD_PREFETCH_BYTES: usize = 32 << 20;
 
-/// The rate of the paced prefetches with FP8 weights, in TB/s. At 1.3 a step took 2.861,
-/// 3.769 and 5.660 ms at contexts 0, 32K and 128K, against 2.885, 3.796 and 5.688 ms with
-/// loads; 1.5 took 2.847 ms at context 0 but 3.782 ms at 32K.
-const PREFETCH_TB_PER_S: f32 = 1.3;
+/// The rate of the paced prefetches with FP8 weights, in TB/s. Once the expert kernel ended
+/// the MoE block and the router ran as one cluster, the chain between prefetches got shorter
+/// and a faster pace paid. FP8 cache, ms per step at contexts 0, 32K and 128K: 1.1 took
+/// 2.857, 3.374 and 4.356; 1.3 took 2.816, 3.329 and 4.312; 1.4 took 2.795, 3.318 and 4.303;
+/// 1.5 took 2.780, 3.315 and 4.298; 1.6 took 2.780, 3.327 and 4.315; 1.7 took 2.810, 3.370
+/// and 4.356.
+const PREFETCH_TB_PER_S: f32 = 1.5;
 
 /// The first bytes of a buffer to prefetch, at most its whole length.
 struct PrefetchStart<'a>(&'a dyn Prefetch, usize);
@@ -1173,27 +1185,39 @@ impl Ctx {
                 vec![Some((&w.mlp_norm, s.mlp_x.as_view_mut()))],
             )?;
         }
-        self.moe(w, &mut s.moe, &s.mlp_x)?;
+        // With FP8 weights the expert kernel also runs the MoE combine, the post-MLP conv and
+        // the residual add into `s.out`, which a separate kernel after it took 2.4 us of: a
+        // step took 2.862 instead of 2.883 ms at context 0. With BF16 weights the step waits
+        // on the prefetch, which forks after the expert kernel, and the fused end delayed it:
+        // 3.752 instead of 3.715 ms.
+        let fused = w.fp8.is_some();
+        self.moe(
+            w,
+            &mut s.moe,
+            &s.mlp_x,
+            fused.then_some((&mut state.conv[3], &s.residual, &mut s.out)),
+        )?;
         // The experts are the visit's last DRAM stream, so the next visit's weights start
         // as soon as they finish, beside the conv and the next visit's depth attention.
-        // Forking after the conv took a step from 3.767 to 3.829 ms with BF16 weights and
-        // from 2.883 to 2.897 ms with FP8 weights. Forking before the router, so that the
-        // prefetch overlaps the experts, took 4.02 and 3.33 ms. The main stream first waits
-        // for this visit's prefetch, which has usually finished by then.
+        // Forking after a separate conv kernel took a step from 3.767 to 3.829 ms with BF16
+        // weights and from 2.883 to 2.897 ms with FP8 weights. Forking before the router, so
+        // that the prefetch overlaps the experts, took 4.02 and 3.33 ms. The main stream first
+        // waits for this visit's prefetch, which has usually finished by then.
         if let Some((layer, messages)) = next.next {
             self.kernels.linear.join_prefetch(&self.stream)?;
             self.prefetch_rest(layer, messages, next.after)?;
         }
-
-        self.kernels.conv.moe_conv_residual(
-            &self.stream,
-            &s.moe.down,
-            &s.moe.weights,
-            &w.post_mlp_conv,
-            &mut state.conv[3],
-            &s.residual,
-            &mut s.out,
-        )?;
+        if !fused {
+            self.kernels.conv.moe_conv_residual(
+                &self.stream,
+                &s.moe.down,
+                &s.moe.weights,
+                &w.post_mlp_conv,
+                &mut state.conv[3],
+                &s.residual,
+                &mut s.out,
+            )?;
+        }
 
         if let Some(t) = trace {
             t.visits.push(VisitTrace {
@@ -1223,25 +1247,13 @@ impl Ctx {
         };
         let shared = matches!(w.input_norms, InputNorms::Shared(_));
         let Some(query) = &w.attention_query else {
-            // Layer 0: no depth attention and no messages, one shared BF16 input.
+            // Layer 0: no depth attention and no messages, one shared BF16 input. The step's
+            // first kernel, `Misc::decode_prologue`, has written its unweighted norm into the
+            // first block state, which is `a.normed`, and its normed input into `qkv_in[0]`.
             ensure!(
                 a.messages.is_none(),
                 "layer without depth attention got messages"
             );
-            let mut normed = a.normed;
-            self.kernels.norm.unweighted_rms_norm_bf16(
-                &self.stream,
-                a.x,
-                &mut normed,
-                self.eps(),
-            )?;
-            self.kernels.norm.rms_norm(
-                &self.stream,
-                a.x,
-                norms[0],
-                &mut a.qkv_in[0],
-                self.eps(),
-            )?;
             return Ok(true);
         };
         let count = if sliding { 1 } else { 3 };
@@ -1411,6 +1423,15 @@ impl Ctx {
                 rel_threshold: cfg.rel_l2_clip_threshold,
                 eps: self.eps(),
                 out: &mut t.gated,
+                // With FP8 weights, a full sliding window in 32 one-tile splits took a step at
+                // 32K from 3.367 to 3.328 ms and at context 0 from 2.814 to 2.818 ms. With
+                // BF16 weights, whose unpaced prefetch then competes with the window's reads,
+                // it took 4.770 to 4.834 ms at 32K and 3.736 to 3.755 at context 0.
+                min_split_slots: if w.fp8.is_some() {
+                    ONE_TILE_SPLIT_SLOTS
+                } else {
+                    MIN_SPLIT_SLOTS
+                },
             },
         )?;
         // decode_step triggers early, and no prefetch starts here.
@@ -1477,8 +1498,16 @@ impl Ctx {
     }
 
     /// MLX-LM's `SparseMoeBlock` for one row from its normalized BF16 input `x`, up to the
-    /// expert outputs in `t.down` and their weights in `t.weights`.
-    fn moe(&self, w: &LayerWeights, t: &mut MoeScratch, x: &CudaSlice<bf16>) -> anyhow::Result<()> {
+    /// expert outputs in `t.down` and their weights in `t.weights`. With `end`, also the
+    /// post-MLP conv with that state and the residual add: `hidden = bf16(residual +
+    /// conv(moe(x)))`.
+    fn moe(
+        &self,
+        w: &LayerWeights,
+        t: &mut MoeScratch,
+        x: &CudaSlice<bf16>,
+        end: Option<(&mut CudaSlice<f32>, &CudaSlice<f32>, &mut CudaSlice<bf16>)>,
+    ) -> anyhow::Result<()> {
         let cfg = &self.config;
         self.kernels.routing.moe_router_step(
             &self.stream,
@@ -1488,7 +1517,6 @@ impl Ctx {
             &mut t.logits,
             &mut t.indices,
             &mut t.weights,
-            &mut t.counter,
             cfg.route_scale,
         )?;
 
@@ -1504,6 +1532,13 @@ impl Ctx {
             &mut t.mlp_sync,
             cfg.mlp_gate_softcap,
             cfg.mlp_up_softcap,
+            end.map(|(conv_state, residual, hidden)| MoeEnd {
+                weights: &t.weights,
+                conv_weight: &w.post_mlp_conv,
+                conv_state,
+                residual,
+                hidden,
+            }),
         )
     }
 

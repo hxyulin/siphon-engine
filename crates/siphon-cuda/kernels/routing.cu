@@ -1349,58 +1349,170 @@ depth_attention_step_2304(const float* blocks, int nb, const float* partial_f32,
     }
 }
 
+namespace {
+
+// Cluster helpers for moe_router_step_2304: one-way stores into another block's shared
+// memory that complete on that block's mbarrier, so the receiver waits on its own barrier
+// instead of a cluster barrier round trip.
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ uint32_t cluster_rank() {
+    uint32_t r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+    return r;
+}
+
+// Address `a` of this block's shared memory in block `rank` of the cluster.
+__device__ __forceinline__ uint32_t cluster_addr(uint32_t a, uint32_t rank) {
+    uint32_t r;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank));
+    return r;
+}
+
+// The sum of the router dot products of one row, as moe_router_step_rows_2304 adds them:
+// virtual thread t = 32 w + lane of a 288-thread block sums its 8 products in order
+// (elements 4t.. then 4(t + 288)..), each virtual warp w adds with warp_sum, and the 9
+// warp sums add in order. Lane `lane` holds the router row's elements at chunks lane + 32 i
+// (4 floats each), the first 9 for the 4t.. runs and the last 9 for the 4(t + 288).. runs.
+__device__ __forceinline__ float router_logit(const float4 (&w)[2 * kStepWarps], const __nv_bfloat16* x,
+                                              int lane) {
+    float total = 0.f;
+#pragma unroll
+    for (int v = 0; v < kStepWarps; ++v) {
+        float xa[4], xb[4];
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(x + 4 * (lane + 32 * v)), xa);
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(x + 4 * (lane + 32 * v + kStepThreads)), xb);
+        const float4 a = w[v];
+        const float4 b = w[v + kStepWarps];
+        float acc = 0.f;
+        acc = fmaf(a.x, xa[0], acc);
+        acc = fmaf(a.y, xa[1], acc);
+        acc = fmaf(a.z, xa[2], acc);
+        acc = fmaf(a.w, xa[3], acc);
+        acc = fmaf(b.x, xb[0], acc);
+        acc = fmaf(b.y, xb[1], acc);
+        acc = fmaf(b.z, xb[2], acc);
+        acc = fmaf(b.w, xb[3], acc);
+        total += warp_sum(acc);
+    }
+    return total;
+}
+
+constexpr int kClusterRouterBlocks = 16;
+constexpr int kClusterRouterWarps = kExperts / kClusterRouterBlocks;
+constexpr int kClusterRouterThreads = 32 * kClusterRouterWarps;
+static_assert(kClusterRouterThreads == 2 * kExperts, "two threads per expert rank it");
+
+}  // namespace
+
 // The router for one BF16 row x that is already normalized: logits = F32(x) @ router.T,
-// then the top-8 routing of moe_router_2304. One block per expert; each thread sums
-// elements 4t.. and 4(t + 288).., then the warps add in order. The last block to finish,
-// found with `counter`, routes. `counter` must start at 0; the last block resets it.
-extern "C" __global__ void __launch_bounds__(kStepThreads)
+// then the top-8 routing of moe_router_2304, as one cluster of 16 blocks of 8 warps.
+// Warp w of block r takes expert 8 r + w: its lanes hold the whole router row, loaded
+// before pdl_wait, and sum the logit exactly as moe_router_step_rows_2304 does. Each
+// block sends its 8 logits to block 0 with two st.async stores, and block 0 routes: each
+// expert's rank among the biased scores, ties to the lower index, counted by two threads
+// over half the experts each, as route_top8 does.
+extern "C" __global__ void __cluster_dims__(kClusterRouterBlocks, 1, 1) __launch_bounds__(kClusterRouterThreads)
 moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, const float* __restrict__ bias,
-                     float* logits, int32_t* indices, float* weights, unsigned* counter, float route_scale) {
-    __shared__ float warp_dots[kStepWarps];
-    __shared__ bool last;
+                     float* logits, int32_t* indices, float* weights, float route_scale) {
+    __shared__ __align__(16) float all[kExperts];
+    __shared__ __align__(16) float mine[kClusterRouterWarps];
+    __shared__ __align__(8) uint64_t arrived;
+    __shared__ float biased[kExperts];
+    __shared__ float score[kExperts];
+    __shared__ int ranks[kClusterRouterThreads];
+    __shared__ float top[kTopK];
     const int t = threadIdx.x;
     const int lane = t % 32;
     const int warp = t / 32;
-    const int ca = 4 * t;
-    const int cb = 4 * (t + kStepThreads);
-    const int e = blockIdx.x;
-    float w[8];
-    load8(router + size_t(e) * kHidden, ca, cb, w);
+    const uint32_t rank = cluster_rank();
+    const uint32_t barrier = smem_addr(&arrived);
+    if (t == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(barrier) : "memory");
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        if (rank == 0) {
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(barrier),
+                         "r"(uint32_t(kExperts * sizeof(float)))
+                         : "memory");
+        }
+    }
+    // Every block arrives now and waits before its first remote store, so block 0's
+    // barrier is ready by then.
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+
+    const int e = int(rank) * kClusterRouterWarps + warp;
+    const auto* row = reinterpret_cast<const float4*>(router + size_t(e) * kHidden);
+    float4 w[2 * kStepWarps];
+#pragma unroll
+    for (int i = 0; i < 2 * kStepWarps; ++i) {
+        w[i] = row[lane + 32 * i];
+    }
+    const float b = rank == 0 && t < kExperts ? bias[t] : 0.f;
     pdl_trigger();
     pdl_wait();
-    float xv[8];
-    unpack_bf16x4(*reinterpret_cast<const uint2*>(x + ca), xv);
-    unpack_bf16x4(*reinterpret_cast<const uint2*>(x + cb), xv + 4);
-    float acc = 0.f;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        acc = fmaf(w[i], xv[i], acc);
-    }
-    acc = warp_sum(acc);
+
+    const float logit = router_logit(w, x, lane);
     if (lane == 0) {
-        warp_dots[warp] = acc;
+        mine[warp] = logit;
     }
     __syncthreads();
-    if (t == 0) {
-        float total = 0.f;
-#pragma unroll
-        for (int s = 0; s < kStepWarps; ++s) {
-            total += warp_dots[s];
-        }
-        logits[e] = total;
-        // Release orders the logit before the count; acquire orders the last block's
-        // reads after every other block's logit. Full fences cost 0.13 us more.
-        unsigned old;
-        asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], 1;" : "=r"(old) : "l"(counter) : "memory");
-        last = old == kExperts - 1;
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (t < kClusterRouterWarps / 4) {
+        const float4 v = reinterpret_cast<const float4*>(mine)[t];
+        const uint32_t dst = cluster_addr(smem_addr(all + rank * kClusterRouterWarps + 4 * t), 0);
+        asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(dst),
+                     "r"(__float_as_uint(v.x)), "r"(__float_as_uint(v.y)), "r"(__float_as_uint(v.z)),
+                     "r"(__float_as_uint(v.w)), "r"(cluster_addr(barrier, 0))
+                     : "memory");
     }
-    __syncthreads();
-    if (!last) {
+    if (rank != 0) {
         return;
     }
-    route_top8(logits, bias, indices, weights, route_scale);
-    if (t == 0) {
-        *counter = 0;
+    asm volatile(
+        "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
+        " @!p bra wait;\n}" ::"r"(barrier)
+        : "memory");
+
+    // route_top8 on the gathered logits.
+    if (t < kExperts) {
+        const float l = all[t];
+        logits[t] = l;
+        // Metal's form of the sigmoid: exp of |x| cannot overflow to inf/inf.
+        const float y = 1.f / (1.f + expf(fabsf(l)));
+        score[t] = l < 0 ? y : 1.f - y;
+        biased[t] = score[t] + b;
+    }
+    __syncthreads();
+    {
+        const int me = t % kExperts;
+        const int half = t / kExperts;
+        const float my = biased[me];
+        int r = 0;
+#pragma unroll 8
+        for (int other = half * kExperts / 2; other < (half + 1) * kExperts / 2; ++other) {
+            const float o = biased[other];
+            r += o > my || (o == my && other < me);
+        }
+        ranks[t] = r;
+    }
+    __syncthreads();
+    if (t < kExperts) {
+        const int r = ranks[t] + ranks[t + kExperts];
+        if (r < kTopK) {
+            indices[r] = t;
+            top[r] = score[t];
+        }
+    }
+    __syncthreads();
+    if (t < kTopK) {
+        float total = 0.f;
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            total = top[k] + total;
+        }
+        weights[t] = top[t] / (total + kScoreEps) * route_scale;
     }
 }
 

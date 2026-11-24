@@ -14,6 +14,7 @@ use half::bf16;
 use siphon_cuda::{
     Gpu,
     ops::{
+        elementwise::Elementwise,
         linear::{Gemv, Linear, Start},
         linear_fp8::{Fp8Matrix, LinearFp8},
         misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, GateStepScratch, Misc},
@@ -890,6 +891,64 @@ fn message_gate_step_fp8_matches_reference() -> anyhow::Result<()> {
                 (k == 0).then_some((normed.as_slice(), norm_host.as_slice())),
             )?;
         }
+    }
+    Ok(())
+}
+
+/// The decode step's first kernel equals the embedding and the three norms it replaces, bit
+/// for bit, for tokens inside the vocabulary and one outside it.
+#[test]
+fn decode_prologue_matches_separate_kernels() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let misc = Misc::load(gpu.context())?;
+    let norm = Norm::load(gpu.context())?;
+    let elementwise = Elementwise::load(gpu.context())?;
+    let vocab = 50;
+    let table = stream.clone_htod(&pseudo_random_bf16(vocab * HIDDEN, 1, 0.05, 0.0))?;
+    let embed_norm = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 2, 0.5, 1.0))?;
+    let input_norm = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 3, 0.5, 1.0))?;
+    let bits16 = |v: Vec<bf16>| v.into_iter().map(bf16::to_bits).collect::<Vec<_>>();
+    let bits32 = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for token in [0, 17, 49, 50] {
+        let ids = stream.clone_htod(&[token])?;
+        let mut embedded = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut hidden_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut normed_want = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut input_want = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        elementwise.embedding(stream, &ids, &table, &mut embedded)?;
+        norm.rms_norm(stream, &embedded, &embed_norm, &mut hidden_want, EPS)?;
+        norm.unweighted_rms_norm_bf16(stream, &hidden_want, &mut normed_want, EPS)?;
+        norm.rms_norm(stream, &hidden_want, &input_norm, &mut input_want, EPS)?;
+        let mut hidden = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut normed = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut input = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        misc.decode_prologue(
+            stream,
+            &ids,
+            &table,
+            &embed_norm,
+            &input_norm,
+            &mut hidden,
+            &mut normed,
+            &mut input,
+            EPS,
+        )?;
+        assert_eq!(
+            bits16(stream.clone_dtoh(&hidden)?),
+            bits16(stream.clone_dtoh(&hidden_want)?),
+            "token {token}: hidden"
+        );
+        assert_eq!(
+            bits32(stream.clone_dtoh(&normed)?),
+            bits32(stream.clone_dtoh(&normed_want)?),
+            "token {token}: normed"
+        );
+        assert_eq!(
+            bits16(stream.clone_dtoh(&input)?),
+            bits16(stream.clone_dtoh(&input_want)?),
+            "token {token}: input"
+        );
     }
     Ok(())
 }

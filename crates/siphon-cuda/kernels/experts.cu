@@ -23,6 +23,7 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 
+#include "conv_step.cuh"
 #include "mlx_ops.cuh"
 #include "pdl.cuh"
 
@@ -230,6 +231,67 @@ __device__ __forceinline__ uint32_t load_relaxed(const uint32_t* p) {
 
 constexpr float kNan = __builtin_nanf("");
 
+// The end of the MoE block for one row, as moe_conv_residual_2304 in conv.cu computes it,
+// bit for bit: the combine of the 8 expert outputs with `weights`, the post-MLP conv, and
+// hidden = bf16(residual + conv).
+struct MoeConv {
+    const float* weights;
+    const __nv_bfloat16* __restrict__ conv_weight;
+    float* conv_state;
+    const float* residual;
+    __nv_bfloat16* hidden;
+};
+
+// One channel's inputs to the end of the MoE block that do not depend on this launch,
+// loaded before the expert outputs are ready.
+struct MoeConvInputs {
+    float weights[8];
+    float window[conv_step::kKernel - 1];
+    uint2 taps;
+    float residual;
+
+    MoeConvInputs() = default;
+    __device__ __forceinline__ MoeConvInputs(const MoeConv& m, int c, int n) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            weights[k] = m.weights[k];
+        }
+#pragma unroll
+        for (int k = 0; k < conv_step::kKernel - 1; ++k) {
+            window[k] = m.conv_state[size_t(k) * n + c];
+        }
+        taps = *reinterpret_cast<const uint2*>(m.conv_weight + size_t(c) * conv_step::kKernel);
+        residual = m.residual[c];
+    }
+};
+
+// Channel c from the expert outputs `down` ([8, n] BF16), which other blocks of this launch
+// wrote, so they are read from L2. The conv follows conv_step::short_conv.
+__device__ __forceinline__ void moe_conv(const MoeConv& m, const MoeConvInputs& in,
+                                         const __nv_bfloat16* down, int n, int c) {
+    float total = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        total = __fadd_rn(total, __fmul_rn(__bfloat162float(__ldcg(down + size_t(k) * n + c)), in.weights[k]));
+    }
+    const float x = conv_step::round_bf16(total);
+    const auto* taps = reinterpret_cast<const __nv_bfloat16*>(&in.taps);
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < conv_step::kKernel; ++k) {
+        const float w = k < conv_step::kKernel - 1 ? in.window[k] : x;
+        acc = __fadd_rn(acc, __fmul_rn(conv_step::round_bf16(w), __bfloat162float(taps[k])));
+    }
+    const float conv = conv_step::round_bf16(acc);
+#pragma unroll
+    for (int k = 0; k < conv_step::kKernel - 1; ++k) {
+        m.conv_state[size_t(k) * n + c] = k + 1 < conv_step::kKernel - 1 ? in.window[k + 1] : x;
+    }
+    const float y = __bfloat162float(
+        __float2bfloat16(__fdiv_rn(__fadd_rn(conv, x), conv_step::kShortDivisor)));
+    m.hidden[c] = __float2bfloat16(__fadd_rn(in.residual, y));
+}
+
 // One block covers `kBlockRows` output rows of one (row, slot) pair, `blockIdx.y`.
 template <bool kFp4, int kK>
 __device__ __forceinline__ void expert_matvec(const __nv_bfloat16* x, const int32_t* indices,
@@ -275,7 +337,8 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
                                            const float* g13, const uint8_t* w2, const uint8_t* s2,
                                            const float* g2, __nv_bfloat16* act,
                                            __nv_bfloat16* out, int n2, int pairs, int experts,
-                                           float gate_softcap, float up_softcap, uint32_t* sync) {
+                                           float gate_softcap, float up_softcap, uint32_t* sync,
+                                           const MoeConv& conv) {
     using G13 = Geometry<kFp4, kK13>;
     using G2 = Geometry<kFp4, kK2>;
     constexpr int kN13 = 2 * kK2;
@@ -344,6 +407,37 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
                 result = known ? result * output_scale(kFp4, g2, expert) : kNan;
                 out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(result);
             }
+            if (conv.hidden != nullptr) {
+                // The last pair's task of each row tile finishes the tile's channels once
+                // the other pairs' tasks, all earlier in task order, have counted in. Its
+                // other inputs load first, so only the expert outputs wait for the count.
+                const unsigned tile = (task - tasks13) % tiles2;
+                uint32_t* count = sync + 1 + pairs + tile;
+                const bool finisher = pair + 1 == unsigned(pairs);
+                const int channel = int(tile) * G2::kBlockRows + threadIdx.x;
+                const MoeConvInputs inputs = finisher && threadIdx.x < G2::kBlockRows
+                                                 ? MoeConvInputs(conv, channel, n2)
+                                                 : MoeConvInputs();
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    if (!finisher) {
+                        __threadfence();
+                        atomicAdd(count, 1u);
+                    } else {
+                        while (load_relaxed(count) < unsigned(pairs) - 1) {
+                            __nanosleep(32);
+                        }
+                        __threadfence();
+                        *count = 0;
+                    }
+                }
+                if (finisher) {
+                    __syncthreads();
+                    if (threadIdx.x < G2::kBlockRows) {
+                        moe_conv(conv, inputs, out, n2, channel);
+                    }
+                }
+            }
         }
     }
     if (threadIdx.x == 0 && atomicAdd(&sync[0], 1u) == gridDim.x - 1) {
@@ -386,7 +480,10 @@ EXPERT_MATVEC(expert_matvec_mxfp8_1152, false, 1152)
 // of n2 rows and input width 1152, with the weights as for `expert_matvec`:
 // - `x`: BF16 `[pairs / 8, 2304]`; `indices`: `[pairs / 8, 8]`;
 // - `act`: BF16 `[pairs, 1152]`, written; `out`: BF16 `[pairs, n2]`;
-// - `sync`: `1 + pairs` zeros, left zero.
+// - `sync`: `1 + pairs` zeros, left zero; with `hidden`, `1 + pairs + n2 / kBlockRows of w2`.
+// With a non-null `hidden`, which needs pairs = 8 (one row) and n2 = 2304, the kernel also
+// ends the MoE block as moe_conv_residual_2304 does, from `weights` ([8] F32),
+// `conv_weight`, `conv_state`, `residual` ([2304] F32) into `hidden` ([2304] BF16).
 // Blocks have `kWarps` warps. The grid may have any size up to the number of tasks,
 // `pairs * (2304 / kBlockRows of w13 + n2 / kBlockRows of w2)`, but all its blocks must
 // fit on the GPU at once.
@@ -395,9 +492,12 @@ EXPERT_MATVEC(expert_matvec_mxfp8_1152, false, 1152)
         name(const __nv_bfloat16* x, const int32_t* indices, const uint8_t* w13,                   \
              const uint8_t* s13, const float* g13, const uint8_t* w2, const uint8_t* s2,           \
              const float* g2, __nv_bfloat16* act, __nv_bfloat16* out, int n2, int pairs,           \
-             int experts, float gate_softcap, float up_softcap, uint32_t* sync) {                  \
+             int experts, float gate_softcap, float up_softcap, uint32_t* sync,                    \
+             const float* weights, const __nv_bfloat16* __restrict__ conv_weight,                  \
+             float* conv_state, const float* residual, __nv_bfloat16* hidden) {                    \
+        const MoeConv conv{weights, conv_weight, conv_state, residual, hidden};                    \
         expert_mlp<fp4, 2304, 1152>(x, indices, w13, s13, g13, w2, s2, g2, act, out, n2, pairs,    \
-                                    experts, gate_softcap, up_softcap, sync);                      \
+                                    experts, gate_softcap, up_softcap, sync, conv);                \
     }
 
 EXPERT_MLP(expert_mlp_nvfp4, true)
