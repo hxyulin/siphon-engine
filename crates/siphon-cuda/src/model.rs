@@ -113,7 +113,8 @@ fn e4m3_to_f32(b: u8) -> f32 {
 }
 
 /// A device copy of everything a sequence keeps across tokens, from [`Model::save_state`]:
-/// every KV cache, every conv state and the position.
+/// the filled slots of every global KV cache, every sliding ring, every conv state and the
+/// position.
 pub struct SavedState {
     visits: Vec<(KvData, Vec<CudaSlice<f32>>)>,
     position: usize,
@@ -602,23 +603,38 @@ impl Model {
             .collect()
     }
 
-    /// Copies every KV cache, conv state and the position on the device, so that
-    /// [`Model::restore_state`] can return to them exactly.
+    /// Copies the slots of every global KV cache below the position, every sliding ring,
+    /// every conv state and the position on the device, so that [`Model::restore_state`]
+    /// can return to them exactly. A global cache's slots from the position on are left
+    /// out: no kernel reads a slot there before writing it, and copying the whole cache
+    /// would double its memory at long capacities.
     pub fn save_state(&self) -> anyhow::Result<SavedState> {
         let stream = &self.ctx.stream;
         let visits = self
             .visits
             .iter()
             .map(|v| {
+                // At least one slot, so that no copy is empty.
+                let slots = if v.kv.window().is_some() {
+                    v.kv.slots()
+                } else {
+                    self.position.clamp(1, v.kv.slots())
+                };
                 let kv = match v.kv.data() {
-                    KvData::Bf16 { keys, values } => KvData::Bf16 {
-                        keys: stream.clone_dtod(keys)?,
-                        values: stream.clone_dtod(values)?,
-                    },
-                    KvData::Fp8 { keys, values } => KvData::Fp8 {
-                        keys: stream.clone_dtod(keys)?,
-                        values: stream.clone_dtod(values)?,
-                    },
+                    KvData::Bf16 { keys, values } => {
+                        let len = keys.len() / v.kv.slots() * slots;
+                        KvData::Bf16 {
+                            keys: stream.clone_dtod(&keys.slice(..len))?,
+                            values: stream.clone_dtod(&values.slice(..len))?,
+                        }
+                    }
+                    KvData::Fp8 { keys, values } => {
+                        let len = keys.len() / v.kv.slots() * slots;
+                        KvData::Fp8 {
+                            keys: stream.clone_dtod(&keys.slice(..len))?,
+                            values: stream.clone_dtod(&values.slice(..len))?,
+                        }
+                    }
                 };
                 let conv = v
                     .conv
@@ -645,16 +661,19 @@ impl Model {
             self.visits.len()
         );
         for (v, (kv, conv)) in self.visits.iter_mut().zip(&state.visits) {
+            // A ring is saved whole, a global cache up to the saved position.
+            let ring = v.kv.window().is_some();
+            let fits = |saved: usize, cache: usize| saved == cache || (!ring && saved < cache);
             match (v.kv.data_mut(), kv) {
                 (KvData::Bf16 { keys, values }, KvData::Bf16 { keys: k, values: x }) => {
-                    ensure!(keys.len() == k.len(), "the cache sizes differ");
-                    stream.memcpy_dtod(k, keys)?;
-                    stream.memcpy_dtod(x, values)?;
+                    ensure!(fits(k.len(), keys.len()), "the cache sizes differ");
+                    stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
+                    stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
                 }
                 (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: x }) => {
-                    ensure!(keys.len() == k.len(), "the cache sizes differ");
-                    stream.memcpy_dtod(k, keys)?;
-                    stream.memcpy_dtod(x, values)?;
+                    ensure!(fits(k.len(), keys.len()), "the cache sizes differ");
+                    stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
+                    stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
                 }
                 _ => anyhow::bail!("the cache formats differ"),
             }
