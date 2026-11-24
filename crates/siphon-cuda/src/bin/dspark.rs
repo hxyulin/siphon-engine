@@ -20,7 +20,7 @@
 //! tokens per round at 3, 5 and 7 drafts, the round time on the first text, and accepted
 //! tokens per millisecond against a verify-time model.
 //!
-//! A variant SPEC is `exact`, `fast` or a `+`-joined set of `fp8-backbone`, `fp8-head`,
+//! A variant SPEC is `exact`, `fp8`, `fast` or a `+`-joined set of `fp8-backbone`, `fp8-head`,
 //! `fp8-fold` and `shortlist` (see `DraftOptions`). `shortlist` ranks tokens by id, or
 //! by `--shortlist`, a token ranking of little-endian u32 ids, as Ingine's
 //! `draft_shortlist.bin`.

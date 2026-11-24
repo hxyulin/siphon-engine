@@ -97,10 +97,24 @@ pub struct DraftOptions {
 }
 
 impl DraftOptions {
-    /// Every approximation, with the shortlist in token id order ([`id_ranking`]): the
-    /// draft speculation uses unless told otherwise. On three texts its acceptance is
-    /// within 0.2 points of the exact draft's at every draft position, and its round takes
-    /// about 40% of the time.
+    /// The three FP8 approximations without a shortlist: the draft speculation uses unless
+    /// told otherwise. Its round takes about 0.96 ms against 0.51 ms for [`Self::fast`],
+    /// but on chat, coding and long-document prompts it keeps 16 to 22% more tokens per
+    /// round, since the id-order shortlist lacks the high ids of reasoning text until they
+    /// appear.
+    #[must_use]
+    pub fn fp8() -> Self {
+        Self {
+            fp8_backbone: true,
+            fp8_head: true,
+            fp8_fold: true,
+            shortlist: None,
+        }
+    }
+
+    /// Every approximation, with the shortlist in token id order ([`id_ranking`]). On
+    /// three texts its teacher-forced acceptance is within 0.2 points of the exact draft's
+    /// at every draft position, and its round takes about 40% of the time.
     #[must_use]
     pub fn fast() -> Self {
         Self {
@@ -111,15 +125,20 @@ impl DraftOptions {
         }
     }
 
-    /// The options of a variant `spec`: `exact`, `fast` ([`Self::fast`]), or a `+`-joined
-    /// set of `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`, which takes
-    /// `ranking`, or without one ranks tokens by id ([`id_ranking`]).
+    /// The options of a variant `spec`: `exact`, `fp8` ([`Self::fp8`]), `fast`
+    /// ([`Self::fast`]), or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and
+    /// `shortlist`, which takes `ranking`, or without one ranks tokens by id
+    /// ([`id_ranking`]). `fp8` and `fast` with a `ranking` use it as their shortlist.
     pub fn parse(spec: &str, ranking: Option<&[u32]>) -> anyhow::Result<Self> {
         let mut options = Self::default();
         match spec {
             "exact" => return Ok(options),
-            "fast" => {
-                options = Self::fast();
+            "fp8" | "fast" => {
+                options = if spec == "fp8" {
+                    Self::fp8()
+                } else {
+                    Self::fast()
+                };
                 if let Some(r) = ranking {
                     options.shortlist = Some(r.to_vec());
                 }

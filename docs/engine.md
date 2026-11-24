@@ -48,12 +48,25 @@ Round times at position 2790 (one committed position plus the round, graph repla
 
 At position 32768, where layer 1 attends over every position, the same steps take 2.169, 1.420, 1.354, 1.288 and 1.277 ms for 3 drafts, and 2.169, 1.660, 1.593, 1.450 and 1.419 ms for 7.
 
-`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond. `DraftOptions::fast` turns on all four, with the shortlist in token id order; speculation (`Speculator::new`, `bench --spec`) uses it, and `DraftOptions::default` stays exact:
+`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond. `DraftOptions::fp8` turns on the three FP8 approximations and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon-serve`); `DraftOptions::fast` adds the shortlist in token id order, and `DraftOptions::default` stays exact:
 
 - `fp8_backbone`: E4M3 copies of the block's and the commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`).
 - `fp8_head`: base logits from an E4M3 copy of the LM head.
 - `fp8_fold`: the Markov logits from the E4M3 fold, without the exact correction.
-- `shortlist`: Ingine's shortlist head. The base and Markov logits cover only the 32,768 highest-ranked tokens, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The speculator notes the tokens of the prompt's last 8,192 positions and each round's emitted tokens, so a long prompt cannot fill every context row and shut out the tokens that generation adds. The ranking defaults to token id order (`draft::id_ranking`): the tokenizer numbers its tokens in BPE merge order, so the first 32,768 ids are the earliest merges. A ranking file of little-endian u32 token ids, as Ingine's `draft_shortlist.bin`, can replace it.
+- `shortlist`: Ingine's shortlist head, off by default (see below). The base and Markov logits cover only the 32,768 highest-ranked tokens, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The speculator notes the tokens of the prompt's last 8,192 positions and each round's emitted tokens, so a long prompt cannot fill every context row and shut out the tokens that generation adds. The ranking defaults to token id order (`draft::id_ranking`): the tokenizer numbers its tokens in BPE merge order, so the first 32,768 ids are the earliest merges. A ranking file of little-endian u32 token ids, as Ingine's `draft_shortlist.bin`, can replace it.
+
+The shortlist halves the round (0.51 against 0.96 ms) but costs acceptance wherever the text uses tokens above id 32,768 before they appear in the context: reasoning text opens with ids near 150,000. Noting each round's anchor on the device, so the next round can draft it, changed neither acceptance nor speed on any prompt below, so the loss is the ranking's coverage, not the one-round lag. `bench --spec auto`, 512 tokens, FP8 weights and KV, tok/s and tokens per round (chat, coding and 32K-document prompts from the Ingine comparison, then the three texts):
+
+| Prompt | Bundled, `fp8` | Bundled, `fast` | DFlash 2, `fp8` | DFlash 2, `fast` |
+| --- | --- | --- | --- | --- |
+| Chat | 466, 3.27 | 405, 2.70 | 544, 4.21 | 407, 3.09 |
+| Coding task | 471, 3.36 | 424, 2.89 | 566, 4.20 | 465, 3.44 |
+| 32K document | 534, 4.89 | 470, 4.01 | 364, 3.13 | 345, 2.90 |
+| `regex-readme`, 2,286 | 494, 3.66 | 525, 3.71 | 516, 4.06 | 520, 3.97 |
+| `half`, 2,273 | 683, 5.67 | 689, 5.43 | 585, 4.90 | 597, 4.90 |
+| `anyhow`, 10,674 | 761, 6.76 | 793, 6.68 | 759, 6.83 | 779, 6.83 |
+
+A frequency ranking would keep most of both: Ingine's file recovered 18 to 23% on the chat-style prompts with the shortlist on.
 
 `dspark accept` measures each variant's teacher-forced acceptance on the stage 0 taps against MLX's top-1 tokens, as `reference/dspark.py accept` counts it, and times its round of 7 drafts at position 2,790 and 32,768. Over all three texts (16,745 anchors):
 
