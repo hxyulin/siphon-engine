@@ -433,13 +433,53 @@ pixi run cargo build --release -p siphon-cuda --bin bench
 target/release/bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps 100] [--warmup 10] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 ```
 
-Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the global KV cache (32 KiB per token, 16 KiB with `--kv fp8`) fits in free memory. Bandwidth columns divide 5.5 GB of weights per token (3.75 GB with `--weights fp8`), plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
+Without `--contexts` it runs 0, 4096 and 32768 tokens, and 131072 if the memory plan for that capacity fits in free memory (see [Memory planning](#memory-planning)). Bandwidth columns divide 5.5 GB of weights per token (3.75 GB with `--weights fp8`), plus the KV bytes read, by the step time, as a share of the RTX 5090's 1.79 TB/s.
 
 With `--prefill`, `bench` times `Model::prefill` instead, once per prompt length from an empty cache, after one warmup chunk. It reports the time to the first token. The prompt is arbitrary token ids, so expert routing differs from real text:
 
 ```sh
 target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf16|fp8] [--json]
 ```
+
+## Memory planning
+
+`siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk and the capacity. It counts:
+
+- the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32. The vision tower is not loaded. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
+- the FP8 copies of `--weights fp8`, 1.14 GB;
+- the global KV caches: 32 KiB per position, or 16 KiB with `--kv fp8`, over the 8 global visits;
+- the 40 sliding rings of 1,024 slots (160 MiB), the conv states and the decode step's vocabulary-sized buffers;
+- the prefill buffers, 0.38 MB per chunk row plus 64 MB, and the verify pass's;
+- the draft's tensors, the bundled draft's fold, the copies its approximations make (the shortlist rows of the LM head, the FP8 backbone), its rings, its buffers and the speculator's tap tails;
+- the draft's global caches, 4 KiB per position and layer: one layer of the bundled draft, every layer of a 2DSD DFlash draft, none of DFlash 2, which keeps rings of 2,056 slots;
+- `RUNTIME_BYTES`, 128 MiB for the module images, the CUDA graphs, the small buffers and the allocator's rounding. It was measured with a thread that sampled `cuMemGetInfo` every millisecond while `siphon-serve` loaded, prefilled more than a chunk and generated speculatively; the uncounted part came to 69 to 87 MiB.
+
+The CUDA context itself takes 507 MiB. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less a 0.5 GiB margin. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.
+
+Planned against measured, as the free memory after creating the context less the lowest sample, after a 3,820-token prompt and 256 speculative tokens:
+
+| Weights, KV cache | Draft | Capacity | Planned GiB | Measured GiB | Over, MiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FP8, FP8 | DSpark | 65,536 | 22.284 | 22.244 | 41 |
+| FP8, FP8 | DSpark | 262,144 | 26.034 | 25.994 | 41 |
+| FP8, FP8 | DSpark | 466,944 (largest) | 29.940 | 29.900 | 41 |
+| FP8, FP8 | DFlash 2 | 65,536 | 22.350 | 22.307 | 45 |
+| FP8, FP8 | DFlash 2 | 262,144 | 25.350 | 25.307 | 45 |
+| FP8, FP8 | DFlash 2 | 563,200 (largest) | 29.944 | 29.900 | 45 |
+| BF16, BF16 | DSpark | 65,536 | 22.222 | 22.180 | 43 |
+| BF16, BF16 | DSpark | 131,072 | 24.472 | 24.430 | 43 |
+| BF16, BF16 | DSpark | 290,816 (largest) | 29.956 | 29.898 | 59 |
+| BF16, BF16 | DFlash 2 | 65,536 | 22.288 | 22.242 | 47 |
+| BF16, BF16 | DFlash 2 | 131,072 | 24.288 | 24.242 | 47 |
+| BF16, BF16 | DFlash 2 | 316,416 (largest) | 29.944 | 29.898 | 47 |
+
+At the largest capacity, `siphon-serve` also prefilled real prompts near the end of the cache and generated 512 tokens speculatively from there, with the same peak memory:
+
+| Weights, KV cache | Draft | Prompt tokens | Prefill |
+| --- | --- | ---: | ---: |
+| FP8, FP8 | DSpark | 461,517 | 81.1 s |
+| FP8, FP8 | DFlash 2 | 556,964 | 111.1 s |
+| BF16, BF16 | DSpark | 287,138 | 38.5 s |
 
 ## KV cache format
 
@@ -455,7 +495,7 @@ The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RM
 Decode reads 3.62 GB of BF16 dense weights per token: every visit's attention input and output projections, the looped layers' message gates (113 MB), and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
 
 - `bf16`, the default, reads the checkpoint's weights.
-- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights, since its GEMMs are compute-bound. The copies take about 1.17 GB of device memory: one per layer, since the looped layers' three visits share theirs.
+- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights, since its GEMMs are compute-bound. The copies take 1.14 GB of device memory: one per layer, since the looped layers' three visits share theirs.
 
 The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
 

@@ -59,8 +59,15 @@ target/release/bench <model-dir> --prompt <capture> --spec auto --weights fp8 --
 ## Server
 
 ```sh
-SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000 --context 65536
+SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
 ```
+
+Before loading anything, it plans the GPU memory from the config and the checkpoint headers. Without `--context`, it takes the longest context that fits the free memory less a 0.5 GiB margin, up to the model's 1,048,576 positions; `--memory <GiB>` caps the total it plans for. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines at startup. On a 32 GB RTX 5090 with 0.45 GiB taken by the desktop, the longest contexts are:
+
+| Dense weights, KV cache | DSpark draft | DFlash 2 |
+| --- | ---: | ---: |
+| FP8, FP8 | 466,944 | 563,200 |
+| BF16, BF16 | 290,816 | 316,416 |
 
 It loads the model with FP8 dense weights and KV cache (`--weights bf16` and `--kv bf16` switch back), prices the verify widths on a short prompt, and then serves:
 
@@ -78,7 +85,7 @@ On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds wit
 
 | Path | Contents |
 | --- | --- |
-| `crates/siphon` | Config parsing, the memory-mapped safetensors checkpoint, and the `siphon inspect` CLI |
+| `crates/siphon` | Config parsing, the memory-mapped safetensors checkpoint, the GPU memory planner, and the `siphon inspect` CLI |
 | `crates/siphon-cuda` | Kernels (`kernels/*.cu`), their Rust launchers (`src/ops`), the model, the draft and speculation, and the `bench`, `eval`, `parity` and `dspark` binaries |
 | `crates/siphon-serve` | The HTTP server: chat rendering, output parsing and the engine thread |
 | `reference` | MLX-LM captures and kernel fixtures, run on a Mac with uv |
