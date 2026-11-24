@@ -1,11 +1,124 @@
 //! Request fields shared by the routes: the ones the server refuses, stop strings,
-//! `tool_choice`, and how a chat prompt ends.
+//! sampling, `tool_choice`, and how a chat prompt ends.
 //!
 //! Fields not named here or in a route's request type are ignored, as vLLM ignores them.
 
+use std::{
+    collections::hash_map::RandomState,
+    hash::BuildHasher as _,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use anyhow::Context as _;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::chat::{Ending, InvalidRequest};
+use crate::{
+    chat::{Ending, InvalidRequest},
+    engine::Sampling,
+};
+
+/// The sampling fields of a request, as vLLM names them.
+#[derive(Debug, Default, Deserialize)]
+pub struct SamplingFields {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f64>,
+    pub seed: Option<i64>,
+}
+
+/// The sampling a request gets for the fields it leaves out: the checkpoint's
+/// `generation_config.json`, as vLLM uses it, else vLLM's own defaults (temperature 1, no
+/// filters).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplingDefaults {
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: i64,
+    pub min_p: f64,
+}
+
+impl Default for SamplingDefaults {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+        }
+    }
+}
+
+impl SamplingDefaults {
+    /// Reads `generation_config.json` in `dir`, if there is one.
+    pub fn load(dir: &Path) -> anyhow::Result<Self> {
+        let path = dir.join("generation_config.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(Self::default());
+        };
+        let config: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let mut defaults = Self::default();
+        let number = |key: &str| config.get(key).and_then(Value::as_f64);
+        if let Some(t) = number("temperature") {
+            defaults.temperature = t;
+        }
+        if let Some(p) = number("top_p") {
+            defaults.top_p = p;
+        }
+        if let Some(k) = config.get("top_k").and_then(Value::as_i64) {
+            defaults.top_k = k;
+        }
+        if let Some(m) = number("min_p") {
+            defaults.min_p = m;
+        }
+        Ok(defaults)
+    }
+}
+
+/// A request's sampling: its fields, the defaults for the ones it leaves out, and a random
+/// seed when it sends none. Rejects values vLLM rejects.
+pub fn sampling(
+    fields: &SamplingFields,
+    defaults: &SamplingDefaults,
+) -> Result<Sampling, InvalidRequest> {
+    let invalid = |message: &str| Err(InvalidRequest(message.to_owned()));
+    let temperature = fields.temperature.unwrap_or(defaults.temperature);
+    let top_p = fields.top_p.unwrap_or(defaults.top_p);
+    let top_k = fields.top_k.unwrap_or(defaults.top_k);
+    let min_p = fields.min_p.unwrap_or(defaults.min_p);
+    if !(temperature.is_finite() && temperature >= 0.0) {
+        return invalid("temperature must be at least 0");
+    }
+    if !(top_p > 0.0 && top_p <= 1.0) {
+        return invalid("top_p must be in (0, 1]");
+    }
+    if top_k < -1 {
+        return invalid("top_k must be -1 or 0 (no limit) or at least 1");
+    }
+    if !(0.0..=1.0).contains(&min_p) {
+        return invalid("min_p must be in [0, 1]");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "F32 settings for the kernels"
+    )]
+    Ok(Sampling {
+        temperature: temperature as f32,
+        top_k: u32::try_from(top_k.max(0)).unwrap_or(u32::MAX),
+        top_p: top_p as f32,
+        min_p: min_p as f32,
+        seed: fields.seed.map_or_else(random_seed, i64::cast_unsigned),
+    })
+}
+
+/// A seed for a request that sends none.
+fn random_seed() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    RandomState::new().hash_one(COUNTER.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Fields whose meaning the server cannot honour without engine work, refused when set to
 /// anything but their default (null, false, 0 or empty).
@@ -200,6 +313,47 @@ mod tests {
             let name = bad.as_object().unwrap().keys().next().unwrap().clone();
             assert!(e.0.starts_with(&name), "{e} for {bad}");
         }
+    }
+
+    #[test]
+    fn sampling_fields() {
+        let defaults = SamplingDefaults::default();
+        let parse = |v: Value| {
+            let fields: SamplingFields = serde_json::from_value(v).unwrap();
+            sampling(&fields, &defaults)
+        };
+        let s = parse(json!({})).unwrap();
+        assert_eq!(
+            (s.temperature, s.top_k, s.top_p, s.min_p),
+            (1.0, 0, 1.0, 0.0)
+        );
+        let s = parse(json!({"temperature": 0.8, "top_p": 0.95, "top_k": -1, "seed": -1})).unwrap();
+        assert_eq!((s.temperature, s.top_k, s.top_p), (0.8, 0, 0.95));
+        assert_eq!(s.seed, u64::MAX);
+        assert_eq!(parse(json!({"top_k": 20})).unwrap().top_k, 20);
+        assert_eq!(parse(json!({"temperature": 0})).unwrap().temperature, 0.0);
+        assert_ne!(
+            parse(json!({})).unwrap().seed,
+            parse(json!({})).unwrap().seed
+        );
+        for bad in [
+            json!({"temperature": -0.1}),
+            json!({"top_p": 0}),
+            json!({"top_p": 1.5}),
+            json!({"top_k": -2}),
+            json!({"min_p": 2}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+        let defaults = SamplingDefaults {
+            temperature: 0.6,
+            top_p: 0.9,
+            top_k: 40,
+            min_p: 0.0,
+        };
+        let fields: SamplingFields = serde_json::from_value(json!({"top_p": 1.0})).unwrap();
+        let s = sampling(&fields, &defaults).unwrap();
+        assert_eq!((s.temperature, s.top_k, s.top_p), (0.6, 40, 1.0));
     }
 
     #[test]

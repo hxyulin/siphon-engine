@@ -33,6 +33,7 @@ use crate::{
         routing::{
             DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsBatch, RowsPartial,
         },
+        sample::SampleBuffers,
         spec::{BatchRows, TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
@@ -231,6 +232,9 @@ pub(super) struct PrefillScratch {
     /// A batched step's own state, in the batch scratch only: each row is then the next
     /// token of its own sequence (see `model/batch.rs`).
     pub(super) batch: Option<BatchBuffers>,
+    /// With sampling on ([`Model::enable_sampling`]), the settings of each row, by which
+    /// the verify and batch heads pick tokens instead of taking the argmax.
+    pub(super) sample: Option<SampleBuffers>,
     pub(super) tokens: CudaSlice<i32>,
     /// The position of the chunk's first row.
     pub(super) start: CudaSlice<u32>,
@@ -297,6 +301,7 @@ impl PrefillScratch {
             taps: None,
             verify: None,
             batch: None,
+            sample: None,
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
             embedded: zeros(stream, rows * hidden)?,
@@ -399,7 +404,7 @@ fn strided_mut<T>(
 
 impl Model {
     /// Runs `tokens` from the current position in chunks of up to `chunk` rows and returns
-    /// the greedy next token after the last one. Fills every KV cache and conv state as
+    /// the next token after the last one, greedy or drawn with [`Model::sampling`]. Fills every KV cache and conv state as
     /// stepping the tokens one at a time would, so [`Model::step`] continues after it, and
     /// advances [`Model::position`] by `tokens.len()`. `chunk` is 1 to
     /// [`MAX_PREFILL_CHUNK`]; its buffers are allocated on the first call that needs them.
@@ -497,8 +502,7 @@ impl Model {
                 taps(start, rows(buffer, piece.len(), row_len))?;
             }
         }
-        let next = self.ctx.stream.clone_dtoh(&self.scratch.next)?[0];
-        u32::try_from(next).context("argmax returned a negative index")
+        self.next_token()
     }
 
     /// Enqueues one chunk. Only the final chunk computes the last row's logits.
@@ -925,7 +929,7 @@ impl Ctx {
         Ok(())
     }
 
-    /// The end of a verify pass of `m` rows: every row's logits and greedy token, the
+    /// The end of a verify pass of `m` rows: every row's logits and token, the
     /// acceptance, and the rollback of the conv states and ring slots of rejected rows.
     fn verify_head(&self, p: &mut PrefillScratch, m: usize) -> anyhow::Result<()> {
         let cfg = &self.config;
@@ -952,12 +956,21 @@ impl Ctx {
             .as_mut()
             .context("the verify buffers are missing")?;
         let spec = &self.kernels.spec;
-        self.kernels.misc.argmax_f32(
-            &self.stream,
-            &rows(&p.head_capped, m, vocab),
-            &mut v.argmax.slice_mut(..m),
-            vocab,
-        )?;
+        match p.sample.as_mut() {
+            Some(sample) => self.kernels.sample.run(
+                &self.stream,
+                &rows(&p.head_capped, m, vocab),
+                vocab,
+                sample,
+                &mut v.argmax.slice_mut(..m),
+            )?,
+            None => self.kernels.misc.argmax_f32(
+                &self.stream,
+                &rows(&p.head_capped, m, vocab),
+                &mut v.argmax.slice_mut(..m),
+                vocab,
+            )?,
+        }
         spec.accept_greedy(
             &self.stream,
             &rows(&p.tokens, m, 1),
@@ -1007,12 +1020,21 @@ impl Ctx {
             cfg.final_logit_softcapping,
         )?;
         let b = p.batch.as_mut().context("the batch buffers are missing")?;
-        self.kernels.misc.argmax_f32(
-            &self.stream,
-            &rows(&p.head_capped, m, vocab),
-            &mut b.argmax_mut().slice_mut(..m),
-            vocab,
-        )
+        match p.sample.as_mut() {
+            Some(sample) => self.kernels.sample.run(
+                &self.stream,
+                &rows(&p.head_capped, m, vocab),
+                vocab,
+                sample,
+                &mut b.argmax_mut().slice_mut(..m),
+            ),
+            None => self.kernels.misc.argmax_f32(
+                &self.stream,
+                &rows(&p.head_capped, m, vocab),
+                &mut b.argmax_mut().slice_mut(..m),
+                vocab,
+            ),
+        }
     }
 
     /// One decoder-layer visit for a chunk, as [`Ctx::visit`] for one row, from

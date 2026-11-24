@@ -1,7 +1,7 @@
 //! The GPU side: one thread owns the model and the draft and runs requests in arrival
 //! order from a bounded queue.
 //!
-//! A request that arrives at an idle server runs alone with greedy speculation in slot 0.
+//! A request that arrives at an idle server runs alone with speculation in slot 0.
 //! With `streams` above 1, a request that arrives meanwhile stops the speculation after its
 //! round, and from then on every request runs batched plain decode in its own slot, up to
 //! `streams` at once, until the server is idle again. A new request's prompt prefills in
@@ -14,6 +14,12 @@
 //! prompt up to that prompt's last multiple of the prefill chunk, it prefills only the
 //! rest. Batched requests prefill whole. Taking slot 0 for another sequence or rebuilding
 //! the draft's state empties the cache.
+//!
+//! Each request picks its tokens greedily or by sampling with its own [`Sampling`]. A
+//! sampled token depends only on the logits, the request's seed and the token's position
+//! (see `siphon_cuda::ops::sample`), and speculation keeps a draft only when it equals the
+//! token the target samples at that position. So sampling keeps the batching property: a
+//! request with a seed gets the same tokens alone or in a batch.
 
 use std::{
     path::PathBuf,
@@ -34,7 +40,20 @@ pub struct Job {
     /// vLLM's `ignore_eos`: generate `max_tokens` tokens, passing the model's end tokens
     /// on as output.
     pub ignore_eos: bool,
+    pub sampling: Sampling,
     pub events: UnboundedSender<Event>,
+}
+
+/// How a request picks its tokens, as vLLM's sampling parameters: temperature 0 is greedy,
+/// and the filters apply in the order temperature, top-k, top-p, min-p.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sampling {
+    pub temperature: f32,
+    /// 0 keeps every token.
+    pub top_k: u32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: u64,
 }
 
 /// Why generation ended.
@@ -101,6 +120,8 @@ pub struct Options {
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
+    /// Whether every request decodes greedily, whatever it asks.
+    pub greedy: bool,
 }
 
 /// Sends jobs to the engine thread.
@@ -157,7 +178,7 @@ mod cuda {
     use siphon_cuda::{
         Gpu, MemoryUse,
         draft::DraftOptions,
-        model::{DEFAULT_PREFILL_CHUNK, Model},
+        model::{DEFAULT_PREFILL_CHUNK, Model, Sampling as ModelSampling},
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{DraftSource, Drafts, Speculator, Width, WidthPolicy, load_draft, price},
         weights::{WeightFormat, Weights},
@@ -181,7 +202,7 @@ mod cuda {
             .spawn(move || match load(&options, &warmup) {
                 Ok((model, speculator, capacity, check)) => {
                     let _ = ready.send(Ok(capacity));
-                    run(model, speculator, check, &queue, &stop, options.streams);
+                    run(model, speculator, check, &queue, &stop, &options);
                 }
                 Err(e) => {
                     let _ = ready.send(Err(e));
@@ -351,6 +372,9 @@ mod cuda {
         let mut model =
             Model::with_formats(&gpu, config, weights, passes, capacity, kv, weight_format)?;
         model.set_prefill_attention(options.prefill_attention.parse()?);
+        if !options.greedy {
+            model.enable_sampling()?;
+        }
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
         let source = options
             .drafter
@@ -411,6 +435,15 @@ mod cuda {
         Ok((model, speculator, capacity, check))
     }
 
+    /// The model's form of a request's sampling, greedy under `--greedy`.
+    fn model_sampling(job: &Job, greedy: bool) -> anyhow::Result<ModelSampling> {
+        let s = job.sampling;
+        if greedy {
+            return Ok(ModelSampling::GREEDY);
+        }
+        ModelSampling::new(s.temperature, s.top_k, s.top_p, s.min_p, s.seed)
+    }
+
     /// A request the engine has taken.
     #[expect(
         clippy::struct_excessive_bools,
@@ -418,6 +451,8 @@ mod cuda {
     )]
     struct Request {
         job: Job,
+        /// How the request picks its tokens.
+        sampling: ModelSampling,
         slot: usize,
         started: Instant,
         /// Prompt tokens prefilled so far.
@@ -444,9 +479,14 @@ mod cuda {
     }
 
     impl Request {
-        fn new(job: Job, slot: usize) -> Self {
-            Self {
+        fn new(job: Job, slot: usize, greedy: bool) -> Self {
+            let (sampling, error) = match model_sampling(&job, greedy) {
+                Ok(s) => (s, None),
+                Err(e) => (ModelSampling::GREEDY, Some(e)),
+            };
+            let mut request = Self {
                 job,
+                sampling,
                 slot,
                 started: Instant::now(),
                 prefilled: 0,
@@ -461,7 +501,11 @@ mod cuda {
                 stay_batched: false,
                 speculated: 0,
                 batched: 0,
+            };
+            if let Some(e) = error {
+                request.fail(&e);
             }
+            request
         }
 
         /// Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
@@ -533,8 +577,9 @@ mod cuda {
         mut check: MemoryCheck,
         queue: &Receiver<Job>,
         stop: &[u32],
-        streams: usize,
+        options: &Options,
     ) {
+        let (streams, greedy) = (options.streams, options.greedy);
         let mut waiting = VecDeque::new();
         // A request that a batch left alone, to continue with speculation.
         let mut resumed = None;
@@ -567,12 +612,17 @@ mod cuda {
                             queue,
                             stop,
                             streams,
+                            greedy,
                         );
                         check.after_job();
                         continue;
                     }
                 }
-                Request::new(job, 0)
+                let request = Request::new(job, 0, greedy);
+                if request.done {
+                    continue;
+                }
+                request
             };
             let interrupt = (streams > 1).then_some((queue, &mut waiting));
             match alone(&mut model, &mut speculator, &mut request, stop, interrupt) {
@@ -587,6 +637,7 @@ mod cuda {
                         queue,
                         stop,
                         streams,
+                        greedy,
                     );
                 }
                 Ok(false) => {}
@@ -608,6 +659,7 @@ mod cuda {
         stop: &[u32],
         mut interrupt: Option<(&Receiver<Job>, &mut VecDeque<Job>)>,
     ) -> anyhow::Result<bool> {
+        model.set_sampling(request.sampling);
         let go_on = if request.next.is_some() {
             true
         } else {
@@ -731,6 +783,7 @@ mod cuda {
     /// chunk of the oldest request still prefilling, then runs one batched step of the
     /// others. A request left alone with nothing waiting returns, in slot 0, to continue
     /// with speculation (`speculate_again`).
+    #[expect(clippy::too_many_arguments, reason = "the scheduler's state")]
     fn batched(
         model: &mut Model,
         speculator: &mut Speculator,
@@ -739,6 +792,7 @@ mod cuda {
         queue: &Receiver<Job>,
         stop: &[u32],
         streams: usize,
+        greedy: bool,
     ) -> Option<Request> {
         loop {
             while active.len() < streams {
@@ -755,7 +809,10 @@ mod cuda {
                 else {
                     break;
                 };
-                let mut request = Request::new(job, slot);
+                let mut request = Request::new(job, slot, greedy);
+                if request.done {
+                    continue;
+                }
                 match model.reset_slot(slot) {
                     Ok(()) => active.push(request),
                     Err(e) => request.fail(&e),
@@ -785,6 +842,7 @@ mod cuda {
                     r.done = true;
                 } else {
                     let end = (r.prefilled + DEFAULT_PREFILL_CHUNK).min(r.job.prompt.len());
+                    model.set_sampling(r.sampling);
                     match model.prefill_slot(
                         r.slot,
                         &r.job.prompt[r.prefilled..end],
@@ -825,15 +883,19 @@ mod cuda {
         active: &mut [Request],
         stop: &[u32],
     ) {
-        let rows: Vec<(usize, u32)> = active
+        let stepped: Vec<&Request> = active
             .iter()
-            .filter(|r| !r.done)
-            .filter_map(|r| r.next.map(|t| (r.slot, t)))
+            .filter(|r| !r.done && r.next.is_some())
             .collect();
+        let rows: Vec<(usize, u32)> = stepped
+            .iter()
+            .map(|r| (r.slot, r.next.unwrap_or_default()))
+            .collect();
+        let sampling: Vec<ModelSampling> = stepped.iter().map(|r| r.sampling).collect();
         if rows.is_empty() {
             return;
         }
-        match model.step_batch(&rows) {
+        match model.step_batch_sampled(&rows, &sampling) {
             Ok(next) => {
                 let mut next = next.into_iter();
                 let stepped = active.iter_mut().filter(|r| !r.done && r.next.is_some());

@@ -24,9 +24,12 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use super::{Model, PrefillLogits, StepGraph, VisitState, prefill::PrefillScratch, zeros};
+use super::{
+    Model, PrefillLogits, Sampling, StepGraph, VisitState, prefill::PrefillScratch, zeros,
+};
 use crate::ops::{
     attention::{HEAD_DIM, KV_HEADS, KvCache, KvData, KvFormat},
+    sample::SampleBuffers,
     spec::{BATCH_STATE_WORDS, BatchRows, VERIFY_ROWS},
 };
 
@@ -49,7 +52,7 @@ pub(super) struct BatchBuffers {
     tables: CudaSlice<u64>,
     /// Each row's position.
     positions: CudaSlice<u32>,
-    /// Each row's greedy token.
+    /// Each row's token, greedy or drawn.
     argmax: CudaSlice<i32>,
     /// The slots whose addresses `tables` holds, by row.
     members: Vec<usize>,
@@ -74,7 +77,7 @@ impl BatchBuffers {
         }
     }
 
-    /// Each row's greedy token, `[BATCH_ROWS]`.
+    /// Each row's token, greedy or drawn, `[BATCH_ROWS]`.
     pub(super) fn argmax_mut(&mut self) -> &mut CudaSlice<i32> {
         &mut self.argmax
     }
@@ -280,8 +283,8 @@ impl Model {
         self.with_slot(slot, |m| m.skip_to_for_benchmark(position))
     }
 
-    /// [`Model::prefill`] into slot `slot`, from its position, returning the greedy next
-    /// token. The other slots are left alone.
+    /// [`Model::prefill`] into slot `slot`, from its position, returning the next token,
+    /// greedy or drawn with [`Model::sampling`]. The other slots are left alone.
     pub fn prefill_slot(
         &mut self,
         slot: usize,
@@ -297,7 +300,23 @@ impl Model {
     /// equal a one-row verify of its slot (see the module docs). Synchronizes once, to read
     /// the tokens.
     pub fn step_batch(&mut self, rows: &[(usize, u32)]) -> anyhow::Result<Vec<u32>> {
+        self.step_batch_sampled(rows, &vec![Sampling::GREEDY; rows.len()])
+    }
+
+    /// [`Self::step_batch`] with each row's token picked by its entry of `sampling`, with
+    /// sampling on ([`Model::enable_sampling`]). A row's draw depends only on its logits,
+    /// its sampling and its position, so it equals a one-row verify's.
+    pub fn step_batch_sampled(
+        &mut self,
+        rows: &[(usize, u32)],
+        sampling: &[Sampling],
+    ) -> anyhow::Result<Vec<u32>> {
         let m = rows.len();
+        ensure!(sampling.len() == m, "one sampling per row");
+        ensure!(
+            self.sampler || sampling.iter().all(Sampling::is_greedy),
+            "sampling in a batched step needs enable_sampling"
+        );
         ensure!(
             (1..=BATCH_ROWS).contains(&m),
             "a batched step takes 1 to {BATCH_ROWS} rows, not {m}"
@@ -344,6 +363,14 @@ impl Model {
         }
         stream.memcpy_htod(&positions, &mut b.positions.slice_mut(..m))?;
         stream.memcpy_htod(&tokens, &mut p.tokens.slice_mut(..m))?;
+        if let Some(sample) = p.sample.as_mut() {
+            let settings: Vec<(Sampling, usize)> = sampling
+                .iter()
+                .zip(&positions)
+                .map(|(&s, &position)| (s, position as usize + 1))
+                .collect();
+            sample.upload(&stream, &settings)?;
+        }
         self.launch_batch(m)?;
         let p = self
             .batch
@@ -388,6 +415,9 @@ impl Model {
             )?);
         }
         p.batch = Some(BatchBuffers::new(stream, self.visits.len())?);
+        if self.sampler {
+            p.sample = Some(SampleBuffers::new(stream, BATCH_ROWS)?);
+        }
         self.batch = Some(p);
         Ok(())
     }

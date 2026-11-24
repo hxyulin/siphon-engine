@@ -16,7 +16,7 @@ use serde_json::json;
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
-                     [--fallback] [--no-prefix-cache] [--prefill-attention auto|bf16|fp8]
+                     [--fallback] [--no-prefix-cache] [--prefill-attention auto|bf16|fp8] [--greedy]
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
@@ -38,6 +38,11 @@ those tokens prefills only the rest. It costs about 0.2 GiB, whatever the contex
 --prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
+--greedy decodes every request greedily, whatever its sampling fields ask. Without it, a
+request samples with its temperature, top_k, top_p, min_p and seed, and the fields it leaves
+out come from the checkpoint's generation_config.json (temperature 1 for Inkling 2 Mini).
+Speculation keeps the model's distribution exactly, and a request with a seed gets the same
+tokens on the same configuration, alone or in a batch (without --fallback).
 Set SIPHON_API_KEY to require `Authorization: Bearer <key>` on every route but /health and /version.";
 
 /// The prompt that prices the verify widths at startup.
@@ -69,6 +74,7 @@ fn args() -> anyhow::Result<Args> {
     let mut fallback = false;
     let mut prefix_cache = true;
     let mut prefill_attention = "auto".to_owned();
+    let mut greedy = false;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -99,6 +105,7 @@ fn args() -> anyhow::Result<Args> {
             "--fallback" => fallback = true,
             "--no-prefix-cache" => prefix_cache = false,
             "--prefill-attention" => prefill_attention = value()?,
+            "--greedy" => greedy = true,
             "--widths" => {
                 widths = value()?
                     .split(',')
@@ -136,6 +143,7 @@ fn args() -> anyhow::Result<Args> {
             fallback,
             prefix_cache,
             prefill_attention,
+            greedy,
         },
         model_dir,
         address,
@@ -172,6 +180,7 @@ fn run() -> anyhow::Result<()> {
             chat::DEFAULT_EFFORT,
         )
         .map_err(|e| anyhow::anyhow!("rendering the warmup prompt: {e}"))?;
+    let sampling = request::SamplingDefaults::load(&args.model_dir)?;
     let engine = engine::start(&args.engine, vocab.stop_ids(), warmup)?;
     let app = Arc::new(openai::App {
         vocab,
@@ -179,6 +188,7 @@ fn run() -> anyhow::Result<()> {
         name: args.name,
         api_key,
         started: openai::started(),
+        sampling,
     });
     if app.api_key.is_none() && !args.address.ip().is_loopback() {
         eprintln!(

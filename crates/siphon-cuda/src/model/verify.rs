@@ -1,6 +1,7 @@
 //! The verify pass of speculative decoding: the anchor and up to 7 drafts as one chunk of
-//! up to [`VERIFY_ROWS`] rows through chunked prefill, then every row's greedy token, the
-//! acceptance and the rollback of rejected rows on the device.
+//! up to [`VERIFY_ROWS`] rows through chunked prefill, then every row's token (greedy, or
+//! drawn with the model's sampling), the acceptance and the rollback of rejected rows on
+//! the device.
 //!
 //! Each width has its own CUDA graph, captured on first use. The tokens, the start
 //! position and the acceptance mode live in device buffers, so a graph replays at any
@@ -25,9 +26,12 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use super::{Model, PrefillLogits, StepGraph, VisitState, prefill::PrefillScratch, zeros};
+use super::{
+    Model, PrefillLogits, Sampling, StepGraph, VisitState, prefill::PrefillScratch, zeros,
+};
 use crate::ops::{
     attention::KvData,
+    sample::SampleBuffers,
     spec::{RESULT_LEN, STATE_ROWS, STREAM_DIMS, STREAMS, VERIFY_ROWS, VISIT_CHANNELS},
 };
 
@@ -42,8 +46,8 @@ pub enum VerifyTokens<'a> {
 /// Which rows a verify keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accept {
-    /// The anchor and the longest run of drafts that each equal the previous row's greedy
-    /// token.
+    /// The anchor and the longest run of drafts that each equal the previous row's token:
+    /// the greedy one, or with sampling on, the row's draw ([`Model::enable_sampling`]).
     Greedy,
     /// The first `n` rows, whatever the tokens: teacher forcing, or a chosen rollback.
     Rows(usize),
@@ -56,12 +60,12 @@ pub struct Verdict {
     pub accepted: usize,
     /// The verified tokens, the anchor first.
     pub tokens: Vec<u32>,
-    /// Each row's greedy token.
+    /// Each row's token: the greedy one, or with sampling on, the row's draw.
     pub argmax: Vec<u32>,
 }
 
 impl Verdict {
-    /// The greedy token after the kept rows: the correction, or the bonus when every draft
+    /// The row's token after the kept rows: the correction, or the bonus when every draft
     /// was kept. It is the next anchor.
     #[must_use]
     pub fn next(&self) -> u32 {
@@ -100,7 +104,7 @@ pub(super) struct VerifyBuffers {
     pub ring_slots: usize,
     /// The ring slots the pass overwrites, BF16 `[sliding visits, 8, 2, 1024]`.
     pub ring_backup: CudaSlice<bf16>,
-    /// Each row's greedy token.
+    /// Each row's token, greedy or drawn.
     pub argmax: CudaSlice<i32>,
     /// Rows to keep whatever the drafts, or 0 for greedy acceptance.
     pub keep: CudaSlice<u32>,
@@ -228,6 +232,12 @@ impl Model {
             &mut p.start,
         )?;
         stream.memcpy_htod(&[keep], &mut v.keep)?;
+        if let Some(sample) = p.sample.as_mut() {
+            // Row j picks the token at position start + j + 1.
+            let settings: Vec<(Sampling, usize)> =
+                (0..m).map(|j| (self.sampling, start + j + 1)).collect();
+            sample.upload(&stream, &settings)?;
+        }
         self.launch_verify(m, start)?;
         self.verify_rows = m;
         self.verify_buffers_mut()?.pending = true;
@@ -334,6 +344,9 @@ impl Model {
             VERIFY_ROWS * p.tap_layout.len() * self.ctx.hidden(),
         )?);
         p.verify = Some(VerifyBuffers::new(stream, &self.visits)?);
+        if self.sampler {
+            p.sample = Some(SampleBuffers::new(stream, VERIFY_ROWS)?);
+        }
         self.verify = Some(p);
         Ok(())
     }

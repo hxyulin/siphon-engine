@@ -32,6 +32,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--fallback` | off | Runs plain steps where no verify width is expected to be faster. It speeds up free prose, but the output can then differ between runs. |
 | `--no-prefix-cache` | cache on | Turns off the prefix cache and gives its 0.2 GiB to the KV cache. |
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
+| `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
 
 With `SIPHON_API_KEY` set, every route but `/health` and `/version` needs `Authorization: Bearer <key>`.
 
@@ -59,9 +60,15 @@ With `SIPHON_API_KEY` set, every route but `/health` and `/version` needs `Autho
 
 Raw completions take `stop`, `return_token_ids` and `ignore_eos` too. A text prompt, like the text sent to the tokenizer routes, is encoded with special-token spellings as plain text and nothing added; send token ids to use special tokens. Decoding keeps special tokens.
 
+## Sampling
+
+Both routes sample with `temperature`, `top_k`, `top_p`, `min_p` and `seed`, in vLLM's order: temperature, then top-k, then top-p, then min-p. A field the request leaves out comes from the checkpoint's `generation_config.json`, as in vLLM. For Inkling 2 Mini that is temperature 1 with no filters. `top_k` of 0 or -1 keeps every token.
+
+`temperature: 0` decodes greedily and gives the same tokens as earlier greedy builds. A request with a `seed` gets the same tokens again on the same server configuration, alone or in a batch. A request without one gets a random seed. `--greedy` decodes every request greedily.
+
 ## Accepted, ignored and refused fields
 
-Decoding is greedy, so `temperature`, `top_p`, `top_k`, `min_p`, the penalties, `seed` and other sampling fields are accepted and ignored. So are `user`, `skip_special_tokens` and unknown fields.
+The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) and other sampling fields are accepted and ignored. So are `user`, `skip_special_tokens` and unknown fields.
 
 Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `min_tokens`, `stop_token_ids`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`.
 
@@ -69,7 +76,7 @@ Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`,
 
 With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit.
 
-A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of 2,048 tokens between the batch's steps. Either way each request gets the same tokens it would get alone. [batching.md](batching.md) has the design.
+A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of 2,048 tokens between the batch's steps. Either way each request gets the same tokens it would get alone, greedy or sampled with a seed. [batching.md](batching.md) has the design.
 
 ## Prefix cache
 

@@ -239,9 +239,9 @@ SIPHON_MODEL=<official-model-dir> SIPHON_DFLASH=<dflash2-dir> \
 
 ## Speculative decoding
 
-`spec::Speculator` runs greedy speculative decoding with the draft. Each round verifies the anchor and its leading drafts, a width of 1 to 8 rows that `spec::Width` sets: a fixed k drafts (`Width::Fixed`), or a width per round from the drafts' confidences (`Width::Adaptive`).
+`spec::Speculator` runs speculative decoding with the draft, greedy or sampled ([Sampling](#sampling)). Each round verifies the anchor and its leading drafts, a width of 1 to 8 rows that `spec::Width` sets: a fixed k drafts (`Width::Fixed`), or a width per round from the drafts' confidences (`Width::Adaptive`).
 
-1. `Model::start_verify` launches the anchor and the round's drafts as one pass through the chunked-prefill code. On the device it keeps the anchor and the longest run of drafts that each equal the previous row's greedy token, and rolls back the rest.
+1. `Model::start_verify` launches the anchor and the round's drafts as one pass through the chunked-prefill code. On the device it keeps the anchor and the longest run of drafts that each equal the previous row's token, greedy or drawn, and rolls back the rest.
 2. The draft's next round goes on the stream right behind it: it commits the feature taps of the kept rows, whose count the verify left on the device, runs its block from the next anchor, and drafts with a confidence each.
 3. `Model::finish_verify` synchronizes once, to read the verdict, and the host reads the new confidences and picks the next round's width. Host time stays near 0.02 ms per round.
 
@@ -260,7 +260,7 @@ The policy was chosen by simulation over sweeps (`bench --spec K --sweep FILE`),
 
 Thresholds from 0.5 to 0.7 and the cost rule land within 2% of each other; the cost rule keeps that place when the verify cost per row changes, without retuning. Widths 2, 4 and 8 alone lose about 1.5%. The policy can pick width 1, a verify of one row, which a plain step and a draft round beat (below).
 
-A round emits the kept drafts and the target's greedy token after them. `Model::prefill_with_taps` records the draft's taps of every prompt row, so the draft's cache covers the prompt.
+A round emits the kept drafts and the target's token after them. `Model::prefill_with_taps` records the draft's taps of every prompt row, so the draft's cache covers the prompt.
 
 The verify pass has one CUDA graph per width, captured on first use, with the tokens, the start position and the acceptance mode in device buffers. `kernels/spec.cu` holds its own kernels:
 
@@ -430,9 +430,77 @@ The fallback is opt-in for two reasons, measured on one build (FP8 weights and c
 
 Fixed prices instead of measured ones would make the paths reproducible; the coding request's loss needs a better plain-or-verify test.
 
+## Sampling
+
+`ops::sample` picks each row's next token from its F32 logits wherever the engine picked the argmax: after a prefill or a plain step, in the verify pass and in batched steps. `Model::set_sampling` sets slot 0's `Sampling`, which the prefill, the steps and the verify use; `Model::step_batch_sampled` takes one per row. The verify and batch heads sample only after `Model::enable_sampling`, which siphon-serve calls unless `--greedy` is set. Temperature 0 takes the argmax with the argmax kernel's rule (the first maximum, NaN above every number), so greedy rows give the same tokens.
+
+The filters follow vLLM, in its order: temperature, then top-k (every token at least as large as the k-th largest stays), then top-p (a token stays while the strictly larger tokens hold less than p of the mass; equal logits stay or go together), then min-p (a token stays at min_p times the largest probability or more). Then one draw by the exponential race: token i scores x_i / T - ln E_i, with E_i an Exp(1) variable hashed from the request's seed, the token's position and i, and the kept token with the highest score is a draw from the filtered distribution. A token therefore depends only on the logits, the seed and the position: not on the other rows of a pass, the width or the reduction order.
+
+### Speculative sampling
+
+The draft proposes greedily, so its proposal distribution q is a point mass on its draft x. The standard rule keeps x with probability min(1, p(x) / q(x)) = p(x), and after a rejection draws from normalize(max(0, p - q)), which is p without x. The verify draws each row's token y from p with the row's seed and position, and keeps the draft when x = y. That keeps x with probability p(x), and after a rejection y is a draw from p conditioned on y != x: the same rule, coupled to the plain draw at that position. So:
+
+- The output follows the target's filtered distribution exactly, and the acceptance kernel is the greedy one (`accept_greedy`), comparing drafts with drawn tokens.
+- The draft's shortlist and approximations change only how often drafts are kept, never the tokens: q is a point mass on whatever the draft proposed.
+- With a seed, speculation gives the tokens of batched steps, whose rows have the verify's logits bit for bit. A seeded request gets the same tokens alone or in a batch, on any width schedule. Plain steps (`--fallback`) sum in other orders, so a run that falls back follows the distribution but not these exact tokens.
+
+A draft that samples from its own filtered distribution would be kept with probability sum(min(p, q)) at each position instead of p(x). `tests/sampling.rs` (`draft_sampling_acceptance`) measures both from the same rounds of the exact bundled draft, whose logits it records, over three prompts and 192 tokens each; positions after the first condition on the greedy drafts before them:
+
+| | Greedy draft kept, by position | Tokens per 8-row round | Sampled draft kept, by position | Tokens per 8-row round |
+| --- | --- | ---: | --- | ---: |
+| Temperature 1 | 0.57, 0.49, 0.49, 0.45, 0.41, 0.37, 0.36 | 2.50 (measured 2.54) | 0.68, 0.58, 0.55, 0.51, 0.47, 0.43, 0.41 | 2.79 |
+| Temperature 0.8, top-p 0.95 | 0.68, 0.57, 0.51, 0.46, 0.46, 0.41, 0.46 | 2.89 (measured 2.90) | 0.72, 0.62, 0.56, 0.49, 0.49, 0.46, 0.52 | 3.05 |
+
+A sampling draft would keep about 12% more tokens per round at temperature 1 and 6% more at 0.8 with top-p 0.95. Speculation keeps the greedy draft anyway. A sampling draft needs its full filtered distribution at every step: the bundled draft's exact head prunes its Markov fold to the rows that can win, and DFlash 2's selector keeps 16 candidates per row, and the verify would need q over the vocabulary for each draft to draw from max(0, p - q). Its draws would also tie a request's tokens to the width schedule, which depends on timings measured at startup, and to whether it ran alone or in a batch, so a seed would no longer reproduce the output.
+
+### Kernels
+
+`sample_prepare` runs a cluster of 8 blocks per row, each taking an eighth of the row, and merges their histograms through distributed shared memory. A greedy row takes the argmax there. A row with top-k or top-p finds the row's maximum, then each filter's threshold: a histogram of the tokens by distance below the maximum in 2,048 bins over 28.5 nats, then a radix over the ordered bits of the logits in the bin where the weight reaches the target, 11 bits at a time, over a shared-memory copy of that bin. Top-k weighs each token 1; top-p weighs it by its probability in fixed point (2^40 for the largest token), summed in 32-bit integer atomics as three 14-bit limbs, so the threshold does not depend on the order of the adds. `sample_race` runs the race over the kept tokens in 32 blocks per row, skipping tokens that cannot beat the best score so far, and the last block to finish reduces the partials.
+
+Kernel time from `tests/sample.rs` (`sampling_cost`), 8 rows of 200,058 synthetic logits, launch included: argmax kernel 10.0 us; greedy rows 4.8 us; temperature 1, 13.0 us; temperature 0.8 with top-p 0.95, 42 us; temperature 0.7 with top-k 40 and top-p 0.95, 64 us. A single block per row took 77 us for top-p: it was bound by issuing about 50 branchy instructions per token on one SM. 64-bit shared-memory atomics compile to compare-and-swap loops on sm_120, and 64-bit float conversions run at the FP64 rate, so the kernels avoid both. In the verify pass on the model's logits (`sampling_cost_in_the_verify`, FP8, best of 3 runs of 160 tokens), the costs at widths 2 and 4 are within the run-to-run noise of about 0.03 ms. At width 8 they are larger, against 6.58 ms greedy:
+
+| Width | Greedy | Temperature 1 | Temperature 0.8, top-p 0.95 | Temperature 0.7, top-k 40, top-p 0.95 |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 3.876 ms | 3.856 | 3.889 | 3.937 |
+| 4 | 4.917 | 4.891 | 4.919 | 4.919 |
+| 8 | 6.584 | 6.655 | 6.681 | 6.769 |
+
+A plain step samples after its graph: 3.008 ms greedy, 3.009 at temperature 1, 3.042 with top-p and 3.069 with top-k and top-p.
+
+siphon-serve on the 12 prompts of the registry runs (3,000 tokens at most, FP8, one request at a time), against the greedy build before sampling (097e99f, 537.5 tok/s and 3.50 tokens per round):
+
+| Sampling | Decode tok/s | Tokens per round | Story prompt |
+| --- | ---: | ---: | --- |
+| Temperature 0 | 537.5 | 3.48 | 549 tok/s, 3,000 tokens |
+| `--greedy` | 536.4 | 3.48 | 548 tok/s |
+| Temperature 1 | 396.3 | 2.21 | 318 tok/s, 1,539 tokens, 1.53 tokens per round |
+| Temperature 0.8, top-p 0.95 | 438.4 | 2.51 | 340 tok/s, 1,536 tokens, 1.72 tokens per round |
+
+With `--streams 8` and 8 requests at a time, the 12 prompts ran at 780 tok/s greedy (779 before), 734 at temperature 1 and 768 at 0.8 with top-p 0.95, wall clock. Temperature 0, `--greedy` and the batched greedy run gave the earlier greedy outputs for all 12 prompts. Each sampled run with seeds gave the same 12 outputs again, alone and with `--streams 8`.
+
+`tests/sample.rs` checks greedy rows against the argmax kernel, draws against a host version of vLLM's filters by a chi-square test (200,000 draws of a 1,000-token row per setting, 20,000 of a 200,058-token row), and that a row's token depends only on its logits, seed and position. `tests/sampling.rs` (`speculation_keeps_the_distribution`) compares speculative and plain sampling of the first 4 tokens after a prompt over many seeds, at temperature 1 and at 0.8 with top-p 0.95, by two-sample chi-square tests, and checks that speculation and batched steps give the same 48 tokens for 12 seeds:
+
+```sh
+cargo test --release -p siphon-cuda --test sample
+SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test sampling -- --ignored --nocapture --test-threads 1
+```
+
+With 1,000 seeds per sample, on the 260-token prefix of `regex-readme` (next-token entropy 3.98 nats), FP8:
+
+| Test | Temperature 1, z (degrees of freedom) | Temperature 0.8, top-p 0.95, z (degrees of freedom) |
+| --- | ---: | ---: |
+| Token 1 | 0.52 (27) | -0.12 (24) |
+| Token 2 | -0.62 (22) | 0.42 (16) |
+| Token 3 | 0.86 (31) | -0.79 (24) |
+| Token 4 | -1.65 (35) | 1.29 (34) |
+| Tokens 1-2 | -0.80 (27) | 0.63 (25) |
+| Tokens 1-4 | -0.50 (14) | 1.01 (37) |
+
+No z-score comes near the 4.5 limit. Speculation kept 1.59 and 1.73 tokens per round over those 4-token draws, and gave the batched steps' 48 tokens for all 12 seeds at both settings.
+
 ## Batched decode
 
-`Model::add_slots` adds sequence slots, each with its own global caches, sliding rings and conv states of slot 0's sizes. `Model::prefill_slot` prefills a slot, and `Model::step_batch` runs the next token of 1 to 8 slots as one pass through the verify pass's code, with each row reading and writing its own slot through a table of device addresses per visit. Each row's logits equal, bit for bit, a one-row verify of its sequence, so a sequence decoded in batches emits the tokens of greedy speculation. [batching.md](batching.md) has the design, the kernel changes and the measurements.
+`Model::add_slots` adds sequence slots, each with its own global caches, sliding rings and conv states of slot 0's sizes. `Model::prefill_slot` prefills a slot, and `Model::step_batch` runs the next token of 1 to 8 slots as one pass through the verify pass's code, with each row reading and writing its own slot through a table of device addresses per visit. Each row's logits equal, bit for bit, a one-row verify of its sequence, so a sequence decoded in batches emits the tokens of speculation, greedy or sampled with the same seed. [batching.md](batching.md) has the design, the kernel changes and the measurements.
 
 siphon-serve returns a request left alone in a batch to speculation. The draft follows the request that left speculation: batched steps record their rows' taps, and the speculator commits the followed row's (`Speculator::follow`, `keep_batched`, `resume`). A request without draft state gets it rebuilt by a prefill with taps into a free slot (`Speculator::rebuild`), and `Model::move_slot` moves a request to slot 0. [batching.md](batching.md#returning-to-speculation) has the costs.
 

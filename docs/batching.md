@@ -1,12 +1,14 @@
 # Batching several sequences
 
-Siphon serves one sequence at a time. This note describes how it runs up to 8 sequences together with plain greedy decode, reusing the verify pass's multi-row kernels, and how the server schedules them. [engine.md](engine.md) describes the verify pass this builds on.
+Siphon serves one sequence at a time. This note describes how it runs up to 8 sequences together with plain decode, reusing the verify pass's multi-row kernels, and how the server schedules them. [engine.md](engine.md) describes the verify pass this builds on.
 
 ## Goal and exactness
 
 A batched step runs one row for each of up to 8 sequences. Every sequence must get exactly the tokens it would get if it were served alone.
 
 The verify pass already gives each row the same logits, bit for bit, as a verify of that row alone at its position, whatever the other rows hold. A batched step reuses those kernels and gives each row its own caches and position, so a batched row equals a one-row verify of its sequence. A sequence decoded in a batch therefore emits `greedy_by_verify`'s tokens: the tokens of greedy decoding through one-row verifies. Speculation without `--fallback` emits the same tokens. So a request gets the same output whether it runs alone with speculation, in a batch, or switches between the two mid-generation.
+
+Sampling keeps this. A sampled token depends only on the row's logits, the request's seed and the token's position, and speculation keeps a draft only when it equals the token the target draws at that position ([engine.md](engine.md#sampling)). A request with a seed therefore gets the same tokens alone, in a batch, or switching between the two. Each batched row samples with its own request's settings (`Model::step_batch_sampled`).
 
 Plain decode (`Model::step`) sums in other orders, so its output differs from both after a near-tie. Batching does not use it. With `--fallback` the speculator takes plain steps, and its output was already allowed to differ between runs.
 
@@ -36,7 +38,7 @@ A shared paged pool would let one long request and several short ones share the 
 
 ## A batched step
 
-A batched step of B rows runs the verify pass's code path (`Ctx::prefill_enqueue` in invariant mode) with row r taken from slot `slot[r]` at position `pos[r]`. It keeps the verify pass's schedule, its FP8 L2 prefetch and its kernels. It skips the verify's backups, acceptance and rollback, and ends with every row's logits and greedy token.
+A batched step of B rows runs the verify pass's code path (`Ctx::prefill_enqueue` in invariant mode) with row r taken from slot `slot[r]` at position `pos[r]`. It keeps the verify pass's schedule, its FP8 L2 prefetch and its kernels. It skips the verify's backups, acceptance and rollback, and ends with every row's logits and token, greedy or drawn with the row's sampling.
 
 Most kernels are row-independent and run unchanged: the embedding and norms, depth attention, the multi-row dense products, the message gates, the router, the experts, the LM head and the argmax. Four places read a sequence's caches or its position:
 

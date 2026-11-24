@@ -1,5 +1,5 @@
-//! Greedy speculative decoding with the DSpark draft: each round verifies the anchor and
-//! up to 7 drafts in one pass and emits the kept drafts and the target's next token.
+//! Speculative decoding with the DSpark draft: each round verifies the anchor and up to 7
+//! drafts in one pass and emits the kept drafts and the target's next token.
 //!
 //! A round, after the prompt's prefill has committed its taps to the draft and the draft
 //! has run its first block:
@@ -11,10 +11,18 @@
 //! 3. [`Model::finish_verify`] synchronizes once to read the verdict, and the host reads
 //!    the new drafts' confidences to choose the next width.
 //!
-//! Greedy acceptance keeps only drafts equal to the target's own greedy token, and the
-//! verify pass gives every row the same result at every width, so the output equals
-//! greedy decoding through the verify pass one row at a time, whatever the draft proposes
-//! and whatever widths the rounds verify ([`greedy_by_verify`]).
+//! Acceptance keeps only drafts equal to the target's own token, and the verify pass gives
+//! every row the same result at every width, so the output equals greedy decoding through
+//! the verify pass one row at a time, whatever the draft proposes and whatever widths the
+//! rounds verify ([`greedy_by_verify`]).
+//!
+//! With the model sampling ([`Model::set_sampling`]), each verify row draws its token from
+//! the target's filtered distribution with the request's seed and the token's position,
+//! and a draft is kept when it equals that draw. The draft proposes greedily, so this is
+//! the standard rule for a point-mass proposal: keep the draft with probability p(x), and
+//! after a rejection draw from p without it. The output follows the target's distribution
+//! exactly and equals sampling through one-row verifies with the same seed (see
+//! `docs/engine.md`).
 //!
 //! When no width is expected to emit tokens faster than plain decoding, a policy with
 //! plain prices ([`WidthPolicy::with_plain`]) runs plain steps instead
@@ -396,7 +404,26 @@ pub struct Speculator {
     batched: Option<Batched>,
     /// The state of the last prompt's prefix, with [`Self::enable_prefix_cache`].
     prefix: Option<PrefixCache>,
+    /// Called after each verify round, for measurements ([`Self::set_round_hook`]).
+    round_hook: Option<RoundHook>,
 }
+
+/// What a verify round saw, for [`Speculator::set_round_hook`].
+pub struct RoundRecord<'a> {
+    /// The drafts the round verified, after the anchor.
+    pub drafts: &'a [u32],
+    /// The draft's logits for each of `drafts`, F32 `[drafts, vocab]`, after
+    /// [`Speculator::record_draft_logits`]; empty otherwise.
+    pub draft_logits: &'a [f32],
+    /// The target's logits for each verified row, the anchor's first, F32
+    /// `[drafts + 1, vocab]`.
+    pub target_logits: &'a [f32],
+    /// Drafts kept.
+    pub accepted: usize,
+}
+
+/// A callback that sees every verify round.
+pub type RoundHook = Box<dyn FnMut(&RoundRecord<'_>) -> anyhow::Result<()> + Send>;
 
 /// What [`Speculator::prefill_cached`] keeps of the last prompt it prefilled: the state at
 /// the prompt's last chunk boundary below its end. With the global caches of slot 0 and of
@@ -547,7 +574,22 @@ impl Speculator {
             stats: SpecStats::default(),
             batched: None,
             prefix: None,
+            round_hook: None,
         })
+    }
+
+    /// Calls `hook` after each verify round with the round's drafts and logits, or stops
+    /// with `None`. Each round then synchronizes twice more and copies the logits to the
+    /// host, so this is for measurements only.
+    pub fn set_round_hook(&mut self, hook: Option<RoundHook>) {
+        self.round_hook = hook;
+    }
+
+    /// Makes the draft keep its logits from the next round on, which
+    /// [`RoundRecord::draft_logits`] then holds. Only the bundled draft without an
+    /// approximate head records them ([`Draft::record_logits`]).
+    pub fn record_draft_logits(&mut self, model: &Model) -> anyhow::Result<()> {
+        self.draft.record_logits(model.stream())
     }
 
     #[must_use]
@@ -1027,6 +1069,28 @@ impl Speculator {
                 self.random.slice(..width - 1)
             }
         };
+        // The drafts and their logits before the draft's next round replaces them.
+        let observed = if self.round_hook.is_some() {
+            let ids = if width > 1 {
+                stream.clone_dtoh(&tokens)?
+            } else {
+                Vec::new()
+            };
+            let logits = match self.draft.markov_logits() {
+                Some(l) if width > 1 => {
+                    let vocab = model.config().unpadded_vocab_size;
+                    stream
+                        .clone_dtoh(&l.slice(..(width - 1) * vocab))?
+                        .into_iter()
+                        .map(f32::from)
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            Some((ids, logits))
+        } else {
+            None
+        };
         let pending = model.start_verify(VerifyTokens::Drafts(tokens), Accept::Greedy)?;
         verified.record(&stream)?;
         if drafts == Drafts::Dspark {
@@ -1043,6 +1107,18 @@ impl Speculator {
         drafted.record(&stream)?;
         let verdict = model.finish_verify(pending)?;
         let a = verdict.accepted;
+        if let (Some((ids, draft_logits)), Some(hook)) = (observed, self.round_hook.as_mut()) {
+            let drafts: Vec<u32> = ids
+                .iter()
+                .map(|&t| u32::try_from(t))
+                .collect::<Result<_, _>>()?;
+            hook(&RoundRecord {
+                drafts: &drafts,
+                draft_logits: &draft_logits,
+                target_logits: &model.verify_logits()?,
+                accepted: a,
+            })?;
+        }
         let emitted = verdict.emitted();
         self.stats.rounds += 1;
         self.stats.widths[width - 1] += 1;

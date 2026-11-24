@@ -27,6 +27,8 @@ pub use prefill::{
 pub use prefix::LocalState;
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
+pub use crate::ops::sample::Sampling;
+
 use std::{ops::Range, sync::Arc};
 
 use anyhow::{Context as _, ensure};
@@ -56,6 +58,7 @@ use crate::{
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, Misc},
         norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
+        sample::{Sample, SampleBuffers},
         spec::{Spec, VERIFY_ROWS},
     },
     weights::{
@@ -79,6 +82,7 @@ struct Kernels {
     misc: Misc,
     norm: Norm,
     routing: Routing,
+    sample: Sample,
     spec: Spec,
 }
 
@@ -343,6 +347,12 @@ pub struct Model {
     batch_graphs: Vec<Option<StepGraph>>,
     /// Whether batched steps record each row's taps ([`Model::set_batch_taps`]).
     batch_taps: bool,
+    /// How slot 0's next tokens are picked ([`Model::set_sampling`]).
+    sampling: Sampling,
+    /// Whether the verify and batch heads sample ([`Model::enable_sampling`]).
+    sampler: bool,
+    /// The settings of a step's or a prefill's draw.
+    sample_one: SampleBuffers,
 }
 
 /// Everything a step reads but does not change.
@@ -437,6 +447,7 @@ impl Model {
             misc: Misc::load(ctx)?,
             norm: Norm::load(ctx)?,
             routing: Routing::load(ctx)?,
+            sample: Sample::load(ctx)?,
             spec: Spec::load(ctx)?,
         };
         if weight_format == WeightFormat::Fp8 {
@@ -483,6 +494,7 @@ impl Model {
                 &mut scratch.message_queries.slice_mut(i * len..(i + 1) * len),
             )?;
         }
+        let sample_one = SampleBuffers::new(&stream, 1)?;
         Ok(Self {
             ctx: Ctx {
                 config,
@@ -512,6 +524,9 @@ impl Model {
             batch: None,
             batch_graphs: (0..BATCH_ROWS).map(|_| None).collect(),
             batch_taps: false,
+            sampling: Sampling::GREEDY,
+            sampler: false,
+            sample_one,
         })
     }
 
@@ -793,8 +808,9 @@ impl Model {
         Ok(self.ctx.stream.clone_dtoh(&self.scratch.capped)?)
     }
 
-    /// Runs one token and returns the greedy next token. Fills `trace` if given; otherwise
-    /// replays the step's CUDA graph, capturing it first if needed.
+    /// Runs one token and returns the next token, greedy or drawn with [`Self::sampling`].
+    /// Fills `trace` if given; otherwise replays the step's CUDA graph, capturing it first
+    /// if needed.
     pub fn step(&mut self, token: u32, trace: Option<&mut Trace>) -> anyhow::Result<u32> {
         self.run_step(token, trace, false)
     }
@@ -858,8 +874,65 @@ impl Model {
                 .0
                 .launch()?;
         }
-        let next = stream.clone_dtoh(&self.scratch.next)?[0];
         self.position += 1;
+        self.next_token()
+    }
+
+    /// How [`Self::step`], [`Self::prefill`] and the verify pick tokens from now on, and,
+    /// with sampling on, [`Self::prefill_slot`]. Starts greedy; a reset keeps it.
+    pub fn set_sampling(&mut self, sampling: Sampling) {
+        self.sampling = sampling;
+    }
+
+    #[must_use]
+    pub fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
+    /// Lets the verify pass and batched steps sample: their heads then pick each row's
+    /// token with `ops::sample`, which takes the argmax of greedy rows by the same rule,
+    /// instead of the argmax kernel. Drops the captured verify and batch graphs. Without
+    /// this, the verify and batched steps stay greedy whatever [`Self::set_sampling`] says.
+    pub fn enable_sampling(&mut self) -> anyhow::Result<()> {
+        self.sampler = true;
+        let stream = Arc::clone(&self.ctx.stream);
+        for p in [self.verify.as_mut(), self.batch.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if p.sample.is_none() {
+                p.sample = Some(SampleBuffers::new(&stream, VERIFY_ROWS)?);
+            }
+        }
+        self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.batch_graphs.iter_mut().for_each(|g| *g = None);
+        Ok(())
+    }
+
+    /// Whether [`Self::enable_sampling`] was called.
+    #[must_use]
+    pub fn sampling_enabled(&self) -> bool {
+        self.sampler
+    }
+
+    /// The token after a step or prefill, whose logits are in the decode buffers: the
+    /// argmax the step computed, or a draw with [`Self::sampling`] for the token at the
+    /// current position.
+    fn next_token(&mut self) -> anyhow::Result<u32> {
+        let stream = Arc::clone(&self.ctx.stream);
+        if !self.sampling.is_greedy() {
+            let s = &mut self.scratch;
+            self.sample_one
+                .upload(&stream, &[(self.sampling, self.position)])?;
+            self.ctx.kernels.sample.run(
+                &stream,
+                &s.capped,
+                self.ctx.config.unpadded_vocab_size,
+                &mut self.sample_one,
+                &mut s.next,
+            )?;
+        }
+        let next = stream.clone_dtoh(&self.scratch.next)?[0];
         u32::try_from(next).context("argmax returned a negative index")
     }
 

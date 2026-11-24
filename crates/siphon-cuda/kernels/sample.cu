@@ -1,0 +1,775 @@
+// Picking each row's next token from its F32 logits: greedy, or one draw from vLLM's
+// filtered distribution.
+//
+// A row with temperature 0 takes the argmax, with the rule of argmax_f32 in misc.cu (the
+// first maximum, NaN above every number), so greedy rows give the same tokens.
+//
+// Any other row samples from softmax(x / T) after vLLM's filters, in this order:
+// - top-k keeps every token whose logit is at least the k-th largest (ties kept);
+// - top-p keeps, among those, every token whose strictly larger tokens hold less than a
+//   share p of their mass (tokens with equal logits are kept or dropped together);
+// - min-p keeps tokens whose probability is at least min_p times the largest.
+// Each filter is exact up to F32 rounding of the probabilities. sample_prepare finds the
+// filters' thresholds with a cluster of 8 blocks per row, each histogramming an eighth of
+// the row and merging the histograms through distributed shared memory: the row's
+// maximum, then a histogram of the tokens by distance below it, then a radix over the
+// ordered bits of the logits in the bin that holds the threshold, counting tokens for
+// top-k and summing their probability for top-p. The probability sums use fixed point
+// (2^40 for the largest token) in integer atomics, so the thresholds do not depend on the
+// order in which threads add.
+//
+// sample_race then draws with the exponential race: token i scores x_i / T - ln E_i, with
+// E_i an Exp(1) variable, and the kept token with the highest score is a draw from the
+// filtered distribution. E_i comes from a hash of the row's seed, its position and i, so a
+// row's token depends only on its logits, seed and position, never on the other rows or
+// on the reduction order. Speculation relies on this: a verify row and a batched row with
+// the same logits, seed and position pick the same token.
+
+#include <cfloat>
+#include <climits>
+#include <cstdint>
+
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+namespace {
+
+// sample_prepare runs each row in a cluster of kCluster blocks of kPrepareThreads, kCluster
+// and PREPARE_THREADS in ops/sample.rs.
+constexpr int kCluster = 8;
+constexpr int kPrepareThreads = 512;
+constexpr int kWarps = kPrepareThreads / 32;
+constexpr int kRaceThreads = 256;
+// Blocks per row of sample_race, kRaceBlocks in ops/sample.rs.
+constexpr int kRaceBlocks = 32;
+constexpr int kBins = 2048;
+// The scaled distance below the maximum that the first level of a threshold search bins,
+// the same as kMassFloor, and the tokens of the chosen bin it copies to shared memory.
+constexpr float kRange = 28.5f;
+constexpr int kList = 1024;
+// The largest token's probability in fixed point, and the scaled logit below which a
+// token's fixed-point probability rounds to 0: exp(-28.5) * 2^40 < 0.5. Rows hold at most
+// kMaxTokens tokens, for the histogram's limbs.
+constexpr float kMassScale = 1099511627776.0f;
+constexpr float kMassFloor = -28.5f;
+constexpr int kMaxTokens = 1 << 18;
+static_assert(static_cast<unsigned long long>(kMaxTokens) * 0x3fff < (1ull << 32), "a limb's sum fits 32 bits");
+// More than the largest -ln E_i can reach: E_i >= 2^-65, so -ln E_i < 45.1.
+constexpr float kMaxBoost = 46.0f;
+
+// One row's settings, struct Params in ops/sample.rs. temperature 0 is greedy; top_k 0,
+// top_p 1 and min_p 0 turn their filters off.
+struct Params {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    unsigned seed_lo;
+    unsigned seed_hi;
+    unsigned position;
+    unsigned pad;
+};
+
+// What sample_prepare leaves for sample_race: whether the row samples, the lowest kept
+// key, and the row's maximum.
+struct State {
+    unsigned sample;
+    unsigned lowest;
+    float max;
+    unsigned pad;
+};
+
+// True if (a, ia) should be the argmax over (b, ib): argmax_better in misc.cu.
+__device__ __forceinline__ bool argmax_better(float a, int ia, float b, int ib) {
+    const bool a_nan = isnan(a);
+    const bool b_nan = isnan(b);
+    if (a_nan || b_nan) {
+        return a_nan && (!b_nan || ia < ib);
+    }
+    return a > b || (a == b && ia < ib);
+}
+
+// The bits of x, ordered as the values: a larger x has a larger key. NaN takes the key
+// of -inf, below every kept token.
+__device__ __forceinline__ unsigned order_key(float x) {
+    if (isnan(x)) {
+        x = -INFINITY;
+    }
+    const unsigned b = __float_as_uint(x);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+__device__ __forceinline__ unsigned long long mix64(unsigned long long z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+// The key of a row's draw: its seed and position.
+__device__ __forceinline__ unsigned long long draw_key(const Params& p) {
+    const unsigned long long seed = (static_cast<unsigned long long>(p.seed_hi) << 32) | p.seed_lo;
+    return mix64(seed ^ mix64(p.position + 0x632be59bd9b4e019ull));
+}
+
+// z / 2^64 for z below 2^63, at least 2^-65, from two 32-bit conversions: 64-bit ones run
+// at the FP64 rate on this GPU.
+__device__ __forceinline__ float unit(unsigned long long z) {
+    const float v = static_cast<float>(static_cast<unsigned>(z >> 32)) * 0x1p-32f +
+                    static_cast<float>(static_cast<unsigned>(z)) * 0x1p-64f;
+    return fmaxf(v, 0x1p-65f);
+}
+
+// -ln E_i for an Exp(1) variable E_i. 64 bits split into a uniform v below 1/2 or its
+// complement, so that both small v (small E) and v near 1 keep 24 significant bits.
+__device__ __forceinline__ float race_boost(unsigned long long key, int i) {
+    const unsigned long long z = mix64(key + (static_cast<unsigned long long>(i) + 1) * 0x9e3779b97f4a7c15ull);
+    float e;
+    if ((z >> 63) == 0) {
+        e = -log1pf(-unit(z));
+    } else {
+        e = -logf(unit(~z));
+    }
+    return -logf(e);
+}
+
+// The fixed-point probability of a token, relative to the row's largest. Converts
+// without 64-bit conversion instructions, which run at the FP64 rate on this GPU: below
+// 2^24 the value rounds to a 32-bit integer, and above it the float is an integer whose
+// mantissa shifts into place.
+__device__ __forceinline__ unsigned long long mass(float x, float max, float inv_t) {
+    const float z = (x - max) * inv_t;
+    if (!(z >= kMassFloor)) {
+        return 0;
+    }
+    const float f = __expf(z) * kMassScale;
+    if (f < 16777216.0f) {
+        return __float2uint_rn(f);
+    }
+    const unsigned bits = __float_as_uint(f);
+    const int exponent = static_cast<int>(bits >> 23) - 127;
+    const unsigned long long mantissa = (bits & 0x7fffffu) | 0x800000u;
+    return mantissa << (exponent - 23);
+}
+
+// Calls f(x[i], i) for the elements i of x that thread `t` of `threads` takes, in some
+// order: 16-byte loads, four in flight per thread, so that one block streams a row near
+// one SM's L2 bandwidth instead of waiting on one load at a time.
+template <int kThreads, typename F>
+__device__ __forceinline__ void for_each(const float* x, int n, int t, F&& f) {
+    constexpr int kUnroll = 4;
+    const int head = min(n, static_cast<int>(((16 - (reinterpret_cast<uintptr_t>(x) & 15)) & 15) / 4));
+    if (t < head) {
+        f(x[t], t);
+    }
+    const float4* v = reinterpret_cast<const float4*>(x + head);
+    const int vectors = (n - head) / 4;
+    int i = t;
+    for (; i + (kUnroll - 1) * kThreads < vectors; i += kUnroll * kThreads) {
+        float4 q[kUnroll];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            q[u] = v[i + u * kThreads];
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const int b = head + 4 * (i + u * kThreads);
+            f(q[u].x, b);
+            f(q[u].y, b + 1);
+            f(q[u].z, b + 2);
+            f(q[u].w, b + 3);
+        }
+    }
+    for (; i < vectors; i += kThreads) {
+        const float4 q = v[i];
+        const int b = head + 4 * i;
+        f(q.x, b);
+        f(q.y, b + 1);
+        f(q.z, b + 2);
+        f(q.w, b + 3);
+    }
+    const int tail = head + 4 * vectors + t;
+    if (tail < n) {
+        f(x[tail], tail);
+    }
+}
+
+// The sum of v over the block, in every thread.
+__device__ __forceinline__ unsigned long long block_sum(unsigned long long v, unsigned long long* scratch) {
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+        scratch[threadIdx.x / 32] = v;
+    }
+    __syncthreads();
+    v = threadIdx.x % 32 < kWarps ? scratch[threadIdx.x % 32] : 0;
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+// The largest of v over the block, in every thread.
+__device__ __forceinline__ float block_max(float v, float* scratch) {
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+        scratch[threadIdx.x / 32] = v;
+    }
+    __syncthreads();
+    v = threadIdx.x % 32 < kWarps ? scratch[threadIdx.x % 32] : -INFINITY;
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+// The smallest (or, with `largest`, the largest) of v over the block, in every thread.
+__device__ __forceinline__ unsigned block_extreme(unsigned v, bool largest, unsigned* scratch) {
+    const auto pick_one = [largest](unsigned a, unsigned b) { return largest ? max(a, b) : min(a, b); };
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v = pick_one(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+        scratch[threadIdx.x / 32] = v;
+    }
+    __syncthreads();
+    v = threadIdx.x % 32 < kWarps ? scratch[threadIdx.x % 32] : (largest ? 0u : UINT_MAX);
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v = pick_one(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    __syncthreads();
+    return v;
+}
+
+// The exclusive prefix sum of v over the block's threads in thread order.
+__device__ __forceinline__ unsigned long long block_exclusive_scan(unsigned long long v,
+                                                                   unsigned long long* scratch) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    unsigned long long inclusive = v;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        const unsigned long long up = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) {
+            inclusive += up;
+        }
+    }
+    __syncthreads();
+    if (lane == 31) {
+        scratch[warp] = inclusive;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        unsigned long long total = lane < kWarps ? scratch[lane] : 0;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            const unsigned long long up = __shfl_up_sync(0xffffffffu, total, offset);
+            if (lane >= offset) {
+                total += up;
+            }
+        }
+        scratch[lane] = total;
+    }
+    __syncthreads();
+    const unsigned long long before = warp > 0 ? scratch[warp - 1] : 0;
+    return before + inclusive - v;
+}
+
+// A histogram of weights below 2^42 in shared memory, as three 14-bit limbs per bin, each
+// summed in its own 32-bit word. A limb's sum stays below 2^32 for up to 2^18 tokens, so
+// the words never wrap, and the adds need no result: sm_120 has no native 64-bit
+// shared-memory add, and an add that returns its old value (for a carry) stalls the
+// thread on every token.
+struct Hist {
+    unsigned limb[3][kBins];
+
+    __device__ void clear(int bins) {
+        for (int b = threadIdx.x; b < bins; b += kPrepareThreads) {
+            limb[0][b] = 0;
+            limb[1][b] = 0;
+            limb[2][b] = 0;
+        }
+    }
+
+    __device__ void add(int bin, unsigned long long w) {
+        const unsigned l0 = static_cast<unsigned>(w) & 0x3fffu;
+        const unsigned l1 = static_cast<unsigned>(w >> 14) & 0x3fffu;
+        const unsigned l2 = static_cast<unsigned>(w >> 28);
+        if (l0 != 0) {
+            atomicAdd(&limb[0][bin], l0);
+        }
+        if (l1 != 0) {
+            atomicAdd(&limb[1][bin], l1);
+        }
+        if (l2 != 0) {
+            atomicAdd(&limb[2][bin], l2);
+        }
+    }
+
+    __device__ unsigned long long get(int bin) const {
+        return static_cast<unsigned long long>(limb[0][bin]) +
+               (static_cast<unsigned long long>(limb[1][bin]) << 14) +
+               (static_cast<unsigned long long>(limb[2][bin]) << 28);
+    }
+};
+
+// The shared memory of one block of a row's cluster.
+struct Search {
+    // This block's histogram of its own tokens.
+    Hist hist;
+    // After merge(), this block's share of the cluster's histogram: bins
+    // rank * per .. rank * per + per - 1, per = bins / kCluster.
+    unsigned long long merged[kBins / kCluster];
+    unsigned long long scan[33];
+    unsigned found[3];
+    unsigned uscratch[32];
+    float fscratch[32];
+    int iscratch[32];
+    // Values each block posts for the others: its maximum, its range of keys, its argmax.
+    float max;
+    unsigned kmin;
+    unsigned kmax;
+    float best;
+    int best_idx;
+    // This block's tokens in the chosen bin.
+    unsigned count;
+    unsigned keys[kList];
+    unsigned long long weights[kList];
+};
+
+// One block's share of a row: tokens offset .. offset + n - 1.
+struct Part {
+    const float* x;
+    int n;
+    int offset;
+};
+
+// Sums every block's histogram of `bins` bins into each block's share of it, `merged`.
+// Starts with a cluster barrier, so that every block's histogram is complete and every
+// block has finished reading the shares of the last merge.
+__device__ void merge(Search& sh, int bins, cg::cluster_group& cluster) {
+    cluster.sync();
+    const int per = bins / kCluster;
+    const int first = static_cast<int>(cluster.block_rank()) * per;
+    for (int j = threadIdx.x; j < per; j += kPrepareThreads) {
+        unsigned long long total = 0;
+#pragma unroll
+        for (int r = 0; r < kCluster; ++r) {
+            total += cluster.map_shared_rank(&sh.hist, r)->get(first + j);
+        }
+        sh.merged[j] = total;
+    }
+    cluster.sync();
+}
+
+// Bin `bin` of the cluster's histogram of `bins` bins, after merge().
+__device__ __forceinline__ unsigned long long merged(Search& sh, int bins, int bin, cg::cluster_group& cluster) {
+    const int per = bins / kCluster;
+    return cluster.map_shared_rank(sh.merged, bin / per)[bin % per];
+}
+
+// The sum of every bin of the cluster's histogram, after merge().
+__device__ unsigned long long merged_total(Search& sh, int bins, cg::cluster_group& cluster) {
+    unsigned long long own = 0;
+    for (int b = threadIdx.x; b < bins; b += kPrepareThreads) {
+        own += merged(sh, bins, b, cluster);
+    }
+    return block_sum(own, sh.scan);
+}
+
+// The bin of the cluster's histogram where the weight before it first reaches `target`,
+// given the weight `above` of everything before the histogram, and the weight before that
+// bin. Bins count in rank order: bin r, or bin bins - 1 - r when descending. Every block
+// finds the same bin. Returns UINT_MAX when no bin reaches the target, which the callers
+// rule out.
+__device__ unsigned pick(Search& sh, int bins, bool descending, unsigned long long above,
+                         unsigned long long target, unsigned long long* before_bin,
+                         cg::cluster_group& cluster) {
+    const int per = bins > kPrepareThreads ? bins / kPrepareThreads : 1;
+    const int first = per * threadIdx.x;
+    const auto at = [&](int rank) { return descending ? bins - 1 - rank : rank; };
+    unsigned long long h[kBins / kPrepareThreads];
+    unsigned long long own = 0;
+    for (int r = 0; r < per; ++r) {
+        h[r] = first + r < bins ? merged(sh, bins, at(first + r), cluster) : 0;
+        own += h[r];
+    }
+    if (threadIdx.x == 0) {
+        sh.found[0] = UINT_MAX;
+    }
+    unsigned long long before = above + block_exclusive_scan(own, sh.scan);
+    for (int r = 0; r < per && first + r < bins; ++r) {
+        if (before < target && before + h[r] >= target) {
+            sh.found[0] = static_cast<unsigned>(at(first + r));
+            sh.found[1] = static_cast<unsigned>(before);
+            sh.found[2] = static_cast<unsigned>(before >> 32);
+        }
+        before += h[r];
+    }
+    __syncthreads();
+    const unsigned bin = sh.found[0];
+    *before_bin = (static_cast<unsigned long long>(sh.found[2]) << 32) | sh.found[1];
+    __syncthreads();
+    return bin;
+}
+
+// The k-th largest key of the row among those at or above `lowest`: a radix over all keys,
+// 11, 11 and 10 bits at a time. Only for a k past every token within kRange of the maximum.
+__device__ unsigned count_threshold(const Part& part, unsigned lowest, unsigned long long k, Search& sh,
+                                    cg::cluster_group& cluster) {
+    unsigned prefix = 0;
+    unsigned long long above = 0;
+    for (int hi = 32; hi > 0;) {
+        const int width = hi == 10 ? 10 : 11;
+        const int shift = hi - width;
+        const int bins = 1 << width;
+        sh.hist.clear(bins);
+        __syncthreads();
+        for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+            const unsigned key = order_key(v);
+            if (isnan(v) || key < lowest || (hi < 32 && (key >> hi) != (prefix >> hi))) {
+                return;
+            }
+            sh.hist.add((key >> shift) & (bins - 1), 1ull);
+        });
+        merge(sh, bins, cluster);
+        const unsigned digit = pick(sh, bins, true, above, k, &above, cluster);
+        if (digit == UINT_MAX) {
+            return lowest;
+        }
+        prefix |= digit << shift;
+        hi = shift;
+    }
+    return prefix;
+}
+
+// The lowest key a filter keeps among the row's keys at or above `lowest`: the largest key
+// K whose strictly larger keys weigh less than the target. Each token weighs 1 (by_mass
+// false, target k) or its fixed-point probability (by_mass true, target the share `share`
+// of the total, rounded up). Returns `lowest` when the filter keeps every token. Each
+// block of the cluster histograms its own part of the row, and merge() sums them.
+//
+// The first level bins the tokens by their scaled distance below the maximum,
+// d = (max - x) / T, in 2048 bins over [0, kRange): a bin holds one contiguous run of
+// keys, and the bins spread the bulk of a vocabulary so that the shared-memory atomics
+// rarely collide. Tokens past kRange weigh nothing by mass; by count, they only add to the
+// total, and a k past the tokens in range falls back to a radix over all keys. Each block
+// copies its tokens of the bin where the weight reaches the target to shared memory (when
+// they fit), and a radix over their keys, 11 bits at a time, finds the exact key.
+__device__ unsigned threshold(const Part& part, unsigned lowest, float top, float inv_t, bool by_mass,
+                              unsigned long long k, float share, Search& sh, cg::cluster_group& cluster) {
+    sh.hist.clear(kBins);
+    if (threadIdx.x == 0) {
+        sh.count = 0;
+    }
+    __syncthreads();
+    // The bin of a token, or -1 for a token the search leaves out, and its weight. A
+    // token whose fixed-point probability rounds to 0 weighs nothing, so it is left out.
+    const auto bin_of = [&](float v) {
+        if (isnan(v) || order_key(v) < lowest) {
+            return -1;
+        }
+        const float d = (top - v) * inv_t;
+        if (!(d < kRange)) {
+            return -1;
+        }
+        return min(static_cast<int>(d * (kBins / kRange)), kBins - 1);
+    };
+    const auto weight = [&](float v) { return by_mass ? mass(v, top, inv_t) : 1ull; };
+    for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+        const int bin = bin_of(v);
+        if (bin >= 0) {
+            const unsigned long long w = weight(v);
+            if (w != 0) {
+                sh.hist.add(bin, w);
+            }
+        }
+    });
+    merge(sh, kBins, cluster);
+    const unsigned long long in_range = merged_total(sh, kBins, cluster);
+    unsigned long long target = k;
+    if (by_mass) {
+        const double t = ceil(static_cast<double>(share) * static_cast<double>(in_range));
+        target = t < 1.0 ? 1ull : min(static_cast<unsigned long long>(t), in_range);
+    } else if (in_range < k) {
+        return count_threshold(part, lowest, k, sh, cluster);
+    }
+    unsigned long long above;
+    const unsigned chosen = pick(sh, kBins, false, 0, target, &above, cluster);
+    if (chosen == UINT_MAX) {
+        return lowest;
+    }
+    // This block's tokens of the chosen bin, and the cluster's range of their keys.
+    unsigned kmin = UINT_MAX;
+    unsigned kmax = 0;
+    for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+        if (bin_of(v) != static_cast<int>(chosen)) {
+            return;
+        }
+        const unsigned long long w = weight(v);
+        if (w == 0) {
+            return;
+        }
+        const unsigned key = order_key(v);
+        kmin = min(kmin, key);
+        kmax = max(kmax, key);
+        const unsigned slot = atomicAdd(&sh.count, 1u);
+        if (slot < kList) {
+            sh.keys[slot] = key;
+            sh.weights[slot] = w;
+        }
+    });
+    kmin = block_extreme(kmin, false, sh.uscratch);
+    kmax = block_extreme(kmax, true, sh.uscratch);
+    if (threadIdx.x == 0) {
+        sh.kmin = kmin;
+        sh.kmax = kmax;
+    }
+    cluster.sync();
+    for (int r = 0; r < kCluster; ++r) {
+        const Search* other = cluster.map_shared_rank(&sh, r);
+        kmin = min(kmin, other->kmin);
+        kmax = max(kmax, other->kmax);
+    }
+    const unsigned count = sh.count;
+    const unsigned range = kmax - kmin;
+    const int bits = range == 0 ? 0 : 32 - __clz(range);
+    unsigned prefix = 0;
+    for (int hi = bits; hi > 0;) {
+        const int width = hi < 11 ? hi : 11;
+        const int shift = hi - width;
+        // At least kCluster bins, so that each block holds a share.
+        const int bins = max(1 << width, kCluster);
+        sh.hist.clear(bins);
+        __syncthreads();
+        const auto add = [&](unsigned key, unsigned long long w) {
+            const unsigned rel = key - kmin;
+            if (hi < 32 && (rel >> hi) != (prefix >> hi)) {
+                return;
+            }
+            sh.hist.add((rel >> shift) & ((1u << width) - 1), w);
+        };
+        if (count <= kList) {
+            for (unsigned j = threadIdx.x; j < count; j += kPrepareThreads) {
+                add(sh.keys[j], sh.weights[j]);
+            }
+        } else {
+            for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+                if (bin_of(v) == static_cast<int>(chosen)) {
+                    const unsigned long long w = weight(v);
+                    if (w != 0) {
+                        add(order_key(v), w);
+                    }
+                }
+            });
+        }
+        merge(sh, bins, cluster);
+        const unsigned digit = pick(sh, bins, true, above, target, &above, cluster);
+        if (digit == UINT_MAX) {
+            return lowest;
+        }
+        prefix |= digit << shift;
+        hi = shift;
+    }
+    return kmin + prefix;
+}
+
+}  // namespace
+
+// The first stage, one cluster of kCluster blocks per row of logits [rows, n], each block
+// taking an eighth of the row: a greedy row writes its argmax to out; a sampling row writes
+// its thresholds to state for sample_race. Grid: rows * kCluster blocks.
+extern "C" __global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kPrepareThreads)
+sample_prepare(const float* logits, int n, const Params* params, State* state, int* out) {
+    __shared__ Search sh;
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank());
+    const int row = blockIdx.x / kCluster;
+    const float* x = logits + static_cast<size_t>(row) * n;
+    const int share = ((n + kCluster - 1) / kCluster + 3) & ~3;
+    const int offset = min(n, rank * share);
+    const Part part{x + offset, min(share, n - offset), offset};
+    const Params p = params[row];
+
+    if (!(p.temperature > 0.f)) {
+        float best = -INFINITY;
+        int best_idx = INT_MAX;
+        for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int i) {
+            if (argmax_better(v, part.offset + i, best, best_idx)) {
+                best = v;
+                best_idx = part.offset + i;
+            }
+        });
+        const auto warp_reduce = [&] {
+#pragma unroll
+            for (int o = 16; o >= 1; o /= 2) {
+                const float v = __shfl_xor_sync(0xffffffffu, best, o);
+                const int idx = __shfl_xor_sync(0xffffffffu, best_idx, o);
+                if (argmax_better(v, idx, best, best_idx)) {
+                    best = v;
+                    best_idx = idx;
+                }
+            }
+        };
+        warp_reduce();
+        const int lane = threadIdx.x % 32;
+        const int warp = threadIdx.x / 32;
+        if (lane == 0) {
+            sh.fscratch[warp] = best;
+            sh.iscratch[warp] = best_idx;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            best = lane < kWarps ? sh.fscratch[lane] : -INFINITY;
+            best_idx = lane < kWarps ? sh.iscratch[lane] : INT_MAX;
+            warp_reduce();
+            if (lane == 0) {
+                sh.best = best;
+                sh.best_idx = best_idx;
+            }
+        }
+        cluster.sync();
+        if (rank == 0 && warp == 0) {
+            best = lane < kCluster ? cluster.map_shared_rank(&sh, lane)->best : -INFINITY;
+            best_idx = lane < kCluster ? cluster.map_shared_rank(&sh, lane)->best_idx : INT_MAX;
+            warp_reduce();
+            if (lane == 0) {
+                out[row] = best_idx;
+                state[row] = State{0u, 0u, 0.f, 0u};
+            }
+        }
+        // No block leaves while another may read its shared memory.
+        cluster.sync();
+        return;
+    }
+
+    const bool top_k = p.top_k > 0 && p.top_k < n;
+    const bool top_p = p.top_p < 1.f;
+    const bool min_p = p.min_p > 0.f;
+    float max = 0.f;
+    if (top_k || top_p || min_p) {
+        float m = -INFINITY;
+        for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) { m = fmaxf(m, v); });
+        m = block_max(m, sh.fscratch);
+        if (threadIdx.x == 0) {
+            sh.max = m;
+        }
+        cluster.sync();
+        for (int r = 0; r < kCluster; ++r) {
+            m = fmaxf(m, cluster.map_shared_rank(&sh, r)->max);
+        }
+        max = m;
+    }
+    const float inv_t = 1.f / p.temperature;
+    unsigned lowest = 0;
+    if (top_k) {
+        lowest = threshold(part, lowest, max, inv_t, false, static_cast<unsigned long long>(p.top_k), 1.f, sh,
+                           cluster);
+    }
+    if (top_p) {
+        lowest = threshold(part, lowest, max, inv_t, true, 0, p.top_p, sh, cluster);
+    }
+    if (rank == 0 && threadIdx.x == 0) {
+        state[row] = State{1u, lowest, max, 0u};
+    }
+    // No block leaves while another may read its shared memory.
+    cluster.sync();
+}
+
+// The second stage: the exponential race over each sampling row's kept tokens. Grid
+// (kRaceBlocks, rows) of 256 threads. Each block writes its best (score, index) to the
+// row's partials, and the row's last block to finish, found with counters[row], writes
+// the winner to out. counters must start at 0; the last block resets its row's.
+extern "C" __global__ void __launch_bounds__(kRaceThreads)
+sample_race(const float* logits, int n, const Params* params, const State* state, float* partial_scores,
+            int* partial_idxs, unsigned* counters, int* out) {
+    __shared__ float warp_scores[kRaceThreads / 32];
+    __shared__ int warp_idxs[kRaceThreads / 32];
+    __shared__ bool last;
+    const int row = blockIdx.y;
+    const State s = state[row];
+    if (s.sample == 0) {
+        return;
+    }
+    const Params p = params[row];
+    const float* x = logits + static_cast<size_t>(row) * n;
+    const float inv_t = 1.f / p.temperature;
+    const bool min_p = p.min_p > 0.f;
+    const unsigned long long key = draw_key(p);
+    float best = -INFINITY;
+    int best_idx = INT_MAX;
+    const auto take = [&](float score, int i) {
+        if (score > best || (score == best && i < best_idx)) {
+            best = score;
+            best_idx = i;
+        }
+    };
+    const auto consider = [&](float v, int i) {
+        if (order_key(v) < s.lowest || isnan(v)) {
+            return;
+        }
+        const float scaled = v * inv_t;
+        // A token that cannot beat the best so far even with the largest boost.
+        if (scaled + kMaxBoost < best) {
+            return;
+        }
+        if (min_p && expf((v - s.max) * inv_t) < p.min_p) {
+            return;
+        }
+        take(scaled + race_boost(key, i), i);
+    };
+    for_each<kRaceBlocks * kRaceThreads>(x, n, blockIdx.x * kRaceThreads + threadIdx.x, consider);
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const auto warp_reduce = [&] {
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            take(__shfl_xor_sync(0xffffffffu, best, offset), __shfl_xor_sync(0xffffffffu, best_idx, offset));
+        }
+    };
+    warp_reduce();
+    if (lane == 0) {
+        warp_scores[warp] = best;
+        warp_idxs[warp] = best_idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < kRaceThreads / 32 ? warp_scores[lane] : -INFINITY;
+        best_idx = lane < kRaceThreads / 32 ? warp_idxs[lane] : INT_MAX;
+        warp_reduce();
+        if (lane == 0) {
+            partial_scores[row * kRaceBlocks + blockIdx.x] = best;
+            partial_idxs[row * kRaceBlocks + blockIdx.x] = best_idx;
+            __threadfence();
+            last = atomicAdd(&counters[row], 1u) == kRaceBlocks - 1;
+        }
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    if (warp == 0) {
+        __threadfence();
+        best = lane < kRaceBlocks ? __ldcg(&partial_scores[row * kRaceBlocks + lane]) : -INFINITY;
+        best_idx = lane < kRaceBlocks ? __ldcg(&partial_idxs[row * kRaceBlocks + lane]) : INT_MAX;
+        warp_reduce();
+        if (lane == 0) {
+            // Every token filtered out cannot happen (the largest is always kept), but a
+            // row of NaN would leave INT_MAX; take token 0 then.
+            out[row] = best_idx == INT_MAX ? 0 : best_idx;
+            counters[row] = 0;
+        }
+    }
+}

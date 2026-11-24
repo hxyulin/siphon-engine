@@ -12,6 +12,7 @@ pub mod linear_rows;
 pub mod misc;
 pub mod norm;
 pub mod routing;
+pub mod sample;
 pub mod spec;
 
 use std::{fmt, str::FromStr};

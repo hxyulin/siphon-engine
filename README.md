@@ -23,7 +23,7 @@ Rust host code, CUDA kernels written for this model and `sm_120a`, and an OpenAI
 
 - **Close to the hardware limit.** One plain decode step takes 2.73 ms with FP8 weights and cache, 81% of the time it takes to read the weights once from memory. Decode runs as one CUDA graph per token, with programmatic dependent launch and an L2 prefetch stream for the next layer's weights.
 - **The official checkpoint, unchanged.** Siphon runs the checkpoint as published: NVFP4 and MXFP8 routed experts, BF16 dense weights and the bundled DSpark draft. It builds optional FP8 copies of the dense weights at load time.
-- **Speculation without changing the output.** The verify pass gives each row the same result at every width, so speculative decoding returns exactly the tokens that verifying one row at a time would. Batched decode keeps that property: a request gets the same tokens alone or next to seven others.
+- **Speculation without changing the output.** The verify pass gives each row the same result at every width, so greedy speculation returns exactly the tokens that verifying one row at a time would. Sampled speculation keeps the model's filtered distribution exactly. Batched decode keeps both properties: a greedy or seeded request gets the same tokens alone or next to seven others.
 - **Checked against a reference.** A quality gate compares the engine with MLX-LM over long texts, and parity tests compare it layer by layer.
 
 ## Quick start
@@ -80,6 +80,18 @@ Greedy, 512 tokens, tok/s and speedup over plain decode. The draft proposes up t
 
 The speedup depends on how predictable the text is. The DSpark draft's first token is accepted 89% to 96% of the time on the Rust sources, 78% to 86% on the README and 66% to 70% on the chat answers. DFlash 2 drafts prose and chat better, and the bundled draft drafts code better.
 
+### Sampling
+
+Sampled text is harder to predict than greedy text, so the draft keeps fewer tokens per round. The 12 prompts of the registry runs, up to 3,000 tokens each, one request at a time and then 8 at a time with `--streams 8`:
+
+| Sampling | Decode tok/s, alone | Tokens per round | Tok/s, 8 streams |
+| --- | ---: | ---: | ---: |
+| Greedy (`temperature: 0`) | 537 | 3.48 | 780 |
+| Temperature 1, the checkpoint's default | 396 | 2.22 | 734 |
+| Temperature 0.8, top-p 0.95 | 438 | 2.51 | 768 |
+
+Requests with seeds gave the same 12 outputs on a second run and with `--streams 8`. Sampling adds 0.08 to 0.19 ms to an 8-row verify of 6.57 ms.
+
 ### Concurrent requests
 
 `siphon-serve --streams N` runs up to 8 requests at once, each in its own KV cache. A request alone speculates. When others arrive, all of them decode in batched steps of one row each, and a request left alone speculates again. Tok/s in all, with tok/s per stream in brackets:
@@ -122,13 +134,14 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 
 ## Features
 
-- **Server.** OpenAI chat completions and completions, with streaming, reasoning (`reasoning_content`), tool calls, `tool_choice`, stop strings and `reasoning_effort`. vLLM and TabbyAPI tokenizer routes, and vLLM's `return_token_ids`, `ignore_eos` and `continue_final_message`.
+- **Server.** OpenAI chat completions and completions, with streaming, reasoning (`reasoning_content`), tool calls, `tool_choice`, stop strings, `reasoning_effort` and sampling. vLLM and TabbyAPI tokenizer routes, and vLLM's `return_token_ids`, `ignore_eos` and `continue_final_message`.
 - **Scheduling.** Continuous batching of up to 8 requests. Speculation for a request that runs alone, and a one-entry prefix cache.
+- **Sampling.** Temperature, top-k, top-p and min-p on the GPU, applied in vLLM's order, with the checkpoint's `generation_config.json` for the fields a request leaves out (temperature 1). Each draw depends only on the logits, the request's seed and the token's position. `temperature: 0` or `--greedy` decodes greedily.
 - **Speculation.** The bundled DSpark draft by default, or Inco AI's DFlash 2 drafter or a 2DSD DFlash export with `--drafter DIR`. `--fallback` runs plain steps where the draft cannot predict the text. It speeds up free prose, but the output can then differ between runs.
 - **Formats.** FP8 dense weights (`--weights fp8`) and an FP8 global KV cache (`--kv fp8`) by default, BF16 for both on request. Prefill can opt in to quantized expert activations and FP8 dense products, which are faster and fail the quality gate on some texts.
 - **Memory planning.** The server checks the planned GPU memory against what it uses after warmup and after each job.
 
-Not yet: sampling other than greedy (sampling fields are accepted and ignored), speculation for more than one request at a time, a prefix cache with more than one entry, and image input.
+Not yet: a draft that samples from its own distribution, the presence, frequency and repetition penalties (accepted and ignored), speculation for more than one request at a time, a prefix cache with more than one entry, and image input.
 
 ## Build from source
 

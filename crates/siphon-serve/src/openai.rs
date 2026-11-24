@@ -11,9 +11,11 @@
 //! - The tokenizer routes of [`crate::tokenize`].
 //! - `GET /health` and `GET /version`, which need no API key.
 //!
-//! Decoding is greedy, so sampling fields such as `temperature`, `top_p`, `top_k`, `min_p`,
-//! the penalties and `seed` are accepted and ignored. [`crate::request`] lists the fields the
-//! server refuses, such as `logprobs` and `n` above 1. Stop strings match the reply's content,
+//! Both completion routes sample with `temperature`, `top_k`, `top_p`, `min_p` and `seed`,
+//! with the checkpoint's `generation_config.json` for the fields a request leaves out
+//! ([`crate::request::sampling`]); `temperature` 0 decodes greedily. The penalties are
+//! accepted and ignored. [`crate::request`] lists the fields the server refuses, such as
+//! `logprobs` and `n` above 1. Stop strings match the reply's content,
 //! not its reasoning or tool calls, and a choice reports the one that matched as vLLM's
 //! `stop_reason`.
 
@@ -44,9 +46,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     chat::{self, Ending, InvalidRequest, Vocab},
-    engine::{Engine, Event, Finish, Job, Refused},
+    engine::{Engine, Event, Finish, Job, Refused, Sampling},
     parse::{Delta, Detokenizer, Parser, ToolCall},
-    request::{self, ToolChoice},
+    request::{self, SamplingDefaults, SamplingFields, ToolChoice},
     stop::Stops,
     tokenize::{self, DecodeRequest, EncodeRequest},
 };
@@ -59,6 +61,8 @@ pub struct App {
     /// The bearer token every route but `/health` and `/version` must carry, if set.
     pub api_key: Option<String>,
     pub started: u64,
+    /// The sampling of fields a request leaves out.
+    pub sampling: SamplingDefaults,
 }
 
 /// Request body bytes allowed per position of the context. A prompt of English text
@@ -258,6 +262,8 @@ struct ChatRequest {
     add_generation_prompt: Option<bool>,
     return_token_ids: Option<bool>,
     ignore_eos: Option<bool>,
+    #[serde(flatten)]
+    sampling: SamplingFields,
     /// Every other field: refused ones are checked, the rest ignored.
     #[serde(flatten)]
     other: Map<String, Value>,
@@ -298,6 +304,7 @@ struct Prepared {
     return_token_ids: bool,
     /// vLLM's `ignore_eos`: run to `max_tokens` through the model's end tokens.
     ignore_eos: bool,
+    sampling: Sampling,
     output: Output,
 }
 
@@ -366,6 +373,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
         ignore_eos: request.ignore_eos.unwrap_or(false),
+        sampling: request::sampling(&request.sampling, &app.sampling)?,
         output: Output::new(
             Decoder::Chat(Parser::new(&app.vocab, &ending)),
             Stops::new(stops),
@@ -409,6 +417,7 @@ fn submit(
     prompt: Vec<u32>,
     max_tokens: usize,
     ignore_eos: bool,
+    sampling: Sampling,
 ) -> Result<mpsc::UnboundedReceiver<Event>, ApiError> {
     let (events, results) = mpsc::unbounded_channel();
     app.engine
@@ -416,6 +425,7 @@ fn submit(
             prompt,
             max_tokens,
             ignore_eos,
+            sampling,
             events,
         })
         .map_err(|e| match e {
@@ -457,6 +467,8 @@ struct CompletionRequest {
     return_token_ids: Option<bool>,
     ignore_eos: Option<bool>,
     #[serde(flatten)]
+    sampling: SamplingFields,
+    #[serde(flatten)]
     other: Map<String, Value>,
 }
 
@@ -491,6 +503,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
         ignore_eos: request.ignore_eos.unwrap_or(false),
+        sampling: request::sampling(&request.sampling, &app.sampling)?,
         output: Output::new(
             Decoder::Text(Detokenizer::default()),
             Stops::new(stops),
@@ -518,11 +531,12 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
         delivery,
         return_token_ids,
         ignore_eos,
+        sampling,
         mut output,
     } = prepared;
     let mut reply = Reply::new(&app, prompt.len(), kind);
     let prompt_ids = return_token_ids.then(|| prompt.clone());
-    let mut results = submit(&app, prompt, max_tokens, ignore_eos)?;
+    let mut results = submit(&app, prompt, max_tokens, ignore_eos, sampling)?;
     if let Delivery::Stream { include_usage } = delivery {
         let (out, rx) = mpsc::channel(64);
         let chunks = Chunks {
