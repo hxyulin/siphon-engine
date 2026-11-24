@@ -10,23 +10,23 @@ Decode, ms per token:
 
 | Dense weights, KV cache | Context 0 | 32K | 128K |
 | --- | ---: | ---: | ---: |
-| BF16, BF16 | 3.71 | 4.77 | 6.66 |
-| FP8, FP8 | 2.89 (346 tok/s) | 3.46 | 4.45 |
+| BF16, BF16 | 3.68 | 4.75 | 6.65 |
+| FP8, FP8 | 2.77 (361 tok/s) | 3.32 | 4.30 |
 
 The DRAM floor at context 0 is 3.25 ms with BF16 weights and 2.21 ms with FP8.
 
-Prefill: 2.24 s for a 32K-token prompt (14,600 tok/s).
+Prefill: 2.22 s for a 32K-token prompt (14,700 tok/s).
 
 Greedy speculative decoding with the bundled DSpark draft, FP8 weights and cache, 256 tokens, tok/s:
 
 | Text, context | Plain decode | Speculation |
 | --- | ---: | ---: |
-| Rust source (`anyhow`), 10.7K | 327 | 675 (2.06x) |
-| Rust source (`anyhow`), 32K | 302 | 572 (1.90x) |
-| Rust source (`half`), 2.3K | 340 | 637 (1.87x) |
-| Rust source (`half`), 32K | 301 | 454 (1.51x) |
-| A README (`regex`), 2.3K | 340 | 404 (1.19x) |
-| A README (`regex`), 32K | 301 | 371 (1.23x) |
+| Rust source (`anyhow`), 10.7K | 328 | 676 (2.06x) |
+| Rust source (`anyhow`), 32K | 302 | 574 (1.90x) |
+| Rust source (`half`), 2.3K | 340 | 632 (1.86x) |
+| Rust source (`half`), 32K | 302 | 455 (1.51x) |
+| A README (`regex`), 2.3K | 340 | 402 (1.18x) |
+| A README (`regex`), 32K | 302 | 372 (1.23x) |
 
 The speedup depends on how predictable the text is: the draft's first token is accepted 88% to 95% of the time on the Rust sources and 71% on the README.
 
