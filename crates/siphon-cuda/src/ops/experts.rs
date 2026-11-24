@@ -56,6 +56,8 @@ const GEMM_PAIRS: usize = 64;
 const QUANTIZED_PAIRS: usize = 128;
 const GEMM_K: usize = 64;
 const GEMM_THREADS: u32 = 256;
+/// Threads per block of `expert_gemm_q8_*`.
+const FP8_GEMM_THREADS: u32 = 256;
 /// `expert_matmul` needs k a multiple of this: two pipeline stages, so that each scale copy is
 /// 4 or 8 aligned bytes.
 const GEMM_K_MULTIPLE: usize = 2 * GEMM_K;
@@ -74,6 +76,10 @@ pub enum ExpertActivations {
     /// NVFP4 or MXFP8 (see [`Experts::quantize_rows`]), and multiplied on the block-scaled
     /// FP4 or FP8 tensor cores. Lowers precision on purpose; decode stays BF16.
     Quantized,
+    /// Quantized to MXFP8 for every expert group (see [`Experts::quantize_rows_fp8`]) and
+    /// multiplied on the block-scaled FP8 tensor cores, the NVFP4 weights with their E4M3
+    /// scales applied exactly. Lowers precision on purpose; decode stays BF16.
+    Fp8,
 }
 
 impl FromStr for ExpertActivations {
@@ -83,7 +89,8 @@ impl FromStr for ExpertActivations {
         match s {
             "bf16" => Ok(Self::Bf16),
             "quantized" => Ok(Self::Quantized),
-            _ => bail!("unknown expert activations {s:?}; expected bf16 or quantized"),
+            "fp8" => Ok(Self::Fp8),
+            _ => bail!("unknown expert activations {s:?}; expected bf16, quantized or fp8"),
         }
     }
 }
@@ -93,6 +100,7 @@ impl fmt::Display for ExpertActivations {
         f.write_str(match self {
             Self::Bf16 => "bf16",
             Self::Quantized => "quantized",
+            Self::Fp8 => "fp8",
         })
     }
 }
@@ -145,6 +153,14 @@ impl ExpertFormat<'_> {
     fn quantized_shared_bytes() -> usize {
         let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
         2 * rows * 64 + 2 * rows * 16
+    }
+
+    /// Dynamic shared memory of an `expert_gemm_q8_*` block, `kQ8Shared` in
+    /// `kernels/expert_matmul.cu`: 3 stages of 32 bytes per weight row and 64 per pair, the
+    /// same scale slots, then the decode table of 176 entries of 16 bytes.
+    fn fp8_shared_bytes() -> usize {
+        let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
+        3 * (GEMM_COLUMNS * 32 + QUANTIZED_PAIRS * 64) + 2 * rows * 16 + 176 * 16
     }
 
     /// Dynamic shared memory of an `expert_gemm_*` block: per pipeline stage, the weight bytes
@@ -240,10 +256,13 @@ impl ExpertWeights<'_> {
     }
 }
 
-/// Activations quantized by [`Experts::quantize_rows`] for the quantized expert products.
+/// Activations quantized by [`Experts::quantize_rows`] or [`Experts::quantize_rows_fp8`] for
+/// the quantized expert products.
 ///
 /// NVFP4 rows hold k / 2 bytes of E2M1 pairs (low nibble first), k / 16 E4M3 block scales
-/// and one F32 outer scale; MXFP8 rows k E4M3 bytes and k / 32 UE8M0 block scales.
+/// and one F32 outer scale; MXFP8 rows k E4M3 bytes and k / 32 UE8M0 block scales. The MXFP8
+/// rows that `quantize_rows_fp8` writes for NVFP4 weights store each block of 32 values in
+/// the order the FP8 kernel loads them.
 #[derive(Debug)]
 pub struct QuantizedRows {
     values: CudaSlice<u8>,
@@ -258,8 +277,30 @@ pub struct QuantizedRows {
 struct Quantized {
     rows: usize,
     k: usize,
-    format: usize,
+    format: RowFormat,
     stream: usize,
+}
+
+/// The format of quantized rows: one per `quantize_rows_*` kernel, in [`Experts::quantize`]'s
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowFormat {
+    Nvfp4 = 0,
+    Mxfp8 = 1,
+    /// MXFP8 in the order of `expert_gemm_q8_*`, for NVFP4 weights.
+    Fp8Paired = 2,
+}
+
+impl RowFormat {
+    /// The row format of the quantized products of `weights`: their checkpoint format, or
+    /// with `fp8` MXFP8, paired for NVFP4 weights.
+    fn of(weights: ExpertFormat<'_>, fp8: bool) -> Self {
+        match (weights, fp8) {
+            (ExpertFormat::Nvfp4 { .. }, false) => Self::Nvfp4,
+            (ExpertFormat::Nvfp4 { .. }, true) => Self::Fp8Paired,
+            (ExpertFormat::Mxfp8, _) => Self::Mxfp8,
+        }
+    }
 }
 
 impl QuantizedRows {
@@ -372,8 +413,13 @@ pub struct Experts {
     gemm: [[CudaFunction; 2]; 2],
     /// The same for `expert_gemm_q_*`, the products with quantized activations.
     gemm_q: [[CudaFunction; 2]; 2],
-    /// `quantize_rows_*` for NVFP4 and MXFP8.
-    quantize: [CudaFunction; 2],
+    /// `expert_gemm_q8_nvfp4`, plain and with the SwiGLU epilogue: NVFP4 weights with FP8
+    /// activations.
+    gemm_q8: [CudaFunction; 2],
+    /// `quantize_rows_*` for NVFP4, MXFP8 and paired MXFP8, in [`RowFormat`] order.
+    quantize: [CudaFunction; 3],
+    /// `nvfp4_scale_spread`.
+    scale_spread: CudaFunction,
 }
 
 /// The input of an `expert_gemm_*` kernel.
@@ -391,8 +437,10 @@ impl GemmInput<'_, '_> {
                 let contents = xq
                     .contents
                     .context("the quantized products need inputs from quantize_rows")?;
+                let suits = contents.format == RowFormat::of(weights.format, false)
+                    || contents.format == RowFormat::of(weights.format, true);
                 ensure!(
-                    contents.k == weights.k && contents.format == weights.format.index(),
+                    contents.k == weights.k && suits,
                     "the inputs were quantized for k = {} or another format than the weights' \
                      k = {}",
                     contents.k,
@@ -454,6 +502,16 @@ impl Experts {
                 shared,
             )?;
         }
+        let gemm_q8 = [
+            matmul.load_function("expert_gemm_q8_nvfp4")?,
+            matmul.load_function("expert_gemm_q8_nvfp4_swiglu")?,
+        ];
+        for function in &gemm_q8 {
+            function.set_attribute(
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(ExpertFormat::fp8_shared_bytes())?,
+            )?;
+        }
         let mlp = [
             module.load_function("expert_mlp_nvfp4")?,
             module.load_function("expert_mlp_mxfp8")?,
@@ -471,10 +529,13 @@ impl Experts {
             group: matmul.load_function("expert_group")?,
             gemm,
             gemm_q,
+            gemm_q8,
             quantize: [
                 matmul.load_function("quantize_rows_nvfp4")?,
                 matmul.load_function("quantize_rows_mxfp8")?,
+                matmul.load_function("quantize_rows_fp8")?,
             ],
+            scale_spread: matmul.load_function("nvfp4_scale_spread")?,
         })
     }
 
@@ -864,6 +925,67 @@ impl Experts {
         format: ExpertFormat<'_>,
         out: &mut QuantizedRows,
     ) -> anyhow::Result<()> {
+        self.quantize(stream, x, k, RowFormat::of(format, false), out)
+    }
+
+    /// Quantizes each row of `x` (BF16 `[rows, k]`) to MXFP8 into `out` for the products
+    /// with FP8 activations on weights of `format`: E4M3 values with a UE8M0 scale per 32, as
+    /// [`Self::quantize_rows`] does for MXFP8 weights. For NVFP4 weights each block of 32
+    /// values is stored in the order `expert_gemm_q8_*` loads it. k must be a multiple of
+    /// 128.
+    pub fn quantize_rows_fp8(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        k: usize,
+        format: ExpertFormat<'_>,
+        out: &mut QuantizedRows,
+    ) -> anyhow::Result<()> {
+        self.quantize(stream, x, k, RowFormat::of(format, true), out)
+    }
+
+    /// Counts the NVFP4 group scales in `scales` (E4M3 bytes, two per 32 weights) for which
+    /// the products with FP8 activations would not be exact. They split each weight in two
+    /// E4M3 values under one power-of-two scale per 32 weights, which is exact while the
+    /// block's two scales are within a factor of 2^10 (`kernels/expert_matmul.cu` gives the
+    /// exact rule). Waits for the GPU.
+    pub fn fp8_inexact_scales(
+        &self,
+        stream: &Arc<CudaStream>,
+        scales: &CudaSlice<u8>,
+    ) -> anyhow::Result<u32> {
+        ensure!(
+            scales.len().is_multiple_of(2),
+            "{} scale bytes, not whole blocks of two",
+            scales.len()
+        );
+        let mut bad = stream.alloc_zeros::<u32>(1)?;
+        let count = scales.len() / 2;
+        if count > 0 {
+            let count_arg = u64::try_from(count)?;
+            let mut launch = stream.launch_builder(&self.scale_spread);
+            launch.arg(scales).arg(&count_arg).arg(&mut bad);
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from(count.div_ceil(256).min(4096))?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the arguments match `nvfp4_scale_spread(const uint16_t*, size_t,
+            // unsigned*)`; `scales` holds `count` pairs of bytes, which the kernel reads as
+            // 16-bit values (device allocations are aligned), and `bad` one value.
+            unsafe { launch.launch(config) }?;
+        }
+        Ok(stream.clone_dtoh(&bad)?[0])
+    }
+
+    fn quantize(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        k: usize,
+        format: RowFormat,
+        out: &mut QuantizedRows,
+    ) -> anyhow::Result<()> {
         let x = x.view();
         ensure!(
             k > 0 && k.is_multiple_of(GEMM_K_MULTIPLE),
@@ -885,7 +1007,7 @@ impl Experts {
         if rows > 0 {
             let rows_arg = i32::try_from(rows).context("too many rows")?;
             let k_arg = i32::try_from(k).context("k is too large")?;
-            let mut launch = stream.launch_builder(&self.quantize[format.index()]);
+            let mut launch = stream.launch_builder(&self.quantize[format as usize]);
             launch
                 .arg(&x)
                 .arg(&rows_arg)
@@ -907,17 +1029,18 @@ impl Experts {
         out.contents = Some(Quantized {
             rows,
             k,
-            format: format.index(),
+            format,
             stream: stream_id(stream),
         });
         Ok(())
     }
 
-    /// [`Self::expert_matmul_grouped`] with inputs quantized by [`Self::quantize_rows`]:
-    /// multiplies the E2M1 or E4M3 inputs with the raw weights on the block-scaled FP4 or FP8
-    /// tensor cores, sums in F32, and rounds to BF16. `xq` must hold the grouping's rows (one
-    /// input per row) or 8 times as many (one per pair), of the weights' k and format, queued
-    /// on this stream. The grouping must come from [`Self::expert_group_quantized`].
+    /// [`Self::expert_matmul_grouped`] with inputs quantized by [`Self::quantize_rows`] or
+    /// [`Self::quantize_rows_fp8`]: multiplies the E2M1 or E4M3 inputs with the raw weights
+    /// on the block-scaled FP4 or FP8 tensor cores, sums in F32, and rounds to BF16. `xq` must
+    /// hold the grouping's rows (one input per row) or 8 times as many (one per pair), of the
+    /// weights' k and format, queued on this stream. The grouping must come from
+    /// [`Self::expert_group_quantized`].
     pub fn expert_matmul_quantized_grouped(
         &self,
         stream: &CudaStream,
@@ -1031,16 +1154,7 @@ impl Experts {
         let pairs = rows * SLOTS;
         let n_arg = i32::try_from(n).context("n is too large")?;
         let k_arg = i32::try_from(k).context("k is too large")?;
-        let (function, shared) = match *input {
-            GemmInput::Bf16(_) => (
-                &self.gemm[format.index()][swiglu],
-                format.gemm_shared_bytes(),
-            ),
-            GemmInput::Quantized(_) => (
-                &self.gemm_q[format.index()][swiglu],
-                ExpertFormat::quantized_shared_bytes(),
-            ),
-        };
+        let (function, shared, threads) = self.gemm_function(input, format, swiglu);
         let null: u64 = 0;
         // One more row of blocks than tiles: the row at the tile count writes the NaN rows.
         let config = LaunchConfig {
@@ -1049,7 +1163,7 @@ impl Experts {
                 u32::try_from(max_tiles(pairs, experts) + 1)?,
                 1,
             ),
-            block_dim: (GEMM_THREADS, 1, 1),
+            block_dim: (threads, 1, 1),
             shared_mem_bytes: u32::try_from(shared)?,
         };
         let mut launch = stream.launch_builder(function);
@@ -1074,8 +1188,9 @@ impl Experts {
             .arg(&up_softcap);
         // SAFETY: the arguments match `expert_gemm_*(const bf16*, const u8*, const u8*,
         // const float*, bf16*, const int*, const int4*, const int*, int, int, int, float,
-        // float)`, or for quantized inputs `expert_gemm_q_*(const u8*, const u8*,
-        // const float*, ...)` with the same remaining parameters. `quantize_rows` wrote
+        // float)`, or for quantized inputs `expert_gemm_q_*` and `expert_gemm_q8_*(const u8*,
+        // const u8*, const float*, ...)` with the same remaining parameters; the paired rows
+        // go only to `expert_gemm_q8_nvfp4*`, with NVFP4 weights, as `len` checked. `quantize_rows` wrote
         // `x_len / k` rows of k values of the weights' format into `xq`, so its values,
         // scales and outer scales cover every input row. The `_swiglu` kernels write n / 2
         // values per pair, which `out` holds.
@@ -1088,6 +1203,37 @@ impl Experts {
         // reads `global_scale`, which then holds `experts` values.
         unsafe { launch.launch(config) }?;
         Ok(())
+    }
+    /// The `expert_gemm_*` kernel for `input` and weights of `format`, plain (`swiglu` 0) or
+    /// with the SwiGLU epilogue (1), with its dynamic shared memory and threads per block.
+    fn gemm_function(
+        &self,
+        input: &GemmInput<'_, '_>,
+        format: ExpertFormat<'_>,
+        swiglu: usize,
+    ) -> (&CudaFunction, usize, u32) {
+        match *input {
+            GemmInput::Bf16(_) => (
+                &self.gemm[format.index()][swiglu],
+                format.gemm_shared_bytes(),
+                GEMM_THREADS,
+            ),
+            GemmInput::Quantized(xq) => {
+                if xq.contents.map(|c| c.format) == Some(RowFormat::Fp8Paired) {
+                    (
+                        &self.gemm_q8[swiglu],
+                        ExpertFormat::fp8_shared_bytes(),
+                        FP8_GEMM_THREADS,
+                    )
+                } else {
+                    (
+                        &self.gemm_q[format.index()][swiglu],
+                        ExpertFormat::quantized_shared_bytes(),
+                        GEMM_THREADS,
+                    )
+                }
+            }
+        }
     }
 }
 

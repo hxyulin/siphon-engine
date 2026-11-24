@@ -289,7 +289,9 @@ impl Planner {
         let prefill = if inputs.prefill_chunk == 0 {
             0
         } else {
-            rows_scratch(c, inputs.prefill_chunk) + inputs.prefill_chunk * taps * hidden * 2
+            rows_scratch(c, inputs.prefill_chunk)
+                + inputs.prefill_chunk * taps * hidden * 2
+                + dense_scratch(c, inputs.prefill_chunk)
         };
         let (verify, draft_bytes, draft_kv_per_position) = match &draft {
             None => (0, 0, 0),
@@ -523,6 +525,14 @@ fn rows_scratch(c: &TextConfig, rows: usize) -> usize {
         + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2)
         + HEAD_ROWS * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
     per_rows + fixed
+}
+
+/// The MXFP8 inputs of a prefill chunk's FP8 dense products (`GateRows::dense`): three
+/// inputs of `2 * hidden` values per row and a scale byte per 32 values. Invariant chunks
+/// allocate none.
+fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
+    let values = rows * 3 * 2 * c.hidden_size;
+    values + values / 32
 }
 
 /// What `PrefillScratch::new` adds for an invariant chunk, the verify pass: every looped

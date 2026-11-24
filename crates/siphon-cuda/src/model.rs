@@ -20,7 +20,9 @@ mod prefix;
 mod verify;
 
 pub use batch::BATCH_ROWS;
-pub use prefill::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits};
+pub use prefill::{
+    DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits,
+};
 pub use prefix::LocalState;
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
@@ -38,6 +40,7 @@ use siphon::TextConfig;
 use crate::{
     DeviceIn, Gpu,
     ops::{
+        Products,
         attention::{
             self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat,
             MIN_SPLIT_SLOTS, ONE_TILE_SPLIT_SLOTS,
@@ -47,7 +50,7 @@ use crate::{
         experts::{self, ExpertActivations, Experts, MoeEnd},
         experts_rows::ExpertsRows,
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
-        linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
+        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8},
         linear_rows::{self, LinearRows, RowsProduct},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, Misc},
         norm::{KvConvWeights, Norm},
@@ -349,6 +352,10 @@ struct Ctx {
     stream: Arc<CudaStream>,
     /// How prefill's expert products take their activations.
     expert_activations: ExpertActivations,
+    /// How prefill's global attention multiplies over an FP8 cache.
+    prefill_attention: Products,
+    /// How prefill's dense products multiply.
+    prefill_dense: Products,
 }
 
 impl std::fmt::Debug for Model {
@@ -480,6 +487,8 @@ impl Model {
                 kernels,
                 stream,
                 expert_activations: ExpertActivations::Bf16,
+                prefill_attention: DEFAULT_PREFILL_ATTENTION,
+                prefill_dense: Products::Bf16,
             },
             passes,
             visits,
@@ -579,8 +588,50 @@ impl Model {
     /// Starts a new sequence: zeroes every KV cache and conv state and moves to position 0.
     /// Makes [`Model::prefill`] run its expert products with `activations`. Decode always
     /// takes BF16 activations.
-    pub fn set_expert_activations(&mut self, activations: ExpertActivations) {
+    ///
+    /// [`ExpertActivations::Fp8`] first checks that the NVFP4 weight scales allow the FP8
+    /// products' exact split (see [`Experts::fp8_inexact_scales`]), and fails otherwise.
+    pub fn set_expert_activations(&mut self, activations: ExpertActivations) -> anyhow::Result<()> {
+        if activations == ExpertActivations::Fp8 {
+            for (layer, w) in self.ctx.weights.layers.iter().enumerate() {
+                if matches!(w.experts.format, ExpertFormat::Nvfp4 { .. }) {
+                    for scales in [&w.experts.w13_scale, &w.experts.w2_scale] {
+                        let bad = self
+                            .ctx
+                            .kernels
+                            .experts
+                            .fp8_inexact_scales(&self.ctx.stream, scales)?;
+                        ensure!(
+                            bad == 0,
+                            "layer {layer}: {bad} NVFP4 scales are too far from their block's \
+                             other scale for the FP8 expert products"
+                        );
+                    }
+                }
+            }
+        }
         self.ctx.expert_activations = activations;
+        Ok(())
+    }
+
+    /// Makes [`Model::prefill`] run attention over an FP8 cache with `products`
+    /// ([`DEFAULT_PREFILL_ATTENTION`] until set). Decode and BF16 caches are unaffected.
+    pub fn set_prefill_attention(&mut self, products: Products) {
+        self.ctx.prefill_attention = products;
+    }
+
+    /// Makes [`Model::prefill`] run its dense products with `products`: with
+    /// [`Products::Fp8`], the attention input projections and the message gates' down
+    /// projections run on FP8 tensor cores with MXFP8 inputs (the output projection stays
+    /// BF16). It reads the FP8 weight copies, so it needs a model loaded with
+    /// [`WeightFormat::Fp8`]; decode and verify are unaffected.
+    pub fn set_prefill_dense(&mut self, products: Products) -> anyhow::Result<()> {
+        ensure!(
+            products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
+            "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"
+        );
+        self.ctx.prefill_dense = products;
+        Ok(())
     }
 
     pub fn reset(&mut self) -> anyhow::Result<()> {
@@ -1875,11 +1926,15 @@ impl Ctx {
     /// `invariant`. With `invariant`, `m` is at most 8 and the multi-row products of
     /// [`LinearRows`] run: each row's result is the same, bit for bit, for every `m` and
     /// whatever the other rows hold, and the FP8 copies stream when every product has one.
+    ///
+    /// With [`Products::Fp8`] and `dense` scratch, more than one row, and an FP8 copy of
+    /// every weight, it runs [`LinearFp8::gemm`] instead: the inputs round to MXFP8.
     fn gemm_rows(
         &self,
         products: &mut [RowProduct<'_>],
         m: usize,
         invariant: bool,
+        dense: Option<&mut Fp8Rows>,
     ) -> anyhow::Result<()> {
         ensure!(m > 0, "no rows");
         for (i, p) in products.iter().enumerate() {
@@ -1909,6 +1964,26 @@ impl Ctx {
                 .linear_rows
                 .run(&self.stream, &mut rows, m, Start::Early);
         }
+        if let Some(scratch) = dense
+            && self.prefill_dense == Products::Fp8
+            && m > 1
+            && products.iter().all(|p| p.fp8.is_some())
+        {
+            let mut gemms: Vec<Fp8Gemm<'_>> = products
+                .iter_mut()
+                .filter_map(|p| {
+                    Some(Fp8Gemm {
+                        weight: p.fp8?,
+                        x: p.x.slice(..),
+                        out: p.out.slice_mut(..),
+                    })
+                })
+                .collect();
+            return self
+                .kernels
+                .linear_fp8
+                .gemm(&self.stream, &mut gemms, m, scratch);
+        }
         let mut gemms: Vec<Gemm<'_, bf16>> = products
             .iter_mut()
             .map(|p| Gemm::new(p.weight, &p.x, &mut p.out))
@@ -1930,7 +2005,7 @@ impl Ctx {
         let n = self.config.n_routed_experts;
         match self.expert_activations {
             ExpertActivations::Bf16 => experts.expert_group(&self.stream, indices, n, scratch),
-            ExpertActivations::Quantized => {
+            ExpertActivations::Quantized | ExpertActivations::Fp8 => {
                 experts.expert_group_quantized(&self.stream, indices, n, scratch)
             }
         }
@@ -1945,8 +2020,8 @@ impl Ctx {
     ///
     /// Runs [`Experts::expert_matmul_grouped`] or [`Experts::expert_matmul_swiglu_grouped`],
     /// which multiply each expert's pairs as one matrix product so each expert's weights are
-    /// read once per call. With [`ExpertActivations::Quantized`], it first quantizes `x` into
-    /// `quantized` and runs the quantized forms instead.
+    /// read once per call. With [`ExpertActivations::Quantized`] or [`ExpertActivations::Fp8`],
+    /// it first quantizes `x` into `quantized` and runs the quantized forms instead.
     fn moe_rows(
         &self,
         x: &CudaView<'_, bf16>,
@@ -1965,8 +2040,12 @@ impl Ctx {
             (ExpertActivations::Bf16, false) => {
                 experts.expert_matmul_grouped(stream, x, weights, out, scratch)
             }
-            (ExpertActivations::Quantized, _) => {
-                experts.quantize_rows(stream, x, weights.k, weights.format, quantized)?;
+            (activations @ (ExpertActivations::Quantized | ExpertActivations::Fp8), _) => {
+                if activations == ExpertActivations::Fp8 {
+                    experts.quantize_rows_fp8(stream, x, weights.k, weights.format, quantized)?;
+                } else {
+                    experts.quantize_rows(stream, x, weights.k, weights.format, quantized)?;
+                }
                 if swiglu {
                     experts.expert_matmul_quantized_swiglu_grouped(
                         stream, quantized, weights, out, scratch, caps.0, caps.1,
@@ -2016,6 +2095,7 @@ impl Ctx {
             sinks,
             scratch,
             out,
+            self.prefill_attention,
         )
     }
 

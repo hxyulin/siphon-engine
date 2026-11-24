@@ -16,7 +16,7 @@ use siphon_cuda::{
     Gpu,
     ops::{
         linear::{Gemv, Linear, Start},
-        linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
+        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8},
     },
 };
 
@@ -202,6 +202,129 @@ fn check_batch(
         }
     }
     Ok((worst, err2, ref2))
+}
+
+/// `x` rows of k values as the FP8 GEMM quantizes them, dequantized: MXFP8 blocks of 32
+/// with a UE8M0 scale, the block's amax / 448 rounded up to a power of two.
+fn mxfp8_rows(x: &[bf16]) -> Vec<f64> {
+    x.chunks(32)
+        .flat_map(|block| {
+            let amax = block.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+            let raw = amax * (1.0 / 448.0);
+            let mut exponent = ((raw.to_bits() + 0x007f_ffff) & 0x7f80_0000) >> 23;
+            if raw <= f32::from_bits(1 << 23) / 2.0 {
+                exponent = 0;
+            }
+            let exponent = exponent.min(254);
+            let inverse = if exponent == 0 {
+                2f32.powi(127)
+            } else {
+                1.0 / f32::from_bits(exponent << 23)
+            };
+            let scale = 2f64.powi(i32::try_from(exponent).expect("small") - 127);
+            block.iter().map(move |v| {
+                let q = (v.to_f32() * inverse).clamp(-448.0, 448.0);
+                f64::from(e4m3_value(e4m3_from_f32(q))) * scale
+            })
+        })
+        .collect()
+}
+
+/// The FP8 GEMM against the F64 reference over the quantized weights and inputs: batches of
+/// products that share an input and that do not, partial row and column tiles, and k of
+/// the attention inputs, the output projection and the message gates.
+#[test]
+fn gemm_matches_reference() -> anyhow::Result<()> {
+    // (m, k, [(n, input)]): products with the same input index share x.
+    type Case = (usize, usize, &'static [(usize, usize)]);
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let fp8 = LinearFp8::load(gpu.context())?;
+    let mut scratch = Fp8Rows::new(stream, 3 * 2048 * 4608)?;
+    let u = f64::from(f32::EPSILON) / 2.0;
+    let cases: &[Case] = &[
+        (
+            300,
+            2304,
+            &[(3072, 0), (24, 0), (1024, 1), (32, 1), (384, 2)],
+        ),
+        (2048, 3072, &[(2304, 0)]),
+        (77, 4608, &[(64, 0), (64, 1), (64, 2)]),
+        (2, 2304, &[(130, 0)]),
+    ];
+    for (case, &(m, k, products)) in cases.iter().enumerate() {
+        let inputs: Vec<Vec<bf16>> = (0..3)
+            .map(|i| hash_values(100 + 10 * case as u32 + i, m * k))
+            .collect();
+        let quantized: Vec<Vec<f64>> = inputs.iter().map(|x| mxfp8_rows(x)).collect();
+        let x_dev = inputs
+            .iter()
+            .map(|x| stream.clone_htod(x))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mats = products
+            .iter()
+            .enumerate()
+            .map(|(i, &(n, _))| {
+                let w = hash_values(7 + 31 * case as u32 + i as u32, n * k);
+                fp8.quantize_any(stream, &stream.clone_htod(&w)?, n, k)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut outs = products
+            .iter()
+            .map(|&(n, _)| stream.alloc_zeros::<bf16>(m * n))
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let mut gemms: Vec<Fp8Gemm<'_>> = mats
+                .iter()
+                .zip(products)
+                .zip(outs.iter_mut())
+                .map(|((weight, &(_, input)), out)| Fp8Gemm {
+                    weight,
+                    x: x_dev[input].slice(..),
+                    out: out.slice_mut(..),
+                })
+                .collect();
+            fp8.gemm(stream, &mut gemms, m, &mut scratch)?;
+        }
+        let mut worst = 0.0f64;
+        for (i, ((mat, &(n, input)), out)) in mats.iter().zip(products).zip(&outs).enumerate() {
+            let (bytes, scales) = read_back(&gpu, mat)?;
+            let got = stream.clone_dtoh(out)?;
+            let x = &quantized[input];
+            // Every row of the small cases; both ends and every 61st row of the large one.
+            let rows: Vec<usize> = (0..m)
+                .filter(|&r| m <= 300 || r % 61 == 0 || r + 2 >= m || r < 2)
+                .collect();
+            for r in rows {
+                for c in 0..n {
+                    let (sum, abs) = bytes[c * k..(c + 1) * k]
+                        .iter()
+                        .zip(&x[r * k..(r + 1) * k])
+                        .fold((0.0, 0.0), |(sum, abs), (&q, &xv)| {
+                            let p = f64::from(e4m3_value(q)) * xv;
+                            (sum + p, abs + p.abs())
+                        });
+                    let s = f64::from(scales[c]);
+                    let want = s * sum;
+                    // F32 sums in any order (Higham's gamma for k terms), the scale's
+                    // rounding and the output's half BF16 ulp.
+                    let ku = k as f64 * u;
+                    let bound = s * ku / (1.0 - ku) * abs + want.abs() * u;
+                    let allowed = bound + bf16_half_ulp(want + bound.copysign(want));
+                    let err = (got[r * n + c].to_f64() - want).abs();
+                    assert!(
+                        err <= allowed,
+                        "case {case} product {i} row {r} column {c}: got {}, want {want}, \
+                         error {err:e} > {allowed:e}",
+                        got[r * n + c]
+                    );
+                    worst = worst.max(err / allowed);
+                }
+            }
+        }
+        eprintln!("gemm case {case} ({m} x {k}): worst error {worst:.3} of bound");
+    }
+    Ok(())
 }
 
 #[test]

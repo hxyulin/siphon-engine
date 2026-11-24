@@ -6,6 +6,7 @@
 //! smallm experts <model-dir> <routing-capture>
 //! smallm attention
 //! smallm verify <model-dir> <capture> --width M [--passes N] [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1]
+//!     [--prefill-attention bf16|fp8]
 //! ```
 //!
 //! `prefill` runs real text through `Model::prefill` in chunks of a few rows, for kernel
@@ -32,7 +33,8 @@
 //! `verify` prefills the capture's text but its last 512 tokens, then runs `--passes`
 //! verify passes of `--width` rows over them, keeping every row, for kernel traces of the
 //! verify pass. `--hash 1` prints a hash of every pass's logits, to compare two builds bit
-//! for bit.
+//! for bit. `--prefill-attention` picks the prompt prefill's attention products (FP8 by
+//! default), which shape the cache the passes read.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -54,7 +56,7 @@ mod linux {
     use siphon::{Checkpoint, TextConfig};
     use siphon_cuda::{
         Gpu,
-        model::{Accept, Model, PrefillLogits, VerifyTokens},
+        model::{Accept, DEFAULT_PREFILL_ATTENTION, Model, PrefillLogits, VerifyTokens},
         ops::attention::KvFormat,
         weights::{WeightFormat, Weights},
     };
@@ -136,11 +138,13 @@ mod linux {
     fn verify() -> anyhow::Result<()> {
         let mut it = env::args().skip(2);
         let usage = "usage: smallm verify <model-dir> <capture> --width M [--passes N] \
-                     [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1]";
+                     [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1] \
+                     [--prefill-attention bf16|fp8]";
         let model_dir = PathBuf::from(it.next().context(usage)?);
         let capture = PathBuf::from(it.next().context(usage)?);
         let (mut width, mut passes, mut weights, mut kv, mut hash) =
             (4usize, 20usize, WeightFormat::Bf16, KvFormat::Bf16, false);
+        let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         while let Some(flag) = it.next() {
             let value = it.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
@@ -149,6 +153,7 @@ mod linux {
                 "--weights" => weights = value.parse()?,
                 "--kv" => kv = value.parse()?,
                 "--hash" => hash = value == "1",
+                "--prefill-attention" => prefill_attention = value.parse()?,
                 _ => anyhow::bail!("unknown flag {flag}; {usage}"),
             }
         }
@@ -165,6 +170,7 @@ mod linux {
         let w = Weights::load(&checkpoint, &config, gpu.stream())?;
         let mut model =
             Model::with_formats(&gpu, config, w, passes_cfg, text.len() + 16, kv, weights)?;
+        model.set_prefill_attention(prefill_attention);
         model.prefill(prompt, 2048, PrefillLogits::Last)?;
         // FNV-1a over the bits of every pass's logits.
         let mut fnv = 0xcbf2_9ce4_8422_2325_u64;

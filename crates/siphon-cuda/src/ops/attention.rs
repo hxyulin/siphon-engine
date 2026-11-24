@@ -36,6 +36,7 @@ use half::bf16;
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
     ops::{
+        Products,
         norm::KvConvWeights,
         spec::{BATCH_STATE_WORDS, BatchRows},
     },
@@ -391,6 +392,8 @@ pub struct Attention {
     decode_step_fp8: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
+    /// `prefill_attention_fp8_mma`, for [`Products::Fp8`].
+    prefill_fp8_mma: CudaFunction,
     /// `attention_rows_bf16_<NT>` and `attention_rows_fp8_<NT>` for NT = 1 to 3.
     rows: Vec<[CudaFunction; 2]>,
     /// `attention_batch_bf16` and `attention_batch_fp8`.
@@ -448,7 +451,8 @@ impl Attention {
         };
         let prefill = module.load_function("prefill_attention_bf16")?;
         let prefill_fp8 = module.load_function("prefill_attention_fp8")?;
-        for function in [&prefill, &prefill_fp8] {
+        let prefill_fp8_mma = module.load_function("prefill_attention_fp8_mma")?;
+        for function in [&prefill, &prefill_fp8, &prefill_fp8_mma] {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 PREFILL_SHARED_BYTES.cast_signed(),
@@ -467,6 +471,7 @@ impl Attention {
             decode_step_fp8: module.load_function("decode_step_fp8")?,
             prefill,
             prefill_fp8,
+            prefill_fp8_mma,
             rows: (1..=ROWS_QUERY_TILES)
                 .map(|nt| {
                     Ok([
@@ -1058,6 +1063,10 @@ impl Attention {
     ///
     /// A single row runs [`Attention::append`] and [`Attention::decode_attention`].
     ///
+    /// With [`Products::Fp8`], an FP8 cache's products run on the FP8 tensor cores
+    /// (`prefill_attention_fp8_mma`): the queries and the softmax weights round to E4M3. A
+    /// BF16 cache ignores it.
+    ///
     /// `rows` is 1 to `scratch`'s row count. The caller checks [`KvCache::holds`] for
     /// position `start + rows - 1`, and `extent` must be a multiple of 8.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
@@ -1074,6 +1083,7 @@ impl Attention {
         sinks: &impl DeviceIn<bf16>,
         scratch: &mut PrefillScratch,
         out: &mut impl DeviceOut<bf16>,
+        products: Products,
     ) -> anyhow::Result<()> {
         let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
         let mut out = out.view_mut();
@@ -1121,9 +1131,10 @@ impl Attention {
             self.append_rows(stream, cache, start, rows, &k, &v)?;
         }
 
-        let function = match cache.data {
-            KvData::Bf16 { .. } => &self.prefill,
-            KvData::Fp8 { .. } => &self.prefill_fp8,
+        let function = match (&cache.data, products) {
+            (KvData::Bf16 { .. }, _) => &self.prefill,
+            (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
+            (KvData::Fp8 { .. }, Products::Fp8) => &self.prefill_fp8_mma,
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&q).arg(&k).arg(&v);
@@ -1153,7 +1164,8 @@ impl Attention {
         // const bf16* v_in, const bf16* k_cache, const bf16* v_cache, const bf16* bias, const
         // bf16* sinks, float* partials, unsigned* counters, bf16* out, const unsigned* start,
         // unsigned rows, unsigned slots, unsigned window, unsigned extent, unsigned
-        // input_keys, float scale)`, or `prefill_attention_fp8` with `uint8_t*` caches. The
+        // input_keys, float scale)`, or `prefill_attention_fp8` and
+        // `prefill_attention_fp8_mma` with `uint8_t*` caches. The
         // checks above size `q`, `k`, `v`, `bias`, `sinks` and `out` for `rows` rows. The
         // kernel reads input rows below `rows`, cache slots below `slots` and bias columns
         // below `extent`. Its `scratch.blocks`

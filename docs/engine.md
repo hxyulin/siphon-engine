@@ -18,7 +18,9 @@ cd reference/fixtures && uv run --project .. python <group>.py
 - `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
 - `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
 
-The small kernels have multi-row forms. Most give the single-row results bit for bit; depth attention, the router logits and the message gates' products sum in their own orders and differ by F32 rounding. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, with the softcapped SwiGLU in the `w13` product's epilogue, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024, 433 and 2048. At 2048 the whole prompt is one chunk wider than the sliding window. It needs the checkpoint and about 20 GB of GPU memory, so it is ignored by default:
+With an FP8 cache, global attention runs on FP8 tensor cores by default, and the expert and dense products can too; [Prefill on FP8 tensor cores](#prefill-on-fp8-tensor-cores) has the options.
+
+The small kernels have multi-row forms. Most give the single-row results bit for bit; depth attention, the router logits and the message gates' products sum in their own orders and differ by F32 rounding. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, with the softcapped SwiGLU in the `w13` product's epilogue, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024, 433 and 2048. At 2048 the whole prompt is one chunk wider than the sliding window. `fp8_prefill_matches_stepping` repeats it with the FP8 cache and weights and every FP8 prefill product on. The tests need the checkpoint and about 20 GB of GPU memory, so they are ignored by default:
 
 ```sh
 SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test prefill -- --ignored --nocapture
@@ -555,7 +557,7 @@ The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RM
 Decode reads 3.62 GB of BF16 dense weights per token: every visit's attention input and output projections, the looped layers' message gates (113 MB), and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
 
 - `bf16`, the default, reads the checkpoint's weights.
-- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights, since its GEMMs are compute-bound. The copies take 1.14 GB of device memory: one per layer, since the looped layers' three visits share theirs.
+- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights unless `--prefill-dense fp8` (see [Prefill on FP8 tensor cores](#dense-products)). The copies take 1.14 GB of device memory: one per layer, since the looped layers' three visits share theirs.
 
 The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
 
@@ -580,7 +582,7 @@ The trace marks the end of each step with a 4-byte device-to-host copy, the samp
 
 ## Expert activation format
 
-Prefill's expert products take `--expert-activations bf16|quantized` in `bench` and `eval`, and `Model::set_expert_activations` takes the same choice. Decode always takes BF16 activations.
+Prefill's expert products take `--expert-activations bf16|quantized|fp8` in `bench` and `eval`, and `Model::set_expert_activations` takes the same choice. Decode always takes BF16 activations. This section covers `quantized`; [Prefill on FP8 tensor cores](#expert-products) covers `fp8`.
 
 - `bf16`, the default, decodes the NVFP4 and MXFP8 weights exactly to BF16 and multiplies them with the BF16 activations, as MLX does.
 - `quantized` quantizes each expert input row as the checkpoint's `hf_quant_config.json` declares (`required_activation_quantization`) and multiplies the raw weights on the block-scaled tensor cores (`mma.sync ... kind::mxf4nvf4.block_scale` and `kind::mxf8f6f4.block_scale`).
@@ -611,6 +613,72 @@ Prefill in chunks of 2048 with the BF16 cache, against the F32 captures of `anyh
 | `quantized` | 3.3e-3, 2.1e-3, 3.3e-3 | 0.038, 0.048, 0.051 | 98.3%, 97.5%, 97.6% |
 
 The NVFP4 activations cause the difference: quantizing only the MXFP8 layers stays close to the `bf16` numbers (0.024, 0.027, 0.028), and quantizing only the NVFP4 layers gives all of it, about half from each projection. Always taking the scale that maps each block's maximum to 6 is worse on all three texts (0.039, 0.051, 0.053). Perplexity stays within 0.3% of the F32 captures'. The greedy continuation still matches all 32 tokens after `anyhow` and `half`, and 12 after `regex-readme` against 26 with `bf16`. The mean |log-prob difference| exceeds the gate's 0.045 on some position ranges, so `eval` fails with `quantized` on 6 of the 7 captures tried.
+
+## Prefill on FP8 tensor cores
+
+Three prefill options run products on the block-scaled FP8 MMA (`mma.sync ... kind::mxf8f6f4.block_scale`, m16n8k32). With F32 accumulators it runs at 1,015 TFLOP/s on the RTX 5090, against 254 for BF16; without block scales the same MMA runs at 509. Each option rounds activations to E4M3, so each went through the quality gate. Decode never uses them. `bench` and `eval` take the flags, and the `Model` setters take the same choices:
+
+| Option | Flag | Setter | Default |
+| --- | --- | --- | --- |
+| Global attention | `--prefill-attention bf16\|fp8` | `Model::set_prefill_attention` | `fp8`, with an FP8 cache |
+| Expert activations | `--expert-activations fp8` | `Model::set_expert_activations` | off |
+| Dense products | `--prefill-dense bf16\|fp8` | `Model::set_prefill_dense` | off |
+
+Time to first token with the FP8 cache and weights, chunks of 2048, from `bench --prefill`. Each column ran alternating with the build before these options, twice, in one GPU lock hold per length:
+
+| Prompt | Before | FP8 attention (default) | FP8 expert activations | FP8 dense products | All three |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 506 ms | 497 ms | 457 ms | 468 ms | 410 ms |
+| 32,768 | 2.23 s | 2.09 s | 2.04 s | 2.09 s | 1.75 s |
+| 92,160 | 7.69 s | 6.55 s | 7.15 s | 7.28 s | 5.61 s |
+| 131,072 | 12.32 s | 10.03 s | 11.53 s | 11.71 s | 8.70 s |
+
+The expert and dense columns have the other options off. The expert column ran in holds of its own, where the build before took 506 ms, 2.23 s, 7.67 s and 12.25 s. At 92,160 tokens with all three, nsys gives FP8 attention 1.00 s (2.14 s before), the NVFP4 expert products 2.43 s (2.88 s), and the dense products 0.45 s on FP8 plus 0.39 s for the output projection, which stays BF16 (1.29 s).
+
+The quality gate with the FP8 cache and weights, prefill in chunks of 2048, against MLX's chunked captures of `anyhow`, `regex-readme` and `half`: mean KL at the sampled positions, mean |log-prob difference| over all positions, and that of the worst position range (limits 4e-3 and 0.045):
+
+| Prefill products | Mean KL | \|log-prob difference\| | Worst range | Verdict |
+| --- | --- | --- | --- | --- |
+| BF16 (before) | 1.9e-3, 1.4e-3, 8.7e-4 | 0.026, 0.032, 0.030 | 0.029, 0.035, 0.032 | pass |
+| FP8 attention (default) | 2.0e-3, 1.5e-3, 7.3e-4 | 0.027, 0.032, 0.031 | 0.030, 0.035, 0.033 | pass |
+| FP8 expert activations | 2.0e-3, 1.7e-3, 1.0e-3 | 0.028, 0.038, 0.036 | 0.033, 0.042, 0.037 | pass |
+| FP8 dense products | 3.5e-3, 1.4e-3, 1.4e-3 | 0.032, 0.037, 0.040 | 0.038, 0.039, 0.042 | pass |
+| FP8 attention and expert activations | 3.2e-3, 1.8e-3, 9.3e-4 | 0.028, 0.038, 0.034 | 0.034, 0.041, 0.036 | fails `half`: perplexity ratio 5.2e-3, limit 5e-3 |
+| All three | 2.8e-3, 2.3e-3, 1.6e-3 | 0.034, 0.042, 0.041 | 0.044, 0.046, 0.043 | fails `regex-readme`: worst range 0.046 |
+
+Each option passes alone. Attention is the default: it saves the most time at long prompts and adds the least error. The expert activations fail together with it, so they stay opt-in, as do the dense products.
+
+### Global attention
+
+`prefill_attention_fp8_mma` runs both products of a global layer's FP8 cache on the FP8 MMA, with the scheduling of `prefill_attention_fp8`:
+
+- S = Q K^T: a segment quantizes its queries to MXFP8 when it loads them: per row and 32 dims, a UE8M0 scale (the block's amax / 448 rounded up to a power of two) and E4M3 values. The scales go into the MMA. The keys are the cache's bytes, read with ldmatrix from the staged tile.
+- O += P V: the softmax weights carry a factor of 2^8 instead of 2^15, so the largest is 256, and round to E4M3. A pass over each staged value tile transposes it to [dim][key] for the B operand. Within each block of 32 keys the MMA's k positions hold the keys in the order a lane holds them in the S fragments, so the weights pack into A registers without shuffles, and the transpose writes the values in the same order.
+
+The online softmax and its sums stay F32. Against an F64 reference with the same quantized queries, `tests/attention.rs` allows 1/14 of each output's magnitude for the weights' rounding; the largest error seen is 5.4%. The kernel uses 255 registers and one block per SM, as before. Sliding layers keep BF16 caches and the BF16 kernel.
+
+### Expert products
+
+`fp8` quantizes every expert input to MXFP8. The MXFP8 experts (layers 20 to 23) then run `expert_gemm_q_mxfp8`, the kernel of `quantized`. The NVFP4 experts (layers 0 to 19) need more: their weights carry an E4M3 scale per 16 values, while the FP8 MMA takes one UE8M0 scale per 32. An E2M1 value times an E4M3 scale has up to 6 significant bits, more than E4M3's 4, so no single E4M3 operand holds a scaled weight.
+
+`expert_gemm_q8_nvfp4` splits each weight w into two E4M3 values under one power of two per row and 32 values: w = 2^e (hi + lo / 16), with 2^e the larger of the block's two scale exponents over 32, hi the top 4 significant bits and lo the rest. Each k step of 32 runs one MMA on hi with A scale 2^e and one on lo with A scale 2^(e - 4), both accumulating in F32. Every product is exact. The split depends only on the E2M1 magnitude, the scale's significand and the exponent gap to the block's larger scale, so each CTA builds a 2.8 KB table of hi and lo bytes and decodes with `prmt` lookups. It is exact while the two scales of a block are within 2^10; the checkpoint's widest gap is 2^5, and `Model::set_expert_activations` checks every scale (`nvfp4_scale_spread`) before it enables `fp8`. Each of 8 warps takes 16 output columns and all 128 pairs of a tile, so each weight is decoded once.
+
+Per call at 2048-row chunks (`bench_expert_activations` in `tests/experts.rs`, uniform routing, quantization included):
+
+| Projection | `bf16` | `quantized` | `fp8` |
+| --- | ---: | ---: | ---: |
+| NVFP4 `w13` with SwiGLU | 906 us | 350 us | 737 us |
+| NVFP4 `w2` | 467 us | 209 us | 447 us |
+| MXFP8 `w13` with SwiGLU | 933 us | 570 us | 570 us |
+| MXFP8 `w2` | 479 us | 326 us | 341 us |
+
+The NVFP4 `fp8` kernel issues twice the MMAs of an exact single-pass one and keeps the tensor pipe about 60% busy; ncu puts most stalls on barriers, MMA throttling and shared-memory loads. Two other designs ran slower: one MMA per 16-value group with a fresh accumulator and four F32 FMAs to apply the scale (807 us for NVFP4 `w13`), and the hi/lo split decoded with F16 arithmetic in each warp (818 to 929 us).
+
+### Dense products
+
+`--prefill-dense fp8` runs the attention input projections and the message gates' down projections with `gemm_fp8_128x128` on the FP8 weight copies of `--weights fp8` (E4M3 with one F32 scale per row). Each distinct input is quantized once per call to MXFP8 into a scratch buffer of the prefill chunk (29 MB at 2048 rows, which the memory planner counts). The inputs' UE8M0 scales go into the MMA; the weight row's scale multiplies each F32 sum before it rounds to BF16. `tests/linear_fp8.rs` checks the products against an F64 reference over the quantized inputs and weights.
+
+The output projection stays BF16. Alone on `regex-readme`, its FP8 product raised the worst range's |log-prob difference| from 0.035 to 0.043; all the input projections together raised it to 0.038, and the message gates not at all. With it, the dense products failed the gate there (0.050).
 
 ## References
 

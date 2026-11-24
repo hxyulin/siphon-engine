@@ -3,14 +3,17 @@
 //! usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] [--steps N]
 //!        [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 //!        bench <model-dir> --prefill 512,4096,32768 [--chunk N] [--passes N]
-//!        [--kv bf16|fp8] [--expert-activations bf16|quantized] [--json]
+//!        [--kv bf16|fp8] [--weights bf16|fp8] [--expert-activations bf16|quantized|fp8]
+//!        [--prefill-attention bf16|fp8] [--prefill-dense bf16|fp8] [--json]
 //!
 //! With `--prefill`, each prompt length runs once through `Model::prefill` in chunks of
 //! `--chunk` rows from an empty cache, after one warmup chunk, and the time to the first
 //! token is the time `prefill` takes to return the greedy next token. The prompt tokens
 //! are arbitrary ids, so expert routing differs from real text. `--expert-activations
 //! quantized` runs prefill's expert products on quantized activations (see
-//! `ExpertActivations`).
+//! `ExpertActivations`). `--prefill-attention fp8` runs global attention over an FP8
+//! cache on FP8 tensor cores, and `--prefill-dense fp8` the dense products on the FP8
+//! weight copies (with `--weights fp8`).
 //!
 //! For each context length the runner skips its caches to that length without computing
 //! the skipped tokens, runs `--warmup` steps, then times `--steps` steps. The tokens it
@@ -93,10 +96,10 @@ mod linux {
         Gpu,
         draft::DraftOptions,
         model::{
-            Accept, BATCH_ROWS, DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits,
-            VerifyTokens,
+            Accept, BATCH_ROWS, DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK,
+            MAX_PREFILL_CHUNK, Model, PrefillLogits, VerifyTokens,
         },
-        ops::{attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
+        ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
         weights::{WeightFormat, Weights},
     };
@@ -115,7 +118,9 @@ mod linux {
                          [--steps N] [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--json]\n       \
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
-                         [--kv bf16|fp8] [--json]";
+                         [--kv bf16|fp8] [--weights bf16|fp8] \
+                         [--expert-activations bf16|quantized|fp8] \
+                         [--prefill-attention bf16|fp8] [--prefill-dense bf16|fp8] [--json]";
 
     #[expect(clippy::struct_excessive_bools, reason = "command-line flags")]
     struct Args {
@@ -127,6 +132,8 @@ mod linux {
         kv: KvFormat,
         weights: WeightFormat,
         expert_activations: ExpertActivations,
+        prefill_attention: Products,
+        prefill_dense: Products,
         json: bool,
         /// Prompt lengths to time prefill at, instead of timing decode.
         prefill: Option<Vec<usize>>,
@@ -170,6 +177,8 @@ mod linux {
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
         let mut expert_activations = ExpertActivations::Bf16;
+        let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
+        let mut prefill_dense = Products::Bf16;
         let mut json = false;
         let mut prefill = None;
         let mut chunk = DEFAULT_PREFILL_CHUNK;
@@ -197,6 +206,8 @@ mod linux {
                 "--kv" => kv = value()?.parse()?,
                 "--weights" => weights = value()?.parse()?,
                 "--expert-activations" => expert_activations = value()?.parse()?,
+                "--prefill-attention" => prefill_attention = value()?.parse()?,
+                "--prefill-dense" => prefill_dense = value()?.parse()?,
                 "--json" => json = true,
                 "--prompt" => prompt = Some(PathBuf::from(value()?)),
                 "--spec" => {
@@ -237,6 +248,8 @@ mod linux {
             kv,
             weights,
             expert_activations,
+            prefill_attention,
+            prefill_dense,
             json,
             prefill,
             chunk,
@@ -367,18 +380,40 @@ mod linux {
     }
 
     /// Times `Model::prefill` at each length in `lengths`.
+    /// Loads the model for `bench_prefill` with the formats and prefill products of `args`.
+    fn prefill_model(
+        args: &Args,
+        gpu: &Gpu,
+        config: TextConfig,
+        passes: usize,
+        capacity: usize,
+    ) -> anyhow::Result<Model> {
+        eprintln!("loading weights");
+        let checkpoint = Checkpoint::open(&args.model)?;
+        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut model = Model::with_formats(
+            gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            args.kv,
+            args.weights,
+        )?;
+        model.set_expert_activations(args.expert_activations)?;
+        model.set_prefill_attention(args.prefill_attention);
+        model.set_prefill_dense(args.prefill_dense)?;
+        Ok(model)
+    }
+
     fn bench_prefill(args: &Args, lengths: &[usize]) -> anyhow::Result<()> {
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let vocab = u32::try_from(config.unpadded_vocab_size)?;
         let gpu = Gpu::new(0)?;
         let before = gpu_state()?;
-        eprintln!("loading weights");
-        let checkpoint = Checkpoint::open(&args.model)?;
-        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         let longest = lengths.iter().copied().max().unwrap_or(0).max(args.chunk);
-        let mut model = Model::with_kv_format(&gpu, config, weights, passes, longest, args.kv)?;
-        model.set_expert_activations(args.expert_activations);
+        let mut model = prefill_model(args, &gpu, config, passes, longest)?;
         // Arbitrary ids spread over the vocabulary.
         let prompt: Vec<u32> = (0..longest as u32)
             .map(|i| (i.wrapping_mul(7919) + 13) % vocab)
@@ -423,14 +458,16 @@ mod linux {
                 .collect();
             println!(
                 "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"processes_before_load\":[{}],\
-                 \"passes\":{passes},\"kv\":{},\"expert_activations\":{},\"chunk\":{},\
-                 \"rows\":[{}]}}",
+                 \"passes\":{passes},\"kv\":{},\"expert_activations\":{},\
+                 \"prefill_attention\":{},\"prefill_dense\":{},\"chunk\":{},\"rows\":[{}]}}",
                 quote(&before.timestamp),
                 quote(&before.name),
                 quote(&before.driver),
                 processes.join(","),
                 quote(&args.kv.to_string()),
                 quote(&args.expert_activations.to_string()),
+                quote(&args.prefill_attention.to_string()),
+                quote(&args.prefill_dense.to_string()),
                 args.chunk,
                 rows.join(","),
             );

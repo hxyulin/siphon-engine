@@ -1700,16 +1700,59 @@ fn dequantize(row: &QuantizedRow, k: usize, fp4: bool) -> Vec<f64> {
         .collect()
 }
 
+/// `quantize_rows_fp8` for NVFP4 weights writes the MXFP8 rows of `quantize_rows`, each block
+/// of 32 values in the paired order: word w holds values 8t + 4h.. for (h, t) = (w / 4, w % 4).
+#[test]
+fn quantize_rows_fp8_pairs_mxfp8() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let dummy = s.stream().clone_htod(&[1f32])?;
+    let nvfp4 = ExpertFormat::Nvfp4 {
+        global_scale: &dummy,
+    };
+    let mut out = QuantizedRows::new(s.stream(), 300 * HIDDEN, 300)?;
+    for (k, rows) in [(HIDDEN, 300), (INTERMEDIATE, 77)] {
+        let x = quantizer_inputs(rows, k, 3 + u32::try_from(k).expect("small"));
+        let (plain, plain_scales, _) = gpu_quantize(&s, &x, k, ExpertFormat::Mxfp8, &mut out)?;
+        let x_gpu = s.stream().clone_htod(&x)?;
+        s.experts
+            .quantize_rows_fp8(s.stream(), &x_gpu, k, nvfp4, &mut out)?;
+        let paired = s.stream().clone_dtoh(&out.values().slice(..rows * k))?;
+        let scales = s
+            .stream()
+            .clone_dtoh(&out.scales().slice(..rows * k / 32))?;
+        assert_eq!(scales, plain_scales, "k {k}: scales");
+        for (b, (got, want)) in paired.chunks(32).zip(plain.chunks(32)).enumerate() {
+            for w in 0..8 {
+                let (h, t) = (w / 4, w % 4);
+                let from = 8 * t + 4 * h;
+                assert_eq!(
+                    got[4 * w..4 * w + 4],
+                    want[from..from + 4],
+                    "k {k} block {b} word {w}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `expert_matmul_quantized_grouped` against the F64 reference on the dequantized inputs,
-/// with every output written and two runs equal.
-fn check_quantized(fp4: bool) -> anyhow::Result<()> {
+/// with every output written and two runs equal. With `fp8`, the inputs are MXFP8 for both
+/// weight formats (`quantize_rows_fp8`).
+fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
     let table = e4m3_table();
     let mut scratch = ExpertScratch::new(stream, 2048, EXPERTS)?;
     let mut xq = QuantizedRows::new(stream, 2048 * SLOTS * INTERMEDIATE, 2048 * SLOTS)?;
     let n = 320;
-    let label = if fp4 { "nvfp4" } else { "mxfp8" };
+    let label = match (fp4, fp8) {
+        (true, false) => "nvfp4",
+        (true, true) => "nvfp4 with fp8 inputs",
+        (false, _) => "mxfp8",
+    };
+    // FP4 inputs only for NVFP4 weights without `fp8`.
+    let fp4_inputs = fp4 && !fp8;
     for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
         let projection = Synthetic::new(&s, fp4, n, k, 11 + k as u32)?;
         let host = projection.host();
@@ -1723,18 +1766,23 @@ fn check_quantized(fp4: bool) -> anyhow::Result<()> {
             let indices = routing(rows, kind, rows as u32 * 7 + 1);
             let x = common::pseudo_random_bf16(rows * inputs_per_row * k, rows as u32, 2.0, 0.0);
             let x_gpu = stream.clone_htod(&x)?;
-            s.experts
-                .quantize_rows(stream, &x_gpu, k, weights.format, &mut xq)?;
+            if fp8 {
+                s.experts
+                    .quantize_rows_fp8(stream, &x_gpu, k, weights.format, &mut xq)?;
+            } else {
+                s.experts
+                    .quantize_rows(stream, &x_gpu, k, weights.format, &mut xq)?;
+            }
             let x64: Vec<f64> = x
                 .chunks(k)
                 .flat_map(|row| {
                     let row: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
-                    let q = if fp4 {
+                    let q = if fp4_inputs {
                         quantize_nvfp4(&table, &row)
                     } else {
                         quantize_mxfp8(&table, &row)
                     };
-                    dequantize(&q, k, fp4)
+                    dequantize(&q, k, fp4_inputs)
                 })
                 .collect();
             let indices_gpu = stream.clone_htod(&indices)?;
@@ -1767,12 +1815,104 @@ fn check_quantized(fp4: bool) -> anyhow::Result<()> {
 
 #[test]
 fn matmul_quantized_nvfp4_matches_reference() -> anyhow::Result<()> {
-    check_quantized(true)
+    check_quantized(true, false)
 }
 
 #[test]
 fn matmul_quantized_mxfp8_matches_reference() -> anyhow::Result<()> {
-    check_quantized(false)
+    check_quantized(false, false)
+}
+
+#[test]
+fn matmul_fp8_nvfp4_matches_reference() -> anyhow::Result<()> {
+    check_quantized(true, true)
+}
+
+/// The host model of `nvfp4_scale_spread`'s rule: whether `expert_gemm_q8_*` multiplies a
+/// block with scale bytes `a` and `b` exactly.
+fn fp8_exact_block(a: u8, b: u8) -> bool {
+    let field = |s: u8| u32::from((s & 0x7f) >> 3).max(1);
+    let top = field(a).max(field(b));
+    [a, b].iter().all(|&s| {
+        let s = s & 0x7f;
+        let m = u32::from(s & 7) | if s >= 8 { 8 } else { 0 };
+        let gap = top - field(s);
+        m == 0 || (gap <= 10 && (m << 7) >= (1 << gap))
+    })
+}
+
+/// The FP8 NVFP4 products stay exact at the edge of their range: block scales up to 2^10
+/// apart, subnormal and zero scales; and `fp8_inexact_scales` counts the scales beyond it.
+#[test]
+fn matmul_fp8_nvfp4_exact_at_wide_scale_gaps() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let table = e4m3_table();
+    let (n, k, rows) = (320, HIDDEN, 512);
+    let mut projection = Synthetic::new(&s, true, n, k, 77)?;
+    let mut random = SplitMix(5);
+    for block in projection.scales.chunks_mut(2) {
+        let pair = loop {
+            let top = 11 + u8::try_from(random.below(5)).expect("small");
+            let gap = u8::try_from(random.below(11)).expect("small");
+            let larger = (top << 3) | (random.byte() % 8);
+            let smaller = match random.below(8) {
+                0 => 0,
+                1 => random.byte() % 8,
+                _ => ((top - gap).max(1) << 3) | (random.byte() % 8),
+            };
+            if larger != 0x7f && fp8_exact_block(larger, smaller) {
+                break if random.below(2) == 0 {
+                    [larger, smaller]
+                } else {
+                    [smaller, larger]
+                };
+            }
+        };
+        block.copy_from_slice(&pair);
+    }
+    projection.gpu.scales = stream.clone_htod(&projection.scales)?;
+    assert_eq!(
+        s.experts
+            .fp8_inexact_scales(stream, &projection.gpu.scales)?,
+        0
+    );
+    let host = projection.host();
+    let weights = projection.gpu.weights();
+    let mut scratch = ExpertScratch::new(stream, rows, EXPERTS)?;
+    let mut xq = QuantizedRows::new(stream, rows * k, rows)?;
+    let indices = routing(rows, Routing::Uniform, 3);
+    let x = common::pseudo_random_bf16(rows * k, 8, 2.0, 0.0);
+    s.experts
+        .quantize_rows_fp8(stream, &stream.clone_htod(&x)?, k, weights.format, &mut xq)?;
+    let x64: Vec<f64> = x
+        .chunks(k)
+        .flat_map(|row| {
+            let row: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
+            dequantize(&quantize_mxfp8(&table, &row), k, false)
+        })
+        .collect();
+    s.experts.expert_group_quantized(
+        stream,
+        &stream.clone_htod(&indices)?,
+        EXPERTS,
+        &mut scratch,
+    )?;
+    let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * n)?;
+    s.experts
+        .expert_matmul_quantized_grouped(stream, &xq, &weights, &mut out, &scratch)?;
+    let got = stream.clone_dtoh(&out)?;
+    let worst = check_reference("fp8 wide scale gaps", &host, &x64, &indices, 1, &got);
+    eprintln!("fp8 wide scale gaps: worst error {worst:.3} of bound");
+    // A gap of 11 is one too many.
+    projection.scales[..2].copy_from_slice(&[12 << 3, 1 << 3]);
+    projection.gpu.scales = stream.clone_htod(&projection.scales)?;
+    assert_eq!(
+        s.experts
+            .fp8_inexact_scales(stream, &projection.gpu.scales)?,
+        1
+    );
+    Ok(())
 }
 
 /// `expert_matmul_quantized_swiglu_grouped` equals `expert_matmul_quantized_grouped`
@@ -1792,11 +1932,16 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
     let x = stream.clone_htod(&common::pseudo_random_bf16(rows * HIDDEN, 9, 4.0, 0.0))?;
     s.experts
         .expert_group_quantized(stream, &indices, EXPERTS, &mut scratch)?;
-    for fp4 in [true, false] {
+    for (fp4, fp8) in [(true, false), (false, false), (true, true)] {
         let w13 = Synthetic::new(&s, fp4, 2 * INTERMEDIATE, HIDDEN, 43)?;
         let weights = w13.gpu.weights();
-        s.experts
-            .quantize_rows(stream, &x, HIDDEN, weights.format, &mut xq)?;
+        if fp8 {
+            s.experts
+                .quantize_rows_fp8(stream, &x, HIDDEN, weights.format, &mut xq)?;
+        } else {
+            s.experts
+                .quantize_rows(stream, &x, HIDDEN, weights.format, &mut xq)?;
+        }
         let mut gate_up = stream.alloc_zeros::<bf16>(pairs * 2 * INTERMEDIATE)?;
         s.experts
             .expert_matmul_quantized_grouped(stream, &xq, &weights, &mut gate_up, &scratch)?;
@@ -1818,12 +1963,86 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
             .zip(&want)
             .filter(|(a, b)| a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()))
             .count();
-        assert_eq!(differing, 0, "fp4 {fp4}: fused and separate SwiGLU differ");
+        assert_eq!(
+            differing, 0,
+            "fp4 {fp4} fp8 {fp8}: fused and separate SwiGLU differ"
+        );
         assert!(
             got[9 * INTERMEDIATE..10 * INTERMEDIATE]
                 .iter()
                 .all(|v| v.is_nan())
         );
+    }
+    Ok(())
+}
+
+/// Times one 2048-row chunk's expert products with each activation format: BF16, quantized
+/// (NVFP4 or MXFP8 inputs) and FP8 (MXFP8 inputs), each with its quantization.
+#[test]
+#[ignore = "benchmark; run alone on an idle GPU with --nocapture"]
+fn bench_expert_activations() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let rows = 2048;
+    let mut scratch = ExpertScratch::new(stream, rows, EXPERTS)?;
+    let mut xq = QuantizedRows::new(stream, rows * SLOTS * INTERMEDIATE, rows * SLOTS)?;
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let indices = stream.clone_htod(&routing(rows, Routing::Uniform, 11))?;
+    println!("| format | projection | bf16 (us) | quantized (us) | fp8 (us) |");
+    println!("| --- | --- | ---: | ---: | ---: |");
+    for fp4 in [true, false] {
+        for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
+            let projection = Synthetic::new(&s, fp4, HIDDEN, k, 3)?;
+            let weights = projection.gpu.weights();
+            let x = stream.clone_htod(&common::pseudo_random_bf16(
+                rows * inputs_per_row * k,
+                1,
+                1.0,
+                0.0,
+            ))?;
+            let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * HIDDEN)?;
+            let mut time = |mode: usize| -> anyhow::Result<f64> {
+                if mode == 0 {
+                    s.experts
+                        .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
+                } else {
+                    s.experts
+                        .expert_group_quantized(stream, &indices, EXPERTS, &mut scratch)?;
+                }
+                let mut call = |out: &mut CudaSlice<bf16>| -> anyhow::Result<()> {
+                    if mode == 0 {
+                        return s
+                            .experts
+                            .expert_matmul_grouped(stream, &x, &weights, out, &scratch);
+                    }
+                    if mode == 1 {
+                        s.experts
+                            .quantize_rows(stream, &x, k, weights.format, &mut xq)?;
+                    } else {
+                        s.experts
+                            .quantize_rows_fp8(stream, &x, k, weights.format, &mut xq)?;
+                    }
+                    s.experts
+                        .expert_matmul_quantized_grouped(stream, &xq, &weights, out, &scratch)
+                };
+                let mut best = f64::INFINITY;
+                for repeat in 0..8 {
+                    let start = stream.record_event(timing)?;
+                    for _ in 0..20 {
+                        call(&mut out)?;
+                    }
+                    let end = stream.record_event(timing)?;
+                    end.synchronize()?;
+                    if repeat > 1 {
+                        best = best.min(f64::from(start.elapsed_ms(&end)?) * 1000.0 / 20.0);
+                    }
+                }
+                Ok(best)
+            };
+            let format = if fp4 { "NVFP4" } else { "MXFP8" };
+            let (bf16_us, quantized_us, fp8_us) = (time(0)?, time(1)?, time(2)?);
+            println!("| {format} | {name} | {bf16_us:.1} | {quantized_us:.1} | {fp8_us:.1} |");
+        }
     }
     Ok(())
 }

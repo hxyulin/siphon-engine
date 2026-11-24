@@ -26,6 +26,7 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 
+#include "mxfp8.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -250,5 +251,285 @@ quantize_e4m3_rows(const __nv_bfloat16* __restrict__ w, int k, uint8_t* __restri
     for (int i = threadIdx.x; i < k; i += kThreads) {
         const float v = s > 0.f ? __bfloat162float(src[i]) / s : 0.f;
         dst[i] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Matrix products `out = x @ W^T` on FP8 tensor cores, for prefill (opt-in): W is an FP8
+// matrix in the layout above, x is [m, k] BF16 quantized by `quantize_rows_mxfp8_dense`
+// to MXFP8 (E4M3 values, a UE8M0 scale per 32, see mxfp8.cuh), out is [m, n] BF16.
+//
+// Each product of 32 values runs on the block-scaled FP8 MMA (`kind::mxf8f6f4`, m16n8k32,
+// F32 accumulators) with the input's scales as A scales and B scales 1, so the sums are
+// exact products of the E4M3 values in F32; the weight row's F32 scale multiplies each
+// sum once before it rounds to BF16, as the FP8 GEMV does.
+//
+// One launch runs up to kMaxProducts products that share m and k. A block of 8 warps
+// computes one 128 x 128 tile of one product, m fastest so that blocks sharing a weight
+// tile run together; each warp 64 rows by 32 columns. A stage holds 128 values of each
+// of the tile's x and W rows and the x rows' 4 scales, in 3 stages, with rows XOR-swizzled
+// in 16-byte chunks so that ldmatrix reads are free of bank conflicts. Rows past m and n
+// load as zeros, and stores past them are skipped.
+
+namespace gemm8 {
+
+constexpr int kMaxProducts = 8;
+constexpr int kBm = 128;
+constexpr int kBn = 128;
+constexpr int kBk = 128;
+constexpr int kWarpsM = 2;
+constexpr int kWarpsN = 4;
+constexpr int kThreads = 32 * kWarpsM * kWarpsN;
+constexpr int kStages = 3;
+constexpr int kWarpRows = kBm / kWarpsM;
+constexpr int kWarpCols = kBn / kWarpsN;
+constexpr int kMi = kWarpRows / 16;
+constexpr int kNi = kWarpCols / 8;
+constexpr int kStageA = kBm * kBk;
+constexpr int kStageB = kBn * kBk;
+constexpr int kStageScales = kBm * 4;
+constexpr int kStage = kStageA + kStageB + kStageScales;
+constexpr int kSmemBytes = kStages * kStage;
+static_assert(kSmemBytes <= 99 * 1024, "one block fits in an SM's shared memory");
+
+struct Product {
+    const uint8_t* w;
+    const float* w_scale;
+    const uint8_t* x;
+    const uint8_t* x_scale;
+    __nv_bfloat16* out;
+    int n;
+    // Tiles of this product and every product before it.
+    int tile_end;
+};
+
+struct Batch {
+    Product p[kMaxProducts];
+    int count;
+    int m;
+    int k;
+};
+
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, bool valid) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src),
+                 "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void cp_async4(uint32_t dst, const void* src, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src),
+                 "r"(valid ? 4 : 0));
+}
+
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// c += a b: the A scales of rows g and g + 8 from byte kByte of lanes 4g and 4g + 1's
+// `scale_a`, B scales 1.
+template <int kByte>
+__device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
+                                    uint32_t b1, uint32_t scale_a) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
+        "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
+        "{%13}, {%12,%12};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
+          "h"(uint16_t(kByte)), "h"(uint16_t(0)), "r"(0x7f7f7f7fu));
+}
+
+// Byte offset of 16-byte chunk `chunk` of row `row` in a [rows, 128] byte tile.
+__device__ __forceinline__ int offset(int row, int chunk) {
+    return row * kBk + ((chunk ^ (row & 7)) << 4);
+}
+
+__device__ void gemm(const Batch& b, uint8_t* smem) {
+    const int block = blockIdx.x;
+    int s = 0;
+    int tile_begin = 0;
+    while (s + 1 < b.count && block >= b.p[s].tile_end) {
+        tile_begin = b.p[s].tile_end;
+        ++s;
+    }
+    const Product& p = b.p[s];
+    const int m = b.m, n = p.n, k = b.k;
+    const int tiles_m = (m + kBm - 1) / kBm;
+    const int tile = block - tile_begin;
+    const int m0 = (tile % tiles_m) * kBm;
+    const int n0 = (tile / tiles_m) * kBn;
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int wn = warp % kWarpsN;
+    const int wm = warp / kWarpsN;
+
+    // Copies: each thread 4 chunks of x rows and 4 of W rows per stage (rows tid / 8 +
+    // 32i, chunk tid % 8), and threads below 128 the 4 scales of x row tid.
+    const int chunk = tid % 8;
+    const uint8_t* a_src[4];
+    const uint8_t* b_src[4];
+    uint32_t dst[4];
+    uint32_t a_live = 0;
+    uint32_t b_live = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = tid / 8 + 32 * i;
+        dst[i] = offset(row, chunk);
+        const bool a_ok = m0 + row < m;
+        const bool b_ok = n0 + row < n;
+        a_live |= uint32_t(a_ok) << i;
+        b_live |= uint32_t(b_ok) << i;
+        a_src[i] = p.x + size_t(a_ok ? m0 + row : 0) * k + chunk * 16;
+        b_src[i] = p.w + size_t(b_ok ? n0 + row : 0) * k + chunk * 16;
+    }
+    const bool scale_ok = tid < kBm && m0 + tid < m;
+    const uint8_t* scale_src = p.x_scale + size_t(scale_ok ? m0 + tid : 0) * (k / 32);
+
+    const uint32_t smem0 = smem_addr(smem);
+    auto load = [&](int stage, int step) {
+        const uint32_t base = smem0 + stage * kStage;
+        const int k0 = step * kBk;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            cp_async16(base + dst[i], a_src[i] + k0, a_live >> i & 1);
+            cp_async16(base + kStageA + dst[i], b_src[i] + k0, b_live >> i & 1);
+        }
+        if (tid < kBm) {
+            cp_async4(base + kStageA + kStageB + 4 * tid, scale_src + step * 4, scale_ok);
+        }
+    };
+
+    // ldmatrix rows of this lane: x rows lane % 16, chunk lane / 16 of each 16-row
+    // fragment; W rows lane % 8 + 8 (lane / 16), chunk lane / 8 % 2 of each pair of
+    // 8-column fragments. Fragment origins are multiples of 8 rows, so the swizzle
+    // depends only on the lane.
+    const int a_row = wm * kWarpRows + lane % 16;
+    const int b_row = wn * kWarpCols + lane % 8 + lane / 16 * 8;
+    // The x row whose scales this lane passes: g (t = 0) or g + 8 (t = 1).
+    const int scale_row = wm * kWarpRows + lane / 4 + 8 * (lane % 2);
+
+    float acc[kMi][kNi][4] = {};
+    const int steps = k / kBk;
+#pragma unroll
+    for (int st = 0; st < kStages - 1; ++st) {
+        if (st < steps) {
+            load(st, st);
+        }
+        cp_async_commit();
+    }
+
+    int stage = 0;
+    for (int step = 0; step < steps; ++step) {
+        cp_async_wait<kStages - 2>();
+        __syncthreads();
+        const int next = step + kStages - 1;
+        if (next < steps) {
+            load((stage + kStages - 1) % kStages, next);
+        }
+        cp_async_commit();
+
+        const uint32_t base = smem0 + stage * kStage;
+        const uint32_t* scales =
+            reinterpret_cast<const uint32_t*>(smem + stage * kStage + kStageA + kStageB);
+        uint32_t sa[kMi];
+#pragma unroll
+        for (int mi = 0; mi < kMi; ++mi) {
+            sa[mi] = scales[scale_row + 16 * mi];
+        }
+        auto k_step = [&]<int kK>() {
+            uint32_t bf[kNi][2];
+#pragma unroll
+            for (int nj = 0; nj < kNi; nj += 2) {
+                uint32_t r[4];
+                ldmatrix_x4(r, base + kStageA + offset(b_row + nj * 8, 2 * kK + lane / 8 % 2));
+                bf[nj][0] = r[0];
+                bf[nj][1] = r[1];
+                bf[nj + 1][0] = r[2];
+                bf[nj + 1][1] = r[3];
+            }
+#pragma unroll
+            for (int mi = 0; mi < kMi; ++mi) {
+                uint32_t af[4];
+                ldmatrix_x4(af, base + offset(a_row + mi * 16, 2 * kK + lane / 16));
+#pragma unroll
+                for (int ni = 0; ni < kNi; ++ni) {
+                    mma<kK>(acc[mi][ni], af, bf[ni][0], bf[ni][1], sa[mi]);
+                }
+            }
+        };
+        k_step.template operator()<0>();
+        k_step.template operator()<1>();
+        k_step.template operator()<2>();
+        k_step.template operator()<3>();
+        stage = stage + 1 == kStages ? 0 : stage + 1;
+    }
+
+    const int g = lane / 4, t = lane % 4;
+#pragma unroll
+    for (int ni = 0; ni < kNi; ++ni) {
+        const int col = n0 + wn * kWarpCols + ni * 8 + 2 * t;
+        if (col >= n) {
+            continue;
+        }
+        const bool second = col + 1 < n;
+        const float s0 = p.w_scale[col];
+        const float s1 = second ? p.w_scale[col + 1] : 0.f;
+#pragma unroll
+        for (int mi = 0; mi < kMi; ++mi)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int row = m0 + wm * kWarpRows + mi * 16 + g + 8 * h;
+                if (row >= m) {
+                    continue;
+                }
+                __nv_bfloat16* dst_row = p.out + size_t(row) * n + col;
+                const float v0 = acc[mi][ni][2 * h] * s0;
+                const float v1 = acc[mi][ni][2 * h + 1] * s1;
+                if (second && n % 2 == 0) {
+                    *reinterpret_cast<__nv_bfloat162*>(dst_row) = __floats2bfloat162_rn(v0, v1);
+                } else {
+                    dst_row[0] = __float2bfloat16_rn(v0);
+                    if (second) {
+                        dst_row[1] = __float2bfloat16_rn(v1);
+                    }
+                }
+            }
+    }
+}
+
+}  // namespace gemm8
+
+// The FP8 GEMM entry point. Grid: one block per 128 x 128 tile of every product; dynamic
+// shared memory gemm8::kSmemBytes (99,840 bytes). k must be a multiple of 128.
+extern "C" __global__ void __launch_bounds__(gemm8::kThreads, 1)
+    gemm_fp8_128x128(const __grid_constant__ gemm8::Batch batch) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm(batch, gemm8_smem);
+}
+
+// Quantizes `rows` BF16 rows of k values (`x`) to MXFP8 for gemm_fp8: E4M3 `values`
+// [rows, k] and UE8M0 `scales` [rows, k / 32]. One warp per row, 8 rows per block of 256
+// threads; k must be a multiple of 32.
+extern "C" __global__ void __launch_bounds__(256)
+    quantize_rows_mxfp8_dense(const __nv_bfloat16* __restrict__ x, int rows, int k,
+                              uint8_t* __restrict__ values, uint8_t* __restrict__ scales) {
+    const int row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row < rows) {
+        quantize_row_mxfp8<false>(x + size_t(row) * k, k, values + size_t(row) * k,
+                                  scales + size_t(row) * (k / 32));
     }
 }

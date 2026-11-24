@@ -3,7 +3,8 @@
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
 //!        [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
-//!        [--expert-activations bf16|quantized]
+//!        [--expert-activations bf16|quantized|fp8] [--prefill-attention bf16|fp8]
+//!        [--prefill-dense bf16|fp8]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -16,9 +17,12 @@
 //! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
 //! the BF16 weights.
 //! `--expert-activations quantized` runs prefill's expert products on quantized
-//! activations (see `ExpertActivations`); stepping stays BF16. With `--verify`, the text
-//! runs through `Model::verify` in passes of WIDTH rows (1 to 8), each keeping every row,
-//! as speculative decoding verifies the anchor and drafts.
+//! activations (see `ExpertActivations`); stepping stays BF16. `--prefill-attention`
+//! picks prefill's global attention products over an FP8 cache (FP8 tensor cores by
+//! default), and `--prefill-dense fp8` runs its dense products on the FP8 weight copies
+//! (with `--weights fp8`). With `--verify`, the text runs through `Model::verify` in passes
+//! of WIDTH rows (1 to 8), each keeping every row, as speculative decoding verifies the
+//! anchor and drafts.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -40,8 +44,11 @@ mod linux {
     use siphon::{Checkpoint, TextConfig};
     use siphon_cuda::{
         Gpu,
-        model::{Accept, MAX_PREFILL_CHUNK, Model, PrefillLogits, VerifyTokens},
-        ops::{attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
+        model::{
+            Accept, DEFAULT_PREFILL_ATTENTION, MAX_PREFILL_CHUNK, Model, PrefillLogits,
+            VerifyTokens,
+        },
+        ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         weights::{WeightFormat, Weights},
     };
 
@@ -74,6 +81,8 @@ mod linux {
         /// Rows per `Model::verify` pass, instead of stepping or prefill.
         verify: Option<usize>,
         expert_activations: ExpertActivations,
+        prefill_attention: Products,
+        prefill_dense: Products,
     }
 
     fn args() -> anyhow::Result<Args> {
@@ -84,6 +93,8 @@ mod linux {
         let mut prefill = None;
         let mut verify = None;
         let mut expert_activations = ExpertActivations::Bf16;
+        let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
+        let mut prefill_dense = Products::Bf16;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if arg == "--passes" {
@@ -95,7 +106,17 @@ mod linux {
             } else if arg == "--expert-activations" {
                 expert_activations = it
                     .next()
-                    .context("--expert-activations needs bf16 or quantized")?
+                    .context("--expert-activations needs bf16, quantized or fp8")?
+                    .parse()?;
+            } else if arg == "--prefill-attention" {
+                prefill_attention = it
+                    .next()
+                    .context("--prefill-attention needs bf16 or fp8")?
+                    .parse()?;
+            } else if arg == "--prefill-dense" {
+                prefill_dense = it
+                    .next()
+                    .context("--prefill-dense needs bf16 or fp8")?
                     .parse()?;
             } else if arg == "--prefill" {
                 let chunk: usize = it.next().context("--prefill needs a chunk size")?.parse()?;
@@ -118,7 +139,8 @@ mod linux {
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
              [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH] \
-             [--expert-activations bf16|quantized]",
+             [--expert-activations bf16|quantized|fp8] [--prefill-attention bf16|fp8] \
+             [--prefill-dense bf16|fp8]",
         )?;
         ensure!(
             prefill.is_none() || verify.is_none(),
@@ -133,6 +155,8 @@ mod linux {
             prefill,
             verify,
             expert_activations,
+            prefill_attention,
+            prefill_dense,
         })
     }
 
@@ -366,7 +390,9 @@ mod linux {
             args.kv,
             args.weights,
         )?;
-        model.set_expert_activations(args.expert_activations);
+        model.set_expert_activations(args.expert_activations)?;
+        model.set_prefill_attention(args.prefill_attention);
+        model.set_prefill_dense(args.prefill_dense)?;
 
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)
@@ -448,8 +474,9 @@ mod linux {
 
         let engine_mode = match (args.prefill, args.verify) {
             (Some(chunk), _) => format!(
-                "prefill in chunks of {chunk}, {} expert activations",
-                args.expert_activations
+                "prefill in chunks of {chunk}, {} expert activations, {} attention and {} dense \
+                 products",
+                args.expert_activations, args.prefill_attention, args.prefill_dense
             ),
             (None, Some(width)) => format!(
                 "verify passes of {width} rows, {} expert activations",

@@ -29,6 +29,7 @@ use half::bf16;
 use siphon_cuda::{
     Gpu,
     ops::{
+        Products,
         attention::{
             Attention, AttentionScratch, DecodeStep, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData,
             KvFormat, MAX_PREFILL_ROWS, MIN_SPLIT_SLOTS, PrefillScratch, REL_DIM,
@@ -76,6 +77,7 @@ impl Setup {
 }
 
 /// One query's inputs: `q` `[24, 128]`, `bias` `[24, EXTENT]` and `sinks` `[24]`.
+#[derive(Clone)]
 struct Query {
     q: Vec<bf16>,
     bias: Vec<bf16>,
@@ -159,6 +161,13 @@ const PREFILL_P_ERROR: f64 = 1.0 / 2048.0;
 /// Absolute error allowed for prefill attention: BF16 values below 2^-14 lose bits when
 /// they convert to F16, at most 2^-25 each, and the weights sum to at most 1.
 const PREFILL_V_ERROR: f64 = 1.0 / 33_554_432.0;
+/// Error of the FP8 product prefill attention per unit of magnitude, against a reference
+/// with the same MXFP8 queries ([`mxfp8_queries`]): the softmax weights round to E4M3,
+/// relative error up to 2^-4.
+const PREFILL_FP8_ERROR: f64 = 1.0 / 14.0;
+/// Absolute error of the FP8 product prefill attention: weights below 2^-17 of a row's
+/// largest flush to zero in E4M3, and the values are at most about 8.
+const PREFILL_FP8_V_ERROR: f64 = 8.0 / 131_072.0;
 
 /// How far one comparison came from its tolerance.
 #[derive(Clone, Copy, Debug, Default)]
@@ -286,6 +295,23 @@ fn stored(format: KvFormat, x: bf16) -> f32 {
         KvFormat::Bf16 => x.to_f32(),
         KvFormat::Fp8 => e4m3_value(e4m3_from_f32(x.to_f32())),
     }
+}
+
+/// The queries `[heads, 128]` as the FP8 product prefill attention quantizes them: MXFP8
+/// per head and 32 dims, a UE8M0 scale of the block's amax / 448 rounded up (at least
+/// 2^-126) and E4M3 values rounded to nearest even. Exact in BF16.
+fn mxfp8_queries(q: &[bf16]) -> Vec<bf16> {
+    q.chunks(32)
+        .flat_map(|block| {
+            let amax = block.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
+            let raw = amax / 448.0;
+            let exponent = ((raw.to_bits() + 0x007f_ffff) & 0x7f80_0000) >> 23;
+            let scale = f32::from_bits(exponent.max(1) << 23);
+            block
+                .iter()
+                .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() / scale)) * scale))
+        })
+        .collect()
 }
 
 /// Prints how far `got` is from `want`, the reference on the unquantized cache: the RMS error
@@ -1064,15 +1090,33 @@ fn assert_same_cache(stream: &Arc<CudaStream>, a: &KvCache, b: &KvCache) -> anyh
 /// append plus decode attention, row by row, on another made the same way. Checks the
 /// prefill rows against the F64 reference, against decode, and the two caches' contents
 /// after every chunk compared with decode.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one pass over the chunks keeps the two caches in step"
-)]
 fn check_prefill(
     make_cache: impl Fn(&Arc<CudaStream>) -> anyhow::Result<KvCache>,
     chunks: &[Chunk],
     seed: u64,
 ) -> anyhow::Result<()> {
+    check_prefill_with(make_cache, chunks, seed, Products::Bf16)
+}
+
+/// [`check_prefill`] with the attention products of `products`. FP8 products are checked
+/// against the reference on their own MXFP8 queries within [`PREFILL_FP8_ERROR`], and
+/// report their RMS error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the chunks keeps the two caches in step"
+)]
+fn check_prefill_with(
+    make_cache: impl Fn(&Arc<CudaStream>) -> anyhow::Result<KvCache>,
+    chunks: &[Chunk],
+    seed: u64,
+    products: Products,
+) -> anyhow::Result<()> {
+    let fp8_products = products == Products::Fp8;
+    let (product_error, value_error) = if fp8_products {
+        (PREFILL_FP8_ERROR, PREFILL_FP8_V_ERROR)
+    } else {
+        (PREFILL_P_ERROR, PREFILL_V_ERROR)
+    };
     let gpu = Gpu::new(0)?;
     let stream = gpu.stream();
     let attention = Attention::load(gpu.context())?;
@@ -1083,6 +1127,7 @@ fn check_prefill(
     let label = match (window, format) {
         (Some(_), _) => "sliding",
         (None, KvFormat::Bf16) => "global",
+        (None, KvFormat::Fp8) if fp8_products => "fp8 global, fp8 products",
         (None, KvFormat::Fp8) => "fp8 global",
     };
 
@@ -1144,6 +1189,7 @@ fn check_prefill(
             &sinks_dev,
             &mut scratch,
             &mut out_dev,
+            products,
         )?;
         let got = stream.clone_dtoh(&out_dev)?;
 
@@ -1186,9 +1232,14 @@ fn check_prefill(
                 bias: bias[i * bias_len..(i + 1) * bias_len].to_vec(),
                 sinks: sinks[i * HEADS..(i + 1) * HEADS].to_vec(),
             };
+            // A single row runs decode attention, which keeps the queries unquantized.
+            let quantized_query = (fp8_products && m > 1).then(|| Query {
+                q: mxfp8_queries(&query.q),
+                ..query.clone()
+            });
             let history = ..(position + 1) * ROW;
             let (want, magnitude) = reference(
-                &query,
+                quantized_query.as_ref().unwrap_or(&query),
                 &stored_k[history],
                 &stored_v[history],
                 window,
@@ -1202,11 +1253,16 @@ fn check_prefill(
                 &want,
                 &magnitude,
                 Tolerance {
-                    absolute: PREFILL_V_ERROR,
-                    ..Tolerance::reference(F32_ERROR + PREFILL_P_ERROR)
+                    absolute: value_error,
+                    ..Tolerance::reference(F32_ERROR + product_error)
                 },
             ));
-            if chunk.decode {
+            if fp8_products && i == checks[0] {
+                report_quantization_error(&format!("{row_label} (stored keys)"), row, &want);
+            }
+            // Decode keeps the queries unquantized, so FP8 products are only checked against
+            // the reference on their own queries.
+            if chunk.decode && !fp8_products {
                 let decoded_row = &decoded[i * head_len..(i + 1) * head_len];
                 check_within(
                     &format!("{label} decode {position} vs F64"),
@@ -1223,8 +1279,8 @@ fn check_prefill(
                     &magnitude,
                     Tolerance {
                         ulps: 2.0,
-                        relative: 2.0 * F32_ERROR + PREFILL_P_ERROR,
-                        absolute: PREFILL_V_ERROR,
+                        relative: 2.0 * F32_ERROR + product_error,
+                        absolute: value_error,
                     },
                 ));
             }
@@ -1335,6 +1391,24 @@ fn fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
     )
 }
 
+#[test]
+fn fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    let chunks = [
+        Chunk::full(77),
+        Chunk::full(1),
+        Chunk::full(2),
+        Chunk::sampled(1024, spread(1024)),
+        Chunk::sampled(512, spread(512)),
+        Chunk::sampled(2048, spread(2048)),
+    ];
+    check_prefill_with(
+        |stream| KvCache::global_with_format(stream, 4096, KvFormat::Fp8),
+        &chunks,
+        6,
+        Products::Fp8,
+    )
+}
+
 /// Chunks past 39,000 tokens, beyond the bias table and the decode kernel's split sizes.
 fn long_chunks() -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = (0..38).map(|_| Chunk::fill(1024)).collect();
@@ -1357,6 +1431,16 @@ fn long_fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
         |stream| KvCache::global_with_format(stream, 40_960, KvFormat::Fp8),
         &long_chunks(),
         8,
+    )
+}
+
+#[test]
+fn long_fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
+    check_prefill_with(
+        |stream| KvCache::global_with_format(stream, 40_960, KvFormat::Fp8),
+        &long_chunks(),
+        8,
+        Products::Fp8,
     )
 }
 
@@ -1442,6 +1526,7 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
                 &sinks,
                 &mut scratch,
                 &mut out,
+                Products::Bf16,
             )
         };
         let begin = gpu

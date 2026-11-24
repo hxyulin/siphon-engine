@@ -24,10 +24,10 @@ use super::{
 };
 use crate::{
     ops::{
-        attention,
+        Products, attention,
         conv::VisitConvs,
         experts::{ExpertScratch, QuantizedRows},
-        linear_fp8::Fp8Matrix,
+        linear_fp8::{Fp8Matrix, Fp8Rows},
         misc::{GATE_SLOTS, GateRowsSlot, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{
@@ -43,6 +43,10 @@ pub const MAX_PREFILL_CHUNK: usize = attention::MAX_PREFILL_ROWS;
 /// The fastest chunk size measured: each expert weight read serves the most rows. Time to
 /// first token for 32K tokens was 2.93 s at 512 rows, 2.55 s at 1024 and 2.39 s at 2048.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+/// The attention products [`Model::prefill`] runs over an FP8 cache unless
+/// [`Model::set_prefill_attention`] says otherwise: FP8, which passes the quality gate (see
+/// `docs/engine.md`) and cuts global attention's time about in half.
+pub const DEFAULT_PREFILL_ATTENTION: Products = Products::Fp8;
 /// Most rows whose visit ends in one kernel that also shifts every conv state
 /// (`Conv::moe_conv_residual_step_rows`); larger chunks shift each state separately.
 const STEP_ROWS: usize = VERIFY_ROWS;
@@ -73,6 +77,44 @@ struct GateRows {
     down: CudaSlice<bf16>,
     /// A gate's output, F32 `[rows, hidden]`, and in invariant chunks one per slot of a launch.
     out: CudaSlice<f32>,
+    /// The MXFP8 inputs of `Products::Fp8` dense products: up to three inputs of
+    /// `2 * hidden` values per row (empty in invariant chunks, which never use them). The
+    /// attention input projections borrow it too.
+    dense: Fp8Rows,
+}
+
+impl GateRows {
+    fn new(
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        hidden: usize,
+        rank: usize,
+        invariant: bool,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            invariant,
+            inputs: [
+                zeros(stream, rows * 2 * hidden)?,
+                zeros(stream, rows * 2 * hidden)?,
+                zeros(stream, rows * 2 * hidden)?,
+                zeros(stream, rows * 2 * hidden)?,
+            ],
+            down: zeros(stream, MESSAGE_SLOTS * rows * rank)?,
+            // Invariant chunks run up to three gates at once, each with its own output.
+            out: zeros(
+                stream,
+                if invariant { GATE_SLOTS } else { 1 } * rows * hidden,
+            )?,
+            dense: Fp8Rows::new(
+                stream,
+                if invariant {
+                    0
+                } else {
+                    dense_values(rows, hidden)
+                },
+            )?,
+        })
+    }
 }
 
 /// Intermediates of attention for a chunk, `[rows, ...]` versions of `AttentionTemps`.
@@ -222,21 +264,7 @@ impl PrefillScratch {
                 .then(|| zeros(stream, MESSAGE_SLOTS * looped * rows * hidden))
                 .transpose()?,
             attention_inputs: zeros(stream, rows * 3 * hidden)?,
-            gate: GateRows {
-                invariant,
-                inputs: [
-                    zeros(stream, rows * 2 * hidden)?,
-                    zeros(stream, rows * 2 * hidden)?,
-                    zeros(stream, rows * 2 * hidden)?,
-                    zeros(stream, rows * 2 * hidden)?,
-                ],
-                down: zeros(stream, MESSAGE_SLOTS * rows * cfg.loop_config.gate_rank)?,
-                // Invariant chunks run up to three gates at once, each with its own output.
-                out: zeros(
-                    stream,
-                    if invariant { GATE_SLOTS } else { 1 } * rows * hidden,
-                )?,
-            },
+            gate: GateRows::new(stream, rows, hidden, cfg.loop_config.gate_rank, invariant)?,
             qkv_in: [
                 zeros(stream, rows * hidden)?,
                 zeros(stream, rows * hidden)?,
@@ -292,6 +320,12 @@ impl PrefillScratch {
 }
 
 /// The first `rows` rows of `width` elements.
+/// Values of [`GateRows::dense`] for `rows` rows: three inputs of `2 * hidden`, the most
+/// one FP8 dense call takes (three message gates).
+pub(crate) fn dense_values(rows: usize, hidden: usize) -> usize {
+    rows * 3 * 2 * hidden
+}
+
 fn rows<T>(x: &CudaSlice<T>, rows: usize, width: usize) -> CudaView<'_, T> {
     x.slice(..rows * width)
 }
@@ -791,6 +825,7 @@ impl Ctx {
             }],
             1,
             false,
+            None,
         )?;
         self.kernels.elementwise.logit_softcap(
             &self.stream,
@@ -820,6 +855,7 @@ impl Ctx {
                 }],
                 n,
                 false,
+                None,
             )?;
             self.kernels.elementwise.logit_softcap(
                 &self.stream,
@@ -851,6 +887,7 @@ impl Ctx {
             }],
             m,
             true,
+            None,
         )?;
         self.kernels.elementwise.logit_softcap(
             &self.stream,
@@ -909,6 +946,7 @@ impl Ctx {
             }],
             m,
             true,
+            None,
         )?;
         self.kernels.elementwise.logit_softcap(
             &self.stream,
@@ -1031,6 +1069,7 @@ impl Ctx {
         self.attention_block_rows(
             state,
             &mut p.attention,
+            &mut p.gate.dense,
             &p.start,
             w,
             sliding,
@@ -1350,6 +1389,7 @@ impl Ctx {
         &self,
         state: &mut VisitState,
         t: &mut AttentionRows,
+        dense: &mut Fp8Rows,
         start: &CudaSlice<u32>,
         w: &LayerWeights,
         sliding: bool,
@@ -1401,7 +1441,7 @@ impl Ctx {
                 rows_mut(&mut t.v_dynamic, m, taps),
             ));
         }
-        self.gemm_rows(&mut products, m, invariant)?;
+        self.gemm_rows(&mut products, m, invariant, Some(&mut *dense))?;
         drop(products);
 
         let conv = match &a.kv_conv {
@@ -1537,6 +1577,11 @@ impl Ctx {
             }],
             m,
             invariant,
+            // The output projection stays BF16 under `Products::Fp8`: alone, its FP8
+            // product raised the gate's |log-prob difference| on regex-readme from 0.035
+            // to 0.043, against 0.038 for all the input projections and none for the
+            // message gates.
+            None,
         )
     }
 
@@ -1584,6 +1629,7 @@ impl Ctx {
                 }],
                 m,
                 invariant,
+                Some(&mut t.dense),
             )?,
             3 => {
                 let (d0, mut rest) = down.split_at_mut(mr);
@@ -1612,6 +1658,7 @@ impl Ctx {
                     ],
                     m,
                     invariant,
+                    Some(&mut t.dense),
                 )?;
             }
             _ => anyhow::bail!("{n} gates; one or three run at once"),

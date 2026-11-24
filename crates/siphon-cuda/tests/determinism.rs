@@ -217,7 +217,7 @@ fn load(gpu: &Gpu, model_dir: &PathBuf, config: Config) -> anyhow::Result<Model>
     let weights = Weights::load(&checkpoint, &text, gpu.stream())?;
     let mut model =
         Model::with_formats(gpu, text, weights, passes, 2048, config.kv, config.weights)?;
-    model.set_expert_activations(config.experts);
+    model.set_expert_activations(config.experts)?;
     Ok(model)
 }
 

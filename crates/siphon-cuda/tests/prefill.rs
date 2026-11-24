@@ -24,6 +24,13 @@
 //!   mean at most 4e-3, max at most 0.12;
 //! - the greedy next token after the prompt must match, and top-1 tokens must agree at 97%
 //!   of prompt positions, the quality gate's per-range limit.
+//!
+//! `fp8_prefill_matches_stepping` runs the same checks with the FP8 cache and weight copies,
+//! and every FP8 prefill product on: attention (the default), expert activations and dense
+//! products. Stepping keeps its own kernels, so the FP8 products' rounding adds to the
+//! differences. The first visit's keys and values then come from projections of MXFP8
+//! inputs (relative rounding up to 2^-4 per input), so its state limit is 2^-4; the KL and
+//! top-1 limits stay.
 
 #![cfg(target_os = "linux")]
 
@@ -35,7 +42,8 @@ use siphon::{Checkpoint, TextConfig};
 use siphon_cuda::{
     Gpu,
     model::{Model, PrefillLogits, VisitSnapshot},
-    weights::Weights,
+    ops::{Products, attention::KvFormat, experts::ExpertActivations},
+    weights::{WeightFormat, Weights},
 };
 
 const PROMPT: usize = 1300;
@@ -43,6 +51,9 @@ const DECODE: usize = 8;
 /// Every this many prompt positions, and the last, the full logits are compared.
 const SAMPLE_EVERY: usize = 97;
 const MAX_STATE_ERROR: f64 = 1.0 / 128.0;
+/// The first-visit state limit with FP8 prefill products: the E4M3 rounding of the
+/// projections' inputs.
+const MAX_FP8_STATE_ERROR: f64 = 1.0 / 16.0;
 const MAX_MEAN_KL: f64 = 4e-3;
 const MAX_KL: f64 = 0.12;
 const MIN_TOP1: f64 = 0.97;
@@ -141,17 +152,47 @@ struct Stepped {
 #[test]
 #[ignore = "needs the checkpoint (SIPHON_MODEL) and about 20 GB of GPU memory"]
 fn prefill_matches_stepping() -> anyhow::Result<()> {
-    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
-    let tokens = tokens()?;
-    ensure!(tokens.len() >= PROMPT + DECODE, "the capture is too short");
-    let (prompt, decode) = (&tokens[..PROMPT], &tokens[PROMPT..PROMPT + DECODE]);
+    prefill_matches_stepping_with(KvFormat::Bf16, WeightFormat::Bf16, false)
+}
 
-    let gpu = Gpu::new(0)?;
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL) and about 20 GB of GPU memory"]
+fn fp8_prefill_matches_stepping() -> anyhow::Result<()> {
+    prefill_matches_stepping_with(KvFormat::Fp8, WeightFormat::Fp8, true)
+}
+
+/// The checkpoint's model with the given cache and weight formats, and with
+/// `fp8_products` every FP8 prefill product on.
+fn load(
+    gpu: &Gpu,
+    kv: KvFormat,
+    weight_format: WeightFormat,
+    fp8_products: bool,
+) -> anyhow::Result<Model> {
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
     let config = TextConfig::load(&model_dir)?;
     let passes = config.loop_config.num_passes;
     let checkpoint = Checkpoint::open(&model_dir)?;
     let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-    let mut model = Model::new(&gpu, config, weights, passes, 2048)?;
+    let mut model = Model::with_formats(gpu, config, weights, passes, 2048, kv, weight_format)?;
+    if fp8_products {
+        model.set_prefill_attention(Products::Fp8);
+        model.set_expert_activations(ExpertActivations::Fp8)?;
+        model.set_prefill_dense(Products::Fp8)?;
+    }
+    Ok(model)
+}
+
+fn prefill_matches_stepping_with(
+    kv: KvFormat,
+    weight_format: WeightFormat,
+    fp8_products: bool,
+) -> anyhow::Result<()> {
+    let tokens = tokens()?;
+    ensure!(tokens.len() >= PROMPT + DECODE, "the capture is too short");
+    let (prompt, decode) = (&tokens[..PROMPT], &tokens[PROMPT..PROMPT + DECODE]);
+    let gpu = Gpu::new(0)?;
+    let mut model = load(&gpu, kv, weight_format, fp8_products)?;
 
     let sampled = |i: usize| i.is_multiple_of(SAMPLE_EVERY) || i == PROMPT - 1;
     let mut stepped = Stepped {
@@ -227,8 +268,13 @@ fn prefill_matches_stepping() -> anyhow::Result<()> {
             "chunk {chunk}: next token {next}, stepping gave {}",
             stepped.next
         );
+        let max_state_error = if fp8_products {
+            MAX_FP8_STATE_ERROR
+        } else {
+            MAX_STATE_ERROR
+        };
         ensure!(
-            first_visit_error <= MAX_STATE_ERROR,
+            first_visit_error <= max_state_error,
             "chunk {chunk}: first-visit state error {first_visit_error:.2e}"
         );
         ensure!(
