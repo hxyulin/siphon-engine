@@ -138,6 +138,8 @@ struct ChatRequest {
     chat_template_kwargs: Option<Value>,
     n: Option<u64>,
     stop: Option<Value>,
+    /// vLLM's extension: also return the prompt's and the completion's token ids.
+    return_token_ids: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +153,7 @@ struct Prepared {
     max_tokens: usize,
     stream: bool,
     include_usage: bool,
+    return_token_ids: bool,
 }
 
 fn prepare(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
@@ -186,6 +189,13 @@ fn prepare(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
             .as_ref()
             .and_then(|k| k.get("reasoning_effort"))
     }))?;
+    let stream = request.stream.unwrap_or(false);
+    let return_token_ids = request.return_token_ids.unwrap_or(false);
+    if stream && return_token_ids {
+        return Err(ApiError::bad_request(
+            "return_token_ids is supported only without streaming",
+        ));
+    }
     let prompt = app.vocab.render(&request.messages, &tools, effort)?;
     let max_tokens = max_tokens(
         app,
@@ -195,11 +205,12 @@ fn prepare(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     Ok(Prepared {
         prompt,
         max_tokens,
-        stream: request.stream.unwrap_or(false),
+        stream,
         include_usage: request
             .stream_options
             .and_then(|o| o.include_usage)
             .unwrap_or(false),
+        return_token_ids,
     })
 }
 
@@ -267,6 +278,7 @@ async fn chat_completions(
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??
     };
     let prompt_tokens = prepared.prompt.len();
+    let prompt_ids = prepared.return_token_ids.then(|| prepared.prompt.clone());
     let mut results = submit(&app, prepared.prompt, prepared.max_tokens)?;
     let reply = Reply::new(&app, prompt_tokens);
     if prepared.stream {
@@ -277,12 +289,12 @@ async fn chat_completions(
     }
     let mut parser = Parser::new(&app.vocab);
     let mut message = Delta::default();
-    let mut completion_tokens = 0;
+    let mut token_ids = Vec::new();
     let finish = loop {
         match results.recv().await {
             Some(Event::Tokens(ids)) => {
-                completion_tokens += ids.len();
                 append(&mut message, parser.push(&app.vocab, &ids));
+                token_ids.extend(ids);
             }
             Some(Event::Done(finish)) => break finish,
             Some(Event::Failed(e)) => {
@@ -315,8 +327,8 @@ async fn chat_completions(
             .map(|call| reply.tool_call(call, None))
             .collect();
     }
-    let usage = reply.usage(completion_tokens, parser.reasoning_tokens());
-    Ok(Json(json!({
+    let usage = reply.usage(token_ids.len(), parser.reasoning_tokens());
+    let mut response = json!({
         "id": reply.id,
         "object": "chat.completion",
         "created": reply.created,
@@ -328,8 +340,12 @@ async fn chat_completions(
             "finish_reason": finish_reason(finish, !message.tool_calls.is_empty()),
         }],
         "usage": usage,
-    }))
-    .into_response())
+    });
+    if let Some(prompt_ids) = prompt_ids {
+        response["prompt_token_ids"] = json!(prompt_ids);
+        response["choices"][0]["token_ids"] = json!(token_ids);
+    }
+    Ok(Json(response).into_response())
 }
 
 #[derive(Deserialize)]

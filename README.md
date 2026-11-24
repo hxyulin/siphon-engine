@@ -66,7 +66,7 @@ It loads the model with FP8 dense weights and KV cache (`--weights bf16` and `--
 
 | Route | Notes |
 | --- | --- |
-| `POST /v1/chat/completions` | Messages rendered as the checkpoint's chat template renders them, with `stream`, `tools` and `reasoning_effort` (a name such as `low`, or 0 to 0.99; default 0.9). The model's thinking comes back as `reasoning_content`. |
+| `POST /v1/chat/completions` | Messages rendered as the checkpoint's chat template renders them, with `stream`, `tools` and `reasoning_effort` (a name such as `low`, or 0 to 0.99; default 0.9). The model's thinking comes back as `reasoning_content`. Without streaming, `return_token_ids` also returns `prompt_token_ids` and each choice's `token_ids`, as vLLM does. |
 | `POST /v1/completions` | A text prompt or token ids, without streaming. |
 | `GET /v1/models`, `GET /health` | |
 
