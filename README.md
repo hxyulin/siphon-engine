@@ -15,22 +15,22 @@ Decode, ms per token:
 
 The DRAM floor at context 0 is 3.25 ms with BF16 weights and 2.21 ms with FP8.
 
-Prefill: 2.22 s for a 32K-token prompt (14,700 tok/s).
+Prefill: 1.66 s for a 32K-token prompt (19,800 tok/s).
 
 Greedy speculative decoding, FP8 weights and cache, 512 tokens, tok/s. The last column runs Inco AI's DFlash 2 drafter (`--drafter`) in place of the bundled DSpark draft:
 
 | Prompt, context | Plain decode | DSpark draft | DFlash 2 |
 | --- | ---: | ---: | ---: |
-| Rust source (`anyhow`), 10.7K | 327 | 757 (2.31x) | 759 (2.32x) |
-| Rust source (`anyhow`), 32K | 302 | 679 (2.25x) | 682 (2.26x) |
-| Rust source (`half`), 2.3K | 341 | 682 (2.00x) | 580 (1.70x) |
-| Rust source (`half`), 32K | 301 | 543 (1.80x) | 520 (1.72x) |
-| A README (`regex`), 2.3K | 340 | 490 (1.44x) | 518 (1.52x) |
-| A README (`regex`), 32K | 301 | 466 (1.55x) | 559 (1.85x) |
-| A chat question, 30 tokens | 356 | 465 (1.31x) | 537 (1.51x) |
-| A coding request, 40 tokens | 356 | 470 (1.32x) | 564 (1.58x) |
+| Rust source (`anyhow`), 10.7K | 327 | 799 (2.44x) | 779 (2.38x) |
+| Rust source (`anyhow`), 32K | 301 | 712 (2.36x) | 699 (2.32x) |
+| Rust source (`half`), 2.3K | 340 | 721 (2.12x) | 590 (1.74x) |
+| Rust source (`half`), 32K | 301 | 575 (1.91x) | 536 (1.78x) |
+| A README (`regex`), 2.3K | 340 | 526 (1.55x) | 532 (1.56x) |
+| A README (`regex`), 32K | 301 | 495 (1.65x) | 575 (1.91x) |
+| A chat question, 30 tokens | 356 | 491 (1.38x) | 541 (1.53x) |
+| A coding request, 40 tokens | 356 | 501 (1.41x) | 594 (1.67x) |
 
-The speedup depends on how predictable the text is. The DSpark draft's first token is accepted 92% to 99% of the time on the Rust sources, 75% to 80% on the README and 68% to 71% on the chat answers; DFlash 2's, 79% to 81% on the chat answers.
+The speedup depends on how predictable the text is. The DSpark draft's first token is accepted 92% to 99% of the time on the Rust sources, 75% to 80% on the README and 66% to 70% on the chat answers; DFlash 2's, 76% to 82% on the chat answers.
 
 ## Features
 
