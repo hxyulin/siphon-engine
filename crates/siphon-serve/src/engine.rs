@@ -31,6 +31,9 @@ pub struct Job {
     pub prompt: Vec<u32>,
     /// Tokens to generate at most, the stop token excluded.
     pub max_tokens: usize,
+    /// vLLM's `ignore_eos`: generate `max_tokens` tokens, passing the model's end tokens
+    /// on as output.
+    pub ignore_eos: bool,
     pub events: UnboundedSender<Event>,
 }
 
@@ -465,7 +468,11 @@ mod cuda {
         /// over or its client has left.
         fn take(&mut self, ids: &[u32], stop: &[u32]) -> ControlFlow<()> {
             let room = self.job.max_tokens - self.output.len();
-            let end = ids.iter().position(|id| stop.contains(id));
+            let end = if self.job.ignore_eos {
+                None
+            } else {
+                ids.iter().position(|id| stop.contains(id))
+            };
             let keep = end.unwrap_or(ids.len()).min(room);
             if keep > 0 {
                 self.output.extend_from_slice(&ids[..keep]);

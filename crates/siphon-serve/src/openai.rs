@@ -257,6 +257,7 @@ struct ChatRequest {
     continue_final_message: Option<bool>,
     add_generation_prompt: Option<bool>,
     return_token_ids: Option<bool>,
+    ignore_eos: Option<bool>,
     /// Every other field: refused ones are checked, the rest ignored.
     #[serde(flatten)]
     other: Map<String, Value>,
@@ -267,14 +268,36 @@ struct StreamOptions {
     include_usage: Option<bool>,
 }
 
+/// How a reply goes back to the client.
+enum Delivery {
+    Whole,
+    /// Server-sent events, ending with a usage chunk if `include_usage`.
+    Stream {
+        include_usage: bool,
+    },
+}
+
+impl Delivery {
+    fn new(stream: Option<bool>, options: Option<StreamOptions>) -> Self {
+        if stream.unwrap_or(false) {
+            Self::Stream {
+                include_usage: options.and_then(|o| o.include_usage).unwrap_or(false),
+            }
+        } else {
+            Self::Whole
+        }
+    }
+}
+
 /// A validated request, ready for the engine.
 struct Prepared {
     prompt: Vec<u32>,
     max_tokens: usize,
-    stream: bool,
-    include_usage: bool,
+    delivery: Delivery,
     /// vLLM's `return_token_ids`: the prompt's and the completion's ids.
     return_token_ids: bool,
+    /// vLLM's `ignore_eos`: run to `max_tokens` through the model's end tokens.
+    ignore_eos: bool,
     output: Output,
 }
 
@@ -340,12 +363,9 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     Ok(Prepared {
         prompt,
         max_tokens,
-        stream: request.stream.unwrap_or(false),
-        include_usage: request
-            .stream_options
-            .and_then(|o| o.include_usage)
-            .unwrap_or(false),
+        delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
+        ignore_eos: request.ignore_eos.unwrap_or(false),
         output: Output::new(
             Decoder::Chat(Parser::new(&app.vocab, &ending)),
             Stops::new(stops),
@@ -388,12 +408,14 @@ fn submit(
     app: &App,
     prompt: Vec<u32>,
     max_tokens: usize,
+    ignore_eos: bool,
 ) -> Result<mpsc::UnboundedReceiver<Event>, ApiError> {
     let (events, results) = mpsc::unbounded_channel();
     app.engine
         .submit(Job {
             prompt,
             max_tokens,
+            ignore_eos,
             events,
         })
         .map_err(|e| match e {
@@ -433,6 +455,7 @@ struct CompletionRequest {
     best_of: Option<u64>,
     stop: Option<Value>,
     return_token_ids: Option<bool>,
+    ignore_eos: Option<bool>,
     #[serde(flatten)]
     other: Map<String, Value>,
 }
@@ -465,12 +488,9 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
     Ok(Prepared {
         prompt,
         max_tokens,
-        stream: request.stream.unwrap_or(false),
-        include_usage: request
-            .stream_options
-            .and_then(|o| o.include_usage)
-            .unwrap_or(false),
+        delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
+        ignore_eos: request.ignore_eos.unwrap_or(false),
         output: Output::new(
             Decoder::Text(Detokenizer::default()),
             Stops::new(stops),
@@ -495,15 +515,15 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
     let Prepared {
         prompt,
         max_tokens,
-        stream: streaming,
-        include_usage,
+        delivery,
         return_token_ids,
+        ignore_eos,
         mut output,
     } = prepared;
     let mut reply = Reply::new(&app, prompt.len(), kind);
     let prompt_ids = return_token_ids.then(|| prompt.clone());
-    let mut results = submit(&app, prompt, max_tokens)?;
-    if streaming {
+    let mut results = submit(&app, prompt, max_tokens, ignore_eos)?;
+    if let Delivery::Stream { include_usage } = delivery {
         let (out, rx) = mpsc::channel(64);
         let chunks = Chunks {
             out,

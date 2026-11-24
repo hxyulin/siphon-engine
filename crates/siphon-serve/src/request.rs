@@ -16,7 +16,6 @@ const REFUSED: &[(&str, &str)] = &[
     ("echo", "echo is not supported"),
     ("suffix", "suffix is not supported"),
     ("logit_bias", "logit_bias is not supported"),
-    ("ignore_eos", "ignore_eos is not supported"),
     ("min_tokens", "min_tokens is not supported"),
     (
         "stop_token_ids",
@@ -192,7 +191,6 @@ mod tests {
             json!({"logprobs": true}),
             json!({"logprobs": 100}),
             json!({"top_logprobs": 5}),
-            json!({"ignore_eos": true}),
             json!({"echo": true}),
             json!({"logit_bias": {"42": -100}}),
             json!({"guided_json": {"type": "object"}}),
