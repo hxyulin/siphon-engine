@@ -41,7 +41,7 @@ use safetensors::{Dtype, SafeTensors};
 use siphon::{Checkpoint, TextConfig};
 use siphon_cuda::{
     Gpu,
-    model::{Model, PrefillLogits, VisitSnapshot},
+    model::{Model, PrefillAttention, PrefillLogits, VisitSnapshot},
     ops::{Products, attention::KvFormat, experts::ExpertActivations},
     weights::{WeightFormat, Weights},
 };
@@ -176,7 +176,7 @@ fn load(
     let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
     let mut model = Model::with_formats(gpu, config, weights, passes, 2048, kv, weight_format)?;
     if fp8_products {
-        model.set_prefill_attention(Products::Fp8);
+        model.set_prefill_attention(PrefillAttention::Fp8);
         model.set_expert_activations(ExpertActivations::Fp8)?;
         model.set_prefill_dense(Products::Fp8)?;
     }

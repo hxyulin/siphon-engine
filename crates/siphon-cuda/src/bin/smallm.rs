@@ -6,7 +6,7 @@
 //! smallm experts <model-dir> <routing-capture>
 //! smallm attention
 //! smallm verify <model-dir> <capture> --width M [--passes N] [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1]
-//!     [--prefill-attention bf16|fp8]
+//!     [--prefill-attention auto|bf16|fp8]
 //! ```
 //!
 //! `prefill` runs real text through `Model::prefill` in chunks of a few rows, for kernel
@@ -139,7 +139,7 @@ mod linux {
         let mut it = env::args().skip(2);
         let usage = "usage: smallm verify <model-dir> <capture> --width M [--passes N] \
                      [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1] \
-                     [--prefill-attention bf16|fp8]";
+                     [--prefill-attention auto|bf16|fp8]";
         let model_dir = PathBuf::from(it.next().context(usage)?);
         let capture = PathBuf::from(it.next().context(usage)?);
         let (mut width, mut passes, mut weights, mut kv, mut hash) =

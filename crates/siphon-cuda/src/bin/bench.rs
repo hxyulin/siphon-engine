@@ -4,15 +4,15 @@
 //!        [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 //!        bench <model-dir> --prefill 512,4096,32768 [--chunk N] [--passes N]
 //!        [--kv bf16|fp8] [--weights bf16|fp8] [--expert-activations bf16|quantized|fp8]
-//!        [--prefill-attention bf16|fp8] [--prefill-dense bf16|fp8] [--json]
+//!        [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]
 //!
 //! With `--prefill`, each prompt length runs once through `Model::prefill` in chunks of
 //! `--chunk` rows from an empty cache, after one warmup chunk, and the time to the first
 //! token is the time `prefill` takes to return the greedy next token. The prompt tokens
 //! are arbitrary ids, so expert routing differs from real text. `--expert-activations
 //! quantized` runs prefill's expert products on quantized activations (see
-//! `ExpertActivations`). `--prefill-attention fp8` runs global attention over an FP8
-//! cache on FP8 tensor cores, and `--prefill-dense fp8` the dense products on the FP8
+//! `ExpertActivations`). `--prefill-attention` picks global attention's products over an FP8
+//! cache (see `PrefillAttention`; `auto` by default), and `--prefill-dense fp8` the dense products on the FP8
 //! weight copies (with `--weights fp8`).
 //!
 //! For each context length the runner skips its caches to that length without computing
@@ -97,7 +97,7 @@ mod linux {
         draft::DraftOptions,
         model::{
             Accept, BATCH_ROWS, DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK,
-            MAX_PREFILL_CHUNK, Model, PrefillLogits, VerifyTokens,
+            MAX_PREFILL_CHUNK, Model, PrefillAttention, PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
@@ -120,7 +120,7 @@ mod linux {
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--expert-activations bf16|quantized|fp8] \
-                         [--prefill-attention bf16|fp8] [--prefill-dense bf16|fp8] [--json]";
+                         [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]";
 
     #[expect(clippy::struct_excessive_bools, reason = "command-line flags")]
     struct Args {
@@ -132,7 +132,7 @@ mod linux {
         kv: KvFormat,
         weights: WeightFormat,
         expert_activations: ExpertActivations,
-        prefill_attention: Products,
+        prefill_attention: PrefillAttention,
         prefill_dense: Products,
         json: bool,
         /// Prompt lengths to time prefill at, instead of timing decode.

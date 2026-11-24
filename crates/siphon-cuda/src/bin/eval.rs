@@ -3,7 +3,7 @@
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
 //!        [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
-//!        [--expert-activations bf16|quantized|fp8] [--prefill-attention bf16|fp8]
+//!        [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8]
 //!        [--prefill-dense bf16|fp8]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
@@ -18,8 +18,8 @@
 //! the BF16 weights.
 //! `--expert-activations quantized` runs prefill's expert products on quantized
 //! activations (see `ExpertActivations`); stepping stays BF16. `--prefill-attention`
-//! picks prefill's global attention products over an FP8 cache (FP8 tensor cores by
-//! default), and `--prefill-dense fp8` runs its dense products on the FP8 weight copies
+//! picks prefill's global attention products over an FP8 cache (`auto` by default: FP8
+//! tensor cores past `FP8_ATTENTION_KEYS` keys), and `--prefill-dense fp8` runs its dense products on the FP8 weight copies
 //! (with `--weights fp8`). With `--verify`, the text runs through `Model::verify` in passes
 //! of WIDTH rows (1 to 8), each keeping every row, as speculative decoding verifies the
 //! anchor and drafts.
@@ -45,8 +45,8 @@ mod linux {
     use siphon_cuda::{
         Gpu,
         model::{
-            Accept, DEFAULT_PREFILL_ATTENTION, MAX_PREFILL_CHUNK, Model, PrefillLogits,
-            VerifyTokens,
+            Accept, DEFAULT_PREFILL_ATTENTION, MAX_PREFILL_CHUNK, Model, PrefillAttention,
+            PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         weights::{WeightFormat, Weights},
@@ -81,7 +81,7 @@ mod linux {
         /// Rows per `Model::verify` pass, instead of stepping or prefill.
         verify: Option<usize>,
         expert_activations: ExpertActivations,
-        prefill_attention: Products,
+        prefill_attention: PrefillAttention,
         prefill_dense: Products,
     }
 
@@ -111,7 +111,7 @@ mod linux {
             } else if arg == "--prefill-attention" {
                 prefill_attention = it
                     .next()
-                    .context("--prefill-attention needs bf16 or fp8")?
+                    .context("--prefill-attention needs auto, bf16 or fp8")?
                     .parse()?;
             } else if arg == "--prefill-dense" {
                 prefill_dense = it
@@ -139,7 +139,7 @@ mod linux {
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
              [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH] \
-             [--expert-activations bf16|quantized|fp8] [--prefill-attention bf16|fp8] \
+             [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
              [--prefill-dense bf16|fp8]",
         )?;
         ensure!(

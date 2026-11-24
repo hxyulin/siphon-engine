@@ -95,6 +95,9 @@ pub struct Options {
     pub fallback: bool,
     /// Whether requests that run alone prefill through a prefix cache.
     pub prefix_cache: bool,
+    /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
+    /// parses them.
+    pub prefill_attention: String,
 }
 
 /// Sends jobs to the engine thread.
@@ -344,6 +347,7 @@ mod cuda {
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         let mut model =
             Model::with_formats(&gpu, config, weights, passes, capacity, kv, weight_format)?;
+        model.set_prefill_attention(options.prefill_attention.parse()?);
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
         let source = options
             .drafter

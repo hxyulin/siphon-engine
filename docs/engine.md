@@ -18,7 +18,7 @@ cd reference/fixtures && uv run --project .. python <group>.py
 - `PrefillLogits::Last` computes only the last row's logits, which `Model::logits` then returns. `PrefillLogits::All(callback)` also passes every row's F32 logits after the softcap to the callback, with the row's position. The LM head runs over 32 rows at a time for it.
 - `Model::reset` zeroes the caches and returns to position 0 for a new sequence.
 
-With an FP8 cache, global attention runs on FP8 tensor cores by default, and the expert and dense products can too; [Prefill on FP8 tensor cores](#prefill-on-fp8-tensor-cores) has the options.
+With an FP8 cache, global attention runs on FP8 tensor cores by default once a chunk reads more than 16,384 keys, and the expert and dense products can too; [Prefill on FP8 tensor cores](#prefill-on-fp8-tensor-cores) has the options.
 
 The small kernels have multi-row forms. Most give the single-row results bit for bit; depth attention, the router logits and the message gates' products sum in their own orders and differ by F32 rounding. The GEMMs, expert products and attention go through `Ctx::gemm_rows`, `Ctx::moe_rows` and `Ctx::attention_rows` in `src/model.rs`. `gemm_rows` runs a tensor-core GEMM. `moe_rows` runs an expert-grouped GEMM, with the softcapped SwiGLU in the `w13` product's epilogue, and `attention_rows` a flash attention over the cache and the chunk. `tests/prefill.rs` checks prefill against stepping on 1300 tokens at chunks of 512, 1024, 433 and 2048. At 2048 the whole prompt is one chunk wider than the sliding window. `fp8_prefill_matches_stepping` repeats it with the FP8 cache and weights and every FP8 prefill product on. The tests need the checkpoint and about 20 GB of GPU memory, so they are ignored by default:
 
@@ -616,11 +616,11 @@ The NVFP4 activations cause the difference: quantizing only the MXFP8 layers sta
 
 ## Prefill on FP8 tensor cores
 
-Three prefill options run products on the block-scaled FP8 MMA (`mma.sync ... kind::mxf8f6f4.block_scale`, m16n8k32). With F32 accumulators it runs at 1,015 TFLOP/s on the RTX 5090, against 254 for BF16; without block scales the same MMA runs at 509. Each option rounds activations to E4M3, so each went through the quality gate. Decode never uses them. `bench` and `eval` take the flags, and the `Model` setters take the same choices:
+Three prefill options run products on the block-scaled FP8 MMA (`mma.sync ... kind::mxf8f6f4.block_scale`, m16n8k32). With F32 accumulators it runs at 1,015 TFLOP/s on the RTX 5090, against 254 for BF16; without block scales the same MMA runs at 509. Each option rounds activations to E4M3, so each went through the quality gate. Decode never uses them. `bench` and `eval` take the flags (`siphon-serve` takes `--prefill-attention`), and the `Model` setters take the same choices:
 
 | Option | Flag | Setter | Default |
 | --- | --- | --- | --- |
-| Global attention | `--prefill-attention bf16\|fp8` | `Model::set_prefill_attention` | `fp8`, with an FP8 cache |
+| Global attention | `--prefill-attention auto\|bf16\|fp8` | `Model::set_prefill_attention` | `auto`: BF16 up to 16,384 keys, FP8 past them, with an FP8 cache |
 | Expert activations | `--expert-activations fp8` | `Model::set_expert_activations` | off |
 | Dense products | `--prefill-dense bf16\|fp8` | `Model::set_prefill_dense` | off |
 
@@ -647,6 +647,17 @@ The quality gate with the FP8 cache and weights, prefill in chunks of 2048, agai
 | All three | 2.8e-3, 2.3e-3, 1.6e-3 | 0.034, 0.042, 0.041 | 0.044, 0.046, 0.043 | fails `regex-readme`: worst range 0.046 |
 
 Each option passes alone. Attention is the default: it saves the most time at long prompts and adds the least error. The expert activations fail together with it, so they stay opt-in, as do the dense products.
+
+FP8 attention throughout still changed short prompts' greedy output, and with it speculation. The registry lab's speed prompt, a 31-token request for a 600-word story, went from 6,304 tokens at 4.19 tokens per verify round (668 tok/s) to 1,264 tokens at 1.72 (343 tok/s): the changed cache tipped decode into the model's terse reasoning style, which the draft predicts poorly. Over 12 varied prompts the mean went from 3.04 to 2.79 tokens per round, with large swings both ways. Short prompts gain almost nothing from FP8, 2% of time to first token at 8,192 tokens, and the eval's top-1 agreement dropped most over the first 1,024 positions (99.12% to 98.34% on `anyhow`), where few keys share the rounded weights. So `auto`, the default, runs a chunk on FP8 only when its last row reads more than `FP8_ATTENTION_KEYS` (16,384) keys. Shorter prompts prefill bit for bit as with `bf16`: the 12 prompts give the same outputs as the build before FP8 attention. Longer ones keep most of the saving, since attention's work grows with the square of the length. Time to first token, alternating the three, twice, in one hold per length:
+
+| Prompt | `bf16` | `auto` | `fp8` |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 505 ms | 505 ms | 496 ms |
+| 32,768 | 2.23 s | 2.12 s | 2.08 s |
+| 92,160 | 7.67 s | 6.58 s | 6.53 s |
+| 131,072 | 12.29 s | 10.06 s | 10.01 s |
+
+The tables above, FP8 attention rows included, ran with `fp8`.
 
 ### Global attention
 

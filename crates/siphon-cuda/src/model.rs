@@ -21,7 +21,8 @@ mod verify;
 
 pub use batch::BATCH_ROWS;
 pub use prefill::{
-    DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits,
+    DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, FP8_ATTENTION_KEYS, MAX_PREFILL_CHUNK,
+    PrefillAttention, PrefillLogits,
 };
 pub use prefix::LocalState;
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
@@ -353,7 +354,9 @@ struct Ctx {
     /// How prefill's expert products take their activations.
     expert_activations: ExpertActivations,
     /// How prefill's global attention multiplies over an FP8 cache.
-    prefill_attention: Products,
+    prefill_attention: PrefillAttention,
+    /// What `prefill_attention` picks for the chunk being enqueued, set per chunk.
+    chunk_attention: Products,
     /// How prefill's dense products multiply.
     prefill_dense: Products,
 }
@@ -488,6 +491,7 @@ impl Model {
                 stream,
                 expert_activations: ExpertActivations::Bf16,
                 prefill_attention: DEFAULT_PREFILL_ATTENTION,
+                chunk_attention: Products::Bf16,
                 prefill_dense: Products::Bf16,
             },
             passes,
@@ -614,10 +618,10 @@ impl Model {
         Ok(())
     }
 
-    /// Makes [`Model::prefill`] run attention over an FP8 cache with `products`
+    /// Makes [`Model::prefill`] run attention over an FP8 cache as `attention` says
     /// ([`DEFAULT_PREFILL_ATTENTION`] until set). Decode and BF16 caches are unaffected.
-    pub fn set_prefill_attention(&mut self, products: Products) {
-        self.ctx.prefill_attention = products;
+    pub fn set_prefill_attention(&mut self, attention: PrefillAttention) {
+        self.ctx.prefill_attention = attention;
     }
 
     /// Makes [`Model::prefill`] run its dense products with `products`: with
@@ -2095,7 +2099,7 @@ impl Ctx {
             sinks,
             scratch,
             out,
-            self.prefill_attention,
+            self.chunk_attention,
         )
     }
 

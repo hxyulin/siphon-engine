@@ -11,7 +11,7 @@
 //! A chunk's buffers hold `[rows, ...]` per intermediate. The block states of one chunk
 //! are `[blocks, rows, 2304]`, so the states in use are one contiguous run.
 
-use std::sync::Arc;
+use std::{fmt, str::FromStr, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _};
@@ -44,9 +44,60 @@ pub const MAX_PREFILL_CHUNK: usize = attention::MAX_PREFILL_ROWS;
 /// first token for 32K tokens was 2.93 s at 512 rows, 2.55 s at 1024 and 2.39 s at 2048.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 /// The attention products [`Model::prefill`] runs over an FP8 cache unless
-/// [`Model::set_prefill_attention`] says otherwise: FP8, which passes the quality gate (see
-/// `docs/engine.md`) and cuts global attention's time about in half.
-pub const DEFAULT_PREFILL_ATTENTION: Products = Products::Fp8;
+/// [`Model::set_prefill_attention`] says otherwise.
+pub const DEFAULT_PREFILL_ATTENTION: PrefillAttention = PrefillAttention::Auto;
+/// Keys past which [`PrefillAttention::Auto`] runs a chunk's global attention on FP8 tensor
+/// cores. Rounding the softmax weights to E4M3 moves the output most where few keys share
+/// them, while attention's time grows with the square of the length: FP8 saves 2% of time to
+/// first token at 8,192 tokens, and keys below this mark are 3% of global attention's work at
+/// 92,160 tokens.
+pub const FP8_ATTENTION_KEYS: usize = 16_384;
+
+/// Which products [`Model::prefill`]'s global attention runs over an FP8 cache. FP8 passes
+/// the quality gate (see `docs/engine.md`) and halves global attention's time, but changes
+/// the cache prefill leaves, and with it greedy decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillAttention {
+    /// BF16 for chunks whose last row reads up to [`FP8_ATTENTION_KEYS`] keys, FP8 after,
+    /// so prompts up to that length prefill exactly as with `Bf16`.
+    Auto,
+    Bf16,
+    Fp8,
+}
+
+impl PrefillAttention {
+    /// The products for a chunk whose last row sits at position `end - 1`.
+    fn products(self, end: usize) -> Products {
+        match self {
+            Self::Auto if end > FP8_ATTENTION_KEYS => Products::Fp8,
+            Self::Auto | Self::Bf16 => Products::Bf16,
+            Self::Fp8 => Products::Fp8,
+        }
+    }
+}
+
+impl FromStr for PrefillAttention {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "bf16" => Ok(Self::Bf16),
+            "fp8" => Ok(Self::Fp8),
+            _ => anyhow::bail!("unknown prefill attention {s:?}; expected auto, bf16 or fp8"),
+        }
+    }
+}
+
+impl fmt::Display for PrefillAttention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
+}
 /// Most rows whose visit ends in one kernel that also shifts every conv state
 /// (`Conv::moe_conv_residual_step_rows`); larger chunks shift each state separately.
 const STEP_ROWS: usize = VERIFY_ROWS;
@@ -476,6 +527,7 @@ impl Model {
             .map(|&t| Ok(i32::try_from(t)?))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let first = u32::try_from(start)?;
+        ctx.chunk_attention = ctx.prefill_attention.products(start + m);
         ctx.stream
             .memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, m, 1))?;
         ctx.stream.memcpy_htod(&[first], &mut p.start)?;
