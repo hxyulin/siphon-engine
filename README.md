@@ -10,8 +10,8 @@ Decode, ms per token:
 
 | Dense weights, KV cache | Context 0 | 32K | 128K |
 | --- | ---: | ---: | ---: |
-| BF16, BF16 | 3.68 | 4.75 | 6.65 |
-| FP8, FP8 | 2.77 (361 tok/s) | 3.32 | 4.30 |
+| BF16, BF16 | 3.70 | 4.74 | 6.63 |
+| FP8, FP8 | 2.73 (366 tok/s) | 3.24 | 4.23 |
 
 The DRAM floor at context 0 is 3.25 ms with BF16 weights and 2.21 ms with FP8.
 
@@ -21,16 +21,16 @@ Greedy speculative decoding, FP8 weights and cache, 512 tokens, tok/s. The last 
 
 | Prompt, context | Plain decode | DSpark draft | DFlash 2 |
 | --- | ---: | ---: | ---: |
-| Rust source (`anyhow`), 10.7K | 327 | 799 (2.44x) | 779 (2.38x) |
-| Rust source (`anyhow`), 32K | 301 | 712 (2.36x) | 699 (2.32x) |
-| Rust source (`half`), 2.3K | 340 | 721 (2.12x) | 590 (1.74x) |
-| Rust source (`half`), 32K | 301 | 575 (1.91x) | 536 (1.78x) |
-| A README (`regex`), 2.3K | 340 | 526 (1.55x) | 532 (1.56x) |
-| A README (`regex`), 32K | 301 | 495 (1.65x) | 575 (1.91x) |
-| A chat question, 30 tokens | 356 | 491 (1.38x) | 541 (1.53x) |
-| A coding request, 40 tokens | 356 | 501 (1.41x) | 594 (1.67x) |
+| Rust source (`anyhow`), 10.7K | 337 | 799 (2.37x) | 783 (2.32x) |
+| Rust source (`anyhow`), 32K | 309 | 720 (2.33x) | 702 (2.27x) |
+| Rust source (`half`), 2.3K | 353 | 722 (2.05x) | 600 (1.70x) |
+| Rust source (`half`), 32K | 309 | 577 (1.87x) | 538 (1.74x) |
+| A README (`regex`), 2.3K | 352 | 528 (1.50x) | 536 (1.52x) |
+| A README (`regex`), 32K | 308 | 494 (1.60x) | 577 (1.87x) |
+| A chat question, 30 tokens | 364 | 489 (1.34x) | 549 (1.51x) |
+| A coding request, 40 tokens | 364 | 498 (1.37x) | 592 (1.63x) |
 
-The speedup depends on how predictable the text is. The DSpark draft's first token is accepted 92% to 99% of the time on the Rust sources, 75% to 80% on the README and 66% to 70% on the chat answers; DFlash 2's, 76% to 82% on the chat answers.
+The speedup depends on how predictable the text is. The DSpark draft's first token is accepted 92% to 99% of the time on the Rust sources, 75% to 80% on the README and 66% to 70% on the chat answers; DFlash 2's, 77% to 82% on the chat answers.
 
 ## Features
 
