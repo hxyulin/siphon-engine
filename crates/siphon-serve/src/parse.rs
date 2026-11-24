@@ -14,7 +14,7 @@
 
 use serde_json::Value;
 
-use crate::chat::{Special, Vocab};
+use crate::chat::{Ending, Special, Vocab};
 
 /// One tool call the model made.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,14 +55,20 @@ pub struct Parser {
 }
 
 impl Parser {
-    /// A parser for ids generated after a prompt that ends with `<|message_model|>`.
-    pub fn new(vocab: &Vocab) -> Self {
+    /// A parser for ids generated after a prompt that ends as `ending` says.
+    pub fn new(vocab: &Vocab, ending: &Ending<'_>) -> Self {
+        let (state, tool_name) = match ending {
+            Ending::Generate | Ending::Bare => (State::Header, Vec::new()),
+            Ending::AnyCall => (State::Tool, Vec::new()),
+            Ending::Continue => (State::Text, Vec::new()),
+            Ending::Call(name) => (State::Tool, vocab.encode(name)),
+        };
         Self {
             special: vocab.special,
-            state: State::Header,
+            state,
             header: Vec::new(),
             tool: Vec::new(),
-            tool_name: Vec::new(),
+            tool_name,
             content: Detokenizer::default(),
             reasoning: Detokenizer::default(),
             reasoning_tokens: 0,
@@ -152,17 +158,18 @@ impl Parser {
     }
 }
 
-/// Turns ids into text a few at a time, holding back ids that end inside a UTF-8
-/// character. Keeps one decoded step of context, as text-generation-inference does.
+/// Turns ids into text a few at a time, special tokens included, holding back ids that end
+/// inside a UTF-8 character. Keeps one decoded step of context, as
+/// text-generation-inference does.
 #[derive(Default)]
-struct Detokenizer {
+pub struct Detokenizer {
     ids: Vec<u32>,
     prefix: usize,
     read: usize,
 }
 
 impl Detokenizer {
-    fn push(&mut self, vocab: &Vocab, id: u32) -> String {
+    pub fn push(&mut self, vocab: &Vocab, id: u32) -> String {
         self.ids.push(id);
         let before = vocab.decode(&self.ids[self.prefix..self.read]);
         let after = vocab.decode(&self.ids[self.prefix..]);
@@ -177,7 +184,7 @@ impl Detokenizer {
         String::new()
     }
 
-    fn flush(&mut self, vocab: &Vocab) -> String {
+    pub fn flush(&mut self, vocab: &Vocab) -> String {
         let before = vocab.decode(&self.ids[self.prefix..self.read]);
         let after = vocab.decode(&self.ids[self.prefix..]);
         self.prefix = self.ids.len();
@@ -206,7 +213,7 @@ mod tests {
         ids.extend(vocab.encode(r#"{"name":"get_weather","args":{"city":"Paris"}}"#));
         ids.extend([s.end_message, s.content_model_end_sampling]);
 
-        let mut parser = Parser::new(&vocab);
+        let mut parser = Parser::new(&vocab, &Ending::Generate);
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut calls = Vec::new();

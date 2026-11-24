@@ -46,6 +46,23 @@ pub struct Special {
     pub end_message: u32,
 }
 
+/// How a rendered prompt ends, and so where generation starts.
+#[derive(Clone, Copy, Debug)]
+pub enum Ending<'a> {
+    /// A new model message, `<|message_model|>`, as `add_generation_prompt` adds.
+    Generate,
+    /// No generation prompt, for counting a conversation's tokens.
+    Bare,
+    /// The final assistant message's last text block left open, as vLLM's
+    /// `continue_final_message` does.
+    Continue,
+    /// A model message that calls the named tool, opened up to its JSON payload.
+    Call(&'a str),
+    /// A model message that calls a tool, opened up to its payload without the tool's name
+    /// in its header, so that the model names the tool in the payload.
+    AnyCall,
+}
+
 /// The checkpoint's tokenizer and its special tokens.
 pub struct Vocab {
     tokenizer: Tokenizer,
@@ -153,25 +170,42 @@ impl Vocab {
         tools: &[Value],
         effort: f64,
     ) -> Result<Vec<u32>, InvalidRequest> {
+        self.render_to(messages, tools, effort, &Ending::Generate)
+    }
+
+    /// [`Vocab::render`] with the prompt ending as `ending` says.
+    pub fn render_to(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        effort: f64,
+        ending: &Ending<'_>,
+    ) -> Result<Vec<u32>, InvalidRequest> {
         let s = self.special;
+        let continuing = matches!(ending, Ending::Continue);
+        if continuing
+            && messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                != Some("assistant")
+        {
+            return Err(invalid(
+                "continue_final_message needs an assistant message last",
+            ));
+        }
         let mut ids = Vec::new();
         let block = |ids: &mut Vec<u32>, header: &[u32], kind: u32, text: &str| {
             self.block(ids, header, kind, text);
         };
         if !tools.is_empty() {
-            let specs: Vec<Value> = tools.iter().map(tool_spec).collect::<Result<_, _>>()?;
-            let mut header = vec![s.message_system];
-            header.extend(self.encode("tool_declare"));
-            block(
-                &mut ids,
-                &header,
-                s.content_xml,
-                &canonical_json(&Value::Array(specs)),
-            );
+            self.declare_tools(&mut ids, tools)?;
         }
         let effort_block = format!("Thinking effort level: {}", effort_text(effort));
         let mut effort_done = false;
-        for message in messages {
+        for (i, message) in messages.iter().enumerate() {
+            // The final assistant message, left open for the model to continue.
+            let open = continuing && i + 1 == messages.len();
             let role = message
                 .get("role")
                 .and_then(Value::as_str)
@@ -212,22 +246,24 @@ impl Vocab {
             if let Some(reasoning) = reasoning {
                 block(&mut ids, &header, s.content_thinking, reasoning);
             }
-            match message.get("content") {
-                Some(Value::String(text)) => {
-                    if !text.is_empty()
-                        || !(assistant && (!tool_calls.is_empty() || reasoning.is_some()))
-                    {
-                        block(&mut ids, &header, s.content_text, text);
-                    }
-                }
-                Some(Value::Array(parts)) => {
-                    for part in parts {
-                        let text = content_part(part)?;
-                        block(&mut ids, &header, s.content_text, text);
-                    }
-                }
-                None | Some(Value::Null) => {}
-                Some(_) => return Err(invalid("message content must be a string or an array")),
+            // An assistant's empty text is left out next to its reasoning or tool calls.
+            let skip_empty = assistant && (!tool_calls.is_empty() || reasoning.is_some());
+            let mut texts = texts(message, skip_empty)?;
+            if open && !tool_calls.is_empty() {
+                return Err(invalid(
+                    "continue_final_message cannot continue a message with tool calls",
+                ));
+            }
+            let last = open.then(|| texts.pop().unwrap_or(""));
+            for text in texts {
+                block(&mut ids, &header, s.content_text, text);
+            }
+            if let Some(last) = last {
+                // The last text block stays open: no end marker.
+                ids.extend_from_slice(&header);
+                ids.push(s.content_text);
+                ids.extend(self.encode(last));
+                continue;
             }
             for call in tool_calls {
                 self.tool_call_block(&mut ids, message, call)?;
@@ -239,7 +275,7 @@ impl Vocab {
         if !effort_done {
             block(&mut ids, &[s.message_system], s.content_text, &effort_block);
         }
-        ids.push(s.message_model);
+        self.end(&mut ids, tools, ending)?;
         Ok(ids)
     }
 }
@@ -251,6 +287,50 @@ impl Vocab {
         ids.push(kind);
         ids.extend(self.encode(text));
         ids.push(self.special.end_message);
+    }
+
+    /// Appends the system block that declares `tools`.
+    fn declare_tools(&self, ids: &mut Vec<u32>, tools: &[Value]) -> Result<(), InvalidRequest> {
+        let specs: Vec<Value> = tools.iter().map(tool_spec).collect::<Result<_, _>>()?;
+        let mut header = vec![self.special.message_system];
+        header.extend(self.encode("tool_declare"));
+        let specs = canonical_json(&Value::Array(specs));
+        self.block(ids, &header, self.special.content_xml, &specs);
+        Ok(())
+    }
+
+    /// Appends what `ending` adds after the messages.
+    fn end(
+        &self,
+        ids: &mut Vec<u32>,
+        tools: &[Value],
+        ending: &Ending<'_>,
+    ) -> Result<(), InvalidRequest> {
+        let s = self.special;
+        match *ending {
+            Ending::Generate => ids.push(s.message_model),
+            Ending::Bare | Ending::Continue => {}
+            Ending::Call(name) => {
+                if !tools
+                    .iter()
+                    .any(|tool| tool_function_name(tool) == Some(name))
+                {
+                    return Err(invalid(format!(
+                        "tool_choice names {name}, which is not a tool"
+                    )));
+                }
+                ids.push(s.message_model);
+                ids.extend(self.encode(name));
+                ids.push(s.content_invoke_tool_json);
+            }
+            Ending::AnyCall => {
+                if tools.is_empty() {
+                    return Err(invalid("tool_choice required needs tools"));
+                }
+                ids.extend([s.message_model, s.content_invoke_tool_json]);
+            }
+        }
+        Ok(())
     }
 
     /// Appends the block of one tool call that the assistant `message` made.
@@ -282,6 +362,32 @@ impl Vocab {
             &payload,
         );
         Ok(())
+    }
+}
+
+/// The thinking effort of a chat request: its `reasoning_effort`, else
+/// `chat_template_kwargs.reasoning_effort`, else effort 0 (no thinking) when
+/// `chat_template_kwargs.enable_thinking` is false, else [`DEFAULT_EFFORT`]. The checkpoint's
+/// template has no `enable_thinking` switch; effort 0 is its no-thinking level.
+pub fn request_effort(
+    reasoning_effort: Option<&Value>,
+    chat_template_kwargs: Option<&Value>,
+) -> Result<f64, InvalidRequest> {
+    let kwarg = |key| {
+        chat_template_kwargs
+            .and_then(|k| k.get(key))
+            .filter(|v| !v.is_null())
+    };
+    match reasoning_effort
+        .filter(|v| !v.is_null())
+        .or_else(|| kwarg("reasoning_effort"))
+    {
+        Some(named) => effort(Some(named)),
+        None => match kwarg("enable_thinking") {
+            None | Some(Value::Bool(true)) => Ok(DEFAULT_EFFORT),
+            Some(Value::Bool(false)) => Ok(0.0),
+            Some(_) => Err(invalid("enable_thinking must be a boolean")),
+        },
     }
 }
 
@@ -335,6 +441,18 @@ fn tool_name<'a>(messages: &'a [Value], message: &Value) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
+/// The texts of a message's content, a block each; an empty string is left out when
+/// `skip_empty`.
+fn texts(message: &Value, skip_empty: bool) -> Result<Vec<&str>, InvalidRequest> {
+    match message.get("content") {
+        Some(Value::String(text)) if text.is_empty() && skip_empty => Ok(Vec::new()),
+        Some(Value::String(text)) => Ok(vec![text.as_str()]),
+        Some(Value::Array(parts)) => parts.iter().map(content_part).collect(),
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(_) => Err(invalid("message content must be a string or an array")),
+    }
+}
+
 /// The text of one content part; images and audio are refused.
 fn content_part(part: &Value) -> Result<&str, InvalidRequest> {
     if let Value::String(text) = part {
@@ -354,13 +472,19 @@ fn content_part(part: &Value) -> Result<&str, InvalidRequest> {
     }
 }
 
+/// The function name of a declared tool.
+pub fn tool_function_name(tool: &Value) -> Option<&str> {
+    tool.get("function")
+        .unwrap_or(tool)
+        .get("name")
+        .and_then(Value::as_str)
+}
+
 /// The declaration of one tool, with the template's keys.
 fn tool_spec(tool: &Value) -> Result<Value, InvalidRequest> {
     let function = tool.get("function").unwrap_or(tool);
-    let name = function
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("every tool needs a function name"))?;
+    let name =
+        tool_function_name(tool).ok_or_else(|| invalid("every tool needs a function name"))?;
     let description = function
         .get("description")
         .filter(|d| !is_empty(d))
@@ -464,6 +588,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn request_effort_and_enable_thinking() {
+        let off = json!({"enable_thinking": false});
+        let on = json!({"enable_thinking": true});
+        assert_eq!(request_effort(None, None).unwrap(), DEFAULT_EFFORT);
+        assert_eq!(request_effort(None, Some(&off)).unwrap(), 0.0);
+        assert_eq!(request_effort(None, Some(&on)).unwrap(), DEFAULT_EFFORT);
+        assert_eq!(
+            request_effort(Some(&json!("none")), Some(&off)).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            request_effort(Some(&json!("low")), Some(&off)).unwrap(),
+            0.2
+        );
+        assert_eq!(request_effort(Some(&Value::Null), Some(&off)).unwrap(), 0.0);
+        let kwarg = json!({"reasoning_effort": "medium", "enable_thinking": false});
+        assert_eq!(request_effort(None, Some(&kwarg)).unwrap(), 0.7);
+        assert!(request_effort(None, Some(&json!({"enable_thinking": "no"}))).is_err());
+    }
+
+    #[test]
     fn canonical_json_sorts_nested_keys() {
         let value = json!({"b": 1, "a": {"z": [1, {"y": 2, "x": 3}], "c": "é"}});
         assert_eq!(
@@ -549,6 +694,55 @@ pub(crate) mod tests {
              <|end_message|><|message_model|><|content_text|>It is 18 C and sunny.<|end_message|>\
              <|content_model_end_sampling|><|message_user|><|content_text|>Thanks<|end_message|>\
              <|message_user|><|content_text|>And tomorrow?<|end_message|><|message_model|>"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    fn render_endings() {
+        let vocab = vocab();
+        let tools = [json!({"type": "function", "function": {"name": "get_weather"}})];
+        let user = json!({"role": "user", "content": "Hi"});
+        let text = |messages: &[Value], ending| {
+            vocab.decode(&vocab.render_to(messages, &tools, 0.0, &ending).unwrap())
+        };
+        let head = "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\
+                    \"name\":\"get_weather\",\"parameters\":{},\"type\":\"function\"}]\
+                    <|end_message|><|message_system|><|content_text|>Thinking effort level: 0\
+                    <|end_message|><|message_user|><|content_text|>Hi<|end_message|>";
+        let alone = std::slice::from_ref(&user);
+        assert_eq!(text(alone, Ending::Bare), head);
+        assert_eq!(
+            text(alone, Ending::AnyCall),
+            format!("{head}<|message_model|><|content_invoke_tool_json|>")
+        );
+        assert_eq!(
+            text(alone, Ending::Call("get_weather")),
+            format!("{head}<|message_model|>get_weather<|content_invoke_tool_json|>")
+        );
+        let partial = json!({"role": "assistant", "reasoning_content": "Hm.",
+                             "content": "def f():"});
+        assert_eq!(
+            text(&[user.clone(), partial], Ending::Continue),
+            format!(
+                "{head}<|message_model|><|content_thinking|>Hm.<|end_message|>\
+                 <|message_model|><|content_text|>def f():"
+            )
+        );
+        let empty = json!({"role": "assistant", "content": null});
+        assert_eq!(
+            text(&[user.clone(), empty], Ending::Continue),
+            format!("{head}<|message_model|><|content_text|>")
+        );
+        assert!(
+            vocab
+                .render_to(alone, &tools, 0.0, &Ending::Continue)
+                .is_err()
+        );
+        assert!(
+            vocab
+                .render_to(alone, &tools, 0.0, &Ending::Call("other"))
+                .is_err()
         );
     }
 }

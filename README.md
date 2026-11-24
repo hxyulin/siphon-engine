@@ -82,9 +82,12 @@ It loads the model with FP8 dense weights and KV cache (`--weights bf16` and `--
 
 | Route | Notes |
 | --- | --- |
-| `POST /v1/chat/completions` | Messages rendered as the checkpoint's chat template renders them, with `stream`, `tools` and `reasoning_effort` (a name such as `low`, or 0 to 0.99; default 0.9). The model's thinking comes back as `reasoning_content`. Without streaming, `return_token_ids` also returns `prompt_token_ids` and each choice's `token_ids`, as vLLM does. |
-| `POST /v1/completions` | A text prompt or token ids, without streaming. |
-| `GET /v1/models`, `GET /health` | |
+| `POST /v1/chat/completions` | Messages rendered as the checkpoint's chat template renders them. Streams with `stream`, and `stream_options.include_usage` adds a usage chunk. The model's thinking comes back as `reasoning_content`. |
+| `POST /v1/completions` | A text prompt or token ids, streaming or not. The text includes any special tokens generated. |
+| `POST /tokenize`, `POST /detokenize` | vLLM's shape, also at `/v1/tokenize` and `/v1/detokenize`: `{"prompt"}` or `{"messages", "tools"}` to `{"tokens", "count", "max_model_len"}`, and `{"tokens"}` to `{"prompt"}`. |
+| `POST /v1/token/encode`, `POST /v1/token/decode` | TabbyAPI's shape: `{"text"}`, a string or messages, to `{"tokens", "length"}`, and `{"tokens"}` to `{"text"}`. |
+| `GET /v1/models`, `GET /v1/models/{id}` | The served model, with `max_model_len`. |
+| `GET /health`, `GET /version` | No API key needed. |
 
 With `--streams N` (1 to 8, default 1), up to N requests run at once and up to `--queue` (8) more wait. Each stream has its own KV cache of `--context` positions, and without `--context` the server takes the longest context at which N caches fit. A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of 2,048 tokens between the batch's steps. Either way each request gets the same tokens it would get alone. FP8 weights and cache, tok/s in all and per stream:
 
@@ -94,7 +97,18 @@ With `--streams N` (1 to 8, default 1), up to N requests run at once and up to `
 | 10,674 | 275 | 408, 204 | 576, 144 | 797, 100 |
 | 32,768 | 254 | 373, 186 | 513, 128 | 683, 85 |
 
-A batch of one runs about 23% slower than plain decode, and a request that speculates alone runs at 490 to 800 tok/s, so batching pays from about three streams on. Decoding is greedy, so `temperature`, `top_p` and other sampling fields are ignored. With `SIPHON_API_KEY` set, `/v1` routes need `Authorization: Bearer <key>`. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
+A batch of one runs about 23% slower than plain decode, and a request that speculates alone runs at 490 to 800 tok/s, so batching pays from about three streams on.
+
+Chat requests take these fields:
+
+- `reasoning_effort`: a name such as `low`, or 0 to 0.99; the default is 0.9. Without it, `chat_template_kwargs.reasoning_effort` counts, and `chat_template_kwargs.enable_thinking: false` means effort 0. The template has no switch that turns thinking off, so at effort 0 the model still writes a short thinking block.
+- `tools` and `tool_choice`: `auto`, `none`, `required`, or `{"type": "function", "function": {"name": ...}}`. A named function, or `required` with one tool, ends the prompt with that tool's call opened. `required` with several tools opens a call without a name, and the model names the tool in the call. A forced call skips the thinking block. The reply ends after the named call, or at the first text after the calls `required` forced. `parallel_tool_calls: false` ends the reply after its first call.
+- `stop`: a string or an array of strings. Stop strings match the reply's content, not its thinking or tool calls. Text that could still begin a stop string is held back while streaming. The reply is cut before the match, finishes with `stop`, and the job ends.
+- vLLM's extensions: `return_token_ids` adds `prompt_token_ids` and each choice's `token_ids`, streaming or not; the ids end with `<|content_model_end_sampling|>` when the model ended its turn. Each choice has `stop_reason`, the stop string that matched or null. `continue_final_message` with `add_generation_prompt: false` continues the last assistant message.
+
+Raw completions take `stop` and `return_token_ids` too. A text prompt, like the text sent to the tokenizer routes, is encoded with special-token spellings as plain text and nothing added; send token ids to use special tokens. Decoding keeps special tokens.
+
+Decoding is greedy, so `temperature`, `top_p`, `top_k`, `min_p`, the penalties, `seed` and other sampling fields are accepted and ignored, as are `user`, `skip_special_tokens` and unknown fields. Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `ignore_eos`, `min_tokens`, `stop_token_ids`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`. With `SIPHON_API_KEY` set, every route but `/health` and `/version` needs `Authorization: Bearer <key>`. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
 
 On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds without its engine, so its tests run but it cannot serve. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment.
 

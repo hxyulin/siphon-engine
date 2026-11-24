@@ -4,6 +4,9 @@ mod chat;
 mod engine;
 mod openai;
 mod parse;
+mod request;
+mod stop;
+mod tokenize;
 
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -29,7 +32,7 @@ counted shortlist), fp8, exact, or a +-joined set of fp8-backbone, fp8-head, fp8
 --fallback runs plain steps where no verify width is expected to be faster. It speeds up
 free prose, but where it steps depends on timings measured at startup, so the output can
 differ between runs.
-Set SIPHON_API_KEY to require `Authorization: Bearer <key>` on /v1 routes.";
+Set SIPHON_API_KEY to require `Authorization: Bearer <key>` on every route but /health and /version.";
 
 /// The prompt that prices the verify widths at startup.
 const WARMUP: &str = "Explain, step by step, how a hash map handles collisions, and compare \
