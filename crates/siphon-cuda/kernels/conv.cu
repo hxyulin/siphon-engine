@@ -436,6 +436,124 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
     }
 }
 
+namespace {
+
+// Words per row of a batched step's state table: the device addresses of the row's key
+// cache, value cache, and key, value, post-attention and post-MLP conv states.
+constexpr int kBatchStateWords = 6;
+
+__device__ __forceinline__ float* batch_state(const unsigned long long* states, int row, int word) {
+    return reinterpret_cast<float*>(states[size_t(row) * kBatchStateWords + word]);
+}
+
+}  // namespace
+
+// The post-attention short conv and residual add of a batched step, which
+// depth_attention_rows_2304 in routing.cu fuses for a chunk (kPartialConvResidual): row r
+// (blockIdx.y) convolves its own post-attention conv state (word 4 of its state table,
+// [3, 2304] F32, only read) and its attention output proj [rows, 2304], adds `hidden`
+// [rows, 2304] if not null, and writes the F32 sum to residual [rows, 2304]. Every value
+// rounds as in the fused kernel for a chunk of one row. Grid (2304 / 256, rows), 256
+// threads.
+extern "C" __global__ void __launch_bounds__(256)
+conv_residual_batch_2304(const __nv_bfloat16* proj, const __nv_bfloat16* __restrict__ weight,
+                         const unsigned long long* states, const __nv_bfloat16* hidden, float* residual) {
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    float taps[kKernel];
+    load_bf16x4(weight + size_t(c) * kKernel, taps);
+    pdl_trigger();
+    pdl_wait();
+    const float* state = batch_state(states, r, 4);
+    const size_t at = size_t(r) * kHidden + c;
+    float win[kKernel];
+#pragma unroll
+    for (int k = 0; k < kKernel - 1; ++k) {
+        win[k] = state[size_t(k) * kHidden + c];
+    }
+    win[kKernel - 1] = __bfloat162float(proj[at]);
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(win[k]), taps[k]));
+    }
+    const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), win[kKernel - 1]), kShortDivisor));
+    residual[at] = hidden != nullptr ? __fadd_rn(__bfloat162float(hidden[at]), y) : y;
+}
+
+// moe_conv_residual_step_rows_2304 for the rows of a batched step, each from its own
+// sequence: row r (blockIdx.y) combines its experts, convolves its own post-MLP conv state
+// (word 5 of its state table) and the combine, adds the residual, and shifts its four conv
+// inputs (k_raw, v_raw [rows, 1024], proj [rows, 2304] and the combine) into its own four
+// states (words 2 to 5). Every value rounds as in moe_conv_residual_step_rows_2304 for a
+// step of one row. Grid (2304 / 256, rows), 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+moe_conv_residual_batch_2304(const __nv_bfloat16* experts, const float* weights,
+                             const __nv_bfloat16* __restrict__ weight, const float* residual,
+                             __nv_bfloat16* __restrict__ out, const __nv_bfloat16* proj, const __nv_bfloat16* k_raw,
+                             const __nv_bfloat16* v_raw, const unsigned long long* states) {
+    constexpr int kOld = kKernel - 1;
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool kv = c < kKvDims;
+    float taps[kKernel];
+    load_bf16x4(weight + size_t(c) * kKernel, taps);
+    pdl_trigger();
+    pdl_wait();
+    float e[kTopK];
+    float w[kTopK];
+#pragma unroll
+    for (int x = 0; x < kTopK; ++x) {
+        e[x] = __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]);
+        w[x] = weights[size_t(r) * kTopK + x];
+    }
+    const size_t at = size_t(r) * kHidden + c;
+    const float res = residual[at];
+    float* const state = batch_state(states, r, 5);
+    float* const proj_state = batch_state(states, r, 4);
+    float* const k_state = batch_state(states, r, 2);
+    float* const v_state = batch_state(states, r, 3);
+    float comb[kKernel];
+    float proj_old[kOld];
+    float k_old[kOld];
+    float v_old[kOld];
+#pragma unroll
+    for (int k = 0; k < kOld; ++k) {
+        comb[k] = state[size_t(k) * kHidden + c];
+        proj_old[k] = proj_state[size_t(k) * kHidden + c];
+        if (kv) {
+            k_old[k] = k_state[size_t(k) * kKvDims + c];
+            v_old[k] = v_state[size_t(k) * kKvDims + c];
+        }
+    }
+    float total = 0.f;
+#pragma unroll
+    for (int x = 0; x < kTopK; ++x) {
+        total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+    }
+    const float mine = round_bf16(total);
+    comb[kOld] = mine;
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(comb[k]), taps[k]));
+    }
+    const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), mine), kShortDivisor));
+    out[at] = __float2bfloat16(__fadd_rn(res, y));
+    // Each state drops its oldest row and takes the row's input.
+#pragma unroll
+    for (int k = 0; k < kOld; ++k) {
+        state[size_t(k) * kHidden + c] = comb[k + 1];
+        proj_state[size_t(k) * kHidden + c] =
+            k + 1 < kOld ? proj_old[k + 1] : __bfloat162float(proj[at]);
+        if (kv) {
+            const size_t kv_at = size_t(r) * kKvDims + c;
+            k_state[size_t(k) * kKvDims + c] = k + 1 < kOld ? k_old[k + 1] : __bfloat162float(k_raw[kv_at]);
+            v_state[size_t(k) * kKvDims + c] = k + 1 < kOld ? v_old[k + 1] : __bfloat162float(v_raw[kv_at]);
+        }
+    }
+}
+
 // Shifts the conv inputs x [rows, dims] of a chunk into state [3, dims]: afterwards the
 // state holds the last three rows of the old state followed by x. One thread per channel.
 extern "C" __global__ void shift_state_rows(const __nv_bfloat16* x, float* state,

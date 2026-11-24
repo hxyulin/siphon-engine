@@ -1,6 +1,6 @@
 # Siphon
 
-Siphon is an inference engine for one model, [Inkling 2 Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/), on one NVIDIA RTX 5090. The host code is Rust; the kernels are CUDA C++ written for this model and this GPU (`sm_120a`). It serves one sequence at a time and aims to keep decode close to the time it takes to read the weights from memory.
+Siphon is an inference engine for one model, [Inkling 2 Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/), on one NVIDIA RTX 5090. The host code is Rust; the kernels are CUDA C++ written for this model and this GPU (`sm_120a`). It aims to keep decode close to the time it takes to read the weights from memory. One sequence decodes with speculation; up to 8 decode together in batches.
 
 It runs the official checkpoint as published: NVFP4 and MXFP8 routed experts, BF16 dense weights and the bundled DSpark draft. Its output is checked against MLX-LM, layer by layer and over long texts.
 
@@ -38,10 +38,11 @@ The speedup depends on how predictable the text is. The DSpark draft's first tok
 - Chunked prefill of up to 2,048 rows on tensor-core GEMMs, an expert-grouped MoE GEMM and flash attention.
 - Opt-in FP8 copies of the dense weights (`--weights fp8`), an FP8 global KV cache (`--kv fp8`) and quantized expert activations for prefill (`--expert-activations quantized`).
 - Greedy speculative decoding with the DSpark draft. The verify pass gives each row the same result at every width, so speculation returns exactly the tokens that verifying one row at a time would. Each round picks its width from the drafts' confidences. With `--fallback` the speculator runs plain steps where the draft cannot predict the text, such as free prose; the output is then greedy along its own path and can differ between runs. `--drafter DIR` runs Inco AI's DFlash 2 drafter or a DFlash draft exported by the 2DSD project instead.
-- An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions.
+- Batched greedy decode of up to 8 sequences, each in its own KV cache, through the verify pass's multi-row kernels. Each sequence gets the same tokens as with speculation alone ([docs/batching.md](docs/batching.md)).
+- An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions, with continuous batching.
 - A quality gate that compares the engine with MLX over long texts, and parity tests per layer visit.
 
-Not yet: sampling other than greedy, probabilistic acceptance, batching several sequences, prefix caching, stop sequences.
+Not yet: sampling other than greedy, probabilistic acceptance, speculation for more than one sequence at a time, prefix caching, stop sequences.
 
 ## Build
 
@@ -85,7 +86,15 @@ It loads the model with FP8 dense weights and KV cache (`--weights bf16` and `--
 | `POST /v1/completions` | A text prompt or token ids, without streaming. |
 | `GET /v1/models`, `GET /health` | |
 
-Requests run one at a time, in arrival order, and up to `--queue` (8) wait. Decoding is greedy, so `temperature`, `top_p` and other sampling fields are ignored. With `SIPHON_API_KEY` set, `/v1` routes need `Authorization: Bearer <key>`. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
+With `--streams N` (1 to 8, default 1), up to N requests run at once and up to `--queue` (8) more wait. Each stream has its own KV cache of `--context` positions, and without `--context` the server takes the longest context at which N caches fit. A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of 2,048 tokens between the batch's steps. Either way each request gets the same tokens it would get alone. FP8 weights and cache, tok/s in all and per stream:
+
+| Context of each stream | 1 stream | 2 | 4 | 8 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 300 | 457, 229 | 666, 166 | 971, 121 |
+| 10,674 | 275 | 408, 204 | 576, 144 | 797, 100 |
+| 32,768 | 254 | 373, 186 | 513, 128 | 683, 85 |
+
+A batch of one runs about 23% slower than plain decode, and a request that speculates alone runs at 490 to 800 tok/s, so batching pays from about three streams on. Decoding is greedy, so `temperature`, `top_p` and other sampling fields are ignored. With `SIPHON_API_KEY` set, `/v1` routes need `Authorization: Bearer <key>`. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
 
 On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds without its engine, so its tests run but it cannot serve. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment.
 

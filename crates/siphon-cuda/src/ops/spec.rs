@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg as _,
 };
 use half::bf16;
 
@@ -25,6 +25,18 @@ pub const KV_DIMS: usize = 1024;
 pub const TAPS: usize = 4;
 /// Most feature taps per row that a [`TapLayout`] may ask for.
 pub const MAX_TAPS: usize = 8;
+
+/// Words per row of a batched step's state table: the device addresses of the row's key
+/// cache, value cache, and key, value, post-attention and post-MLP conv states.
+pub const BATCH_STATE_WORDS: usize = 6;
+
+/// Where the rows of a batched step keep their state in one visit: each row's line of the
+/// visit's state table (`[rows, BATCH_STATE_WORDS]` device addresses) and its position
+/// (`[rows]`). Each row is the next token of its own sequence.
+pub struct BatchRows<'a> {
+    pub states: CudaView<'a, u64>,
+    pub positions: CudaView<'a, u32>,
+}
 
 /// The hidden states a draft reads for each row: the partial block entering each visit of
 /// `visits`, in order, then the final normed hidden state if `final_hidden` is set.

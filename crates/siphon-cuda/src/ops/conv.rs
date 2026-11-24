@@ -13,7 +13,10 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::{
+    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    ops::spec::BATCH_STATE_WORDS,
+};
 
 /// Taps per channel.
 const KERNEL: usize = 4;
@@ -65,6 +68,8 @@ pub struct Conv {
     short_conv_residual_rows_2304: CudaFunction,
     moe_conv_residual_rows_2304: CudaFunction,
     moe_conv_residual_step_rows_2304: CudaFunction,
+    residual_batch_2304: CudaFunction,
+    moe_conv_residual_batch_2304: CudaFunction,
     shift_state_rows: CudaFunction,
 }
 
@@ -114,6 +119,8 @@ impl Conv {
             moe_conv_residual_rows_2304: module.load_function("moe_conv_residual_rows_2304")?,
             moe_conv_residual_step_rows_2304: module
                 .load_function("moe_conv_residual_step_rows_2304")?,
+            residual_batch_2304: module.load_function("conv_residual_batch_2304")?,
+            moe_conv_residual_batch_2304: module.load_function("moe_conv_residual_batch_2304")?,
             shift_state_rows: module.load_function("shift_state_rows")?,
         })
     }
@@ -459,6 +466,109 @@ impl Conv {
         // of the 1024 key and value channels below 1024) in one row, with every row of a
         // channel in the same block.
         unsafe { args.launch_pdl(stream, &self.moe_conv_residual_step_rows_2304, config) }
+    }
+
+    /// The post-attention short conv and residual add of a batched step: row `r` of `proj`
+    /// (`[rows, 2304]`, the attention output projection) convolves with its own
+    /// post-attention conv state, which `states` names, adds row `r` of `hidden` if given,
+    /// and goes to `residual` (`[rows, 2304]`, F32). The state is only read. Each row
+    /// rounds as `Routing::depth_attention_rows` computes its `ConvResidual` partial for a
+    /// chunk of that one row.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn conv_residual_batch(
+        &self,
+        stream: &CudaStream,
+        proj: &impl DeviceIn<bf16>,
+        weight: &CudaSlice<bf16>,
+        states: &CudaView<'_, u64>,
+        hidden: Option<&CudaView<'_, bf16>>,
+        residual: &mut impl DeviceOut<f32>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let proj = proj.view();
+        let mut residual = residual.view_mut();
+        ensure!(
+            (1..=MOE_CONV_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {MOE_CONV_ROWS}"
+        );
+        check_len("weight", weight.len(), HIDDEN * KERNEL)?;
+        check_len("proj", proj.len(), rows * HIDDEN)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        check_len("states", states.len(), rows * BATCH_STATE_WORDS)?;
+        if let Some(hidden) = hidden {
+            check_len("hidden", hidden.len(), rows * HIDDEN)?;
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&proj, stream)
+            .ptr(weight, stream)
+            .ptr(states, stream)
+            .opt(hidden, stream)
+            .ptr_mut(&mut residual, stream);
+        // SAFETY: the arguments match `conv_residual_batch_2304(const bf16*, const bf16*,
+        // const unsigned long long*, const bf16*, float*)`. Every buffer holds `rows` rows
+        // as checked above, the grid has one y index per row and 9 blocks of 256 channels,
+        // and the caller keeps each row's post-attention state, word 4 of its state table, a
+        // live `[3, 2304]` F32 buffer. Before `pdl_wait` the kernel reads only the weight.
+        unsafe { args.launch_pdl(stream, &self.residual_batch_2304, hidden_rows_config(rows)?) }
+    }
+
+    /// [`Conv::moe_conv_residual_step_rows`] for the rows of a batched step, each with its
+    /// own conv states, which `states` names: each row combines its experts, convolves
+    /// its own post-MLP state and the combine, adds its residual into `out`, and shifts its
+    /// `k_raw`, `v_raw`, `proj` and combine rows into its own four states. Each row rounds
+    /// as a step of that one row.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn moe_conv_residual_batch(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        residual: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<bf16>,
+        [proj, k_raw, v_raw]: [CudaView<'_, bf16>; 3],
+        states: &CudaView<'_, u64>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
+        let mut out = out.view_mut();
+        ensure!(
+            (1..=MOE_CONV_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {MOE_CONV_ROWS}"
+        );
+        check_len("weight", weight.len(), HIDDEN * KERNEL)?;
+        check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
+        check_len("weights", weights.len(), rows * TOP_K)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        check_len("out", out.len(), rows * HIDDEN)?;
+        check_len("proj", proj.len(), rows * HIDDEN)?;
+        check_len("k_raw", k_raw.len(), rows * DYNAMIC_DIMS)?;
+        check_len("v_raw", v_raw.len(), rows * DYNAMIC_DIMS)?;
+        check_len("states", states.len(), rows * BATCH_STATE_WORDS)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&experts, stream)
+            .ptr(&weights, stream)
+            .ptr(weight, stream)
+            .ptr(&residual, stream)
+            .ptr_mut(&mut out, stream)
+            .ptr(&proj, stream)
+            .ptr(&k_raw, stream)
+            .ptr(&v_raw, stream)
+            .ptr(states, stream);
+        // SAFETY: the arguments match `moe_conv_residual_batch_2304(const bf16*, const float*,
+        // const bf16*, const float*, bf16*, const bf16*, const bf16*, const bf16*, const
+        // unsigned long long*)`. Every buffer holds `rows` rows as checked above, the grid
+        // has one y index per row and 9 blocks of 256 channels, and the caller keeps each
+        // row's four conv states, words 2 to 5 of its state table, live buffers of
+        // `[3, 1024]`, `[3, 1024]`, `[3, 2304]` and `[3, 2304]` F32, distinct between rows.
+        // Before `pdl_wait` the kernel reads only the weight.
+        unsafe {
+            args.launch_pdl(
+                stream,
+                &self.moe_conv_residual_batch_2304,
+                hidden_rows_config(rows)?,
+            )
+        }
     }
 
     /// Shifts the conv inputs `x` (`[rows, dims]`) of a chunk into `state` (`[3, dims]`),

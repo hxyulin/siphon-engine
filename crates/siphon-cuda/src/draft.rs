@@ -941,6 +941,17 @@ impl Draft {
         self.committed
     }
 
+    /// Treats every position below `position` as committed without computing it, for
+    /// benchmarks at long contexts. Drafts after this are not meaningful.
+    pub fn skip_to_for_benchmark(&mut self, position: usize) -> anyhow::Result<()> {
+        ensure!(
+            position <= self.capacity,
+            "the draft's cache cannot hold position {position}"
+        );
+        self.committed = position;
+        Ok(())
+    }
+
     /// Forgets every committed position and the shortlist's context tokens, for a new
     /// sequence.
     pub fn reset(&mut self) {

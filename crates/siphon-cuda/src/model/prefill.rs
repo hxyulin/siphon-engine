@@ -20,7 +20,7 @@ use siphon::TextConfig;
 
 use super::{
     Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, Upcoming, VisitState, Window,
-    verify::VerifyBuffers, visit_plan, zeros,
+    batch::BatchBuffers, verify::VerifyBuffers, visit_plan, zeros,
 };
 use crate::{
     ops::{
@@ -31,7 +31,7 @@ use crate::{
         misc::{GATE_SLOTS, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsPartial},
-        spec::{TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
+        spec::{BatchRows, TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -133,6 +133,9 @@ pub(super) struct PrefillScratch {
     pub(super) taps: Option<CudaSlice<bf16>>,
     /// The verify pass's own state, in the verify scratch only.
     pub(super) verify: Option<VerifyBuffers>,
+    /// A batched step's own state, in the batch scratch only: each row is then the next
+    /// token of its own sequence (see `model/batch.rs`).
+    pub(super) batch: Option<BatchBuffers>,
     pub(super) tokens: CudaSlice<i32>,
     /// The position of the chunk's first row.
     pub(super) start: CudaSlice<u32>,
@@ -192,6 +195,7 @@ impl PrefillScratch {
             tap_layout: TapLayout::stock(),
             taps: None,
             verify: None,
+            batch: None,
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
             embedded: zeros(stream, rows * hidden)?,
@@ -469,6 +473,11 @@ impl Ctx {
     /// states and the ring slots it will overwrite, records each visit's conv inputs, and
     /// ends with every row's logits and greedy token, the acceptance and the rollback (see
     /// `kernels/spec.cu`). The decode scratch is left alone.
+    ///
+    /// In the batch scratch, the chunk is a batched step instead: row r is the next token of
+    /// its own sequence, whose caches, conv states and position the batch's state tables
+    /// give, and `visits` only gives each visit's cache sizes and formats. It ends with
+    /// every row's logits and greedy token. The decode scratch is left alone.
     #[expect(clippy::too_many_arguments, reason = "the parts of Model a chunk uses")]
     #[expect(
         clippy::too_many_lines,
@@ -495,7 +504,8 @@ impl Ctx {
         // weights the prefetch made every width slower, paced or not: at 10,674 tokens and
         // 1, 4 and 8 rows, 5.61, 7.68 and 9.89 ms with it against 5.38, 7.20 and 9.29
         // without.
-        let prefetch = p.verify.is_some() && self.weights.lm_head_fp8.is_some();
+        let prefetch =
+            (p.verify.is_some() || p.batch.is_some()) && self.weights.lm_head_fp8.is_some();
         let plan = visit_plan(cfg, passes);
         if prefetch {
             let (layer, messages) = plan.first().context("no visits")?.0;
@@ -506,10 +516,12 @@ impl Ctx {
             )?;
         }
         // The sliding rings as decode prefetches them (see `Ctx::prefetch_rest`), from the
-        // first row's position.
+        // first row's position. A batched step's rows read rings of their own slots, which
+        // `visits` does not hold, so it prefetches none.
         let position = p.start.device_ptr(&self.stream).0;
         let windows: Vec<Option<Window>> = visits
             .iter()
+            .filter(|_| p.batch.is_none())
             .map(|v| {
                 v.kv.ring_buffers(&self.stream)
                     .map(|(buffers, slot_bytes)| Window {
@@ -678,6 +690,9 @@ impl Ctx {
         if verify {
             return self.verify_head(p, m);
         }
+        if p.batch.is_some() {
+            return self.batch_head(p, m);
+        }
         if skip_logits {
             return Ok(());
         }
@@ -797,6 +812,35 @@ impl Ctx {
         )
     }
 
+    /// The end of a batched step of `m` rows: every row's logits and greedy token.
+    fn batch_head(&self, p: &mut PrefillScratch, m: usize) -> anyhow::Result<()> {
+        let cfg = &self.config;
+        let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
+        self.gemm_rows(
+            &mut [RowProduct {
+                weight: &self.weights.lm_head,
+                fp8: self.weights.lm_head_fp8.as_ref(),
+                x: rows(&p.final_hidden, m, self.hidden()),
+                out: rows_mut(&mut p.head_logits, m, padded),
+            }],
+            m,
+            true,
+        )?;
+        self.kernels.elementwise.logit_softcap(
+            &self.stream,
+            &rows(&p.head_logits, m, padded),
+            &mut rows_mut(&mut p.head_capped, m, vocab),
+            cfg.final_logit_softcapping,
+        )?;
+        let b = p.batch.as_mut().context("the batch buffers are missing")?;
+        self.kernels.misc.argmax_f32(
+            &self.stream,
+            &rows(&p.head_capped, m, vocab),
+            &mut b.argmax_mut().slice_mut(..m),
+            vocab,
+        )
+    }
+
     /// One decoder-layer visit for a chunk, as [`Ctx::visit`] for one row, from
     /// `p.hidden` to `p.out`; the two then swap.
     #[expect(
@@ -817,6 +861,11 @@ impl Ctx {
         let hidden = self.hidden();
         let kv_dims = self.config.num_key_value_heads * self.config.head_dim;
         let mh = m * hidden;
+        let batch = p.batch.as_ref().map(|b| b.rows(index, m));
+        ensure!(
+            batch.is_none() || m <= STEP_ROWS,
+            "a batched step takes at most {STEP_ROWS} rows"
+        );
         if p.record_taps
             && let Some(tap) = p.tap_layout.visits.iter().position(|&v| v == index)
         {
@@ -892,6 +941,7 @@ impl Ctx {
             sliding,
             [q_in, k_in, v_in].map(|x| rows(x, m, hidden)),
             m,
+            batch.as_ref(),
         )?;
         // Up to STEP_ROWS rows, the kernel that ends the visit shifts every conv state.
         let step = m <= STEP_ROWS;
@@ -925,17 +975,35 @@ impl Ctx {
                 ],
             ),
         };
+        // A batched step convolves each row with its own state first, and depth attention
+        // reads the residual back; the values are the fused kernel's.
+        if let Some(batch) = &batch {
+            self.kernels.conv.conv_residual_batch(
+                &self.stream,
+                &rows(&p.attention.proj, m, hidden),
+                &w.post_attention_conv,
+                &batch.states,
+                (!block_start).then(|| rows(&p.hidden, m, hidden)).as_ref(),
+                &mut rows_mut(&mut p.residual, m, hidden),
+                m,
+            )?;
+        }
+        let partial = if batch.is_some() {
+            RowsPartial::F32(rows(&p.residual, m, hidden))
+        } else {
+            RowsPartial::ConvResidual {
+                x: rows(&p.attention.proj, m, hidden),
+                weight: &w.post_attention_conv,
+                state: state.conv[2].as_view(),
+                hidden: (!block_start).then(|| rows(&p.hidden, m, hidden)),
+                residual: rows_mut(&mut p.residual, m, hidden),
+            }
+        };
         self.kernels.routing.depth_attention_rows(
             &self.stream,
             DepthRows {
                 blocks: blocks.rows(&p.blocks, mh)?,
-                partial: RowsPartial::ConvResidual {
-                    x: rows(&p.attention.proj, m, hidden),
-                    weight: &w.post_attention_conv,
-                    state: state.conv[2].as_view(),
-                    hidden: (!block_start).then(|| rows(&p.hidden, m, hidden)),
-                    residual: rows_mut(&mut p.residual, m, hidden),
-                },
+                partial,
                 normed_partial: None,
                 queries: &w.mlp_query,
                 out: mlp_out,
@@ -984,6 +1052,25 @@ impl Ctx {
             self.prefetch_rest(layer, messages, after, true, after_window)?;
         }
 
+        if let Some(batch) = &batch {
+            self.kernels.conv.moe_conv_residual_batch(
+                &self.stream,
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
+                &w.post_mlp_conv,
+                &rows(&p.residual, m, hidden),
+                &mut rows_mut(&mut p.out, m, hidden),
+                [
+                    rows(&p.attention.proj, m, hidden),
+                    rows(&p.attention.k_raw, m, kv_dims),
+                    rows(&p.attention.v_raw, m, kv_dims),
+                ],
+                &batch.states,
+                m,
+            )?;
+            std::mem::swap(&mut p.hidden, &mut p.out);
+            return Ok(());
+        }
         if step {
             let [k_state, v_state, proj_state, moe_state] = &mut state.conv;
             let len = VERIFY_ROWS * VISIT_CHANNELS;
@@ -1151,6 +1238,9 @@ impl Ctx {
     }
 
     /// [`Ctx::attention`] for a chunk of `m` rows. `start` holds the first row's position.
+    /// With `batch`, each row is the next token of its own sequence instead, with the
+    /// caches, conv states and position `batch` gives; `state` then only gives the cache's
+    /// size and format.
     #[expect(
         clippy::too_many_arguments,
         reason = "the attention inputs and outputs"
@@ -1165,6 +1255,7 @@ impl Ctx {
         sliding: bool,
         [q_in, k_in, v_in]: [CudaView<'_, bf16>; 3],
         m: usize,
+        batch: Option<&BatchRows<'_>>,
     ) -> anyhow::Result<()> {
         fn product<'a>(
             (weight, fp8): (&'a CudaSlice<bf16>, Option<&'a Fp8Matrix>),
@@ -1255,6 +1346,7 @@ impl Ctx {
                         rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
                     )
                 }),
+                batch,
             },
             m,
         )?;
@@ -1285,7 +1377,23 @@ impl Ctx {
             )?;
         }
 
-        if invariant {
+        if let Some(batch) = batch {
+            ensure!(invariant, "a batched step runs the invariant kernels");
+            self.kernels.attention.attention_batch(
+                &self.stream,
+                &rows(&t.q, m, q_dims),
+                &rows(&t.k, m, kv_dims),
+                &rows(&t.v, m, kv_dims),
+                &state.kv,
+                batch,
+                m,
+                &rows(&t.bias, m, heads * cfg.rel_extent),
+                &rows(&t.sinks, m, heads),
+                Some(&rows(&t.gate, m, q_dims)),
+                &mut t.rows,
+                &mut rows_mut(&mut t.gated, m, q_dims),
+            )?;
+        } else if invariant {
             self.kernels.attention.attention_rows(
                 &self.stream,
                 &rows(&t.q, m, q_dims),

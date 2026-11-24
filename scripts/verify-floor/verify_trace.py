@@ -17,7 +17,7 @@ import json
 import sqlite3
 
 CLASSES = [
-    ("attention", ("attention_rows_", "attention_post_rows")),
+    ("attention", ("attention_rows_", "attention_batch_", "attention_post_rows")),
     ("dense", ("rows_fp8_k2304", "rows_fp8_k3072")),
     ("experts", ("expert_mlp_rows",)),
     ("router", ("moe_router_step_rows",)),

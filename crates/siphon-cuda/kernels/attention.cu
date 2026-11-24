@@ -3064,6 +3064,64 @@ ATTENTION_ROWS(1)
 ATTENTION_ROWS(2)
 ATTENTION_ROWS(3)
 
+// Words per row of a batched step's state table (see `BATCH_STATE_WORDS` in ops/spec.rs):
+// the device addresses of the row's key cache, value cache, and key, value,
+// post-attention and post-MLP conv states.
+constexpr int kBatchStateWords = 6;
+
+// The attention of a batched step: row z of the batch (blockIdx.z), each from its own
+// sequence, attends from its query into its own cache at its own position, as
+// attention_rows does for one row, and appends its key and value there. states: the
+// rows' state tables, [rows, kBatchStateWords] addresses; positions: [rows]. q, k_new,
+// v_new, bias, sinks, gate and out are [rows, ...] as in attention_rows; each row takes
+// its own 24 query rows of the partials and its own 16 counters ([rows, 16]). A one-row
+// instance has 3 combiners, so at most 2 blocks per instance wait: 128 in a batch of 8,
+// fewer than the GPU holds at once, so the blocks they wait for always get an SM.
+// Grid (8, kRowsBlocks + kRowsRecentBlocks, rows), 128 threads, sizeof(RowsShared<F>)
+// bytes of dynamic shared memory.
+template <class F>
+__device__ __forceinline__ void attention_batch(const __nv_bfloat16* q, const __nv_bfloat16* k_new,
+                                                const __nv_bfloat16* v_new, const unsigned long long* states,
+                                                const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                                                float* partial_out, float* partial_max, float* partial_sum,
+                                                unsigned* counters, __nv_bfloat16* out, const __nv_bfloat16* gate,
+                                                const unsigned* positions, unsigned slots, unsigned window,
+                                                unsigned extent, float scale, char* smem) {
+    const size_t z = blockIdx.z;
+    const size_t q_at = z * kHeads * kHeadDim;
+    const size_t kv_at = z * kKvRow;
+    const size_t query0 = z * kHeads * kRowsParts;
+    auto* const k_cache = reinterpret_cast<typename F::Elem*>(states[z * kBatchStateWords]);
+    auto* const v_cache = reinterpret_cast<typename F::Elem*>(states[z * kBatchStateWords + 1]);
+    attention_rows<F, 1>(q + q_at, k_new + kv_at, v_new + kv_at, k_cache, v_cache, bias + z * kHeads * extent,
+                         sinks + z * kHeads, partial_out + query0 * kHeadDim, partial_max + query0,
+                         partial_sum + query0, counters + z * 2 * kKvHeads, out + q_at,
+                         gate != nullptr ? gate + q_at : nullptr, positions + z, 1, slots, window, extent, scale,
+                         smem);
+}
+
+extern "C" __global__ void __launch_bounds__(kRowsThreads, 2)
+attention_batch_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+                     const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                     float* partial_out, float* partial_max, float* partial_sum, unsigned* counters,
+                     __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, unsigned slots,
+                     unsigned window, unsigned extent, float scale) {
+    extern __shared__ __align__(16) char rows_smem[];
+    attention_batch<Bf16Format>(q, k_new, v_new, states, bias, sinks, partial_out, partial_max, partial_sum,
+                                counters, out, gate, positions, slots, window, extent, scale, rows_smem);
+}
+
+extern "C" __global__ void __launch_bounds__(kRowsThreads, 2)
+attention_batch_fp8(const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+                    const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                    float* partial_out, float* partial_max, float* partial_sum, unsigned* counters,
+                    __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, unsigned slots,
+                    unsigned window, unsigned extent, float scale) {
+    extern __shared__ __align__(16) char rows_smem[];
+    attention_batch<Fp8Format>(q, k_new, v_new, states, bias, sinks, partial_out, partial_max, partial_sum,
+                               counters, out, gate, positions, slots, window, extent, scale, rows_smem);
+}
+
 // The launcher passes these as the dynamic shared memory of the two kernels.
 static_assert(sizeof(RowsShared<Bf16Format>) == 32768);
 static_assert(sizeof(RowsShared<Fp8Format>) == 49152);

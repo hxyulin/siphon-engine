@@ -11,11 +11,14 @@
 //!
 //! [`Model::prefill`] runs a prompt in chunks of many rows instead; see [`prefill`].
 //! [`Model::verify`] runs the anchor and drafts of a speculative round through the same
-//! multi-row path; see [`verify`].
+//! multi-row path; see [`verify`]. [`Model::step_batch`] runs the next token of several
+//! sequences through it, each in its own slot; see [`batch`].
 
+mod batch;
 mod prefill;
 mod verify;
 
+pub use batch::BATCH_ROWS;
 pub use prefill::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits};
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
@@ -323,6 +326,14 @@ pub struct Model {
     verify_rows: usize,
     /// The feature taps that prefill with taps and verify record for the draft.
     tap_layout: crate::ops::spec::TapLayout,
+    /// Sequence slots besides slot 0, the state above.
+    slots: Vec<batch::Slot>,
+    /// Buffers of [`Model::step_batch`], allocated on its first call.
+    batch: Option<prefill::PrefillScratch>,
+    /// The captured batched step of each size from 1 to [`BATCH_ROWS`].
+    batch_graphs: Vec<Option<StepGraph>>,
+    /// Whether batched steps record each row's taps ([`Model::set_batch_taps`]).
+    batch_taps: bool,
 }
 
 /// Everything a step reads but does not change.
@@ -478,6 +489,10 @@ impl Model {
             verify_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
             verify_rows: 0,
             tap_layout: crate::ops::spec::TapLayout::stock(),
+            slots: Vec::new(),
+            batch: None,
+            batch_graphs: (0..BATCH_ROWS).map(|_| None).collect(),
+            batch_taps: false,
         })
     }
 
@@ -485,6 +500,10 @@ impl Model {
     /// and starts a new sequence. The kernels still see only the window. Captured graphs
     /// are dropped, since they hold the old rings.
     pub fn set_ring_slots(&mut self, slots: usize) -> anyhow::Result<()> {
+        ensure!(
+            self.slots.is_empty(),
+            "the ring size changes only without other sequence slots"
+        );
         let window = self.ctx.config.sliding_window_size;
         for v in &mut self.visits {
             if v.kv.window().is_some() {
@@ -495,6 +514,8 @@ impl Model {
         self.tap_graph = None;
         self.verify = None;
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.batch = None;
+        self.batch_graphs.iter_mut().for_each(|g| *g = None);
         self.reset()
     }
 
@@ -505,8 +526,8 @@ impl Model {
         &self.tap_layout
     }
 
-    /// Records the taps of `layout` from now on. Drops the verify buffers and graphs when
-    /// the layout changes, since they hold the old taps.
+    /// Records the taps of `layout` from now on. Drops the verify and batch buffers and
+    /// graphs when the layout changes, since they hold the old taps.
     pub fn set_tap_layout(&mut self, layout: crate::ops::spec::TapLayout) -> anyhow::Result<()> {
         let visits = self.visits.len();
         ensure!(
@@ -526,6 +547,8 @@ impl Model {
             self.step_taps = None;
             self.verify = None;
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch = None;
+            self.batch_graphs.iter_mut().for_each(|g| *g = None);
         }
         Ok(())
     }

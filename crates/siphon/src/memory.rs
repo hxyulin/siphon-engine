@@ -118,6 +118,9 @@ pub struct PlanInputs<'a> {
     pub draft: DraftChoice<'a>,
     /// Rows of the largest prefill chunk, or 0 if nothing prefills.
     pub prefill_chunk: usize,
+    /// Sequence slots, each with its own caches of the capacity, 1 to [`VERIFY_ROWS`].
+    /// More than one adds the batched step's buffers.
+    pub streams: usize,
 }
 
 /// Device bytes of one configuration at one capacity, by what holds them.
@@ -125,14 +128,18 @@ pub struct PlanInputs<'a> {
 pub struct Plan {
     /// Positions of the global KV caches.
     pub capacity: usize,
+    /// Sequence slots, each with caches of `capacity` positions.
+    pub streams: usize,
     /// The target's checkpoint tensors.
     pub weights: usize,
     /// The FP8 copies decode reads ([`WeightFormat::Fp8`]).
     pub fp8_copies: usize,
-    /// The target's global KV caches.
+    /// The target's global KV caches, of every slot.
     pub kv: usize,
-    /// The sliding rings, the conv states and the decode step's buffers.
+    /// The sliding rings and the conv states of every slot, and the decode step's buffers.
     pub rings: usize,
+    /// The batched step's buffers, with more than one slot.
+    pub batch: usize,
     /// The prefill chunk's buffers.
     pub prefill: usize,
     /// The verify pass's buffers and the speculator's.
@@ -154,6 +161,7 @@ impl Plan {
             + self.fp8_copies
             + self.kv
             + self.rings
+            + self.batch
             + self.prefill
             + self.verify
             + self.draft
@@ -184,6 +192,7 @@ impl fmt::Display for Plan {
             ("FP8 copies", self.fp8_copies),
             ("KV", self.kv),
             ("rings", self.rings),
+            ("batch", self.batch),
             ("prefill", self.prefill),
             ("verify", self.verify),
             ("draft", self.draft),
@@ -195,9 +204,14 @@ impl fmt::Display for Plan {
             .filter(|(_, bytes)| *bytes > 0)
             .map(|(name, bytes)| format!("{name} {}", gib(*bytes)))
             .collect();
+        let streams = if self.streams > 1 {
+            format!(" x {} streams", self.streams)
+        } else {
+            String::new()
+        };
         write!(
             f,
-            "{} GiB for {} positions ({})",
+            "{} GiB for {} positions{streams} ({})",
             gib(self.total()),
             self.capacity,
             listed.join(", ")
@@ -256,8 +270,14 @@ impl Planner {
         };
         let taps = draft.as_ref().map_or(0, |(d, _)| d.taps);
 
-        let rings = sliding_visits * c.sliding_window_size * 2 * kv_dims * 2
-            + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4
+        let streams = inputs.streams;
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&streams),
+            "{streams} streams; 1 to {VERIFY_ROWS} fit a batched step"
+        );
+        let rings = streams
+            * (sliding_visits * c.sliding_window_size * 2 * kv_dims * 2
+                + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4)
             + c.vocab_size * 2
             + c.unpadded_vocab_size * 4;
         let prefill = if inputs.prefill_chunk == 0 {
@@ -281,9 +301,20 @@ impl Planner {
                 )
             }
         };
-        let kv_per_position = global_visits * 2 * kv_dims * inputs.kv.element_bytes();
+        let kv_per_position = streams * global_visits * 2 * kv_dims * inputs.kv.element_bytes();
+        // The batched step's chunk buffers, its state tables, positions and tokens, and its
+        // rows' taps for the draft.
+        let batch = if streams > 1 {
+            rows_scratch(c, VERIFY_ROWS)
+                + visits.len() * VERIFY_ROWS * 6 * 8
+                + VERIFY_ROWS * 8
+                + VERIFY_ROWS * taps * hidden * 2
+        } else {
+            0
+        };
         let fixed = Plan {
             capacity: 0,
+            streams,
             weights: target_weight_bytes(inputs.checkpoint),
             fp8_copies: match inputs.weights {
                 WeightFormat::Bf16 => 0,
@@ -291,6 +322,7 @@ impl Planner {
             },
             kv: 0,
             rings,
+            batch,
             prefill,
             verify,
             draft: draft_bytes,

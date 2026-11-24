@@ -11,11 +11,15 @@ use anyhow::{Context as _, bail, ensure};
 use serde_json::json;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
-                     [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--queue 8] \
-                     [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] [--fallback]
+                     [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
+                     [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
+                     [--fallback]
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
+--streams runs up to N requests at once (1 to 8), each with its own KV cache of --context
+positions. A request alone speculates; once another arrives, all run batched plain decode.
+Either way a request gets the same tokens. Up to --queue more requests wait.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
 plan may use the free memory at startup less a 0.5 GiB margin.
 --drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
@@ -49,6 +53,7 @@ fn args() -> anyhow::Result<Args> {
     let mut fp8_weights = true;
     let mut fp8_kv = true;
     let mut queue = 8;
+    let mut streams = 1;
     let mut widths: Vec<usize> = (1..=8).collect();
     let mut drafter = None;
     let mut draft = "fast".to_owned();
@@ -74,6 +79,10 @@ fn args() -> anyhow::Result<Args> {
             "--weights" => fp8_weights = fp8(&value()?)?,
             "--kv" => fp8_kv = fp8(&value()?)?,
             "--queue" => queue = value()?.parse()?,
+            "--streams" => {
+                streams = value()?.parse()?;
+                ensure!((1..=8).contains(&streams), "--streams takes 1 to 8");
+            }
             "--drafter" => drafter = Some(PathBuf::from(value()?)),
             "--draft" => draft = value()?,
             "--fallback" => fallback = true,
@@ -108,6 +117,7 @@ fn args() -> anyhow::Result<Args> {
             fp8_kv,
             widths,
             queue,
+            streams,
             drafter,
             draft,
             fallback,

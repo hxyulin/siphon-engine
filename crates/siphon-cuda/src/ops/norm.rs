@@ -9,7 +9,10 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::{
+    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    ops::spec::{BATCH_STATE_WORDS, BatchRows},
+};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -101,6 +104,10 @@ pub struct AttentionPostRows<'a> {
     /// The layer's relative bias table `[16, extent]` and the bias `[rows, 24, extent]` to
     /// compute from the rows' relative states, as `Attention::relative_bias_rows` does.
     pub bias: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
+    /// For a batched step, each row's conv states and position: every row is then the first
+    /// of its own chunk, `k_state` and `v_state` go unread, and the log scale takes the
+    /// row's position instead of `start + row`.
+    pub batch: Option<&'a BatchRows<'a>>,
 }
 
 #[derive(Debug)]
@@ -469,6 +476,10 @@ impl Norm {
     /// shifts `k_raw` and `v_raw` into them afterwards with
     /// [`Conv::shift_state`](crate::ops::conv::Conv::shift_state). Each row's results equal
     /// a single-row call's bit for bit.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks and pushes every kernel argument"
+    )]
     pub fn attention_post_rows(
         &self,
         stream: &CudaStream,
@@ -567,9 +578,19 @@ impl Norm {
             .opt(table, stream)
             .opt_mut(bias.as_mut(), stream)
             .i32(i32::try_from(extent)?);
+        if let Some(batch) = a.batch {
+            check("states", batch.states.len(), rows * BATCH_STATE_WORDS)?;
+            check("positions", batch.positions.len(), rows)?;
+            args.ptr(&batch.states, stream)
+                .ptr(&batch.positions, stream);
+        } else {
+            args.u64(0).u64(0);
+        }
         // SAFETY: the arguments match `attention_post_rows_bf16`'s signature, which is
-        // `attention_post_bf16`'s with `start` for `position`, then the table, the bias and
-        // the extent. Every per-row buffer holds `rows` rows as checked above and the grid
+        // `attention_post_bf16`'s with `start` for `position`, then the table, the bias, the
+        // extent, and the batch's state table and positions (null outside a batch, and
+        // then the kernel reads neither); in a batch, each row's words 2 and 3 name live
+        // `[3, 1024]` F32 states. Every per-row buffer holds `rows` rows as checked above and the grid
         // has one y index per row, and bias blocks only with a table and a bias of `rows` x
         // 24 x extent; the kernel reads no null pointer (the static conv weights only
         // without dynamic taps, `start` only with log scaling), writes no state, and reads

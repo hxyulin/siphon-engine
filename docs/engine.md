@@ -424,6 +424,20 @@ The fallback is opt-in for two reasons, measured on one build (FP8 weights and c
 
 Fixed prices instead of measured ones would make the paths reproducible; the coding request's loss needs a better plain-or-verify test.
 
+## Batched decode
+
+`Model::add_slots` adds sequence slots, each with its own global caches, sliding rings and conv states of slot 0's sizes. `Model::prefill_slot` prefills a slot, and `Model::step_batch` runs the next token of 1 to 8 slots as one pass through the verify pass's code, with each row reading and writing its own slot through a table of device addresses per visit. Each row's logits equal, bit for bit, a one-row verify of its sequence, so a sequence decoded in batches emits the tokens of greedy speculation. [batching.md](batching.md) has the design, the kernel changes and the measurements.
+
+siphon-serve returns a request left alone in a batch to speculation. The draft follows the request that left speculation: batched steps record their rows' taps, and the speculator commits the followed row's (`Speculator::follow`, `keep_batched`, `resume`). A request without draft state gets it rebuilt by a prefill with taps into a free slot (`Speculator::rebuild`), and `Model::move_slot` moves a request to slot 0. [batching.md](batching.md#returning-to-speculation) has the costs.
+
+`tests/batch.rs` decodes five prompts of 40 to 2,500 tokens that join the batch at different steps, and checks every token and every row's logits against one-row verifies, with BF16 and FP8 weights and caches. Two more tests speculate, batch and speculate again, with the bundled draft and with the drafter in `SIPHON_DFLASH`, and check every token:
+
+```sh
+SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test batch -- --ignored --nocapture --test-threads 1
+```
+
+`bench --batch 1,2,4,8 --prompt <capture>` times batched steps at each context against a plain step and a one-row verify. Row r feeds the capture's tokens from offset r / 8 of its length on, so the rows route their experts as different texts do: 8 rows from 8 texts touch about 50 distinct experts per visit, against 29 for 8 consecutive rows of one text.
+
 ## Benchmarks and profiling
 
 The `bench` binary times greedy decode at several context lengths. For each length it marks every cache as full to that length without computing it, runs warmup steps, then times `--steps` steps. It prints one markdown table row per context length, or JSON with `--json`, along with the time, the GPU clocks and the processes on the GPU. Numbers are comparable only on an otherwise idle GPU.
@@ -443,7 +457,7 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 
 ## Memory planning
 
-`siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk and the capacity. It counts:
+`siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk, the number of streams and the capacity. Each stream gets its own global caches of the capacity, rings and conv states, and more than one stream adds the batched step's buffers. It counts:
 
 - the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32. The vision tower is not loaded. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
 - the FP8 copies of `--weights fp8`, 1.14 GB;

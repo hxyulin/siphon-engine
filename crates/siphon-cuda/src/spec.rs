@@ -392,6 +392,17 @@ pub struct Speculator {
     row_len: usize,
     prompt_len: usize,
     stats: SpecStats,
+    /// The sequence the draft follows through batched steps, if any.
+    batched: Option<Batched>,
+}
+
+/// A sequence that left speculation for batched steps ([`Speculator::follow`]): the draft
+/// holds its state below `start`, and `plain_taps` the taps of the `tokens.len()` rows
+/// from `start` on, which emitted `tokens`.
+#[derive(Debug)]
+struct Batched {
+    start: usize,
+    tokens: Vec<u32>,
 }
 
 /// Which draft a [`Speculator`] runs.
@@ -519,6 +530,7 @@ impl Speculator {
             row_len,
             prompt_len: 0,
             stats: SpecStats::default(),
+            batched: None,
         })
     }
 
@@ -552,6 +564,7 @@ impl Speculator {
             "the speculator prefills from position 0"
         );
         self.draft.reset();
+        self.batched = None;
         let stream = Arc::clone(model.stream());
         // A shortlist head takes the tokens of the prompt's last positions, latest first,
         // and keeps room for the tokens the rounds emit.
@@ -623,6 +636,106 @@ impl Speculator {
             self.prompt_len - self.tail_rows,
         )?;
         model.set_verify_anchor(first)
+    }
+
+    /// Follows the sequence in slot 0 into batched steps ([`Model::step_batch`]) from its
+    /// position, through which the draft holds its state after a round or a run of plain
+    /// steps. [`Self::keep_batched`] then keeps the taps of its rows, and
+    /// [`Self::resume`] returns it to speculation.
+    pub fn follow(&mut self, model: &Model) {
+        self.batched = Some(Batched {
+            start: model.position(),
+            tokens: Vec::new(),
+        });
+    }
+
+    /// [`Draft::skip_to_for_benchmark`]: the draft takes every position below `position`
+    /// as committed, for benchmarks at long contexts.
+    pub fn skip_to_for_benchmark(&mut self, position: usize) -> anyhow::Result<()> {
+        self.draft.skip_to_for_benchmark(position)
+    }
+
+    /// Stops following a sequence, whose draft state is then lost.
+    pub fn forget(&mut self) {
+        self.batched = None;
+    }
+
+    /// Whether the draft follows a sequence ([`Self::follow`]).
+    #[must_use]
+    pub fn following(&self) -> bool {
+        self.batched.is_some()
+    }
+
+    /// After a batched step in which the followed sequence was row `row` and emitted
+    /// `token`: keeps the row's taps, which batched steps must record
+    /// ([`Model::set_batch_taps`]). Commits them to the draft every [`MAX_PLAIN_RUN`] rows.
+    /// Each row of a batched step equals a one-row verify, so the draft gets the taps that
+    /// speculation would have committed.
+    pub fn keep_batched(&mut self, model: &Model, row: usize, token: u32) -> anyhow::Result<()> {
+        let row_len = self.row_len;
+        let b = self
+            .batched
+            .as_mut()
+            .context("the draft follows no sequence")?;
+        let taps = model.batch_taps(row)?;
+        ensure!(
+            taps.len() == row_len,
+            "the batched step's taps differ from the draft's"
+        );
+        let at = b.tokens.len() * row_len;
+        model
+            .stream()
+            .memcpy_dtod(&taps, &mut self.plain_taps.slice_mut(at..at + row_len))?;
+        b.tokens.push(token);
+        if b.tokens.len() == MAX_PLAIN_RUN {
+            let start = b.start;
+            b.start += MAX_PLAIN_RUN;
+            let tokens = std::mem::take(&mut b.tokens);
+            self.commit_plain(&Arc::clone(model.stream()), model, start, &tokens)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the followed sequence to speculation: commits the taps of its batched rows
+    /// and makes `anchor`, its next token, the verify's anchor. The sequence must be in
+    /// slot 0 ([`Model::move_slot`]) at the position after its last kept row.
+    /// [`Self::generate_with`] then continues it.
+    pub fn resume(&mut self, model: &mut Model, anchor: u32) -> anyhow::Result<()> {
+        let b = self
+            .batched
+            .take()
+            .context("the draft follows no sequence")?;
+        ensure!(
+            model.position() == b.start + b.tokens.len(),
+            "the model is at {}, the draft's rows end at {}",
+            model.position(),
+            b.start + b.tokens.len()
+        );
+        self.commit_plain(&Arc::clone(model.stream()), model, b.start, &b.tokens)?;
+        model.set_verify_anchor(anchor)
+    }
+
+    /// Builds the draft's state for a sequence that ran without it, whose positions 0 ..
+    /// `tokens.len()` took `tokens`: prefills them with taps into slot `slot`, whose
+    /// sequence is lost, and commits the taps. The draft then follows the sequence from
+    /// the end of `tokens`, for [`Self::resume`]. Prefill sums in other orders than the
+    /// verify pass, so the draft gets slightly different taps than speculation would have
+    /// committed; that changes its drafts, never the target's tokens.
+    pub fn rebuild(
+        &mut self,
+        model: &mut Model,
+        slot: usize,
+        tokens: &[u32],
+    ) -> anyhow::Result<()> {
+        model.reset_slot(slot)?;
+        model.with_slot(slot, |m| {
+            self.prefill(m, tokens, crate::model::DEFAULT_PREFILL_CHUNK)
+        })?;
+        self.batched = Some(Batched {
+            start: tokens.len(),
+            tokens: Vec::new(),
+        });
+        Ok(())
     }
 
     /// Generates at least `n` tokens after [`Self::prefill`], `first` (its result)

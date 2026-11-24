@@ -72,6 +72,17 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     # append to the cache, after the wait.
     **{f"attention_rows_{f}_{nt}": {"k_cache", "v_cache", "start"}
        for f in ("bf16", "fp8") for nt in (1, 2, 3)},
+    # A batched step's state tables and positions: the host writes them before the step.
+    **{f"attention_batch_{f}": {"states", "positions"} for f in ("bf16", "fp8")},
+    "attention_post_rows_bf16": {"states", "positions"},
+}
+
+# Tables of device addresses, per kernel, that the host writes before a pass: a load whose
+# address comes from one of them reads a buffer the table names. The batched attention
+# copies its first cache tiles before the wait, from each row's caches in its state table,
+# as attention_rows does from k_cache and v_cache.
+ADDRESS_TABLES: dict[str, set[str]] = {
+    f"attention_batch_{f}": {"states"} for f in ("bf16", "fp8")
 }
 
 # Pointer fields of struct parameters, by (kernel file, type name): the stride of the
@@ -566,6 +577,7 @@ class LoadReport:
 
 def audit_kernel(k: Kernel) -> tuple[list[LoadReport], list[LoadReport]]:
     ro = READ_ONLY | READ_ONLY_PER_KERNEL.get(k.name, set())
+    tables = ADDRESS_TABLES.get(k.name, set())
     early = pre_wait(k.instrs)
     tracer = Tracer(k)
     pre, nc = [], []
@@ -577,7 +589,8 @@ def audit_kernel(k: Kernel) -> tuple[list[LoadReport], list[LoadReport]]:
         indexed = params_of(k, origin.loaded)
         written = [p for p in pointers if p.name not in ro]
         if i in early:
-            bad = bool(written) or bool(origin.unknown) or not pointers
+            from_table = bool(indexed) and all(p.name in tables for p in indexed)
+            bad = bool(written) or bool(origin.unknown) or not (pointers or from_table)
             pre.append(LoadReport(ins, pointers, indexed, origin.unknown, bad))
         elif ".CONSTANT" in ins.op and written:
             nc.append(LoadReport(ins, pointers, indexed, origin.unknown, True))

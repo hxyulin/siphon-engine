@@ -22,6 +22,20 @@
 //! Results are comparable only on an otherwise idle GPU, so the output records the GPU
 //! clocks, the processes on the GPU and the time.
 //!
+//! Batched decode of several sequences (`Model::step_batch`):
+//!
+//!        bench <model-dir> --batch 1,2,4,8 --prompt <capture> [--contexts 0,4096,32768]
+//!        [--steps N] [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] [--follow]
+//!
+//! For each context and batch size, every sequence's caches skip to that length, and the
+//! runner times `--steps` batched steps after `--warmup`, and plain steps and one-row
+//! verifies for comparison, each the median step. Row r feeds the capture's tokens from
+//! offset r / 8 of its length on, so the rows route their experts as different texts do.
+//! It prints the time per step and the tokens per second in all and per sequence, and the
+//! mean batched step. With `--follow`, the bundled draft follows row 0 as siphon-serve's
+//! does: batched steps record their rows' taps, and the draft keeps row 0's and commits
+//! them every 32 steps (`Speculator::keep_batched`).
+//!
 //! Speculative decoding, from the tokens of a capture (`--prompt`, a safetensors file
 //! with a `tokens` tensor such as `reference/capture_eval.py` writes):
 //!
@@ -67,17 +81,23 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::{env, fmt::Write as _, path::PathBuf, process::Command, time::Instant};
+    use std::{env, fmt::Write as _, fs, path::PathBuf, process::Command, time::Instant};
 
     use anyhow::{Context as _, ensure};
+    use safetensors::{Dtype, SafeTensors};
     use siphon::{
         Checkpoint, TextConfig,
         memory::{self, DraftChoice, PlanInputs, Planner},
     };
     use siphon_cuda::{
         Gpu,
-        model::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits},
-        ops::{attention::KvFormat, experts::ExpertActivations},
+        draft::DraftOptions,
+        model::{
+            Accept, BATCH_ROWS, DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits,
+            VerifyTokens,
+        },
+        ops::{attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
+        spec::{DraftSource, Speculator, Width, load_draft},
         weights::{WeightFormat, Weights},
     };
 
@@ -97,6 +117,7 @@ mod linux {
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--json]";
 
+    #[expect(clippy::struct_excessive_bools, reason = "command-line flags")]
     struct Args {
         model: PathBuf,
         contexts: Option<Vec<usize>>,
@@ -126,6 +147,10 @@ mod linux {
         verify_widths: bool,
         /// Whether `--spec auto` falls back to plain steps.
         fallback: bool,
+        /// Batch sizes to time batched decode at, instead of plain decode.
+        batch: Option<Vec<usize>>,
+        /// Whether the draft follows row 0 of the batched steps.
+        follow: bool,
     }
 
     fn token_counts(arg: &str, value: &str) -> anyhow::Result<Vec<usize>> {
@@ -157,6 +182,8 @@ mod linux {
         let mut sweep = None;
         let mut verify_widths = false;
         let mut fallback = false;
+        let mut batch = None;
+        let mut follow = false;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             let mut value = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -183,6 +210,8 @@ mod linux {
                 "--sweep" => sweep = Some(PathBuf::from(value()?)),
                 "--verify-widths" => verify_widths = true,
                 "--fallback" => fallback = true,
+                "--batch" => batch = Some(token_counts(&arg, &value()?)?),
+                "--follow" => follow = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -220,6 +249,8 @@ mod linux {
             sweep,
             verify_widths,
             fallback,
+            batch,
+            follow,
         })
     }
 
@@ -448,6 +479,9 @@ mod linux {
         if args.spec.is_some() || args.verify_widths {
             return speculation::run(&args);
         }
+        if let Some(sizes) = args.batch.take() {
+            return bench_batch(&args, &sizes);
+        }
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let global_visits = config
@@ -474,6 +508,7 @@ mod linux {
             kv: args.kv,
             draft: DraftChoice::None,
             prefill_chunk: 0,
+            streams: 1,
         })?;
         let contexts = args
             .contexts
@@ -534,6 +569,157 @@ mod linux {
             println!("{}", json(&before, passes, &args, &rows));
         } else {
             print!("{}", markdown(&before, passes, &args, &rows));
+        }
+        Ok(())
+    }
+
+    /// The tokens of a capture, a safetensors file with an I32 `tokens` tensor.
+    fn tokens(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let capture = SafeTensors::deserialize(&bytes)?;
+        let view = capture.tensor("tokens")?;
+        ensure!(view.dtype() == Dtype::I32, "tokens are {:?}", view.dtype());
+        view.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| Ok(u32::try_from(i32::from_le_bytes(*b))?))
+            .collect()
+    }
+
+    /// The median of `times`.
+    fn median(times: &mut [f64]) -> f64 {
+        times.sort_by(f64::total_cmp);
+        times[times.len() / 2]
+    }
+
+    /// `--batch`: batched steps of each size at each context, against a plain step and a
+    /// one-row verify there. Row r feeds the capture's tokens from offset r / 8 of its
+    /// length on, whatever the model predicts, so that the rows route as different texts
+    /// do.
+    #[expect(clippy::too_many_lines, reason = "one table of runs")]
+    fn bench_batch(args: &Args, sizes: &[usize]) -> anyhow::Result<()> {
+        let largest = sizes.iter().max().copied().unwrap_or(1);
+        ensure!(
+            sizes.iter().all(|s| (1..=BATCH_ROWS).contains(s)),
+            "--batch takes sizes of 1 to {BATCH_ROWS}"
+        );
+        let text = tokens(args.prompt.as_deref().context("--batch needs --prompt")?)?;
+        ensure!(text.len() >= 8 * 64, "the capture is too short");
+        let token =
+            |row: usize, step: usize| text[(row * text.len() / BATCH_ROWS + step) % text.len()];
+        let config = TextConfig::load(&args.model)?;
+        let passes = args.passes.unwrap_or(config.loop_config.num_passes);
+        let contexts = args.contexts.clone().unwrap_or(DEFAULT_CONTEXTS.to_vec());
+        let tail = args.warmup + args.steps + 2;
+        let gpu = Gpu::new(0)?;
+        let before = gpu_state()?;
+        let checkpoint = Checkpoint::open(&args.model)?;
+        eprintln!("loading weights");
+        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
+        let mut model = Model::with_formats(
+            &gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            args.kv,
+            args.weights,
+        )?;
+        model.add_slots(largest - 1)?;
+        let mut speculator = if args.follow {
+            let draft = load_draft(
+                &mut model,
+                &checkpoint,
+                DraftSource::Bundled,
+                capacity,
+                &DraftOptions::fast(),
+            )?;
+            model.set_batch_taps(true);
+            Some(Speculator::with_draft(
+                &model,
+                draft,
+                Width::Fixed(VERIFY_ROWS - 1),
+            )?)
+        } else {
+            None
+        };
+        println!(
+            "{} on {}, driver {}, SM {}/{} MHz, {} passes, {:?} weights, {:?} KV cache, {} steps{}",
+            before.timestamp,
+            before.name,
+            before.driver,
+            before.sm_mhz,
+            before.max_sm_mhz,
+            passes,
+            args.weights,
+            args.kv,
+            args.steps,
+            if args.follow {
+                ", the draft follows row 0"
+            } else {
+                ""
+            }
+        );
+        println!();
+        println!(
+            "| Context | Plain step ms | One-row verify ms | Streams | Batched step ms | Mean ms | tok/s in all | tok/s per stream |"
+        );
+        println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+        let total = args.warmup + args.steps;
+        for &context in &contexts {
+            // Plain steps and one-row verifies of row 0's tokens, the median of each.
+            model.skip_to_for_benchmark(context)?;
+            let mut plain = Vec::with_capacity(total);
+            for i in 0..total {
+                let t = Instant::now();
+                model.step(token(0, i), None)?;
+                plain.push(t.elapsed().as_secs_f64());
+            }
+            model.skip_to_for_benchmark(context)?;
+            let mut verify = Vec::with_capacity(total);
+            for i in 0..total {
+                let t = Instant::now();
+                model.verify(VerifyTokens::Host(&[token(0, i)]), Accept::Rows(1))?;
+                verify.push(t.elapsed().as_secs_f64());
+            }
+            let plain = median(&mut plain[args.warmup..]);
+            let verify = median(&mut verify[args.warmup..]);
+            for &size in sizes {
+                for slot in 0..size {
+                    model.skip_slot_to_for_benchmark(slot, context)?;
+                }
+                if let Some(s) = speculator.as_mut() {
+                    s.skip_to_for_benchmark(context)?;
+                    s.follow(&model);
+                }
+                let mut times = Vec::with_capacity(total);
+                for i in 0..total {
+                    let rows: Vec<(usize, u32)> = (0..size).map(|r| (r, token(r, i))).collect();
+                    let t = Instant::now();
+                    let next = model.step_batch(&rows)?;
+                    // The kept taps and the commits run before the next step, inside its
+                    // time.
+                    if let Some(s) = speculator.as_mut() {
+                        s.keep_batched(&model, 0, next[0])?;
+                    }
+                    times.push(t.elapsed().as_secs_f64());
+                }
+                gpu.stream().synchronize()?;
+                let kept = &mut times[args.warmup..];
+                let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+                let per_step = median(kept);
+                println!(
+                    "| {context} | {:.3} | {:.3} | {size} | {:.3} | {:.3} | {:.0} | {:.0} |",
+                    plain * 1e3,
+                    verify * 1e3,
+                    per_step * 1e3,
+                    mean * 1e3,
+                    size as f64 / per_step,
+                    1.0 / per_step
+                );
+            }
         }
         Ok(())
     }
@@ -653,7 +839,6 @@ mod linux {
         use std::{fmt::Write as _, fs, time::Instant};
 
         use anyhow::{Context as _, ensure};
-        use safetensors::{Dtype, SafeTensors};
         use siphon::{Checkpoint, TextConfig};
         use siphon_cuda::{
             Gpu,
@@ -667,7 +852,7 @@ mod linux {
             weights::{WeightFormat, Weights},
         };
 
-        use super::{Args, gpu_state};
+        use super::{Args, gpu_state, tokens};
 
         /// Tokens at the end of the capture kept out of the prompt, for verify rows.
         const RESERVED: usize = 512;
@@ -685,19 +870,6 @@ mod linux {
         const MXFP8_EXPERT: f64 = 8.21e6;
         /// DRAM bandwidth times plain decode's efficiency, as the design's cost model.
         const EFFECTIVE_BANDWIDTH: f64 = 1.70e12 * 0.84;
-
-        fn tokens(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
-            let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            let capture = SafeTensors::deserialize(&bytes)?;
-            let view = capture.tensor("tokens")?;
-            ensure!(view.dtype() == Dtype::I32, "tokens are {:?}", view.dtype());
-            view.data()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| Ok(u32::try_from(i32::from_le_bytes(*b))?))
-                .collect()
-        }
 
         /// The prompt for `context`: arbitrary ids, then `text`, `context` tokens in all, or
         /// `text` alone when it is longer.

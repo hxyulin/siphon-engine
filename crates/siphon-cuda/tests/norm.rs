@@ -538,6 +538,7 @@ fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
                     rel_threshold: REL_THRESHOLD,
                     eps: EPS,
                     bias: Some((&table, bias.as_view_mut())),
+                    batch: None,
                 },
                 rows,
             )?;

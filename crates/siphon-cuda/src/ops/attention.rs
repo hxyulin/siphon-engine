@@ -35,7 +35,10 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::norm::KvConvWeights,
+    ops::{
+        norm::KvConvWeights,
+        spec::{BATCH_STATE_WORDS, BatchRows},
+    },
 };
 
 /// Query heads.
@@ -390,11 +393,14 @@ pub struct Attention {
     prefill_fp8: CudaFunction,
     /// `attention_rows_bf16_<NT>` and `attention_rows_fp8_<NT>` for NT = 1 to 3.
     rows: Vec<[CudaFunction; 2]>,
+    /// `attention_batch_bf16` and `attention_batch_fp8`.
+    batch: [CudaFunction; 2],
 }
 
-/// The partials of [`Attention::attention_rows`]: per query row of up to 8 x 24, one
-/// output, max and sum per block of its KV head. The counters, two per KV head, count the
-/// finished blocks and combiners, and return to zero at the end of every call.
+/// The partials of [`Attention::attention_rows`] and [`Attention::attention_batch`]: per
+/// query row of up to 8 x 24, one output, max and sum per block of its KV head. The
+/// counters, two per KV head and batch row, count the finished blocks and combiners, and
+/// return to zero at the end of every call.
 #[derive(Debug)]
 pub struct RowsAttentionScratch {
     out: CudaSlice<f32>,
@@ -410,7 +416,7 @@ impl RowsAttentionScratch {
             out: stream.alloc_zeros(rows * HEAD_DIM)?,
             max: stream.alloc_zeros(rows)?,
             sum: stream.alloc_zeros(rows)?,
-            counters: stream.alloc_zeros(2 * KV_HEADS)?,
+            counters: stream.alloc_zeros(2 * KV_HEADS * ROWS_MAX)?,
         })
     }
 }
@@ -469,6 +475,10 @@ impl Attention {
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
+            batch: [
+                rows_function("attention_batch_bf16", ROWS_SHARED_BYTES[0])?,
+                rows_function("attention_batch_fp8", ROWS_SHARED_BYTES[1])?,
+            ],
         })
     }
 
@@ -570,6 +580,89 @@ impl Attention {
         // block of their KV head has finished reading the cache; no two blocks write the same
         // elements, since rows <= 8 < slots. Before `pdl_wait` it reads only `start` and the
         // caches, which no kernel of the pass writes before this one.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// [`Attention::attention_rows`] for the rows of a batched step, 1 to [`ROWS_MAX`],
+    /// each the next token of its own sequence: row `r` attends from its query into its own
+    /// cache at its own position, as a call with that one row on that cache would, bit for
+    /// bit, and its key and value go to that cache. `batch` names each row's caches and
+    /// position; `like` is any of the rows' caches for this visit, whose format, slots and
+    /// window every row's cache shares. Every per-row buffer is `[rows, ...]` as in
+    /// [`Attention::attention_rows`].
+    #[expect(clippy::too_many_arguments, reason = "mirrors attention_rows")]
+    pub fn attention_batch(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        like: &KvCache,
+        batch: &BatchRows<'_>,
+        rows: usize,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
+        gate: Option<&CudaView<'_, bf16>>,
+        scratch: &mut RowsAttentionScratch,
+        out: &mut impl DeviceOut<bf16>,
+    ) -> anyhow::Result<()> {
+        let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
+        let mut out = out.view_mut();
+        if let Some(gate) = gate {
+            check_len("gate", gate.len(), rows * HEADS * HEAD_DIM)?;
+        }
+        ensure!(
+            (1..=ROWS_MAX).contains(&rows),
+            "{rows} rows, expected 1 to {ROWS_MAX}"
+        );
+        check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        check_len("sinks", sinks.len(), rows * HEADS)?;
+        check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("states", batch.states.len(), rows * BATCH_STATE_WORDS)?;
+        check_len("positions", batch.positions.len(), rows)?;
+        let extent = extent("bias", bias.len(), rows * HEADS)?;
+        let slots = u32::try_from(like.slots)?;
+        let window = u32::try_from(like.window.unwrap_or(0)).context("window too large")?;
+        let (function, smem) = match like.data {
+            KvData::Bf16 { .. } => (&self.batch[0], ROWS_SHARED_BYTES[0]),
+            KvData::Fp8 { .. } => (&self.batch[1], ROWS_SHARED_BYTES[1]),
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&q, stream)
+            .ptr(&k, stream)
+            .ptr(&v, stream)
+            .ptr(&batch.states, stream)
+            .ptr(&bias, stream)
+            .ptr(&sinks, stream)
+            .ptr_mut(&mut scratch.out, stream)
+            .ptr_mut(&mut scratch.max, stream)
+            .ptr_mut(&mut scratch.sum, stream)
+            .ptr_mut(&mut scratch.counters, stream)
+            .ptr_mut(&mut out, stream)
+            .opt(gate, stream)
+            .ptr(&batch.positions, stream)
+            .u32(slots)
+            .u32(window)
+            .u32(extent)
+            .f32(SCALE);
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS, u32::try_from(rows)?),
+            block_dim: (ROWS_THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        // SAFETY: the arguments match `attention_batch_bf16(const bf16* q, const bf16* k_new,
+        // const bf16* v_new, const unsigned long long* states, const bf16* bias, const bf16*
+        // sinks, float* partial_out, float* partial_max, float* partial_sum, unsigned*
+        // counters, bf16* out, const bf16* gate, const unsigned* positions, unsigned slots,
+        // unsigned window, unsigned extent, float scale)`, or `attention_batch_fp8`. Grid z
+        // index r runs attention_rows' one-row kernel for row r on the caches of words 0 and
+        // 1 of its state table, which the caller keeps live caches of `like`'s format and
+        // slots that hold the row's position; the row takes the scratch's partials of query
+        // rows 24 r .. 24 r + 23 and counters 16 r .. 16 r + 15, within the scratch's 8 rows.
+        // Before `pdl_wait` it reads only the table, the positions and the caches, which the
+        // host writes before the step and no kernel of the step writes before this one.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 

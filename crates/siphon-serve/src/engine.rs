@@ -1,5 +1,13 @@
-//! The GPU side: one thread owns the model and the draft and runs one request at a time,
-//! in arrival order, from a bounded queue.
+//! The GPU side: one thread owns the model and the draft and runs requests in arrival
+//! order from a bounded queue.
+//!
+//! A request that arrives at an idle server runs alone with greedy speculation in slot 0.
+//! With `streams` above 1, a request that arrives meanwhile stops the speculation after its
+//! round, and from then on every request runs batched plain decode in its own slot, up to
+//! `streams` at once, until the server is idle again. A new request's prompt prefills in
+//! chunks between the batch's steps. Batched steps and speculation give each sequence the
+//! same tokens, so a request's output does not depend on what else runs (see
+//! `docs/batching.md`).
 
 use std::{
     path::PathBuf,
@@ -63,8 +71,10 @@ pub struct Options {
     pub fp8_kv: bool,
     /// Verify widths the adaptive policy chooses among.
     pub widths: Vec<usize>,
-    /// Jobs that wait while one runs.
+    /// Jobs that wait while `streams` run.
     pub queue: usize,
+    /// Requests that run at once, each in its own sequence slot, 1 to 8.
+    pub streams: usize,
     /// A DFlash draft's export directory, in place of the bundled draft.
     pub drafter: Option<PathBuf>,
     /// The draft's approximations, as `DraftOptions::parse` takes them.
@@ -112,6 +122,7 @@ pub use cuda::start;
 #[cfg(target_os = "linux")]
 mod cuda {
     use std::{
+        collections::VecDeque,
         ops::ControlFlow,
         sync::mpsc::{Receiver, sync_channel},
         thread,
@@ -150,7 +161,7 @@ mod cuda {
             .spawn(move || match load(&options, &warmup) {
                 Ok((model, speculator, capacity, check)) => {
                     let _ = ready.send(Ok(capacity));
-                    run(model, speculator, check, &queue, &stop);
+                    run(model, speculator, check, &queue, &stop, options.streams);
                 }
                 Err(e) => {
                     let _ = ready.send(Err(e));
@@ -312,6 +323,7 @@ mod cuda {
                     DraftChoice::Dflash(dir, draft_options.approx())
                 }),
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
+            streams: options.streams,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
@@ -348,6 +360,21 @@ mod cuda {
             policy.with_plain(None)?
         };
         speculator.set_width(Width::Adaptive(policy))?;
+        if options.streams > 1 {
+            // Capture the batched step of every size now, rather than in a request. Batched
+            // steps record their rows' taps, so that a request that leaves speculation can
+            // return to it (see `Speculator::follow`).
+            model.add_slots(options.streams - 1)?;
+            model.set_batch_taps(true);
+            for size in 1..=options.streams {
+                let rows: Vec<(usize, u32)> = (0..size).map(|s| (s, warmup[0])).collect();
+                model.step_batch(&rows)?;
+            }
+            for slot in 0..options.streams {
+                model.reset_slot(slot)?;
+            }
+            eprintln!("serving up to {} requests at once", options.streams);
+        }
         drop(saved);
         // The full chunk's buffers now, so that the check below sees every planned buffer
         // and a plan that undercounts fails here rather than on the first long prompt.
@@ -358,82 +385,66 @@ mod cuda {
         Ok((model, speculator, capacity, check))
     }
 
-    fn run(
-        mut model: Model,
-        mut speculator: Speculator,
-        mut check: MemoryCheck,
-        queue: &Receiver<Job>,
-        stop: &[u32],
-    ) {
-        for job in queue {
-            if job.events.is_closed() {
-                continue;
-            }
-            let started = Instant::now();
-            let events = job.events.clone();
-            match generate(&mut model, &mut speculator, &job, stop) {
-                Ok((finish, emitted, prefill_s)) => {
-                    let decode_s = started.elapsed().as_secs_f64() - prefill_s;
-                    let stats = speculator.stats();
-                    let acceptance: Vec<String> = stats
-                        .acceptance()
-                        .iter()
-                        .map(|a| format!("{:.1}%", a * 100.0))
-                        .collect();
-                    eprintln!(
-                        "job: {} prompt tokens, prefill {:.0} ms, {emitted} tokens in {:.2} s \
-                         ({:.1} tok/s, {:.2} tokens per round, {} plain steps, {} probes, \
-                         draft {:.3} ms per round, acceptance by position [{}]), {}",
-                        job.prompt.len(),
-                        prefill_s * 1e3,
-                        decode_s,
-                        emitted as f64 / decode_s.max(1e-9),
-                        stats.tokens_per_round(),
-                        stats.stepped.len(),
-                        stats.probes,
-                        stats.draft.as_secs_f64() * 1e3
-                            / (stats.rounds + stats.probes).max(1) as f64,
-                        acceptance.join(", "),
-                        if events.is_closed() {
-                            "client left".to_owned()
-                        } else {
-                            format!("{finish:?}")
-                        },
-                    );
-                    let _ = events.send(Event::Done(finish));
-                }
-                Err(e) => {
-                    eprintln!("job failed: {e:#}");
-                    let _ = events.send(Event::Failed(format!("{e:#}")));
-                }
-            }
-            check.after_job();
-        }
+    /// A request the engine has taken.
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "independent states of a request"
+    )]
+    struct Request {
+        job: Job,
+        slot: usize,
+        started: Instant,
+        /// Prompt tokens prefilled so far.
+        prefilled: usize,
+        prefill_s: f64,
+        /// The token to feed next, once the prompt is prefilled.
+        next: Option<u32>,
+        /// The tokens sent to the client. Every one but the last has been fed.
+        output: Vec<u32>,
+        finish: Finish,
+        /// Whether the job is over: finished, failed, or its client left.
+        done: bool,
+        /// Whether the client got an error instead of the end of its tokens.
+        failed: bool,
+        /// Whether the draft follows this request through batched steps.
+        followed: bool,
+        /// Whether returning to speculation failed, so that the request stays batched.
+        stay_batched: bool,
+        /// Tokens emitted by speculation and by batched steps.
+        speculated: usize,
+        batched: usize,
     }
 
-    /// Runs `job` and returns why it ended, the tokens it emitted, and the prefill's
-    /// seconds.
-    fn generate(
-        model: &mut Model,
-        speculator: &mut Speculator,
-        job: &Job,
-        stop: &[u32],
-    ) -> anyhow::Result<(Finish, usize, f64)> {
-        let started = Instant::now();
-        model.reset()?;
-        let first = speculator.prefill(model, &job.prompt, DEFAULT_PREFILL_CHUNK)?;
-        let prefill_s = started.elapsed().as_secs_f64();
-        let mut emitted = 0;
-        let mut finish = Finish::Length;
-        // Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
-        // over or its client has left.
-        let mut take = |ids: &[u32]| {
-            let room = job.max_tokens - emitted;
+    impl Request {
+        fn new(job: Job, slot: usize) -> Self {
+            Self {
+                job,
+                slot,
+                started: Instant::now(),
+                prefilled: 0,
+                prefill_s: 0.0,
+                next: None,
+                output: Vec::new(),
+                finish: Finish::Length,
+                done: false,
+                failed: false,
+                followed: false,
+                stay_batched: false,
+                speculated: 0,
+                batched: 0,
+            }
+        }
+
+        /// Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
+        /// over or its client has left.
+        fn take(&mut self, ids: &[u32], stop: &[u32]) -> ControlFlow<()> {
+            let room = self.job.max_tokens - self.output.len();
             let end = ids.iter().position(|id| stop.contains(id));
             let keep = end.unwrap_or(ids.len()).min(room);
             if keep > 0 {
-                emitted += keep;
-                if job
+                self.output.extend_from_slice(&ids[..keep]);
+                if self
+                    .job
                     .events
                     .send(Event::Tokens(ids[..keep].to_vec()))
                     .is_err()
@@ -442,17 +453,369 @@ mod cuda {
                 }
             }
             if end.is_some_and(|e| e <= room) {
-                finish = Finish::Stop;
+                self.finish = Finish::Stop;
                 return ControlFlow::Break(());
             }
-            if emitted == job.max_tokens {
+            if self.output.len() == self.job.max_tokens {
                 return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
-        };
-        if take(&[first]).is_continue() {
-            speculator.generate_with(model, job.max_tokens, Drafts::Dspark, &mut take)?;
         }
-        Ok((finish, emitted, prefill_s))
+
+        /// Logs the job and tells its client it is done.
+        fn finish(&self, detail: &str) {
+            let decode_s = self.started.elapsed().as_secs_f64() - self.prefill_s;
+            let events = &self.job.events;
+            eprintln!(
+                "job: {} prompt tokens, prefill {:.0} ms, {} tokens in {:.2} s ({:.1} tok/s, \
+                 {} speculated, {} batched steps{detail}), {}",
+                self.job.prompt.len(),
+                self.prefill_s * 1e3,
+                self.output.len(),
+                decode_s,
+                self.output.len() as f64 / decode_s.max(1e-9),
+                self.speculated,
+                self.batched,
+                if events.is_closed() {
+                    "client left".to_owned()
+                } else {
+                    format!("{:?}", self.finish)
+                },
+            );
+            let _ = events.send(Event::Done(self.finish));
+        }
+
+        fn fail(&mut self, e: &anyhow::Error) {
+            eprintln!("job failed: {e:#}");
+            let _ = self.job.events.send(Event::Failed(format!("{e:#}")));
+            self.done = true;
+            self.failed = true;
+        }
+    }
+
+    fn run(
+        mut model: Model,
+        mut speculator: Speculator,
+        mut check: MemoryCheck,
+        queue: &Receiver<Job>,
+        stop: &[u32],
+        streams: usize,
+    ) {
+        let mut waiting = VecDeque::new();
+        // A request that a batch left alone, to continue with speculation.
+        let mut resumed = None;
+        loop {
+            let mut request = if let Some(request) = resumed.take() {
+                request
+            } else {
+                let job = match waiting.pop_front() {
+                    Some(job) => job,
+                    None => match queue.recv() {
+                        Ok(job) => job,
+                        Err(_) => return,
+                    },
+                };
+                if job.events.is_closed() {
+                    continue;
+                }
+                // Another job already waits: start them together.
+                if streams > 1 {
+                    if let Ok(next) = queue.try_recv() {
+                        waiting.push_back(next);
+                    }
+                    if !waiting.is_empty() {
+                        waiting.push_front(job);
+                        resumed = batched(
+                            &mut model,
+                            &mut speculator,
+                            Vec::new(),
+                            &mut waiting,
+                            queue,
+                            stop,
+                            streams,
+                        );
+                        check.after_job();
+                        continue;
+                    }
+                }
+                Request::new(job, 0)
+            };
+            let interrupt = (streams > 1).then_some((queue, &mut waiting));
+            match alone(&mut model, &mut speculator, &mut request, stop, interrupt) {
+                Ok(true) => {
+                    speculator.follow(&model);
+                    request.followed = true;
+                    resumed = batched(
+                        &mut model,
+                        &mut speculator,
+                        vec![request],
+                        &mut waiting,
+                        queue,
+                        stop,
+                        streams,
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => request.fail(&e),
+            }
+            check.after_job();
+        }
+    }
+
+    /// Runs `request` alone in slot 0 with speculation: from its prompt, or from its next
+    /// token when it returns from a batch (`Speculator::resume`). With `interrupt`, stops
+    /// after the round in which another job arrives, moves that job to the waiting list
+    /// and returns true: the request then continues in a batch from slot 0. Otherwise
+    /// finishes it.
+    fn alone(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        request: &mut Request,
+        stop: &[u32],
+        mut interrupt: Option<(&Receiver<Job>, &mut VecDeque<Job>)>,
+    ) -> anyhow::Result<bool> {
+        let go_on = if request.next.is_some() {
+            true
+        } else {
+            model.reset()?;
+            let first = speculator.prefill(model, &request.job.prompt, DEFAULT_PREFILL_CHUNK)?;
+            request.prefilled = request.job.prompt.len();
+            request.prefill_s = request.started.elapsed().as_secs_f64();
+            request.next = Some(first);
+            request.take(&[first], stop).is_continue()
+        };
+        let mut interrupted = false;
+        let mut last = request.next.unwrap_or_default();
+        let before = request.output.len();
+        let started = Instant::now();
+        if go_on {
+            let remaining = request.job.max_tokens - request.output.len();
+            speculator.generate_with(model, remaining, Drafts::Dspark, |ids| {
+                request.speculated += ids.len();
+                last = ids.last().copied().unwrap_or(last);
+                if request.take(ids, stop).is_break() {
+                    return ControlFlow::Break(());
+                }
+                if let Some((queue, waiting)) = interrupt.as_mut()
+                    && let Ok(job) = queue.try_recv()
+                {
+                    waiting.push_back(job);
+                    interrupted = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            })?;
+        }
+        let stats = speculator.stats();
+        let speculated = request.output.len() - before;
+        let seconds = started.elapsed().as_secs_f64();
+        let acceptance: Vec<String> = stats
+            .acceptance()
+            .iter()
+            .map(|a| format!("{:.1}%", a * 100.0))
+            .collect();
+        let episode = format!(
+            "speculated {speculated} tokens in {seconds:.2} s ({:.1} tok/s, {:.2} tokens per \
+             round, {} plain steps, {} probes, draft {:.3} ms per round, acceptance by \
+             position [{}])",
+            speculated as f64 / seconds.max(1e-9),
+            stats.tokens_per_round(),
+            stats.stepped.len(),
+            stats.probes,
+            stats.draft.as_secs_f64() * 1e3 / (stats.rounds + stats.probes).max(1) as f64,
+            acceptance.join(", "),
+        );
+        if interrupted {
+            eprintln!("{episode}, then batched from position {}", model.position());
+            request.next = Some(last);
+            return Ok(true);
+        }
+        request.finish(&format!(", last {episode}"));
+        Ok(false)
+    }
+
+    /// Prompt and generated tokens per remaining token above which a lone request that
+    /// ran without the draft gets the draft's state rebuilt, by prefilling its tokens
+    /// again, to speculate. A one-row batched step takes about 3.7 ms and speculation about
+    /// 2 ms per token, so each remaining token saves about 1.7 ms, while the rebuild
+    /// prefills about 20,000 tokens per second: it pays off once the remaining tokens
+    /// exceed about 1/34 of the position. Requiring 1/16 leaves room for requests that
+    /// stop well before their limit.
+    const REBUILD_RATIO: usize = 16;
+
+    /// Moves a lone request from a batch back to speculation in slot 0: commits the taps
+    /// the draft kept while following it, or rebuilds the draft's state from its tokens in
+    /// a free slot, then moves it to slot 0 if it is elsewhere. Returns false when it
+    /// stays batched: it never ran with the draft and too few tokens remain to rebuild.
+    fn speculate_again(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        r: &mut Request,
+        streams: usize,
+    ) -> anyhow::Result<bool> {
+        let started = Instant::now();
+        let position = model.slot_position(r.slot)?;
+        let next = r.next.context("the request has no next token")?;
+        let how = if r.followed {
+            "the draft kept its taps".to_owned()
+        } else {
+            let remaining = r.job.max_tokens - r.output.len();
+            if remaining * REBUILD_RATIO < position {
+                return Ok(false);
+            }
+            let fed = &r.output[..r.output.len() - 1];
+            let tokens: Vec<u32> = r.job.prompt.iter().chain(fed).copied().collect();
+            anyhow::ensure!(
+                tokens.len() == position,
+                "{} tokens fed, the slot is at {position}",
+                tokens.len()
+            );
+            let free = (0..streams)
+                .find(|&s| s != r.slot)
+                .context("no free slot to rebuild the draft in")?;
+            speculator.rebuild(model, free, &tokens)?;
+            r.followed = true;
+            format!("rebuilt the draft in slot {free}")
+        };
+        let from = r.slot;
+        model.move_slot(from, 0)?;
+        r.slot = 0;
+        speculator.resume(model, next)?;
+        model.stream().synchronize()?;
+        eprintln!(
+            "speculating again at position {position} from slot {from}: {how}, {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        r.followed = false;
+        Ok(true)
+    }
+
+    /// Runs `active` and the jobs that arrive while any runs, up to `streams` at once, each
+    /// in its own slot, until none is left or one is left alone. Each turn prefills one
+    /// chunk of the oldest request still prefilling, then runs one batched step of the
+    /// others. A request left alone with nothing waiting returns, in slot 0, to continue
+    /// with speculation (`speculate_again`).
+    fn batched(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        mut active: Vec<Request>,
+        waiting: &mut VecDeque<Job>,
+        queue: &Receiver<Job>,
+        stop: &[u32],
+        streams: usize,
+    ) -> Option<Request> {
+        loop {
+            while active.len() < streams {
+                let Some(job) = waiting.pop_front().or_else(|| queue.try_recv().ok()) else {
+                    break;
+                };
+                if job.events.is_closed() {
+                    continue;
+                }
+                let Some(slot) = (0..streams).find(|s| active.iter().all(|r| r.slot != *s)) else {
+                    break;
+                };
+                let mut request = Request::new(job, slot);
+                match model.reset_slot(slot) {
+                    Ok(()) => active.push(request),
+                    Err(e) => request.fail(&e),
+                }
+            }
+            if active.is_empty() {
+                return None;
+            }
+            if let [r] = active.as_mut_slice()
+                && r.next.is_some()
+                && !r.stay_batched
+                && waiting.is_empty()
+            {
+                match speculate_again(model, speculator, r, streams) {
+                    Ok(true) => return active.pop(),
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("returning to speculation failed, staying batched: {e:#}");
+                        speculator.forget();
+                        r.followed = false;
+                        r.stay_batched = true;
+                    }
+                }
+            }
+            if let Some(r) = active.iter_mut().find(|r| r.next.is_none()) {
+                if r.job.events.is_closed() {
+                    r.done = true;
+                } else {
+                    let end = (r.prefilled + DEFAULT_PREFILL_CHUNK).min(r.job.prompt.len());
+                    match model.prefill_slot(
+                        r.slot,
+                        &r.job.prompt[r.prefilled..end],
+                        DEFAULT_PREFILL_CHUNK,
+                    ) {
+                        Ok(first) => {
+                            r.prefilled = end;
+                            if end == r.job.prompt.len() {
+                                r.prefill_s = r.started.elapsed().as_secs_f64();
+                                r.next = Some(first);
+                                r.done = r.take(&[first], stop).is_break();
+                            }
+                        }
+                        Err(e) => r.fail(&e),
+                    }
+                }
+            }
+            step_rows(model, speculator, &mut active, stop);
+            active.retain(|r| {
+                if r.done {
+                    if r.followed {
+                        speculator.forget();
+                    }
+                    if !r.failed && r.next.is_some() {
+                        r.finish("");
+                    }
+                }
+                !r.done
+            });
+        }
+    }
+
+    /// Runs one batched step of the requests of `active` that have a next token, and keeps
+    /// the taps of the one the draft follows.
+    fn step_rows(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut [Request],
+        stop: &[u32],
+    ) {
+        let rows: Vec<(usize, u32)> = active
+            .iter()
+            .filter(|r| !r.done)
+            .filter_map(|r| r.next.map(|t| (r.slot, t)))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        match model.step_batch(&rows) {
+            Ok(next) => {
+                let mut next = next.into_iter();
+                let stepped = active.iter_mut().filter(|r| !r.done && r.next.is_some());
+                for (row, r) in stepped.enumerate() {
+                    let token = next.next().unwrap_or_default();
+                    if r.followed
+                        && let Err(e) = speculator.keep_batched(model, row, token)
+                    {
+                        eprintln!("the draft stops following a request: {e:#}");
+                        speculator.forget();
+                        r.followed = false;
+                    }
+                    r.batched += 1;
+                    r.next = Some(token);
+                    r.done = r.take(&[token], stop).is_break();
+                }
+            }
+            Err(e) => {
+                for r in active.iter_mut().filter(|r| !r.done && r.next.is_some()) {
+                    r.fail(&e);
+                }
+            }
+        }
     }
 }

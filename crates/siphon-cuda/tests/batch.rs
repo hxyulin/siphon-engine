@@ -1,0 +1,265 @@
+//! Batched decode (`Model::step_batch`): each sequence of a batch must emit exactly the
+//! tokens, and the logits bit for bit, of one-row verifies of that sequence alone.
+//!
+//! Needs the checkpoint and about 20 GB of GPU memory, so every test is ignored by
+//! default. Each test loads its own model, so run them one at a time:
+//!
+//! ```sh
+//! SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test batch -- \
+//!     --ignored --nocapture --test-threads 1
+//! ```
+//!
+//! The prompts are slices of the tokens of `reference/out/anyhow-chunked.safetensors` (or
+//! `SIPHON_CAPTURE`), of lengths on both sides of the sliding-window wrap at 1024. The
+//! sequences join and leave the batch at different steps, so the batch size, the rows'
+//! order and their positions all change during the run.
+//!
+//! `speculation_returns_after_batch_bundled` speculates, batches and speculates again with the
+//! bundled draft; `speculation_returns_after_batch_dflash` does the same with the drafter
+//! in `SIPHON_DFLASH`, and passes without it.
+
+#![cfg(target_os = "linux")]
+
+use std::{env, fs, path::PathBuf};
+
+use anyhow::{Context as _, ensure};
+use safetensors::{Dtype, SafeTensors};
+use siphon::{Checkpoint, TextConfig};
+use siphon_cuda::{
+    Gpu,
+    draft::DraftOptions,
+    model::{Accept, DEFAULT_PREFILL_CHUNK, Model, PrefillLogits, VerifyTokens},
+    ops::attention::KvFormat,
+    spec::{DraftSource, Drafts, Speculator, Width, greedy_by_verify, load_draft},
+    weights::{WeightFormat, Weights},
+};
+
+/// (first token, length) of each prompt in the capture.
+const PROMPTS: [(usize, usize); 5] = [(0, 40), (100, 700), (0, 1100), (3000, 2500), (5000, 1023)];
+/// Tokens each sequence generates after its first.
+const STEPS: usize = 40;
+/// The batched step at which each sequence starts decoding.
+const JOINS: [usize; 5] = [0, 0, 3, 7, 12];
+const CAPACITY: usize = 4096;
+
+fn capture_tokens() -> anyhow::Result<Vec<u32>> {
+    let path = env::var_os("SIPHON_CAPTURE").map_or_else(
+        || {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../reference/out/anyhow-chunked.safetensors")
+        },
+        PathBuf::from,
+    );
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let capture = SafeTensors::deserialize(&bytes)?;
+    let view = capture.tensor("tokens")?;
+    ensure!(view.dtype() == Dtype::I32, "tokens are {:?}", view.dtype());
+    view.data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| Ok(u32::try_from(i32::from_le_bytes(*b))?))
+        .collect()
+}
+
+fn load(kv: KvFormat, weights: WeightFormat) -> anyhow::Result<(Gpu, Model)> {
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let gpu = Gpu::new(0)?;
+    let config = TextConfig::load(&model_dir)?;
+    let passes = config.loop_config.num_passes;
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let loaded = Weights::load(&checkpoint, &config, gpu.stream())?;
+    let model = Model::with_formats(&gpu, config, loaded, passes, CAPACITY, kv, weights)?;
+    Ok((gpu, model))
+}
+
+/// FNV-1a over the bits of a row of logits.
+fn hash(row: &[f32]) -> u64 {
+    row.iter().fold(0xcbf2_9ce4_8422_2325, |h, v| {
+        (h ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The first token after `prompt` and the next `STEPS` tokens with their logits' hashes,
+/// through one-row verifies in slot 0.
+fn alone(model: &mut Model, prompt: &[u32]) -> anyhow::Result<(Vec<u32>, Vec<u64>)> {
+    model.reset()?;
+    let mut token = model.prefill(prompt, DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+    let mut tokens = vec![token];
+    let mut hashes = Vec::new();
+    for _ in 0..STEPS {
+        let verdict = model.verify(VerifyTokens::Host(&[token]), Accept::Rows(1))?;
+        hashes.push(hash(&model.verify_logits()?));
+        token = verdict.next();
+        tokens.push(token);
+    }
+    Ok((tokens, hashes))
+}
+
+fn batch_matches_alone(kv: KvFormat, weights: WeightFormat) -> anyhow::Result<()> {
+    let (_gpu, mut model) = load(kv, weights)?;
+    let vocab = model.config().unpadded_vocab_size;
+    let capture = capture_tokens()?;
+    let prompts: Vec<&[u32]> = PROMPTS
+        .iter()
+        .map(|&(first, len)| &capture[first..first + len])
+        .collect();
+    let want = prompts
+        .iter()
+        .map(|p| alone(&mut model, p))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    model.add_slots(prompts.len() - 1)?;
+    // Slot s holds prompt s, except that slots 0 and 1 swap, so slot 0 is not the first
+    // row.
+    let slot_of = |i: usize| match i {
+        0 => 1,
+        1 => 0,
+        i => i,
+    };
+    let mut got: Vec<(Vec<u32>, Vec<u64>)> = Vec::new();
+    for (i, prompt) in prompts.iter().enumerate() {
+        let slot = slot_of(i);
+        model.reset_slot(slot)?;
+        let first = model.prefill_slot(slot, prompt, DEFAULT_PREFILL_CHUNK)?;
+        ensure!(
+            model.slot_position(slot)? == prompt.len(),
+            "slot {slot} is at {}",
+            model.slot_position(slot)?
+        );
+        got.push((vec![first], Vec::new()));
+    }
+    let mut step = 0;
+    while got.iter().any(|(tokens, _)| tokens.len() <= STEPS) {
+        // Joined sequences that still need tokens, the later joiners first.
+        let mut rows: Vec<usize> = (0..prompts.len())
+            .filter(|&i| JOINS[i] <= step && got[i].0.len() <= STEPS)
+            .collect();
+        rows.reverse();
+        let batch: Vec<(usize, u32)> = rows
+            .iter()
+            .map(|&i| (slot_of(i), *got[i].0.last().unwrap_or(&0)))
+            .collect();
+        let next = model.step_batch(&batch)?;
+        let logits = model.batch_logits(rows.len())?;
+        for (r, &i) in rows.iter().enumerate() {
+            got[i].0.push(next[r]);
+            got[i].1.push(hash(&logits[r * vocab..(r + 1) * vocab]));
+        }
+        step += 1;
+    }
+    for (i, (want, got)) in want.iter().zip(&got).enumerate() {
+        let tokens_differ = want.0.iter().zip(&got.0).position(|(a, b)| a != b);
+        let logits_differ = want.1.iter().zip(&got.1).position(|(a, b)| a != b);
+        println!(
+            "prompt {i} ({} tokens): first different token {tokens_differ:?}, first different logits {logits_differ:?}",
+            prompts[i].len()
+        );
+        ensure!(
+            tokens_differ.is_none() && logits_differ.is_none(),
+            "prompt {i}: the batch differs from one-row verifies"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_fp8() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Fp8, WeightFormat::Fp8)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_bf16() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16)
+}
+
+/// Tokens of `prompt`'s greedy continuation through one-row verifies in slot 0, the first
+/// token from the prefill included, `n` in all.
+fn reference(model: &mut Model, prompt: &[u32], n: usize) -> anyhow::Result<Vec<u32>> {
+    model.reset()?;
+    let first = model.prefill(prompt, DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+    let mut tokens = vec![first];
+    tokens.extend(greedy_by_verify(model, first, n - 1)?);
+    Ok(tokens)
+}
+
+/// Sequence A speculates in slot 0, then runs in batched steps as row 1 beside sequence B
+/// in slot 1 while the draft keeps A's taps, then speculates again. B then returns to
+/// speculation too: the draft's state is rebuilt for it in slot 2 and B moves to slot 0.
+/// Both must emit the tokens of one-row verifies.
+fn speculation_returns_after_batch(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let capture = capture_tokens()?;
+    let (a, b) = (&capture[100..800], &capture[3000..4100]);
+    model.add_slots(2)?;
+    model.set_batch_taps(true);
+    let source = drafter.map_or(DraftSource::Bundled, DraftSource::Dflash);
+    let draft = load_draft(
+        &mut model,
+        &checkpoint,
+        source,
+        CAPACITY,
+        &DraftOptions::fast(),
+    )?;
+    let mut spec = Speculator::with_draft(&model, draft, Width::Fixed(7))?;
+
+    model.reset()?;
+    let mut got_a = vec![spec.prefill(&mut model, a, DEFAULT_PREFILL_CHUNK)?];
+    got_a.extend(spec.generate(&mut model, 30, Drafts::Dspark)?);
+    let before = spec.stats().tokens_per_round();
+    spec.follow(&model);
+    model.reset_slot(1)?;
+    let mut got_b = vec![model.prefill_slot(1, b, DEFAULT_PREFILL_CHUNK)?];
+    // More steps than the draft keeps before it commits, so that it commits mid-batch.
+    for _ in 0..STEPS {
+        let last = |t: &[u32]| t.last().copied().unwrap_or_default();
+        let next = model.step_batch(&[(1, last(&got_b)), (0, last(&got_a))])?;
+        spec.keep_batched(&model, 1, next[1])?;
+        got_b.push(next[0]);
+        got_a.push(next[1]);
+    }
+    spec.resume(&mut model, got_a.last().copied().unwrap_or_default())?;
+    got_a.extend(spec.generate(&mut model, 30, Drafts::Dspark)?);
+    let after = spec.stats().tokens_per_round();
+
+    let fed: Vec<u32> = b.iter().chain(&got_b[..got_b.len() - 1]).copied().collect();
+    spec.rebuild(&mut model, 2, &fed)?;
+    model.move_slot(1, 0)?;
+    spec.resume(&mut model, got_b.last().copied().unwrap_or_default())?;
+    got_b.extend(spec.generate(&mut model, 30, Drafts::Dspark)?);
+    let rebuilt = spec.stats().tokens_per_round();
+    println!(
+        "tokens per round: A {before:.2} before the batch, {after:.2} after; B {rebuilt:.2} after the rebuild"
+    );
+
+    for (name, prompt, got) in [("A", a, &got_a), ("B", b, &got_b)] {
+        let want = reference(&mut model, prompt, got.len())?;
+        let differ = want.iter().zip(got).position(|(w, g)| w != g);
+        println!(
+            "{name}: {} tokens, first different token {differ:?}",
+            got.len()
+        );
+        ensure!(differ.is_none(), "{name} differs from one-row verifies");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn speculation_returns_after_batch_bundled() -> anyhow::Result<()> {
+    speculation_returns_after_batch(None)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn speculation_returns_after_batch_dflash() -> anyhow::Result<()> {
+    let Some(dir) = env::var_os("SIPHON_DFLASH") else {
+        println!("SIPHON_DFLASH is not set; skipped");
+        return Ok(());
+    };
+    speculation_returns_after_batch(Some(std::path::Path::new(&dir)))
+}
