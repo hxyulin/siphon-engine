@@ -1813,7 +1813,7 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
                      int dst_stride,
                      const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,
                      const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3,
-                     float eps, float scale, int rows) {
+                     float eps, float scale, int rows, int probs_batch, int dst_batch) {
     constexpr int kCandidates = NB + 1;
     constexpr int kDots = kCandidates * NQ;
     // The dots, then the partial's sum of squares.
@@ -1826,7 +1826,15 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
     const int warp = t / 32;
     const int ca = 4 * t;
     const int cb = 4 * (t + kStepThreads);
-    __nv_bfloat16* const dst[kDests] = {dst0, dst1, dst2, dst3};
+    // Batch y (blockIdx.y) has its own queries, weights and destinations.
+    const size_t batch = blockIdx.y;
+    queries += batch * NQ * kHidden;
+    if (probs != nullptr) {
+        probs += batch * probs_batch;
+    }
+    __nv_bfloat16* const dst[kDests] = {
+        dst0 != nullptr ? dst0 + batch * dst_batch : nullptr, dst1 != nullptr ? dst1 + batch * dst_batch : nullptr,
+        dst2 != nullptr ? dst2 + batch * dst_batch : nullptr, dst3 != nullptr ? dst3 + batch * dst_batch : nullptr};
     const __nv_bfloat16* const weight[kDests] = {weight0, weight1, weight2, weight3};
     unsigned normed_rows = 0;
 #pragma unroll
@@ -1843,7 +1851,28 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
         load8(queries + size_t(j) * kHidden, ca, cb, q[j]);
     }
     pdl_trigger();
-    pdl_wait();
+    // The conv taps of this thread's 8 channels, 4 per channel, and the conv state in L2:
+    // both were last read a visit of this layer ago.
+    uint4 taps[4] = {};
+    if (mode == kPartialConvResidual) {
+        const uint4* wa = reinterpret_cast<const uint4*>(conv_weight + 4 * ca);
+        const uint4* wb = reinterpret_cast<const uint4*>(conv_weight + 4 * cb);
+        taps[0] = wa[0];
+        taps[1] = wa[1];
+        taps[2] = wb[0];
+        taps[3] = wb[1];
+        if (t % 8 == 0) {
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                prefetch_l2(conv_state + size_t(k) * kHidden + ca);
+                prefetch_l2(conv_state + size_t(k) * kHidden + cb);
+            }
+        }
+    }
+    // A branch keeps ptxas from placing the wait before the tap loads (see pdl.cuh).
+    if (rows > 0) {
+        pdl_wait();
+    }
 
     int parity = 0;
     for (int row = blockIdx.x; row < rows; row += gridDim.x, parity ^= 1) {
@@ -1871,15 +1900,6 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
             if (conv_hidden != nullptr) {
                 load8_bf16(conv_hidden + at, ca, cb, hid);
             }
-            // The conv taps of this thread's 8 channels, 4 per channel; after the first row
-            // they come from L1.
-            uint4 taps[4];
-            const uint4* wa = reinterpret_cast<const uint4*>(conv_weight + 4 * ca);
-            const uint4* wb = reinterpret_cast<const uint4*>(conv_weight + 4 * cb);
-            taps[0] = wa[0];
-            taps[1] = wa[1];
-            taps[2] = wb[0];
-            taps[3] = wb[1];
             const auto* w = reinterpret_cast<const __nv_bfloat16*>(taps);
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
@@ -2068,6 +2088,10 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
 // rebuild an output from its candidates. Destination k receives output row
 // min(k, NQ - 1) after an RMS norm, times weight_k if that is not null, as BF16 rows
 // dst_stride apart.
+//
+// The grid's y dimension runs a batch of such attentions over the same candidates: batch y
+// reads queries + y * NQ * 2304 and writes probs + y * probs_batch and dst_k + y * dst_batch.
+// out, normed_partial and residual take one batch only.
 #define DEPTH_ATTENTION_ROWS(NB, NQ)                                                                            \
     extern "C" __global__ void __launch_bounds__(kStepThreads) depth_attention_rows_2304_##NB##_##NQ(        \
         const float* blocks, int block_stride, const float* partial_f32,                                       \
@@ -2077,11 +2101,11 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
         __nv_bfloat16* dst0, __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,    \
         const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,                  \
         const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3, float eps,       \
-        float scale, int rows) {                                                                               \
+        float scale, int rows, int probs_batch, int dst_batch) {                                               \
         depth_attention_rows<NB, NQ>(blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight,        \
                                      conv_state, conv_hidden, residual, normed_partial, queries, out, probs,    \
                                      dst0, dst1, dst2, dst3, dst_stride, weight0, weight1, weight2, weight3,    \
-                                     eps, scale, rows);                                                        \
+                                     eps, scale, rows, probs_batch, dst_batch);                                \
     }
 
 #define DEPTH_ATTENTION_ROWS_Q(NQ) \

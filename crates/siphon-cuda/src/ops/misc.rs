@@ -5,13 +5,13 @@ use std::sync::Arc;
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
+    DevicePtr as _, DevicePtrMut as _, LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
 };
 use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::linear_fp8::Fp8Matrix,
+    ops::{linear::launch_by_value, linear_fp8::Fp8Matrix},
 };
 
 /// Threads per block for the elementwise kernels.
@@ -35,8 +35,19 @@ const GATE_TILE_THREADS: u32 = 256;
 
 /// Block states a message rebuilt by [`Misc::message_gate_out_rows`] can mix.
 const GATE_MAX_BLOCKS: usize = 5;
+/// Most rows of [`Misc::message_gate_rows`].
+pub const GATE_ROWS_MAX: usize = 8;
+/// Dynamic shared memory of `message_gate_rows_2304` and `message_gate_rows_fp8_2304`,
+/// `gate_rows::smem_bytes` in the kernel: the down stages of two warp splits (5 of 4 KiB
+/// each for BF16 weights, 3 for FP8), then the block's forget and gain rows.
+const GATE_ROWS_SMEM_BF16: u32 = 2 * 5 * 4096 + 2 * 144 * 64 * 2;
+const GATE_ROWS_SMEM_FP8: u32 = 2 * 3 * 4096 + 2 * 144 * 64 * 2;
 /// Gates [`Misc::message_gate_out`] runs in one launch.
 pub const GATE_SLOTS: usize = 3;
+const _: () = assert!(
+    GATE_SLOTS == 3,
+    "siphon::memory counts 3 gate outputs per verify launch"
+);
 /// Threads, values per thread and most blocks of `argmax_wide_f32`.
 const ARGMAX_WIDE_THREADS: u32 = 256;
 const ARGMAX_WIDE_PER_THREAD: usize = 2;
@@ -63,6 +74,154 @@ pub struct GateStep<'a> {
     /// Every gate of a launch has them or none does.
     pub fp8: Option<&'a [Fp8Matrix; 3]>,
     pub norm: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
+}
+
+/// One gate of [`Misc::message_gate_rows`].
+pub struct GateRowsSlot<'a> {
+    /// `[64, 4608]`.
+    pub down: &'a CudaSlice<bf16>,
+    /// The down weight's FP8 copy, which the gate reads instead. Every gate of a launch has
+    /// one or none does.
+    pub down_fp8: Option<&'a Fp8Matrix>,
+    /// `[2304, 64]` each.
+    pub forget: &'a CudaSlice<bf16>,
+    pub gain: &'a CudaSlice<bf16>,
+    /// The down projection's input: the normalized state and the normalized message, BF16
+    /// rows of 2304 with the row strides of [`Misc::message_gate_rows`].
+    pub x_state: CudaView<'a, bf16>,
+    pub x_message: CudaView<'a, bf16>,
+    /// The gate's state, rows `h_stride` apart.
+    pub h: CudaView<'a, f32>,
+    /// Each row's message weights, as in [`MessageMix`].
+    pub probs: CudaView<'a, f32>,
+    /// The norm weight and the normalized output, `[rows, 2304]`.
+    pub norm: (&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>),
+    /// Receives the gate's output before the norm, F32 `[rows, 2304]`.
+    pub out: CudaViewMut<'a, f32>,
+}
+
+/// The launch shape [`GateRowsSlot::push`] checks a gate's buffers against.
+struct GateRowsShape {
+    rows: usize,
+    nb: usize,
+    probs_stride: usize,
+    x_strides: [usize; 2],
+    h_stride: usize,
+}
+
+impl GateRowsSlot<'_> {
+    /// Checks the gate's buffers against `shape` and writes their pointers into slot `k`
+    /// of `args`.
+    fn push(
+        &mut self,
+        args: &mut GateRowsArgs,
+        k: usize,
+        shape: &GateRowsShape,
+        stream: &CudaStream,
+    ) -> anyhow::Result<()> {
+        let GateRowsShape {
+            rows,
+            nb,
+            probs_stride,
+            x_strides,
+            h_stride,
+        } = *shape;
+        check_len("down weight", self.down.len(), GATE_RANK * 2 * HIDDEN)?;
+        check_len("forget", self.forget.len(), HIDDEN * GATE_RANK)?;
+        check_len("gain", self.gain.len(), HIDDEN * GATE_RANK)?;
+        for (name, x, stride) in [
+            ("x_state", &self.x_state, x_strides[0]),
+            ("x_message", &self.x_message, x_strides[1]),
+        ] {
+            ensure!(
+                x.len() >= (rows - 1) * stride + HIDDEN,
+                "{name} has {} elements, too few for {rows} rows {stride} apart",
+                x.len()
+            );
+        }
+        ensure!(
+            self.h.len() >= (rows - 1) * h_stride + HIDDEN,
+            "h has {} elements, too few for {rows} rows {h_stride} apart",
+            self.h.len()
+        );
+        ensure!(
+            self.probs.len() > (rows - 1) * probs_stride + nb,
+            "probs has {} elements, too few for {rows} rows {probs_stride} apart",
+            self.probs.len()
+        );
+        check_len("norm weight", self.norm.0.len(), HIDDEN)?;
+        check_len("normed", self.norm.1.len(), rows * HIDDEN)?;
+        check_len("out", self.out.len(), rows * HIDDEN)?;
+        let (down, scale) = match self.down_fp8 {
+            Some(w) => {
+                ensure!(
+                    (w.rows(), w.k()) == (GATE_RANK, 2 * HIDDEN),
+                    "FP8 down weight shape"
+                );
+                (
+                    w.values().device_ptr(stream).0,
+                    w.scales().device_ptr(stream).0,
+                )
+            }
+            None => (self.down.device_ptr(stream).0, 0),
+        };
+        let x_state = self.x_state.device_ptr(stream).0;
+        let x_message = self.x_message.device_ptr(stream).0;
+        ensure!(
+            (down | x_state | x_message).is_multiple_of(16),
+            "the down weight and x must be 16-byte aligned"
+        );
+        args.g[k] = GateRowsGate {
+            down,
+            down_scale: scale,
+            forget: self.forget.device_ptr(stream).0,
+            gain: self.gain.device_ptr(stream).0,
+            x_state,
+            x_message,
+            h: self.h.device_ptr(stream).0,
+            probs: self.probs.device_ptr(stream).0,
+            norm_weight: self.norm.0.device_ptr(stream).0,
+            normed: self.norm.1.device_ptr_mut(stream).0,
+            out: self.out.device_ptr_mut(stream).0,
+        };
+        Ok(())
+    }
+}
+
+/// One gate of [`GateRowsArgs`], as `gate_rows::Gate` in the kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GateRowsGate {
+    down: u64,
+    down_scale: u64,
+    forget: u64,
+    gain: u64,
+    x_state: u64,
+    x_message: u64,
+    h: u64,
+    probs: u64,
+    norm_weight: u64,
+    normed: u64,
+    out: u64,
+}
+
+/// Kernel parameter of `message_gate_rows_2304`, as `gate_rows::GateRowsArgs` in the
+/// kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GateRowsArgs {
+    g: [GateRowsGate; GATE_SLOTS],
+    m: u64,
+    blocks: u64,
+    x_state_stride: i32,
+    x_message_stride: i32,
+    h_stride: i32,
+    m_stride: i32,
+    block_stride: i32,
+    nb: i32,
+    probs_stride: i32,
+    rows: i32,
+    eps: f32,
 }
 
 /// The partial results of [`Misc::argmax_wide_f32`].
@@ -108,6 +267,8 @@ pub struct Misc {
     argmax_wide_f32: CudaFunction,
     message_gate_step_2304: CudaFunction,
     message_gate_step_fp8_2304: CudaFunction,
+    message_gate_rows_2304: CudaFunction,
+    message_gate_rows_fp8_2304: CudaFunction,
     decode_prologue_2304: CudaFunction,
 }
 
@@ -131,6 +292,21 @@ fn cluster_function(module: &Arc<CudaModule>, name: &str) -> anyhow::Result<Cuda
     Ok(f)
 }
 
+/// [`cluster_function`] with `smem` bytes of dynamic shared memory.
+fn gate_rows_function(
+    module: &Arc<CudaModule>,
+    name: &str,
+    smem: u32,
+) -> anyhow::Result<CudaFunction> {
+    let f = cluster_function(module, name)?;
+    f.set_attribute(
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        i32::try_from(smem)?,
+    )
+    .with_context(|| format!("raising the shared memory of {name}"))?;
+    Ok(f)
+}
+
 fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
     ensure!(len == want, "{name} has {len} elements, expected {want}");
     Ok(())
@@ -150,6 +326,16 @@ impl Misc {
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
             message_gate_step_2304: cluster_function(&module, "message_gate_step_2304")?,
             message_gate_step_fp8_2304: cluster_function(&module, "message_gate_step_fp8_2304")?,
+            message_gate_rows_2304: gate_rows_function(
+                &module,
+                "message_gate_rows_2304",
+                GATE_ROWS_SMEM_BF16,
+            )?,
+            message_gate_rows_fp8_2304: gate_rows_function(
+                &module,
+                "message_gate_rows_fp8_2304",
+                GATE_ROWS_SMEM_FP8,
+            )?,
             decode_prologue_2304: module.load_function("decode_prologue_2304")?,
         })
     }
@@ -529,6 +715,117 @@ impl Misc {
         // unsigned*, int*)`, the scratch holds a partial for each of the at most 256 blocks,
         // a fresh buffer is 256-byte aligned, and the kernel reads nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.argmax_wide_f32, config) }
+    }
+
+    /// The whole `MessageGate` for the `rows` rows (1 to [`GATE_ROWS_MAX`]) of a chunk and
+    /// 1 to 3 gates in one launch: each gate's down projection of its state and message
+    /// side by side (their rows `x_state_stride` and `x_message_stride` apart), its outputs with the
+    /// message rebuilt from `mix` (`m` being the partial candidate, rows `m_stride` apart),
+    /// and their norm. It sums as the multi-row down product of
+    /// [`crate::ops::linear_rows::LinearRows`] followed by [`Misc::message_gate_out_rows`]
+    /// with its norm, so the results are the same bit for bit, and each row's result
+    /// depends on that row only.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn message_gate_rows(
+        &self,
+        stream: &CudaStream,
+        gates: &mut [GateRowsSlot<'_>],
+        [x_state_stride, x_message_stride]: [usize; 2],
+        h_stride: usize,
+        (m, m_stride): (&impl DeviceIn<f32>, usize),
+        blocks: &CudaView<'_, f32>,
+        probs_stride: usize,
+        eps: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let m = m.view();
+        let n = gates.len();
+        ensure!(
+            (1..=GATE_SLOTS).contains(&n),
+            "{n} gates; one launch takes 1 to {GATE_SLOTS}"
+        );
+        ensure!(
+            (1..=GATE_ROWS_MAX).contains(&rows),
+            "{rows} rows, expected 1 to {GATE_ROWS_MAX}"
+        );
+        let fp8 = gates[0].down_fp8.is_some();
+        let block_len = rows * HIDDEN;
+        ensure!(
+            blocks.len().is_multiple_of(block_len),
+            "blocks has {} elements, not a multiple of {rows} x {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / block_len;
+        ensure!(
+            nb <= GATE_MAX_BLOCKS,
+            "{nb} block states; at most {GATE_MAX_BLOCKS} fit"
+        );
+        ensure!(
+            m_stride >= HIDDEN
+                && m_stride.is_multiple_of(2)
+                && m.len() >= (rows - 1) * m_stride + HIDDEN,
+            "m has {} elements, too few for {rows} even rows {m_stride} apart",
+            m.len()
+        );
+        ensure!(
+            h_stride >= HIDDEN && h_stride.is_multiple_of(2),
+            "h_stride {h_stride} is odd or below {HIDDEN}"
+        );
+        ensure!(
+            probs_stride > nb,
+            "probs_stride {probs_stride} holds no {} weights",
+            nb + 1
+        );
+        ensure!(
+            [x_state_stride, x_message_stride]
+                .iter()
+                .all(|&s| s >= HIDDEN && s.is_multiple_of(8)),
+            "x strides must be multiples of 8, at least {HIDDEN}"
+        );
+        let mut args = GateRowsArgs {
+            m: m.device_ptr(stream).0,
+            blocks: blocks.device_ptr(stream).0,
+            x_state_stride: i32::try_from(x_state_stride)?,
+            x_message_stride: i32::try_from(x_message_stride)?,
+            h_stride: i32::try_from(h_stride)?,
+            m_stride: i32::try_from(m_stride)?,
+            block_stride: i32::try_from(block_len)?,
+            nb: i32::try_from(nb)?,
+            probs_stride: i32::try_from(probs_stride)?,
+            rows: i32::try_from(rows)?,
+            eps,
+            ..GateRowsArgs::default()
+        };
+        let shape = GateRowsShape {
+            rows,
+            nb,
+            probs_stride,
+            x_strides: [x_state_stride, x_message_stride],
+            h_stride,
+        };
+        for (k, gate) in gates.iter_mut().enumerate() {
+            ensure!(
+                gate.down_fp8.is_some() == fp8,
+                "every gate of a launch has an FP8 down weight or none does"
+            );
+            gate.push(&mut args, k, &shape, stream)?;
+        }
+        let (function, smem) = if fp8 {
+            (&self.message_gate_rows_fp8_2304, GATE_ROWS_SMEM_FP8)
+        } else {
+            (&self.message_gate_rows_2304, GATE_ROWS_SMEM_BF16)
+        };
+        let config = LaunchConfig {
+            grid_dim: (GATE_CLUSTER, u32::try_from(n)?, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        // SAFETY: `args` has the layout of `gate_rows::GateRowsArgs`. The checks above size every
+        // buffer for `rows` rows of the `n` gates of the grid's y dimension, the message
+        // weights for `nb` block states, and the grid is one cluster of 16 blocks per gate
+        // as the kernel is compiled, with its dynamic shared memory. The kernel reads only
+        // weights before `pdl_wait`.
+        unsafe { launch_by_value(stream, function, config, &args, true) }
     }
 
     /// [`Misc::message_gate_out`] for each of the `rows` rows of a chunk: `down`

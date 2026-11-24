@@ -289,6 +289,7 @@ impl Planner {
             None => (0, 0, 0),
             Some((d, approx)) => {
                 let verify = rows_scratch(c, VERIFY_ROWS)
+                    + invariant_scratch(c, VERIFY_ROWS)
                     + VERIFY_ROWS * taps * hidden * 2
                     + visits.len() * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
                     + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4
@@ -306,6 +307,7 @@ impl Planner {
         // rows' taps for the draft.
         let batch = if streams > 1 {
             rows_scratch(c, VERIFY_ROWS)
+                + invariant_scratch(c, VERIFY_ROWS)
                 + visits.len() * VERIFY_ROWS * 6 * 8
                 + VERIFY_ROWS * 8
                 + VERIFY_ROWS * taps * hidden * 2
@@ -510,6 +512,15 @@ fn rows_scratch(c: &TextConfig, rows: usize) -> usize {
         + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2)
         + HEAD_ROWS * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
     per_rows + fixed
+}
+
+/// What `PrefillScratch::new` adds for an invariant chunk, the verify pass: every looped
+/// layer's message weights and normalized messages, and an output for each of the 3 gates
+/// one launch runs (`misc::GATE_SLOTS`).
+fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
+    let hidden = c.hidden_size;
+    let looped = c.loop_config.core_end - c.loop_config.core_start;
+    rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2 + 2 * hidden * 4)
 }
 
 /// The bundled draft's shape: the checkpoint's tensors outside the text and vision models

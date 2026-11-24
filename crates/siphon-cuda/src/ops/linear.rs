@@ -394,6 +394,18 @@ impl<T: DeviceRepr> Prefetch for CudaSlice<T> {
     }
 }
 
+/// Asks for the largest shared-memory carveout for `f`. The prefetch kernels need almost
+/// no shared memory, so the driver would give their SMs a small carveout, and a main-stream
+/// block that needs more cannot start on those SMs until they drain. A message-gate cluster,
+/// which needs 16 SMs of one GPC at once, waited up to 13 us for that.
+fn max_shared(f: CudaFunction) -> anyhow::Result<CudaFunction> {
+    f.set_attribute(
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )?;
+    Ok(f)
+}
+
 /// How [`Linear::prefetch`] pulls weights into L2.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Pace {
@@ -451,8 +463,8 @@ impl Linear {
             },
             gemm_bf16: GemmKernels::load::<bf16>(ctx, &module, &GEMM_BF16_TILES)?,
             gemm_f32: GemmKernels::load::<f32>(ctx, &module, &GEMM_F32_TILES)?,
-            prefetch_l2: f("prefetch_l2")?,
-            prefetch_l2_paced: f("prefetch_l2_paced")?,
+            prefetch_l2: max_shared(f("prefetch_l2")?)?,
+            prefetch_l2_paced: max_shared(f("prefetch_l2_paced")?)?,
             side: ctx.new_stream()?,
             fork: ctx.new_event(None)?,
             join: ctx.new_event(None)?,

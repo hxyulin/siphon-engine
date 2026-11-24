@@ -28,9 +28,11 @@ use crate::{
         conv::VisitConvs,
         experts::{ExpertScratch, QuantizedRows},
         linear_fp8::Fp8Matrix,
-        misc::{GATE_SLOTS, MessageMix},
+        misc::{GATE_SLOTS, GateRowsSlot, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
-        routing::{DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsPartial},
+        routing::{
+            DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsBatch, RowsPartial,
+        },
         spec::{BatchRows, TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
@@ -69,7 +71,7 @@ struct GateRows {
     inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
     /// The down projections, BF16 `[slots, rows, rank]`.
     down: CudaSlice<bf16>,
-    /// A gate's output, F32 `[rows, hidden]`.
+    /// A gate's output, F32 `[rows, hidden]`, and in invariant chunks one per slot of a launch.
     out: CudaSlice<f32>,
 }
 
@@ -149,8 +151,13 @@ pub(super) struct PrefillScratch {
     /// Block states in the bank, the candidates of the messages besides `bank_normed`.
     bank_rows: usize,
     /// The weights of the messages over their candidates, F32 `[rows, 4, bank_rows + 1]`;
-    /// the message gates rebuild the messages from them.
+    /// the message gates rebuild the messages from them. Invariant chunks hold every looped
+    /// layer's, one after another (see `message_x`).
     message_probs: CudaSlice<f32>,
+    /// In invariant chunks, every looped layer's normalized messages, BF16
+    /// `[4 slots, looped layers, rows, hidden]`: one launch per pass computes them all
+    /// instead of one per visit. Other chunks put them into the gate inputs' second halves.
+    message_x: Option<CudaSlice<bf16>>,
     /// F32 `[rows, 1 or 3, hidden]`.
     attention_inputs: CudaSlice<f32>,
     gate: GateRows,
@@ -189,6 +196,7 @@ impl PrefillScratch {
         let dynamic = cfg.num_key_value_heads * cfg.sconv_kernel_size;
         let top_k = cfg.num_experts_per_tok;
         let width = cfg.intermediate_size;
+        let looped = cfg.loop_config.core_end - cfg.loop_config.core_start;
         Ok(Self {
             rows,
             record_taps: false,
@@ -206,7 +214,13 @@ impl PrefillScratch {
             bank: zeros(stream, rows * max_blocks * hidden)?,
             bank_normed: zeros(stream, rows * hidden)?,
             bank_rows: 0,
-            message_probs: zeros(stream, rows * MESSAGE_SLOTS * FUSED_MAX_CANDIDATES)?,
+            message_probs: zeros(
+                stream,
+                if invariant { looped } else { 1 } * rows * MESSAGE_SLOTS * FUSED_MAX_CANDIDATES,
+            )?,
+            message_x: invariant
+                .then(|| zeros(stream, MESSAGE_SLOTS * looped * rows * hidden))
+                .transpose()?,
             attention_inputs: zeros(stream, rows * 3 * hidden)?,
             gate: GateRows {
                 invariant,
@@ -217,7 +231,11 @@ impl PrefillScratch {
                     zeros(stream, rows * 2 * hidden)?,
                 ],
                 down: zeros(stream, MESSAGE_SLOTS * rows * cfg.loop_config.gate_rank)?,
-                out: zeros(stream, rows * hidden)?,
+                // Invariant chunks run up to three gates at once, each with its own output.
+                out: zeros(
+                    stream,
+                    if invariant { GATE_SLOTS } else { 1 } * rows * hidden,
+                )?,
             },
             qkv_in: [
                 zeros(stream, rows * hidden)?,
@@ -449,6 +467,40 @@ struct Messages<'a> {
     bank: CudaView<'a, f32>,
     normed: CudaView<'a, f32>,
     probs: CudaView<'a, f32>,
+    /// In invariant chunks, the normalized message of each slot, BF16 `[rows, hidden]`;
+    /// other chunks hold them in the gate inputs.
+    x: Option<[CudaView<'a, bf16>; MESSAGE_SLOTS]>,
+}
+
+impl<'a> Messages<'a> {
+    /// The messages of looped layer `i` of `looped` for a chunk of `m` rows, from
+    /// [`PrefillScratch`]'s `bank`, `bank_normed`, `message_probs` and `message_x`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the scratch fields they come from"
+    )]
+    fn new(
+        bank: &'a CudaSlice<f32>,
+        bank_rows: usize,
+        normed: &'a CudaSlice<f32>,
+        probs: &'a CudaSlice<f32>,
+        x: Option<&'a CudaSlice<bf16>>,
+        m: usize,
+        hidden: usize,
+        (i, looped): (usize, usize),
+    ) -> Self {
+        let mh = m * hidden;
+        let set = m * MESSAGE_SLOTS * (bank_rows + 1);
+        let first = if x.is_some() { i * set } else { 0 };
+        Self {
+            bank: bank.slice(..bank_rows * mh),
+            normed: rows(normed, m, hidden),
+            probs: probs.slice(first..first + set),
+            x: x.map(|x| {
+                std::array::from_fn(|k| x.slice((k * looped + i) * mh..(k * looped + i + 1) * mh))
+            }),
+        }
+    }
 }
 
 /// What [`Ctx::attention_inputs_rows`] reads and writes, as `AttentionInputs` for a chunk.
@@ -608,8 +660,40 @@ impl Ctx {
                 )?;
                 blocks.len = prelude_blocks;
             }
+            if pass > 0 && p.message_x.is_some() {
+                // Every looped layer's messages in one launch: they attend over the bank,
+                // which stays the same for the whole pass.
+                let looped = core_end - core_start;
+                let bank_rows = p.bank_rows;
+                let x = p.message_x.as_mut().context("message_x")?;
+                let (x0, mut rest) = x.split_at_mut(looped * mh);
+                let (x1, mut rest) = rest.split_at_mut(looped * mh);
+                let (x2, x3) = rest.split_at_mut(looped * mh);
+                let dests = [x0, x1, x2, x3].map(|out| Some(NormDest { out, weight: None }));
+                let probs_set = m * MESSAGE_SLOTS * (bank_rows + 1);
+                self.kernels.routing.depth_attention_rows_batch(
+                    &self.stream,
+                    DepthRows {
+                        blocks: p.bank.slice(..bank_rows * mh),
+                        partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
+                        normed_partial: None,
+                        queries: &s.message_queries,
+                        out: None,
+                        probs: Some(p.message_probs.slice_mut(..looped * probs_set)),
+                        dests,
+                        dst_stride: hidden,
+                        rows: m,
+                    },
+                    RowsBatch {
+                        count: looped,
+                        probs_stride: probs_set,
+                        dst_stride: mh,
+                    },
+                    self.eps(),
+                )?;
+            }
             for (i, layer) in (core_start..core_end).enumerate() {
-                if pass > 0 {
+                if pass > 0 && p.message_x.is_none() {
                     // The messages' weights, and their normalized halves of the gate inputs.
                     let bank_rows = p.bank_rows;
                     let dests = p.gate.inputs.each_mut().map(|x| {
@@ -889,6 +973,12 @@ impl Ctx {
         } else {
             None
         };
+        // This layer's index among the looped layers, and their count.
+        let loops = self.config.loop_config;
+        let looped = (
+            layer.saturating_sub(loops.core_start),
+            loops.core_end - loops.core_start,
+        );
         // The first visit starts prefetching the rest of its own weights; later visits had
         // theirs started by the visit before.
         if let Some(next) = upcoming
@@ -913,11 +1003,16 @@ impl Ctx {
                 messages: gates.map(|g| {
                     (
                         g,
-                        Messages {
-                            bank: p.bank.slice(..p.bank_rows * mh),
-                            normed: rows(&p.bank_normed, m, hidden),
-                            probs: rows(&p.message_probs, m, MESSAGE_SLOTS * (p.bank_rows + 1)),
-                        },
+                        Messages::new(
+                            &p.bank,
+                            p.bank_rows,
+                            &p.bank_normed,
+                            &p.message_probs,
+                            p.message_x.as_ref(),
+                            m,
+                            hidden,
+                            looped,
+                        ),
                     )
                 }),
             },
@@ -1029,11 +1124,16 @@ impl Ctx {
                 &mut p.gate,
                 3,
                 (rows(&p.mlp_input, m, hidden), hidden, 0),
-                &Messages {
-                    bank: p.bank.slice(..p.bank_rows * mh),
-                    normed: rows(&p.bank_normed, m, hidden),
-                    probs: rows(&p.message_probs, m, MESSAGE_SLOTS * (p.bank_rows + 1)),
-                },
+                &Messages::new(
+                    &p.bank,
+                    p.bank_rows,
+                    &p.bank_normed,
+                    &p.message_probs,
+                    p.message_x.as_ref(),
+                    m,
+                    hidden,
+                    looped,
+                ),
                 vec![(&w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))],
                 m,
             )?;
@@ -1461,6 +1561,18 @@ impl Ctx {
         let n = weights.len();
         let invariant = t.invariant;
         ensure!(n == norms.len(), "{n} gates with {} norms", norms.len());
+        if invariant {
+            // One launch for the gates: down projections, outputs and norms, as below.
+            return self.message_gate_launch(
+                weights,
+                t,
+                first,
+                (state, h_stride, h_slot_stride),
+                messages,
+                norms,
+                m,
+            );
+        }
         let mut down = t.down.slice_mut(first * mr..(first + n) * mr);
         match n {
             1 => self.gemm_rows(
@@ -1527,6 +1639,72 @@ impl Ctx {
             )?;
         }
         Ok(())
+    }
+
+    /// [`Ctx::message_gate_rows`] for an invariant chunk: every gate's down projection,
+    /// outputs and norm in one launch of [`crate::ops::misc::Misc::message_gate_rows`],
+    /// which sums as the separate launches do.
+    #[expect(clippy::too_many_arguments, reason = "the gates' inputs and outputs")]
+    fn message_gate_launch(
+        &self,
+        weights: &[MessageGateWeights],
+        t: &mut GateRows,
+        first: usize,
+        (state, h_stride, h_slot_stride): (CudaView<'_, f32>, usize, usize),
+        messages: &Messages<'_>,
+        norms: Vec<(&CudaSlice<bf16>, CudaViewMut<'_, bf16>)>,
+        m: usize,
+    ) -> anyhow::Result<()> {
+        let hidden = self.hidden();
+        let n = weights.len();
+        let mh = m * hidden;
+        let candidates = messages.bank.len() / mh + 1;
+        let fp8 = weights.iter().all(|w| w.fp8.is_some());
+        let (o0, mut rest) = t.out.split_at_mut(mh);
+        let (o1, mut rest) = rest.split_at_mut(mh);
+        let mut outs = vec![o0, o1, rest.slice_mut(..mh)];
+        outs.truncate(n);
+        let inputs = &t.inputs;
+        let x_message_stride = if messages.x.is_some() {
+            hidden
+        } else {
+            2 * hidden
+        };
+        let mut gates: Vec<GateRowsSlot<'_>> = weights
+            .iter()
+            .zip(norms)
+            .zip(outs)
+            .enumerate()
+            .map(|(i, ((w, norm), out))| {
+                let slot = first + i;
+                GateRowsSlot {
+                    down: &w.down,
+                    down_fp8: w.fp8.as_ref().filter(|_| fp8).map(|f| &f[0]),
+                    forget: &w.forget,
+                    gain: &w.gain,
+                    x_state: rows(&inputs[slot], m, 2 * hidden),
+                    x_message: match &messages.x {
+                        Some(x) => x[slot].slice(..),
+                        None => inputs[slot].slice(hidden..m * 2 * hidden),
+                    },
+                    h: state.slice(i * h_slot_stride..),
+                    probs: messages.probs.slice(slot * candidates..),
+                    norm,
+                    out,
+                }
+            })
+            .collect();
+        self.kernels.misc.message_gate_rows(
+            &self.stream,
+            &mut gates,
+            [2 * hidden, x_message_stride],
+            h_stride,
+            (&messages.normed, hidden),
+            &messages.bank,
+            MESSAGE_SLOTS * candidates,
+            self.eps(),
+            m,
+        )
     }
 
     /// [`Ctx::moe`] for a chunk of `m` rows from the MLP input `x` after its norm: the

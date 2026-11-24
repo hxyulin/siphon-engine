@@ -150,6 +150,15 @@ pub struct DepthRows<'a> {
     pub rows: usize,
 }
 
+/// The sets of [`Routing::depth_attention_rows_batch`]: how many, and how far apart each
+/// set's weights and destinations are, in elements. The default is one set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowsBatch {
+    pub count: usize,
+    pub probs_stride: usize,
+    pub dst_stride: usize,
+}
+
 /// A BF16 copy of one depth-attention output row after an RMS norm.
 pub struct NormDest<'a> {
     pub out: CudaViewMut<'a, bf16>,
@@ -692,6 +701,22 @@ impl Routing {
         d: DepthRows<'_>,
         eps: f32,
     ) -> anyhow::Result<()> {
+        self.depth_attention_rows_batch(stream, d, RowsBatch::default(), eps)
+    }
+
+    /// [`Routing::depth_attention_rows`] for `b.count` sets of queries over the same
+    /// candidates in one launch: `d.queries` holds the sets one after another, and set `i`
+    /// writes its weights `i * b.probs_stride` and its destinations `i * b.dst_stride`
+    /// elements after set 0's. Every set sums as a launch of its own would. With more than
+    /// one set, `out` and `normed_partial` must be `None` and the partial not a
+    /// [`RowsPartial::ConvResidual`].
+    pub fn depth_attention_rows_batch(
+        &self,
+        stream: &CudaStream,
+        d: DepthRows<'_>,
+        b: RowsBatch,
+        eps: f32,
+    ) -> anyhow::Result<()> {
         let DepthRows {
             blocks,
             partial,
@@ -716,12 +741,20 @@ impl Routing {
             "{nb} blocks; 1 to {} fit",
             FUSED_MAX_CANDIDATES - 1
         );
+        let count = b.count.max(1);
         ensure!(
-            queries.len().is_multiple_of(HIDDEN),
-            "queries has {} elements, not a multiple of {HIDDEN}",
+            queries.len().is_multiple_of(count * HIDDEN),
+            "queries has {} elements, not {count} sets of whole rows of {HIDDEN}",
             queries.len()
         );
-        let nq = queries.len() / HIDDEN;
+        ensure!(
+            count == 1
+                || (out.is_none()
+                    && normed_partial.is_none()
+                    && !matches!(partial, RowsPartial::ConvResidual { .. })),
+            "a batch of sets writes only weights and destinations"
+        );
+        let nq = queries.len() / (count * HIDDEN);
         let q_index = ROWS_QUERY_COUNTS
             .iter()
             .position(|&n| n == nq)
@@ -734,15 +767,18 @@ impl Routing {
             out.as_ref().is_none_or(|x| x.len() == rows * nq * HIDDEN),
             "out must hold {rows} x {nq} x {HIDDEN} elements"
         );
+        let probs_len = rows * nq * (nb + 1);
         ensure!(
-            probs
-                .as_ref()
-                .is_none_or(|x| x.len() == rows * nq * (nb + 1)),
-            "probs must hold {rows} x {nq} x {} elements",
+            probs.as_ref().is_none_or(|x| if count == 1 {
+                x.len() == probs_len
+            } else {
+                b.probs_stride >= probs_len && x.len() >= (count - 1) * b.probs_stride + probs_len
+            }),
+            "probs must hold {count} sets of {rows} x {nq} x {} elements",
             nb + 1
         );
         ensure!(dst_stride >= HIDDEN, "dst_stride is below {HIDDEN}");
-        let dest_len = (rows - 1) * dst_stride + HIDDEN;
+        let dest_len = (count - 1) * b.dst_stride + (rows - 1) * dst_stride + HIDDEN;
         for dest in dests.iter().flatten() {
             ensure!(
                 dest.out.len() >= dest_len && dest.weight.is_none_or(|w| w.len() == HIDDEN),
@@ -768,17 +804,20 @@ impl Routing {
         let rows_u32 = u32::try_from(rows).context("too many rows")?;
         args.f32(eps)
             .f32((HIDDEN as f32).sqrt().recip())
-            .i32(i32::try_from(rows)?);
+            .i32(i32::try_from(rows)?)
+            .i32(i32::try_from(b.probs_stride).context("probs stride too large")?)
+            .i32(i32::try_from(b.dst_stride).context("destination stride too large")?);
         let (function, resident) = &self.depth_attention_rows_2304[q_index][nb - 1];
         let config = LaunchConfig {
-            grid_dim: (rows_u32.min(*resident), 1, 1),
+            grid_dim: (rows_u32.min(*resident), u32::try_from(count)?, 1),
             block_dim: (DEPTH_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `depth_attention_rows_2304_<nb>_<nq>`'s signature,
-        // every non-null pointer comes from a live buffer that holds the rows checked above,
-        // the blocks loop over the rows, and the kernel reads only weights (queries, norm
-        // weights, conv taps) before `pdl_wait`.
+        // every non-null pointer comes from a live buffer that holds the rows of every set
+        // checked above, the blocks loop over the rows and the grid's y dimension covers
+        // the sets, and the kernel reads only weights (queries, norm weights, conv taps)
+        // before `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
