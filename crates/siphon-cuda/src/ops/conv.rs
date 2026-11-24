@@ -29,10 +29,9 @@ const BLOCK: u32 = 256;
 const MOE_CONV_ROWS: usize = 8;
 const MOE_CONV_THREADS: u32 = 192;
 const MOE_CONV_BLOCK_COLS: usize = 768;
-/// Threads per block of `moe_conv_residual_step_rows_2304` and channels per block,
-/// `kStepThreads` and `kStepBlockCols` in the kernel.
-const STEP_THREADS: u32 = 128;
-const STEP_BLOCK_COLS: usize = 128;
+/// Channels per block of `moe_conv_residual_step_rows_2304`, `kStepBlockCols` in the
+/// kernel; each row takes a warp of the block.
+const STEP_BLOCK_COLS: usize = 32;
 /// Hidden width, the channels of the post-attention and post-MLP convs.
 const HIDDEN: usize = 2304;
 /// Experts per token in the MoE combine.
@@ -426,7 +425,7 @@ impl Conv {
         }
         let config = LaunchConfig {
             grid_dim: (u32::try_from(HIDDEN / STEP_BLOCK_COLS)?, 1, 1),
-            block_dim: (STEP_THREADS, 1, 1),
+            block_dim: (u32::try_from(32 * rows)?, 1, 1),
             shared_mem_bytes: 0,
         };
         let VisitConvs {
@@ -456,9 +455,9 @@ impl Conv {
         // SAFETY: the arguments match `moe_conv_residual_step_rows_2304(const bf16*, const
         // float*, const bf16*, float*, const float*, bf16*, int, const bf16*, float*, const
         // bf16*, const bf16*, float*, float*, bf16*)`, every buffer has the length checked
-        // above for `rows` rows, and the grid gives each thread one channel of the
-        // 2304, and of the 1024 key and value channels for the threads that start below
-        // 1024.
+        // above for `rows` rows, and the grid gives each thread one channel of the 2304 (and
+        // of the 1024 key and value channels below 1024) in one row, with every row of a
+        // channel in the same block.
         unsafe { args.launch_pdl(stream, &self.moe_conv_residual_step_rows_2304, config) }
     }
 

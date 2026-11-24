@@ -88,7 +88,7 @@ const ROWS_WARP_QUERIES: usize = 3;
 const ROWS_THREADS: u32 = 256;
 /// Dynamic shared memory of `attention_rows_bf16` and `attention_rows_fp8`, the sizes of
 /// `RowsShared` in the kernel.
-const ROWS_SHARED_BYTES: [u32; 2] = [49_152, 32_768];
+const ROWS_SHARED_BYTES: [u32; 2] = [49_920, 33_536];
 
 /// Element format of the global-layer KV caches. Sliding caches are always BF16.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -405,17 +405,17 @@ pub struct Attention {
     prefill_fp8: CudaFunction,
     /// `attention_rows_bf16_<NQ>` and `attention_rows_fp8_<NQ>` for NQ = 1 to 3.
     rows: Vec<[CudaFunction; 2]>,
-    /// `attention_rows_combine` for a BF16 and an FP8 cache.
-    rows_combine: [CudaFunction; 2],
 }
 
 /// The partials of [`Attention::attention_rows`]: per query row of up to 8 x 24, one
-/// output, max and sum per block of its KV head.
+/// output, max and sum per block of its KV head. The counters, two per KV head, count the
+/// finished blocks and combiners, and return to zero at the end of every call.
 #[derive(Debug)]
 pub struct RowsAttentionScratch {
     out: CudaSlice<f32>,
     max: CudaSlice<f32>,
     sum: CudaSlice<f32>,
+    counters: CudaSlice<u32>,
 }
 
 impl RowsAttentionScratch {
@@ -425,6 +425,7 @@ impl RowsAttentionScratch {
             out: stream.alloc_zeros(rows * HEAD_DIM)?,
             max: stream.alloc_zeros(rows)?,
             sum: stream.alloc_zeros(rows)?,
+            counters: stream.alloc_zeros(2 * KV_HEADS)?,
         })
     }
 }
@@ -483,10 +484,6 @@ impl Attention {
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
-            rows_combine: [
-                module.load_function("attention_rows_combine_bf16")?,
-                module.load_function("attention_rows_combine_fp8")?,
-            ],
         })
     }
 
@@ -549,15 +546,18 @@ impl Attention {
         };
         let mut args = KernelArgs::default();
         args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
-        match &cache.data {
-            KvData::Bf16 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
-            KvData::Fp8 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
+        match &mut cache.data {
+            KvData::Bf16 { keys, values } => args.ptr_mut(keys, stream).ptr_mut(values, stream),
+            KvData::Fp8 { keys, values } => args.ptr_mut(keys, stream).ptr_mut(values, stream),
         };
         args.ptr(&bias, stream)
             .ptr(&sinks, stream)
             .ptr_mut(&mut scratch.out, stream)
             .ptr_mut(&mut scratch.max, stream)
             .ptr_mut(&mut scratch.sum, stream)
+            .ptr_mut(&mut scratch.counters, stream)
+            .ptr_mut(&mut out, stream)
+            .opt(gate, stream)
             .ptr(start, stream)
             .i32(i32::try_from(rows)?)
             .u32(slots)
@@ -569,53 +569,21 @@ impl Attention {
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
-        // SAFETY: the arguments match `attention_rows_bf16_<NQ>(const bf16* q, const bf16* k_new,
-        // const bf16* v_new, const bf16* k_cache, const bf16* v_cache, const bf16* bias, const bf16* sinks, float* partial_out, float*
-        // partial_max, float* partial_sum, const unsigned* start, int rows, unsigned slots,
-        // unsigned window, unsigned extent, float scale)`, or `attention_rows_fp8_<NQ>` with
-        // `uint8_t*` caches. The kernel reads slots below min(start + rows, slots) of the
-        // caches, which the caller checked the cache holds, `rows` rows of q, k, v, bias and
-        // sinks,
-        // and writes partials for `rows` x 24 query rows of `ROWS_BLOCKS` blocks, which the
-        // scratch holds. It reads nothing before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, function, config) }?;
-
-        let mut args = KernelArgs::default();
-        args.ptr(&scratch.out, stream)
-            .ptr(&scratch.max, stream)
-            .ptr(&scratch.sum, stream)
-            .ptr_mut(&mut out, stream)
-            .i32(i32::try_from(ROWS_BLOCKS)?)
-            .opt(gate, stream)
-            .ptr(&k, stream)
-            .ptr(&v, stream);
-        let combine = match &mut cache.data {
-            KvData::Bf16 { keys, values } => {
-                args.ptr_mut(keys, stream).ptr_mut(values, stream);
-                &self.rows_combine[0]
-            }
-            KvData::Fp8 { keys, values } => {
-                args.ptr_mut(keys, stream).ptr_mut(values, stream);
-                &self.rows_combine[1]
-            }
-        };
-        args.ptr(start, stream).u32(slots);
-        let config = LaunchConfig {
-            grid_dim: (u32::try_from(rows * HEADS)?, 1, 1),
-            block_dim: (HEAD_DIM as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: the arguments match `attention_rows_combine_bf16(const float*, const
-        // float*, const float*, bf16*, int, const bf16*, const bf16*, const bf16*, bf16*,
-        // bf16*, const unsigned*, unsigned)`, or `attention_rows_combine_fp8` with `uint8_t*`
-        // caches. The grid has one block per query row, each reading the `ROWS_BLOCKS`
-        // partials the attention kernel wrote and its gate row if there is one, and writing
-        // its 128 outputs, which `out` holds. The first head of each KV group writes that
-        // head's 128 channels of its row's key and value, read from `k` and `v`, at slot
-        // (start + row) mod slots, which the cache holds; no two blocks write the same
-        // elements, since rows <= 8 < slots. It reads nothing before `pdl_wait`, so the
-        // attention kernel, which reads the slots the rows overwrite, has finished.
-        unsafe { args.launch_pdl(stream, combine, config) }
+        // SAFETY: the arguments match `attention_rows_bf16_<NQ>(const bf16* q, const bf16*
+        // k_new, const bf16* v_new, bf16* k_cache, bf16* v_cache, const bf16* bias, const
+        // bf16* sinks, float* partial_out, float* partial_max, float* partial_sum, unsigned*
+        // counters, bf16* out, const bf16* gate, const unsigned* start, int rows, unsigned
+        // slots, unsigned window, unsigned extent, float scale)`, or `attention_rows_fp8_<NQ>`
+        // with `uint8_t*` caches. The kernel reads slots below min(start + rows, slots) of the
+        // caches, which the caller checked the cache holds, and `rows` rows of q, k, v, bias,
+        // sinks and gate (if any). It writes partials for `rows` x 24 query rows of
+        // `ROWS_BLOCKS` blocks, which the scratch holds, uses the scratch's 16 counters,
+        // which every call leaves at zero, and writes `rows` rows of `out`. The combining
+        // blocks write the rows' keys and values at slots (start + row) mod slots once every
+        // block of their KV head has finished reading the cache; no two blocks write the same
+        // elements, since rows <= 8 < slots. Before `pdl_wait` it reads only `start` and the
+        // caches, which no kernel of the pass writes before this one.
+        unsafe { args.launch_pdl(stream, function, config) }
     }
 
     /// `bias = rel @ table` for relative states `rel` `[rows, 24, 16]` and the layer's

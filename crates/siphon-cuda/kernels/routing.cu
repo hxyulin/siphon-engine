@@ -1400,64 +1400,81 @@ __device__ __forceinline__ float router_logit(const float4 (&w)[2 * kStepWarps],
     return total;
 }
 
-// router_logit for R rows of x [R, 2304] at once: each row's sum runs in the same order,
-// and the rows' loads and warp sums interleave instead of waiting on each other.
-template <int R>
-__device__ __forceinline__ void router_logits(const float4 (&w)[2 * kStepWarps], const __nv_bfloat16* x, int lane,
-                                              float (&out)[R]) {
+// warp_sum's xor butterfly (offsets 1, 2, 4, 8, 16) of 32 values at once, in 31
+// shuffles: lane l gets the sum of value bitreverse5(l). Each step adds the same pairs of
+// partial sums as warp_sum's step of that offset, so every sum equals warp_sum's bit for
+// bit. Step s keeps the lower half of the values in lanes whose bit s is clear and the
+// upper half in the others.
+__device__ __forceinline__ float warp_butterfly_transpose(float (&v)[32]) {
+    const int lane = threadIdx.x % 32;
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        out[r] = 0.f;
-    }
+    for (int s = 0; s < 5; ++s) {
+        const int offset = 1 << s;
+        const int half = 16 >> s;
+        const bool upper = (lane & offset) != 0;
 #pragma unroll
-    for (int v = 0; v < kStepWarps; ++v) {
-        const float4 a = w[v];
-        const float4 b = w[v + kStepWarps];
-        float acc[R];
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const __nv_bfloat16* xr = x + size_t(r) * kHidden;
-            float xa[4], xb[4];
-            unpack_bf16x4(*reinterpret_cast<const uint2*>(xr + 4 * (lane + 32 * v)), xa);
-            unpack_bf16x4(*reinterpret_cast<const uint2*>(xr + 4 * (lane + 32 * v + kStepThreads)), xb);
-            float s = 0.f;
-            s = fmaf(a.x, xa[0], s);
-            s = fmaf(a.y, xa[1], s);
-            s = fmaf(a.z, xa[2], s);
-            s = fmaf(a.w, xa[3], s);
-            s = fmaf(b.x, xb[0], s);
-            s = fmaf(b.y, xb[1], s);
-            s = fmaf(b.z, xb[2], s);
-            s = fmaf(b.w, xb[3], s);
-            acc[r] = s;
-        }
-#pragma unroll
-        // warp_sum's butterfly, rows side by side.
-#pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], offset);
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            out[r] += acc[r];
+        for (int k = 0; k < half; ++k) {
+            const float send = upper ? v[k] : v[k + half];
+            const float keep = upper ? v[k + half] : v[k];
+            v[k] = keep + __shfl_xor_sync(0xffffffffu, send, offset);
         }
     }
+    return v[0];
 }
 
+__device__ __forceinline__ int bitreverse5(int x) {
+    return int(__brev(unsigned(x)) >> 27);
+}
+
+// router_logit for R rows of x [R, 2304] at once, for the expert whose router row the
+// warp holds: each row's 9 per-virtual-warp sums are warp_sum's, taken 32 at a time by
+// warp_butterfly_transpose, and add in order as router_logit adds them. `sums` is this
+// warp's scratch of R * 9 floats, padded to whole groups of 32. Lane r < R returns row
+// r's logit.
 template <int R>
-__device__ __forceinline__ void router_logits_to(const float4 (&w)[2 * kStepWarps], const __nv_bfloat16* x, int lane,
-                                                 float (*mine)[kExperts / 16], int warp) {
-    float out[R];
-    router_logits<R>(w, x, lane, out);
-    if (lane == 0) {
+__device__ __forceinline__ float router_logits_rows(const float4 (&w)[2 * kStepWarps], const __nv_bfloat16* x,
+                                                    int lane, float* sums) {
+    constexpr int kSums = R * kStepWarps;
+    constexpr int kGroups = (kSums + 31) / 32;
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            mine[r][warp] = out[r];
+    for (int g = 0; g < kGroups; ++g) {
+        float v[32];
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const int i = 32 * g + k;
+            v[k] = 0.f;
+            if (i < kSums) {
+                const int r = i / kStepWarps;
+                const int vw = i % kStepWarps;
+                const __nv_bfloat16* xr = x + size_t(r) * kHidden;
+                float xa[4], xb[4];
+                unpack_bf16x4(*reinterpret_cast<const uint2*>(xr + 4 * (lane + 32 * vw)), xa);
+                unpack_bf16x4(*reinterpret_cast<const uint2*>(xr + 4 * (lane + 32 * vw + kStepThreads)), xb);
+                const float4 a = w[vw];
+                const float4 b = w[vw + kStepWarps];
+                float acc = 0.f;
+                acc = fmaf(a.x, xa[0], acc);
+                acc = fmaf(a.y, xa[1], acc);
+                acc = fmaf(a.z, xa[2], acc);
+                acc = fmaf(a.w, xa[3], acc);
+                acc = fmaf(b.x, xb[0], acc);
+                acc = fmaf(b.y, xb[1], acc);
+                acc = fmaf(b.z, xb[2], acc);
+                acc = fmaf(b.w, xb[3], acc);
+                v[k] = acc;
+            }
+        }
+        sums[32 * g + bitreverse5(lane)] = warp_butterfly_transpose(v);
+    }
+    __syncwarp();
+    float total = 0.f;
+    if (lane < R) {
+#pragma unroll
+        for (int vw = 0; vw < kStepWarps; ++vw) {
+            total += sums[lane * kStepWarps + vw];
         }
     }
+    return total;
 }
 
 constexpr int kClusterRouterBlocks = 16;
@@ -1579,40 +1596,44 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
 // moe_router_step_2304 for 1 to kStepRouterRows rows of a step, such as a speculative
 // verify: each row's logits sum exactly as moe_router_step_2304 sums one row's, so each
 // row's logits, indices and weights equal a one-row call's bit for bit, for every row
-// count. The same cluster of 16 blocks: warp w of block r holds the router row of expert
-// 8 r + w and sums its logit for every row, each block sends its 8 m logits to block 0, and
-// block 0 routes the rows side by side. A block of 128 experts per row took 3.0 us at one
-// row and 6.9 us at four, since its last block routed the rows one after another.
+// count. The same cluster of 16 blocks: warp w of block b holds the router row of expert
+// 8 b + w and sums its logit for every row (router_logits_rows), each block sends its 8
+// logits of row r to block r, and block r routes row r as moe_router_step_2304's block 0
+// routes its row.
 constexpr int kStepRouterRows = 8;
+static_assert(kStepRouterRows <= kClusterRouterBlocks, "a block per row routes");
 
 extern "C" __global__ void __cluster_dims__(kClusterRouterBlocks, 1, 1) __launch_bounds__(kClusterRouterThreads)
 moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restrict__ router,
                           const float* __restrict__ bias, float* logits, int32_t* indices,
                           float* weights, float route_scale) {
-    __shared__ __align__(16) float all[kStepRouterRows][kExperts];
+    constexpr int kSumsPerWarp = (kStepRouterRows * kStepWarps + 31) / 32 * 32;
+    __shared__ __align__(16) float all[kExperts];
     __shared__ __align__(16) float mine[kStepRouterRows][kClusterRouterWarps];
+    __shared__ float sums[kClusterRouterWarps][kSumsPerWarp];
     __shared__ __align__(8) uint64_t arrived;
-    __shared__ float biased[kStepRouterRows][kExperts];
-    __shared__ float score[kStepRouterRows][kExperts];
-    __shared__ int ranks[kStepRouterRows][kClusterRouterThreads];
-    __shared__ float top[kStepRouterRows][kTopK];
-    __shared__ float bias_s[kExperts];
+    __shared__ float biased[kExperts];
+    __shared__ float score[kExperts];
+    __shared__ int ranks[kClusterRouterThreads];
+    __shared__ float top[kTopK];
     const int t = threadIdx.x;
     const int lane = t % 32;
     const int warp = t / 32;
     const uint32_t rank = cluster_rank();
     const uint32_t barrier = smem_addr(&arrived);
+    // Block `rank` routes row `rank`, if there is one.
+    const bool routes = int(rank) < rows;
     if (t == 0) {
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(barrier) : "memory");
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-        if (rank == 0) {
+        if (routes) {
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(barrier),
-                         "r"(uint32_t(rows * kExperts * sizeof(float)))
+                         "r"(uint32_t(kExperts * sizeof(float)))
                          : "memory");
         }
     }
-    // Every block arrives now and waits before its first remote store, so block 0's
-    // barrier is ready by then.
+    // Every block arrives now and waits before its first remote store, so the routing
+    // blocks' barriers are ready by then.
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 
     const int e = int(rank) * kClusterRouterWarps + warp;
@@ -1622,50 +1643,54 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
     for (int i = 0; i < 2 * kStepWarps; ++i) {
         w[i] = row[lane + 32 * i];
     }
-    if (rank == 0 && t < kExperts) {
-        bias_s[t] = bias[t];
-    }
+    const float b = routes && t < kExperts ? bias[t] : 0.f;
     pdl_trigger();
     pdl_wait();
 
     // A ladder of comparisons rather than a switch, whose jump table scripts/pdl_audit.py
     // cannot follow.
+    float logit;
+    float* my_sums = sums[warp];
     if (rows <= 4) {
         if (rows <= 2) {
             if (rows <= 1) {
-                router_logits_to<1>(w, x, lane, mine, warp);
+                logit = router_logits_rows<1>(w, x, lane, my_sums);
             } else {
-                router_logits_to<2>(w, x, lane, mine, warp);
+                logit = router_logits_rows<2>(w, x, lane, my_sums);
             }
         } else if (rows <= 3) {
-            router_logits_to<3>(w, x, lane, mine, warp);
+            logit = router_logits_rows<3>(w, x, lane, my_sums);
         } else {
-            router_logits_to<4>(w, x, lane, mine, warp);
+            logit = router_logits_rows<4>(w, x, lane, my_sums);
         }
     } else if (rows <= 6) {
         if (rows <= 5) {
-            router_logits_to<5>(w, x, lane, mine, warp);
+            logit = router_logits_rows<5>(w, x, lane, my_sums);
         } else {
-            router_logits_to<6>(w, x, lane, mine, warp);
+            logit = router_logits_rows<6>(w, x, lane, my_sums);
         }
     } else if (rows <= 7) {
-        router_logits_to<7>(w, x, lane, mine, warp);
+        logit = router_logits_rows<7>(w, x, lane, my_sums);
     } else {
-        router_logits_to<8>(w, x, lane, mine, warp);
+        logit = router_logits_rows<8>(w, x, lane, my_sums);
+    }
+    if (lane < rows) {
+        mine[lane][warp] = logit;
     }
     __syncthreads();
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (t < rows * kClusterRouterWarps / 4) {
-        const int r = t / (kClusterRouterWarps / 4);
-        const int q = t % (kClusterRouterWarps / 4);
+    // Thread 2 r + q sends this block's logits 4 q .. 4 q + 3 of row r to block r.
+    if (t < 2 * rows) {
+        const int r = t / 2;
+        const int q = t % 2;
         const float4 v = reinterpret_cast<const float4*>(mine[r])[q];
-        const uint32_t dst = cluster_addr(smem_addr(&all[r][rank * kClusterRouterWarps + 4 * q]), 0);
+        const uint32_t dst = cluster_addr(smem_addr(all + rank * kClusterRouterWarps + 4 * q), uint32_t(r));
         asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(dst),
                      "r"(__float_as_uint(v.x)), "r"(__float_as_uint(v.y)), "r"(__float_as_uint(v.z)),
-                     "r"(__float_as_uint(v.w)), "r"(cluster_addr(barrier, 0))
+                     "r"(__float_as_uint(v.w)), "r"(cluster_addr(barrier, uint32_t(r)))
                      : "memory");
     }
-    if (rank != 0) {
+    if (!routes) {
         return;
     }
     asm volatile(
@@ -1673,50 +1698,45 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
         " @!p bra wait;\n}" ::"r"(barrier)
         : "memory");
 
-    // route_top8 on every row's gathered logits.
-    for (int i = t; i < rows * kExperts; i += kClusterRouterThreads) {
-        const int r = i / kExperts;
-        const int ex = i % kExperts;
-        const float l = all[r][ex];
-        logits[i] = l;
+    // route_top8 on row `rank`'s gathered logits.
+    const int r = int(rank);
+    if (t < kExperts) {
+        const float l = all[t];
+        logits[r * kExperts + t] = l;
         // Metal's form of the sigmoid: exp of |x| cannot overflow to inf/inf.
         const float y = 1.f / (1.f + expf(fabsf(l)));
-        score[r][ex] = l < 0 ? y : 1.f - y;
-        biased[r][ex] = score[r][ex] + bias_s[ex];
+        score[t] = l < 0 ? y : 1.f - y;
+        biased[t] = score[t] + b;
     }
     __syncthreads();
-    for (int i = t; i < rows * kClusterRouterThreads; i += kClusterRouterThreads) {
-        const int r = i / kClusterRouterThreads;
-        const int me = i % kExperts;
-        const int half = i % kClusterRouterThreads / kExperts;
-        const float my = biased[r][me];
+    {
+        const int me = t % kExperts;
+        const int half = t / kExperts;
+        const float my = biased[me];
         int rk = 0;
 #pragma unroll 8
         for (int other = half * kExperts / 2; other < (half + 1) * kExperts / 2; ++other) {
-            const float o = biased[r][other];
+            const float o = biased[other];
             rk += o > my || (o == my && other < me);
         }
-        ranks[r][i % kClusterRouterThreads] = rk;
+        ranks[t] = rk;
     }
     __syncthreads();
-    for (int i = t; i < rows * kExperts; i += kClusterRouterThreads) {
-        const int r = i / kExperts;
-        const int ex = i % kExperts;
-        const int rk = ranks[r][ex] + ranks[r][ex + kExperts];
+    if (t < kExperts) {
+        const int rk = ranks[t] + ranks[t + kExperts];
         if (rk < kTopK) {
-            indices[r * kTopK + rk] = ex;
-            top[r][rk] = score[r][ex];
+            indices[r * kTopK + rk] = t;
+            top[rk] = score[t];
         }
     }
     __syncthreads();
-    if (t < rows * kTopK) {
-        const int r = t / kTopK;
+    if (t < kTopK) {
         float total = 0.f;
 #pragma unroll
         for (int k = 0; k < kTopK; ++k) {
-            total = top[r][k] + total;
+            total = top[k] + total;
         }
-        weights[t] = top[r][t % kTopK] / (total + kScoreEps) * route_scale;
+        weights[r * kTopK + t] = top[t] / (total + kScoreEps) * route_scale;
     }
 }
 
