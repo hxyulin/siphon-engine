@@ -1,10 +1,13 @@
-//! The DFlash draft (`Draft::dflash`) against the 2DSD project's PyTorch runner, given
-//! the same target features.
+//! A drafter given with `--drafter` against a PyTorch reference, given the same target
+//! features: 2DSD's DFlash draft (`Draft::dflash`) against the 2DSD project's runner, or
+//! Inco AI's DFlash 2 drafter (`Draft::dflash2`) against `reference/dflash2.py`.
 //!
-//! Needs the research checkpoint the draft was trained on (`SIPHON_MODEL`), the draft's
-//! export directory (`SIPHON_DFLASH`, see `DflashWeights`) and a directory
+//! Needs the checkpoint the drafter was trained for (`SIPHON_MODEL`: the research
+//! checkpoint for 2DSD's draft, the official one for DFlash 2), the drafter's directory
+//! (`SIPHON_DFLASH`, see `DflashWeights` and `Dflash2Weights`) and a directory
 //! `SIPHON_DFLASH_REF` that holds `tokens.safetensors`, an I32 `tokens` tensor: a prompt
-//! and the target's greedy continuation. About 20 GB of GPU memory:
+//! and the target's greedy continuation. With `SIPHON_DFLASH_CONTINUE=N` the test appends
+//! N greedy tokens of plain decode to `tokens` first. About 20 GB of GPU memory:
 //!
 //! ```sh
 //! SIPHON_MODEL=<model-dir> SIPHON_DFLASH=<draft-dir> SIPHON_DFLASH_REF=<dir> \
@@ -22,10 +25,21 @@
 //! A reference script runs the runner over `taps.safetensors` and writes
 //! `<dir>/reference.safetensors`: `ids` (I32 `[anchors, 7]`), `confidence` (F32) and
 //! `gap` (F32), the difference between the largest and the second-largest corrected logit
-//! at each draft. When that file exists, the test compares the exact draft with it. In
-//! each round the drafts before the first difference must match; that difference must
-//! fall on a near-tie, a gap of at most `NEAR_TIE`. Later drafts follow another token and
-//! are not compared.
+//! (DFlash 2: capped selector score) at each draft. For DFlash 2:
+//!
+//! ```sh
+//! uv run --script reference/dflash2.py <dir>/taps.safetensors <drafter-dir> <model-dir> \
+//!     <dir>/reference.safetensors
+//! ```
+//!
+//! DFlash 2's reference also writes `kgap` (F32 `[anchors, 7]`), how far the 16th logit of
+//! each draft row lies above the 17th: the selector picks among the top 16, and a tie at
+//! that boundary lets either token in.
+//!
+//! When that file exists, the test compares the exact draft with it. In each round the
+//! drafts before the first difference must match; that difference must fall on a
+//! near-tie, a gap (or `kgap`) of at most `NEAR_TIE`. Later drafts follow another token
+//! and are not compared.
 
 #![cfg(target_os = "linux")]
 
@@ -40,9 +54,9 @@ use siphon_cuda::{
     draft::{Draft, DraftOptions, STEPS},
     model::{Model, PrefillLogits},
     ops::linear::Linear,
+    spec::{DraftSource, load_draft},
     weights::{
         WeightFormat, Weights,
-        dflash::DflashWeights,
         draft::{HIDDEN, SharedWeights},
     },
 };
@@ -144,13 +158,14 @@ fn rounds(
 }
 
 #[test]
-#[ignore = "needs the research checkpoint (SIPHON_MODEL), SIPHON_DFLASH, SIPHON_DFLASH_REF and \
+#[ignore = "needs the drafter's checkpoint (SIPHON_MODEL), SIPHON_DFLASH, SIPHON_DFLASH_REF and \
             about 20 GB of GPU memory"]
 fn dflash_matches_runner() -> anyhow::Result<()> {
     let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
     let draft_dir = PathBuf::from(env::var_os("SIPHON_DFLASH").context("set SIPHON_DFLASH")?);
     let dir = PathBuf::from(env::var_os("SIPHON_DFLASH_REF").context("set SIPHON_DFLASH_REF")?);
-    let tokens = read_i32(&dir.join("tokens.safetensors"), "tokens")?;
+    let mut tokens = read_i32(&dir.join("tokens.safetensors"), "tokens")?;
+    let extra: usize = env::var("SIPHON_DFLASH_CONTINUE").map_or(Ok(0), |v| v.parse())?;
     let variant = env::var("SIPHON_DFLASH_VARIANT").unwrap_or_else(|_| "fast".to_owned());
     ensure!(
         tokens.len() > FIRST + STEPS + 2,
@@ -164,7 +179,7 @@ fn dflash_matches_runner() -> anyhow::Result<()> {
     let passes = config.loop_config.num_passes;
     let checkpoint = Checkpoint::open(&model_dir)?;
     let weights = Weights::load(&checkpoint, &config, &stream)?;
-    let capacity = tokens.len() + 64;
+    let capacity = tokens.len() + extra + 64;
     let mut model = Model::with_formats(
         &gpu,
         config.clone(),
@@ -174,26 +189,31 @@ fn dflash_matches_runner() -> anyhow::Result<()> {
         siphon_cuda::ops::attention::KvFormat::Bf16,
         WeightFormat::Bf16,
     )?;
-    let load = || DflashWeights::load(&draft_dir, &config, &stream);
-    let mut exact = Draft::dflash(
-        &stream,
-        &config,
-        load()?,
-        model.draft_shared(),
+    let source = DraftSource::Dflash(&draft_dir);
+    let mut exact = load_draft(
+        &mut model,
+        &checkpoint,
+        source,
         capacity,
         &DraftOptions::default(),
     )?;
-    let mut fast = Draft::dflash(
-        &stream,
-        &config,
-        load()?,
-        model.draft_shared(),
+    let mut fast = load_draft(
+        &mut model,
+        &checkpoint,
+        source,
         capacity,
         &DraftOptions::parse(&variant, None)?,
     )?;
     let layout = exact.tap_layout();
     let row = layout.len() * HIDDEN;
-    model.set_tap_layout(layout.clone())?;
+    if extra > 0 {
+        extend_greedy(
+            &mut model,
+            &mut tokens,
+            extra,
+            &dir.join("tokens.safetensors"),
+        )?;
+    }
     println!("taps {layout:?}, {} tokens", tokens.len());
 
     let prompt: Vec<u32> = tokens
@@ -233,6 +253,7 @@ fn dflash_matches_runner() -> anyhow::Result<()> {
         ids: read_i32(&reference, "ids")?,
         confidence: read_f32(&reference, "confidence")?,
         gap: read_f32(&reference, "gap")?,
+        kgap: read_f32(&reference, "kgap").ok(),
     };
     ensure!(
         reference.ids.len() == e.ids.len()
@@ -246,11 +267,42 @@ fn dflash_matches_runner() -> anyhow::Result<()> {
     reference.compare(&f, &variant, false)
 }
 
-/// The runner's drafts, their confidences and the top-2 gap of each.
+/// Appends `extra` greedy tokens of plain decode to `tokens`, writes them to `path` and
+/// resets the model.
+fn extend_greedy(
+    model: &mut Model,
+    tokens: &mut Vec<i32>,
+    extra: usize,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let prompt: Vec<u32> = tokens
+        .iter()
+        .map(|&t| u32::try_from(t))
+        .collect::<Result<_, _>>()?;
+    let mut next = model.prefill(&prompt, 2048, PrefillLogits::Last)?;
+    for _ in 0..extra {
+        tokens.push(i32::try_from(next)?);
+        next = model.step(next, None)?;
+    }
+    model.reset()?;
+    write(
+        path,
+        &[(
+            "tokens",
+            Dtype::I32,
+            vec![tokens.len()],
+            le_bytes(tokens, i32::to_le_bytes),
+        )],
+    )
+}
+
+/// The runner's drafts, their confidences and the top-2 gap of each, and for DFlash 2 the
+/// gap at the top-16 boundary of each row.
 struct Reference {
     ids: Vec<i32>,
     confidence: Vec<f32>,
     gap: Vec<f32>,
+    kgap: Option<Vec<f32>>,
 }
 
 impl Reference {
@@ -258,7 +310,7 @@ impl Reference {
     /// first different draft is not a near-tie.
     fn compare(&self, got: &Rounds, name: &str, strict: bool) -> anyhow::Result<()> {
         let anchors = self.ids.len() / STEPS;
-        let (mut compared, mut differ, mut far) = (0, 0, Vec::new());
+        let (mut compared, mut differ, mut far, mut boundary) = (0, 0, Vec::new(), 0);
         let mut whole = 0;
         let mut conf_diff = 0f32;
         for a in 0..anchors {
@@ -268,7 +320,10 @@ impl Reference {
                 conf_diff = conf_diff.max((got.confidence[j] - self.confidence[j]).abs());
                 if got.ids[j] != self.ids[j] {
                     differ += 1;
-                    if self.gap[j] > NEAR_TIE {
+                    let kgap = self.kgap.as_ref().map_or(f32::INFINITY, |k| k[j]);
+                    if self.gap[j] > NEAR_TIE && kgap <= NEAR_TIE {
+                        boundary += 1;
+                    } else if self.gap[j] > NEAR_TIE {
                         far.push((FIRST + a, j - r.start, self.gap[j]));
                     }
                     break;
@@ -278,8 +333,9 @@ impl Reference {
         }
         println!(
             "{name}: {whole} of {anchors} rounds identical; {compared} drafts compared, \
-             {differ} rounds differ, {} of them at a gap above {NEAR_TIE}; largest \
-             confidence difference {conf_diff:.4} over the compared drafts",
+             {differ} rounds differ, {boundary} of them on a tie at the top-16 boundary and \
+             {} at a gap above {NEAR_TIE}; largest confidence difference {conf_diff:.4} over \
+             the compared drafts",
             far.len()
         );
         for (p, j, g) in far.iter().take(20) {

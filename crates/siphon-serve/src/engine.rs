@@ -227,14 +227,23 @@ mod cuda {
             match generate(&mut model, &mut speculator, &job, stop) {
                 Ok((finish, emitted, prefill_s)) => {
                     let decode_s = started.elapsed().as_secs_f64() - prefill_s;
+                    let stats = speculator.stats();
+                    let acceptance: Vec<String> = stats
+                        .acceptance()
+                        .iter()
+                        .map(|a| format!("{:.1}%", a * 100.0))
+                        .collect();
                     eprintln!(
                         "job: {} prompt tokens, prefill {:.0} ms, {emitted} tokens in {:.2} s \
-                         ({:.1} tok/s, {:.2} tokens per round), {}",
+                         ({:.1} tok/s, {:.2} tokens per round, draft {:.3} ms per round, \
+                         acceptance by position [{}]), {}",
                         job.prompt.len(),
                         prefill_s * 1e3,
                         decode_s,
                         emitted as f64 / decode_s.max(1e-9),
-                        speculator.stats().tokens_per_round(),
+                        stats.tokens_per_round(),
+                        stats.draft.as_secs_f64() * 1e3 / stats.rounds.max(1) as f64,
+                        acceptance.join(", "),
                         if events.is_closed() {
                             "client left".to_owned()
                         } else {

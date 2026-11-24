@@ -13,7 +13,8 @@ use serde_json::json;
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context 65536] [--weights fp8|bf16] [--kv fp8|bf16] [--queue 8] \
                      [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast]
---drafter runs a DFlash draft exported by the 2DSD project instead of the bundled draft.
+--drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
+or a DFlash draft exported by the 2DSD project.
 --draft picks the draft's approximations as bench does: fast, exact, or a +-joined set of
 fp8-backbone, fp8-head, fp8-fold and shortlist.
 Set SIPHON_API_KEY to require `Authorization: Bearer <key>` on /v1 routes.";

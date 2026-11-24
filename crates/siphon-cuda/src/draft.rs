@@ -38,12 +38,17 @@ use crate::{
     ops::{
         draft::{
             ArgmaxPartials, AttentionKeys, AttentionScratch, BLOCK, CONTROL, DraftKernels,
-            FoldRows, Fp8Product, Fp8Rows, KV_WIDTH, KvCache, LogitBounds,
+            F8_MAX_PRODUCTS, FoldRows, Fp8Product, Fp8Rows, KV_WIDTH, KvCache, LogitBounds, Rope,
+            TOP_K, TopkScratch,
         },
-        linear::{Gemm, Linear},
+        linear::{Gemm, Linear, MAX_PRODUCTS},
     },
     weights::{
         dflash::{DflashLayerWeights, DflashWeights},
+        dflash2::{
+            CONV_COEFFICIENTS, ConvWeights, DFLASH2_HEADS, DFLASH2_MLP_WIDTH, DFLASH2_ROPE_THETA,
+            DFLASH2_WINDOW, Dflash2LayerWeights, Dflash2Weights,
+        },
         draft::{
             DraftLayerWeights, DraftWeights, HEAD_DIM, HEADS, HIDDEN, LAYERS, MLP_WIDTH, RANK,
             SharedWeights, TAPS,
@@ -57,6 +62,8 @@ pub const STEPS: usize = BLOCK - 1;
 pub const WINDOW: usize = 1024;
 /// Slots of the local layers' rings: the window and the block.
 const LOCAL_SLOTS: usize = WINDOW + BLOCK;
+/// Slots of DFlash 2's rings: the window before the block's first row and the block.
+const DFLASH2_SLOTS: usize = DFLASH2_WINDOW + BLOCK;
 /// RoPE base of the draft (`rope_theta` in `mtp_config`).
 const ROPE_THETA: f64 = 1e6;
 /// RMSNorm epsilon of the draft (`rms_norm_eps` in `mtp_config`).
@@ -157,10 +164,16 @@ pub fn read_ranking(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
         .collect())
 }
 
-/// The RoPE frequencies `1 / theta^(2i/128)` as vLLM's F32 table builds them: a correctly
-/// rounded power, then a correctly rounded reciprocal.
+/// The RoPE frequencies `1 / theta^(2i/128)` of the bundled draft (theta 1e6) as vLLM's
+/// F32 table builds them: a correctly rounded power, then a correctly rounded reciprocal.
 #[must_use]
 pub fn rope_inv_freq() -> Vec<f32> {
+    rope_inv_freq_theta(ROPE_THETA)
+}
+
+/// [`rope_inv_freq`] for the base `theta`.
+#[must_use]
+pub fn rope_inv_freq_theta(theta: f64) -> Vec<f32> {
     (0..HEAD_DIM / 2)
         .map(|i| {
             #[expect(clippy::cast_precision_loss, reason = "i is below 64")]
@@ -169,7 +182,7 @@ pub fn rope_inv_freq() -> Vec<f32> {
                 clippy::cast_possible_truncation,
                 reason = "rounding the power to F32 is the intent"
             )]
-            let power = ROPE_THETA.powf(exponent) as f32;
+            let power = theta.powf(exponent) as f32;
             1.0 / power
         })
         .collect()
@@ -222,6 +235,29 @@ enum Arch {
         /// An FP8 copy of `fc`, with [`DraftOptions::fp8_backbone`].
         fc_fp8: Option<Fp8Rows>,
     },
+    /// Inco AI's DFlash 2 drafter ([`Dflash2Weights`]): `fc` over the taps, sliding layers
+    /// with block convolutions, and a candidate selector over the top 16 tokens.
+    Dflash2 {
+        weights: Dflash2Weights,
+        /// An FP8 copy of `fc`, with [`DraftOptions::fp8_backbone`].
+        fc_fp8: Option<Fp8Rows>,
+        /// The mask token's normed target embedding, BF16 `[2304]`.
+        mask_embed: CudaSlice<bf16>,
+    },
+}
+
+/// The context rows of a DFlash or DFlash 2 draft: `fc` and `hidden_norm` of the taps,
+/// then each layer's `k_proj`, `v_proj` and key norm.
+struct ContextRefs<'a> {
+    fc: &'a CudaSlice<bf16>,
+    fc_fp8: Option<&'a Fp8Rows>,
+    hidden_norm: &'a CudaSlice<bf16>,
+    /// Each layer's `(k, v, k_norm)`.
+    layers: Vec<(
+        &'a CudaSlice<bf16>,
+        &'a CudaSlice<bf16>,
+        &'a CudaSlice<bf16>,
+    )>,
 }
 
 /// The weights of one decoder layer's block forward, which both architectures share.
@@ -237,6 +273,8 @@ struct LayerRefs<'a> {
     gate: &'a CudaSlice<bf16>,
     up: &'a CudaSlice<bf16>,
     down: &'a CudaSlice<bf16>,
+    /// DFlash 2's convolutions around the attention and the MLP.
+    convs: Option<(&'a ConvWeights, &'a ConvWeights)>,
 }
 
 impl<'a> From<&'a DraftLayerWeights> for LayerRefs<'a> {
@@ -253,6 +291,7 @@ impl<'a> From<&'a DraftLayerWeights> for LayerRefs<'a> {
             gate: &w.gate,
             up: &w.up,
             down: &w.down,
+            convs: None,
         }
     }
 }
@@ -271,6 +310,26 @@ impl<'a> From<&'a DflashLayerWeights> for LayerRefs<'a> {
             gate: &w.gate,
             up: &w.up,
             down: &w.down,
+            convs: None,
+        }
+    }
+}
+
+impl<'a> From<&'a Dflash2LayerWeights> for LayerRefs<'a> {
+    fn from(w: &'a Dflash2LayerWeights) -> Self {
+        Self {
+            input_norm: &w.input_norm,
+            post_attention_norm: &w.post_attention_norm,
+            q: &w.q,
+            k: &w.k,
+            v: &w.v,
+            o: &w.o,
+            q_norm: &w.q_norm,
+            k_norm: &w.k_norm,
+            gate: &w.gate,
+            up: &w.up,
+            down: &w.down,
+            convs: Some((&w.attention_conv, &w.mlp_conv)),
         }
     }
 }
@@ -280,6 +339,7 @@ impl Arch {
         match self {
             Self::Stock { weights, .. } => weights.layers.len(),
             Self::Dflash { weights, .. } => weights.layers.len(),
+            Self::Dflash2 { weights, .. } => weights.layers.len(),
         }
     }
 
@@ -287,14 +347,68 @@ impl Arch {
         match self {
             Self::Stock { weights, .. } => (&weights.layers[layer]).into(),
             Self::Dflash { weights, .. } => (&weights.layers[layer]).into(),
+            Self::Dflash2 { weights, .. } => (&weights.layers[layer]).into(),
         }
     }
 
-    /// Whether `layer` attends to every position rather than a window.
+    /// Whether `layer` keeps every position up to the capacity rather than a ring.
     fn global(&self, layer: usize) -> bool {
         match self {
             Self::Stock { .. } => layer == 1,
             Self::Dflash { .. } => true,
+            Self::Dflash2 { .. } => false,
+        }
+    }
+
+    /// Slots of `layer`'s cache for a draft of `capacity` positions.
+    fn slots(&self, layer: usize, capacity: usize) -> usize {
+        match self {
+            Self::Dflash2 { .. } => DFLASH2_SLOTS,
+            _ if self.global(layer) => capacity,
+            _ => LOCAL_SLOTS,
+        }
+    }
+
+    /// The keys of `layer`'s block attention: the positions before the block it reads
+    /// (0: all) and the window of each row (0: none), as [`AttentionKeys::Device`] takes
+    /// them.
+    fn attention_window(&self, layer: usize) -> (usize, usize) {
+        match self {
+            Self::Dflash2 { .. } => (DFLASH2_WINDOW - 1, DFLASH2_WINDOW),
+            _ if self.global(layer) => (0, 0),
+            _ => (WINDOW, 0),
+        }
+    }
+
+    /// Width of the queries of a block row.
+    fn q_width(&self) -> usize {
+        match self {
+            Self::Dflash2 { .. } => DFLASH2_HEADS * HEAD_DIM,
+            _ => HEADS * HEAD_DIM,
+        }
+    }
+
+    /// Width of the MLP.
+    fn mlp_width(&self) -> usize {
+        match self {
+            Self::Dflash2 { .. } => DFLASH2_MLP_WIDTH,
+            _ => MLP_WIDTH,
+        }
+    }
+
+    /// The RoPE arithmetic of the reference the draft follows.
+    fn rope(&self) -> Rope {
+        match self {
+            Self::Stock { .. } => Rope::F32,
+            Self::Dflash { .. } => Rope::Bf16Table,
+            Self::Dflash2 { .. } => Rope::Bf16Ops,
+        }
+    }
+
+    fn rope_theta(&self) -> f64 {
+        match self {
+            Self::Dflash2 { .. } => DFLASH2_ROPE_THETA,
+            _ => ROPE_THETA,
         }
     }
 
@@ -302,6 +416,7 @@ impl Arch {
         match self {
             Self::Stock { weights, .. } => &weights.mask_embed,
             Self::Dflash { weights, .. } => &weights.mask_embed,
+            Self::Dflash2 { mask_embed, .. } => mask_embed,
         }
     }
 
@@ -309,16 +424,50 @@ impl Arch {
         match self {
             Self::Stock { weights, .. } => &weights.norm,
             Self::Dflash { weights, .. } => &weights.norm,
+            Self::Dflash2 { weights, .. } => &weights.norm,
         }
     }
 
-    /// The rows a shortlist head gathers for its Markov bias, and their bias.
-    fn fold_rows(&self) -> (&CudaSlice<bf16>, &CudaSlice<bf16>) {
+    /// The rows a shortlist head gathers for its Markov bias, and their bias, if the
+    /// draft has a Markov head.
+    fn fold_rows(&self) -> Option<(&CudaSlice<bf16>, &CudaSlice<bf16>)> {
         match self {
-            Self::Stock { fold, .. } => (&fold.weight, &fold.bias),
+            Self::Stock { fold, .. } => Some((&fold.weight, &fold.bias)),
             Self::Dflash {
                 weights, zero_bias, ..
-            } => (&weights.w2, zero_bias),
+            } => Some((&weights.w2, zero_bias)),
+            Self::Dflash2 { .. } => None,
+        }
+    }
+
+    /// The context projections of a DFlash or DFlash 2 draft.
+    fn context(&self) -> Option<ContextRefs<'_>> {
+        match self {
+            Self::Stock { .. } => None,
+            Self::Dflash {
+                weights, fc_fp8, ..
+            } => Some(ContextRefs {
+                fc: &weights.fc,
+                fc_fp8: fc_fp8.as_ref(),
+                hidden_norm: &weights.hidden_norm,
+                layers: weights
+                    .layers
+                    .iter()
+                    .map(|l| (&l.k, &l.v, &l.k_norm))
+                    .collect(),
+            }),
+            Self::Dflash2 {
+                weights, fc_fp8, ..
+            } => Some(ContextRefs {
+                fc: &weights.fc,
+                fc_fp8: fc_fp8.as_ref(),
+                hidden_norm: &weights.hidden_norm,
+                layers: weights
+                    .layers
+                    .iter()
+                    .map(|l| (&l.k, &l.v, &l.k_norm))
+                    .collect(),
+            }),
         }
     }
 
@@ -326,15 +475,13 @@ impl Arch {
         match self {
             Self::Stock { .. } => TapLayout::stock(),
             Self::Dflash { weights, .. } => weights.taps.clone(),
+            Self::Dflash2 { weights, .. } => weights.taps.clone(),
         }
     }
 
     /// Taps per position.
     fn tap_count(&self) -> usize {
-        match self {
-            Self::Stock { .. } => TAPS,
-            Self::Dflash { weights, .. } => weights.taps.len(),
-        }
+        self.taps().len()
     }
 }
 
@@ -451,8 +598,26 @@ struct Scratch {
     confidence: CudaSlice<f32>,
     /// Each step's Markov logits, BF16 `[7, vocab]`, when recorded.
     logits: Option<CudaSlice<bf16>>,
-    /// The context rows of a DFlash draft.
+    /// The context rows of a DFlash or DFlash 2 draft.
     dflash: Option<DflashScratch>,
+    /// DFlash 2's convolutions and selector.
+    dflash2: Option<Dflash2Scratch>,
+}
+
+/// DFlash 2's convolution coefficients and outputs, and the selector's inputs.
+struct Dflash2Scratch {
+    /// The coefficient projections of the attention's and the MLP's input, BF16
+    /// `[8, 576]` each.
+    coef_attention: CudaSlice<bf16>,
+    coef_mlp: CudaSlice<bf16>,
+    /// The input convolution of a sublayer, BF16 `[8, 2304]`.
+    conv: CudaSlice<bf16>,
+    topk: TopkScratch,
+    /// The top 16 candidates of each draft row and their logits, `[7, 16]`.
+    cand: CudaSlice<i32>,
+    unary: CudaSlice<f32>,
+    /// The hidden projection of block rows 1 to 7, BF16 `[7, 256]`.
+    hp: CudaSlice<bf16>,
 }
 
 /// The context rows of a DFlash draft: `fc` of the taps, then `hidden_norm`.
@@ -471,13 +636,27 @@ impl Scratch {
         let zf = |n: usize| stream.alloc_zeros::<f32>(n);
         let dflash = match arch {
             Arch::Stock { .. } => None,
-            Arch::Dflash { .. } => Some(DflashScratch {
+            Arch::Dflash { .. } | Arch::Dflash2 { .. } => Some(DflashScratch {
                 raw: z(COMMIT_ROWS * HIDDEN)?,
                 normed: z(COMMIT_ROWS * HIDDEN)?,
                 round_raw: z(BLOCK * HIDDEN)?,
                 round_normed: z(BLOCK * HIDDEN)?,
             }),
         };
+        let dflash2 = match arch {
+            Arch::Dflash2 { .. } => Some(Dflash2Scratch {
+                coef_attention: z(BLOCK * CONV_COEFFICIENTS)?,
+                coef_mlp: z(BLOCK * CONV_COEFFICIENTS)?,
+                conv: z(BLOCK * HIDDEN)?,
+                topk: TopkScratch::new(stream)?,
+                cand: stream.alloc_zeros(STEPS * TOP_K)?,
+                unary: zf(STEPS * TOP_K)?,
+                hp: z(STEPS * RANK)?,
+            }),
+            _ => None,
+        };
+        let q_width = arch.q_width();
+        let mlp_width = arch.mlp_width();
         Ok(Self {
             mixed: z(COMMIT_ROWS * HIDDEN)?,
             ctx_k: z(COMMIT_ROWS * KV_WIDTH)?,
@@ -488,14 +667,14 @@ impl Scratch {
             f: z(HIDDEN)?,
             residual: z(BLOCK * HIDDEN)?,
             h: z(BLOCK * HIDDEN)?,
-            q: z(BLOCK * HEADS * HEAD_DIM)?,
+            q: z(BLOCK * q_width)?,
             k: z(BLOCK * KV_WIDTH)?,
             v: z(BLOCK * KV_WIDTH)?,
-            attn: z(BLOCK * HEADS * HEAD_DIM)?,
+            attn: z(BLOCK * q_width)?,
             o: z(BLOCK * HIDDEN)?,
-            gate: z(BLOCK * MLP_WIDTH)?,
-            up: z(BLOCK * MLP_WIDTH)?,
-            act: z(BLOCK * MLP_WIDTH)?,
+            gate: z(BLOCK * mlp_width)?,
+            up: z(BLOCK * mlp_width)?,
+            act: z(BLOCK * mlp_width)?,
             mlp: z(BLOCK * HIDDEN)?,
             y: z(BLOCK * HIDDEN)?,
             attention: AttentionScratch::new(stream)?,
@@ -510,6 +689,7 @@ impl Scratch {
             confidence: stream.alloc_zeros(STEPS)?,
             logits: None,
             dflash,
+            dflash2,
         })
     }
 }
@@ -592,6 +772,52 @@ impl Draft {
         Self::build(stream, config, kernels, arch, shared, capacity, options)
     }
 
+    /// Inco AI's DFlash 2 drafter ([`Dflash2Weights`]) in place of the bundled draft,
+    /// with the approximations in `options` (`fp8_fold` does nothing: the drafter has no
+    /// Markov head). Every layer keeps a ring of the last 2056 positions, 4 KiB each. Its
+    /// taps are [`Self::tap_layout`], which the target must record.
+    pub fn dflash2(
+        stream: &Arc<CudaStream>,
+        config: &TextConfig,
+        weights: Dflash2Weights,
+        shared: SharedWeights<'_>,
+        capacity: usize,
+        options: &DraftOptions,
+    ) -> anyhow::Result<Self> {
+        let kernels = DraftKernels::load(stream.context())?;
+        check_lm_head(config, shared)?;
+        let fc_fp8 = if options.fp8_backbone {
+            let k = weights.taps.len() * HIDDEN;
+            let mut out = Fp8Rows::new(stream, HIDDEN, k)?;
+            kernels.quantize_rows(stream, &weights.fc, None, HIDDEN, 0, &mut out)?;
+            Some(out)
+        } else {
+            None
+        };
+        // The mask rows are the mask token's normed target embedding: row 0 of a block
+        // anchored at the mask token.
+        let mask = stream.clone_htod(&[i32::try_from(weights.mask_token)?])?;
+        let mut rows = stream.alloc_zeros::<bf16>(BLOCK * HIDDEN)?;
+        let unused = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        kernels.block_input(
+            stream,
+            &mask,
+            shared.embed,
+            shared.embed_norm,
+            &unused,
+            &mut rows,
+            EPS,
+        )?;
+        let mut mask_embed = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        stream.memcpy_dtod(&rows.slice(..HIDDEN), &mut mask_embed)?;
+        let arch = Arch::Dflash2 {
+            weights,
+            fc_fp8,
+            mask_embed,
+        };
+        Self::build(stream, config, kernels, arch, shared, capacity, options)
+    }
+
     fn build(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
@@ -610,19 +836,10 @@ impl Draft {
             "the draft's confidences need a positive logit softcap"
         );
         let padded_vocab = config.vocab_size;
-        let inv_freq = rope_inv_freq();
+        let inv_freq = rope_inv_freq_theta(arch.rope_theta());
         let layers = arch.layers();
         let caches = (0..layers)
-            .map(|layer| {
-                KvCache::new(
-                    stream,
-                    if arch.global(layer) {
-                        capacity
-                    } else {
-                        LOCAL_SLOTS
-                    },
-                )
-            })
+            .map(|layer| KvCache::new(stream, arch.slots(layer, capacity)))
             .collect::<anyhow::Result<_>>()?;
         let s = Scratch::new(stream, config, &arch)?;
         let z = |n: usize| stream.alloc_zeros::<bf16>(n);
@@ -631,13 +848,11 @@ impl Draft {
             .then(|| quantize_backbone(stream, &kernels, &arch))
             .transpose()?;
         let round_taps = z(BLOCK * arch.tap_count() * HIDDEN)?;
-        let (fold_weight, fold_bias) = arch.fold_rows();
         let head = Head::new(
             stream,
             &kernels,
             shared,
-            fold_weight,
-            fold_bias,
+            arch.fold_rows(),
             config.unpadded_vocab_size,
             options,
         )?;
@@ -753,13 +968,11 @@ impl Draft {
         list.stale = false;
         let changed = list.bucket() != bucket;
         let ids = stream.clone_htod(&ids)?;
-        let (fold_weight, fold_bias) = self.arch.fold_rows();
         head.gather(
             stream,
             &self.kernels,
             shared,
-            fold_weight,
-            fold_bias,
+            self.arch.fold_rows(),
             &ids.slice(..),
             first,
         )?;
@@ -1004,14 +1217,17 @@ impl Draft {
                     EPS,
                 )?;
             }
-            Arch::Dflash { .. } => self.commit_dflash(stream, linear, &taps, start, rows)?,
+            Arch::Dflash { .. } | Arch::Dflash2 { .. } => {
+                self.commit_dflash(stream, linear, &taps, start, rows)?;
+            }
         }
         self.committed = start + rows;
         Ok(())
     }
 
-    /// [`Self::commit`]'s work for a DFlash draft: `fc` and `hidden_norm` of each position's
-    /// taps, then every layer's keys and values of that context row.
+    /// [`Self::commit`]'s work for a DFlash or DFlash 2 draft: `fc` and `hidden_norm` of
+    /// each position's taps, then every layer's keys and values of that context row.
+    /// DFlash 2 skips positions that no later block's window reaches.
     fn commit_dflash(
         &mut self,
         stream: &CudaStream,
@@ -1020,10 +1236,22 @@ impl Draft {
         start: usize,
         rows: usize,
     ) -> anyhow::Result<()> {
-        let Arch::Dflash { weights, .. } = &self.arch else {
-            anyhow::bail!("not a DFlash draft");
-        };
+        let context = self
+            .arch
+            .context()
+            .context("not a DFlash or DFlash 2 draft")?;
+        let rope = self.arch.rope();
         let row_len = self.arch.tap_count() * HIDDEN;
+        // The next block sits at start + rows or later, and its rows see at most the
+        // DFLASH2_WINDOW - 1 positions before it.
+        let skip = match self.arch {
+            Arch::Dflash2 { .. } => (start + rows)
+                .saturating_sub(DFLASH2_WINDOW - 1)
+                .saturating_sub(start)
+                .min(rows),
+            _ => 0,
+        };
+        let (taps, start, rows) = (taps.slice(skip * row_len..), start + skip, rows - skip);
         let s = &mut self.s;
         let dfl = s
             .dflash
@@ -1034,24 +1262,24 @@ impl Draft {
             let chunk = taps.slice(offset * row_len..(offset + n) * row_len);
             let position = start + offset;
             let mut raw = dfl.raw.slice_mut(..n * HIDDEN);
-            linear.gemm_bf16(stream, &mut [Gemm::new(&weights.fc, &chunk, &mut raw)], n)?;
+            linear.gemm_bf16(stream, &mut [Gemm::new(context.fc, &chunk, &mut raw)], n)?;
             self.kernels.add_rms_norm(
                 stream,
                 None,
                 &mut dfl.raw,
-                &weights.hidden_norm,
+                context.hidden_norm,
                 &mut dfl.normed,
                 EPS,
             )?;
             let normed = dfl.normed.slice(..n * HIDDEN);
-            for (lw, cache) in weights.layers.iter().zip(&mut self.caches) {
+            for (&(k, v, k_norm), cache) in context.layers.iter().zip(&mut self.caches) {
                 let mut ck = s.ctx_k.slice_mut(..n * KV_WIDTH);
                 let mut cv = s.ctx_v.slice_mut(..n * KV_WIDTH);
                 linear.gemm_bf16(
                     stream,
                     &mut [
-                        Gemm::new(&lw.k, &normed, &mut ck),
-                        Gemm::new(&lw.v, &normed, &mut cv),
+                        Gemm::new(k, &normed, &mut ck),
+                        Gemm::new(v, &normed, &mut cv),
                     ],
                     n,
                 )?;
@@ -1061,11 +1289,11 @@ impl Draft {
                     n,
                     KV_WIDTH / HEAD_DIM,
                     KV_WIDTH,
-                    &lw.k_norm,
+                    k_norm,
                     &self.inv_freq,
                     position,
                     EPS,
-                    true,
+                    rope,
                 )?;
                 self.kernels
                     .store_kv(stream, &s.ctx_k, &s.ctx_v, n, KV_WIDTH, cache, position)?;
@@ -1215,20 +1443,18 @@ impl Draft {
                     &mut self.caches,
                 )
             }
-            Arch::Dflash { .. } => self.commit_round_dflash(stream, linear),
+            Arch::Dflash { .. } | Arch::Dflash2 { .. } => self.commit_round_dflash(stream, linear),
         }
     }
 
-    /// [`Self::commit_round`]'s work for a DFlash draft.
+    /// [`Self::commit_round`]'s work for a DFlash or DFlash 2 draft.
     fn commit_round_dflash(&mut self, stream: &CudaStream, linear: &Linear) -> anyhow::Result<()> {
-        let Arch::Dflash {
-            weights: dw,
-            fc_fp8,
-            ..
-        } = &self.arch
-        else {
-            anyhow::bail!("not a DFlash draft");
-        };
+        let context = self
+            .arch
+            .context()
+            .context("not a DFlash or DFlash 2 draft")?;
+        let ring = matches!(self.arch, Arch::Dflash2 { .. });
+        let rope = self.arch.rope();
         let k = &self.kernels;
         let s = &mut self.s;
         let control = &self.inputs.control;
@@ -1242,33 +1468,38 @@ impl Draft {
             k,
             stream,
             &self.inputs.taps.slice(..),
-            &mut [(&dw.fc, fc_fp8.as_ref(), dfl.round_raw.slice_mut(..))],
+            &mut [(context.fc, context.fc_fp8, dfl.round_raw.slice_mut(..))],
         )?;
         k.add_rms_norm(
             stream,
             None,
             &mut dfl.round_raw,
-            &dw.hidden_norm,
+            context.hidden_norm,
             &mut dfl.round_normed,
             EPS,
         )?;
-        for (layer, lw) in dw.layers.iter().enumerate() {
-            let kv = layer * BLOCK * KV_WIDTH..(layer + 1) * BLOCK * KV_WIDTH;
-            let ck = s.round_k.slice_mut(kv.clone());
-            let cv = s.round_v.slice_mut(kv);
+        // Every layer's keys and values of the same context rows, in as few launches as
+        // the product limits allow.
+        let layer_rows = BLOCK * KV_WIDTH;
+        let mut products = Vec::with_capacity(2 * context.layers.len());
+        for ((layer, &(lk, lv, _)), (ck, cv)) in context.layers.iter().enumerate().zip(
+            s.round_k
+                .as_view_mut()
+                .chunks_exact_mut(layer_rows)
+                .zip(s.round_v.as_view_mut().chunks_exact_mut(layer_rows)),
+        ) {
             let fp8 = self.backbone.as_ref().map(|b| &b[layer]);
-            project(
-                linear,
-                k,
-                stream,
-                &dfl.round_normed.slice(..),
-                &mut [
-                    (&lw.k, fp8.map(|f| &f.k), ck),
-                    (&lw.v, fp8.map(|f| &f.v), cv),
-                ],
-            )?;
+            products.push((lk, fp8.map(|f| &f.k), ck));
+            products.push((lv, fp8.map(|f| &f.v), cv));
         }
-        let norms: Vec<&CudaSlice<bf16>> = dw.layers.iter().map(|l| &l.k_norm).collect();
+        project(
+            linear,
+            k,
+            stream,
+            &dfl.round_normed.slice(..),
+            &mut products,
+        )?;
+        let norms: Vec<&CudaSlice<bf16>> = context.layers.iter().map(|l| l.2).collect();
         k.dflash_commit_rope_store(
             stream,
             &s.round_k,
@@ -1278,6 +1509,8 @@ impl Draft {
             EPS,
             &norms,
             &mut self.caches,
+            ring,
+            rope,
         )
     }
 
@@ -1301,43 +1534,38 @@ impl Draft {
             &mut s.residual,
             EPS,
         )?;
+        // The MLP convolution of the previous layer, which the next norm applies.
+        let mut pending: Option<&ConvWeights> = None;
         for (layer, cache) in self.caches.iter_mut().enumerate() {
             let lw = arch.layer(layer);
-            let x = (layer > 0).then_some(&s.mlp);
-            k.add_rms_norm(stream, x, &mut s.residual, lw.input_norm, &mut s.h, EPS)?;
+            if layer == 0 {
+                k.add_rms_norm(stream, None, &mut s.residual, lw.input_norm, &mut s.h, EPS)?;
+            } else {
+                s.add_norm(k, stream, Sublayer::Mlp, pending, lw.input_norm, false)?;
+            }
             let f = self.backbone.as_ref().map(|b| &b[layer]);
+            let (attention_conv, mlp_conv) = lw.convs.unzip();
+            let input = sublayer_input(
+                linear,
+                k,
+                stream,
+                &s.h,
+                s.dflash2.as_mut(),
+                Sublayer::Attention,
+                attention_conv,
+            )?;
             project(
                 linear,
                 k,
                 stream,
-                &s.h.slice(..),
+                &input,
                 &mut [
                     (lw.q, f.map(|f| &f.q), s.q.slice_mut(..)),
                     (lw.k, f.map(|f| &f.k), s.k.slice_mut(..)),
                     (lw.v, f.map(|f| &f.v), s.v.slice_mut(..)),
                 ],
             )?;
-            let global = arch.global(layer);
-            k.block_rope_store(
-                stream,
-                &mut s.q,
-                &s.k,
-                &s.v,
-                control,
-                &self.inv_freq,
-                EPS,
-                lw.q_norm,
-                lw.k_norm,
-                cache,
-                global,
-                matches!(arch, Arch::Dflash { .. }),
-            )?;
-            let keys = AttentionKeys::Device {
-                control,
-                window: if global { 0 } else { WINDOW },
-                max_keys: if global { cache.slots } else { LOCAL_SLOTS },
-            };
-            k.attention_from(stream, &s.q, cache, keys, &mut s.attention, &mut s.attn)?;
+            attend(k, stream, arch, s, control, &self.inv_freq, layer, cache)?;
             project(
                 linear,
                 k,
@@ -1345,19 +1573,28 @@ impl Draft {
                 &s.attn.slice(..),
                 &mut [(lw.o, f.map(|f| &f.o), s.o.slice_mut(..))],
             )?;
-            k.add_rms_norm(
+            s.add_norm(
+                k,
                 stream,
-                Some(&s.o),
-                &mut s.residual,
+                Sublayer::Attention,
+                attention_conv,
                 lw.post_attention_norm,
-                &mut s.h,
-                EPS,
+                false,
+            )?;
+            let input = sublayer_input(
+                linear,
+                k,
+                stream,
+                &s.h,
+                s.dflash2.as_mut(),
+                Sublayer::Mlp,
+                mlp_conv,
             )?;
             project(
                 linear,
                 k,
                 stream,
-                &s.h.slice(..),
+                &input,
                 &mut [
                     (lw.gate, f.map(|f| &f.gate), s.gate.slice_mut(..)),
                     (lw.up, f.map(|f| &f.up), s.up.slice_mut(..)),
@@ -1371,15 +1608,9 @@ impl Draft {
                 &s.act.slice(..),
                 &mut [(lw.down, f.map(|f| &f.down), s.mlp.slice_mut(..))],
             )?;
+            pending = mlp_conv;
         }
-        k.add_rms_norm(
-            stream,
-            Some(&s.mlp),
-            &mut s.residual,
-            arch.norm(),
-            &mut s.y,
-            EPS,
-        )
+        s.add_norm(k, stream, Sublayer::Mlp, pending, arch.norm(), true)
     }
 
     /// The base logits and `steps` greedy Markov steps of the block in [`Self::y`].
@@ -1390,8 +1621,10 @@ impl Draft {
         shared: SharedWeights<'_>,
         steps: usize,
     ) -> anyhow::Result<()> {
-        let Arch::Stock { weights, fold, .. } = &self.arch else {
-            return self.markov_dflash(stream, linear, shared, steps);
+        let (weights, fold) = match &self.arch {
+            Arch::Stock { weights, fold, .. } => (weights, fold),
+            Arch::Dflash { .. } => return self.markov_dflash(stream, linear, shared, steps),
+            Arch::Dflash2 { .. } => return self.select_dflash2(stream, linear, shared, steps),
         };
         let k = &self.kernels;
         let mw = &weights.markov;
@@ -1553,6 +1786,216 @@ impl Draft {
     }
 }
 
+impl Draft {
+    /// DFlash 2's drafts over the block in [`Self::y`]: the top 16 tokens of rows 1 to
+    /// `steps` through the LM head (or the approximate head), then the selector's greedy
+    /// walk from the anchor. A draft's confidence is its softmax probability over its
+    /// row's 16 capped scores.
+    fn select_dflash2(
+        &mut self,
+        stream: &CudaStream,
+        linear: &Linear,
+        shared: SharedWeights<'_>,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        let Arch::Dflash2 { weights, .. } = &self.arch else {
+            anyhow::bail!("not a DFlash 2 draft");
+        };
+        let k = &self.kernels;
+        let s = &mut self.s;
+        let control = &self.inputs.control;
+        let head = self.head.as_ref();
+        let list = head.and_then(|h| h.shortlist.as_ref());
+        let (rows, ld) = base_logits(
+            linear,
+            k,
+            stream,
+            shared,
+            head,
+            s,
+            steps,
+            self.vocab,
+            self.padded_vocab,
+        )?;
+        let d2 = s
+            .dflash2
+            .as_mut()
+            .context("the DFlash 2 buffers are missing")?;
+        k.topk(
+            stream,
+            &s.base.slice(..),
+            steps,
+            rows,
+            ld,
+            list.map(|l| &l.count),
+            list.map(|l| &l.map),
+            &mut d2.topk,
+            &mut d2.unary,
+            &mut d2.cand,
+        )?;
+        // At least two rows for the BF16 GEMM, as in base_logits.
+        let m_rows = steps.max(2);
+        let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
+        let mut hp = d2.hp.slice_mut(..m_rows * RANK);
+        linear.gemm_bf16(
+            stream,
+            &mut [Gemm::new(&weights.selector.hidden_projection, &y, &mut hp)],
+            m_rows,
+        )?;
+        k.select(
+            stream,
+            &d2.cand,
+            &d2.unary,
+            &d2.hp,
+            &weights.selector.predecessor,
+            &weights.selector.successor,
+            control,
+            steps,
+            self.softcap,
+            &mut s.ids,
+            &mut s.confidence,
+        )
+    }
+}
+
+/// The input convolution of a DFlash 2 sublayer: `coef = conv.projection · x`, then side 0
+/// of the convolution of `x` into `out`.
+fn conv_input(
+    linear: &Linear,
+    k: &DraftKernels,
+    stream: &CudaStream,
+    conv: &ConvWeights,
+    x: &CudaSlice<bf16>,
+    coef: &mut CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+) -> anyhow::Result<()> {
+    linear.gemm_bf16(
+        stream,
+        &mut [Gemm::new(
+            &conv.projection,
+            &x.slice(..),
+            &mut coef.slice_mut(..),
+        )],
+        BLOCK,
+    )?;
+    k.conv(stream, x, coef, 0, &conv.base, out)
+}
+
+/// The block attention of `layer`: norm and RoPE of the block's queries and keys, the
+/// stores of its keys and values in `cache`, and the attention over `cache` into
+/// [`Scratch::attn`].
+#[expect(clippy::too_many_arguments, reason = "the draft's parts and the layer")]
+fn attend(
+    k: &DraftKernels,
+    stream: &CudaStream,
+    arch: &Arch,
+    s: &mut Scratch,
+    control: &CudaSlice<i32>,
+    inv_freq: &CudaSlice<f32>,
+    layer: usize,
+    cache: &mut KvCache,
+) -> anyhow::Result<()> {
+    let lw = arch.layer(layer);
+    k.block_rope_store(
+        stream,
+        &mut s.q,
+        &s.k,
+        &s.v,
+        control,
+        inv_freq,
+        EPS,
+        lw.q_norm,
+        lw.k_norm,
+        cache,
+        arch.global(layer),
+        arch.rope(),
+    )?;
+    let (window, row_window) = arch.attention_window(layer);
+    let keys = AttentionKeys::Device {
+        control,
+        window,
+        row_window,
+        max_keys: if window == 0 {
+            cache.slots
+        } else {
+            (window + BLOCK).min(cache.slots)
+        },
+    };
+    k.attention_from(stream, &s.q, cache, keys, &mut s.attention, &mut s.attn)
+}
+
+/// A decoder layer's sublayer, for DFlash 2's convolution coefficients.
+#[derive(Clone, Copy)]
+enum Sublayer {
+    Attention,
+    Mlp,
+}
+
+impl Scratch {
+    /// `residual += x` and `out = rms_norm(residual; weight)`, where `x` is the sublayer's
+    /// output (`o` or `mlp`) and `out` is `y` with `last`, else `h`. With `conv`, `x` first
+    /// goes through DFlash 2's output convolution with that sublayer's coefficients.
+    fn add_norm(
+        &mut self,
+        k: &DraftKernels,
+        stream: &CudaStream,
+        sublayer: Sublayer,
+        conv: Option<&ConvWeights>,
+        weight: &CudaSlice<bf16>,
+        last: bool,
+    ) -> anyhow::Result<()> {
+        let x = match sublayer {
+            Sublayer::Attention => &self.o,
+            Sublayer::Mlp => &self.mlp,
+        };
+        let out = if last { &mut self.y } else { &mut self.h };
+        let Some(conv) = conv else {
+            return k.add_rms_norm(stream, Some(x), &mut self.residual, weight, out, EPS);
+        };
+        let d2 = self
+            .dflash2
+            .as_ref()
+            .context("the DFlash 2 buffers are missing")?;
+        let coef = match sublayer {
+            Sublayer::Attention => &d2.coef_attention,
+            Sublayer::Mlp => &d2.coef_mlp,
+        };
+        k.conv_add_rms_norm(
+            stream,
+            x,
+            coef,
+            &conv.base,
+            &mut self.residual,
+            weight,
+            out,
+            EPS,
+        )
+    }
+}
+
+/// A sublayer's input: its normed input `h`, or with `conv` DFlash 2's input convolution
+/// of `h` (see [`conv_input`]) into `d2`'s buffers.
+fn sublayer_input<'a>(
+    linear: &Linear,
+    k: &DraftKernels,
+    stream: &CudaStream,
+    h: &'a CudaSlice<bf16>,
+    d2: Option<&'a mut Dflash2Scratch>,
+    sublayer: Sublayer,
+    conv: Option<&ConvWeights>,
+) -> anyhow::Result<CudaView<'a, bf16>> {
+    let Some(conv) = conv else {
+        return Ok(h.slice(..));
+    };
+    let d2 = d2.context("the DFlash 2 buffers are missing")?;
+    let coef = match sublayer {
+        Sublayer::Attention => &mut d2.coef_attention,
+        Sublayer::Mlp => &mut d2.coef_mlp,
+    };
+    conv_input(linear, k, stream, conv, h, coef, &mut d2.conv)?;
+    Ok(d2.conv.slice(..))
+}
+
 /// Rows 1 to `steps` of the block output [`Scratch::y`] through the LM head, or through
 /// the approximate head's rows, into [`Scratch::base`]. Returns the rows of each step's
 /// base logits and the elements between steps.
@@ -1681,16 +2124,16 @@ fn quantize_backbone(
                         Some(quantize(&c.v_ctx, HIDDEN)?),
                     )
                 }
-                Arch::Dflash { .. } => (None, None),
+                Arch::Dflash { .. } | Arch::Dflash2 { .. } => (None, None),
             };
             Ok(Fp8Layer {
                 q: quantize(w.q, HIDDEN)?,
                 k: quantize(w.k, HIDDEN)?,
                 v: quantize(w.v, HIDDEN)?,
-                o: quantize(w.o, HEADS * HEAD_DIM)?,
+                o: quantize(w.o, arch.q_width())?,
                 gate: quantize(w.gate, HIDDEN)?,
                 up: quantize(w.up, HIDDEN)?,
-                down: quantize(w.down, MLP_WIDTH)?,
+                down: quantize(w.down, arch.mlp_width())?,
                 k_ctx,
                 v_ctx,
             })
@@ -1699,18 +2142,19 @@ fn quantize_backbone(
 }
 
 impl Head {
-    /// The approximate head `options` ask for, or `None` for the exact one.
+    /// The approximate head `options` ask for, or `None` for the exact one. `fold` holds
+    /// the fold weight and bias of a draft with a Markov head.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &DraftKernels,
         shared: SharedWeights<'_>,
-        fold_weight: &CudaSlice<bf16>,
-        fold_bias: &CudaSlice<bf16>,
+        fold: Option<(&CudaSlice<bf16>, &CudaSlice<bf16>)>,
         vocab: usize,
         options: &DraftOptions,
     ) -> anyhow::Result<Option<Self>> {
+        let fp8_fold = options.fp8_fold && fold.is_some();
         let Some(ranking) = &options.shortlist else {
-            if !options.fp8_head && !options.fp8_fold {
+            if !options.fp8_head && !fp8_fold {
                 return Ok(None);
             }
             let quantize = |w: &CudaSlice<bf16>, k: usize| -> anyhow::Result<Matrix> {
@@ -1723,9 +2167,9 @@ impl Head {
                     .fp8_head
                     .then(|| quantize(shared.lm_head, HIDDEN))
                     .transpose()?,
-                fold: options
-                    .fp8_fold
-                    .then(|| quantize(fold_weight, RANK))
+                fold: fold
+                    .filter(|_| fp8_fold)
+                    .map(|(w, _)| quantize(w, RANK))
                     .transpose()?,
                 fold_bias: None,
                 shortlist: None,
@@ -1761,12 +2205,12 @@ impl Head {
             } else {
                 Matrix::Bf16(stream.alloc_zeros(capacity * HIDDEN)?)
             }),
-            fold: Some(if options.fp8_fold {
-                Matrix::Fp8(Fp8Rows::new(stream, capacity, RANK)?)
-            } else {
-                Matrix::Bf16(stream.alloc_zeros(capacity * RANK)?)
-            }),
-            fold_bias: Some(stream.alloc_zeros(capacity)?),
+            fold: match (fold, fp8_fold) {
+                (None, _) => None,
+                (Some(_), true) => Some(Matrix::Fp8(Fp8Rows::new(stream, capacity, RANK)?)),
+                (Some(_), false) => Some(Matrix::Bf16(stream.alloc_zeros(capacity * RANK)?)),
+            },
+            fold_bias: fold.map(|_| stream.alloc_zeros(capacity)).transpose()?,
             shortlist: Some(Shortlist {
                 ranked,
                 used: ranked,
@@ -1778,28 +2222,18 @@ impl Head {
             }),
         };
         let ids = stream.clone_htod(&ids)?;
-        head.gather(
-            stream,
-            kernels,
-            shared,
-            fold_weight,
-            fold_bias,
-            &ids.slice(..),
-            0,
-        )?;
+        head.gather(stream, kernels, shared, fold, &ids.slice(..), 0)?;
         Ok(Some(head))
     }
 
-    /// Copies the head, fold and fold-bias rows of the tokens in `ids` into rows
-    /// `first..` of the shortlist's tables.
-    #[expect(clippy::too_many_arguments, reason = "the source tables and the rows")]
+    /// Copies the head rows of the tokens in `ids`, and with `fold` the fold and fold-bias
+    /// rows, into rows `first..` of the shortlist's tables.
     fn gather(
         &mut self,
         stream: &CudaStream,
         kernels: &DraftKernels,
         shared: SharedWeights<'_>,
-        fold_weight: &CudaSlice<bf16>,
-        fold_bias: &CudaSlice<bf16>,
+        fold: Option<(&CudaSlice<bf16>, &CudaSlice<bf16>)>,
         ids: &CudaView<'_, i32>,
         first: usize,
     ) -> anyhow::Result<()> {
@@ -1811,6 +2245,9 @@ impl Head {
         if let Some(lm) = self.lm.as_mut() {
             copy(shared.lm_head, HIDDEN, lm)?;
         }
+        let Some((fold_weight, fold_bias)) = fold else {
+            return Ok(());
+        };
         if let Some(fold) = self.fold.as_mut() {
             copy(fold_weight, RANK, fold)?;
         }
@@ -1822,7 +2259,8 @@ impl Head {
 }
 
 /// `out = x · weight^T` over the 8 block rows for each product `(weight, fp8, out)`:
-/// through the FP8 copies when every product has one, else through the BF16 weights.
+/// through the FP8 copies when every product has one, else through the BF16 weights. As
+/// few launches as the kernels' product limits allow.
 fn project(
     linear: &Linear,
     kernels: &DraftKernels,
@@ -1830,23 +2268,27 @@ fn project(
     x: &CudaView<'_, bf16>,
     products: &mut [(&CudaSlice<bf16>, Option<&Fp8Rows>, CudaViewMut<'_, bf16>)],
 ) -> anyhow::Result<()> {
-    let fp8: Option<Vec<&Fp8Rows>> = products.iter().map(|p| p.1).collect();
-    if let Some(fp8) = fp8 {
-        let mut fp8: Vec<Fp8Product<'_>> = fp8
-            .into_iter()
-            .zip(products.iter_mut())
-            .map(|(w, p)| {
-                let ld = p.2.len() / BLOCK;
-                fp8_rows(w, w.rows(), p.2.slice_mut(..), ld)
-            })
-            .collect();
-        return kernels.gemm_fp8(stream, x, BLOCK, &mut fp8);
+    if products.iter().all(|p| p.1.is_some()) {
+        for chunk in products.chunks_mut(F8_MAX_PRODUCTS) {
+            let mut fp8: Vec<Fp8Product<'_>> = chunk
+                .iter_mut()
+                .filter_map(|p| {
+                    let ld = p.2.len() / BLOCK;
+                    p.1.map(|w| fp8_rows(w, w.rows(), p.2.slice_mut(..), ld))
+                })
+                .collect();
+            kernels.gemm_fp8(stream, x, BLOCK, &mut fp8)?;
+        }
+        return Ok(());
     }
-    let mut gemms: Vec<Gemm<'_, bf16>> = products
-        .iter_mut()
-        .map(|p| Gemm::new(p.0, x, &mut p.2))
-        .collect();
-    linear.gemm_bf16(stream, &mut gemms, BLOCK)
+    for chunk in products.chunks_mut(MAX_PRODUCTS) {
+        let mut gemms: Vec<Gemm<'_, bf16>> = chunk
+            .iter_mut()
+            .map(|p| Gemm::new(p.0, x, &mut p.2))
+            .collect();
+        linear.gemm_bf16(stream, &mut gemms, BLOCK)?;
+    }
+    Ok(())
 }
 
 /// An [`Fp8Product`] over the first `rows` rows of `w`.

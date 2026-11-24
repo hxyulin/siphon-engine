@@ -33,13 +33,18 @@ use crate::{
     ops::{linear::Linear, spec::VERIFY_ROWS},
     weights::{
         dflash::DflashWeights,
+        dflash2::{DFLASH2_WINDOW, Dflash2Weights, is_dflash2},
         draft::{DraftWeights, HIDDEN},
     },
 };
 
 /// Prompt rows whose taps [`Speculator::restart`] commits again: the slots of the draft's
-/// local rings, the window and a block.
-const TAIL: usize = WINDOW + STEPS + 1;
+/// rings, the window and a block. DFlash 2's rings, 2056 slots, are the longest.
+const TAIL: usize = DFLASH2_WINDOW + STEPS + 1;
+const _: () = assert!(
+    DFLASH2_WINDOW >= WINDOW,
+    "TAIL covers the bundled draft's rings"
+);
 
 /// Prompt positions whose tokens a shortlist head adds to its context rows, the last
 /// ones: at most half of [`CONTEXT_ROWS`], so the tokens that generation emits keep room.
@@ -237,8 +242,9 @@ pub struct Speculator {
 pub enum DraftSource<'a> {
     /// The DSpark draft bundled with the checkpoint (`mtp.safetensors`).
     Bundled,
-    /// A DFlash draft with DSpark heads exported by the 2DSD project, in this directory
-    /// (see [`DflashWeights`]).
+    /// A drafter in this directory: Inco AI's DFlash 2 drafter (see [`Dflash2Weights`])
+    /// when its `config.json` names `DFlash2DraftModel`, else a DFlash draft with DSpark
+    /// heads exported by the 2DSD project (see [`DflashWeights`]).
     Dflash(&'a std::path::Path),
 }
 
@@ -256,6 +262,17 @@ pub fn load_draft(
         DraftSource::Bundled => {
             let weights = DraftWeights::load(checkpoint, model.config(), &stream)?;
             Draft::with_options(
+                &stream,
+                model.config(),
+                weights,
+                model.draft_shared(),
+                capacity + STEPS + 1,
+                options,
+            )?
+        }
+        DraftSource::Dflash(dir) if is_dflash2(dir)? => {
+            let weights = Dflash2Weights::load(dir, model.config(), &stream)?;
+            Draft::dflash2(
                 &stream,
                 model.config(),
                 weights,
@@ -427,8 +444,8 @@ impl Speculator {
     /// Returns the draft to the end of the prompt of the last [`Self::prefill`], with
     /// `first` as the anchor again, after the model's state was restored to that point
     /// ([`Model::restore_state`]). Rounds after the prompt overwrite the ring slots of
-    /// the prompt's last positions in the draft's local layers, but nothing of its global
-    /// layer below the prompt's end, so committing the prompt's last [`TAIL`] rows again
+    /// the prompt's last positions in the draft's ring layers, but nothing of its global
+    /// layers below the prompt's end, so committing the prompt's last [`TAIL`] rows again
     /// restores the draft. A shortlist head keeps the tokens noted since the prefill.
     pub fn restart(&mut self, model: &mut Model, first: u32) -> anyhow::Result<()> {
         ensure!(self.prompt_len > 0, "nothing was prefilled");

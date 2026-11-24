@@ -217,7 +217,7 @@ fn check_config(c: &Value, target: &TextConfig) -> anyhow::Result<usize> {
 
 /// The taps of `dflash_config.target_layer_ids`: visit ids of the target, whose input
 /// partial block is the tap, or the visit count for the final normed hidden state, last.
-fn tap_layout(c: &Value, target: &TextConfig) -> anyhow::Result<TapLayout> {
+pub(super) fn tap_layout(c: &Value, target: &TextConfig) -> anyhow::Result<TapLayout> {
     let ids = c
         .pointer("/dflash_config/target_layer_ids")
         .and_then(Value::as_array)

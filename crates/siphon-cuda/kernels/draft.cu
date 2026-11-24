@@ -176,14 +176,21 @@ draft_block_input(const int32_t* anchor, const __nv_bfloat16* embed, int32_t voc
 
 namespace {
 
+// RoPE arithmetic of norm_rope_head, as `Rope` in src/ops/draft.rs.
+constexpr int kRopeF32 = 0;         // F32 cosine and sine, F32 arithmetic
+constexpr int kRopeBf16Table = 1;   // BF16 cosine and sine, F32 arithmetic
+constexpr int kRopeBf16Ops = 2;     // BF16 cosine and sine, every product and sum rounded
+
 // Per-head RMSNorm of the 128 values at `in` with `weight`, rounded to BF16, then NeoX
 // RoPE at `position`, written to `out`, which may equal `in`. A block of 64 threads:
-// thread i rotates elements i and i + 64. With `bf16_table` the cosine and sine are
+// thread i rotates elements i and i + 64. With kRopeBf16Table the cosine and sine are
 // rounded to BF16 first, as a BF16 RoPE table holds them (the 2DSD runner's DFlash
-// draft, and Transformers' Qwen3 rotary embedding it was trained with).
+// draft, and Transformers' Qwen3 rotary embedding it was trained with). kRopeBf16Ops
+// also rounds each product and the sum to BF16, as BF16 tensor arithmetic does
+// (SGLang's table_qk_norm_rope with a BF16 table, and Transformers in BF16).
 __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
                                const __nv_bfloat16* weight, const float* inv_freq,
-                               int32_t position, float eps, bool bf16_table = false) {
+                               int32_t position, float eps, int rope = kRopeF32) {
     __shared__ float partial[kHalf / 32];
     const int i = threadIdx.x;
     const float x1 = bf(in[i]);
@@ -198,9 +205,16 @@ __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
     const float n2 = round_bf16(__fmul_rn(__fmul_rn(x2, inv), bf(weight[i + kHalf])));
     float sin_f, cos_f;
     sincosf(__fmul_rn(static_cast<float>(position), inv_freq[i]), &sin_f, &cos_f);
-    if (bf16_table) {
+    if (rope != kRopeF32) {
         sin_f = round_bf16(sin_f);
         cos_f = round_bf16(cos_f);
+    }
+    if (rope == kRopeBf16Ops) {
+        out[i] = __float2bfloat16_rn(
+            __fsub_rn(round_bf16(__fmul_rn(n1, cos_f)), round_bf16(__fmul_rn(n2, sin_f))));
+        out[i + kHalf] = __float2bfloat16_rn(
+            __fadd_rn(round_bf16(__fmul_rn(n2, cos_f)), round_bf16(__fmul_rn(n1, sin_f))));
+        return;
     }
     out[i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(n1, cos_f), __fmul_rn(n2, sin_f)));
     out[i + kHalf] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(n2, cos_f), __fmul_rn(n1, sin_f)));
@@ -210,15 +224,15 @@ __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
 
 // In place on the leading `heads` 128-wide heads of each row of x (row stride
 // `row_stride` elements): per-head RMSNorm with `weight`, rounded to BF16, then NeoX
-// RoPE at position `start + row`. inv_freq is F32 [64], theta^(-2i/128). With
-// `bf16_rope` the cosine and sine are rounded to BF16 (see norm_rope_head). Grid (rows,
-// heads), 64 threads: thread i rotates elements i and i + 64.
+// RoPE at position `start + row`. inv_freq is F32 [64], theta^(-2i/128). `rope` picks
+// the arithmetic (see norm_rope_head). Grid (rows, heads), 64 threads: thread i rotates
+// elements i and i + 64.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_head_norm_rope(__nv_bfloat16* x, int32_t row_stride, const __nv_bfloat16* weight,
-                     const float* inv_freq, int32_t start, float eps, int32_t bf16_rope) {
+                     const float* inv_freq, int32_t start, float eps, int32_t rope) {
     __nv_bfloat16* head = x + size_t(blockIdx.x) * row_stride + blockIdx.y * kHeadDim;
     norm_rope_head(head, head, weight, inv_freq, start + static_cast<int32_t>(blockIdx.x), eps,
-                   bf16_rope != 0);
+                   rope);
 }
 
 // Copies rows of keys and values (BF16 [rows, 1024] with row stride `row_stride`) into
@@ -238,15 +252,19 @@ draft_store_kv(const __nv_bfloat16* k, const __nv_bfloat16* v, int32_t row_strid
 namespace {
 
 constexpr int kAttnThreads = kBlock * 32;     // one warp per block row
-constexpr int kQueryRows = kBlock * kGroup;  // 24 query rows per KV head
-constexpr int kKeyChunk = 32;                // one key per lane
-constexpr int kMaxSplits = 128;              // MAX_ATTENTION_SPLITS in src/ops/draft.rs
-constexpr int kMinKeysPerSplit = 128;        // MIN_KEYS_PER_SPLIT in src/ops/draft.rs
-constexpr int kKeyStride = kHeadDim + 8;     // BF16 elements per key row in shared memory
-// Dynamic shared memory of draft_attention, ATTENTION_SMEM in src/ops/draft.rs.
-constexpr int kAttentionSmem = 4 * kQueryRows * kHeadDim + 2 * 2 * kKeyChunk * kKeyStride +
-                               2 * 2 * kKeyChunk * kHeadDim + 16 * kBlock * kKeyChunk;
-static_assert(kAttentionSmem == 50176, "ATTENTION_SMEM in src/ops/draft.rs");
+constexpr int kMaxGroup = 4;                  // query heads per KV head, at most
+constexpr int kKeyChunk = 32;                 // one key per lane
+constexpr int kMaxSplits = 128;               // MAX_ATTENTION_SPLITS in src/ops/draft.rs
+constexpr int kMinKeysPerSplit = 128;         // MIN_KEYS_PER_SPLIT in src/ops/draft.rs
+constexpr int kKeyStride = kHeadDim + 8;      // BF16 elements per key row in shared memory
+// Dynamic shared memory of draft_attention with G query heads per KV head,
+// attention_smem in src/ops/draft.rs.
+constexpr int attention_smem(int group) {
+    return 4 * kBlock * group * kHeadDim + 2 * 2 * kKeyChunk * kKeyStride +
+           2 * 2 * kKeyChunk * kHeadDim + 16 * kBlock * kKeyChunk;
+}
+static_assert(attention_smem(kGroup) == 50176, "attention_smem in src/ops/draft.rs");
+static_assert(attention_smem(kMaxGroup) == 54272, "attention_smem in src/ops/draft.rs");
 
 // The keys of each split of a block attention over `keys` keys, as attention_splits in
 // src/ops/draft.rs: a multiple of 32, at least 128.
@@ -284,29 +302,33 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
 }
 
-}  // namespace
-
-// One split of the block attention: the 8 rows' queries (BF16 [8, 24 * 128], after
+// One split of the block attention: the 8 rows' queries (BF16 [8, G * 8 * 128], after
 // norm and RoPE) of KV head blockIdx.x against keys at positions
 // first + split * keys_per_split, up to first + keys. Position p sits in cache slot
 // p mod slots (caches BF16 [slots, 8, 128]). Writes the unnormalized F32 output
-// [24, 128] and the row max and sum [24, 2] of the split. Query row r is token r / 3,
-// head 3 * blockIdx.x + r % 3. Scale 128^-0.5.
+// [8 G, 128] and the row max and sum [8 G, 2] of the split. Query row r is token r / G,
+// head G * blockIdx.x + r % G. Scale 128^-0.5.
 //
 // With `control` not null, `first` and `keys` come from the round's position (see
-// attention_range) and blocks past the split count exit. Warp w holds the three query
-// rows of token w and lane j key j of each chunk of 32. The arithmetic per query row is
-// a fixed sequence, with every product and sum rounded on its own: per chunk of 32 keys,
-// sequential F32 dot products over the 128 dimensions, the running max, the sum of the
-// exponentials in key order, and the output rescaled then accumulated in key order.
-// Splits depend only on the key count.
-extern "C" __global__ void __launch_bounds__(kAttnThreads)
-draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                const __nv_bfloat16* cache_v, int32_t slots, const int32_t* control,
-                int32_t window, int32_t first, int32_t keys, float* partial_out,
-                float* partial_stats) {
-    // Dynamic shared memory, kAttentionSmem bytes: the queries, two chunks of keys and
-    // values, and each warp's exponentials (rows in x, y and z).
+// attention_range) and blocks past the split count exit. With `row_window` above zero
+// as well, block row j sees only keys at or after P + j - (row_window - 1), for the
+// block at P: a window of `row_window` positions ending at the row itself, as a sliding
+// layer's mask gives each query. Warp w holds the G query rows of token w and lane j key
+// j of each chunk of 32. The arithmetic per query row is a fixed sequence, with every
+// product and sum rounded on its own: per chunk of 32 keys, sequential F32 dot products
+// over the 128 dimensions, the running max, the sum of the exponentials in key order,
+// and the output rescaled then accumulated in key order. Splits depend only on the key
+// count.
+template <int G>
+__device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
+                                                const __nv_bfloat16* cache_k,
+                                                const __nv_bfloat16* cache_v, int32_t slots,
+                                                const int32_t* control, int32_t window,
+                                                int32_t row_window, int32_t first, int32_t keys,
+                                                float* partial_out, float* partial_stats) {
+    constexpr int kQueryRows = kBlock * G;
+    // Dynamic shared memory, attention_smem(G) bytes: the queries, two chunks of keys and
+    // values, and each warp's exponentials (one per query row).
     extern __shared__ __align__(16) unsigned char smem[];
     auto& qs = *reinterpret_cast<float (*)[kQueryRows][kHeadDim]>(smem);
     auto& ks = *reinterpret_cast<__nv_bfloat16 (*)[2][kKeyChunk][kKeyStride]>(
@@ -330,6 +352,11 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
     const int t = threadIdx.x;
     const int warp = t / 32, lane = t % 32;
     const float scale = rsqrtf(static_cast<float>(kHeadDim));
+    // The first key position the warp's block row sees.
+    int32_t row_first = 0;
+    if (control != nullptr && row_window > 0) {
+        row_first = control[0] + control[1] + warp - (row_window - 1);
+    }
 
     const int begin = split * per_split;
     const int end = min(keys, begin + per_split);
@@ -353,13 +380,13 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
 
     for (int idx = t; idx < kQueryRows * kHeadDim; idx += kAttnThreads) {
         const int r = idx / kHeadDim, d = idx % kHeadDim;
-        const int token = r / kGroup, head = kv * kGroup + r % kGroup;
-        qs[r][d] = bf(q[size_t(token) * kGroup * kKvHeads * kHeadDim + head * kHeadDim + d]);
+        const int token = r / G, head = kv * G + r % G;
+        qs[r][d] = bf(q[size_t(token) * G * kKvHeads * kHeadDim + head * kHeadDim + d]);
     }
 
-    float row_max[kGroup], row_sum[kGroup], acc[kGroup][4];
+    float row_max[G], row_sum[G], acc[G][4];
 #pragma unroll
-    for (int i = 0; i < kGroup; ++i) {
+    for (int i = 0; i < G; ++i) {
         row_max[i] = -INFINITY;
         row_sum[i] = 0.f;
 #pragma unroll
@@ -379,10 +406,15 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
         }
         __syncthreads();
 
-        // Scores of key `lane` against the warp's three query rows.
-        float s[kGroup];
+        // Scores of key `lane` against the warp's G query rows.
+        const bool visible = lane < n && first + c0 + lane >= row_first;
+        float s[G];
         {
-            float dot[kGroup] = {0.f, 0.f, 0.f};
+            float dot[G];
+#pragma unroll
+            for (int i = 0; i < G; ++i) {
+                dot[i] = 0.f;
+            }
             if (lane < n) {
                 const __nv_bfloat16* kr = ks[buf][lane];
 #pragma unroll 2
@@ -391,8 +423,8 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
                     const float kval[8] = {bf_lo(kv8.x), bf_hi(kv8.x), bf_lo(kv8.y), bf_hi(kv8.y),
                                            bf_lo(kv8.z), bf_hi(kv8.z), bf_lo(kv8.w), bf_hi(kv8.w)};
 #pragma unroll
-                    for (int i = 0; i < kGroup; ++i) {
-                        const float* qr = &qs[warp * kGroup + i][dd];
+                    for (int i = 0; i < G; ++i) {
+                        const float* qr = &qs[warp * G + i][dd];
                         const float4 qa = *reinterpret_cast<const float4*>(qr);
                         const float4 qb = *reinterpret_cast<const float4*>(qr + 4);
                         const float qv[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
@@ -404,50 +436,54 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
                 }
             }
 #pragma unroll
-            for (int i = 0; i < kGroup; ++i) {
-                s[i] = lane < n ? __fmul_rn(dot[i], scale) : -INFINITY;
+            for (int i = 0; i < G; ++i) {
+                s[i] = visible ? __fmul_rn(dot[i], scale) : -INFINITY;
             }
         }
 
-        float correction[kGroup];
+        float correction[G];
         float4 p4 = make_float4(0.f, 0.f, 0.f, 0.f);
         float* p = &p4.x;
 #pragma unroll
-        for (int i = 0; i < kGroup; ++i) {
+        for (int i = 0; i < G; ++i) {
             float chunk_max = s[i];
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, offset));
             }
             const float m = fmaxf(row_max[i], chunk_max);
-            correction[i] = expf(__fsub_rn(row_max[i], m));
-            p[i] = lane < n ? expf(__fsub_rn(s[i], m)) : 0.f;
+            // A row that has seen no visible key yet keeps a zero output and sum.
+            const float base = m == -INFINITY ? 0.f : m;
+            correction[i] = expf(__fsub_rn(row_max[i], base));
+            p[i] = visible ? expf(__fsub_rn(s[i], base)) : 0.f;
             row_max[i] = m;
         }
         ps[warp][lane] = p4;
         __syncwarp();
         {
-            float sum[kGroup];
+            float sum[G];
 #pragma unroll
-            for (int i = 0; i < kGroup; ++i) {
+            for (int i = 0; i < G; ++i) {
                 sum[i] = __fmul_rn(row_sum[i], correction[i]);
             }
 #pragma unroll 8
             for (int key = 0; key < kKeyChunk; ++key) {
                 const float4 pk = ps[warp][key];
-                sum[0] = __fadd_rn(sum[0], pk.x);
-                sum[1] = __fadd_rn(sum[1], pk.y);
-                sum[2] = __fadd_rn(sum[2], pk.z);
+                const float pv[4] = {pk.x, pk.y, pk.z, pk.w};
+#pragma unroll
+                for (int i = 0; i < G; ++i) {
+                    sum[i] = __fadd_rn(sum[i], pv[i]);
+                }
             }
 #pragma unroll
-            for (int i = 0; i < kGroup; ++i) {
+            for (int i = 0; i < G; ++i) {
                 row_sum[i] = sum[i];
             }
         }
 
-        // Lane j accumulates dimensions 4j to 4j + 3 of the three rows.
+        // Lane j accumulates dimensions 4j to 4j + 3 of the G rows.
 #pragma unroll
-        for (int i = 0; i < kGroup; ++i) {
+        for (int i = 0; i < G; ++i) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 acc[i][j] = __fmul_rn(acc[i][j], correction[i]);
@@ -455,13 +491,15 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
         }
         for (int key = 0; key < n; ++key) {
             const float4 pk = ps[warp][key];
+            const float pv[4] = {pk.x, pk.y, pk.z, pk.w};
             const uint2 v4 = *reinterpret_cast<const uint2*>(&vs[buf][key][4 * lane]);
             const float v[4] = {bf_lo(v4.x), bf_hi(v4.x), bf_lo(v4.y), bf_hi(v4.y)};
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                acc[0][j] = fmaf(pk.x, v[j], acc[0][j]);
-                acc[1][j] = fmaf(pk.y, v[j], acc[1][j]);
-                acc[2][j] = fmaf(pk.z, v[j], acc[2][j]);
+#pragma unroll
+                for (int i = 0; i < G; ++i) {
+                    acc[i][j] = fmaf(pv[i], v[j], acc[i][j]);
+                }
             }
         }
         __syncthreads();
@@ -469,8 +507,8 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
 
     const size_t base = (size_t(split) * kKvHeads + kv) * kQueryRows;
 #pragma unroll
-    for (int i = 0; i < kGroup; ++i) {
-        const size_t r = base + warp * kGroup + i;
+    for (int i = 0; i < G; ++i) {
+        const size_t r = base + warp * G + i;
         *reinterpret_cast<float4*>(&partial_out[r * kHeadDim + 4 * lane]) =
             make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
         if (lane == 0) {
@@ -480,32 +518,58 @@ draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
     }
 }
 
-// Combines the splits of draft_attention into out, BF16 [8, 24 * 128]. Grid (8 KV
-// heads, 24 query rows), 128 threads. With `control` not null the split count comes
-// from the round's position, as in draft_attention; otherwise from first and keys.
+}  // namespace
+
+// attention_split with 3 query heads per KV head (the bundled draft and 2DSD's DFlash
+// draft).
+extern "C" __global__ void __launch_bounds__(kAttnThreads)
+draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
+                const __nv_bfloat16* cache_v, int32_t slots, const int32_t* control,
+                int32_t window, int32_t row_window, int32_t first, int32_t keys,
+                float* partial_out, float* partial_stats) {
+    attention_split<kGroup>(q, cache_k, cache_v, slots, control, window, row_window, first, keys,
+                            partial_out, partial_stats);
+}
+
+// attention_split with 4 query heads per KV head (DFlash 2).
+extern "C" __global__ void __launch_bounds__(kAttnThreads)
+draft_attention_g4(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
+                   const __nv_bfloat16* cache_v, int32_t slots, const int32_t* control,
+                   int32_t window, int32_t row_window, int32_t first, int32_t keys,
+                   float* partial_out, float* partial_stats) {
+    attention_split<kMaxGroup>(q, cache_k, cache_v, slots, control, window, row_window, first,
+                               keys, partial_out, partial_stats);
+}
+
+// Combines the splits of draft_attention into out, BF16 [8, group * 8 * 128]. Grid (8
+// KV heads, 8 * group query rows), 128 threads. With `control` not null the split count
+// comes from the round's position, as in draft_attention; otherwise from first and keys.
 extern "C" __global__ void __launch_bounds__(kHeadDim)
 draft_attention_combine(const float* partial_out, const float* partial_stats,
                         const int32_t* control, int32_t window, int32_t first, int32_t keys,
-                        __nv_bfloat16* out) {
+                        int32_t group, __nv_bfloat16* out) {
     pdl_wait();
     pdl_trigger();
     attention_range(control, window, first, keys);
     const int per_split = keys_per_split(keys);
     const int splits = (keys + per_split - 1) / per_split;
+    const int query_rows = kBlock * group;
     const int kv = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
     float m = -INFINITY;
     for (int s = 0; s < splits; ++s) {
-        m = fmaxf(m, partial_stats[((size_t(s) * kKvHeads + kv) * kQueryRows + r) * 2]);
+        m = fmaxf(m, partial_stats[((size_t(s) * kKvHeads + kv) * query_rows + r) * 2]);
     }
     float sum = 0.f, value = 0.f;
     for (int s = 0; s < splits; ++s) {
-        const size_t row = (size_t(s) * kKvHeads + kv) * kQueryRows + r;
-        const float w = expf(partial_stats[row * 2] - m);
+        const size_t row = (size_t(s) * kKvHeads + kv) * query_rows + r;
+        const float stat = partial_stats[row * 2];
+        // A split none of whose keys the row sees adds nothing.
+        const float w = stat == -INFINITY ? 0.f : expf(stat - m);
         sum = fmaf(partial_stats[row * 2 + 1], w, sum);
         value = fmaf(partial_out[row * kHeadDim + d], w, value);
     }
-    const int token = r / kGroup, head = kv * kGroup + r % kGroup;
-    out[size_t(token) * kGroup * kKvHeads * kHeadDim + head * kHeadDim + d] =
+    const int token = r / group, head = kv * group + r % group;
+    out[size_t(token) * group * kKvHeads * kHeadDim + head * kHeadDim + d] =
         __float2bfloat16_rn(value / sum);
 }
 
@@ -856,36 +920,35 @@ draft_commit_rope_store(const __nv_bfloat16* ctx_k, const __nv_bfloat16* ctx_v,
     }
 }
 
-// The block's queries, keys and values at the round's position P = start + rows: the 24
-// query heads of each row of q get draft_head_norm_rope's norm and RoPE at P + row in
-// place; the 8 key heads of each row of k get them on their way to cache slot
+// The block's queries, keys and values at the round's position P = start + rows: the
+// `q_heads` query heads of each row of q get draft_head_norm_rope's norm and RoPE at
+// P + row in place; the 8 key heads of each row of k get them on their way to cache slot
 // (P + row) mod slots, with the value heads of v beside them. With `limit` set,
-// positions at or past `slots` are skipped. With `bf16_rope` the cosine and sine are
-// rounded to BF16 (see norm_rope_head). Grid (8 rows, 32 heads), 64 threads.
+// positions at or past `slots` are skipped. `rope` picks the RoPE arithmetic (see
+// norm_rope_head). Grid (8 rows, q_heads + 8 heads), 64 threads.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_block_rope_store(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
                        const int32_t* control, const float* inv_freq, float eps,
                        const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
                        __nv_bfloat16* cache_k, __nv_bfloat16* cache_v, int32_t slots,
-                       int32_t limit, int32_t bf16_rope) {
+                       int32_t limit, int32_t rope, int32_t q_heads) {
     constexpr int kWidth = kKvHeads * kHeadDim;
-    constexpr int kQWidth = kKvHeads * kGroup * kHeadDim;
     pdl_wait();
     pdl_trigger();
     const int row = blockIdx.x, head = blockIdx.y;
     const int32_t position = control[0] + control_rows(control) + row;
-    if (head < kKvHeads * kGroup) {
-        __nv_bfloat16* x = q + size_t(row) * kQWidth + head * kHeadDim;
-        norm_rope_head(x, x, q_norm, inv_freq, position, eps, bf16_rope != 0);
+    if (head < q_heads) {
+        __nv_bfloat16* x = q + size_t(row) * q_heads * kHeadDim + head * kHeadDim;
+        norm_rope_head(x, x, q_norm, inv_freq, position, eps, rope);
         return;
     }
-    const int g = head - kKvHeads * kGroup;
+    const int g = head - q_heads;
     if (position < 0 || (limit != 0 && position >= slots)) {
         return;
     }
     const size_t src = size_t(row) * kWidth + g * kHeadDim;
     const size_t dst = size_t(position % slots) * kWidth + g * kHeadDim;
-    norm_rope_head(k + src, cache_k + dst, k_norm, inv_freq, position, eps, bf16_rope != 0);
+    norm_rope_head(k + src, cache_k + dst, k_norm, inv_freq, position, eps, rope);
     for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
         cache_v[dst + i] = v[src + i];
     }
@@ -903,14 +966,16 @@ struct DflashCommit {
     __nv_bfloat16* cache_v[kDflashMaxLayers];
     int32_t slots[kDflashMaxLayers];
     float eps;
+    int32_t ring;  // nonzero: position p goes to slot p mod slots; else positions past slots are skipped
+    int32_t rope;  // the RoPE arithmetic of norm_rope_head
 };
 
-// The round's context keys and values of a DFlash draft, whose layers all keep every
-// position: for row r below control[1], KV head h and layer l, the key head of
-// ctx_k[l, r] gets draft_head_norm_rope's norm (layer l's k_norm) and RoPE from a BF16
-// table at position start + r and lands in slot start + r of layer l's cache, with the value head of
-// ctx_v[l, r] beside it. Positions at or past a cache's slots are skipped. Grid (8 rows,
-// 8 heads, layers), 64 threads.
+// The round's context keys and values of a DFlash draft: for row r below control[1], KV
+// head h and layer l, the key head of ctx_k[l, r] gets draft_head_norm_rope's norm
+// (layer l's k_norm) and RoPE (arithmetic `rope`) at position start + r and lands in
+// slot start + r of layer l's cache, with the value head of ctx_v[l, r] beside it. With
+// `ring` the slot is the position mod the cache's slots; otherwise positions at or past
+// them are skipped. Grid (8 rows, 8 heads, layers), 64 threads.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_dflash_commit_rope_store(const __grid_constant__ DflashCommit c) {
     constexpr int kWidth = kKvHeads * kHeadDim;
@@ -922,13 +987,13 @@ draft_dflash_commit_rope_store(const __grid_constant__ DflashCommit c) {
         return;
     }
     const int32_t position = c.control[0] + row;
-    if (position < 0 || position >= c.slots[layer]) {
+    if (position < 0 || (c.ring == 0 && position >= c.slots[layer])) {
         return;
     }
     const size_t src = (size_t(layer) * kBlock + row) * kWidth + head * kHeadDim;
-    const size_t dst = size_t(position) * kWidth + head * kHeadDim;
+    const size_t dst = size_t(position % c.slots[layer]) * kWidth + head * kHeadDim;
     norm_rope_head(c.ctx_k + src, c.cache_k[layer] + dst, c.k_norm[layer], c.inv_freq,
-                   position, c.eps, true);
+                   position, c.eps, c.rope);
     for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
         c.cache_v[layer][dst + i] = c.ctx_v[src + i];
     }
@@ -1331,7 +1396,7 @@ constexpr int kF8Tile = 3072;  // input columns staged in shared memory at once
 constexpr int kF8MaxM = 8;     // input rows
 constexpr int kF8Rows = 2;     // weight rows per warp
 constexpr int kF8Loads = kF8Tile / 16 / 32;  // 16-byte loads per lane and row per tile
-constexpr int kF8MaxSegments = 3;
+constexpr int kF8MaxSegments = 10;
 // Dynamic shared memory of draft_gemm_fp8, F8_SMEM in src/ops/draft.rs.
 constexpr int kF8Smem = kF8MaxM * kF8Tile * 2;
 static_assert(kF8Smem == 49152, "F8_SMEM in src/ops/draft.rs");
@@ -1370,7 +1435,7 @@ __device__ __forceinline__ void stage_x(__nv_bfloat16* xs, const __nv_bfloat16* 
 }  // namespace
 
 // out[i, n] = bf16(scale[n] * sum_j x[i, j] w[n, j]) for up to 8 input rows x (BF16
-// [m, k]) and E4M3 weights w [rows, k] with one F32 scale per row, for up to 3 products
+// [m, k]) and E4M3 weights w [rows, k] with one F32 scale per row, for up to 10 products
 // that share x. A group of 16 weight rows is one warp's 2 rows for each of 8 warps; each
 // warp sums its rows against all input rows, 16 columns per lane load, and lanes reduce
 // with a butterfly. The blocks loop over the groups. x sits in shared memory: staged
@@ -1864,4 +1929,338 @@ draft_markov_exact(const __nv_bfloat16* fold_weight, const __nv_bfloat16* fold_b
         }
     }
     fold_partial(value, index, best_value, best_index, partial_value, partial_index);
+}
+
+// ---------------------------------------------------------------------------------------
+// DFlash 2: the block convolutions, the top-16 candidates and the selector's walk. The
+// numerics follow SGLang's DFlash 2 kernels: the convolutions run in F32 and round once,
+// the selector's correction is a BF16 product of BF16 factors.
+
+namespace {
+
+constexpr int kConvGroup = 16;                          // channels per coefficient
+constexpr int kConvGroups = kHidden / kConvGroup;       // 144
+constexpr int kConvTaps = 2;
+constexpr int kConvCoefficients = 2 * kConvTaps * kConvGroups;  // 576 per row
+
+// Row `row` of the two-tap convolution of x (BF16 [8, 2304]) with side `side` of the
+// coefficients: tap j of channel c weighs base[side, j, c] + coef[row, side, j, c / 16]
+// and reads x[row - j], zero before the block. Products and sums in F32, as SGLang's
+// Triton kernel and the compiled reference; the caller rounds.
+__device__ __forceinline__ void conv_row(const __nv_bfloat16* x, const __nv_bfloat16* coef,
+                                         int side, const __nv_bfloat16* base, int row,
+                                         float (&out)[kRowVec]) {
+    const __nv_bfloat16* d = coef + size_t(row) * kConvCoefficients + side * kConvTaps * kConvGroups;
+    const __nv_bfloat16* b = base + size_t(side) * kConvTaps * kHidden;
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        const int c = threadIdx.x + i * kRowThreads;
+        const int g = c / kConvGroup;
+        const float c0 = __fadd_rn(bf(b[c]), bf(d[g]));
+        float acc = __fmul_rn(c0, bf(x[size_t(row) * kHidden + c]));
+        if (row > 0) {
+            const float c1 = __fadd_rn(bf(b[kHidden + c]), bf(d[kConvGroups + g]));
+            acc = fmaf(c1, bf(x[size_t(row - 1) * kHidden + c]), acc);
+        }
+        out[i] = acc;
+    }
+}
+
+}  // namespace
+
+// out = bf16(conv(x)) with side `side` of the coefficients (see conv_row), for the 8 rows
+// of x, BF16 [8, 2304]. coef is BF16 [8, 576], the coefficient projection of the
+// sublayer's input; base BF16 [2, 2, 2304]. One block per row.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_conv(const __nv_bfloat16* x, const __nv_bfloat16* coef, int32_t side,
+           const __nv_bfloat16* base, __nv_bfloat16* out) {
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.x;
+    float v[kRowVec];
+    conv_row(x, coef, side, base, row, v);
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        out[size_t(row) * kHidden + threadIdx.x + i * kRowThreads] = __float2bfloat16_rn(v[i]);
+    }
+}
+
+// The output convolution of a sublayer fused with the residual add and the next norm:
+// t = bf16(conv(x)) with side 1 of the coefficients, sum = residual + t in F32,
+// residual = bf16(sum), out = rms_norm(sum; weight), as draft_add_rms_norm. One block per
+// row.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_conv_add_rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* coef,
+                        const __nv_bfloat16* base, __nv_bfloat16* residual,
+                        const __nv_bfloat16* weight, __nv_bfloat16* out, float eps) {
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.x;
+    float v[kRowVec];
+    conv_row(x, coef, 1, base, row, v);
+    const size_t base_index = size_t(row) * kHidden;
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        const size_t c = base_index + threadIdx.x + i * kRowThreads;
+        v[i] = __fadd_rn(bf(residual[c]), round_bf16(v[i]));
+        residual[c] = __float2bfloat16_rn(v[i]);
+    }
+    store_normed_row(v, weight, out + base_index, eps);
+}
+
+namespace {
+
+constexpr int kTopK = 16;
+constexpr int kTopkPer = 8;                            // values per thread
+constexpr int kTopkThreads = 256;
+constexpr int kTopkSpan = kTopkPer * kTopkThreads;     // values per block of the first pass
+constexpr int kTopkWarps = kTopkThreads / 32;
+constexpr int kEmptyId = INT32_MAX;
+
+// Sorts a thread's values best first: larger, ties to the smaller id.
+template <int N>
+__device__ __forceinline__ void sort_desc(float (&v)[N], int32_t (&id)[N]) {
+#pragma unroll
+    for (int i = 1; i < N; ++i) {
+#pragma unroll
+        for (int j = i; j > 0; --j) {
+            if (better(v[j], id[j], v[j - 1], id[j - 1])) {
+                const float tv = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = tv;
+                const int32_t ti = id[j];
+                id[j] = id[j - 1];
+                id[j - 1] = ti;
+            }
+        }
+    }
+}
+
+// The best of the warp's list heads, in 16 rounds: each round the warp finds the best
+// head and its lane drops it. Lane r holds round r's pick on return. Lists are sorted.
+template <int N>
+__device__ __forceinline__ void warp_top16(float (&v)[N], int32_t (&id)[N], float& out_v,
+                                           int32_t& out_id) {
+    const int lane = threadIdx.x % 32;
+    out_v = -INFINITY;
+    out_id = kEmptyId;
+#pragma unroll 1
+    for (int round = 0; round < kTopK; ++round) {
+        float bv = v[0];
+        int32_t bi = id[0];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+            const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
+            if (better(ov, oi, bv, bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == round) {
+            out_v = bv;
+            out_id = bi;
+        }
+        if (id[0] == bi && bi != kEmptyId) {
+#pragma unroll
+            for (int k = 0; k + 1 < N; ++k) {
+                v[k] = v[k + 1];
+                id[k] = id[k + 1];
+            }
+            v[N - 1] = -INFINITY;
+            id[N - 1] = kEmptyId;
+        }
+    }
+}
+
+// The 16 best of the block's per-thread values, best first, into out_v and out_id
+// (written by threads 0 to 15). Ids are distinct apart from kEmptyId.
+__device__ void block_top16(float (&v)[kTopkPer], int32_t (&id)[kTopkPer], float* out_v,
+                            int32_t* out_id) {
+    __shared__ float wv[kTopkWarps * kTopK];
+    __shared__ int32_t wi[kTopkWarps * kTopK];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    sort_desc(v, id);
+    float pv;
+    int32_t pi;
+    warp_top16(v, id, pv, pi);
+    if (lane < kTopK) {
+        wv[warp * kTopK + lane] = pv;
+        wi[warp * kTopK + lane] = pi;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        constexpr int kPer = kTopkWarps * kTopK / 32;
+        float lv[kPer];
+        int32_t li[kPer];
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            lv[k] = wv[lane + 32 * k];
+            li[k] = wi[lane + 32 * k];
+        }
+        sort_desc(lv, li);
+        warp_top16(lv, li, pv, pi);
+        if (lane < kTopK) {
+            out_v[lane] = pv;
+            out_id[lane] = pi;
+        }
+    }
+}
+
+}  // namespace
+
+// First pass of the top 16 of each row of BF16 logits: row blockIdx.y of `logits` (row
+// stride `ld`) holds n values, or min(n, *count) with `count`; value i stands for token
+// map[i] with `map`, else token i. Block b keeps the 16 best of values
+// b * 2048 .. b * 2048 + 2047 in part_v and part_id [rows, gridDim.x, 16], best first,
+// larger values first and ties to the smaller token; NaN counts as -inf.
+extern "C" __global__ void __launch_bounds__(kTopkThreads)
+draft_topk_partial(const __nv_bfloat16* logits, int32_t ld, int32_t n, const int32_t* count,
+                   const int32_t* map, float* part_v, int32_t* part_id) {
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const int limit = count != nullptr ? min(n, *count) : n;
+    float v[kTopkPer];
+    int32_t id[kTopkPer];
+#pragma unroll
+    for (int k = 0; k < kTopkPer; ++k) {
+        const int i = blockIdx.x * kTopkSpan + k * kTopkThreads + threadIdx.x;
+        if (i < limit) {
+            const float x = bf(logits[size_t(row) * ld + i]);
+            v[k] = isnan(x) ? -INFINITY : x;
+            id[k] = map != nullptr ? map[i] : i;
+        } else {
+            v[k] = -INFINITY;
+            id[k] = kEmptyId;
+        }
+    }
+    const size_t out = (size_t(row) * gridDim.x + blockIdx.x) * kTopK;
+    block_top16(v, id, part_v + out, part_id + out);
+}
+
+// Second pass: the 16 best of each row's `parts` first-pass values (at most 2048), best
+// first, into values and ids [rows, 16]. One block per row.
+extern "C" __global__ void __launch_bounds__(kTopkThreads)
+draft_topk_merge(const float* part_v, const int32_t* part_id, int32_t parts, float* values,
+                 int32_t* ids) {
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.x;
+    float v[kTopkPer];
+    int32_t id[kTopkPer];
+#pragma unroll
+    for (int k = 0; k < kTopkPer; ++k) {
+        const int i = k * kTopkThreads + threadIdx.x;
+        if (i < parts) {
+            v[k] = part_v[size_t(row) * parts + i];
+            id[k] = part_id[size_t(row) * parts + i];
+        } else {
+            v[k] = -INFINITY;
+            id[k] = kEmptyId;
+        }
+    }
+    block_top16(v, id, values + size_t(row) * kTopK, ids + size_t(row) * kTopK);
+}
+
+namespace {
+constexpr int kSelectWarps = kTopK;  // one warp per candidate
+constexpr int kSelectSteps = kBlock - 1;
+}  // namespace
+
+// The selector's greedy walk over `steps` draft rows (1 to 7). Row e has candidates
+// ids[e, 0..16] with logits unary[e, ..] (F32 [steps, 16], best first) and the hidden
+// projection hp[e] (BF16 [steps, 256]). Its predecessor t is the anchor (control[2]) for
+// e = 0, else the token picked at e - 1. Candidate c scores
+//   s = softcap tanh((unary[e, c] + bf16(sum_r bf16(pred[t, r] hp[e, r]) succ[c, r])) / softcap)
+// with F32 sums; the walk picks the largest, ties to the earlier candidate, and its
+// softmax probability over the 16 scores is the draft's confidence. Writes draft_ids and
+// confidence [steps]. One block of 16 warps, warp c for candidate c; lane l holds
+// elements 8l to 8l + 7 of each row.
+extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
+draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
+             const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
+             const int32_t* control, int32_t steps, float softcap, int32_t* draft_ids,
+             float* confidence) {
+    __shared__ float product[kRank];
+    __shared__ float score[kTopK];
+    __shared__ int32_t chosen;
+    pdl_wait();
+    pdl_trigger();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const uint4 zero = make_uint4(0, 0, 0, 0);
+    auto row = [&](const __nv_bfloat16* table, int32_t id) {
+        return id >= 0 && id < vocab
+                   ? *reinterpret_cast<const uint4*>(table + size_t(id) * kRank + lane * 8)
+                   : zero;
+    };
+    // Every row this warp may need: the successor rows of its candidates and the
+    // predecessor rows of its candidates at the rows before; warp 0 also the anchor's.
+    uint4 succ[kSelectSteps], pred[kSelectSteps];
+#pragma unroll
+    for (int e = 0; e < kSelectSteps; ++e) {
+        succ[e] = e < steps ? row(successor, cand[e * kTopK + warp]) : zero;
+        pred[e] = e == 0     ? (warp == 0 ? row(predecessor, control[2]) : zero)
+                  : e < steps ? row(predecessor, cand[(e - 1) * kTopK + warp])
+                              : zero;
+    }
+    if (threadIdx.x == 0) {
+        chosen = 0;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int e = 0; e < kSelectSteps; ++e) {
+        if (e >= steps) {
+            break;
+        }
+        // The predecessor's row times the hidden projection, rounded to BF16.
+        if (warp == chosen) {
+            const uint4 h = *reinterpret_cast<const uint4*>(hp + size_t(e) * kRank + lane * 8);
+            const uint32_t hw[4] = {h.x, h.y, h.z, h.w};
+            const uint32_t aw[4] = {pred[e].x, pred[e].y, pred[e].z, pred[e].w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                product[lane * 8 + 2 * k] = round_bf16(__fmul_rn(bf_lo(aw[k]), bf_lo(hw[k])));
+                product[lane * 8 + 2 * k + 1] = round_bf16(__fmul_rn(bf_hi(aw[k]), bf_hi(hw[k])));
+            }
+        }
+        __syncthreads();
+        const uint32_t sw[4] = {succ[e].x, succ[e].y, succ[e].z, succ[e].w};
+        float dot = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            dot = fmaf(product[lane * 8 + 2 * k], bf_lo(sw[k]), dot);
+            dot = fmaf(product[lane * 8 + 2 * k + 1], bf_hi(sw[k]), dot);
+        }
+        dot = warp_sum(dot);
+        if (lane == 0) {
+            const int32_t id = cand[e * kTopK + warp];
+            const float s = __fadd_rn(unary[e * kTopK + warp], round_bf16(dot));
+            score[warp] = id >= 0 && id < vocab
+                              ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap)))
+                              : -INFINITY;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float s = lane < kTopK ? score[lane] : -INFINITY;
+            float bv = s;
+            int32_t bi = lane;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+                const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
+                if (better(ov, oi, bv, bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            const float sum = warp_sum(lane < kTopK && s != -INFINITY ? expf(s - bv) : 0.f);
+            if (lane == 0) {
+                draft_ids[e] = cand[e * kTopK + bi];
+                confidence[e] = 1.f / sum;
+                chosen = bi;
+            }
+        }
+        __syncthreads();
+    }
 }

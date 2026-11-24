@@ -35,7 +35,7 @@ The speedup depends on how predictable the text is: the draft's first token is a
 - Decode as one CUDA graph per token, with programmatic dependent launch and an L2 prefetch stream for the next layer's weights.
 - Chunked prefill of up to 2,048 rows on tensor-core GEMMs, an expert-grouped MoE GEMM and flash attention.
 - Opt-in FP8 copies of the dense weights (`--weights fp8`), an FP8 global KV cache (`--kv fp8`) and quantized expert activations for prefill (`--expert-activations quantized`).
-- Greedy speculative decoding with the DSpark draft. The verify pass gives each row the same result at every width, so speculation returns exactly the tokens that verifying one row at a time would. Each round picks its width from the drafts' confidences. `--drafter DIR` runs a DFlash draft exported by the 2DSD project instead.
+- Greedy speculative decoding with the DSpark draft. The verify pass gives each row the same result at every width, so speculation returns exactly the tokens that verifying one row at a time would. Each round picks its width from the drafts' confidences. `--drafter DIR` runs Inco AI's DFlash 2 drafter or a DFlash draft exported by the 2DSD project instead.
 - An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions.
 - A quality gate that compares the engine with MLX over long texts, and parity tests per layer visit.
 

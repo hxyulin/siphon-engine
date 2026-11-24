@@ -28,6 +28,7 @@ use crate::ops::{
 };
 
 pub mod dflash;
+pub mod dflash2;
 pub mod draft;
 
 /// Largest E2M1 value, from MLX-LM's `sanitize`.

@@ -19,8 +19,10 @@ use crate::weights::draft::{HEAD_DIM, HIDDEN, KV_HEADS, RANK, TAPS};
 pub const BLOCK: usize = 8;
 /// Width of the keys or values of one position: 8 heads of 128.
 pub const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
-/// Query heads per KV head.
+/// Query heads per KV head of the bundled draft and of 2DSD's DFlash draft.
 const GROUP: usize = 3;
+/// Query heads per KV head of DFlash 2, the most a block attention takes.
+const MAX_GROUP: usize = 4;
 /// Most splits of one block attention.
 pub const MAX_ATTENTION_SPLITS: usize = 128;
 /// Fewest keys one attention split takes, a multiple of the kernel's chunk of 32.
@@ -31,10 +33,22 @@ pub const LOGIT_BLOCKS: usize = 148;
 pub const FOLD_BLOCKS: usize = 340;
 /// Partials an [`ArgmaxPartials`] holds.
 const MAX_PARTIALS: usize = 512;
-/// Dynamic shared memory of `draft_attention`, `kAttentionSmem` in the kernel.
-const ATTENTION_SMEM: u32 = 50176;
+/// Dynamic shared memory of the block attention with `group` query heads per KV head,
+/// `attention_smem` in the kernel.
+const fn attention_smem(group: usize) -> u32 {
+    (4 * BLOCK * group * HEAD_DIM
+        + 2 * 2 * 32 * (HEAD_DIM + 8)
+        + 2 * 2 * 32 * HEAD_DIM
+        + 16 * BLOCK * 32) as u32
+}
+/// Candidates the DFlash 2 selector keeps per draft row, `kTopK` in the kernel.
+pub const TOP_K: usize = 16;
+/// Values per block of the first top-k pass, `kTopkSpan` in the kernel.
+const TOPK_SPAN: usize = 2048;
+/// Rows of DFlash 2's convolution coefficients: 2 sides of 2 taps of 144 groups.
+const CONV_COEFFICIENTS: usize = 576;
 /// Products one [`DraftKernels::gemm_fp8`] launch takes, `kF8MaxSegments` in the kernel.
-pub const F8_MAX_PRODUCTS: usize = 3;
+pub const F8_MAX_PRODUCTS: usize = 10;
 /// Input rows of [`DraftKernels::gemm_fp8`], `kF8MaxM` in the kernel.
 const F8_MAX_M: usize = 8;
 /// Weight rows per group of `draft_gemm_fp8`: 8 warps of `kF8Rows`.
@@ -58,6 +72,7 @@ pub struct DraftKernels {
     head_norm_rope: CudaFunction,
     store_kv: CudaFunction,
     attention: CudaFunction,
+    attention_g4: CudaFunction,
     attention_combine: CudaFunction,
     silu_mul: CudaFunction,
     markov_context_input: CudaFunction,
@@ -85,6 +100,11 @@ pub struct DraftKernels {
     markov_fold_raw: CudaFunction,
     dflash_commit_rope_store: CudaFunction,
     dflash_step: CudaFunction,
+    conv: CudaFunction,
+    conv_add_rms_norm: CudaFunction,
+    topk_partial: CudaFunction,
+    topk_merge: CudaFunction,
+    select: CudaFunction,
 }
 
 /// A matrix `[rows, k]` of E4M3 values with one F32 scale per row, `amax / 448`, as
@@ -174,6 +194,20 @@ struct DflashCommit {
     cache_v: [u64; DFLASH_MAX_LAYERS],
     slots: [i32; DFLASH_MAX_LAYERS],
     eps: f32,
+    ring: i32,
+    rope: i32,
+}
+
+/// The RoPE arithmetic of the draft kernels, `kRope*` in the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rope {
+    /// F32 cosine, sine and arithmetic, rounded once (vLLM's bundled draft).
+    F32 = 0,
+    /// BF16 cosine and sine with F32 arithmetic (the 2DSD runner).
+    Bf16Table = 1,
+    /// BF16 cosine and sine, each product and the sum rounded to BF16 (SGLang's
+    /// `table_qk_norm_rope` with a BF16 table, and Transformers in BF16).
+    Bf16Ops = 2,
 }
 
 /// Where a block attention takes its keys from.
@@ -183,10 +217,13 @@ pub enum AttentionKeys<'a> {
     Host { first: usize, keys: usize },
     /// The block of the round whose inputs `control` holds (see
     /// [`DraftKernels::set_control`]), after `window` positions (0: every position).
-    /// `max_keys` bounds the key count, which sizes the grid.
+    /// `max_keys` bounds the key count, which sizes the grid. With `row_window` above
+    /// zero, block row `j` at `P + j` sees only keys at or after `P + j - (row_window -
+    /// 1)`, a sliding window of `row_window` positions that ends at the row.
     Device {
         control: &'a CudaSlice<i32>,
         window: usize,
+        row_window: usize,
         max_keys: usize,
     },
 }
@@ -199,10 +236,27 @@ pub struct AttentionScratch {
 
 impl AttentionScratch {
     pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
-        let rows = MAX_ATTENTION_SPLITS * KV_HEADS * BLOCK * GROUP;
+        let rows = MAX_ATTENTION_SPLITS * KV_HEADS * BLOCK * MAX_GROUP;
         Ok(Self {
             out: stream.alloc_zeros(rows * HEAD_DIM)?,
             stats: stream.alloc_zeros(rows * 2)?,
+        })
+    }
+}
+
+/// The first-pass partials of [`DraftKernels::topk`] for up to 7 rows of up to
+/// 262,144 values each.
+pub struct TopkScratch {
+    values: CudaSlice<f32>,
+    ids: CudaSlice<i32>,
+}
+
+impl TopkScratch {
+    pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let n = (BLOCK - 1) * TOPK_SPAN;
+        Ok(Self {
+            values: stream.alloc_zeros(n)?,
+            ids: stream.alloc_zeros(n)?,
         })
     }
 }
@@ -320,12 +374,14 @@ impl DraftKernels {
         let module = load_module(ctx, "draft", cubin!("draft"))?;
         let f = |name: &str| module.load_function(name);
         let attention = f("draft_attention")?;
-        attention
-            .set_attribute(
+        let attention_g4 = f("draft_attention_g4")?;
+        for (func, group) in [(&attention, GROUP), (&attention_g4, MAX_GROUP)] {
+            func.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                i32::try_from(ATTENTION_SMEM)?,
+                i32::try_from(attention_smem(group))?,
             )
-            .context("raising the shared memory of draft_attention")?;
+            .context("raising the shared memory of the block attention")?;
+        }
         Ok(Self {
             mix_rms_norm: f("draft_mix_rms_norm")?,
             add_rms_norm: f("draft_add_rms_norm")?,
@@ -333,6 +389,7 @@ impl DraftKernels {
             head_norm_rope: f("draft_head_norm_rope")?,
             store_kv: f("draft_store_kv")?,
             attention,
+            attention_g4,
             attention_combine: f("draft_attention_combine")?,
             silu_mul: f("draft_silu_mul")?,
             markov_context_input: f("draft_markov_context_input")?,
@@ -360,6 +417,11 @@ impl DraftKernels {
             markov_fold_raw: f("draft_markov_fold_raw")?,
             dflash_commit_rope_store: f("draft_dflash_commit_rope_store")?,
             dflash_step: f("draft_dflash_step")?,
+            conv: f("draft_conv")?,
+            conv_add_rms_norm: f("draft_conv_add_rms_norm")?,
+            topk_partial: f("draft_topk_partial")?,
+            topk_merge: f("draft_topk_merge")?,
+            select: f("draft_select")?,
         })
     }
 
@@ -480,12 +542,20 @@ impl DraftKernels {
         eps: f32,
     ) -> anyhow::Result<()> {
         self.head_norm_rope_table(
-            stream, x, rows, heads, row_stride, weight, inv_freq, start, eps, false,
+            stream,
+            x,
+            rows,
+            heads,
+            row_stride,
+            weight,
+            inv_freq,
+            start,
+            eps,
+            Rope::F32,
         )
     }
 
-    /// [`Self::head_norm_rope`], with the cosine and sine rounded to BF16 first when
-    /// `bf16_rope` is set, as a BF16 RoPE table holds them.
+    /// [`Self::head_norm_rope`] with the RoPE arithmetic `rope`.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn head_norm_rope_table(
         &self,
@@ -498,7 +568,7 @@ impl DraftKernels {
         inv_freq: &CudaSlice<f32>,
         start: usize,
         eps: f32,
-        bf16_rope: bool,
+        rope: Rope,
     ) -> anyhow::Result<()> {
         let mut x = x.view_mut();
         ensure!(
@@ -526,7 +596,7 @@ impl DraftKernels {
             block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let bf16_rope = i32::from(bf16_rope);
+        let rope = rope as i32;
         let mut launch = stream.launch_builder(&self.head_norm_rope);
         launch
             .arg(&mut x)
@@ -535,7 +605,7 @@ impl DraftKernels {
             .arg(inv_freq)
             .arg(&start)
             .arg(&eps)
-            .arg(&bf16_rope);
+            .arg(&rope);
         // SAFETY: the arguments match `draft_head_norm_rope(bf16*, int, const bf16*, const
         // float*, int, float, int)`. The check above keeps every head of every row inside `x`, and
         // every position fits an i32.
@@ -600,9 +670,9 @@ impl DraftKernels {
         Ok(())
     }
 
-    /// Bidirectional attention of the block's queries `q` (BF16 `[8, 24 * 128]`) over the
-    /// keys at positions `first..first + keys` of `cache`, into `out` (BF16
-    /// `[8, 24 * 128]`). Scale 128^-0.5, F32 softmax.
+    /// Bidirectional attention of the block's queries `q` (BF16 `[8, heads * 128]`, 24 or
+    /// 32 heads) over the keys at positions `first..first + keys` of `cache`, into `out`
+    /// (the shape of `q`). Scale 128^-0.5, F32 softmax.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn attention(
         &self,
@@ -635,11 +705,15 @@ impl DraftKernels {
         scratch: &mut AttentionScratch,
         out: &mut CudaSlice<bf16>,
     ) -> anyhow::Result<()> {
-        let width = KV_HEADS * GROUP * HEAD_DIM;
-        check_len("q", q.len(), BLOCK * width)?;
-        check_len("out", out.len(), BLOCK * width)?;
+        let group = q.len() / (BLOCK * KV_WIDTH);
+        ensure!(
+            q.len() == BLOCK * group * KV_WIDTH && (group == GROUP || group == MAX_GROUP),
+            "q has {} elements, not 8 rows of 24 or 32 heads",
+            q.len()
+        );
+        check_len("out", out.len(), q.len())?;
         let slots = i32_arg("slots", cache.slots)?;
-        let (control, window, first, count, max_keys) = match keys {
+        let (control, window, row_window, first, count, max_keys) = match keys {
             AttentionKeys::Host { first, keys } => {
                 ensure!(keys > 0, "attention needs at least one key");
                 ensure!(
@@ -650,6 +724,7 @@ impl DraftKernels {
                 (
                     None,
                     0,
+                    0,
                     start_arg(first, keys)?,
                     i32_arg("keys", keys)?,
                     keys,
@@ -658,6 +733,7 @@ impl DraftKernels {
             AttentionKeys::Device {
                 control,
                 window,
+                row_window,
                 max_keys,
             } => {
                 check_len("control", control.len(), CONTROL)?;
@@ -666,7 +742,14 @@ impl DraftKernels {
                     "{max_keys} keys do not fit {} slots",
                     cache.slots
                 );
-                (Some(control), i32_arg("window", window)?, 0, 0, max_keys)
+                (
+                    Some(control),
+                    i32_arg("window", window)?,
+                    i32_arg("row_window", row_window)?,
+                    0,
+                    0,
+                    max_keys,
+                )
             }
         };
         // The splits of the largest key count bound the splits of every smaller one.
@@ -676,7 +759,7 @@ impl DraftKernels {
         let config = LaunchConfig {
             grid_dim: (KV_HEADS as u32, u32::try_from(grid_splits)?, 1),
             block_dim: ((BLOCK * 32) as u32, 1, 1),
-            shared_mem_bytes: ATTENTION_SMEM,
+            shared_mem_bytes: attention_smem(group),
         };
         let mut args = KernelArgs::default();
         args.ptr(q, stream)
@@ -685,19 +768,27 @@ impl DraftKernels {
             .i32(slots)
             .opt(control, stream)
             .i32(window)
+            .i32(row_window)
             .i32(first)
             .i32(count)
             .ptr_mut(&mut scratch.out, stream)
             .ptr_mut(&mut scratch.stats, stream);
+        let attention = if group == GROUP {
+            &self.attention
+        } else {
+            &self.attention_g4
+        };
         // SAFETY: the arguments match `draft_attention(const bf16*, const bf16*, const bf16*,
-        // int, const int*, int, int, int, float*, float*)`. Every key position maps to a slot
-        // below `slots`; the grid covers the splits of `max_keys` keys, at most
-        // MAX_ATTENTION_SPLITS, which the scratch holds, and blocks past the split count of
-        // the actual keys exit. The kernel reads earlier outputs only after `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.attention, config) }?;
+        // int, const int*, int, int, int, int, float*, float*)` and `draft_attention_g4`,
+        // picked by the head count of `q`. Every key position maps to a slot below
+        // `slots`; the grid covers the splits of `max_keys` keys, at most
+        // MAX_ATTENTION_SPLITS, which the scratch holds for 4 query heads per KV head, and
+        // blocks past the split count of the actual keys exit. The kernel reads earlier
+        // outputs only after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, attention, config) }?;
 
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, (BLOCK * GROUP) as u32, 1),
+            grid_dim: (KV_HEADS as u32, (BLOCK * group) as u32, 1),
             block_dim: (HEAD_DIM as u32, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -708,10 +799,11 @@ impl DraftKernels {
             .i32(window)
             .i32(first)
             .i32(count)
+            .i32(i32_arg("group", group)?)
             .ptr_mut(out, stream);
         // SAFETY: the arguments match `draft_attention_combine(const float*, const float*,
-        // const int*, int, int, int, bf16*)`; the first launch wrote all the splits the
-        // combine reads, and `out` holds the 8 rows of 24 heads.
+        // const int*, int, int, int, int, bf16*)`; the first launch wrote all the splits the
+        // combine reads, and `out` holds the 8 rows of 8 * group heads.
         unsafe { args.launch_pdl(stream, &self.attention_combine, config) }?;
         Ok(())
     }
@@ -1100,11 +1192,11 @@ impl DraftKernels {
         Ok(())
     }
 
-    /// Norm and RoPE of the block's queries `q` (BF16 `[8, 3072]`, in place) and keys `k`
-    /// (BF16 `[8, 1024]`) at the round's position, and the cache stores of the keys and
-    /// the values `v` (see `draft_block_rope_store`). With `limit`, positions at or past
-    /// the cache's slots are skipped, for a cache that is not a ring. With `bf16_rope` the
-    /// cosine and sine are rounded to BF16 first.
+    /// Norm and RoPE of the block's queries `q` (BF16 `[8, heads * 128]`, in place) and
+    /// keys `k` (BF16 `[8, 1024]`) at the round's position, and the cache stores of the
+    /// keys and the values `v` (see `draft_block_rope_store`). With `limit`, positions at
+    /// or past the cache's slots are skipped, for a cache that is not a ring. `rope` picks
+    /// the RoPE arithmetic.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn block_rope_store(
         &self,
@@ -1119,9 +1211,13 @@ impl DraftKernels {
         k_norm: &CudaSlice<bf16>,
         cache: &mut KvCache,
         limit: bool,
-        bf16_rope: bool,
+        rope: Rope,
     ) -> anyhow::Result<()> {
-        check_len("q", q.len(), BLOCK * KV_HEADS * GROUP * HEAD_DIM)?;
+        let q_heads = rows_of("q", q.len(), BLOCK * HEAD_DIM)?;
+        ensure!(
+            q_heads == KV_HEADS * GROUP || q_heads == KV_HEADS * MAX_GROUP,
+            "{q_heads} query heads, expected 24 or 32"
+        );
         check_len("k", k.len(), BLOCK * KV_WIDTH)?;
         check_len("v", v.len(), BLOCK * KV_WIDTH)?;
         check_len("control", control.len(), CONTROL)?;
@@ -1142,16 +1238,17 @@ impl DraftKernels {
             .ptr_mut(&mut cache.v, stream)
             .i32(slots)
             .i32(i32::from(limit))
-            .i32(i32::from(bf16_rope));
+            .i32(rope as i32)
+            .i32(i32_arg("q_heads", q_heads)?);
         let config = LaunchConfig {
-            grid_dim: (BLOCK as u32, (KV_HEADS * (GROUP + 1)) as u32, 1),
+            grid_dim: (BLOCK as u32, u32::try_from(q_heads + KV_HEADS)?, 1),
             block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `draft_block_rope_store(bf16*, const bf16*, const
         // bf16*, const int*, const float*, float, const bf16*, const bf16*, bf16*, bf16*, int,
-        // int, int)`. The buffers have the checked sizes and every cache slot index is below
-        // `slots`.
+        // int, int, int)`. The buffers have the checked sizes, the grid has one block per
+        // query head of `q` and per KV head, and every cache slot index is below `slots`.
         unsafe { args.launch_pdl(stream, &self.block_rope_store, config) }?;
         Ok(())
     }
@@ -1350,7 +1447,7 @@ impl DraftKernels {
         Ok(())
     }
 
-    /// Up to 3 products with E4M3 weights that share the input `x` (BF16 `[m, k]`, `m` up
+    /// Up to 10 products with E4M3 weights that share the input `x` (BF16 `[m, k]`, `m` up
     /// to 8) in one launch: BF16 outputs, F32 accumulation, each row's scale applied to
     /// its sum (see `draft_gemm_fp8`).
     pub fn gemm_fp8(
@@ -1531,6 +1628,7 @@ impl DraftKernels {
     /// Norm, RoPE and cache stores of a DFlash draft round's context keys and values (see
     /// `draft_dflash_commit_rope_store`): `ctx_k` and `ctx_v` are BF16 `[layers, 8, 1024]`,
     /// the projections of the round's context rows by each layer's `k_proj` and `v_proj`.
+    /// With `ring` the caches are rings; otherwise positions past a cache are skipped.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn dflash_commit_rope_store(
         &self,
@@ -1542,6 +1640,8 @@ impl DraftKernels {
         eps: f32,
         k_norms: &[&CudaSlice<bf16>],
         caches: &mut [KvCache],
+        ring: bool,
+        rope: Rope,
     ) -> anyhow::Result<()> {
         let layers = caches.len();
         ensure!(
@@ -1559,6 +1659,8 @@ impl DraftKernels {
             control: control.device_ptr(stream).0,
             inv_freq: inv_freq.device_ptr(stream).0,
             eps,
+            ring: i32::from(ring),
+            rope: rope as i32,
             ..DflashCommit::default()
         };
         for (l, (norm, cache)) in k_norms.iter().zip(caches.iter_mut()).enumerate() {
@@ -1574,9 +1676,9 @@ impl DraftKernels {
             shared_mem_bytes: 0,
         };
         // SAFETY: `c` has the kernel's `DflashCommit` layout. The buffers have the checked
-        // sizes; the kernel writes cache slots below each cache's `slots`, skipping
-        // positions past them and below zero, and reads `ctx_k` and `ctx_v` after
-        // `pdl_wait`.
+        // sizes; the kernel writes cache slots below each cache's `slots` (positions mod
+        // `slots` with `ring`, else skipping positions past them), skips positions below
+        // zero, and reads `ctx_k` and `ctx_v` after `pdl_wait`.
         unsafe { launch_by_value(stream, &self.dflash_commit_rope_store, config, &c, true) }?;
         Ok(())
     }
@@ -1633,6 +1735,208 @@ impl DraftKernels {
         // against `vocab`, reads row step + 1 of the 8 rows of `y`, and writes ids and
         // confidences below `steps`.
         unsafe { args.launch_pdl(stream, &self.dflash_step, one_block(256)) }?;
+        Ok(())
+    }
+
+    /// DFlash 2's convolution of the 8 block rows of `x` (BF16 `[8, 2304]`) with side
+    /// `side` (0 or 1) of the coefficients, into `out`: tap `j` of channel `c` in row `r`
+    /// weighs `base[side, j, c] + coef[r, side, j, c / 16]` and reads row `r - j`, zero
+    /// before the block. `coef` is BF16 `[8, 576]`, `base` BF16 `[2, 2, 2304]`. Sums in
+    /// F32 and rounds once.
+    pub fn conv(
+        &self,
+        stream: &CudaStream,
+        x: &CudaSlice<bf16>,
+        coef: &CudaSlice<bf16>,
+        side: usize,
+        base: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+    ) -> anyhow::Result<()> {
+        ensure!(side < 2, "side {side}, expected 0 or 1");
+        check_len("x", x.len(), BLOCK * HIDDEN)?;
+        check_len("coef", coef.len(), BLOCK * CONV_COEFFICIENTS)?;
+        check_len("base", base.len(), 4 * HIDDEN)?;
+        check_len("out", out.len(), BLOCK * HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(x, stream)
+            .ptr(coef, stream)
+            .i32(i32_arg("side", side)?)
+            .ptr(base, stream)
+            .ptr_mut(out, stream);
+        // SAFETY: the arguments match `draft_conv(const bf16*, const bf16*, int, const
+        // bf16*, bf16*)`, with one block per row of the checked buffers. The kernel reads
+        // earlier outputs only after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.conv, row_config(BLOCK)?) }?;
+        Ok(())
+    }
+
+    /// DFlash 2's output convolution (side 1 of `coef`, see [`Self::conv`]) of the
+    /// sublayer output `x`, fused with the residual add and the next norm:
+    /// `sum = residual + bf16(conv(x))`, `residual = bf16(sum)`, `out = rms_norm(sum;
+    /// weight)`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn conv_add_rms_norm(
+        &self,
+        stream: &CudaStream,
+        x: &CudaSlice<bf16>,
+        coef: &CudaSlice<bf16>,
+        base: &CudaSlice<bf16>,
+        residual: &mut CudaSlice<bf16>,
+        weight: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        check_len("x", x.len(), BLOCK * HIDDEN)?;
+        check_len("coef", coef.len(), BLOCK * CONV_COEFFICIENTS)?;
+        check_len("base", base.len(), 4 * HIDDEN)?;
+        check_len("residual", residual.len(), BLOCK * HIDDEN)?;
+        check_len("weight", weight.len(), HIDDEN)?;
+        check_len("out", out.len(), BLOCK * HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(x, stream)
+            .ptr(coef, stream)
+            .ptr(base, stream)
+            .ptr_mut(residual, stream)
+            .ptr(weight, stream)
+            .ptr_mut(out, stream)
+            .f32(eps);
+        // SAFETY: the arguments match `draft_conv_add_rms_norm(const bf16*, const bf16*,
+        // const bf16*, bf16*, const bf16*, bf16*, float)`, with one block per row of the
+        // checked buffers. The kernel reads earlier outputs only after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.conv_add_rms_norm, row_config(BLOCK)?) }?;
+        Ok(())
+    }
+
+    /// The 16 largest of each of the `rows` rows of BF16 `logits` (row stride `ld`), best
+    /// first and ties to the smaller token, into `values` (F32) and `ids` (I32), each
+    /// `[rows, 16]`. A row holds `n` values, or `min(n, *count)` with `count`; value `i`
+    /// is token `map[i]` with `map`, else token `i`. Slots past the row's values hold
+    /// `-inf` and `i32::MAX`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn topk(
+        &self,
+        stream: &CudaStream,
+        logits: &CudaView<'_, bf16>,
+        rows: usize,
+        n: usize,
+        ld: usize,
+        count: Option<&CudaSlice<i32>>,
+        map: Option<&CudaSlice<i32>>,
+        scratch: &mut TopkScratch,
+        values: &mut CudaSlice<f32>,
+        ids: &mut CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..BLOCK).contains(&rows) && n > 0 && ld >= n,
+            "{rows} rows of {n} values {ld} apart"
+        );
+        ensure!(
+            logits.len() >= (rows - 1) * ld + n,
+            "logits have {} elements, too few for {rows} rows",
+            logits.len()
+        );
+        if let Some(map) = map {
+            ensure!(map.len() >= n, "the map has {} of {n} entries", map.len());
+        }
+        if let Some(count) = count {
+            check_len("count", count.len(), 1)?;
+        }
+        let blocks = n.div_ceil(TOPK_SPAN);
+        let parts = blocks * TOP_K;
+        ensure!(
+            parts <= TOPK_SPAN && rows * parts <= scratch.values.len(),
+            "{n} values exceed the top-k scratch"
+        );
+        check_len("values", values.len(), (BLOCK - 1) * TOP_K)?;
+        check_len("ids", ids.len(), (BLOCK - 1) * TOP_K)?;
+        let mut args = KernelArgs::default();
+        args.ptr(logits, stream)
+            .i32(i32_arg("ld", ld)?)
+            .i32(i32_arg("n", n)?)
+            .opt(count, stream)
+            .opt(map, stream)
+            .ptr_mut(&mut scratch.values, stream)
+            .ptr_mut(&mut scratch.ids, stream);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks)?, u32::try_from(rows)?, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_topk_partial(const bf16*, int, int, const int*,
+        // const int*, float*, int*)`. The kernel reads values below n (and below *count) of
+        // the `rows` rows `ld` apart, the map below n, and writes 16 entries per block and
+        // row, which the scratch holds. It reads earlier outputs only after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.topk_partial, config) }?;
+        let mut args = KernelArgs::default();
+        args.ptr(&scratch.values, stream)
+            .ptr(&scratch.ids, stream)
+            .i32(i32_arg("parts", parts)?)
+            .ptr_mut(values, stream)
+            .ptr_mut(ids, stream);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows)?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `draft_topk_merge(const float*, const int*, int,
+        // float*, int*)`: the first pass wrote `parts` entries per row, at most the 2048 the
+        // kernel takes, and the outputs hold 16 per row.
+        unsafe { args.launch_pdl(stream, &self.topk_merge, config) }?;
+        Ok(())
+    }
+
+    /// DFlash 2's greedy walk over the candidates of [`Self::topk`] (see `draft_select`):
+    /// `hp` is BF16 `[steps.max(2), 256]`, the hidden projection of block rows 1 to
+    /// `steps`; the anchor is `control[2]`. Writes `steps` draft ids and confidences.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn select(
+        &self,
+        stream: &CudaStream,
+        cand: &CudaSlice<i32>,
+        unary: &CudaSlice<f32>,
+        hp: &CudaSlice<bf16>,
+        predecessor: &CudaSlice<bf16>,
+        successor: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        steps: usize,
+        softcap: f32,
+        ids: &mut CudaSlice<i32>,
+        confidence: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..BLOCK).contains(&steps) && ids.len() >= steps && confidence.len() >= steps,
+            "{steps} steps for {} ids and {} confidences",
+            ids.len(),
+            confidence.len()
+        );
+        check_len("cand", cand.len(), (BLOCK - 1) * TOP_K)?;
+        check_len("unary", unary.len(), (BLOCK - 1) * TOP_K)?;
+        ensure!(
+            hp.len() >= steps * RANK,
+            "hp has {} elements, too few for {steps} rows",
+            hp.len()
+        );
+        let vocab = rows_of("predecessor", predecessor.len(), RANK)?;
+        check_len("successor", successor.len(), vocab * RANK)?;
+        check_len("control", control.len(), CONTROL)?;
+        let mut args = KernelArgs::default();
+        args.ptr(cand, stream)
+            .ptr(unary, stream)
+            .ptr(hp, stream)
+            .ptr(predecessor, stream)
+            .ptr(successor, stream)
+            .i32(i32_arg("vocab", vocab)?)
+            .ptr(control, stream)
+            .i32(i32_arg("steps", steps)?)
+            .f32(softcap)
+            .ptr_mut(ids, stream)
+            .ptr_mut(confidence, stream);
+        // SAFETY: the arguments match `draft_select(const int*, const float*, const bf16*,
+        // const bf16*, const bf16*, int, const int*, int, float, int*, float*)`. The kernel
+        // reads rows below `steps` of the checked inputs, bounds-checks every token against
+        // `vocab` before reading a codebook row, and writes `steps` ids and confidences. It
+        // reads everything after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.select, one_block(TOP_K * 32)) }?;
         Ok(())
     }
 

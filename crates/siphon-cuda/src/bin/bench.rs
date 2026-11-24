@@ -41,8 +41,9 @@
 //! takes a variant of the draft as `dspark` does: `fast` (the default, every
 //! approximation), `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`
 //! and `shortlist`, which ranks tokens by id unless `--shortlist` names a ranking file.
-//! `--drafter DIR` runs a DFlash draft with DSpark heads exported by the 2DSD project
-//! (`DflashWeights`) instead of the bundled draft, with the same variants.
+//! `--drafter DIR` runs the drafter in DIR instead of the bundled draft, with the same
+//! variants: Inco AI's DFlash 2 drafter (`Dflash2Weights`) or a DFlash draft with DSpark
+//! heads exported by the 2DSD project (`DflashWeights`), told apart by its `config.json`.
 //! `--sweep FILE` also decodes `--steps` tokens one verify row at a time with a draft
 //! round of 7 at every anchor, and writes the tokens and every anchor's drafts and
 //! confidences to FILE as JSON lines, one per context. The verify and the draft's

@@ -140,6 +140,67 @@ A draft round of 7 drafts with BF16 weights (`bench --spec 7`, the round's commi
 
 The two extra layers and `fc` cost about 0.25 ms. The rest of the gap grows with the context: 5 layers read every position's keys and values, 0.64 GB at 32,768.
 
+## DFlash 2 draft
+
+`Draft::dflash2` runs Inco AI's DFlash 2 drafter for the official checkpoint ([`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) at revision `4f9088ea`) in place of the bundled draft. `--drafter DIR` picks it when `config.json` names `DFlash2DraftModel`, and `Dflash2Weights` checks the config against what the kernels run. The model card's numbers come from SGLang with the repository's compatibility patch (`sglang_inkling_dflash2.py`), so the engine follows SGLang's DFlash worker where it differs from z-lab's generator ([z-lab/dflash](https://github.com/z-lab/dflash)):
+
+- Taps. SGLang's Inkling model captures the partial block entering each visit in `target_layer_ids` and, for the id equal to the visit count, the final normed hidden state. So `[5, 23, 41, 48]` are the bundled draft's taps, and the target records them as it always does. `fc` (`[2304, 9216]`) and `hidden_norm` turn each position's taps into one context row, which every layer projects with the block's own `k_proj` and `v_proj`.
+- Block. The anchor and 7 mask rows sit at positions P to P + 7. The rows are the target's input embeddings, `embed_norm(embed(id))`, and the mask rows embed token 200,056. z-lab's generator reads the raw embedding table instead; with raw rows the drafter accepts nothing.
+- Layers. 5 Qwen3-style layers with 32 query heads, 8 KV heads and an MLP of 6912. RoPE uses theta 10,000 from a BF16 table, with each product and the sum rounded to BF16 (`Rope::Bf16Ops`), as SGLang's `table_qk_norm_rope` does. Every row attends to the whole block and to the 2048 positions that end at itself: row j at P + j sees P + j - 2047 onward. Each layer's cache is a ring of 2056 slots, so the round costs the same at any context. A commit skips positions that no later block's window reaches.
+- Convolutions. A two-tap grouped dynamic convolution wraps each attention and each MLP, over the block's rows only. Tap j of channel c in row r weighs `base[s, j, c] + delta[r, s, j, c / 16]`, where `delta` (576 values per row) projects the sublayer's normed input. Side 0 convolves the sublayer's input; side 1 convolves its output and runs fused with the residual add and the next norm. Row 0 has no previous row, so no convolution state carries over between rounds. Sums run in F32 and round once, as SGLang's Triton kernel does.
+- Selector. The drafter has no LM head. Rows 1 to 7 go through the target's LM head, and the top 16 logits over the 200,058 real tokens become each row's candidates. Walking from the anchor, candidate c after token t scores `30 tanh((logit_c + bf16(<bf16(A[t] h), B[c]>)) / 30)`, with `h = hidden_projection · y` (rank 256). The softcap applies after the correction (`selector_softcap_mode: after_correction`, which the patch adds; z-lab caps the logits before adding). The greedy walk takes the best score, ties to the larger logit. A draft's confidence, which `WidthPolicy` reads, is its softmax probability over its row's 16 scores: the distribution a walk at temperature 1 samples from.
+
+The block forward shares the other drafts' code. The block attention takes 3 or 4 query heads per KV head and an optional window per row; the bundled draft's results stay the same bit for bit (`tests/draft_exact.rs`). New kernels: `draft_conv` and `draft_conv_add_rms_norm` for the convolutions, `draft_topk_partial` and `draft_topk_merge` for the candidates (two passes, ties to the smaller token), and `draft_select` for the walk (one block, one warp per candidate). Of the `DraftOptions`, `fp8_backbone` and `fp8_head` apply, `shortlist` limits the candidates to the shortlist's tokens, and `fp8_fold` does nothing.
+
+`reference/dflash2.py` runs z-lab's `DFlash2DraftModel` at every anchor of a taps file, with SGLang's rules above around it, and `tests/dflash.rs` compares the engine with it (`SIPHON_DFLASH` set to the drafter, `SIPHON_MODEL` to the official checkpoint). On a math chat prompt and 1,400 tokens of its greedy continuation (1,480 anchors), the exact draft gives the reference's 7 drafts in 1,403 rounds. In the other 77 the first different draft falls on a near-tie: a selector gap of at most 0.25 in 67, and a tie at the top-16 boundary of its row in 10, where the 16th and 17th logits differ by at most two BF16 steps. Against the reference run in F32, the engine's whole rounds agree in 95.4% of anchors and the BF16 reference's in 95.7%. The engine's decoder output is closer to the F32 reference (median relative error 0.0108) than the BF16 reference's (0.0151). Teacher-forced on MLX's top-1 tokens of the three texts, the reference keeps 3.91, 3.27 and 3.43 tokens per round at k = 7 (`anyhow`, `half`, `regex-readme`), against 3.79 for the bundled draft over all three. With the softcap before the correction, as z-lab applies it, `regex-readme` drops from 3.43 to 3.30.
+
+`tests/spec.rs` (`dflash_speculation_is_exact`) checks exactness with the drafter: speculation at k = 1, 3, 7 and adaptive widths returns all 1024 greedy tokens after each of the three texts. The `anyhow` prompt of 10,674 tokens runs every round past the window.
+
+Chat prompts through `siphon-serve` with the bundled chat template, FP8 weights and KV, adaptive widths: two math problems, two coding tasks, a travel-planning conversation and a logic puzzle at effort `xhigh`, 10,338 tokens in all. Every run emitted the same tokens. Without a shortlist, both drafts keep their FP8 backbone and head:
+
+| Draft | Variant | tok/s | Tokens per round | Acceptance, drafts 1 to 7 | Draft per round |
+| --- | --- | ---: | ---: | --- | ---: |
+| Bundled | no shortlist | 484.9 | 3.78 | 79.8, 59.9, 43.3, 34.7, 26.1, 19.2, 14.9% | 0.956 ms |
+| DFlash 2 | no shortlist | 554.9 | 4.61 | 85.6, 71.1, 54.8, 46.9, 39.8, 33.1, 29.2% | 1.046 ms |
+| Bundled | `fast` | 468.8 | 3.46 | 72.4, 52.6, 37.9, 29.9, 22.8, 16.7, 13.1% | 0.516 ms |
+| DFlash 2 | `fast` | 495.8 | 3.97 | 75.5, 58.5, 45.3, 38.0, 31.2, 26.1, 22.6% | 0.798 ms |
+
+Per prompt, without a shortlist, tok/s and tokens per round:
+
+| Prompt | Tokens | Bundled | DFlash 2 |
+| --- | ---: | --- | --- |
+| Math: cheapest packs of pencils | 1,057 | 473.0, 3.64 | 557.3, 5.04 |
+| Math: nested square roots | 900 | 469.1, 3.58 | 648.7, 5.33 |
+| Code: merge intervals in Python | 2,048 | 526.1, 4.30 | 602.3, 5.19 |
+| Code: LRU cache in Rust | 2,048 | 525.0, 4.19 | 544.7, 4.57 |
+| Chat: a trip to Kyoto | 2,048 | 529.8, 4.32 | 603.2, 5.14 |
+| Logic puzzle, effort `xhigh` | 2,237 | 406.2, 2.97 | 468.4, 3.58 |
+
+On math DFlash 2 keeps 5.0 to 5.3 tokens per round against 3.6 for the bundled draft, close to the model card's 4.8 to 5.0 against 3.5 with sampling. The shortlist in token id order costs DFlash 2 more than the bundled draft: reasoning text uses many tokens above id 32,768.
+
+`bench --spec auto`, 256 tokens after each text, FP8 weights and KV, tok/s and tokens per round. The prompt-length column is the second, warm run:
+
+| Text, context | Plain decode | Bundled, no shortlist | DFlash 2, no shortlist | Bundled, `fast` | DFlash 2, `fast` |
+| --- | ---: | --- | --- | --- | --- |
+| `anyhow`, 10,674 | 328 | 650, 6.12 | 629, 6.12 | 674, 6.12 | 652, 6.24 |
+| `anyhow`, 32,768 | 302 | 568, 6.09 | 545, 5.91 | 570, 5.82 | 552, 5.91 |
+| `half`, 2,273 | 340 | 609, 5.25 | 490, 4.34 | 635, 5.35 | 481, 4.13 |
+| `half`, 32,768 | 301 | 430, 4.34 | 431, 4.43 | 452, 4.41 | 444, 4.51 |
+| `regex-readme`, 2,286 | 340 | 383, 2.78 | 395, 3.08 | 404, 2.84 | 395, 3.01 |
+| `regex-readme`, 32,768 | 301 | 365, 3.49 | 439, 4.37 | 366, 3.40 | 415, 4.10 |
+
+These greedy continuations repeat their text, which suits the bundled draft; DFlash 2 wins on `regex-readme` and ties or loses on the others. Its round costs 1.047 ms at every context (0.804 ms with the shortlist). The bundled draft's grows from 0.96 to 1.08 ms at 32,768 without the shortlist and from 0.52 to 0.65 ms with it, since its middle layer reads every position.
+
+In a kernel trace of a round of 7 drafts (each kernel from the previous one's end, 1,031 us in all), FP8 products take 766 us: 297 us for the LM head (461 MB at 1.55 TB/s) and 418 us for the five layers' projections. The output (K = 4096) and down (K = 6912) projections run at 0.6 to 0.7 TB/s, since they stage their input in tiles of 3,072 columns per group of rows. Each layer's attention over 2,055 keys takes 18 us with its combine, and its convolutions 23 us (two coefficient products, two input convolutions and two fused output convolutions). The commit takes 58 us; the top 16, the hidden projection and the walk 34 us. Running the five layers' context keys and values as one launch saved 17 us. Groups of 8 rows instead of 16 for the wide products did not help: the down projection got slower.
+
+```sh
+SIPHON_MODEL=<official-model-dir> SIPHON_DFLASH=<dflash2-dir> SIPHON_DFLASH_REF=<dir> SIPHON_DFLASH_CONTINUE=1400 \
+    cargo test --release -p siphon-cuda --test dflash -- --ignored --nocapture
+uv run --script reference/dflash2.py <dir>/taps.safetensors <dflash2-dir> <official-model-dir> <dir>/reference.safetensors
+SIPHON_MODEL=<official-model-dir> SIPHON_DFLASH=<dflash2-dir> \
+    cargo test --release -p siphon-cuda --test spec -- --ignored --nocapture --test-threads 1 dflash
+```
+
 ## Speculative decoding
 
 `spec::Speculator` runs greedy speculative decoding with the draft. Each round verifies the anchor and its leading drafts, a width of 1 to 8 rows that `spec::Width` sets: a fixed k drafts (`Width::Fixed`), or a width per round from the drafts' confidences (`Width::Adaptive`).

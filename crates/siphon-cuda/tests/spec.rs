@@ -17,8 +17,10 @@
 //!   orders, without a pass criterion.
 //! - `random_drafts_change_nothing` (test B): the same with uniformly random drafts at
 //!   k = 3 and with widths cycling from 1 to 8; the target almost never accepts them.
-//! - `dflash_speculation_is_exact` (test C): test A's widths with the DFlash draft in
-//!   `SIPHON_DFLASH`, an export of the 2DSD project (see `DflashWeights`).
+//! - `dflash_speculation_is_exact` (test C): test A's widths with the drafter in
+//!   `SIPHON_DFLASH`: an export of the 2DSD project (see `DflashWeights`, with its research
+//!   checkpoint) or Inco AI's DFlash 2 drafter (see `Dflash2Weights`, with the official
+//!   checkpoint).
 
 #![cfg(target_os = "linux")]
 
@@ -213,8 +215,8 @@ fn random_drafts_change_nothing() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs the checkpoint (SIPHON_MODEL), a DFlash draft (SIPHON_DFLASH), the captures \
-            and about 22 GB of GPU memory"]
+#[ignore = "needs the checkpoint (SIPHON_MODEL), a drafter (SIPHON_DFLASH), the captures and \
+            about 22 GB of GPU memory"]
 fn dflash_speculation_is_exact() -> anyhow::Result<()> {
     let dir = PathBuf::from(env::var_os("SIPHON_DFLASH").context("set SIPHON_DFLASH")?);
     check(
