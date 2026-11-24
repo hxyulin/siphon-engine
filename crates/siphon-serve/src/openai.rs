@@ -16,7 +16,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Request, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
@@ -46,11 +46,18 @@ pub struct App {
     pub started: u64,
 }
 
+/// Request body bytes allowed per position of the context. A prompt of English text
+/// takes about 5 bytes per token; JSON escapes and token-id arrays take more.
+const BODY_BYTES_PER_POSITION: usize = 32;
+
 pub fn router(app: Arc<App>) -> Router {
+    // axum's default limit of 2 MB holds a prompt of only about 400K tokens.
+    let body_limit = (app.engine.max_context() * BODY_BYTES_PER_POSITION).max(2 << 20);
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .layer(DefaultBodyLimit::max(body_limit))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize))
         .route("/health", get(|| async { "ok" }))
         .with_state(app)
