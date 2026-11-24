@@ -456,6 +456,10 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 
 The CUDA context itself takes 507 MiB. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less a 0.5 GiB margin. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.
 
+`siphon-serve` also checks the plan against what it uses. It allocates the full prefill chunk's buffers at startup (`Model::reserve_prefill`), so every buffer the plan counts exists once the warmup has run. Every buffer comes from the device's memory pool, because cudarc allocates with `cuMemAllocAsync`. `Gpu::memory` reads the pool's reserved bytes and their peak (`cuMemPoolGetAttribute`) along with the device's free memory. The bytes outside the pool, the module images and the CUDA graphs, are the drop in free memory since the context was created less the pool's bytes, measured once after warmup. The check prints the pool's peak plus those bytes against the plan, and warns once if a later job takes the pool's peak past the plan.
+
+`siphon-plan` draws the plan in the terminal. It plans every combination of weight format, KV format and draft (the bundled draft, a `--drafter`, none) with `siphon::memory`. It takes the free memory after the context from nvidia-smi's free memory less the 507 MiB context, which is how the context was measured.
+
 Planned against measured, as the free memory after creating the context less the lowest sample, after a 3,820-token prompt and 256 speculative tokens:
 
 | Weights, KV cache | Draft | Capacity | Planned GiB | Measured GiB | Over, MiB |

@@ -69,6 +69,14 @@ Before loading anything, it plans the GPU memory from the config and the checkpo
 | FP8, FP8 | 466,944 | 563,200 |
 | BF16, BF16 | 290,816 | 316,416 |
 
+After warmup, it compares what the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the rest, the module images and the CUDA graphs, from the change in free memory. It checks the pool's peak again after each job and warns if it goes past the plan.
+
+`siphon-plan` shows the same plan in the terminal before you start the server, and runs on macOS too. It draws the GPU's memory as a bar and a table of what holds it, with the longest context of every combination of formats and drafts. Keys switch the formats and the draft and move the context. It reads the free memory from nvidia-smi, or takes `--free <GiB>`, or assumes an idle 32 GB RTX 5090. `--print` prints one frame as text:
+
+```sh
+target/release/siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--context N]
+```
+
 It loads the model with FP8 dense weights and KV cache (`--weights bf16` and `--kv bf16` switch back), prices the verify widths on a short prompt, and then serves:
 
 | Route | Notes |
@@ -88,6 +96,7 @@ On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds wit
 | `crates/siphon` | Config parsing, the memory-mapped safetensors checkpoint, the GPU memory planner, and the `siphon inspect` CLI |
 | `crates/siphon-cuda` | Kernels (`kernels/*.cu`), their Rust launchers (`src/ops`), the model, the draft and speculation, and the `bench`, `eval`, `parity` and `dspark` binaries |
 | `crates/siphon-serve` | The HTTP server: chat rendering, output parsing and the engine thread |
+| `crates/siphon-plan` | `siphon-plan`, a terminal view of the memory plan |
 | `reference` | MLX-LM captures and kernel fixtures, run on a Mac with uv |
 | `scripts` | Remote sync, the PDL read-order audit, and profiling scripts |
 | `docs/engine.md` | How the engine works, how it is tested and measured, and the formats it uses |
