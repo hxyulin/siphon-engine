@@ -405,7 +405,8 @@ pub struct Attention {
     prefill_fp8: CudaFunction,
     /// `attention_rows_bf16_<NQ>` and `attention_rows_fp8_<NQ>` for NQ = 1 to 3.
     rows: Vec<[CudaFunction; 2]>,
-    rows_combine: CudaFunction,
+    /// `attention_rows_combine` for a BF16 and an FP8 cache.
+    rows_combine: [CudaFunction; 2],
 }
 
 /// The partials of [`Attention::attention_rows`]: per query row of up to 8 x 24, one
@@ -482,7 +483,10 @@ impl Attention {
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
-            rows_combine: module.load_function("attention_rows_combine")?,
+            rows_combine: [
+                module.load_function("attention_rows_combine_bf16")?,
+                module.load_function("attention_rows_combine_fp8")?,
+            ],
         })
     }
 
@@ -491,7 +495,9 @@ impl Attention {
     /// `[rows, 24, 128]`) into `out` (`[rows, 24, 128]`) as `rows` pairs of
     /// [`Attention::append`] and [`Attention::decode_attention`] would, with each row's
     /// relative bias (`bias` `[rows, 24, extent]`) and sinks (`sinks` `[rows, 24]`), then
-    /// appends their keys `k` and values `v` (`[rows, 8, 128]`) to `cache`.
+    /// appends their keys `k` and values `v` (`[rows, 8, 128]`) to `cache`. With `gate`
+    /// (`[rows, 24, 128]`), `out` receives the gated output, as
+    /// `Elementwise::attention_gate` computes it from the attention and the gate.
     ///
     /// Each key and value tile streams once for all rows. Each row's result depends only on
     /// its position, its query and the cache: it is the same, bit for bit, for every row
@@ -513,11 +519,15 @@ impl Attention {
         rows: usize,
         bias: &impl DeviceIn<bf16>,
         sinks: &impl DeviceIn<bf16>,
+        gate: Option<&CudaView<'_, bf16>>,
         scratch: &mut RowsAttentionScratch,
         out: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
         let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
         let mut out = out.view_mut();
+        if let Some(gate) = gate {
+            check_len("gate", gate.len(), rows * HEADS * HEAD_DIM)?;
+        }
         ensure!(
             (1..=ROWS_MAX).contains(&rows),
             "{rows} rows, expected 1 to {ROWS_MAX}"
@@ -575,19 +585,37 @@ impl Attention {
             .ptr(&scratch.max, stream)
             .ptr(&scratch.sum, stream)
             .ptr_mut(&mut out, stream)
-            .i32(i32::try_from(ROWS_BLOCKS)?);
+            .i32(i32::try_from(ROWS_BLOCKS)?)
+            .opt(gate, stream)
+            .ptr(&k, stream)
+            .ptr(&v, stream);
+        let combine = match &mut cache.data {
+            KvData::Bf16 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream);
+                &self.rows_combine[0]
+            }
+            KvData::Fp8 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream);
+                &self.rows_combine[1]
+            }
+        };
+        args.ptr(start, stream).u32(slots);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows * HEADS)?, 1, 1),
             block_dim: (HEAD_DIM as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: the arguments match `attention_rows_combine(const float*, const float*,
-        // const float*, bf16*, int)`; the grid has one block per query row, each reading the
-        // `ROWS_BLOCKS` partials the attention kernel wrote and writing its 128 outputs,
-        // which `out` holds. It reads nothing before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.rows_combine, config) }?;
-        // After the attention kernel, which reads the slots the rows overwrite.
-        self.append_rows(stream, cache, start, rows, &k, &v)
+        // SAFETY: the arguments match `attention_rows_combine_bf16(const float*, const
+        // float*, const float*, bf16*, int, const bf16*, const bf16*, const bf16*, bf16*,
+        // bf16*, const unsigned*, unsigned)`, or `attention_rows_combine_fp8` with `uint8_t*`
+        // caches. The grid has one block per query row, each reading the `ROWS_BLOCKS`
+        // partials the attention kernel wrote and its gate row if there is one, and writing
+        // its 128 outputs, which `out` holds. The first head of each KV group writes that
+        // head's 128 channels of its row's key and value, read from `k` and `v`, at slot
+        // (start + row) mod slots, which the cache holds; no two blocks write the same
+        // elements, since rows <= 8 < slots. It reads nothing before `pdl_wait`, so the
+        // attention kernel, which reads the slots the rows overwrite, has finished.
+        unsafe { args.launch_pdl(stream, combine, config) }
     }
 
     /// `bias = rel @ table` for relative states `rel` `[rows, 24, 16]` and the layer's

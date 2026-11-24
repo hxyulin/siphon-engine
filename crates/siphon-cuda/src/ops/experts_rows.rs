@@ -35,15 +35,23 @@ const K2: usize = 1152;
 const N2: usize = 2304;
 /// Warps per block, `kWarps` in the kernel.
 const WARPS: usize = 4;
-/// Dynamic shared memory per block: `kWarps` warps of `kRing` slots of 16 rows of 128 bytes.
-const SMEM: usize = WARPS * 3 * 16 * 128;
+/// Ring slots per warp of the two kernels of each format: the deeper ring for up to
+/// [`DEEP_RING_ROWS`] rows. On an RTX 5090, one step's expert MLPs with real routing took
+/// 1517 instead of 1663 us at 1 row and 2182 instead of 2228 at 2, but 3198 instead of
+/// 3139 at 4, where the 3 blocks per SM of the deeper ring held too few warps.
+const RINGS: [usize; 2] = [3, 4];
+const DEEP_RING_ROWS: usize = 3;
+/// Dynamic shared memory per block: `kWarps` warps of `ring` slots of 16 rows of 128 bytes.
+const fn smem(ring: usize) -> usize {
+    WARPS * ring * 16 * 128
+}
 
 #[derive(Debug)]
 pub struct ExpertsRows {
-    /// NVFP4 and MXFP8.
-    kernels: [CudaFunction; 2],
+    /// By ring ([`RINGS`]), then NVFP4 and MXFP8.
+    kernels: [[CudaFunction; 2]; 2],
     /// Blocks of each kernel that fit on the GPU at once.
-    blocks: [usize; 2],
+    blocks: [[usize; 2]; 2],
 }
 
 impl ExpertsRows {
@@ -67,11 +75,16 @@ impl ExpertsRows {
             ensure!(per_sm > 0, "{name} does not fit on an SM");
             Ok((function, per_sm * sms))
         };
-        let (nvfp4, nvfp4_blocks) = load("expert_mlp_rows_nvfp4", SMEM)?;
-        let (mxfp8, mxfp8_blocks) = load("expert_mlp_rows_mxfp8", SMEM)?;
+        let load_ring = |ring: usize| -> anyhow::Result<([CudaFunction; 2], [usize; 2])> {
+            let (nvfp4, nvfp4_blocks) = load(&format!("expert_mlp_rows_nvfp4_{ring}"), smem(ring))?;
+            let (mxfp8, mxfp8_blocks) = load(&format!("expert_mlp_rows_mxfp8_{ring}"), smem(ring))?;
+            Ok(([nvfp4, mxfp8], [nvfp4_blocks, mxfp8_blocks]))
+        };
+        let (shallow, shallow_blocks) = load_ring(RINGS[0])?;
+        let (deep, deep_blocks) = load_ring(RINGS[1])?;
         Ok(Self {
-            kernels: [nvfp4, mxfp8],
-            blocks: [nvfp4_blocks, mxfp8_blocks],
+            kernels: [shallow, deep],
+            blocks: [shallow_blocks, deep_blocks],
         })
     }
 
@@ -176,6 +189,7 @@ impl ExpertsRows {
         let n2 = experts(w2, w2.k / bytes, group)?;
         ensure!(n13 == n2, "w13 has {n13} experts and w2 {n2}");
 
+        let ring = usize::from(m <= DEEP_RING_ROWS);
         let mut args = KernelArgs::default();
         args.ptr(&x, stream)
             .ptr(&indices, stream)
@@ -191,19 +205,23 @@ impl ExpertsRows {
             .f32(up_softcap)
             .ptr_mut(&mut sync, stream);
         let config = LaunchConfig {
-            grid_dim: (u32::try_from(self.blocks[format]).context("grid")?, 1, 1),
+            grid_dim: (
+                u32::try_from(self.blocks[ring][format]).context("grid")?,
+                1,
+                1,
+            ),
             block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
-            shared_mem_bytes: u32::try_from(SMEM)?,
+            shared_mem_bytes: u32::try_from(smem(RINGS[ring]))?,
         };
         // SAFETY: the arguments match `expert_mlp_rows_*(const bf16*, const int*, int,
         // const u8*, const u8*, const float*, const u8*, const u8*, const float*, bf16*,
         // bf16*, float, float, unsigned*)`. The checks above give `x` m rows of 2304, `act`
         // and `out` 8 m pairs of 1152 and 2304, the weights the kernel's shapes for every
         // expert id the router writes, and `sync` 1 + 8 m counters, zero as the kernel
-        // leaves them. The grid holds only blocks that fit on the GPU at once, which the
-        // kernel's waits need. Only the NVFP4 kernel reads the global scales. The kernel
-        // reads nothing before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.kernels[format], config) }
+        // leaves them. The grid holds only blocks that fit on the GPU at once with the
+        // ring's shared memory, which the kernel's waits need. Only the NVFP4 kernels read
+        // the global scales. The kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.kernels[ring][format], config) }
     }
 }
 

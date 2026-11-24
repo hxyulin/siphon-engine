@@ -14,6 +14,7 @@ use half::bf16;
 use siphon_cuda::{
     Gpu,
     ops::{
+        attention::Attention,
         conv::Conv,
         elementwise::Elementwise,
         misc::Misc,
@@ -399,7 +400,9 @@ fn attention_post_matches_separate_kernels() -> anyhow::Result<()> {
 
 /// The multi-row attention post-processing against one single-row call per row, over
 /// chunks of 5, 1, 2 and 7 rows with carried conv states, for static and dynamic convs,
-/// with and without log scaling. Same rounded operations, so bit for bit.
+/// with and without log scaling, and its relative bias against
+/// `Attention::relative_bias_rows` of its relative states. Same rounded operations, so bit
+/// for bit.
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -407,10 +410,14 @@ fn attention_post_matches_separate_kernels() -> anyhow::Result<()> {
 )]
 fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
     const CHUNKS: [usize; 4] = [5, 1, 2, 7];
+    // Columns of the relative bias table.
+    const EXTENT: usize = 64;
     let gpu = Gpu::new(0)?;
     let stream = gpu.stream();
     let norm = Norm::load(gpu.context())?;
     let conv = Conv::load(gpu.context())?;
+    let attention = Attention::load(gpu.context())?;
+    let table = stream.clone_htod(&pseudo_random_bf16(16 * EXTENT, 78, 1.0, 0.0))?;
     let (alpha, n_floor) = (0.1, 8192.0);
     let q_scale = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 128, 70, 0.5, 1.0))?;
     let r_scale = stream.clone_htod(&pseudo_random_bf16(Q_HEADS * 16, 71, 0.5, 1.0))?;
@@ -496,6 +503,7 @@ fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
             let mut v: CudaSlice<bf16> = stream.alloc_zeros(rows * KV)?;
             let mut q: CudaSlice<bf16> = stream.alloc_zeros(rows * Q_HEADS * 128)?;
             let mut rel: CudaSlice<bf16> = stream.alloc_zeros(rows * Q_HEADS * 16)?;
+            let mut bias: CudaSlice<bf16> = stream.alloc_zeros(rows * Q_HEADS * EXTENT)?;
             let conv_weights = if dynamic {
                 KvConvWeights::Dynamic {
                     k_dynamic: k_dyn.as_view(),
@@ -529,9 +537,18 @@ fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
                     qk_threshold: QK_THRESHOLD,
                     rel_threshold: REL_THRESHOLD,
                     eps: EPS,
+                    bias: Some((&table, bias.as_view_mut())),
                 },
                 rows,
             )?;
+            let mut bias_ref: CudaSlice<bf16> = stream.alloc_zeros(rows * Q_HEADS * EXTENT)?;
+            attention.relative_bias_rows(stream, &rel, &table, &mut bias_ref)?;
+            assert_bf16_close(
+                &format!("{label}: bias"),
+                &stream.clone_dtoh(&bias)?,
+                &stream.clone_dtoh(&bias_ref)?,
+                0,
+            );
             conv.shift_state(stream, &k_raw, &mut k_state, KV, rows)?;
             conv.shift_state(stream, &v_raw, &mut v_state, KV, rows)?;
             for (name, got, want) in [

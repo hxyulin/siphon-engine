@@ -88,7 +88,6 @@ fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
 pub struct Spec {
     copy_tap: CudaFunction,
     conv_backup: CudaFunction,
-    conv_inputs_rows: CudaFunction,
     conv_rollback: CudaFunction,
     ring_backup: CudaFunction,
     ring_restore: CudaFunction,
@@ -102,7 +101,6 @@ impl Spec {
         Ok(Self {
             copy_tap: f("copy_tap")?,
             conv_backup: f("conv_backup")?,
-            conv_inputs_rows: f("conv_inputs_rows")?,
             conv_rollback: f("conv_rollback")?,
             ring_backup: f("ring_backup")?,
             ring_restore: f("ring_restore")?,
@@ -166,63 +164,6 @@ impl Spec {
         // stream's dims; block (x, s, v) copies stream `s` of visit `v` into its place in
         // `backup`, which holds every visit.
         unsafe { launch.launch(state_config(visits)?) }?;
-        Ok(())
-    }
-
-    /// Records one visit's conv inputs of `rows` rows into `inputs` `[8, 6656]`: `k_raw` and
-    /// `v_raw` `[rows, 1024]`, `proj` `[rows, 2304]`, and the MoE combine of `experts`
-    /// `[rows, 8, 2304]` with `weights` `[rows, 8]`, rounded as the post-MLP conv rounds it.
-    #[expect(clippy::too_many_arguments, reason = "the four conv inputs")]
-    pub fn conv_inputs_rows(
-        &self,
-        stream: &CudaStream,
-        k_raw: &impl DeviceIn<bf16>,
-        v_raw: &impl DeviceIn<bf16>,
-        proj: &impl DeviceIn<bf16>,
-        experts: &impl DeviceIn<bf16>,
-        weights: &impl DeviceIn<f32>,
-        inputs: &mut impl DeviceOut<bf16>,
-        rows: usize,
-    ) -> anyhow::Result<()> {
-        let (k_raw, v_raw, proj, experts, weights) = (
-            k_raw.view(),
-            v_raw.view(),
-            proj.view(),
-            experts.view(),
-            weights.view(),
-        );
-        let mut inputs = inputs.view_mut();
-        ensure!(
-            (1..=VERIFY_ROWS).contains(&rows),
-            "{rows} rows, expected 1 to {VERIFY_ROWS}"
-        );
-        check_len("k_raw", k_raw.len(), rows * KV_DIMS)?;
-        check_len("v_raw", v_raw.len(), rows * KV_DIMS)?;
-        check_len("proj", proj.len(), rows * HIDDEN)?;
-        check_len("experts", experts.len(), rows * 8 * HIDDEN)?;
-        check_len("weights", weights.len(), rows * 8)?;
-        check_len("inputs", inputs.len(), VERIFY_ROWS * VISIT_CHANNELS)?;
-        let config = LaunchConfig {
-            grid_dim: (
-                u32::try_from(HIDDEN)?.div_ceil(THREADS),
-                u32::try_from(rows)?,
-                1,
-            ),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch = stream.launch_builder(&self.conv_inputs_rows);
-        launch
-            .arg(&k_raw)
-            .arg(&v_raw)
-            .arg(&proj)
-            .arg(&experts)
-            .arg(&weights)
-            .arg(&mut inputs);
-        // SAFETY: the arguments match `conv_inputs_rows(const bf16*, const bf16*, const
-        // bf16*, const bf16*, const float*, bf16*)`; block row `r` reads row `r` of each
-        // input and writes row `r` of `inputs`, all checked to hold `rows` rows.
-        unsafe { launch.launch(config) }?;
         Ok(())
     }
 

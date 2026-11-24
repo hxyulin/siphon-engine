@@ -179,6 +179,15 @@ Each verify row gives the same logits, bit for bit, as a verify of that row alon
 - Experts (`ops::experts_rows`): one kernel groups the row-slot pairs by expert on the device and streams each distinct expert's `w13` and `w2` once, on tensor cores with the expert's pairs as the columns. An E2M1 or E4M3 weight times its block scale is an exact BF16 value.
 - Attention (`Attention::attention_rows`): each key and value tile streams once for the 3 query heads and all rows. The cache splits by absolute slot, a row's masked keys weigh exactly zero, and the slot a row's key goes to shows the new key to that row and later rows and the old entry to earlier ones. The rows' keys append after attention, so 1024-slot rings work.
 
+Around these kernels the pass follows a decode step's schedule, in fewer launches than chunked prefill uses:
+
+- With FP8 dense weights it forks the decode step's L2 prefetches: the first visit's projections before the pass, and after each visit's experts the next visit's output projection, MLP gate and router, and the projections of the visit after it. With BF16 weights the prefetch made every width slower, so it stays off.
+- Up to 8 rows, a visit ends in one kernel, `Conv::moe_conv_residual_step_rows`: the MoE combine, the post-MLP conv and the residual add, the shifts of all four conv states, and the record of the verify's conv inputs. `attention_post_rows_bf16` also computes the relative bias, and the attention combine also gates the output and appends the rows' keys and values. A pass of one row runs 762 kernels instead of 1,146.
+- The attention copies its first key and value tile before `pdl_wait`: no kernel of the pass writes a visit's cache before that visit's attention.
+- The router runs as the decode router's cluster, every row's sums side by side. The expert kernel loads each stage's block scales with its weights, and verifies of 1 to 3 rows run it with a 4-slot copy ring instead of 3.
+
+None of these changes a result: the verify logits stay the same bit for bit, which `smallm verify --width M --hash 1` checks across builds by hashing every pass's logits.
+
 `tests/linear_rows.rs`, `tests/experts_rows.rs`, `tests/attention_rows.rs` and `moe_router_step_rows_matches_step` in `tests/routing.rs` check each kernel's row invariance bit for bit, and its distance from the decode and prefill kernels.
 
 The verify pass computes the same model as `Model::step` but sums in other orders, so the two greedy outputs split at the first near-tie: after 247 to 817 of 1024 tokens on the three texts.
@@ -192,18 +201,25 @@ SIPHON_MODEL=<model-dir> SIPHON_TAPS=reference/out/regex-readme-taps.safetensors
 
 `eval --verify WIDTH` teacher-forces a capture through verify passes of WIDTH rows, and passes the quality gate at widths 1 and 4. `bench --prompt <capture> --spec K|auto` compares speculation with plain decode from one prefilled state, `--draft` picks the draft variant, `--sweep` records drafts and confidences at every anchor, and `--verify-widths` times one pass of each width.
 
-One verify pass, after the `anyhow` prompt of 10,674 tokens or with the caches marked full to 32,768 or 131,072:
+One verify pass, after the `anyhow` prompt of 10,674 tokens or with the caches marked full to 32,768 or 131,072, the fastest of 40, ms. Before is the pass without the schedule above:
 
 | Rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,674, BF16 weights, ms | 6.41 | 6.93 | 7.62 | 8.15 | 8.67 | 9.30 | 9.64 | 10.03 |
-| 10,674, FP8 weights, ms | 5.56 | 6.09 | 6.74 | 7.29 | 7.79 | 8.44 | 8.82 | 9.20 |
-| 32,768, BF16 weights, ms | 6.95 | 7.59 | 8.44 | 8.91 | 9.56 | 10.42 | 10.79 | 11.22 |
-| 32,768, FP8 weights, ms | 6.10 | 6.74 | 7.59 | 8.09 | 8.72 | 9.57 | 9.97 | 10.36 |
-| 131,072, BF16 weights, ms | 9.29 | 10.21 | 11.88 | 12.48 | 13.32 | 15.10 | 15.64 | 16.19 |
-| Bandwidth model, ms | 3.82 | 4.49 | 5.03 | 5.49 | 5.92 | 6.31 | 6.68 | 7.02 |
+| 10,674, FP8 weights and cache | 4.12 | 4.83 | 5.43 | 5.95 | 6.50 | 7.19 | 7.69 | 8.17 |
+| Before | 5.33 | 5.90 | 6.62 | 7.13 | 7.63 | 8.27 | 8.66 | 9.04 |
+| 32,768, FP8 weights and cache | 4.78 | 5.60 | 6.22 | 6.75 | 7.37 | 8.23 | 8.76 | 9.28 |
+| Before | 5.80 | 6.46 | 7.36 | 7.90 | 8.49 | 9.28 | 9.70 | 10.16 |
+| 10,674, BF16 weights and cache | 5.38 | 6.04 | 6.65 | 7.20 | 7.75 | 8.48 | 8.88 | 9.29 |
+| Before | 6.29 | 6.87 | 7.54 | 8.06 | 8.57 | 9.20 | 9.60 | 9.95 |
+| 32,768, BF16 weights and cache | 5.91 | 6.62 | 7.43 | 8.08 | 8.58 | 9.45 | 9.93 | 10.50 |
+| Before | 6.82 | 7.49 | 8.46 | 8.84 | 9.47 | 10.29 | 10.73 | 11.15 |
+| 131,072, BF16 weights, FP8 cache | 8.54 | 9.73 | 10.48 | 11.12 | 11.86 | 13.50 | 14.15 | 14.76 |
+| Before | 8.76 | 9.64 | 11.40 | 12.10 | 12.80 | 14.39 | 14.99 | 15.48 |
+| Bandwidth model | 3.82 | 4.49 | 5.03 | 5.49 | 5.92 | 6.31 | 6.68 | 7.02 |
 
-The bandwidth model reads the BF16 dense weights once and 8 m^0.6 distinct experts per visit at 84% of 1.70 TB/s, without KV. At 4 rows and 10,674 tokens with BF16 weights, a pass spends 3.37 ms in the experts, 2.1 ms in the dense products (0.55 ms of it the LM head), 1.0 ms in attention and about 2 ms in small kernels: depth attention, message gates, the router, the relative bias, conv states and norms.
+A plain decode step takes 2.78 ms at context 0 and 3.31 ms at 32,768 with FP8 weights and cache, and 3.69 and 4.75 ms with BF16. The bandwidth model reads the BF16 dense weights once and 8 m^0.6 distinct experts per visit at 84% of 1.70 TB/s, without KV.
+
+In a kernel trace of one row at 10,674 tokens with FP8 weights and cache (each kernel from the previous one's end), a pass spans 4.14 ms against 3.06 ms for a decode step. The difference: the attention chain takes 0.91 ms against 0.51 (post-processing, attention and combine against one fused decode kernel), the NVFP4 and MXFP8 experts 1.48 ms against 1.32, the message gates 0.42 ms in three kernels per gate against 0.23 in one, the input projections 5.5 to 9.7 us each against 3.3 us for the decode GEMV, and the visit's last kernel 0.10 ms, which decode folds into its expert kernel. At 3 rows the pass spans 5.85 ms, 2.69 ms of it in the experts.
 
 `bench --spec`, 256 tokens after each text, FP8 global KV cache, tok/s. Before is the commit before the adaptive width and the fast draft, with the exact draft at a fixed k; after is `--spec auto` with the fast draft, the faster of two runs each:
 
@@ -221,6 +237,23 @@ The bandwidth model reads the BF16 dense weights once and 8 m^0.6 distinct exper
 | `regex-readme`, 32,768 | BF16 | 229 | 278 / 286 / 270 | 307 | 3.49, 6.01 |
 | `regex-readme`, 2,286 | FP8 | 325 | 299 / 283 / 264 | 343 | 2.86, 4.88 |
 | `regex-readme`, 32,768 | FP8 | 289 | 301 / 293 / 285 | 334 | 3.44, 5.77 |
+
+The same runs with the verify schedule above (after) and without it (before), `--spec auto`, one run each:
+
+| Text, context | Weights | Plain decode | Before | After | Tokens and verify rows per round, after |
+| --- | --- | ---: | ---: | ---: | --- |
+| `anyhow`, 10,674 | FP8 | 327 | 625 | 675 (2.06x) | 6.12, 7.14 |
+| `anyhow`, 32,768 | FP8 | 302 | 525 | 572 (1.90x) | 5.82, 7.20 |
+| `half`, 2,273 | FP8 | 340 | 570 | 637 (1.87x) | 5.35, 6.60 |
+| `half`, 32,768 | FP8 | 301 | 408 | 454 (1.51x) | 4.41, 6.29 |
+| `regex-readme`, 2,286 | FP8 | 340 | 343 | 404 (1.19x) | 2.84, 4.59 |
+| `regex-readme`, 32,768 | FP8 | 301 | 335 | 371 (1.23x) | 3.44, 5.65 |
+| `anyhow`, 10,674 | BF16 | 241 | 566 | 601 (2.50x) | 6.32, 7.49 |
+| `anyhow`, 32,768 | BF16 | 210 | 520 | 552 (2.63x) | 6.40, 7.33 |
+| `half`, 2,273 | BF16 | 257 | 519 | 565 (2.20x) | 5.57, 6.87 |
+| `half`, 32,768 | BF16 | 210 | 406 | 440 (2.10x) | 4.92, 6.58 |
+| `regex-readme`, 2,286 | BF16 | 256 | 341 | 380 (1.48x) | 3.37, 5.50 |
+| `regex-readme`, 32,768 | BF16 | 210 | 263 | 288 (1.37x) | 2.83, 4.93 |
 
 The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At low acceptance the policy verifies 2 to 4 rows; it cannot fall back to plain decode, whose output differs from the verify path's.
 

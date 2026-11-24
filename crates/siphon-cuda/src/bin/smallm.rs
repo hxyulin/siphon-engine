@@ -5,7 +5,7 @@
 //! smallm dense <model-dir>
 //! smallm experts <model-dir> <routing-capture>
 //! smallm attention
-//! smallm verify <model-dir> <capture> --width M [--passes N] [--weights bf16|fp8]
+//! smallm verify <model-dir> <capture> --width M [--passes N] [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1]
 //! ```
 //!
 //! `prefill` runs real text through `Model::prefill` in chunks of a few rows, for kernel
@@ -31,7 +31,8 @@
 //!
 //! `verify` prefills the capture's text but its last 512 tokens, then runs `--passes`
 //! verify passes of `--width` rows over them, keeping every row, for kernel traces of the
-//! verify pass.
+//! verify pass. `--hash 1` prints a hash of every pass's logits, to compare two builds bit
+//! for bit.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -135,16 +136,19 @@ mod linux {
     fn verify() -> anyhow::Result<()> {
         let mut it = env::args().skip(2);
         let usage = "usage: smallm verify <model-dir> <capture> --width M [--passes N] \
-                     [--weights bf16|fp8]";
+                     [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1]";
         let model_dir = PathBuf::from(it.next().context(usage)?);
         let capture = PathBuf::from(it.next().context(usage)?);
-        let (mut width, mut passes, mut weights) = (4usize, 20usize, WeightFormat::Bf16);
+        let (mut width, mut passes, mut weights, mut kv, mut hash) =
+            (4usize, 20usize, WeightFormat::Bf16, KvFormat::Bf16, false);
         while let Some(flag) = it.next() {
             let value = it.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--width" => width = value.parse()?,
                 "--passes" => passes = value.parse()?,
                 "--weights" => weights = value.parse()?,
+                "--kv" => kv = value.parse()?,
+                "--hash" => hash = value == "1",
                 _ => anyhow::bail!("unknown flag {flag}; {usage}"),
             }
         }
@@ -159,22 +163,25 @@ mod linux {
         let gpu = Gpu::new(0)?;
         let checkpoint = Checkpoint::open(&model_dir)?;
         let w = Weights::load(&checkpoint, &config, gpu.stream())?;
-        let mut model = Model::with_formats(
-            &gpu,
-            config,
-            w,
-            passes_cfg,
-            text.len() + 16,
-            KvFormat::Bf16,
-            weights,
-        )?;
+        let mut model =
+            Model::with_formats(&gpu, config, w, passes_cfg, text.len() + 16, kv, weights)?;
         model.prefill(prompt, 2048, PrefillLogits::Last)?;
+        // FNV-1a over the bits of every pass's logits.
+        let mut fnv = 0xcbf2_9ce4_8422_2325_u64;
         for (i, rows) in rest.chunks_exact(width).take(passes).enumerate() {
             let t = Instant::now();
             model.verify(VerifyTokens::Host(rows), Accept::Rows(width))?;
             if i + 1 == passes {
                 println!("last pass: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
             }
+            if hash {
+                for x in model.verify_logits()? {
+                    fnv = (fnv ^ u64::from(x.to_bits())).wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        if hash {
+            println!("logits hash: {fnv:016x}");
         }
         Ok(())
     }
@@ -770,6 +777,7 @@ mod linux {
                                 m,
                                 &bias.slice(..m * HEADS * EXTENT),
                                 &sinks.slice(..m * HEADS),
+                                None,
                                 &mut rows_scratch,
                                 &mut out.slice_mut(..m * HEADS * HEAD_DIM),
                             )

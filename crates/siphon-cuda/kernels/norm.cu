@@ -483,9 +483,85 @@ attention_post_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                               rel_threshold, eps);
 }
 
+namespace {
+
+// Blocks per row of attention_post_rows_bf16 that compute the relative bias, and the heads
+// each one takes.
+constexpr int kBiasBlocks = 24;
+constexpr int kBiasHeads = kQHeads / kBiasBlocks;
+static_assert(kBiasHeads * kBiasBlocks == kQHeads && kBiasHeads <= kPostThreads, "whole heads");
+
+// The relative state of `head` in row `row` before rounding to BF16 storage: the scaled L2
+// clip, summed in order as l2_clip_bf16_16 does. `scaled` applies the log scale.
+template <class Scaled>
+__device__ __forceinline__ void rel_head(const __nv_bfloat16* r_raw, const __nv_bfloat16* r_scale, int row,
+                                         int head, float rel_threshold, const Scaled& scaled,
+                                         float (&out)[kRelDim]) {
+    const size_t at = (size_t(row) * kQHeads + head) * kRelDim;
+    float x[kRelDim];
+#pragma unroll
+    for (int i = 0; i < kRelDim; i += kVec) {
+        float part[kVec];
+        float sc[kVec];
+        load_bf16x4(r_raw + at + i, part);
+        load_bf16x4(r_scale + head * kRelDim + i, sc);
+#pragma unroll
+        for (int j = 0; j < kVec; ++j) {
+            x[i + j] = __fmul_rn(part[j], sc[j]);
+        }
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < kRelDim; ++i) {
+        acc = __fadd_rn(acc, __fmul_rn(x[i], x[i]));
+    }
+    const float factor = l2_clip_factor(acc, rel_threshold);
+#pragma unroll
+    for (int i = 0; i < kRelDim; ++i) {
+        out[i] = scaled(__bfloat162float(__float2bfloat16(__fmul_rn(x[i], factor))));
+    }
+}
+
+__device__ __forceinline__ float fmul_ftz(float a, float b) {
+    float r;
+    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__ float fadd_ftz(float a, float b) {
+    float r;
+    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+// relative_bias_dot in attention.cu: sum_k r[k] * t[k] in MLX's BF16 matmul order.
+__device__ __forceinline__ float relative_bias_dot(const float (&r)[kRelDim], const float (&t)[kRelDim]) {
+    float x[kRelDim];
+#pragma unroll
+    for (int k = 0; k < kRelDim; ++k) {
+        x[k] = fmul_ftz(r[k], t[k]);
+    }
+    float pair[kRelDim / 2];
+#pragma unroll
+    for (int k = 0; k < kRelDim / 2; ++k) {
+        pair[k] = fadd_ftz(x[2 * k], x[2 * k + 1]);
+    }
+    float quad[kRelDim / 4];
+#pragma unroll
+    for (int k = 0; k < kRelDim / 4; ++k) {
+        quad[k] = fadd_ftz(pair[k], pair[k + kRelDim / 4]);
+    }
+    return fadd_ftz(fadd_ftz(fadd_ftz(quad[0], quad[1]), quad[2]), quad[3]);
+}
+
+}  // namespace
+
 // attention_post_bf16 for each row (blockIdx.y) of a chunk whose first row sits at
 // position *start. The per-row buffers are [rows, ...]. The k and v conv states are
 // only read; shift_state_rows in conv.cu shifts k_raw and v_raw into them afterwards.
+// With a non-null `table` [16, extent], kBiasBlocks more blocks per row also compute the
+// relative bias [rows, 24, extent] of the rows' relative states, as relative_bias_rows_bf16
+// in attention.cu does, bit for bit; extent is a multiple of 4.
 // Every value rounds as attention_post_row computes it. Inputs that earlier kernels write
 // are not __restrict__, so that no load of them becomes a non-coherent load, which ptxas
 // may move above pdl_wait.
@@ -498,7 +574,8 @@ attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                          const __nv_bfloat16* __restrict__ q_scale, const __nv_bfloat16* r_raw,
                          const __nv_bfloat16* __restrict__ r_scale, __nv_bfloat16* k, __nv_bfloat16* v,
                          __nv_bfloat16* q, __nv_bfloat16* r, const uint32_t* start, int log_scale, float alpha,
-                         float n_floor, float qk_threshold, float rel_threshold, float eps) {
+                         float n_floor, float qk_threshold, float rel_threshold, float eps,
+                         const __nv_bfloat16* __restrict__ table, __nv_bfloat16* bias, int extent) {
     const int row = blockIdx.y;
     const int b = blockIdx.x;
     if (b >= kQBlock0) {
@@ -509,6 +586,49 @@ attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
         const auto scaled = [&](float x) {
             return log_scale ? __bfloat162float(__float2bfloat16(__fmul_rn(x, tau))) : x;
         };
+        if (b > kRBlock) {
+            // The relative bias of heads h0 .. h0 + kBiasHeads from their relative states,
+            // which these blocks compute as the r block does. Thread t takes table columns
+            // 4t.. and every 4 * kPostThreads further on.
+            __shared__ __align__(16) float rel_s[kBiasHeads][kRelDim];
+            const int h0 = (b - kRBlock - 1) * kBiasHeads;
+            if (threadIdx.x < kBiasHeads) {
+                float rel[kRelDim];
+                rel_head(r_raw, r_scale, row, h0 + threadIdx.x, rel_threshold, scaled, rel);
+#pragma unroll
+                for (int i = 0; i < kRelDim; ++i) {
+                    rel_s[threadIdx.x][i] = rel[i];
+                }
+            }
+            __syncthreads();
+            for (int c = kVec * threadIdx.x; c < extent; c += kVec * kPostThreads) {
+                float t[kVec][kRelDim];
+#pragma unroll
+                for (int k = 0; k < kRelDim; ++k) {
+                    float v[kVec];
+                    load_bf16x4(table + size_t(k) * extent + c, v);
+#pragma unroll
+                    for (int j = 0; j < kVec; ++j) {
+                        t[j][k] = v[j];
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < kBiasHeads; ++h) {
+                    float rv[kRelDim];
+#pragma unroll
+                    for (int k = 0; k < kRelDim; ++k) {
+                        rv[k] = rel_s[h][k];
+                    }
+                    float out[kVec];
+#pragma unroll
+                    for (int j = 0; j < kVec; ++j) {
+                        out[j] = relative_bias_dot(rv, t[j]);
+                    }
+                    store_bf16x4(bias + (size_t(row) * kQHeads + h0 + h) * extent + c, out);
+                }
+            }
+            return;
+        }
         if (b < kRBlock) {
             // Queries: the scaled L2 clip of each head, one warp per head.
             const int head = (b - kQBlock0) * kHeadsPerBlock + threadIdx.x / 32;
@@ -534,33 +654,12 @@ attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
         if (head >= kQHeads) {
             return;
         }
-        const size_t at = (size_t(row) * kQHeads + head) * kRelDim;
-        float x[kRelDim];
+        float rel[kRelDim];
+        rel_head(r_raw, r_scale, row, head, rel_threshold, scaled, rel);
 #pragma unroll
         for (int i = 0; i < kRelDim; i += kVec) {
-            float part[kVec];
-            float sc[kVec];
-            load_bf16x4(r_raw + at + i, part);
-            load_bf16x4(r_scale + head * kRelDim + i, sc);
-#pragma unroll
-            for (int j = 0; j < kVec; ++j) {
-                x[i + j] = __fmul_rn(part[j], sc[j]);
-            }
-        }
-        float acc = 0.f;
-#pragma unroll
-        for (int i = 0; i < kRelDim; ++i) {
-            acc = __fadd_rn(acc, __fmul_rn(x[i], x[i]));
-        }
-        const float factor = l2_clip_factor(acc, rel_threshold);
-#pragma unroll
-        for (int i = 0; i < kRelDim; i += kVec) {
-            float part[kVec];
-#pragma unroll
-            for (int j = 0; j < kVec; ++j) {
-                part[j] = scaled(__bfloat162float(__float2bfloat16(__fmul_rn(x[i + j], factor))));
-            }
-            store_bf16x4(r + at + i, part);
+            const float part[kVec] = {rel[i], rel[i + 1], rel[i + 2], rel[i + 3]};
+            store_bf16x4(r + (size_t(row) * kQHeads + head) * kRelDim + i, part);
         }
         return;
     }

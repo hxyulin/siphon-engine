@@ -738,26 +738,9 @@ impl Model {
         let hidden = ctx.hidden();
         let mut visits = self.visits.iter_mut();
         let mut next_visit = || visits.next().context("fewer visit caches than visits");
-        // Each visit's layer and whether it takes messages: each visit starts prefetching the
-        // next one's weights, which need the visit after that.
-        let looped = core_end - core_start;
-        let plan: Vec<(usize, bool)> = cfg
-            .visit_layers(self.passes)
-            .into_iter()
-            .enumerate()
-            .map(|(v, layer)| {
-                (
-                    layer,
-                    v >= core_start + looped && v < core_start + self.passes * looped,
-                )
-            })
-            .collect();
-        let mut upcoming = plan.iter().skip(1).map(|&p| Some(p)).chain([None]);
-        let mut after = plan.iter().skip(2).map(|&p| Some(p)).chain([None, None]);
-        let mut next_plan = || Upcoming {
-            next: upcoming.next().flatten(),
-            after: after.next().flatten(),
-        };
+        let plan = visit_plan(cfg, self.passes);
+        let mut upcoming = plan.iter().map(|&(_, u)| u);
+        let mut next_plan = || upcoming.next().unwrap_or_default();
 
         // The embedding, its norm, and the first visit's attention inputs (see
         // `attention_inputs`), which go into the first block state and `qkv_in[0]`.
@@ -787,8 +770,8 @@ impl Model {
         };
         ctx.kernels.linear.prefetch(
             &ctx.stream,
-            &ctx.visit_prefetch(plan[0].0, plan[0].1),
-            ctx.prefetch_pace(plan[0].0),
+            &ctx.visit_prefetch(plan[0].0.0, plan[0].0.1, false),
+            ctx.prefetch_pace(plan[0].0.0),
         )?;
         for layer in 0..core_start {
             ctx.visit(
@@ -957,8 +940,37 @@ struct VisitPlan {
     next: Upcoming,
 }
 
+/// Each visit's layer and whether it takes messages, with the visits after it: each visit
+/// starts prefetching the next one's weights, which need the visit after that.
+fn visit_plan(cfg: &TextConfig, passes: usize) -> Vec<((usize, bool), Upcoming)> {
+    let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
+    let looped = core_end - core_start;
+    let plan: Vec<(usize, bool)> = cfg
+        .visit_layers(passes)
+        .into_iter()
+        .enumerate()
+        .map(|(v, layer)| {
+            (
+                layer,
+                v >= core_start + looped && v < core_start + passes * looped,
+            )
+        })
+        .collect();
+    (0..plan.len())
+        .map(|v| {
+            (
+                plan[v],
+                Upcoming {
+                    next: plan.get(v + 1).copied(),
+                    after: plan.get(v + 2).copied(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// The visits after one, whose weights it prefetches.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Upcoming {
     /// The next visit's layer and whether it takes messages.
     next: Option<(usize, bool)>,
@@ -1020,13 +1032,18 @@ impl Ctx {
     /// The weights a visit of `layer` reads first: the attention projections and, with
     /// `messages`, the message gates that build their inputs, then the fused attention
     /// step's small weights, which nothing has read since the previous step. The
-    /// projections are their FP8 copies when the layer has them.
-    fn visit_prefetch(&self, layer: usize, messages: bool) -> Vec<&dyn Prefetch> {
+    /// projections are their FP8 copies when the layer has them. With `rows`, the gates'
+    /// matrices are those a verify pass reads.
+    fn visit_prefetch(&self, layer: usize, messages: bool, rows: bool) -> Vec<&dyn Prefetch> {
         let w = &self.weights.layers[layer];
         let mut weights: Vec<&dyn Prefetch> = Vec::new();
         if let Some(gates) = w.message_gates.as_ref().filter(|_| messages) {
             for g in &gates[..3] {
-                weights.extend(g.decode_matrices());
+                weights.extend(if rows {
+                    g.rows_matrices()
+                } else {
+                    g.decode_matrices()
+                });
             }
         }
         let a = &w.attention;
@@ -1049,12 +1066,14 @@ impl Ctx {
 
     /// Starts prefetching what a visit of `layer` reads after its projections: the output
     /// projection, the MLP message gate if `gated`, then the projections of the visit
-    /// after it, `next`, or the start of the LM head after the last visit.
+    /// after it, `next`, or the start of the LM head after the last visit. With `rows`,
+    /// the gates' matrices are those a verify pass reads.
     fn prefetch_rest(
         &self,
         layer: usize,
         gated: bool,
         next: Option<(usize, bool)>,
+        rows: bool,
     ) -> anyhow::Result<()> {
         let w = &self.weights.layers[layer];
         let mut prefetch: Vec<&dyn Prefetch> = match &w.fp8 {
@@ -1062,11 +1081,19 @@ impl Ctx {
             None => vec![&w.attention.o],
         };
         if let Some(gates) = w.message_gates.as_ref().filter(|_| gated) {
-            prefetch.extend(gates[3].decode_matrices());
+            prefetch.extend(if rows {
+                gates[3].rows_matrices()
+            } else {
+                gates[3].decode_matrices()
+            });
+        }
+        if rows {
+            // The verify router loads its F32 weights only once its previous kernel ends.
+            prefetch.push(&w.router);
         }
         let lm_head_start;
         if let Some((layer, messages)) = next {
-            prefetch.extend(self.visit_prefetch(layer, messages));
+            prefetch.extend(self.visit_prefetch(layer, messages, rows));
         } else {
             // The last visit's experts leave DRAM bandwidth to spare for the start of the
             // LM head, which the step reads next.
@@ -1129,7 +1156,7 @@ impl Ctx {
         // starts the rest of its own here, and does not wait for its projections: they read
         // from DRAM alongside the prefetch.
         if layer == 0 {
-            self.prefetch_rest(layer, gates.is_some(), next.next)?;
+            self.prefetch_rest(layer, gates.is_some(), next.next, false)?;
         }
 
         // The normalized visit input goes straight into the new block state at a block start.
@@ -1238,7 +1265,7 @@ impl Ctx {
         // waits for this visit's prefetch, which has usually finished by then.
         if let Some((layer, messages)) = next.next {
             self.kernels.linear.join_prefetch(&self.stream)?;
-            self.prefetch_rest(layer, messages, next.after)?;
+            self.prefetch_rest(layer, messages, next.after, false)?;
         }
         if !fused {
             self.kernels.conv.moe_conv_residual(

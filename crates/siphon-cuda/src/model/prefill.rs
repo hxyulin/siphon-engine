@@ -19,12 +19,13 @@ use half::bf16;
 use siphon::TextConfig;
 
 use super::{
-    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, VisitState, verify::VerifyBuffers,
-    zeros,
+    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, Upcoming, VisitState,
+    verify::VerifyBuffers, visit_plan, zeros,
 };
 use crate::{
     ops::{
         attention,
+        conv::VisitConvs,
         experts::{ExpertScratch, QuantizedRows},
         linear_fp8::Fp8Matrix,
         misc::{GATE_SLOTS, MessageMix},
@@ -40,6 +41,9 @@ pub const MAX_PREFILL_CHUNK: usize = attention::MAX_PREFILL_ROWS;
 /// The fastest chunk size measured: each expert weight read serves the most rows. Time to
 /// first token for 32K tokens was 2.93 s at 512 rows, 2.55 s at 1024 and 2.39 s at 2048.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+/// Most rows whose visit ends in one kernel that also shifts every conv state
+/// (`Conv::moe_conv_residual_step_rows`); larger chunks shift each state separately.
+const STEP_ROWS: usize = VERIFY_ROWS;
 /// Rows the LM head runs at once when every row's logits are wanted: 32 rows of 201,024
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
@@ -99,8 +103,7 @@ struct MoeRows {
     /// Whether the router and experts run the multi-row step kernels, whose rows are the
     /// same bit for bit for any row count (see [`PrefillScratch::new`]).
     invariant: bool,
-    /// The counters of the multi-row router and expert kernels, left zero by each call.
-    router_counter: CudaSlice<u32>,
+    /// The counters of the multi-row expert kernel, left zero by each call.
     expert_sync: CudaSlice<u32>,
     logits: CudaSlice<f32>,
     router: RouterRowsScratch,
@@ -242,7 +245,6 @@ impl PrefillScratch {
             mlp_x: zeros(stream, rows * hidden)?,
             moe: MoeRows {
                 invariant,
-                router_counter: zeros(stream, 1)?,
                 expert_sync: zeros(stream, 1 + rows * top_k)?,
                 logits: zeros(stream, rows * cfg.n_routed_experts)?,
                 router: RouterRowsScratch::new(stream, rows)?,
@@ -475,9 +477,29 @@ impl Ctx {
         let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
         let hidden = self.hidden();
         let mh = m * hidden;
+        // A verify pass with FP8 dense weights prefetches each visit's dense weights into L2
+        // beside the main stream, as a decode step does (see `Ctx::visit`). With BF16
+        // weights the prefetch made every width slower, paced or not: at 10,674 tokens and
+        // 1, 4 and 8 rows, 5.61, 7.68 and 9.89 ms with it against 5.38, 7.20 and 9.29
+        // without.
+        let prefetch = p.verify.is_some() && self.weights.lm_head_fp8.is_some();
+        let plan = visit_plan(cfg, passes);
+        if prefetch {
+            let (layer, messages) = plan.first().context("no visits")?.0;
+            self.kernels.linear.prefetch(
+                &self.stream,
+                &self.visit_prefetch(layer, messages, true),
+                self.prefetch_pace(layer),
+            )?;
+        }
+        let mut plan = plan
+            .iter()
+            .map(|&(_, upcoming)| prefetch.then_some(upcoming));
         let mut visits = visits.iter_mut().enumerate();
-        let mut next_visit = || visits.next().context("fewer visit caches than visits");
-
+        let mut next_visit = || {
+            let visit = visits.next().context("fewer visit caches than visits")?;
+            Ok::<_, anyhow::Error>((visit, plan.next().flatten()))
+        };
         if let Some(v) = p.verify.as_mut() {
             self.kernels
                 .spec
@@ -580,6 +602,9 @@ impl Ctx {
             self.visit_rows(p, next_visit()?, layer, &mut blocks, false, m)?;
         }
         let verify = p.verify.is_some();
+        if prefetch {
+            self.kernels.linear.join_prefetch(&self.stream)?;
+        }
         let skip_logits = !final_chunk && matches!(logits, PrefillLogits::Last);
         if skip_logits && !verify && !p.record_taps {
             return Ok(());
@@ -750,7 +775,7 @@ impl Ctx {
     fn visit_rows(
         &self,
         p: &mut PrefillScratch,
-        (index, state): (usize, &mut VisitState),
+        ((index, state), upcoming): ((usize, &mut VisitState), Option<Upcoming>),
         layer: usize,
         blocks: &mut Blocks,
         messages: bool,
@@ -784,6 +809,13 @@ impl Ctx {
         } else {
             None
         };
+        // The first visit starts prefetching the rest of its own weights; later visits had
+        // theirs started by the visit before.
+        if let Some(next) = upcoming
+            && index == 0
+        {
+            self.prefetch_rest(layer, gates.is_some(), next.next, true)?;
+        }
 
         // The normalized visit input goes straight into the new block state at a block start.
         // Elsewhere nothing reads it.
@@ -830,6 +862,8 @@ impl Ctx {
             [q_in, k_in, v_in].map(|x| rows(x, m, hidden)),
             m,
         )?;
+        // Up to STEP_ROWS rows, the kernel that ends the visit shifts every conv state.
+        let step = m <= STEP_ROWS;
 
         // The post-attention conv and residual add run inside the MLP's depth attention.
         // Without message gates, its output goes straight to the router input after the
@@ -881,13 +915,15 @@ impl Ctx {
             },
             self.eps(),
         )?;
-        self.kernels.conv.shift_state(
-            &self.stream,
-            &rows(&p.attention.proj, m, hidden),
-            &mut state.conv[2],
-            hidden,
-            m,
-        )?;
+        if !step {
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &rows(&p.attention.proj, m, hidden),
+                &mut state.conv[2],
+                hidden,
+                m,
+            )?;
+        }
         if let Some(gates) = gates {
             self.message_gate_rows(
                 &gates[3..],
@@ -904,7 +940,45 @@ impl Ctx {
             )?;
         }
         self.moe_block_rows(w, &mut p.moe, &p.mlp_x, m)?;
+        // The experts are the visit's last DRAM stream, so the next visits' weights start
+        // as soon as they finish.
+        if let Some(Upcoming {
+            next: Some((layer, messages)),
+            after,
+        }) = upcoming
+        {
+            self.kernels.linear.join_prefetch(&self.stream)?;
+            self.prefetch_rest(layer, messages, after, true)?;
+        }
 
+        if step {
+            let [k_state, v_state, proj_state, moe_state] = &mut state.conv;
+            let len = VERIFY_ROWS * VISIT_CHANNELS;
+            self.kernels.conv.moe_conv_residual_step_rows(
+                &self.stream,
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
+                &w.post_mlp_conv,
+                moe_state,
+                &rows(&p.residual, m, hidden),
+                &mut rows_mut(&mut p.out, m, hidden),
+                VisitConvs {
+                    proj: rows(&p.attention.proj, m, hidden),
+                    proj_state,
+                    k_raw: rows(&p.attention.k_raw, m, kv_dims),
+                    v_raw: rows(&p.attention.v_raw, m, kv_dims),
+                    k_state,
+                    v_state,
+                    inputs: p
+                        .verify
+                        .as_mut()
+                        .map(|v| v.inputs.slice_mut(index * len..(index + 1) * len)),
+                },
+                m,
+            )?;
+            std::mem::swap(&mut p.hidden, &mut p.out);
+            return Ok(());
+        }
         self.kernels.conv.moe_conv_residual_rows(
             &self.stream,
             &rows(&p.moe.down, m, 8 * hidden),
@@ -916,19 +990,6 @@ impl Ctx {
             &mut rows_mut(&mut p.out, m, hidden),
             m,
         )?;
-        if let Some(v) = p.verify.as_mut() {
-            let len = VERIFY_ROWS * VISIT_CHANNELS;
-            self.kernels.spec.conv_inputs_rows(
-                &self.stream,
-                &rows(&p.attention.k_raw, m, kv_dims),
-                &rows(&p.attention.v_raw, m, kv_dims),
-                &rows(&p.attention.proj, m, hidden),
-                &rows(&p.moe.down, m, 8 * hidden),
-                &rows(&p.moe.weights, m, 8),
-                &mut v.inputs.slice_mut(index * len..(index + 1) * len),
-                m,
-            )?;
-        }
         std::mem::swap(&mut p.hidden, &mut p.out);
         Ok(())
     }
@@ -1154,30 +1215,42 @@ impl Ctx {
                 qk_threshold: cfg.qk_l2_clip_threshold,
                 rel_threshold: cfg.rel_l2_clip_threshold,
                 eps: self.eps(),
+                // Up to STEP_ROWS rows, the same launch computes the relative bias.
+                bias: (m <= STEP_ROWS).then(|| {
+                    (
+                        &a.rel_table,
+                        rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
+                    )
+                }),
             },
             m,
         )?;
-        let [k_state, v_state, ..] = &mut state.conv;
-        self.kernels.conv.shift_state(
-            &self.stream,
-            &rows(&t.k_raw, m, kv_dims),
-            k_state,
-            kv_dims,
-            m,
-        )?;
-        self.kernels.conv.shift_state(
-            &self.stream,
-            &rows(&t.v_raw, m, kv_dims),
-            v_state,
-            kv_dims,
-            m,
-        )?;
-        self.kernels.attention.relative_bias_rows(
-            &self.stream,
-            &rows(&t.r, m, rel_dims),
-            &a.rel_table,
-            &mut rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
-        )?;
+        // Up to STEP_ROWS rows, the kernel that ends the visit shifts the states.
+        if m > STEP_ROWS {
+            let [k_state, v_state, ..] = &mut state.conv;
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &rows(&t.k_raw, m, kv_dims),
+                k_state,
+                kv_dims,
+                m,
+            )?;
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &rows(&t.v_raw, m, kv_dims),
+                v_state,
+                kv_dims,
+                m,
+            )?;
+        }
+        if m > STEP_ROWS {
+            self.kernels.attention.relative_bias_rows(
+                &self.stream,
+                &rows(&t.r, m, rel_dims),
+                &a.rel_table,
+                &mut rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
+            )?;
+        }
 
         if invariant {
             self.kernels.attention.attention_rows(
@@ -1190,8 +1263,9 @@ impl Ctx {
                 m,
                 &rows(&t.bias, m, heads * cfg.rel_extent),
                 &rows(&t.sinks, m, heads),
+                Some(&rows(&t.gate, m, q_dims)),
                 &mut t.rows,
-                &mut rows_mut(&mut t.out, m, q_dims),
+                &mut rows_mut(&mut t.gated, m, q_dims),
             )?;
         } else {
             self.attention_rows(
@@ -1206,13 +1280,13 @@ impl Ctx {
                 &mut t.partials,
                 &mut rows_mut(&mut t.out, m, q_dims),
             )?;
+            self.kernels.elementwise.attention_gate(
+                &self.stream,
+                &rows(&t.out, m, q_dims),
+                &rows(&t.gate, m, q_dims),
+                &mut rows_mut(&mut t.gated, m, q_dims),
+            )?;
         }
-        self.kernels.elementwise.attention_gate(
-            &self.stream,
-            &rows(&t.out, m, q_dims),
-            &rows(&t.gate, m, q_dims),
-            &mut rows_mut(&mut t.gated, m, q_dims),
-        )?;
         self.gemm_rows(
             &mut [RowProduct {
                 weight: &a.o,
@@ -1337,7 +1411,6 @@ impl Ctx {
                 &mut rows_mut(&mut t.logits, m, cfg.n_routed_experts),
                 &mut rows_mut(&mut t.indices, m, top_k),
                 &mut rows_mut(&mut t.weights, m, top_k),
-                &mut t.router_counter,
                 cfg.route_scale,
                 m,
             )?;

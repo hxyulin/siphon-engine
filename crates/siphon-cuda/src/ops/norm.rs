@@ -29,6 +29,9 @@ const CONV_TAPS: usize = 4;
 /// and one more block for the relative-position heads.
 const POST_THREADS: u32 = 128;
 const POST_BLOCKS: u32 = ((2 * KV_HEADS + Q_HEADS) / 4 + 1) as u32;
+/// Blocks per row of `attention_post_rows_bf16` that compute the relative bias,
+/// `kBiasBlocks` in the kernel.
+const BIAS_BLOCKS: u32 = 24;
 
 /// The key and value convolutions of [`Norm::attention_post`].
 pub enum KvConvWeights<'a> {
@@ -95,6 +98,9 @@ pub struct AttentionPostRows<'a> {
     pub qk_threshold: f32,
     pub rel_threshold: f32,
     pub eps: f32,
+    /// The layer's relative bias table `[16, extent]` and the bias `[rows, 24, extent]` to
+    /// compute from the rows' relative states, as `Attention::relative_bias_rows` does.
+    pub bias: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
 }
 
 #[derive(Debug)]
@@ -108,6 +114,29 @@ pub struct Norm {
     l2_clip_bf16_16: CudaFunction,
     attention_post_bf16: CudaFunction,
     attention_post_rows_bf16: CudaFunction,
+}
+
+/// The extent of a relative bias table `[16, extent]`, after checking that the bias holds
+/// `rows` rows of 24 heads of it; 0 without one.
+fn bias_extent(
+    bias: Option<&(&CudaSlice<bf16>, CudaViewMut<'_, bf16>)>,
+    rows: usize,
+) -> anyhow::Result<usize> {
+    let Some((table, bias)) = bias else {
+        return Ok(0);
+    };
+    ensure!(
+        table.len().is_multiple_of(4 * REL_DIM) && !table.is_empty(),
+        "table has {} elements, not [16, a multiple of 4]",
+        table.len()
+    );
+    let extent = table.len() / REL_DIM;
+    ensure!(
+        bias.len() == rows * Q_HEADS * extent,
+        "bias has {} elements, expected {rows} x {Q_HEADS} x {extent}",
+        bias.len()
+    );
+    Ok(extent)
 }
 
 /// Row count of `x` as a grid dimension, after checking that `x` holds whole rows of `width`.
@@ -468,9 +497,10 @@ impl Norm {
         check("r_raw", a.r_raw.len(), rows * Q_HEADS * REL_DIM)?;
         check("r", a.r.len(), rows * Q_HEADS * REL_DIM)?;
         check("r_scale", a.r_scale.len(), Q_HEADS * REL_DIM)?;
+        let extent = bias_extent(a.bias.as_ref(), rows)?;
         let config = LaunchConfig {
             grid_dim: (
-                POST_BLOCKS,
+                POST_BLOCKS + if a.bias.is_some() { BIAS_BLOCKS } else { 0 },
                 u32::try_from(rows).context("too many rows")?,
                 1,
             ),
@@ -516,6 +546,7 @@ impl Norm {
             None => (None, 0, 0.0, 1.0),
         };
         let (mut k_out, mut v_out, mut q_out, mut r_out) = (a.k, a.v, a.q, a.r);
+        let (table, mut bias) = a.bias.unzip();
         args.ptr(a.k_state, stream)
             .ptr(a.v_state, stream)
             .ptr(&a.q_raw, stream)
@@ -532,12 +563,17 @@ impl Norm {
             .f32(n_floor)
             .f32(a.qk_threshold)
             .f32(a.rel_threshold)
-            .f32(a.eps);
+            .f32(a.eps)
+            .opt(table, stream)
+            .opt_mut(bias.as_mut(), stream)
+            .i32(i32::try_from(extent)?);
         // SAFETY: the arguments match `attention_post_rows_bf16`'s signature, which is
-        // `attention_post_bf16`'s with `start` for `position`. Every per-row buffer holds
-        // `rows` rows as checked above and the grid has one y index per row; the kernel reads
-        // no null pointer (the static conv weights only without dynamic taps, `start` only
-        // with log scaling), writes no state, and reads nothing before `pdl_wait`.
+        // `attention_post_bf16`'s with `start` for `position`, then the table, the bias and
+        // the extent. Every per-row buffer holds `rows` rows as checked above and the grid
+        // has one y index per row, and bias blocks only with a table and a bias of `rows` x
+        // 24 x extent; the kernel reads no null pointer (the static conv weights only
+        // without dynamic taps, `start` only with log scaling), writes no state, and reads
+        // nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.attention_post_rows_bf16, config) }
     }
 }

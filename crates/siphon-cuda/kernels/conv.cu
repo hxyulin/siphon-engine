@@ -310,6 +310,191 @@ moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
     }
 }
 
+namespace {
+
+// Channels per thread and threads per block of moe_conv_residual_step_rows_2304. The
+// kernel is bound by the latency of its loads, so it runs one channel per thread over more
+// warps: 4 channels per thread in 3 blocks took 4.4 us at one row and 7.5 us at four.
+constexpr int kStepCols = 1;
+constexpr int kStepThreads = 128;
+constexpr int kStepBlockCols = kStepCols * kStepThreads;
+static_assert(kHidden % kStepBlockCols == 0, "blocks cover the row");
+
+__device__ __forceinline__ void load_bf16s(const __nv_bfloat16* p, float (&v)[kStepCols]) {
+#pragma unroll
+    for (int j = 0; j < kStepCols; ++j) {
+        v[j] = __bfloat162float(p[j]);
+    }
+}
+
+// The last 3 rows of `old` followed by the `rows` values of `x` (stride `dims`) into
+// `state`, for the thread's channels from c: new row k is window row k + rows.
+__device__ __forceinline__ void shift_step(float* state, const float (&old)[kKernel - 1][kStepCols],
+                                           const __nv_bfloat16* x, int dims, int c, int rows) {
+#pragma unroll
+    for (int k = 0; k < kKernel - 1; ++k) {
+        const int i = k + rows;
+        float v[kStepCols];
+        if (i < kKernel - 1) {
+#pragma unroll
+            for (int j = 0; j < kStepCols; ++j) {
+                v[j] = old[i][j];
+            }
+        } else {
+            load_bf16s(x + size_t(i - (kKernel - 1)) * dims + c, v);
+        }
+#pragma unroll
+        for (int j = 0; j < kStepCols; ++j) {
+            state[size_t(k) * dims + c + j] = v[j];
+        }
+    }
+}
+
+__device__ __forceinline__ void load_state_step(const float* state, int dims, int c,
+                                                float (&old)[kKernel - 1][kStepCols]) {
+#pragma unroll
+    for (int k = 0; k < kKernel - 1; ++k) {
+#pragma unroll
+        for (int j = 0; j < kStepCols; ++j) {
+            old[k][j] = state[size_t(k) * dims + c + j];
+        }
+    }
+}
+
+__device__ __forceinline__ void copy_step(__nv_bfloat16* dst, const __nv_bfloat16* src) {
+#pragma unroll
+    for (int j = 0; j < kStepCols; ++j) {
+        dst[j] = src[j];
+    }
+}
+
+constexpr int kKvDims = 1024;
+// One row of a verify's conv inputs (see spec.cu): keys, values, post-attention and
+// post-MLP inputs.
+constexpr int kVisitChannels = 2 * kKvDims + 2 * kHidden;
+
+}  // namespace
+
+// moe_conv_residual_rows_2304 for the 1 to 8 rows of a step, which also does the work of
+// the kernels after it in a visit of a step: it shifts the rows' inputs into all four conv
+// states of the visit, as shift_state_rows does, from `k_raw`, `v_raw` ([rows, 1024]),
+// `proj` and the combines, after every kernel that reads those states has run. With a
+// non-null `inputs`, it also records the rows' conv inputs into inputs [8, 6656] as
+// conv_rollback in spec.cu reads them. Each thread owns kStepCols channels of every stream,
+// so it alone reads and writes them. Every row rounds as moe_conv_residual_rows_2304 does.
+// Grid: 2304 / kStepBlockCols blocks of kStepThreads threads.
+extern "C" __global__ void __launch_bounds__(kStepThreads)
+moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weights,
+                                 const __nv_bfloat16* __restrict__ weight, float* state,
+                                 const float* residual, __nv_bfloat16* __restrict__ out, int rows,
+                                 const __nv_bfloat16* proj, float* proj_state,
+                                 const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
+                                 float* k_state, float* v_state, __nv_bfloat16* inputs) {
+    const int c0 = blockIdx.x * kStepBlockCols + threadIdx.x * kStepCols;
+    const bool kv = c0 < kKvDims;
+    float taps[kStepCols][kKernel];
+#pragma unroll
+    for (int j = 0; j < kStepCols; ++j) {
+        load_bf16x4(weight + size_t(c0 + j) * kKernel, taps[j]);
+    }
+    pdl_trigger();
+    pdl_wait();
+    // comb[i] holds the combine of row i - 3, or state row i for i < 3.
+    constexpr int kWindowRows = kMoeConvRows + kKernel - 1;
+    float comb[kWindowRows][kStepCols];
+#pragma unroll
+    for (int i = 0; i < kWindowRows; ++i) {
+        const int r = i - (kKernel - 1);
+        if (r < 0) {
+#pragma unroll
+            for (int j = 0; j < kStepCols; ++j) {
+                comb[i][j] = state[size_t(i) * kHidden + c0 + j];
+            }
+        } else if (r < rows) {
+            const __nv_bfloat16* e = experts + size_t(r) * kTopK * kHidden + c0;
+            const float* w = weights + size_t(r) * kTopK;
+            float total[kStepCols] = {};
+#pragma unroll
+            for (int x = 0; x < kTopK; ++x) {
+                float v[kStepCols];
+                load_bf16s(e + size_t(x) * kHidden, v);
+                const float wx = w[x];
+#pragma unroll
+                for (int j = 0; j < kStepCols; ++j) {
+                    total[j] = __fadd_rn(total[j], __fmul_rn(v[j], wx));
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kStepCols; ++j) {
+                comb[i][j] = round_bf16(total[j]);
+            }
+        }
+    }
+    float proj_old[kKernel - 1][kStepCols];
+    load_state_step(proj_state, kHidden, c0, proj_old);
+    float k_old[kKernel - 1][kStepCols];
+    float v_old[kKernel - 1][kStepCols];
+    if (kv) {
+        load_state_step(k_state, kKvDims, c0, k_old);
+        load_state_step(v_state, kKvDims, c0, v_old);
+    }
+#pragma unroll
+    for (int i = kKernel - 1; i < kWindowRows; ++i) {
+        const int r = i - (kKernel - 1);
+        if (r >= rows) {
+            break;
+        }
+        __nv_bfloat16 o[kStepCols];
+        __nv_bfloat16 cb[kStepCols];
+#pragma unroll
+        for (int j = 0; j < kStepCols; ++j) {
+            cb[j] = __float2bfloat16(comb[i][j]);
+            // short_conv_window in conv_step.cuh, over rows r - 3 .. r.
+            float acc = 0.f;
+#pragma unroll
+            for (int k = 0; k < kKernel; ++k) {
+                acc = __fadd_rn(acc, __fmul_rn(round_bf16(comb[i - (kKernel - 1) + k][j]), taps[j][k]));
+            }
+            const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), comb[i][j]), kShortDivisor));
+            o[j] = __float2bfloat16(__fadd_rn(residual[size_t(r) * kHidden + c0 + j], y));
+        }
+        copy_step(out + size_t(r) * kHidden + c0, o);
+        // The last 3 rows' combines become the post-MLP state, row k = r + 3 - rows.
+        if (r + kKernel - 1 >= rows) {
+#pragma unroll
+            for (int j = 0; j < kStepCols; ++j) {
+                state[size_t(r + kKernel - 1 - rows) * kHidden + c0 + j] = comb[i][j];
+            }
+        }
+        if (inputs != nullptr) {
+            __nv_bfloat16* row = inputs + size_t(r) * kVisitChannels;
+            copy_step(row + 2 * kKvDims + kHidden + c0, cb);
+            copy_step(row + 2 * kKvDims + c0, proj + size_t(r) * kHidden + c0);
+            if (kv) {
+                copy_step(row + c0, k_raw + size_t(r) * kKvDims + c0);
+                copy_step(row + kKvDims + c0, v_raw + size_t(r) * kKvDims + c0);
+            }
+        }
+    }
+    // With fewer than 3 rows, old state row k + rows moves to row k. Selects, not an
+    // indexed register array, which nvcc turns into a jump table.
+#pragma unroll
+    for (int k = 0; k < kKernel - 2; ++k) {
+        if (k + rows < kKernel - 1) {
+            const bool second = k + rows == 2;
+#pragma unroll
+            for (int j = 0; j < kStepCols; ++j) {
+                state[size_t(k) * kHidden + c0 + j] = second ? comb[2][j] : comb[1][j];
+            }
+        }
+    }
+    shift_step(proj_state, proj_old, proj, kHidden, c0, rows);
+    if (kv) {
+        shift_step(k_state, k_old, k_raw, kKvDims, c0, rows);
+        shift_step(v_state, v_old, v_raw, kKvDims, c0, rows);
+    }
+}
+
 // Shifts the conv inputs x [rows, dims] of a chunk into state [3, dims]: afterwards the
 // state holds the last three rows of the old state followed by x. One thread per channel.
 extern "C" __global__ void shift_state_rows(const __nv_bfloat16* x, float* state,

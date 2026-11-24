@@ -49,8 +49,9 @@ constexpr int kMaxRows = 8;
 constexpr int kMaxPairs = kMaxRows * 8;
 // Warps per block; each runs its own tasks.
 constexpr int kWarps = 4;
-// Ring slots per warp: copies run kRing - 1 stages ahead of the products.
-constexpr int kRing = 3;
+// Ring slots per warp: copies run kRing - 1 stages ahead of the products. The launcher picks
+// 4 slots for 1 to 3 rows, where fewer warps run deeper copies faster, and 3 above.
+// The ring changes when loads issue, not the arithmetic, so results do not depend on it.
 // Bytes of each weight row per stage: 128, or 64 for NVFP4's w2, whose rows are 576 bytes.
 constexpr int kStageBytes = 128;
 constexpr int kK13 = 2304;
@@ -194,7 +195,7 @@ __device__ __forceinline__ int slot_index(int r, int c) {
 // into the accumulators of the m16n8 fragment: acc[0], acc[1] are row g and columns 2t,
 // 2t + 1; acc[2], acc[3] are row g + 8. `ready()` runs after the first weight copies are
 // issued and before anything reads `x`.
-template <bool kFp4, int K, typename Ready>
+template <bool kFp4, int K, int kRing, typename Ready>
 __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s, int row0,
                                              const __nv_bfloat16* x, uint4* ring, int lane,
                                              uint64_t policy, float* acc, Ready ready) {
@@ -218,19 +219,47 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
         }
         commit();
     };
-#pragma unroll
-    for (int i = 0; i < kRing - 1; ++i) {
-        issue(i);
-    }
-    ready();
     const uint8_t* sa_row = s + size_t(row0 + g) * G::kRowScales;
     const uint8_t* sb_row = s + size_t(row0 + g + 8) * G::kRowScales;
+    // The block scales of stage i, which come from DRAM like the weights: they load with
+    // the stage's weight copies, kRing - 1 stages ahead, and move down a register ring.
+    // Loading them when the stage starts left a DRAM round trip in every stage.
+    const auto load_scales = [&](int i, uint32_t (&sa)[kJ], uint32_t (&sb)[kJ]) {
+        if (i < G::kStages) {
+#pragma unroll
+            for (int j = 0; j < kJ; ++j) {
+                const int k = i * G::kKPerStage + (4 * j + t) * G::kValues;
+                if constexpr (kFp4) {
+                    sa[j] = load_scale_u16(sa_row + k / G::kGroup, policy);
+                    sb[j] = load_scale_u16(sb_row + k / G::kGroup, policy);
+                } else {
+                    sa[j] = load_scale_u8(sa_row + k / G::kGroup, policy);
+                    sb[j] = load_scale_u8(sb_row + k / G::kGroup, policy);
+                }
+            }
+        }
+    };
+    // ra[q], rb[q]: the scales of stage i + q.
+    uint32_t ra[kRing - 1][kJ];
+    uint32_t rb[kRing - 1][kJ];
+#pragma unroll
+    for (int q = 0; q < kRing - 1; ++q) {
+        issue(q);
+        load_scales(q, ra[q], rb[q]);
+    }
+    ready();
     for (int i = 0; i < G::kStages; ++i) {
         issue(i + kRing - 1);
-        // The stage's inputs and scales load while its weights arrive.
+        uint32_t na[kJ], nb[kJ];
+        load_scales(i + kRing - 1, na, nb);
+        uint32_t sa[kJ], sb[kJ];
+#pragma unroll
+        for (int j = 0; j < kJ; ++j) {
+            sa[j] = ra[0][j];
+            sb[j] = rb[0][j];
+        }
+        // The stage's inputs load from L2 while its weights arrive.
         uint4 xv[kJ][kXVecs];
-        uint32_t sa[kJ];
-        uint32_t sb[kJ];
 #pragma unroll
         for (int j = 0; j < kJ; ++j) {
             const int k = i * G::kKPerStage + (4 * j + t) * G::kValues;
@@ -238,13 +267,6 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
             for (int h = 0; h < kXVecs; ++h) {
                 xv[j][h] = x != nullptr ? reinterpret_cast<const uint4*>(x + k)[h]
                                         : make_uint4(0, 0, 0, 0);
-            }
-            if constexpr (kFp4) {
-                sa[j] = load_scale_u16(sa_row + k / G::kGroup, policy);
-                sb[j] = load_scale_u16(sb_row + k / G::kGroup, policy);
-            } else {
-                sa[j] = load_scale_u8(sa_row + k / G::kGroup, policy);
-                sb[j] = load_scale_u8(sb_row + k / G::kGroup, policy);
             }
         }
         wait_copies<kRing - 1>();
@@ -310,10 +332,20 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
         }
         // Every lane has read the slot before a later stage overwrites it.
         __syncwarp();
+#pragma unroll
+        for (int j = 0; j < kJ; ++j) {
+#pragma unroll
+            for (int q = 0; q + 1 < kRing - 1; ++q) {
+                ra[q][j] = ra[q + 1][j];
+                rb[q][j] = rb[q + 1][j];
+            }
+            ra[kRing - 2][j] = na[j];
+            rb[kRing - 2][j] = nb[j];
+        }
     }
 }
 
-template <bool kFp4>
+template <bool kFp4, int kRing>
 __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const int32_t* indices,
                                                 int m, const uint8_t* w13, const uint8_t* s13,
                                                 const float* g13, const uint8_t* w2,
@@ -389,7 +421,7 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
         const int mine = g < count ? expert_pairs[ordinal][g] : -1;
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
         if (up_proj) {
-            tile_product<kFp4, kK13>(w13 + size_t(e) * kN13 * G13::kRowBytes,
+            tile_product<kFp4, kK13, kRing>(w13 + size_t(e) * kN13 * G13::kRowBytes,
                                      s13 + size_t(e) * kN13 * G13::kRowScales, row0,
                                      mine >= 0 ? x + size_t(mine / 8) * kK13 : nullptr, ring,
                                      lane, policy, acc, [] {});
@@ -419,7 +451,7 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
             // The first stages of the tile's weights copy while the warp waits for the
             // activations. Prefetching the whole tile into L2 as well was slower: 4.93 ms per
             // step at 8 rows against 4.58, since it competes with the w13 tiles still running.
-            tile_product<kFp4, kK2>(w2e, s2 + size_t(e) * kN2 * G2::kRowScales, row0,
+            tile_product<kFp4, kK2, kRing>(w2e, s2 + size_t(e) * kN2 * G2::kRowScales, row0,
                                     mine >= 0 ? act + size_t(mine) * kK2 : nullptr, ring, lane,
                                     policy, acc, [&] {
                                         if (lane == 0) {
@@ -466,18 +498,20 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
 // - `act`: BF16 `[m * 8, 1152]`, written; `out`: BF16 `[m * 8, 2304]`, pair `8 r + s` for
 //   row r and slot s;
 // - `sync`: 1 + 8 m zeros, left zero.
-// Blocks of kWarps warps with kWarps x kRing slots of dynamic shared memory; every block
-// of the grid must be resident at once.
-#define EXPERT_MLP_ROWS(name, fp4)                                                                 \
+// Blocks of kWarps warps with kWarps x ring slots of dynamic shared memory; every block of
+// the grid must be resident at once. `expert_mlp_rows_<format>_<ring>` runs `ring` slots.
+#define EXPERT_MLP_ROWS(name, fp4, RING)                                                           \
     extern "C" __global__ void __launch_bounds__(kWarps * 32)                                       \
         name(const __nv_bfloat16* x, const int32_t* indices, int m, const uint8_t* w13,            \
              const uint8_t* s13, const float* g13, const uint8_t* w2, const uint8_t* s2,           \
              const float* g2, __nv_bfloat16* act, __nv_bfloat16* out, float gate_softcap,          \
              float up_softcap, uint32_t* sync) {                                                   \
         extern __shared__ uint4 ring[];                                                            \
-        expert_mlp_rows<fp4>(x, indices, m, w13, s13, g13, w2, s2, g2, act, out, gate_softcap,     \
-                             up_softcap, sync, ring);                                              \
+        expert_mlp_rows<fp4, RING>(x, indices, m, w13, s13, g13, w2, s2, g2, act, out,             \
+                                   gate_softcap, up_softcap, sync, ring);                          \
     }
 
-EXPERT_MLP_ROWS(expert_mlp_rows_nvfp4, true)
-EXPERT_MLP_ROWS(expert_mlp_rows_mxfp8, false)
+EXPERT_MLP_ROWS(expert_mlp_rows_nvfp4_3, true, 3)
+EXPERT_MLP_ROWS(expert_mlp_rows_mxfp8_3, false, 3)
+EXPERT_MLP_ROWS(expert_mlp_rows_nvfp4_4, true, 4)
+EXPERT_MLP_ROWS(expert_mlp_rows_mxfp8_4, false, 4)

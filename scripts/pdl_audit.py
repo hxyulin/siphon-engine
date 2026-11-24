@@ -67,6 +67,11 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     "attention_post_bf16": {"position"},
     # The embedding norm and the first layer's input norm.
     "decode_prologue_2304": {"embed_norm", "input_norm"},
+    # The multi-row attention copies its first cache tiles before the wait: the host
+    # uploads the start before the pass, and only the visit's own combine, after it,
+    # appends to the cache.
+    **{f"attention_rows_{f}_{nq}": {"k_cache", "v_cache", "start"}
+       for f in ("bf16", "fp8") for nq in (1, 2, 3)},
 }
 
 # Pointer fields of struct parameters, by (kernel file, type name): the stride of the

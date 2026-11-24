@@ -164,6 +164,8 @@ struct Bf16Format {
     __device__ static void unpack4(const Elem* p, float (&v)[4]) {
         unpack_bf16x4(*reinterpret_cast<const uint2*>(p), v);
     }
+    // Stores one BF16 value as it is.
+    __device__ static void store1(Elem* p, __nv_bfloat16 x) { *p = x; }
     // Stores 4 values that are already BF16 values.
     __device__ static void store4(Elem* p, const float (&v)[4]) {
         const __nv_bfloat162 lo = __floats2bfloat162_rn(v[0], v[1]);
@@ -184,6 +186,10 @@ struct Fp8Format {
     // Stores 4 BF16 values rounded to E4M3 as kv_append_fp8 does.
     __device__ static void store4(Elem* p, const float (&v)[4]) {
         *reinterpret_cast<uint32_t*>(p) = pack_e4m3x4(v[0], v[1], v[2], v[3]);
+    }
+    // Stores one BF16 value rounded to E4M3 as kv_append_fp8 does.
+    __device__ static void store1(Elem* p, __nv_bfloat16 x) {
+        *p = uint8_t(pack_e4m3x4(__bfloat162float(x), 0.f, 0.f, 0.f) & 0xffu);
     }
 };
 
@@ -2213,9 +2219,11 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
     const int head0 = kv_head * kGroup;
     const int queries = kGroup * rows;
 
-    // The queries, positions and cache rows come from earlier kernels.
     pdl_trigger();
-    pdl_wait();
+    // The host uploads the start before the pass, and no kernel of the pass writes this
+    // visit's cache before its attention: the rows append after it. So the first tile
+    // copies before pdl_wait, while the previous kernel still runs. The queries, keys,
+    // values, bias and sinks of the rows come from earlier kernels.
     const unsigned start = *start_ptr;
     // The row whose key goes to `slot`, or rows or more for none.
     const unsigned first_new = start % slots;
@@ -2224,6 +2232,18 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
     };
     // Live slots of the last row: no row reads past them.
     const unsigned live = min(start + unsigned(rows), slots);
+    // Tile k of this block is tile k % kSplitTiles of split block + (k / kSplitTiles) blocks.
+    const auto tile_first = [&](int k) {
+        return unsigned(block + k / kSplitTiles * blocks) * kRowsSplitSlots + unsigned(k % kSplitTiles) * kRowsTile;
+    };
+    int tiles = 0;
+    while (tile_first(tiles) < live) {
+        ++tiles;
+    }
+    if (tiles > 0) {
+        rows_load_tile(sm, 0, k_cache, v_cache, kv_head, tile_first(0), live);
+    }
+    pdl_wait();
     for (int i = threadIdx.x; i < queries * kHeadDim; i += kRowsThreads) {
         const int qi = i / kHeadDim;
         const int d = i % kHeadDim;
@@ -2259,18 +2279,6 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
         }
     }
 
-    // Tile k of this block is tile k % kSplitTiles of split block + (k / kSplitTiles) blocks.
-    const auto tile_first = [&](int k) {
-        return unsigned(block + k / kSplitTiles * blocks) * kRowsSplitSlots + unsigned(k % kSplitTiles) * kRowsTile;
-    };
-    int tiles = 0;
-    while (tile_first(tiles) < live) {
-        ++tiles;
-    }
-    if (tiles > 0) {
-        __syncthreads();
-        rows_load_tile(sm, 0, k_cache, v_cache, kv_head, tile_first(0), live);
-    }
     for (int t = 0; t < tiles; ++t) {
         const int stage = t % 2;
         const unsigned first = tile_first(t);
@@ -2451,13 +2459,23 @@ ATTENTION_ROWS(3)
 static_assert(sizeof(RowsShared<Bf16Format>) == 49152);
 static_assert(sizeof(RowsShared<Fp8Format>) == 32768);
 
-// out[query] = the partials of `blocks` blocks of attention_rows for query row
-// blockIdx.x (row-major [rows, 24]), combined in block order: each block's output and
-// sum scaled by e^(its max - the largest max), summed, then the output divided by the sum
-// and rounded to BF16. 128 threads, one per dim.
-extern "C" __global__ void __launch_bounds__(kHeadDim)
-attention_rows_combine(const float* partial_out, const float* partial_max, const float* partial_sum,
-                       __nv_bfloat16* out, int blocks) {
+namespace {
+
+// The partials of `blocks` blocks of attention_rows for query row blockIdx.x (row-major
+// [rows, 24]), combined in block order: each block's output and sum scaled by e^(its max -
+// the largest max), summed, then the output divided by the sum and rounded to BF16. With a
+// non-null `gate`, the output is then gated as attention_gate_bf16 in elementwise.cu does.
+// With a non-null `k_cache`, the blocks of each row's first head of a KV group then append
+// the row's key and value of that KV head at slot (*start + row) mod slots, as
+// kv_append_rows does: every attention block has finished reading the caches by then.
+// 128 threads, one per dim.
+template <class F>
+__device__ __forceinline__ void attention_rows_finish(const float* partial_out, const float* partial_max,
+                                                      const float* partial_sum, __nv_bfloat16* out, int blocks,
+                                                      const __nv_bfloat16* gate, const __nv_bfloat16* k_new,
+                                                      const __nv_bfloat16* v_new, typename F::Elem* k_cache,
+                                                      typename F::Elem* v_cache, const unsigned* start,
+                                                      unsigned slots) {
     const size_t query = blockIdx.x;
     const int d = threadIdx.x;
     pdl_trigger();
@@ -2473,5 +2491,39 @@ attention_rows_combine(const float* partial_out, const float* partial_max, const
         total = fmaf(factor, partial_sum[query * blocks + b], total);
         value = fmaf(factor, partial_out[(query * blocks + b) * kHeadDim + d], value);
     }
-    out[query * kHeadDim + d] = __float2bfloat16(total == 0.f ? value : value / total);
+    const __nv_bfloat16 attn = __float2bfloat16(total == 0.f ? value : value / total);
+    const size_t at = query * kHeadDim + d;
+    out[at] = gate != nullptr
+                  ? to_bf16_ftz(fmul(__bfloat162float(attn), mlx_sigmoid(__bfloat162float(gate[at]))))
+                  : attn;
+    const int head = int(query % kHeads);
+    if (k_cache != nullptr && head % kGroup == 0) {
+        const size_t row = query / kHeads;
+        const size_t channel = size_t(head / kGroup) * kHeadDim + d;
+        const size_t dst = size_t((*start + unsigned(row)) % slots) * kKvRow + channel;
+        F::store1(k_cache + dst, k_new[row * kKvRow + channel]);
+        F::store1(v_cache + dst, v_new[row * kKvRow + channel]);
+    }
+}
+
+}  // namespace
+
+// attention_rows_finish over a BF16 or an FP8 cache. `k_cache` may be null: then nothing
+// appends, and k_new, v_new, start and slots are unused.
+extern "C" __global__ void __launch_bounds__(kHeadDim)
+attention_rows_combine_bf16(const float* partial_out, const float* partial_max, const float* partial_sum,
+                            __nv_bfloat16* out, int blocks, const __nv_bfloat16* gate, const __nv_bfloat16* k_new,
+                            const __nv_bfloat16* v_new, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
+                            const unsigned* start, unsigned slots) {
+    attention_rows_finish<Bf16Format>(partial_out, partial_max, partial_sum, out, blocks, gate, k_new, v_new,
+                                      k_cache, v_cache, start, slots);
+}
+
+extern "C" __global__ void __launch_bounds__(kHeadDim)
+attention_rows_combine_fp8(const float* partial_out, const float* partial_max, const float* partial_sum,
+                           __nv_bfloat16* out, int blocks, const __nv_bfloat16* gate, const __nv_bfloat16* k_new,
+                           const __nv_bfloat16* v_new, uint8_t* k_cache, uint8_t* v_cache, const unsigned* start,
+                           unsigned slots) {
+    attention_rows_finish<Fp8Format>(partial_out, partial_max, partial_sum, out, blocks, gate, k_new, v_new,
+                                     k_cache, v_cache, start, slots);
 }

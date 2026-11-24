@@ -580,6 +580,16 @@ impl MessageGateWeights {
         }
     }
 
+    /// The matrices a verify pass reads, in the order the gate reads them: the FP8 copy of
+    /// the down projection if there is one, and the BF16 forget and gain weights.
+    #[must_use]
+    pub fn rows_matrices(&self) -> [&dyn Prefetch; 3] {
+        match &self.fp8 {
+            Some([down, ..]) => [down, &self.forget, &self.gain],
+            None => [&self.down, &self.forget, &self.gain],
+        }
+    }
+
     fn load(loader: &Loader<'_>, config: &TextConfig, p: &str) -> anyhow::Result<Self> {
         let hidden = config.hidden_size;
         let rank = config.loop_config.gate_rank;

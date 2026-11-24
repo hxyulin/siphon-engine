@@ -135,7 +135,8 @@ fn run_rows(
     let sinks = stream.clone_htod(&rows.sinks)?;
     let mut out = stream.alloc_zeros::<bf16>(count * HEADS * HEAD_DIM)?;
     setup.attention.attention_rows(
-        stream, &q_dev, &k_dev, &v_dev, cache, &start_dev, count, &bias, &sinks, scratch, &mut out,
+        stream, &q_dev, &k_dev, &v_dev, cache, &start_dev, count, &bias, &sinks, None, scratch,
+        &mut out,
     )?;
     Ok(stream.clone_dtoh(&out)?)
 }

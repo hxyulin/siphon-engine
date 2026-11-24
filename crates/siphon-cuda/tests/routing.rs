@@ -1122,7 +1122,6 @@ fn moe_router_step_rows_matches_step() -> anyhow::Result<()> {
     let routing = Routing::load(gpu.context())?;
     let router = stream.clone_htod(&router_weight())?;
     let bias_dev = stream.clone_htod(&bias)?;
-    let mut counter = stream.alloc_zeros::<u32>(1)?;
     let rows_max = STEP_ROUTER_ROWS;
     let x_host = pseudo_random_bf16(rows_max * HIDDEN, 600, 2.0, 0.0);
     // Each row alone through the one-row kernel.
@@ -1160,7 +1159,6 @@ fn moe_router_step_rows_matches_step() -> anyhow::Result<()> {
             &mut logits,
             &mut indices,
             &mut weights,
-            &mut counter,
             ROUTE_SCALE,
             rows,
         )?;
@@ -1178,11 +1176,6 @@ fn moe_router_step_rows_matches_step() -> anyhow::Result<()> {
             to_bits(&stream.clone_dtoh(&weights)?),
             to_bits(&want.2[..rows * TOP_K]),
             "{rows} rows: weights"
-        );
-        assert_eq!(
-            stream.clone_dtoh(&counter)?,
-            [0],
-            "the kernel resets its counter"
         );
     }
     Ok(())

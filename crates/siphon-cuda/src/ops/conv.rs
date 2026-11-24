@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg as _,
 };
 use half::bf16;
 
@@ -28,6 +29,10 @@ const BLOCK: u32 = 256;
 const MOE_CONV_ROWS: usize = 8;
 const MOE_CONV_THREADS: u32 = 192;
 const MOE_CONV_BLOCK_COLS: usize = 768;
+/// Threads per block of `moe_conv_residual_step_rows_2304` and channels per block,
+/// `kStepThreads` and `kStepBlockCols` in the kernel.
+const STEP_THREADS: u32 = 128;
+const STEP_BLOCK_COLS: usize = 128;
 /// Hidden width, the channels of the post-attention and post-MLP convs.
 const HIDDEN: usize = 2304;
 /// Experts per token in the MoE combine.
@@ -60,7 +65,24 @@ pub struct Conv {
     moe_conv_residual_2304: CudaFunction,
     short_conv_residual_rows_2304: CudaFunction,
     moe_conv_residual_rows_2304: CudaFunction,
+    moe_conv_residual_step_rows_2304: CudaFunction,
     shift_state_rows: CudaFunction,
+}
+
+/// The other conv streams of a visit, which [`Conv::moe_conv_residual_step_rows`] shifts
+/// into their states.
+pub struct VisitConvs<'a> {
+    /// The attention output projection, the post-attention conv's input, `[rows, 2304]`.
+    pub proj: CudaView<'a, bf16>,
+    pub proj_state: &'a mut CudaSlice<f32>,
+    /// The raw keys and values, the inputs of the key and value convs, `[rows, 1024]`.
+    pub k_raw: CudaView<'a, bf16>,
+    pub v_raw: CudaView<'a, bf16>,
+    pub k_state: &'a mut CudaSlice<f32>,
+    pub v_state: &'a mut CudaSlice<f32>,
+    /// Where a verify records the visit's conv inputs, BF16 `[8, 6656]`: per row the raw
+    /// keys and values, the projection and the MoE combine.
+    pub inputs: Option<CudaViewMut<'a, bf16>>,
 }
 
 /// One block of [`BLOCK`] channels per (channel block, row) of a `[rows, 2304]` chunk.
@@ -91,6 +113,8 @@ impl Conv {
             moe_conv_residual_2304: module.load_function("moe_conv_residual_2304")?,
             short_conv_residual_rows_2304: module.load_function("short_conv_residual_rows_2304")?,
             moe_conv_residual_rows_2304: module.load_function("moe_conv_residual_rows_2304")?,
+            moe_conv_residual_step_rows_2304: module
+                .load_function("moe_conv_residual_step_rows_2304")?,
             shift_state_rows: module.load_function("shift_state_rows")?,
         })
     }
@@ -352,6 +376,90 @@ impl Conv {
         // columns and the rows in tiles of 16 (the kernel stops at `rows`).
         unsafe { args.launch_pdl(stream, &self.moe_conv_residual_rows_2304, config) }?;
         self.shift_state(stream, &combined.slice(..), state, HIDDEN, rows)
+    }
+
+    /// [`Conv::moe_conv_residual_rows`] for the 1 to 8 rows of a step, which also shifts
+    /// the visit's other conv inputs in `convs` into their states, as
+    /// [`Conv::shift_state`] would after the kernels that read them, and records every
+    /// stream's inputs into `convs.inputs` if given. One launch instead of six.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn moe_conv_residual_step_rows(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        state: &mut CudaSlice<f32>,
+        residual: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<bf16>,
+        convs: VisitConvs<'_>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
+        let mut out = out.view_mut();
+        check_hidden_conv(weight, state)?;
+        ensure!(
+            (1..=MOE_CONV_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {MOE_CONV_ROWS}"
+        );
+        check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
+        check_len("weights", weights.len(), rows * TOP_K)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        check_len("out", out.len(), rows * HIDDEN)?;
+        check_len("proj", convs.proj.len(), rows * HIDDEN)?;
+        check_len("proj state", convs.proj_state.len(), STATE_ROWS * HIDDEN)?;
+        for (name, len) in [("k_raw", convs.k_raw.len()), ("v_raw", convs.v_raw.len())] {
+            check_len(name, len, rows * DYNAMIC_DIMS)?;
+        }
+        for (name, len) in [
+            ("k state", convs.k_state.len()),
+            ("v state", convs.v_state.len()),
+        ] {
+            check_len(name, len, STATE_ROWS * DYNAMIC_DIMS)?;
+        }
+        if let Some(inputs) = &convs.inputs {
+            check_len(
+                "inputs",
+                inputs.len(),
+                MOE_CONV_ROWS * (2 * DYNAMIC_DIMS + 2 * HIDDEN),
+            )?;
+        }
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(HIDDEN / STEP_BLOCK_COLS)?, 1, 1),
+            block_dim: (STEP_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let VisitConvs {
+            proj,
+            proj_state,
+            k_raw,
+            v_raw,
+            k_state,
+            v_state,
+            mut inputs,
+        } = convs;
+        let mut args = KernelArgs::default();
+        args.ptr(&experts, stream)
+            .ptr(&weights, stream)
+            .ptr(weight, stream)
+            .ptr_mut(state, stream)
+            .ptr(&residual, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(rows)?)
+            .ptr(&proj, stream)
+            .ptr_mut(proj_state, stream)
+            .ptr(&k_raw, stream)
+            .ptr(&v_raw, stream)
+            .ptr_mut(k_state, stream)
+            .ptr_mut(v_state, stream)
+            .opt_mut(inputs.as_mut(), stream);
+        // SAFETY: the arguments match `moe_conv_residual_step_rows_2304(const bf16*, const
+        // float*, const bf16*, float*, const float*, bf16*, int, const bf16*, float*, const
+        // bf16*, const bf16*, float*, float*, bf16*)`, every buffer has the length checked
+        // above for `rows` rows, and the grid gives each thread one channel of the
+        // 2304, and of the 1024 key and value channels for the threads that start below
+        // 1024.
+        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_step_rows_2304, config) }
     }
 
     /// Shifts the conv inputs `x` (`[rows, dims]`) of a chunk into `state` (`[3, dims]`),

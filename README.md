@@ -21,12 +21,12 @@ Greedy speculative decoding with the bundled DSpark draft, FP8 weights and cache
 
 | Text, context | Plain decode | Speculation |
 | --- | ---: | ---: |
-| Rust source (`anyhow`), 10.7K | 308 | 612 (1.99x) |
-| Rust source (`anyhow`), 32K | 289 | 524 (1.81x) |
-| Rust source (`half`), 2.3K | 325 | 569 (1.75x) |
-| Rust source (`half`), 32K | 289 | 406 (1.41x) |
-| A README (`regex`), 2.3K | 325 | 343 (1.06x) |
-| A README (`regex`), 32K | 289 | 335 (1.16x) |
+| Rust source (`anyhow`), 10.7K | 327 | 675 (2.06x) |
+| Rust source (`anyhow`), 32K | 302 | 572 (1.90x) |
+| Rust source (`half`), 2.3K | 340 | 637 (1.87x) |
+| Rust source (`half`), 32K | 301 | 454 (1.51x) |
+| A README (`regex`), 2.3K | 340 | 404 (1.19x) |
+| A README (`regex`), 32K | 301 | 371 (1.23x) |
 
 The speedup depends on how predictable the text is: the draft's first token is accepted 88% to 95% of the time on the Rust sources and 71% on the README.
 

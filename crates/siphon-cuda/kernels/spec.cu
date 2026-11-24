@@ -11,8 +11,9 @@
 //   nothing: attention reads only slots below each row's position, and later rows
 //   overwrite the stale ones.
 // - the conv states, F32 [3, dims] per visit and stream (keys, values, post-attention,
-//   post-MLP). conv_backup saves them before the pass, conv_inputs_rows records each
-//   visit's m input rows during it, and conv_rollback rebuilds each state as the last 3
+//   post-MLP). conv_backup saves them before the pass, each visit's last kernel
+//   (moe_conv_residual_step_rows_2304 in conv.cu) records its m input rows during it, and
+//   conv_rollback rebuilds each state as the last 3
 //   rows of [old state; inputs of rows 0..a].
 //
 // None of these kernels is launched with programmatic dependent launch.
@@ -24,7 +25,6 @@ namespace {
 
 constexpr int kHidden = 2304;
 constexpr int kKvDims = 1024;
-constexpr int kTopK = 8;
 constexpr int kVerifyRows = 8;
 constexpr int kStateRows = 3;
 constexpr int kStreams = 4;
@@ -64,33 +64,6 @@ extern "C" __global__ void conv_backup(const unsigned long long* states, float* 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         dst[i] = src[i];
     }
-}
-
-// Records one visit's conv inputs of `rows` rows into inputs [8, kVisitChannels]: the raw
-// keys and values [rows, 1024], the attention output projection [rows, 2304] and the MoE
-// combine of experts [rows, 8, 2304] with weights [rows, 8], rounded as
-// moe_conv_residual_rows_2304 rounds it. Grid: (9, rows), 256 threads.
-extern "C" __global__ void conv_inputs_rows(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
-                                            const __nv_bfloat16* proj, const __nv_bfloat16* experts,
-                                            const float* weights, __nv_bfloat16* inputs) {
-    const size_t r = blockIdx.y;
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= kHidden) {
-        return;
-    }
-    __nv_bfloat16* row = inputs + r * kVisitChannels;
-    if (c < kKvDims) {
-        row[stream_offset(0) + c] = k_raw[r * kKvDims + c];
-        row[stream_offset(1) + c] = v_raw[r * kKvDims + c];
-    }
-    row[stream_offset(2) + c] = proj[r * kHidden + c];
-    float total = 0.f;
-#pragma unroll
-    for (int x = 0; x < kTopK; ++x) {
-        const float e = __bfloat162float(experts[(r * kTopK + x) * kHidden + c]);
-        total = __fadd_rn(total, __fmul_rn(e, weights[r * kTopK + x]));
-    }
-    row[stream_offset(3) + c] = __float2bfloat16(total);
 }
 
 // Sets every conv state to rows keep..keep+2 of [backup (3 rows); inputs (m rows)], where
