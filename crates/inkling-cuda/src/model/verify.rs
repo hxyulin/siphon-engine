@@ -77,6 +77,15 @@ impl Verdict {
     }
 }
 
+/// A verify pass that [`Model::start_verify`] launched and whose verdict
+/// [`Model::finish_verify`] has not read yet.
+#[must_use = "the model's position advances only in finish_verify"]
+#[derive(Debug)]
+pub struct PendingVerify {
+    rows: usize,
+    start: usize,
+}
+
 /// What a verify pass keeps besides a chunk's intermediates (see `kernels/spec.cu`).
 pub(super) struct VerifyBuffers {
     /// Device addresses of every visit's four conv states, in visit order.
@@ -99,6 +108,8 @@ pub(super) struct VerifyBuffers {
     pub result: CudaSlice<i32>,
     /// The next anchor, `argmax[accepted]`.
     pub anchor: CudaSlice<i32>,
+    /// Whether a pass was launched and its verdict not read yet.
+    pub pending: bool,
 }
 
 impl VerifyBuffers {
@@ -140,6 +151,7 @@ impl VerifyBuffers {
             keep: zeros(stream, 1)?,
             result: zeros(stream, RESULT_LEN)?,
             anchor: zeros(stream, 1)?,
+            pending: false,
         })
     }
 }
@@ -150,6 +162,20 @@ impl Model {
     /// the rest. Advances the position past the kept rows. The next anchor stays on the
     /// device for [`VerifyTokens::Drafts`]. Synchronizes once, to read the verdict.
     pub fn verify(&mut self, tokens: VerifyTokens<'_>, accept: Accept) -> anyhow::Result<Verdict> {
+        let pending = self.start_verify(tokens, accept)?;
+        self.finish_verify(pending)
+    }
+
+    /// Launches the verify pass of [`Self::verify`] without waiting for it. Work enqueued on
+    /// the model's stream before [`Self::finish_verify`] runs after the pass and before the
+    /// verdict is read: [`Self::verify_taps`], [`Self::verify_kept`] and
+    /// [`Self::verify_anchor`] hold the pass's results on the device. The position stays at
+    /// the pass's start until then.
+    pub fn start_verify(
+        &mut self,
+        tokens: VerifyTokens<'_>,
+        accept: Accept,
+    ) -> anyhow::Result<PendingVerify> {
         let m = match &tokens {
             VerifyTokens::Host(t) => t.len(),
             VerifyTokens::Drafts(d) => d.len() + 1,
@@ -181,6 +207,7 @@ impl Model {
             .verify
             .as_mut()
             .context("the verify buffers are missing")?;
+        ensure!(!v.pending, "the last verify's verdict was not read");
         match tokens {
             VerifyTokens::Host(t) => {
                 let ids = t
@@ -203,12 +230,25 @@ impl Model {
         stream.memcpy_htod(&[keep], &mut v.keep)?;
         self.launch_verify(m, start)?;
         self.verify_rows = m;
+        self.verify_buffers_mut()?.pending = true;
+        Ok(PendingVerify { rows: m, start })
+    }
 
-        let v = self
-            .verify
-            .as_ref()
-            .and_then(|p| p.verify.as_ref())
-            .context("the verify buffers are missing")?;
+    /// Waits for the pass of `pending` and the work enqueued after it, reads the verdict
+    /// and advances the position past the kept rows.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the pass by value reads each verdict once"
+    )]
+    pub fn finish_verify(&mut self, pending: PendingVerify) -> anyhow::Result<Verdict> {
+        let PendingVerify { rows: m, start } = pending;
+        ensure!(
+            self.position == start && self.verify_rows == m,
+            "the verdict belongs to another pass"
+        );
+        let stream = Arc::clone(&self.ctx.stream);
+        let v = self.verify_buffers_mut()?;
+        v.pending = false;
         let result = stream.clone_dtoh(&v.result)?;
         let accepted = usize::try_from(result[0])?;
         ensure!(accepted < m, "accepted {accepted} of {} drafts", m - 1);
@@ -237,6 +277,22 @@ impl Model {
             .context("the verify buffers are missing")?;
         stream.memcpy_htod(&[i32::try_from(token)?], &mut v.anchor)?;
         Ok(())
+    }
+
+    /// The number of drafts the last verify kept, on the device, one I32.
+    pub fn verify_kept(&self) -> anyhow::Result<CudaView<'_, i32>> {
+        self.verify
+            .as_ref()
+            .and_then(|p| p.verify.as_ref())
+            .map(|v| v.result.slice(..1))
+            .context("no verify has run")
+    }
+
+    fn verify_buffers_mut(&mut self) -> anyhow::Result<&mut VerifyBuffers> {
+        self.verify
+            .as_mut()
+            .and_then(|p| p.verify.as_mut())
+            .context("the verify buffers are missing")
     }
 
     /// The anchor of the next round on the device, one I32.

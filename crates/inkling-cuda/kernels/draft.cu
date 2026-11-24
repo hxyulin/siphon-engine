@@ -901,18 +901,37 @@ __device__ __forceinline__ void warp_best(float& value, int32_t& index) {
     }
 }
 
+// Sums v over the block into out[blockIdx.x]; `shared` holds a value per warp.
+__device__ __forceinline__ void block_partial_sum(float v, float* shared, float* out) {
+    v = warp_sum(v);
+    if (threadIdx.x % 32 == 0) {
+        shared[threadIdx.x / 32] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.f;
+        for (int w = 0; w < int(blockDim.x / 32); ++w) {
+            total += shared[w];
+        }
+        out[blockIdx.x] = total;
+    }
+}
+
 }  // namespace
 
 // One Markov step, or with step == steps only the last pick. Picks the previous step's
 // token: the anchor (control[2]) at step 0, otherwise the argmax of `count` partials
-// from draft_markov_fold, written to ids[step - 1]. Then, for state element j (one warp
+// from draft_markov_fold, written to ids[step - 1], with its confidence, the softmax
+// probability exp(logit - cap) / sum of the `count` partial sums, at most 1, written to
+// confidence[step - 1]. Then, for state element j (one warp
 // each), the three rnn_proj rows j, 256 + j and 512 + j times [state; w1[token]] with
 // linear.cu's split GEMV order, and the gate of draft_markov_gate: writes the new state
 // to state_out and the latent to latent. state_in is unused at step 0, where the state
 // is zero. Grid 32, 256 threads.
 extern "C" __global__ void __launch_bounds__(kStepWarps * 32)
 draft_markov_step(int32_t pdl, int32_t step, int32_t steps, const float* partial_value,
-                  const int32_t* partial_index, int32_t count, const int32_t* control,
+                  const int32_t* partial_index, const float* partial_sum, int32_t count,
+                  float softcap, float* confidence, const int32_t* control,
                   int32_t* ids, const __nv_bfloat16* w1, int32_t vocab,
                   const __nv_bfloat16* rnn_state, const float* context, const float* bias,
                   const float* state_in, float* state_out, float* latent) {
@@ -948,14 +967,21 @@ draft_markov_step(int32_t pdl, int32_t step, int32_t steps, const float* partial
         } else {
             float value = -INFINITY;
             int32_t index = INT32_MAX;
+            float total = 0.f;
             for (int i = lane; i < count; i += 32) {
                 if (better(partial_value[i], partial_index[i], value, index)) {
                     value = partial_value[i];
                     index = partial_index[i];
                 }
+                total += partial_sum[i];
             }
             warp_best(value, index);
+            total = warp_sum(total);
             token = index == INT32_MAX ? 0 : index;
+            if (lane == 0 && blockIdx.x == 0) {
+                const float p = __expf(value - softcap) / total;
+                confidence[step - 1] = total > 0.f ? fminf(p, 1.f) : 0.f;
+            }
         }
         if (lane == 0) {
             picked = valid ? token : -1;
@@ -1018,15 +1044,17 @@ constexpr int kFoldGroup = 16;  // rows a warp sums at once, one 16-byte load pe
 // fold_weight · latent (fold_weight BF16 [rows, 256], latent F32 [256]): each row sums
 // as linear.cu's F32-input GEMV for k = 256, then logit = bf16(cap tanh(bf16(base +
 // bf16(fold_bias + acc)) / cap)) as draft_markov_logits. Writes the logits below `vocab`
-// to `logits` if it is not null, and each block's best (value, index) to partial_value
-// and partial_index. With `reverse` set, the warps walk the rows from the end, so
-// consecutive steps meet the rows the previous one read last while they are still in L2.
+// to `logits` if it is not null, each block's best (value, index) to partial_value
+// and partial_index, and each block's sum of exp(logit - cap) to partial_sum. With
+// `reverse` set, the warps walk the rows from the end, so consecutive steps meet the rows
+// the previous one read last while they are still in L2.
 extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
 draft_markov_fold(int32_t pdl, int32_t reverse, const __nv_bfloat16* fold_weight,
                   const __nv_bfloat16* fold_bias, const __nv_bfloat16* base, const float* latent,
                   int32_t vocab, float softcap, __nv_bfloat16* logits, float* partial_value,
-                  int32_t* partial_index) {
+                  int32_t* partial_index, float* partial_sum) {
     __shared__ __align__(16) float z[kRank];
+    __shared__ float warp_sums[kFoldWarps];
     __shared__ float best_value[kFoldWarps];
     __shared__ int32_t best_index[kFoldWarps];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -1057,6 +1085,7 @@ draft_markov_fold(int32_t pdl, int32_t reverse, const __nv_bfloat16* fold_weight
 
     float value = -INFINITY;
     int32_t index = INT32_MAX;
+    float sum = 0.f;
     for (int g = first; g < groups; g += stride) {
         float mine = 0.f;
 #pragma unroll
@@ -1078,12 +1107,14 @@ draft_markov_fold(int32_t pdl, int32_t reverse, const __nv_bfloat16* fold_weight
             if (logits != nullptr) {
                 logits[c] = logit;
             }
+            sum += __expf(bf(logit) - softcap);
             if (better(bf(logit), c, value, index)) {
                 value = bf(logit);
                 index = c;
             }
         }
     }
+    block_partial_sum(sum, warp_sums, partial_sum);
     warp_best(value, index);
     if (lane == 0) {
         best_value[warp] = value;
@@ -1373,13 +1404,15 @@ __device__ void fold_partial(float value, int32_t index, float* best_value, int3
 // scale[n] when the weights are E4M3 (`scale` not null), else BF16. Then logit =
 // bf16(cap tanh(bf16(base[n] + bf16(fold_bias[n] + acc)) / cap)). The rows are
 // `rows` or, with `count` not null, *count; row n stands for token map[n], or n without
-// a map. Each block writes its best (value, token) pair to the partials.
+// a map. Each block writes its best (value, token) pair and its sum of exp(logit - cap)
+// to the partials.
 extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
 draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat16* fold_bias,
                       const __nv_bfloat16* base, const float* latent, int32_t rows,
                       const int32_t* count, const int32_t* map, float softcap,
-                      float* partial_value, int32_t* partial_index) {
+                      float* partial_value, int32_t* partial_index, float* partial_sum) {
     __shared__ __align__(16) float z[kRank];
+    __shared__ float warp_sums[kFoldWarps];
     __shared__ float best_value[kFoldWarps];
     __shared__ int32_t best_index[kFoldWarps];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -1395,6 +1428,7 @@ draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat1
     const int stride = gridDim.x * kFoldWarps;
     float value = -INFINITY;
     int32_t index = INT32_MAX;
+    float sum = 0.f;
     for (int g = blockIdx.x * kFoldWarps + warp; g < groups; g += stride) {
         const int row0 = g * kFoldGroup;
         float mine = 0.f;
@@ -1452,6 +1486,7 @@ draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat1
             const float bias = round_bf16(__fadd_rn(bf(fold_bias[n]), mine));
             const float total = round_bf16(__fadd_rn(bf(base[n]), bias));
             const float logit = step_logit(total, softcap);
+            sum += __expf(logit - softcap);
             const int32_t token = map != nullptr ? map[n] : n;
             if (better(logit, token, value, index)) {
                 value = logit;
@@ -1459,6 +1494,7 @@ draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat1
             }
         }
     }
+    block_partial_sum(sum, warp_sums, partial_sum);
     fold_partial(value, index, best_value, best_index, partial_value, partial_index);
 }
 
@@ -1530,7 +1566,8 @@ draft_fold_error(const __nv_bfloat16* w, const uint8_t* q, const float* scale, i
 
 // The bounds of one step's logits from the E4M3 fold (q, scale) and err: writes each
 // row's upper bound to upper[c] and each block's largest lower bound to
-// lower[blockIdx.x]. A warp takes 32 rows at a time: a row is 256 bytes, so lanes 0-15
+// lower[blockIdx.x], and each block's sum of exp(logit - cap) over the estimates' logits
+// to partial_sum[blockIdx.x], for the confidence. A warp takes 32 rows at a time: a row is 256 bytes, so lanes 0-15
 // load 16 bytes each of one row and lanes 16-31 of the next, and after the sums lane j
 // finishes row j with coalesced loads of its scale, error, base logit and fold bias.
 // With `reverse` set, the warps walk the rows from the end, so consecutive steps meet the
@@ -1540,11 +1577,12 @@ extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
 draft_markov_bound(int32_t reverse, const uint8_t* q, const float* scale, const float* err,
                    const __nv_bfloat16* fold_bias, const __nv_bfloat16* base,
                    const float* latent, int32_t vocab, float softcap, float* upper,
-                   float* lower) {
+                   float* lower, float* partial_sum) {
     constexpr int kRowsPerGroup = 32;
     constexpr int kPairs = kRowsPerGroup / 2;
     __shared__ __align__(16) float z[kRank];
     __shared__ float block_lower[kFoldWarps];
+    __shared__ float warp_sums[kFoldWarps];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int groups = (vocab + kRowsPerGroup - 1) / kRowsPerGroup;
     const int stride = gridDim.x * kFoldWarps;
@@ -1558,6 +1596,7 @@ draft_markov_bound(int32_t reverse, const uint8_t* q, const float* scale, const 
         zl[e] = z[(lane % 16) * 16 + e];
     }
     float best = -INFINITY;
+    float sum = 0.f;
     for (int g = blockIdx.x * kFoldWarps + warp; g < groups; g += stride) {
         const int row0 = (reverse ? groups - 1 - g : g) * kRowsPerGroup;
         // Rows past the end read the last row, so no load sits behind a branch.
@@ -1598,8 +1637,10 @@ draft_markov_bound(int32_t reverse, const uint8_t* q, const float* scale, const 
             const float estimate = mine * sc;
             best = fmaxf(best, logit_at(b, fb, estimate - e, softcap));
             upper[row0 + lane] = logit_at(b, fb, estimate + e, softcap);
+            sum += __expf(logit_at(b, fb, estimate, softcap) - softcap);
         }
     }
+    block_partial_sum(sum, warp_sums, partial_sum);
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         best = fmaxf(best, __shfl_xor_sync(0xffffffffu, best, offset));

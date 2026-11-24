@@ -84,6 +84,74 @@ pub struct DraftOptions {
     pub shortlist: Option<Vec<u32>>,
 }
 
+impl DraftOptions {
+    /// Every approximation, with the shortlist in token id order ([`id_ranking`]): the
+    /// draft speculation uses unless told otherwise. On three texts its acceptance is
+    /// within 0.2 points of the exact draft's at every draft position, and its round takes
+    /// about 40% of the time.
+    #[must_use]
+    pub fn fast() -> Self {
+        Self {
+            fp8_backbone: true,
+            fp8_head: true,
+            fp8_fold: true,
+            shortlist: Some(id_ranking()),
+        }
+    }
+
+    /// The options of a variant `spec`: `exact`, `fast` ([`Self::fast`]), or a `+`-joined
+    /// set of `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`, which takes
+    /// `ranking`, or without one ranks tokens by id ([`id_ranking`]).
+    pub fn parse(spec: &str, ranking: Option<&[u32]>) -> anyhow::Result<Self> {
+        let mut options = Self::default();
+        match spec {
+            "exact" => return Ok(options),
+            "fast" => {
+                options = Self::fast();
+                if let Some(r) = ranking {
+                    options.shortlist = Some(r.to_vec());
+                }
+                return Ok(options);
+            }
+            _ => {}
+        }
+        for part in spec.split('+') {
+            match part {
+                "fp8-backbone" => options.fp8_backbone = true,
+                "fp8-head" => options.fp8_head = true,
+                "fp8-fold" => options.fp8_fold = true,
+                "shortlist" => {
+                    options.shortlist = Some(ranking.map_or_else(id_ranking, <[u32]>::to_vec));
+                }
+                _ => anyhow::bail!("unknown draft variant part {part:?}"),
+            }
+        }
+        Ok(options)
+    }
+}
+
+/// The first [`SHORTLIST_ROWS`] token ids in order, a ranking for
+/// [`DraftOptions::shortlist`]. The tokenizer numbers its tokens in the order of its BPE
+/// merges, so a lower id was merged earlier, from a pair that was more frequent in the
+/// tokenizer's training text.
+#[must_use]
+pub fn id_ranking() -> Vec<u32> {
+    (0..SHORTLIST_ROWS as u32).collect()
+}
+
+/// Reads a token ranking for [`DraftOptions::shortlist`]: little-endian u32 token ids,
+/// most frequent first, as Ingine's `draft_shortlist.bin`.
+pub fn read_ranking(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    ensure!(bytes.len() % 4 == 0, "the ranking is not whole u32s");
+    Ok(bytes
+        .as_chunks()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .collect())
+}
+
 /// The RoPE frequencies `1 / theta^(2i/128)` as vLLM's F32 table builds them: a correctly
 /// rounded power, then a correctly rounded reciprocal.
 #[must_use]
@@ -239,6 +307,8 @@ struct Scratch {
     partials: ArgmaxPartials,
     bounds: LogitBounds,
     ids: CudaSlice<i32>,
+    /// Each draft's softmax probability under the Markov logits, F32 `[7]`.
+    confidence: CudaSlice<f32>,
     /// Each step's Markov logits, BF16 `[7, vocab]`, when recorded.
     logits: Option<CudaSlice<bf16>>,
 }
@@ -275,6 +345,10 @@ impl Draft {
         ensure!(
             capacity >= LOCAL_SLOTS,
             "capacity {capacity} is below the {LOCAL_SLOTS} positions of a window and a block"
+        );
+        ensure!(
+            config.final_logit_softcapping > 0.0,
+            "the draft's confidences need a positive logit softcap"
         );
         let kernels = DraftKernels::load(stream.context())?;
         let padded_vocab = config.vocab_size;
@@ -327,6 +401,7 @@ impl Draft {
             partials: ArgmaxPartials::new(stream)?,
             bounds: LogitBounds::new(stream, config.unpadded_vocab_size)?,
             ids: stream.alloc_zeros(STEPS)?,
+            confidence: stream.alloc_zeros(STEPS)?,
             logits: None,
         };
         let backbone = options
@@ -571,6 +646,15 @@ impl Draft {
     #[must_use]
     pub fn draft_ids(&self) -> &CudaSlice<i32> {
         &self.s.ids
+    }
+
+    /// The confidence of each of the last round's drafts, F32 `[7]`: its probability under
+    /// the softmax of the Markov logits, an estimate that may be off by a few percent (it
+    /// sums the E4M3 fold's logits unless the logits are recorded). A round of `k` drafts
+    /// writes the first `k`.
+    #[must_use]
+    pub fn confidences(&self) -> &CudaSlice<f32> {
+        &self.s.confidence
     }
 
     /// The last round's decoder output for the 8 block rows, BF16 `[8, 2304]`.
@@ -983,8 +1067,10 @@ impl Draft {
                 step,
                 steps,
                 &s.partials,
+                self.softcap,
                 control,
                 &mut s.ids,
+                &mut s.confidence,
                 &mw.w1,
                 &mw.rnn_state,
                 &context,

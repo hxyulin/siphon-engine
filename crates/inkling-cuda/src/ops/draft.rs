@@ -203,10 +203,12 @@ impl LogitBounds {
     }
 }
 
-/// The first-pass results of the Markov argmax.
+/// The first-pass results of the Markov argmax, and each block's sum of
+/// `exp(logit - softcap)` for the confidence.
 pub struct ArgmaxPartials {
     value: CudaSlice<f32>,
     index: CudaSlice<i32>,
+    sum: CudaSlice<f32>,
 }
 
 impl ArgmaxPartials {
@@ -214,6 +216,7 @@ impl ArgmaxPartials {
         Ok(Self {
             value: stream.alloc_zeros(MAX_PARTIALS)?,
             index: stream.alloc_zeros(MAX_PARTIALS)?,
+            sum: stream.alloc_zeros(MAX_PARTIALS)?,
         })
     }
 }
@@ -1105,7 +1108,8 @@ impl DraftKernels {
 
     /// One Markov step of a round of `steps` (see `draft_markov_step`), or with
     /// `step == steps` only the pick of the last step's id. `context` is the step's row of
-    /// the `[y; f]` product, F32 `[768]`. `state_in` and `state_out` are F32 `[256]`.
+    /// the `[y; f]` product, F32 `[768]`. `state_in` and `state_out` are F32 `[256]`. The
+    /// pick's softmax probability goes to `confidence`, F32 like `ids`.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn markov_step(
         &self,
@@ -1113,8 +1117,10 @@ impl DraftKernels {
         step: usize,
         steps: usize,
         partials: &ArgmaxPartials,
+        softcap: f32,
         control: &CudaSlice<i32>,
         ids: &mut CudaSlice<i32>,
+        confidence: &mut CudaSlice<f32>,
         w1: &CudaSlice<bf16>,
         rnn_state: &CudaSlice<bf16>,
         context: &CudaView<'_, f32>,
@@ -1124,9 +1130,10 @@ impl DraftKernels {
         latent: &mut CudaSlice<f32>,
     ) -> anyhow::Result<()> {
         ensure!(
-            step <= steps && steps <= ids.len(),
-            "step {step} of {steps} with {} ids",
-            ids.len()
+            step <= steps && steps <= ids.len() && confidence.len() == ids.len(),
+            "step {step} of {steps} with {} ids and {} confidences",
+            ids.len(),
+            confidence.len()
         );
         check_len("control", control.len(), CONTROL)?;
         let vocab = i32_arg("vocab", rows_of("w1", w1.len(), RANK)?)?;
@@ -1142,7 +1149,10 @@ impl DraftKernels {
             .i32(i32_arg("steps", steps)?)
             .ptr(&partials.value, stream)
             .ptr(&partials.index, stream)
+            .ptr(&partials.sum, stream)
             .i32(i32_arg("partials", FOLD_BLOCKS)?)
+            .f32(softcap)
+            .ptr_mut(confidence, stream)
             .ptr(control, stream)
             .ptr_mut(ids, stream)
             .ptr(w1, stream)
@@ -1159,10 +1169,11 @@ impl DraftKernels {
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `draft_markov_step(int, int, int, const float*, const
-        // int*, int, const int*, int*, const bf16*, int, const bf16*, const float*, const
-        // float*, const float*, float*, float*)`. Before `pdl_wait` it reads only
-        // `rnn_state`, which no kernel writes. At step 0 the anchor is bounds-checked; later
-        // tokens are argmax columns below the vocabulary. It writes ids below `steps`.
+        // int*, const float*, int, float, float*, const int*, int*, const bf16*, int, const
+        // bf16*, const float*, const float*, const float*, float*, float*)`. Before
+        // `pdl_wait` it reads only `rnn_state`, which no kernel writes. At step 0 the anchor
+        // is bounds-checked; later tokens are argmax columns below the vocabulary. It writes
+        // ids and confidences below `steps`.
         unsafe { args.launch_pdl(stream, &self.markov_step, config) }?;
         Ok(())
     }
@@ -1205,14 +1216,15 @@ impl DraftKernels {
             .f32(softcap)
             .opt_mut(logits.as_mut(), stream)
             .ptr_mut(&mut partials.value, stream)
-            .ptr_mut(&mut partials.index, stream);
+            .ptr_mut(&mut partials.index, stream)
+            .ptr_mut(&mut partials.sum, stream);
         let config = LaunchConfig {
             grid_dim: (FOLD_BLOCKS as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `draft_markov_fold(int, int, const bf16*, const bf16*,
-        // const bf16*, const float*, int, float, bf16*, float*, int*)`. Before `pdl_wait` it
+        // const bf16*, const float*, int, float, bf16*, float*, int*, float*)`. Before `pdl_wait` it
         // reads only `fold_weight`. It reads rows and columns below `vocab` and writes one
         // partial per block, FOLD_BLOCKS of them, which the partials hold.
         unsafe { args.launch_pdl(stream, &self.markov_fold, config) }?;
@@ -1394,7 +1406,8 @@ impl DraftKernels {
             .opt(map, stream)
             .f32(softcap)
             .ptr_mut(&mut partials.value, stream)
-            .ptr_mut(&mut partials.index, stream);
+            .ptr_mut(&mut partials.index, stream)
+            .ptr_mut(&mut partials.sum, stream);
         let config = LaunchConfig {
             grid_dim: (FOLD_BLOCKS as u32, 1, 1),
             block_dim: (256, 1, 1),
@@ -1402,7 +1415,7 @@ impl DraftKernels {
         };
         // SAFETY: the arguments match `draft_markov_fold_any(const void*, const float*, const
         // bf16*, const bf16*, const float*, int, const int*, const int*, float, float*,
-        // int*)`. With `count`, the caller keeps *count at most `rows`, which the buffers
+        // int*, float*)`. With `count`, the caller keeps *count at most `rows`, which the buffers
         // hold; the kernel writes FOLD_BLOCKS partials.
         unsafe { args.launch_pdl(stream, &self.markov_fold_any, config) }?;
         Ok(())
@@ -1506,11 +1519,13 @@ impl DraftKernels {
             .i32(vocab)
             .f32(softcap)
             .ptr_mut(&mut bounds.upper, stream)
-            .ptr_mut(&mut bounds.lower, stream);
+            .ptr_mut(&mut bounds.lower, stream)
+            .ptr_mut(&mut partials.sum, stream);
         // SAFETY: the arguments match `draft_markov_bound(int, const uint8_t*, const float*,
-        // const float*, const bf16*, const bf16*, const float*, int, float, float*, float*)`.
-        // Before `pdl_wait` it reads only the E4M3 fold. It reads rows below `vocab`, writes
-        // `upper` below `vocab` and one lower bound per block, FOLD_BLOCKS of them.
+        // const float*, const bf16*, const bf16*, const float*, int, float, float*, float*,
+        // float*)`. Before `pdl_wait` it reads only the E4M3 fold. It reads rows below
+        // `vocab`, writes `upper` below `vocab` and one lower bound and one sum per block,
+        // FOLD_BLOCKS of each.
         unsafe { args.launch_pdl(stream, &self.markov_bound, config) }?;
         let mut args = KernelArgs::default();
         args.ptr(fold_weight, stream)

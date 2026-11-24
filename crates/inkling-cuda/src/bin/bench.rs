@@ -25,8 +25,9 @@
 //! Speculative decoding, from the tokens of a capture (`--prompt`, a safetensors file
 //! with a `tokens` tensor such as `reference/capture_eval.py` writes):
 //!
-//!        bench <model-dir> --prompt <capture> --spec K [--contexts 0,32768] [--steps N]
-//!        [--weights bf16|fp8] [--kv bf16|fp8]
+//!        bench <model-dir> --prompt <capture> --spec K|auto [--widths 2,4,8]
+//!        [--draft SPEC] [--shortlist FILE] [--sweep FILE] [--contexts 0,32768]
+//!        [--steps N] [--weights bf16|fp8] [--kv bf16|fp8]
 //!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
 //!
 //! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
@@ -34,9 +35,18 @@
 //! `--spec K` prefills the prompt once, then from that same state generates `--steps`
 //! tokens with plain decode and with greedy speculation verifying K drafts per round,
 //! and reports both rates, the rounds, tokens per round, per-position acceptance and the
-//! split of a round between verify, draft and host. The verify always runs on BF16
-//! weights. `--verify-widths` times one verify pass of each width from 1 to 8, each
-//! keeping one row, so the next starts one position later.
+//! split of a round between verify, draft and host. `--spec auto` picks each round's
+//! width from the drafts' confidences (`WidthPolicy`), among `--widths` (default 1 to
+//! 8), priced by verify passes of each width timed at that context first. `--draft`
+//! takes a variant of the draft as `dspark` does: `fast` (the default, every
+//! approximation), `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`
+//! and `shortlist`, which ranks tokens by id unless `--shortlist` names a ranking file.
+//! `--sweep FILE` also decodes `--steps` tokens one verify row at a time with a draft
+//! round of 7 at every anchor, and writes the tokens and every anchor's drafts and
+//! confidences to FILE as JSON lines, one per context. The verify and the draft's
+//! shared LM head read the weights `--weights` names. `--verify-widths` times one verify
+//! pass of each width from 1 to 8, each keeping one row, so the next starts one position
+//! later.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -97,8 +107,15 @@ mod linux {
         chunk: usize,
         /// The capture whose tokens `--spec` and `--verify-widths` use.
         prompt: Option<PathBuf>,
-        /// Drafts per round for speculative decoding.
+        /// Drafts per round for speculative decoding, or 0 for an adaptive width.
         spec: Option<usize>,
+        /// The widths `--spec auto` picks from.
+        widths: Vec<usize>,
+        /// The draft variant and the shortlist ranking file.
+        draft: String,
+        shortlist: Option<PathBuf>,
+        /// Where `--spec` writes the sweep, if anywhere.
+        sweep: Option<PathBuf>,
         verify_widths: bool,
     }
 
@@ -124,6 +141,10 @@ mod linux {
         let mut chunk = DEFAULT_PREFILL_CHUNK;
         let mut prompt = None;
         let mut spec = None;
+        let mut widths = (1..=8).collect();
+        let mut draft = "fast".to_owned();
+        let mut shortlist = None;
+        let mut sweep = None;
         let mut verify_widths = false;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -140,7 +161,14 @@ mod linux {
                 "--expert-activations" => expert_activations = value()?.parse()?,
                 "--json" => json = true,
                 "--prompt" => prompt = Some(PathBuf::from(value()?)),
-                "--spec" => spec = Some(value()?.parse()?),
+                "--spec" => {
+                    let v = value()?;
+                    spec = Some(if v == "auto" { 0 } else { v.parse()? });
+                }
+                "--widths" => widths = token_counts(&arg, &value()?)?,
+                "--draft" => draft = value()?,
+                "--shortlist" => shortlist = Some(PathBuf::from(value()?)),
+                "--sweep" => sweep = Some(PathBuf::from(value()?)),
                 "--verify-widths" => verify_widths = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
@@ -172,6 +200,10 @@ mod linux {
             chunk,
             prompt,
             spec,
+            widths,
+            draft,
+            shortlist,
+            sweep,
             verify_widths,
         })
     }
@@ -595,14 +627,16 @@ mod linux {
 
     /// `--spec` and `--verify-widths`.
     mod speculation {
-        use std::{fs, time::Instant};
+        use std::{fmt::Write as _, fs, time::Instant};
 
         use anyhow::{Context as _, ensure};
         use inkling::{Checkpoint, TextConfig};
         use inkling_cuda::{
             Gpu,
-            model::{Accept, DEFAULT_PREFILL_CHUNK, Model, VerifyTokens},
-            spec::{Drafts, Speculator},
+            draft::{DraftOptions, read_ranking},
+            model::{Accept, DEFAULT_PREFILL_CHUNK, Model, SavedState, VerifyTokens},
+            ops::spec::VERIFY_ROWS,
+            spec::{Drafts, Speculator, SweepRow, Width, WidthPolicy},
             weights::{WeightFormat, Weights},
         };
         use safetensors::{Dtype, SafeTensors};
@@ -615,9 +649,14 @@ mod linux {
         const DEFAULT_STEPS: usize = 256;
         /// Timed verify passes per width.
         const VERIFY_REPEATS: usize = 40;
-        /// Bytes the byte model of a verify uses: BF16 dense weights, and one expert's
-        /// `w13` and `w2` with scales in NVFP4 (44 visits) and MXFP8 (4 visits).
+        /// Timed verify passes per width that price `--spec auto`.
+        const PRICE_REPEATS: usize = 8;
+        /// Bytes the byte model of a verify uses: dense weights in BF16 or with
+        /// `--weights fp8` (the attention projections and LM head as E4M3 values and
+        /// scales), and one expert's `w13` and `w2` with scales in NVFP4 (44 visits) and
+        /// MXFP8 (4 visits).
         const DENSE_BYTES: f64 = 3.62e9;
+        const DENSE_FP8_BYTES: f64 = 1.87e9;
         const NVFP4_EXPERT: f64 = 4.48e6;
         const MXFP8_EXPERT: f64 = 8.21e6;
         /// DRAM bandwidth times plain decode's efficiency, as the design's cost model.
@@ -648,9 +687,13 @@ mod linux {
 
         /// The design's byte model of a verify of `m` rows: dense weights once and each
         /// distinct expert once per visit, with `8 m^0.6` distinct experts per visit.
-        fn modeled_ms(m: usize) -> f64 {
+        fn modeled_ms(m: usize, weights: WeightFormat) -> f64 {
             let distinct = 8.0 * (m as f64).powf(0.6);
-            let bytes = DENSE_BYTES + distinct * (44.0 * NVFP4_EXPERT + 4.0 * MXFP8_EXPERT);
+            let dense = match weights {
+                WeightFormat::Bf16 => DENSE_BYTES,
+                WeightFormat::Fp8 => DENSE_FP8_BYTES,
+            };
+            let bytes = dense + distinct * (44.0 * NVFP4_EXPERT + 4.0 * MXFP8_EXPERT);
             bytes / EFFECTIVE_BANDWIDTH * 1e3
         }
 
@@ -703,22 +746,33 @@ mod linux {
                 },
             );
             println!(
-                "passes {passes}, {} global KV cache, {} decode weights (verify and draft BF16), \
-                 prompt {} ({} tokens)\n",
+                "passes {passes}, {} global KV cache, {} weights for decode, verify and the \
+                 draft's LM head, draft {}, prompt {} ({} tokens)\n",
                 args.kv,
                 args.weights,
+                args.draft,
                 path.display(),
                 text.len()
             );
             if args.verify_widths {
-                verify_widths(&mut model, text, rows, &contexts, vocab)?;
+                verify_widths(&mut model, text, rows, &contexts, vocab, args.weights)?;
             }
             if let Some(k) = args.spec {
-                let mut speculator = Speculator::new(&model, &checkpoint, capacity, k)?;
+                let ranking = args.shortlist.as_deref().map(read_ranking).transpose()?;
+                let options = DraftOptions::parse(&args.draft, ranking.as_deref())?;
+                let width = if k == 0 {
+                    // Priced at each context before its run.
+                    Width::Adaptive(WidthPolicy::new(&args.widths, [1.0; VERIFY_ROWS])?)
+                } else {
+                    Width::Fixed(k)
+                };
+                let mut speculator =
+                    Speculator::with_options(&model, &checkpoint, capacity, width, &options)?;
                 spec(
                     &mut model,
                     &mut speculator,
                     text,
+                    rows,
                     &contexts,
                     steps,
                     vocab,
@@ -734,6 +788,7 @@ mod linux {
             rows: &[u32],
             contexts: &[usize],
             vocab: u32,
+            weights: WeightFormat,
         ) -> anyhow::Result<()> {
             println!(
                 "| context | rows | min ms | median ms | byte model ms | min ms per row | SM MHz \
@@ -750,18 +805,7 @@ mod linux {
                 )?;
                 let saved = model.save_state()?;
                 for m in 1..=8 {
-                    model.restore_state(&saved)?;
-                    let mut times = Vec::with_capacity(VERIFY_REPEATS);
-                    // Three untimed passes first: the first captures the graph.
-                    for i in 0..VERIFY_REPEATS + 3 {
-                        let window = &rows[i..i + m];
-                        model.stream().synchronize()?;
-                        let t = Instant::now();
-                        model.verify(VerifyTokens::Host(window), Accept::Rows(1))?;
-                        if i >= 3 {
-                            times.push(t.elapsed().as_secs_f64() * 1e3);
-                        }
-                    }
+                    let mut times = verify_times(model, &saved, rows, m, VERIFY_REPEATS)?;
                     times.sort_by(f64::total_cmp);
                     let after = gpu_state()?;
                     println!(
@@ -769,7 +813,7 @@ mod linux {
                         prompt.len(),
                         times[0],
                         times[times.len() / 2],
-                        modeled_ms(m),
+                        modeled_ms(m, weights),
                         times[0] / m as f64,
                         after.sm_mhz,
                         after.mem_mhz
@@ -780,21 +824,138 @@ mod linux {
             Ok(())
         }
 
+        /// Times `repeats` verify passes of `m` rows from `saved`, each keeping one row,
+        /// after three untimed ones (the first captures the graph), in ms.
+        fn verify_times(
+            model: &mut Model,
+            saved: &SavedState,
+            rows: &[u32],
+            m: usize,
+            repeats: usize,
+        ) -> anyhow::Result<Vec<f64>> {
+            model.restore_state(saved)?;
+            let mut times = Vec::with_capacity(repeats);
+            for i in 0..repeats + 3 {
+                let window = &rows[i..i + m];
+                model.stream().synchronize()?;
+                let t = Instant::now();
+                model.verify(VerifyTokens::Host(window), Accept::Rows(1))?;
+                if i >= 3 {
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            Ok(times)
+        }
+
+        /// Prices each width of an adaptive `speculator` at the state `saved`: the fastest
+        /// of a few verify passes of that width, plus the draft and host time per round of
+        /// a short warmup generation. Leaves the model at `saved`.
+        fn price(
+            model: &mut Model,
+            speculator: &mut Speculator,
+            saved: &SavedState,
+            rows: &[u32],
+            first: u32,
+        ) -> anyhow::Result<[f64; VERIFY_ROWS]> {
+            let Width::Adaptive(policy) = speculator.width().clone() else {
+                anyhow::bail!("only an adaptive width is priced");
+            };
+            let mut verify = [f64::INFINITY; VERIFY_ROWS];
+            for &w in policy.widths() {
+                let times = verify_times(model, saved, rows, w, PRICE_REPEATS)?;
+                verify[w - 1] = times.into_iter().fold(f64::INFINITY, f64::min);
+            }
+            model.restore_state(saved)?;
+            speculator.restart(model, first)?;
+            speculator.generate(model, 64, Drafts::Dspark)?;
+            let stats = speculator.stats();
+            let rounds = stats.rounds.max(1) as f64;
+            let other = (stats.draft + stats.host()).as_secs_f64() * 1e3 / rounds;
+            model.restore_state(saved)?;
+            Ok(verify.map(|v| if v.is_finite() { v + other } else { 1.0 }))
+        }
+
+        /// Prices an adaptive width at the state `saved` (see [`price`]) and returns the
+        /// label of the speculator's width.
+        fn set_price(
+            model: &mut Model,
+            speculator: &mut Speculator,
+            saved: &SavedState,
+            rows: &[u32],
+            first: u32,
+            context: usize,
+        ) -> anyhow::Result<String> {
+            Ok(match speculator.width().clone() {
+                Width::Adaptive(policy) => {
+                    let round_ms = price(model, speculator, saved, rows, first)?;
+                    let priced = policy
+                        .widths()
+                        .iter()
+                        .map(|&w| format!("{w}: {:.3}", round_ms[w - 1]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("round ms by width at context {context}: {priced}");
+                    speculator.set_width(Width::Adaptive(WidthPolicy::new(
+                        policy.widths(),
+                        round_ms,
+                    )?))?;
+                    format!("auto {:?}", policy.widths())
+                }
+                Width::Fixed(k) => format!("k = {k}"),
+            })
+        }
+
+        /// Appends a sweep to `path` as one JSON line.
+        fn write_sweep(
+            path: &std::path::Path,
+            context: usize,
+            first: u32,
+            tokens: &[u32],
+            rows: &[SweepRow],
+        ) -> anyhow::Result<()> {
+            let mut line = format!(
+                "{{\"context\":{context},\"first\":{first},\"tokens\":{tokens:?},\"drafts\":["
+            );
+            for (i, row) in rows.iter().enumerate() {
+                let sep = if i == 0 { "" } else { "," };
+                write!(line, "{sep}{:?}", row.drafts)?;
+            }
+            line.push_str("],\"confidence\":[");
+            for (i, row) in rows.iter().enumerate() {
+                let sep = if i == 0 { "" } else { "," };
+                write!(line, "{sep}{:?}", row.confidence)?;
+            }
+            line.push_str("]}\n");
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            std::io::Write::write_all(&mut file, line.as_bytes())?;
+            println!(
+                "  sweep of {} anchors appended to {}",
+                rows.len(),
+                path.display()
+            );
+            Ok(())
+        }
+
+        #[expect(clippy::too_many_arguments, reason = "the run's inputs")]
         fn spec(
             model: &mut Model,
             speculator: &mut Speculator,
             text: &[u32],
+            rows: &[u32],
             contexts: &[usize],
             steps: usize,
             vocab: u32,
             args: &Args,
         ) -> anyhow::Result<()> {
-            let k = speculator.k();
             for &context in contexts {
                 let prompt = prompt(text, context, vocab);
                 model.reset()?;
                 let first = speculator.prefill(model, &prompt, DEFAULT_PREFILL_CHUNK)?;
                 let saved = model.save_state()?;
+                let label = set_price(model, speculator, &saved, rows, first, prompt.len())?;
 
                 // Plain decode from the same state.
                 let mut plain = Vec::with_capacity(steps);
@@ -841,15 +1002,18 @@ mod linux {
                     plain_clocks.mem_mhz
                 );
                 println!(
-                    "  speculation k = {k}: {spec_rate:.1} tok/s ({:.2}x), {} rounds, {:.3} tokens \
-                     per round, acceptance by position [{}], SM {} MHz, mem {} MHz",
+                    "  speculation {label}: {spec_rate:.1} tok/s ({:.2}x), {} rounds, {:.3} tokens \
+                     and {:.3} verify rows per round, acceptance by position [{}], SM {} MHz, \
+                     mem {} MHz",
                     spec_rate / plain_rate,
                     stats.rounds,
                     stats.tokens_per_round(),
+                    stats.rows_per_round(),
                     acceptance.join(", "),
                     spec_clocks.sm_mhz,
                     spec_clocks.mem_mhz
                 );
+                println!("  rounds by width 1 to 8: {:?}", stats.widths);
                 println!(
                     "  per round: {:.3} ms = verify {:.3} + draft {:.3} + host {:.3}",
                     per_round(stats.wall),
@@ -865,6 +1029,12 @@ mod linux {
                         ""
                     }
                 );
+                if let Some(path) = &args.sweep {
+                    model.restore_state(&saved)?;
+                    speculator.restart(model, first)?;
+                    let (tokens, rows) = speculator.sweep(model, steps)?;
+                    write_sweep(path, prompt.len(), first, &tokens, &rows)?;
+                }
             }
             Ok(())
         }

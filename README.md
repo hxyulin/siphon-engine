@@ -49,7 +49,8 @@ INKLING_MODEL=<model-dir> cargo test --release -p inkling-cuda --test prefill --
 `draft::Draft` runs the speculative draft bundled in the checkpoint (`mtp.safetensors`): a 3-layer dense transformer over one block of 8 rows, then a recurrent Markov head that turns the 7 mask rows into 7 greedy draft tokens. It reads the target's embedding, `embed_norm` and LM head, and folds `hidden_out` into the LM head at load in F64. Its kernels are in `kernels/draft.cu`; the BF16 products run through `ops::linear`.
 
 - `Draft::commit(taps, start)` writes the draft cache entries of target positions `start..` from their four feature taps, BF16 `[rows, 4, 2304]`: the partial block entering visits 5, 23 and 41, and the final normed hidden state.
-- `Draft::round(anchor)` runs the block at the next uncommitted position, with the anchor token read from device memory, and leaves the 7 ids in `Draft::draft_ids`.
+- `Draft::round(anchor)` runs the block at the next uncommitted position, with the anchor token read from device memory, and leaves the 7 ids in `Draft::draft_ids` and their confidences in `Draft::confidences`.
+- Each draft's confidence is its softmax probability under the Markov logits, `exp(logit - 30) / sum exp(logit_c - 30)`: the softcap bounds every logit by 30, so the sum needs no running maximum. The kernel that scans every row (`draft_markov_bound`, `draft_markov_fold` or `draft_markov_fold_any`) writes a partial sum per block, and the next step's pick divides. The pruned argmax sums the logits of the E4M3 estimates and a shortlist head sums only its rows, so the confidence is an estimate; the round takes no measurable extra time.
 - `Draft::round_inputs()` holds a round's inputs in device memory: the taps of up to 8 positions to commit, BF16 `[8, 4, 2304]`, and `control`, I32 `[start, rows, anchor]`. `Draft::run_round(steps)` commits those positions, runs the block right after them, and runs the base logits and Markov head for `steps` drafts (1 to 7). `Draft::replay_round(steps)` replays the same work as a CUDA graph, captured once per `steps`. A verify pass can write the inputs on the device and launch the draft graph right after its own; no position goes through the host. `Draft::set_round_inputs` fills the inputs from the host.
 - Layers 0 and 2 keep rings of 1032 slots, the window of 1024 and the block. Layer 1 keeps every position up to the capacity, 4 KiB each.
 
@@ -67,26 +68,32 @@ Round times at position 2790 (one committed position plus the round, graph repla
 
 At position 32768, where layer 1 attends over every position, the same steps take 2.169, 1.420, 1.354, 1.288 and 1.277 ms for 3 drafts, and 2.169, 1.660, 1.593, 1.450 and 1.419 ms for 7.
 
-`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond:
+`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond. `DraftOptions::fast` turns on all four, with the shortlist in token id order; speculation (`Speculator::new`, `bench --spec`) uses it, and `DraftOptions::default` stays exact:
 
 - `fp8_backbone`: E4M3 copies of the block's and the commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`).
 - `fp8_head`: base logits from an E4M3 copy of the LM head.
 - `fp8_fold`: the Markov logits from the E4M3 fold, without the exact correction.
-- `shortlist`: Ingine's shortlist head. The base and Markov logits cover only the 32,768 highest-ranked tokens of a ranking file, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The ranking is 65,536 little-endian u32 token ids, as Ingine's `draft_shortlist.bin`.
+- `shortlist`: Ingine's shortlist head. The base and Markov logits cover only the 32,768 highest-ranked tokens, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The speculator notes the tokens of the prompt's last 8,192 positions and each round's emitted tokens, so a long prompt cannot fill every context row and shut out the tokens that generation adds. The ranking defaults to token id order (`draft::id_ranking`): the tokenizer numbers its tokens in BPE merge order, so the first 32,768 ids are the earliest merges. A ranking file of little-endian u32 token ids, as Ingine's `draft_shortlist.bin`, can replace it.
 
-`dspark accept` measures each variant's teacher-forced acceptance on the stage 0 taps against MLX's top-1 tokens, as `reference/dspark.py accept` counts it, and times its round. Over all three texts (16,745 anchors), with the verify-time model of the design (5.7 ms with BF16 weights and 5.0 ms with FP8 at 3 drafts):
+`dspark accept` measures each variant's teacher-forced acceptance on the stage 0 taps against MLX's top-1 tokens, as `reference/dspark.py accept` counts it, and times its round of 7 drafts at position 2,790 and 32,768. Over all three texts (16,745 anchors):
 
-| Variant | Acceptance, drafts 1 to 3 | Tokens per round, k = 3 | Round, k = 3 | Tokens per ms, BF16 verify | Tokens per ms, FP8 verify |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Exact | 79.2, 58.7, 45.2% | 2.832 | 1.175 ms | 0.412 | 0.459 |
-| FP8 backbone | 79.2, 58.7, 45.2% | 2.832 | 1.077 ms | 0.418 | 0.466 |
-| FP8 head | 79.3, 58.7, 45.2% | 2.832 | 0.916 ms | 0.428 | 0.479 |
-| Shortlist | 79.2, 58.7, 45.2% | 2.830 | 0.650 ms | 0.446 | 0.501 |
-| Shortlist, FP8 backbone, head and fold | 79.2, 58.5, 45.0% | 2.827 | 0.460 ms | 0.459 | 0.518 |
+| Variant | Acceptance, drafts 1 to 3 | Tokens per round, k = 7 | Round, 2,790 | Round, 32,768 |
+| --- | --- | ---: | ---: | ---: |
+| Exact | 79.2, 58.7, 45.2% | 3.793 | 1.316 ms | 1.420 ms |
+| FP8 backbone | 79.2, 58.7, 45.2% | 3.794 | 1.220 ms | 1.331 ms |
+| FP8 head | 79.3, 58.7, 45.2% | 3.792 | 1.062 ms | 1.166 ms |
+| FP8 fold | 79.2, 58.7, 45.1% | 3.792 | 1.321 ms | 1.425 ms |
+| Shortlist, id order | 79.2, 58.7, 45.2% | 3.794 | 0.708 ms | 0.812 ms |
+| Shortlist, ranked by counts over a code sample | 76.7, 56.3, 43.4% | 3.691 | 0.708 ms | 0.813 ms |
+| Fast: shortlist in id order, FP8 backbone, head and fold | 79.2, 58.6, 45.0% | 3.787 | 0.491 ms | 0.628 ms |
+
+FP8 fold alone saves nothing, since the pruned argmax already reads the E4M3 fold; it matters with a shortlist, which skips the pruning. The counted ranking took 72 million tokens of open-source Rust crates and the CPython standard library, the evaluation texts' crates left out. Code-heavy counts drop common prose tokens that the id order keeps.
+
+In a kernel trace of the round of 7 drafts at position 2,790 (each kernel from the previous one's end), the exact draft spends 918 of its 1,315 us in BF16 GEMMs, most of it the 7-row LM-head product over the full vocabulary, and 212 us in the pruned argmax's bound pass. The fast draft takes 494 us: 339 us in the FP8 GEMMs (16 products), 42 us in attention (138 us at 32,768), 34 us in the shortlist Markov fold and 20 us in the Markov steps.
 
 ```sh
-cargo run --release -p inkling-cuda --bin dspark -- accept <model-dir> <taps-dir> --shortlist <ranking> \
-    --variants exact,shortlist+fp8-backbone+fp8-head+fp8-fold
+cargo run --release -p inkling-cuda --bin dspark -- accept <model-dir> <taps-dir> \
+    --variants exact,shortlist,fast --steps 7
 cargo run --release -p inkling-cuda --bin dspark -- time <model-dir> <taps-dir>/regex-readme-taps.safetensors
 INKLING_MODEL=<model-dir> INKLING_DSPARK_REF=<dir> cargo test --release -p inkling-cuda --test draft_exact -- --ignored --nocapture
 ```
@@ -104,10 +111,26 @@ INKLING_MODEL=<model-dir> INKLING_DSPARK_REF=reference/out cargo test --release 
 
 ## Speculative decoding
 
-`spec::Speculator` runs greedy speculative decoding with the draft and a fixed number k of drafts per round (1 to 7):
+`spec::Speculator` runs greedy speculative decoding with the draft. Each round verifies the anchor and its leading drafts, a width of 1 to 8 rows that `spec::Width` sets: a fixed k drafts (`Width::Fixed`), or a width per round from the drafts' confidences (`Width::Adaptive`).
 
-1. `Model::verify` runs the anchor and the first k drafts as one pass of k + 1 rows through the chunked-prefill code, keeps the anchor and the longest run of drafts that each equal the previous row's greedy token, and rolls back the rest. It synchronizes once, to read the verdict.
-2. The draft commits the feature taps of the kept rows and runs its block from the next anchor, which the verify left on the device.
+1. `Model::start_verify` launches the anchor and the round's drafts as one pass through the chunked-prefill code. On the device it keeps the anchor and the longest run of drafts that each equal the previous row's greedy token, and rolls back the rest.
+2. The draft's next round goes on the stream right behind it: it commits the feature taps of the kept rows, whose count the verify left on the device, runs its block from the next anchor, and drafts with a confidence each.
+3. `Model::finish_verify` synchronizes once, to read the verdict, and the host reads the new confidences and picks the next round's width. Host time stays near 0.02 ms per round.
+
+`spec::WidthPolicy` takes each confidence c_j as the chance that the target accepts draft j after the drafts before it, so draft j survives with s_j = c_1 ... c_j and a width w emits 1 + s_1 + ... + s_(w-1) tokens on average. It picks the width with the most such tokens per millisecond of round time, from a time per width that the caller measures: `bench --spec auto` times verify passes of each width at the context, plus the draft and host time per round. On the greedy continuations of the three texts, the share of accepted drafts in each confidence bin is within a few points of the confidence at every draft position, so the policy uses no other calibration.
+
+The policy was chosen by simulation over sweeps (`bench --spec K --sweep FILE`), which decode 1,024 tokens one verify row at a time and run a draft round of 7 at every anchor. A round sees the same drafts at an anchor whatever earlier rounds verified, so each sweep prices any policy exactly, given the measured verify time per width. Over the three texts at their own length and at 32,768, BF16 and FP8 weights (12 sweeps), geometric mean tok/s at the first 256 tokens:
+
+| Policy | tok/s, measured verify | tok/s, verify of 0.6 x today's one-row pass + 0.3 ms per extra row |
+| --- | ---: | ---: |
+| Fixed k = 3 | 362 | 576 |
+| Fixed k = 7 | 416 | 662 |
+| Ingine: leading drafts above 0.8, widths 2, 4, 8 | 425 | 662 |
+| Leading drafts above 0.5, widths 2 to 8 | 444 | 700 |
+| Most expected tokens per ms, widths 1 to 8 (`WidthPolicy`) | 441 | 698 |
+| Oracle: the width of the accepted run | 489 | 765 |
+
+Thresholds from 0.5 to 0.7 and the cost rule land within 2% of each other; the cost rule keeps that place when the verify cost per row changes, without retuning. Widths 2, 4 and 8 alone lose about 1.5%. The policy can pick width 1, a verify of one row, but plain `Model::step` decoding cannot stand in for it: decode sums in other orders than the verify path, so the output would depend on the policy.
 
 A round emits the kept drafts and the target's greedy token after them. `Model::prefill_with_taps` records the draft's taps of every prompt row, so the draft's cache covers the prompt.
 
@@ -129,14 +152,14 @@ Each verify row gives the same logits, bit for bit, as a verify of that row alon
 
 The verify pass computes the same model as `Model::step` but sums in other orders, so the two greedy outputs split at the first near-tie: after 247 to 817 of 1024 tokens on the three texts.
 
-`tests/verify.rs` checks the taps against MLX, a verify against stepping, the rollback against a shorter verify (bit for bit), the ring size, and row invariance. `tests/spec.rs` checks exactness with the draft at k = 1, 3 and 7 and with random drafts, 1024 tokens after each text. Both need the checkpoint:
+`tests/verify.rs` checks the taps against MLX, a verify against stepping, the rollback against a shorter verify (bit for bit), the ring size, and row invariance. `tests/spec.rs` checks exactness with the draft at k = 1, 3 and 7 and at an adaptive width priced so that every width from 1 to 8 gets picked, and with random drafts at k = 3 and at widths cycling from 1 to 8, 1024 tokens after each text. Both need the checkpoint:
 
 ```sh
 INKLING_MODEL=<model-dir> INKLING_TAPS=reference/out/regex-readme-taps.safetensors \
     cargo test --release -p inkling-cuda --test verify --test spec -- --ignored --nocapture --test-threads 1
 ```
 
-`eval --verify WIDTH` teacher-forces a capture through verify passes of WIDTH rows, and passes the quality gate at widths 1 and 4. `bench --prompt <capture> --spec K` compares speculation with plain decode from one prefilled state, and `--verify-widths` times one pass of each width.
+`eval --verify WIDTH` teacher-forces a capture through verify passes of WIDTH rows, and passes the quality gate at widths 1 and 4. `bench --prompt <capture> --spec K|auto` compares speculation with plain decode from one prefilled state, `--draft` picks the draft variant, `--sweep` records drafts and confidences at every anchor, and `--verify-widths` times one pass of each width.
 
 One verify pass, after the `anyhow` prompt of 10,674 tokens or with the caches marked full to 32,768 or 131,072:
 
@@ -151,15 +174,24 @@ One verify pass, after the `anyhow` prompt of 10,674 tokens or with the caches m
 
 The bandwidth model reads the BF16 dense weights once and 8 m^0.6 distinct experts per visit at 84% of 1.70 TB/s, without KV. At 4 rows and 10,674 tokens with BF16 weights, a pass spends 3.37 ms in the experts, 2.1 ms in the dense products (0.55 ms of it the LM head), 1.0 ms in attention and about 2 ms in small kernels: depth attention, message gates, the router, the relative bias, conv states and norms.
 
-`bench --spec 3`, 512 tokens after each text:
+`bench --spec`, 256 tokens after each text, FP8 global KV cache, tok/s. Before is the commit before the adaptive width and the fast draft, with the exact draft at a fixed k; after is `--spec auto` with the fast draft, the faster of two runs each:
 
-| Text, context | Plain decode | Speculation, BF16 weights | Speculation, FP8 weights | Tokens per round | Round with BF16 weights: verify + draft |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `regex-readme`, 2,286 | 255 tok/s | 334 tok/s | 328 tok/s | 3.20 | 8.37 + 1.18 ms |
-| `anyhow`, 10,674 | 239 tok/s | 395 tok/s | 426 tok/s | 3.92 | 8.68 + 1.21 ms |
-| `anyhow`, 32,768 | 209 tok/s | 365 tok/s | 393 tok/s | 3.93 | 9.46 + 1.28 ms |
+| Text, context | Weights | Plain decode | Before, k = 3 / 5 / 7 | After, auto | Tokens and verify rows per round |
+| --- | --- | ---: | --- | ---: | --- |
+| `anyhow`, 10,674 | BF16 | 250 | 390 / 487 / 515 | 558 | 6.14, 7.36 |
+| `anyhow`, 32,768 | BF16 | 229 | 360 / 435 / 475 | 521 | 6.29, 7.39 |
+| `anyhow`, 10,674 | FP8 | 313 | 437 / 520 / 575 | 624 | 6.29, 7.37 |
+| `anyhow`, 32,768 | FP8 | 289 | 391 / 471 / 506 | 523 | 5.82, 7.33 |
+| `half`, 2,273 | BF16 | 260 | 362 / 418 / 442 | 506 | 5.35, 6.98 |
+| `half`, 32,768 | BF16 | 229 | 326 / 372 / 376 | 421 | 5.16, 7.26 |
+| `half`, 2,273 | FP8 | 325 | 400 / 468 / 473 | 568 | 5.47, 6.94 |
+| `half`, 32,768 | FP8 | 289 | 337 / 370 / 366 | 406 | 4.41, 6.62 |
+| `regex-readme`, 2,286 | BF16 | 259 | 290 / 271 / 258 | 326 | 3.08, 5.17 |
+| `regex-readme`, 32,768 | BF16 | 229 | 278 / 286 / 270 | 307 | 3.49, 6.01 |
+| `regex-readme`, 2,286 | FP8 | 325 | 299 / 283 / 264 | 343 | 2.86, 4.88 |
+| `regex-readme`, 32,768 | FP8 | 289 | 301 / 293 / 285 | 334 | 3.44, 5.77 |
 
-The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At that acceptance, 2.1 tokens per round of about 9.6 ms would give 220 tok/s with BF16 weights. With `--weights fp8`, plain decode runs at 265 tok/s at context 0.
+The context of 32,768 puts arbitrary token ids before the text. The greedy continuations of these texts repeat themselves, so the draft is right far more often than on chat: vLLM measured 58%, 33% and 20% there. At low acceptance the policy verifies 2 to 4 rows; it cannot fall back to plain decode, whose output differs from the verify path's.
 
 ## Benchmarks and profiling
 

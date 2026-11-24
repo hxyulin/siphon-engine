@@ -11,11 +11,12 @@
 //!
 //! After each text, both generate 1024 tokens from the same state (`Model::save_state`).
 //! - `speculation_is_exact` (test A): speculation with the DSpark draft at k = 1, 3 and 7
-//!   must emit the tokens of verifying one row at a time, every one. The test also prints
-//!   the acceptance and how many leading tokens agree with plain `Model::step` decoding,
-//!   which sums in other orders, without a pass criterion.
+//!   and with an adaptive width over every width from 1 to 8 must emit the tokens of
+//!   verifying one row at a time, every one. The test also prints the acceptance and how
+//!   many leading tokens agree with plain `Model::step` decoding, which sums in other
+//!   orders, without a pass criterion.
 //! - `random_drafts_change_nothing` (test B): the same with uniformly random drafts at
-//!   k = 3, which the target almost never accepts.
+//!   k = 3 and with widths cycling from 1 to 8; the target almost never accepts them.
 
 #![cfg(target_os = "linux")]
 
@@ -26,7 +27,7 @@ use inkling::{Checkpoint, TextConfig};
 use inkling_cuda::{
     Gpu,
     model::Model,
-    spec::{Drafts, Speculator, greedy_by_verify},
+    spec::{Drafts, Speculator, Width, WidthPolicy, greedy_by_verify},
     weights::Weights,
 };
 use safetensors::{Dtype, SafeTensors};
@@ -77,9 +78,19 @@ fn load(prompts: &[Vec<u32>]) -> anyhow::Result<Setup> {
     })
 }
 
-/// Runs every text: the reference, then each `(k, drafts)` from the same state, and checks
-/// that each emits the reference's tokens.
-fn check(runs: &[(usize, Drafts)], with_step: bool) -> anyhow::Result<()> {
+/// An adaptive width over every width from 1 to 8, priced so that each can win: a round
+/// of `w` rows costs `6 + 0.5 w` ms.
+fn every_width() -> anyhow::Result<Width> {
+    let round_ms = std::array::from_fn(|i| 6.0 + 0.5 * (i + 1) as f64);
+    Ok(Width::Adaptive(WidthPolicy::new(
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        round_ms,
+    )?))
+}
+
+/// Runs every text: the reference, then each `(width, drafts)` from the same state, and
+/// checks that each emits the reference's tokens.
+fn check(runs: &[(Width, Drafts)], with_step: bool) -> anyhow::Result<()> {
     let prompts = TEXTS
         .iter()
         .map(|t| tokens(t))
@@ -90,7 +101,7 @@ fn check(runs: &[(usize, Drafts)], with_step: bool) -> anyhow::Result<()> {
         mut model,
         capacity,
     } = load(&prompts)?;
-    let mut speculator = Speculator::new(&model, &checkpoint, capacity, runs[0].0)?;
+    let mut speculator = Speculator::new(&model, &checkpoint, capacity, 1)?;
     let mut failures = Vec::new();
     for (text, prompt) in TEXTS.iter().zip(&prompts) {
         model.reset()?;
@@ -116,9 +127,10 @@ fn check(runs: &[(usize, Drafts)], with_step: bool) -> anyhow::Result<()> {
                  agree, {same} positions equal"
             );
         }
-        for &(k, drafts) in runs {
+        for (width, drafts) in runs {
+            let drafts = *drafts;
             model.restore_state(&saved)?;
-            speculator.set_k(k)?;
+            speculator.set_width(width.clone())?;
             speculator.restart(&mut model, first)?;
             let got = speculator.generate(&mut model, GENERATED, drafts)?;
             let stats = speculator.stats();
@@ -128,16 +140,21 @@ fn check(runs: &[(usize, Drafts)], with_step: bool) -> anyhow::Result<()> {
                 .iter()
                 .map(|a| format!("{:.1}%", a * 100.0))
                 .collect();
+            let name = match width {
+                Width::Fixed(k) => format!("k = {k}"),
+                Width::Adaptive(_) => "adaptive".to_owned(),
+            };
             println!(
-                "{text}, k = {k}, {drafts:?}: {agree} of {GENERATED} tokens match, {} rounds, \
-                 {:.3} tokens per round, acceptance by position [{}]",
+                "{text}, {name}, {drafts:?}: {agree} of {GENERATED} tokens match, {} rounds, \
+                 {:.3} tokens per round, rounds by width {:?}, acceptance by position [{}]",
                 stats.rounds,
                 stats.tokens_per_round(),
+                stats.widths,
                 acceptance.join(", ")
             );
             if agree < GENERATED {
                 failures.push(format!(
-                    "{text} k = {k} {drafts:?}: first mismatch at {agree}"
+                    "{text} {name} {drafts:?}: first mismatch at {agree}"
                 ));
             }
         }
@@ -154,9 +171,10 @@ fn check(runs: &[(usize, Drafts)], with_step: bool) -> anyhow::Result<()> {
 fn speculation_is_exact() -> anyhow::Result<()> {
     check(
         &[
-            (1, Drafts::Dspark),
-            (3, Drafts::Dspark),
-            (7, Drafts::Dspark),
+            (Width::Fixed(1), Drafts::Dspark),
+            (Width::Fixed(3), Drafts::Dspark),
+            (Width::Fixed(7), Drafts::Dspark),
+            (every_width()?, Drafts::Dspark),
         ],
         true,
     )
@@ -165,5 +183,11 @@ fn speculation_is_exact() -> anyhow::Result<()> {
 #[test]
 #[ignore = "needs the checkpoint (INKLING_MODEL), the captures and about 21 GB of GPU memory"]
 fn random_drafts_change_nothing() -> anyhow::Result<()> {
-    check(&[(3, Drafts::Random(0x5eed))], false)
+    check(
+        &[
+            (Width::Fixed(3), Drafts::Random(0x5eed)),
+            (every_width()?, Drafts::Random(0x5eed)),
+        ],
+        false,
+    )
 }

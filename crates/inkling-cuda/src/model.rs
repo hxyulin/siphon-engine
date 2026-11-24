@@ -17,7 +17,7 @@ mod prefill;
 mod verify;
 
 pub use prefill::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, PrefillLogits};
-pub use verify::{Accept, Verdict, VerifyTokens};
+pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
 use std::{ops::Range, sync::Arc};
 

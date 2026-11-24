@@ -20,9 +20,10 @@
 //! tokens per round at 3, 5 and 7 drafts, the round time on the first text, and accepted
 //! tokens per millisecond against a verify-time model.
 //!
-//! A variant SPEC is `exact` or a `+`-joined set of `fp8-backbone`, `fp8-head`,
-//! `fp8-fold` and `shortlist` (see `DraftOptions`). `shortlist` needs `--shortlist`, a
-//! token ranking of little-endian u32 ids, as Ingine's `draft_shortlist.bin`.
+//! A variant SPEC is `exact`, `fast` or a `+`-joined set of `fp8-backbone`, `fp8-head`,
+//! `fp8-fold` and `shortlist` (see `DraftOptions`). `shortlist` ranks tokens by id, or
+//! by `--shortlist`, a token ranking of little-endian u32 ids, as Ingine's
+//! `draft_shortlist.bin`.
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
@@ -49,7 +50,7 @@ mod linux {
     use inkling::{Checkpoint, TextConfig};
     use inkling_cuda::{
         Gpu,
-        draft::{Draft, DraftOptions, STEPS},
+        draft::{Draft, DraftOptions, STEPS, read_ranking},
         ops::linear::Linear,
         weights::draft::{DraftWeights, HIDDEN, SharedTensors, SharedWeights, TAPS},
     };
@@ -125,38 +126,6 @@ mod linux {
             .split(',')
             .map(|v| v.parse().with_context(|| format!("bad number {v:?}")))
             .collect()
-    }
-
-    /// The options of a variant SPEC.
-    fn variant(spec: &str, ranking: Option<&Vec<u32>>) -> anyhow::Result<DraftOptions> {
-        let mut options = DraftOptions::default();
-        if spec == "exact" {
-            return Ok(options);
-        }
-        for part in spec.split('+') {
-            match part {
-                "fp8-backbone" => options.fp8_backbone = true,
-                "fp8-head" => options.fp8_head = true,
-                "fp8-fold" => options.fp8_fold = true,
-                "shortlist" => {
-                    options.shortlist =
-                        Some(ranking.context("shortlist needs --shortlist")?.clone());
-                }
-                _ => bail!("unknown variant part {part:?}"),
-            }
-        }
-        Ok(options)
-    }
-
-    fn read_ranking(path: &Path) -> anyhow::Result<Vec<u32>> {
-        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        ensure!(bytes.len() % 4 == 0, "the ranking is not whole u32s");
-        Ok(bytes
-            .as_chunks()
-            .0
-            .iter()
-            .map(|b| u32::from_le_bytes(*b))
-            .collect())
     }
 
     struct Env {
@@ -353,7 +322,7 @@ mod linux {
                 let text = read_text(&path)?;
                 let capacity = positions.iter().max().context("no positions")? + STEPS + 2;
                 for spec in &variants {
-                    let options = variant(spec, ranking.as_ref())?;
+                    let options = DraftOptions::parse(spec, ranking.as_deref())?;
                     let mut draft = env.draft(&options, capacity)?;
                     host_times(&env, &mut draft, &text, &positions, repeats)?;
                     let times = round_times(&env, &mut draft, &text, &positions, &steps, repeats)?;
@@ -430,7 +399,7 @@ mod linux {
             + 2;
         let mut summary = Vec::new();
         for spec in variants {
-            let options = variant(spec, ranking)?;
+            let options = DraftOptions::parse(spec, ranking.map(Vec::as_slice))?;
             let mut draft = env.draft(&options, capacity)?;
             println!("\n### {spec}\n");
             println!(
