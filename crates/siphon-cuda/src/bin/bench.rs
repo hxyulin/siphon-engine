@@ -70,7 +70,10 @@ mod linux {
     use std::{env, fmt::Write as _, path::PathBuf, process::Command, time::Instant};
 
     use anyhow::{Context as _, ensure};
-    use siphon::{Checkpoint, TextConfig};
+    use siphon::{
+        Checkpoint, TextConfig,
+        memory::{self, DraftChoice, PlanInputs, Planner},
+    };
     use siphon_cuda::{
         Gpu,
         model::{DEFAULT_PREFILL_CHUNK, MAX_PREFILL_CHUNK, Model, PrefillLogits},
@@ -83,15 +86,11 @@ mod linux {
     /// Bytes `--weights fp8` saves per step: the 3.51 GB of BF16 attention projections
     /// and LM head read as 1.76 GB of E4M3 values and scales.
     const FP8_SAVED_BYTES_PER_TOKEN: f64 = 1.75e9;
-    /// Device memory the FP8 copies take: one per layer, 1.11 GB.
-    const FP8_COPY_BYTES: usize = 1_120_000_000;
     /// RTX 5090 DRAM bandwidth.
     const PEAK_BANDWIDTH: f64 = 1.79e12;
     const DEFAULT_CONTEXTS: [usize; 3] = [0, 4096, 32768];
-    /// Added to the defaults when its cache fits.
+    /// Added to the defaults when the memory plan fits.
     const LONG_CONTEXT: usize = 131_072;
-    /// Free memory to leave for the runner's per-step buffers.
-    const HEADROOM: usize = 2 << 30;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
                          [--steps N] [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--json]\n       \
@@ -465,31 +464,23 @@ mod linux {
         let tail = args.warmup + args.steps;
 
         let gpu = Gpu::new(0)?;
+        let (free, _) = gpu.context().mem_get_info()?;
         let before = gpu_state()?;
-        eprintln!("loading weights");
         let checkpoint = Checkpoint::open(&args.model)?;
+        let planner = Planner::new(&PlanInputs {
+            config: &config,
+            checkpoint: &checkpoint,
+            weights: args.weights,
+            kv: args.kv,
+            draft: DraftChoice::None,
+            prefill_chunk: 0,
+        })?;
+        let contexts = args
+            .contexts
+            .take()
+            .unwrap_or_else(|| default_contexts(&planner, free, tail));
+        eprintln!("loading weights");
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-
-        let contexts = if let Some(c) = args.contexts.take() {
-            c
-        } else {
-            let mut c = DEFAULT_CONTEXTS.to_vec();
-            let (free, _) = gpu.context().mem_get_info()?;
-            let mut need = (LONG_CONTEXT + tail) * kv_bytes_per_token + HEADROOM;
-            if args.weights == WeightFormat::Fp8 {
-                need += FP8_COPY_BYTES;
-            }
-            if need <= free {
-                c.push(LONG_CONTEXT);
-            } else {
-                eprintln!(
-                    "skipping context {LONG_CONTEXT}: needs {} MiB, {} MiB free",
-                    need >> 20,
-                    free >> 20
-                );
-            }
-            c
-        };
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -545,6 +536,22 @@ mod linux {
             print!("{}", markdown(&before, passes, &args, &rows));
         }
         Ok(())
+    }
+
+    /// [`DEFAULT_CONTEXTS`], and [`LONG_CONTEXT`] if its plan, with `tail` more positions,
+    /// fits `free` bytes.
+    fn default_contexts(planner: &Planner, free: usize, tail: usize) -> Vec<usize> {
+        let mut contexts = DEFAULT_CONTEXTS.to_vec();
+        let plan = planner.plan(LONG_CONTEXT + tail);
+        if plan.total() <= memory::budget(free, None) {
+            contexts.push(LONG_CONTEXT);
+        } else {
+            eprintln!(
+                "skipping context {LONG_CONTEXT}: it needs {plan}; {} GiB free",
+                memory::gib(free)
+            );
+        }
+        contexts
     }
 
     fn markdown(gpu: &GpuState, passes: usize, args: &Args, rows: &[Row]) -> String {

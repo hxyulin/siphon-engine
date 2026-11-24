@@ -29,6 +29,10 @@ const BLOCK: usize = 8;
 pub const DFLASH2_HEADS: usize = 32;
 /// Width of the SiLU-gated MLP.
 pub const DFLASH2_MLP_WIDTH: usize = 6912;
+const _: () = assert!(
+    DFLASH2_HEADS * HEAD_DIM == siphon::memory::DFLASH2_Q_WIDTH
+        && DFLASH2_MLP_WIDTH == siphon::memory::DFLASH2_MLP_WIDTH
+);
 /// Channels that share one dynamic convolution coefficient.
 pub const CONV_GROUP: usize = 16;
 /// Taps of each convolution: the row itself and the row before it in the block.

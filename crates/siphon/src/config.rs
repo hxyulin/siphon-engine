@@ -40,6 +40,9 @@ pub struct TextConfig {
     pub local_layer_ids: Vec<usize>,
     pub final_logit_softcapping: f32,
     pub loop_config: LoopConfig,
+    /// The longest sequence the model supports, 1,048,576 for Inkling 2 Mini (the same as
+    /// `mtp_config.max_position_embeddings`).
+    pub model_max_length: usize,
 }
 
 /// The block of layers `core_start..core_end` runs `num_passes` times with shared weights.

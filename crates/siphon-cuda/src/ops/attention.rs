@@ -23,7 +23,7 @@
 //! picks its kernels when they are launched, so a captured graph holds the variant of each
 //! cache and nothing branches when it replays.
 
-use std::{fmt, str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
@@ -79,10 +79,12 @@ const PREFILL_BLOCK: u32 = 256;
 const PREFILL_SHARED_BYTES: u32 = 84_240;
 /// F32 values of one prefill partial slot: 128 rows of 128 outputs, a max and a sum.
 const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
+const _: () = assert!(PREFILL_SLOT == siphon::memory::PREFILL_SLOT);
 /// Most rows [`Attention::attention_rows`] takes, `kRowsMax` in the kernel.
 pub const ROWS_MAX: usize = 8;
 /// Blocks per KV head of `attention_rows_*`: each takes every 32nd split of 64 slots.
 const ROWS_BLOCKS: usize = 32;
+const _: () = assert!(ROWS_MAX * HEADS * ROWS_BLOCKS == siphon::memory::ROWS_ATTENTION_ROWS);
 /// Most query rows one warp of `attention_rows_*` owns: 3 heads x 8 rows over 8 warps.
 const ROWS_WARP_QUERIES: usize = 3;
 /// Threads per block of `attention_rows_*`.
@@ -91,49 +93,7 @@ const ROWS_THREADS: u32 = 256;
 /// `RowsShared` in the kernel.
 const ROWS_SHARED_BYTES: [u32; 2] = [49_920, 33_536];
 
-/// Element format of the global-layer KV caches. Sliding caches are always BF16.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum KvFormat {
-    /// BF16, the projections' own values.
-    #[default]
-    Bf16,
-    /// E4M3 without a scale: each BF16 value rounded to the nearest E4M3 value, which halves
-    /// the bytes attention reads. Keys are L2-clipped to norm `sqrt(512)` and values are
-    /// RMS-normed, so every element lies far inside E4M3's range of +-448.
-    Fp8,
-}
-
-impl KvFormat {
-    /// Bytes of one stored key or value element.
-    #[must_use]
-    pub fn element_bytes(self) -> usize {
-        match self {
-            Self::Bf16 => 2,
-            Self::Fp8 => 1,
-        }
-    }
-}
-
-impl FromStr for KvFormat {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "bf16" => Ok(Self::Bf16),
-            "fp8" => Ok(Self::Fp8),
-            _ => anyhow::bail!("unknown KV cache format {s:?}; expected bf16 or fp8"),
-        }
-    }
-}
-
-impl fmt::Display for KvFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Bf16 => "bf16",
-            Self::Fp8 => "fp8",
-        })
-    }
-}
+pub use siphon::KvFormat;
 
 /// The key and value buffers of a [`KvCache`], each of shape `[slots, 8, 128]`.
 #[derive(Debug)]

@@ -30,6 +30,7 @@ const ROUTING_THREADS: u32 = 256;
 const DEPTH_THREADS: u32 = 288;
 /// Candidates and queries `depth_attention_fused_2304` holds in registers.
 pub const FUSED_MAX_CANDIDATES: usize = 6;
+const _: () = assert!(FUSED_MAX_CANDIDATES == siphon::memory::FUSED_MAX_CANDIDATES);
 pub const FUSED_MAX_QUERIES: usize = 4;
 /// Normalized copies `depth_attention_fused_2304` can write.
 pub const FUSED_DESTS: usize = 4;
@@ -39,6 +40,7 @@ const ROUTER_THREADS: u32 = 288;
 /// Slices of the inner dimension that `moe_router_logits_rows_2304` sums separately, of
 /// 256 columns each.
 const ROUTER_SPLITS: usize = 9;
+const _: () = assert!(ROUTER_SPLITS == siphon::memory::ROUTER_SPLITS);
 /// Rows per block of `moe_router_logits_rows_2304`, which covers all 128 experts.
 const ROUTER_TILE_ROWS: usize = 64;
 const ROUTER_TILE_THREADS: u32 = 256;

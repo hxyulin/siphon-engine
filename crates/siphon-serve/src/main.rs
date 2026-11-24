@@ -11,8 +11,13 @@ use anyhow::{Context as _, bail, ensure};
 use serde_json::json;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
-                     [--context 65536] [--weights fp8|bf16] [--kv fp8|bf16] [--queue 8] \
+                     [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--queue 8] \
                      [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] [--fallback]
+--context sets the positions of the KV cache: the prompt and the generated tokens. Without it
+the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
+way it plans the memory before loading the weights and stops if the plan does not fit.
+--memory caps the GPU memory the plan may use, the CUDA context included. Without it the
+plan may use the free memory at startup less a 0.5 GiB margin.
 --drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
 or a DFlash draft exported by the 2DSD project.
 --draft picks the draft's approximations as bench does: fast (the default, FP8 plus the
@@ -39,7 +44,8 @@ fn args() -> anyhow::Result<Args> {
     let mut host = "127.0.0.1".to_owned();
     let mut port = 8000u16;
     let mut name = "inkling-2-mini".to_owned();
-    let mut capacity = 65536;
+    let mut capacity = None;
+    let mut memory = None;
     let mut fp8_weights = true;
     let mut fp8_kv = true;
     let mut queue = 8;
@@ -57,7 +63,14 @@ fn args() -> anyhow::Result<Args> {
             "--host" => host = value()?,
             "--port" => port = value()?.parse()?,
             "--name" => name = value()?,
-            "--context" => capacity = value()?.parse()?,
+            "--context" => capacity = Some(value()?.parse()?),
+            "--memory" => {
+                let gib: f64 = value()?.parse().context("--memory takes GiB")?;
+                ensure!(gib > 0.0, "--memory takes a positive number of GiB");
+                #[expect(clippy::cast_sign_loss, reason = "gib is positive")]
+                let bytes = (gib * f64::from(1u32 << 30)) as usize;
+                memory = Some(bytes);
+            }
             "--weights" => fp8_weights = fp8(&value()?)?,
             "--kv" => fp8_kv = fp8(&value()?)?,
             "--queue" => queue = value()?.parse()?,
@@ -90,6 +103,7 @@ fn args() -> anyhow::Result<Args> {
         engine: engine::Options {
             model_dir: model_dir.clone(),
             capacity,
+            memory,
             fp8_weights,
             fp8_kv,
             widths,

@@ -58,25 +58,32 @@ use crate::{
 
 /// Draft tokens per round: one per mask row.
 pub const STEPS: usize = BLOCK - 1;
+const _: () = assert!(STEPS == siphon::memory::DRAFT_STEPS);
 /// Positions before the block that the local layers (0 and 2) see.
 pub const WINDOW: usize = 1024;
 /// Slots of the local layers' rings: the window and the block.
 const LOCAL_SLOTS: usize = WINDOW + BLOCK;
+const _: () = assert!(LOCAL_SLOTS == siphon::memory::DRAFT_RING_SLOTS);
 /// Slots of DFlash 2's rings: the window before the block's first row and the block.
 const DFLASH2_SLOTS: usize = DFLASH2_WINDOW + BLOCK;
+const _: () = assert!(DFLASH2_SLOTS == siphon::memory::DFLASH2_RING_SLOTS);
 /// RoPE base of the draft (`rope_theta` in `mtp_config`).
 const ROPE_THETA: f64 = 1e6;
 /// RMSNorm epsilon of the draft (`rms_norm_eps` in `mtp_config`).
 const EPS: f32 = 1e-6;
 /// Target positions one [`Draft::commit`] chunk projects at once.
 const COMMIT_ROWS: usize = 512;
+const _: () = assert!(COMMIT_ROWS == siphon::memory::COMMIT_ROWS);
 
 /// Ranked tokens a shortlist head keeps, as Ingine's drafter.
 pub const SHORTLIST_ROWS: usize = 32768;
+const _: () = assert!(SHORTLIST_ROWS == siphon::memory::SHORTLIST_ROWS);
 /// Context tokens a shortlist head adds at most.
 pub const CONTEXT_ROWS: usize = 16384;
+const _: () = assert!(CONTEXT_ROWS == siphon::memory::SHORTLIST_CONTEXT_ROWS);
 /// The first special token id; a shortlist head keeps every token from here on.
 const FIRST_SPECIAL: usize = 199_990;
+const _: () = assert!(FIRST_SPECIAL == siphon::memory::FIRST_SPECIAL);
 /// A shortlist head's base logits cover its rows in use rounded up to this.
 const HEAD_BUCKET: usize = 1024;
 
@@ -154,6 +161,17 @@ impl DraftOptions {
             }
         }
         Ok(options)
+    }
+
+    /// The approximations as a memory plan counts them.
+    #[must_use]
+    pub fn approx(&self) -> siphon::memory::DraftApprox {
+        siphon::memory::DraftApprox {
+            fp8_backbone: self.fp8_backbone,
+            fp8_head: self.fp8_head,
+            fp8_fold: self.fp8_fold,
+            shortlist: self.shortlist.is_some(),
+        }
     }
 }
 

@@ -2,6 +2,9 @@
 
 mod checkpoint;
 mod config;
+mod format;
+pub mod memory;
 
 pub use checkpoint::{Checkpoint, TensorEntry};
 pub use config::{LoopConfig, TextConfig};
+pub use format::{KvFormat, WeightFormat};

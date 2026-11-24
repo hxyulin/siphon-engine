@@ -54,8 +54,11 @@ pub enum Event {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub model_dir: PathBuf,
-    /// Positions of the global KV cache: the prompt and the generated tokens.
-    pub capacity: usize,
+    /// Positions of the global KV cache: the prompt and the generated tokens. `None` takes
+    /// the most that fit the memory budget.
+    pub capacity: Option<usize>,
+    /// Bytes of GPU memory the plan may use, the CUDA context included.
+    pub memory: Option<usize>,
     pub fp8_weights: bool,
     pub fp8_kv: bool,
     /// Verify widths the adaptive policy chooses among.
@@ -116,7 +119,10 @@ mod cuda {
     };
 
     use anyhow::Context as _;
-    use siphon::{Checkpoint, TextConfig};
+    use siphon::{
+        Checkpoint, TextConfig,
+        memory::{self, CONTEXT_BYTES, DraftChoice, PlanInputs, Planner, SAFETY_MARGIN, gib},
+    };
     use siphon_cuda::{
         Gpu,
         draft::DraftOptions,
@@ -136,68 +142,119 @@ mod cuda {
     /// ids that end a turn.
     pub fn start(options: &Options, stop: Vec<u32>, warmup: Vec<u32>) -> anyhow::Result<Engine> {
         anyhow::ensure!(warmup.len() >= 32, "the warmup prompt is too short");
-        anyhow::ensure!(
-            options.capacity > warmup.len() + 128 + MARGIN,
-            "--context {} is too small",
-            options.capacity
-        );
         let (jobs, queue) = sync_channel(options.queue);
         let (ready, loaded) = sync_channel(1);
-        let max_context = options.capacity - MARGIN;
         let options = options.clone();
         thread::Builder::new()
             .name("engine".to_owned())
             .spawn(move || match load(&options, &warmup) {
-                Ok((model, speculator)) => {
-                    let _ = ready.send(Ok(()));
+                Ok((model, speculator, capacity)) => {
+                    let _ = ready.send(Ok(capacity));
                     run(model, speculator, &queue, &stop);
                 }
                 Err(e) => {
                     let _ = ready.send(Err(e));
                 }
             })?;
-        loaded
+        let capacity = loaded
             .recv()
             .context("the engine thread died while loading")??;
-        Ok(Engine { jobs, max_context })
+        Ok(Engine {
+            jobs,
+            max_context: capacity - MARGIN,
+        })
     }
 
-    fn load(options: &Options, warmup: &[u32]) -> anyhow::Result<(Model, Speculator)> {
+    /// Plans the GPU memory and picks the capacity, before loading anything: the one
+    /// `options` asks for if it fits, else the most that fit.
+    fn plan(
+        options: &Options,
+        planner: &Planner,
+        free: usize,
+        warmup: usize,
+    ) -> anyhow::Result<usize> {
+        let budget = memory::budget(free, options.memory);
+        let limit = options.memory.map_or_else(String::new, |l| {
+            format!(
+                ", within --memory {} GiB less the context's {} GiB",
+                gib(l),
+                gib(CONTEXT_BYTES)
+            )
+        });
+        let budget_line = format!(
+            "budget {} GiB: {} GiB free less a {} GiB margin{limit}",
+            gib(budget),
+            gib(free),
+            gib(SAFETY_MARGIN)
+        );
+        let capacity = match options.capacity {
+            Some(capacity) => {
+                let plan = planner.plan(capacity);
+                anyhow::ensure!(
+                    plan.total() <= budget,
+                    "--context {capacity} does not fit: it needs {plan}; {budget_line}; \
+                     the largest that fits is {}",
+                    planner.max_capacity(budget).unwrap_or(0)
+                );
+                capacity
+            }
+            None => planner.max_capacity(budget).with_context(|| {
+                format!(
+                    "the model does not fit: it needs {}; {budget_line}",
+                    planner.plan(0)
+                )
+            })?,
+        };
+        anyhow::ensure!(
+            capacity > warmup + 128 + MARGIN,
+            "a context of {capacity} is too small"
+        );
+        eprintln!("memory plan: {}", planner.plan(capacity));
+        eprintln!("memory {budget_line}");
+        Ok(capacity)
+    }
+
+    fn load(options: &Options, warmup: &[u32]) -> anyhow::Result<(Model, Speculator, usize)> {
         let started = Instant::now();
         let config = TextConfig::load(&options.model_dir)?;
         let passes = config.loop_config.num_passes;
         let gpu = Gpu::new(0)?;
+        let (free, _) = gpu.context().mem_get_info()?;
         let checkpoint = Checkpoint::open(&options.model_dir)?;
+        let kv = if options.fp8_kv {
+            KvFormat::Fp8
+        } else {
+            KvFormat::Bf16
+        };
+        let weight_format = if options.fp8_weights {
+            WeightFormat::Fp8
+        } else {
+            WeightFormat::Bf16
+        };
+        let draft_options = DraftOptions::parse(&options.draft, None)?;
+        let planner = Planner::new(&PlanInputs {
+            config: &config,
+            checkpoint: &checkpoint,
+            weights: weight_format,
+            kv,
+            draft: options
+                .drafter
+                .as_deref()
+                .map_or(DraftChoice::Bundled(draft_options.approx()), |dir| {
+                    DraftChoice::Dflash(dir, draft_options.approx())
+                }),
+            prefill_chunk: DEFAULT_PREFILL_CHUNK,
+        })?;
+        let capacity = plan(options, &planner, free, warmup.len())?;
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-        let mut model = Model::with_formats(
-            &gpu,
-            config,
-            weights,
-            passes,
-            options.capacity,
-            if options.fp8_kv {
-                KvFormat::Fp8
-            } else {
-                KvFormat::Bf16
-            },
-            if options.fp8_weights {
-                WeightFormat::Fp8
-            } else {
-                WeightFormat::Bf16
-            },
-        )?;
+        let mut model =
+            Model::with_formats(&gpu, config, weights, passes, capacity, kv, weight_format)?;
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
         let source = options
             .drafter
             .as_deref()
             .map_or(DraftSource::Bundled, DraftSource::Dflash);
-        let draft = load_draft(
-            &mut model,
-            &checkpoint,
-            source,
-            options.capacity,
-            &DraftOptions::parse(&options.draft, None)?,
-        )?;
+        let draft = load_draft(&mut model, &checkpoint, source, capacity, &draft_options)?;
         let mut speculator = Speculator::with_draft(&model, draft, width)?;
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
 
@@ -223,7 +280,7 @@ mod cuda {
             policy.with_plain(None)?
         };
         speculator.set_width(Width::Adaptive(policy))?;
-        Ok((model, speculator))
+        Ok((model, speculator, capacity))
     }
 
     fn run(mut model: Model, mut speculator: Speculator, queue: &Receiver<Job>, stop: &[u32]) {

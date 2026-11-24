@@ -30,6 +30,7 @@ const ROWS_PER_BLOCK: usize = 8;
 /// Rows of an [`Fp8Matrix`] round up to a multiple of this, which `ROWS_PER_BLOCK`
 /// divides, so no load leaves the matrix.
 const ROW_PAD: usize = 32;
+const _: () = assert!(ROW_PAD == siphon::memory::FP8_ROW_PAD);
 
 /// A weight `[rows, k]` as E4M3 bytes `[padded_rows, k]` followed by one F32 scale per
 /// padded row, in one device buffer. Padding rows are zero.

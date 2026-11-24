@@ -47,6 +47,7 @@ const STEP_ROWS: usize = VERIFY_ROWS;
 /// Rows the LM head runs at once when every row's logits are wanted: 32 rows of 201,024
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
+const _: () = assert!(HEAD_ROWS == siphon::memory::HEAD_ROWS);
 /// Receives each chunk's feature taps and the position of its first row.
 type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 

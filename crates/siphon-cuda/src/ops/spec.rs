@@ -64,6 +64,7 @@ impl Default for TapLayout {
 }
 /// Most rows one verify takes: the anchor and up to 7 drafts.
 pub const VERIFY_ROWS: usize = 8;
+const _: () = assert!(VERIFY_ROWS == siphon::memory::VERIFY_ROWS);
 /// Conv state rows per stream.
 pub const STATE_ROWS: usize = 3;
 /// Conv streams per visit: keys, values, post-attention and post-MLP.

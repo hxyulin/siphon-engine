@@ -48,6 +48,7 @@ use crate::{
 /// Prompt rows whose taps [`Speculator::restart`] commits again: the slots of the draft's
 /// rings, the window and a block. DFlash 2's rings, 2056 slots, are the longest.
 const TAIL: usize = DFLASH2_WINDOW + STEPS + 1;
+const _: () = assert!(TAIL == siphon::memory::TAIL_ROWS);
 const _: () = assert!(
     DFLASH2_WINDOW >= WINDOW,
     "TAIL covers the bundled draft's rings"
@@ -64,6 +65,7 @@ const NOTED_PROMPT: usize = CONTEXT_ROWS / 2;
 /// step and a draft round emit a token faster than a verify of one row.
 const FIRST_PLAIN_RUN: usize = 1;
 const MAX_PLAIN_RUN: usize = 32;
+const _: () = assert!(MAX_PLAIN_RUN == siphon::memory::PLAIN_RUN_ROWS);
 
 /// The share of drafts the target kept so far in a generation, for each tenth of the
 /// confidence range: the calibration by which a policy with plain prices decides between

@@ -26,6 +26,13 @@ pub const MLP_WIDTH: usize = 9216;
 pub const LAYERS: usize = 3;
 /// Rank of the Markov head's state and token embedding.
 pub const RANK: usize = 256;
+const _: () = assert!(RANK == siphon::memory::MARKOV_RANK);
+const _: () = assert!(
+    LAYERS == siphon::memory::DRAFT_LAYERS
+        && TAPS == siphon::memory::DRAFT_TAPS
+        && HEADS * HEAD_DIM == siphon::memory::DRAFT_Q_WIDTH
+        && MLP_WIDTH == siphon::memory::DRAFT_MLP_WIDTH
+);
 /// Target features the draft mixes: the partial block entering visits 5, 23 and 41, and
 /// the final normed hidden state (`target_layer_ids [5, 23, 41, 48]`).
 pub const TAPS: usize = 4;
