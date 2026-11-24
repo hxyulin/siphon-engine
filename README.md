@@ -36,9 +36,10 @@ The speedup depends on how predictable the text is: the draft's first token is a
 - Chunked prefill of up to 2,048 rows on tensor-core GEMMs, an expert-grouped MoE GEMM and flash attention.
 - Opt-in FP8 copies of the dense weights (`--weights fp8`), an FP8 global KV cache (`--kv fp8`) and quantized expert activations for prefill (`--expert-activations quantized`).
 - Greedy speculative decoding with the DSpark draft. The verify pass gives each row the same result at every width, so speculation returns exactly the tokens that verifying one row at a time would. Each round picks its width from the drafts' confidences.
+- An OpenAI-compatible server (`siphon-serve`): chat completions with streaming, reasoning and tool calls, and raw completions.
 - A quality gate that compares the engine with MLX over long texts, and parity tests per layer visit.
 
-Not yet: sampling other than greedy, probabilistic acceptance, batching several sequences, prefix caching, a server.
+Not yet: sampling other than greedy, probabilistic acceptance, batching several sequences, prefix caching, stop sequences.
 
 ## Build
 
@@ -51,9 +52,25 @@ target/release/bench <model-dir> --contexts 0,32768 --weights fp8 --kv fp8
 target/release/bench <model-dir> --prompt <capture> --spec auto --weights fp8 --kv fp8
 ```
 
-`<model-dir>` holds the checkpoint from Hugging Face (`thinkingmachines/Inkling-2-Mini`). Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
+`<model-dir>` holds the checkpoint from Hugging Face (`thinkingmachines/Inkling-2-Mini`).
 
-On macOS only the `siphon` crate builds, and `siphon-cuda` compiles to an empty crate. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment.
+## Server
+
+```sh
+SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000 --context 65536
+```
+
+It loads the model with FP8 dense weights and KV cache (`--weights bf16` and `--kv bf16` switch back), prices the verify widths on a short prompt, and then serves:
+
+| Route | Notes |
+| --- | --- |
+| `POST /v1/chat/completions` | Messages rendered as the checkpoint's chat template renders them, with `stream`, `tools` and `reasoning_effort` (a name such as `low`, or 0 to 0.99; default 0.9). The model's thinking comes back as `reasoning_content`. |
+| `POST /v1/completions` | A text prompt or token ids, without streaming. |
+| `GET /v1/models`, `GET /health` | |
+
+Requests run one at a time, in arrival order, and up to `--queue` (8) wait. Decoding is greedy, so `temperature`, `top_p` and other sampling fields are ignored. With `SIPHON_API_KEY` set, `/v1` routes need `Authorization: Bearer <key>`. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
+
+On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds without its engine, so its tests run but it cannot serve. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment.
 
 ## Layout
 
@@ -61,6 +78,7 @@ On macOS only the `siphon` crate builds, and `siphon-cuda` compiles to an empty 
 | --- | --- |
 | `crates/siphon` | Config parsing, the memory-mapped safetensors checkpoint, and the `siphon inspect` CLI |
 | `crates/siphon-cuda` | Kernels (`kernels/*.cu`), their Rust launchers (`src/ops`), the model, the draft and speculation, and the `bench`, `eval`, `parity` and `dspark` binaries |
+| `crates/siphon-serve` | The HTTP server: chat rendering, output parsing and the engine thread |
 | `reference` | MLX-LM captures and kernel fixtures, run on a Mac with uv |
 | `scripts` | Remote sync, the PDL read-order audit, and profiling scripts |
 | `docs/engine.md` | How the engine works, how it is tested and measured, and the formats it uses |

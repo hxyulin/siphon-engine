@@ -1,0 +1,289 @@
+//! The GPU side: one thread owns the model and the draft and runs one request at a time,
+//! in arrival order, from a bounded queue.
+
+use std::{
+    path::PathBuf,
+    sync::mpsc::{SyncSender, TrySendError},
+};
+
+use tokio::sync::mpsc::UnboundedSender;
+
+/// What a request asks the engine for.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only the Linux engine runs jobs")
+)]
+pub struct Job {
+    pub prompt: Vec<u32>,
+    /// Tokens to generate at most, the stop token excluded.
+    pub max_tokens: usize,
+    pub events: UnboundedSender<Event>,
+}
+
+/// Why generation ended.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only the Linux engine runs jobs")
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// The model ended its turn.
+    Stop,
+    /// The request's token limit.
+    Length,
+}
+
+/// What the engine reports for a job, in order: `Tokens` any number of times, then
+/// `Done` or `Failed`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only the Linux engine runs jobs")
+)]
+#[derive(Debug)]
+pub enum Event {
+    Tokens(Vec<u32>),
+    Done(Finish),
+    Failed(String),
+}
+
+/// How to load the model.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only the Linux engine runs jobs")
+)]
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub model_dir: PathBuf,
+    /// Positions of the global KV cache: the prompt and the generated tokens.
+    pub capacity: usize,
+    pub fp8_weights: bool,
+    pub fp8_kv: bool,
+    /// Verify widths the adaptive policy chooses among.
+    pub widths: Vec<usize>,
+    /// Jobs that wait while one runs.
+    pub queue: usize,
+}
+
+/// Sends jobs to the engine thread.
+#[derive(Clone)]
+pub struct Engine {
+    jobs: SyncSender<Job>,
+    max_context: usize,
+}
+
+/// Why the engine did not take a job.
+pub enum Refused {
+    Busy,
+    Stopped,
+}
+
+impl Engine {
+    /// Prompt and generated tokens that one job may hold together.
+    pub fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    /// Queues `job`, or refuses it when the queue is full or the engine has stopped.
+    pub fn submit(&self, job: Job) -> Result<(), Refused> {
+        self.jobs.try_send(job).map_err(|e| match e {
+            TrySendError::Full(_) => Refused::Busy,
+            TrySendError::Disconnected(_) => Refused::Stopped,
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn start(_options: &Options, _stop: Vec<u32>, _warmup: Vec<u32>) -> anyhow::Result<Engine> {
+    anyhow::bail!("the engine needs Linux with an NVIDIA GPU")
+}
+
+#[cfg(target_os = "linux")]
+pub use cuda::start;
+
+#[cfg(target_os = "linux")]
+mod cuda {
+    use std::{
+        ops::ControlFlow,
+        sync::mpsc::{Receiver, sync_channel},
+        thread,
+        time::Instant,
+    };
+
+    use anyhow::Context as _;
+    use siphon::{Checkpoint, TextConfig};
+    use siphon_cuda::{
+        Gpu,
+        draft::DraftOptions,
+        model::{DEFAULT_PREFILL_CHUNK, Model},
+        ops::{attention::KvFormat, spec::VERIFY_ROWS},
+        spec::{Drafts, Speculator, Width, WidthPolicy, price},
+        weights::{WeightFormat, Weights},
+    };
+
+    use super::{Engine, Event, Finish, Job, Options};
+
+    /// Positions past the last generated token that a round may write: a full verify.
+    const MARGIN: usize = VERIFY_ROWS + 1;
+
+    /// Loads the model on a new thread, prices the verify widths on `warmup` (a prompt
+    /// of at least 32 tokens), and returns once the thread takes jobs. `stop` holds the
+    /// ids that end a turn.
+    pub fn start(options: &Options, stop: Vec<u32>, warmup: Vec<u32>) -> anyhow::Result<Engine> {
+        anyhow::ensure!(warmup.len() >= 32, "the warmup prompt is too short");
+        anyhow::ensure!(
+            options.capacity > warmup.len() + 128 + MARGIN,
+            "--context {} is too small",
+            options.capacity
+        );
+        let (jobs, queue) = sync_channel(options.queue);
+        let (ready, loaded) = sync_channel(1);
+        let max_context = options.capacity - MARGIN;
+        let options = options.clone();
+        thread::Builder::new()
+            .name("engine".to_owned())
+            .spawn(move || match load(&options, &warmup) {
+                Ok((model, speculator)) => {
+                    let _ = ready.send(Ok(()));
+                    run(model, speculator, &queue, &stop);
+                }
+                Err(e) => {
+                    let _ = ready.send(Err(e));
+                }
+            })?;
+        loaded
+            .recv()
+            .context("the engine thread died while loading")??;
+        Ok(Engine { jobs, max_context })
+    }
+
+    fn load(options: &Options, warmup: &[u32]) -> anyhow::Result<(Model, Speculator)> {
+        let started = Instant::now();
+        let config = TextConfig::load(&options.model_dir)?;
+        let passes = config.loop_config.num_passes;
+        let gpu = Gpu::new(0)?;
+        let checkpoint = Checkpoint::open(&options.model_dir)?;
+        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut model = Model::with_formats(
+            &gpu,
+            config,
+            weights,
+            passes,
+            options.capacity,
+            if options.fp8_kv {
+                KvFormat::Fp8
+            } else {
+                KvFormat::Bf16
+            },
+            if options.fp8_weights {
+                WeightFormat::Fp8
+            } else {
+                WeightFormat::Bf16
+            },
+        )?;
+        let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
+        let mut speculator = Speculator::with_options(
+            &model,
+            &checkpoint,
+            options.capacity,
+            width,
+            &DraftOptions::fast(),
+        )?;
+        eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
+
+        // Price each width at the warmup prompt, which also captures the graphs.
+        model.reset()?;
+        let first = speculator.prefill(&mut model, warmup, DEFAULT_PREFILL_CHUNK)?;
+        let saved = model.save_state()?;
+        let round_ms = price(&mut model, &mut speculator, &saved, warmup, first)?;
+        let priced: Vec<String> = options
+            .widths
+            .iter()
+            .map(|&w| format!("{w}: {:.3}", round_ms[w - 1]))
+            .collect();
+        eprintln!("round ms by width: {}", priced.join(", "));
+        speculator.set_width(Width::Adaptive(WidthPolicy::new(
+            &options.widths,
+            round_ms,
+        )?))?;
+        Ok((model, speculator))
+    }
+
+    fn run(mut model: Model, mut speculator: Speculator, queue: &Receiver<Job>, stop: &[u32]) {
+        for job in queue {
+            if job.events.is_closed() {
+                continue;
+            }
+            let started = Instant::now();
+            let events = job.events.clone();
+            match generate(&mut model, &mut speculator, &job, stop) {
+                Ok((finish, emitted, prefill_s)) => {
+                    let decode_s = started.elapsed().as_secs_f64() - prefill_s;
+                    eprintln!(
+                        "job: {} prompt tokens, prefill {:.0} ms, {emitted} tokens in {:.2} s \
+                         ({:.1} tok/s, {:.2} tokens per round), {}",
+                        job.prompt.len(),
+                        prefill_s * 1e3,
+                        decode_s,
+                        emitted as f64 / decode_s.max(1e-9),
+                        speculator.stats().tokens_per_round(),
+                        if events.is_closed() {
+                            "client left".to_owned()
+                        } else {
+                            format!("{finish:?}")
+                        },
+                    );
+                    let _ = events.send(Event::Done(finish));
+                }
+                Err(e) => {
+                    eprintln!("job failed: {e:#}");
+                    let _ = events.send(Event::Failed(format!("{e:#}")));
+                }
+            }
+        }
+    }
+
+    /// Runs `job` and returns why it ended, the tokens it emitted, and the prefill's
+    /// seconds.
+    fn generate(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        job: &Job,
+        stop: &[u32],
+    ) -> anyhow::Result<(Finish, usize, f64)> {
+        let started = Instant::now();
+        model.reset()?;
+        let first = speculator.prefill(model, &job.prompt, DEFAULT_PREFILL_CHUNK)?;
+        let prefill_s = started.elapsed().as_secs_f64();
+        let mut emitted = 0;
+        let mut finish = Finish::Length;
+        // Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
+        // over or its client has left.
+        let mut take = |ids: &[u32]| {
+            let room = job.max_tokens - emitted;
+            let end = ids.iter().position(|id| stop.contains(id));
+            let keep = end.unwrap_or(ids.len()).min(room);
+            if keep > 0 {
+                emitted += keep;
+                if job
+                    .events
+                    .send(Event::Tokens(ids[..keep].to_vec()))
+                    .is_err()
+                {
+                    return ControlFlow::Break(());
+                }
+            }
+            if end.is_some_and(|e| e <= room) {
+                finish = Finish::Stop;
+                return ControlFlow::Break(());
+            }
+            if emitted == job.max_tokens {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        };
+        if take(&[first]).is_continue() {
+            speculator.generate_with(model, job.max_tokens, Drafts::Dspark, &mut take)?;
+        }
+        Ok((finish, emitted, prefill_s))
+    }
+}
