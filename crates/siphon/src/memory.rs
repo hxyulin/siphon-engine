@@ -77,8 +77,8 @@ pub const FP8_ROW_PAD: usize = 32;
 pub const SMS: usize = 170;
 /// Floats of one prefill attention partial slot: 128 rows of 128 values, a maximum and a sum.
 pub const PREFILL_SLOT: usize = 128 * (128 + 2);
-/// Partial rows of the multi-row attention: 8 rows of 24 heads in 32 blocks.
-pub const ROWS_ATTENTION_ROWS: usize = 8 * 24 * 32;
+/// Partial rows of the multi-row attention: 8 rows of 24 heads, 33 partials each.
+pub const ROWS_ATTENTION_ROWS: usize = 8 * 24 * 33;
 /// Slices of the prefill router's inner dimension.
 pub const ROUTER_SPLITS: usize = 9;
 /// Message candidates the fused depth attention weighs per slot.

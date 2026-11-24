@@ -14,12 +14,12 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut};
+use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _};
 use half::bf16;
 use siphon::TextConfig;
 
 use super::{
-    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, Upcoming, VisitState,
+    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, Upcoming, VisitState, Window,
     verify::VerifyBuffers, visit_plan, zeros,
 };
 use crate::{
@@ -505,9 +505,27 @@ impl Ctx {
                 self.prefetch_pace(layer),
             )?;
         }
-        let mut plan = plan
+        // The sliding rings as decode prefetches them (see `Ctx::prefetch_rest`), from the
+        // first row's position.
+        let position = p.start.device_ptr(&self.stream).0;
+        let windows: Vec<Option<Window>> = visits
             .iter()
-            .map(|&(_, upcoming)| prefetch.then_some(upcoming));
+            .map(|v| {
+                v.kv.ring_buffers(&self.stream)
+                    .map(|(buffers, slot_bytes)| Window {
+                        buffers,
+                        slot_bytes,
+                        position,
+                    })
+            })
+            .collect();
+        let mut plan = plan.iter().enumerate().map(|(v, &(_, upcoming))| {
+            prefetch.then_some(Upcoming {
+                next_window: windows.get(v + 1).copied().flatten(),
+                after_window: windows.get(v + 2).copied().flatten(),
+                ..upcoming
+            })
+        });
         let mut visits = visits.iter_mut().enumerate();
         let mut next_visit = || {
             let visit = visits.next().context("fewer visit caches than visits")?;
@@ -827,7 +845,7 @@ impl Ctx {
         if let Some(next) = upcoming
             && index == 0
         {
-            self.prefetch_rest(layer, gates.is_some(), next.next, true, None)?;
+            self.prefetch_rest(layer, gates.is_some(), next.next, true, next.next_window)?;
         }
 
         // The normalized visit input goes straight into the new block state at a block start.
@@ -958,11 +976,12 @@ impl Ctx {
         if let Some(Upcoming {
             next: Some((layer, messages)),
             after,
+            after_window,
             ..
         }) = upcoming
         {
             self.kernels.linear.join_prefetch(&self.stream)?;
-            self.prefetch_rest(layer, messages, after, true, None)?;
+            self.prefetch_rest(layer, messages, after, true, after_window)?;
         }
 
         if step {

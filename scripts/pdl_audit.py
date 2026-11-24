@@ -70,8 +70,8 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     # The multi-row attention copies its first cache tiles before the wait: the host
     # uploads the start before the pass, and only the kernel's own combining blocks
     # append to the cache, after the wait.
-    **{f"attention_rows_{f}_{nq}": {"k_cache", "v_cache", "start"}
-       for f in ("bf16", "fp8") for nq in (1, 2, 3)},
+    **{f"attention_rows_{f}_{nt}": {"k_cache", "v_cache", "start"}
+       for f in ("bf16", "fp8") for nt in (1, 2, 3)},
 }
 
 # Pointer fields of struct parameters, by (kernel file, type name): the stride of the

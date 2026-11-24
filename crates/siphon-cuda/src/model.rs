@@ -1285,9 +1285,7 @@ impl Ctx {
         let lm_head_start;
         // With FP8 weights, the next visit's sliding KV ring too, once every slot is filled
         // (see `Prefetch::ring`): at 32K its attention took 8.1 us with the window in DRAM.
-        let window = window
-            .filter(|_| !rows && w.fp8.is_some())
-            .map(Window::prefetch);
+        let window = window.filter(|_| w.fp8.is_some()).map(Window::prefetch);
         if let Some((layer, messages)) = next {
             prefetch.extend(self.visit_prefetch(layer, messages, rows));
             prefetch.extend(window.iter().flatten().map(|r| r as &dyn Prefetch));

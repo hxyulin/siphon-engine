@@ -82,16 +82,20 @@ const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
 const _: () = assert!(PREFILL_SLOT == siphon::memory::PREFILL_SLOT);
 /// Most rows [`Attention::attention_rows`] takes, `kRowsMax` in the kernel.
 pub const ROWS_MAX: usize = 8;
-/// Blocks per KV head of `attention_rows_*`: each takes every 32nd split of 64 slots.
-const ROWS_BLOCKS: usize = 32;
-const _: () = assert!(ROWS_MAX * HEADS * ROWS_BLOCKS == siphon::memory::ROWS_ATTENTION_ROWS);
-/// Most query rows one warp of `attention_rows_*` owns: 3 heads x 8 rows over 8 warps.
-const ROWS_WARP_QUERIES: usize = 3;
+/// Partials per query row of `attention_rows_*`: one from each of 32 blocks that take every
+/// 32nd split of 64 slots, and one for the row's 8 nearest keys.
+const ROWS_PARTS: usize = 33;
+const _: () = assert!(ROWS_MAX * HEADS * ROWS_PARTS == siphon::memory::ROWS_ATTENTION_ROWS);
+/// Blocks per KV head of `attention_rows_*`: the 32 split blocks and two for the rows' 8
+/// nearest keys, 4 rows each.
+const ROWS_BLOCKS: u32 = 34;
+/// Most 8-column tiles of query rows: 3 heads x 8 rows.
+const ROWS_QUERY_TILES: usize = 3;
 /// Threads per block of `attention_rows_*`.
-const ROWS_THREADS: u32 = 256;
+const ROWS_THREADS: u32 = 128;
 /// Dynamic shared memory of `attention_rows_bf16` and `attention_rows_fp8`, the sizes of
 /// `RowsShared` in the kernel.
-const ROWS_SHARED_BYTES: [u32; 2] = [49_920, 33_536];
+const ROWS_SHARED_BYTES: [u32; 2] = [32_768, 49_152];
 
 pub use siphon::KvFormat;
 
@@ -384,7 +388,7 @@ pub struct Attention {
     decode_step_fp8: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
-    /// `attention_rows_bf16_<NQ>` and `attention_rows_fp8_<NQ>` for NQ = 1 to 3.
+    /// `attention_rows_bf16_<NT>` and `attention_rows_fp8_<NT>` for NT = 1 to 3.
     rows: Vec<[CudaFunction; 2]>,
 }
 
@@ -401,7 +405,7 @@ pub struct RowsAttentionScratch {
 
 impl RowsAttentionScratch {
     pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
-        let rows = ROWS_MAX * HEADS * ROWS_BLOCKS;
+        let rows = ROWS_MAX * HEADS * ROWS_PARTS;
         Ok(Self {
             out: stream.alloc_zeros(rows * HEAD_DIM)?,
             max: stream.alloc_zeros(rows)?,
@@ -457,11 +461,11 @@ impl Attention {
             decode_step_fp8: module.load_function("decode_step_fp8")?,
             prefill,
             prefill_fp8,
-            rows: (1..=ROWS_WARP_QUERIES)
-                .map(|nq| {
+            rows: (1..=ROWS_QUERY_TILES)
+                .map(|nt| {
                     Ok([
-                        rows_function(&format!("attention_rows_bf16_{nq}"), ROWS_SHARED_BYTES[0])?,
-                        rows_function(&format!("attention_rows_fp8_{nq}"), ROWS_SHARED_BYTES[1])?,
+                        rows_function(&format!("attention_rows_bf16_{nt}"), ROWS_SHARED_BYTES[0])?,
+                        rows_function(&format!("attention_rows_fp8_{nt}"), ROWS_SHARED_BYTES[1])?,
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
@@ -477,11 +481,13 @@ impl Attention {
     /// (`[rows, 24, 128]`), `out` receives the gated output, as
     /// `Elementwise::attention_gate` computes it from the attention and the gate.
     ///
-    /// Each key and value tile streams once for all rows. Each row's result depends only on
-    /// its position, its query and the cache: it is the same, bit for bit, for every row
-    /// count and whatever the other rows hold, so a call of one row at position `start + i`
-    /// gives row `i`. It differs from [`Attention::decode_attention`]'s by F32 summation
-    /// order. The caller checks [`KvCache::holds`] for the last row's position.
+    /// Each key and value chunk streams once for all rows, on tensor cores. Each row's result
+    /// depends only on its position, its query and the cache: it is the same, bit for bit,
+    /// for every row count and whatever the other rows hold, so a call of one row at position
+    /// `start + i` gives row `i`. It differs from [`Attention::decode_attention`]'s by
+    /// summation order and by rounding the softmax weights to F16 for the value product, as
+    /// prefill attention does. The caller checks [`KvCache::holds`] for the last row's
+    /// position.
     #[expect(
         clippy::too_many_arguments,
         reason = "the attention inputs and outputs"
@@ -519,7 +525,7 @@ impl Attention {
         let extent = extent("bias", bias.len(), rows * HEADS)?;
         let slots = u32::try_from(cache.slots)?;
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
-        // The entry point whose loops cover each warp's query rows, ceil(3 rows / 8).
+        // The entry point for the 8-column tiles of query rows, ceil(3 rows / 8).
         let entry = &self.rows[(3 * rows).div_ceil(8) - 1];
         let (function, smem) = match cache.data {
             KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
@@ -546,19 +552,19 @@ impl Attention {
             .u32(extent)
             .f32(SCALE);
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS as u32, 1),
+            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS, 1),
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
-        // SAFETY: the arguments match `attention_rows_bf16_<NQ>(const bf16* q, const bf16*
+        // SAFETY: the arguments match `attention_rows_bf16_<NT>(const bf16* q, const bf16*
         // k_new, const bf16* v_new, bf16* k_cache, bf16* v_cache, const bf16* bias, const
         // bf16* sinks, float* partial_out, float* partial_max, float* partial_sum, unsigned*
         // counters, bf16* out, const bf16* gate, const unsigned* start, int rows, unsigned
-        // slots, unsigned window, unsigned extent, float scale)`, or `attention_rows_fp8_<NQ>`
+        // slots, unsigned window, unsigned extent, float scale)`, or `attention_rows_fp8_<NT>`
         // with `uint8_t*` caches. The kernel reads slots below min(start + rows, slots) of the
         // caches, which the caller checked the cache holds, and `rows` rows of q, k, v, bias,
         // sinks and gate (if any). It writes partials for `rows` x 24 query rows of
-        // `ROWS_BLOCKS` blocks, which the scratch holds, uses the scratch's 16 counters,
+        // `ROWS_PARTS` partials, which the scratch holds, uses the scratch's 16 counters,
         // which every call leaves at zero, and writes `rows` rows of `out`. The combining
         // blocks write the rows' keys and values at slots (start + row) mod slots once every
         // block of their KV head has finished reading the cache; no two blocks write the same
