@@ -981,6 +981,7 @@ dependencies = [
  "cudarc",
  "half",
  "safetensors",
+ "serde_json",
  "siphon",
 ]
 

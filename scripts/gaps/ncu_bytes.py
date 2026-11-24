@@ -5,7 +5,7 @@ usage: ncu_bytes.py <ncu.csv> [--json out.json]
 Expects the metrics gpu__time_duration.sum, dram__bytes_op_read.sum,
 dram__bytes_op_write.sum and lts__t_bytes.sum, collected with --cache-control all so each
 kernel starts from cold caches: its DRAM bytes are then the bytes it must move once. A
-step runs from an `embedding` kernel to the next `argmax` kernel. Prints each kernel's
+step runs from an `embedding` or `decode_prologue` kernel to the next `argmax` kernel. Prints each kernel's
 calls, isolated time, DRAM bytes and the time those bytes take at 1.70 TB/s.
 """
 
@@ -30,7 +30,7 @@ for r in rows[1:]:
         d[r[im]] = 0.0
 ids = sorted(k)
 names = [k[i]["name"] for i in ids]
-starts = [j for j, n in enumerate(names) if n.startswith("embedding")]
+starts = [j for j, n in enumerate(names) if n.startswith(("embedding", "decode_prologue"))]
 start = starts[-1]
 end = next(j for j in range(start, len(names)) if names[j].startswith("argmax"))
 agg = collections.defaultdict(lambda: [0, 0.0, 0.0, 0.0])
