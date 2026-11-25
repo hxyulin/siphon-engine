@@ -159,6 +159,7 @@ impl SampleBuffers {
 pub struct Sample {
     prepare: CudaFunction,
     race: CudaFunction,
+    noise: CudaFunction,
 }
 
 impl Sample {
@@ -167,7 +168,35 @@ impl Sample {
         Ok(Self {
             prepare: module.load_function("sample_prepare")?,
             race: module.load_function("sample_race")?,
+            noise: module.load_function("sample_noise")?,
         })
+    }
+
+    /// Writes `-ln E_i`, the race's noise, of tokens `0..out.len()` of the draw with `seed`
+    /// for the token at `position`: what `sample_race` adds to each scaled logit. For tests
+    /// of the host port, `siphon::race`.
+    pub fn noise(
+        &self,
+        stream: &CudaStream,
+        seed: u64,
+        position: u32,
+        out: &mut impl DeviceOut<f32>,
+    ) -> anyhow::Result<()> {
+        let mut out = out.view_mut();
+        let n = i32::try_from(out.len()).context("too many tokens")?;
+        let (seed_lo, seed_hi) = (seed as u32, (seed >> 32) as u32);
+        let config = LaunchConfig::for_num_elems(n.cast_unsigned());
+        let mut launch = stream.launch_builder(&self.noise);
+        launch
+            .arg(&seed_lo)
+            .arg(&seed_hi)
+            .arg(&position)
+            .arg(&n)
+            .arg(&mut out);
+        // SAFETY: the arguments match `sample_noise(unsigned, unsigned, unsigned, int,
+        // float*)`, and the kernel writes the `n` elements `out` holds.
+        unsafe { launch.launch(config) }?;
+        Ok(())
     }
 
     /// Writes each row's token of `logits` (`[rows, n]`, F32) to `out` (`[rows]`) with the

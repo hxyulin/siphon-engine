@@ -31,6 +31,8 @@
 
 #include <cooperative_groups.h>
 
+#include "race.cuh"
+
 namespace cg = cooperative_groups;
 
 namespace {
@@ -55,8 +57,6 @@ constexpr float kMassScale = 1099511627776.0f;
 constexpr float kMassFloor = -28.5f;
 constexpr int kMaxTokens = 1 << 18;
 static_assert(static_cast<unsigned long long>(kMaxTokens) * 0x3fff < (1ull << 32), "a limb's sum fits 32 bits");
-// More than the largest -ln E_i can reach: E_i >= 2^-65, so -ln E_i < 45.1.
-constexpr float kMaxBoost = 46.0f;
 
 // One row's settings, struct Params in ops/sample.rs. temperature 0 is greedy; top_k 0,
 // top_p 1 and min_p 0 turn their filters off.
@@ -100,38 +100,13 @@ __device__ __forceinline__ unsigned order_key(float x) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-__device__ __forceinline__ unsigned long long mix64(unsigned long long z) {
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-    return z ^ (z >> 31);
-}
-
-// The key of a row's draw: its seed and position.
+// The key of a row's draw: its seed and position (race.cuh).
 __device__ __forceinline__ unsigned long long draw_key(const Params& p) {
-    const unsigned long long seed = (static_cast<unsigned long long>(p.seed_hi) << 32) | p.seed_lo;
-    return mix64(seed ^ mix64(p.position + 0x632be59bd9b4e019ull));
+    return race::draw_key(p.seed_lo, p.seed_hi, p.position);
 }
 
-// z / 2^64 for z below 2^63, at least 2^-65, from two 32-bit conversions: 64-bit ones run
-// at the FP64 rate on this GPU.
-__device__ __forceinline__ float unit(unsigned long long z) {
-    const float v = static_cast<float>(static_cast<unsigned>(z >> 32)) * 0x1p-32f +
-                    static_cast<float>(static_cast<unsigned>(z)) * 0x1p-64f;
-    return fmaxf(v, 0x1p-65f);
-}
-
-// -ln E_i for an Exp(1) variable E_i. 64 bits split into a uniform v below 1/2 or its
-// complement, so that both small v (small E) and v near 1 keep 24 significant bits.
-__device__ __forceinline__ float race_boost(unsigned long long key, int i) {
-    const unsigned long long z = mix64(key + (static_cast<unsigned long long>(i) + 1) * 0x9e3779b97f4a7c15ull);
-    float e;
-    if ((z >> 63) == 0) {
-        e = -log1pf(-unit(z));
-    } else {
-        e = -logf(unit(~z));
-    }
-    return -logf(e);
-}
+using race::kMaxBoost;
+using race::race_boost;
 
 // The fixed-point probability of a token, relative to the row's largest. Converts
 // without 64-bit conversion instructions, which run at the FP64 rate on this GPU: below
@@ -771,5 +746,15 @@ sample_race(const float* logits, int n, const Params* params, const State* state
             out[row] = best_idx == INT_MAX ? 0 : best_idx;
             counters[row] = 0;
         }
+    }
+}
+
+// -ln E_i of tokens 0..n of the draw with this seed and position, for tests of the host
+// port (crates/siphon/src/race.rs). One thread per token.
+extern "C" __global__ void sample_noise(unsigned seed_lo, unsigned seed_hi, unsigned position,
+                                        int n, float* out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = race::race_boost(race::draw_key(seed_lo, seed_hi, position), i);
     }
 }

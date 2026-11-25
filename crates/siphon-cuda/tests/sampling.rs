@@ -20,12 +20,22 @@
 //!   also checks that speculation and batched steps with the same seed give the same 48
 //!   tokens: a draw depends only on the logits, the seed and the position, and a batched
 //!   row's logits equal a verify row's.
-//! - `draft_sampling_acceptance` measures what a sampling draft would gain over the greedy
-//!   draft the speculator uses: at each verified draft position, the greedy draft is kept
-//!   with probability p(x), while a draft sampled from its own filtered distribution q
-//!   would be kept with probability sum(min(p, q)). Both come from the same rounds, so the
-//!   positions after the first condition on the greedy drafts before them. It needs the
-//!   exact draft, the only one that records its logits.
+//! - `draft_sampling_acceptance` measures, from the rounds of the exact bundled draft
+//!   (the only one that records its logits), what each kind of draft would keep at each
+//!   verified position: the draft's argmax x is kept with probability p(x), a draft
+//!   sampled from its own filtered distribution q with probability sum(min(p, q)), and the
+//!   coupled draft, which speculation proposes, when its race over the draft's logits
+//!   picks the target's draw (`SIPHON_COUPLED_SEEDS` seeds per position, default 32).
+//!   The run's drafts are coupled picks, so every position after the first conditions on
+//!   the coupled drafts before it as drawn with the run's seed; the other seeds' chains
+//!   reuse those rounds, an approximation. The test also prints the run's measured share
+//!   kept, the two confidences a coupled draft could report, and checks that the host's
+//!   race (`siphon::race`) reproduces the draft's picks and the verify's draws.
+//! - `coupled_draft_acceptance` runs speculation end to end with the draft's argmax and
+//!   with coupled drafts, the same seeds each, and prints tokens per round, the share kept
+//!   by position and the draft's time per round: the fast bundled draft, and DFlash 2
+//!   with `SIPHON_DFLASH2` set to its directory (`SIPHON_COUPLED_RUNS` seeds per prompt,
+//!   default 4).
 //!
 //! `SIPHON_SAMPLING_SEEDS` sets the seeds per sample (default 1000).
 
@@ -40,7 +50,7 @@ use std::{
 
 use anyhow::{Context as _, ensure};
 use safetensors::{Dtype, SafeTensors};
-use siphon::{Checkpoint, TextConfig};
+use siphon::{Checkpoint, TextConfig, race};
 use siphon_cuda::{
     Gpu,
     draft::DraftOptions,
@@ -56,6 +66,8 @@ const DRAWN: usize = 4;
 /// Tokens per seed for the exact comparison with batched steps, and its seeds.
 const EXACT_TOKENS: usize = 48;
 const EXACT_SEEDS: u64 = 12;
+/// The seed of `draft_sampling_acceptance`'s run.
+const RUN_SEED: u64 = 5;
 
 fn capture(text: &str) -> anyhow::Result<Vec<u32>> {
     let dir = env::var_os("SIPHON_CAPTURES").map_or_else(
@@ -81,8 +93,15 @@ struct Setup {
     speculator: Speculator,
 }
 
-fn load(draft: &DraftOptions, slots: usize) -> anyhow::Result<Setup> {
-    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+fn model_dir() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(
+        env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?,
+    ))
+}
+
+/// The model, sampling on, with `slots` batch slots.
+fn load_model(slots: usize) -> anyhow::Result<(Gpu, Model)> {
+    let model_dir = model_dir()?;
     let gpu = Gpu::new(0)?;
     let config = TextConfig::load(&model_dir)?;
     let passes = config.loop_config.num_passes;
@@ -101,9 +120,24 @@ fn load(draft: &DraftOptions, slots: usize) -> anyhow::Result<Setup> {
     if slots > 0 {
         model.add_slots(slots)?;
     }
-    let source = DraftSource::Bundled;
-    let d = load_draft(&mut model, &checkpoint, source, CAPACITY, draft)?;
-    let speculator = Speculator::with_draft(&model, d, Width::Fixed(7))?;
+    Ok((gpu, model))
+}
+
+/// A speculator with the draft `source` names and its approximations `draft`, 7 drafts
+/// per round.
+fn speculator_for(
+    model: &mut Model,
+    source: DraftSource<'_>,
+    draft: &DraftOptions,
+) -> anyhow::Result<Speculator> {
+    let checkpoint = Checkpoint::open(&model_dir()?)?;
+    let d = load_draft(model, &checkpoint, source, CAPACITY, draft)?;
+    Speculator::with_draft(model, d, Width::Fixed(7))
+}
+
+fn load(draft: &DraftOptions, slots: usize) -> anyhow::Result<Setup> {
+    let (gpu, mut model) = load_model(slots)?;
+    let speculator = speculator_for(&mut model, DraftSource::Bundled, draft)?;
     Ok(Setup {
         _gpu: gpu,
         model,
@@ -357,15 +391,188 @@ fn filtered(logits: &[f32], s: Sampling) -> Vec<(usize, f64)> {
         .collect()
 }
 
+/// The most likely tokens of `dist` (as [`filtered`] returns it, most likely first) that
+/// hold all but 1e-6 of its mass. The race's winner over every token lies among them
+/// except with probability 1e-6: a race picks each token with its probability.
+fn likely(dist: &[(usize, f64)]) -> Vec<usize> {
+    let mut mass = 0.0;
+    let mut out = Vec::new();
+    for &(i, p) in dist {
+        out.push(i);
+        mass += p;
+        if mass >= 1.0 - 1e-6 {
+            break;
+        }
+    }
+    out
+}
+
+/// The first largest value's index, the draft kernels' argmax rule.
+fn argmax(row: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, &v) in row.iter().enumerate() {
+        if v > row[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// Seeds per draft position for the coupled draft's acceptance (`SIPHON_COUPLED_SEEDS`,
+/// default 32).
+fn coupled_seeds() -> u64 {
+    env::var("SIPHON_COUPLED_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32)
+}
+
 #[derive(Default)]
 struct Acceptance {
     rounds: usize,
-    /// Per draft position: summed p(x) for the greedy draft, summed sum(min(p, q)).
+    /// Per draft position: summed p(x) for the greedy draft x, summed sum(min(p, q)) for a
+    /// draft sampled from its filtered q, and the coupled draft's share kept over the
+    /// seeds.
     greedy: [f64; 7],
     sampled: [f64; 7],
+    coupled: [f64; 7],
+    /// Per draft position, the confidences a coupled draft could report: the largest
+    /// probability under softmax(l / T), which the kernels report, and the probability of
+    /// the run's coupled pick.
+    peak_confidence: [f64; 7],
+    pick_confidence: [f64; 7],
+    /// The run's drafts kept, by position.
+    kept: [f64; 7],
     /// Expected tokens per 8-row round under each.
     greedy_tokens: f64,
     sampled_tokens: f64,
+    coupled_tokens: f64,
+    /// Positions checked, and those where the host's race disagreed with the draft's
+    /// coupled pick or with the verify's draw.
+    checked: usize,
+    draft_mismatches: usize,
+    draw_mismatches: usize,
+}
+
+impl Acceptance {
+    /// Adds one round of the coupled draft at `sampling`, with `seeds` seeds per position
+    /// for the coupled draft's share kept.
+    fn add_round(
+        &mut self,
+        r: &RoundRecord<'_>,
+        vocab: usize,
+        sampling: Sampling,
+        seeds: u64,
+    ) -> anyhow::Result<()> {
+        let temperature = sampling.temperature;
+        // The coupled pick ignores the target's filters (see Draft::set_sampling).
+        let unfiltered = Sampling::new(temperature, 0, 1.0, 0.0, sampling.seed)?;
+        self.rounds += 1;
+        let (mut g_chain, mut s_chain) = (1.0, 1.0);
+        let (mut g_tokens, mut s_tokens) = (1.0, 1.0);
+        let seeds = usize::try_from(seeds)?;
+        let mut c_chain = vec![true; seeds];
+        let mut c_tokens = 1.0;
+        for (j, &draft) in r.drafts.iter().enumerate() {
+            let target = &r.target_logits[j * vocab..(j + 1) * vocab];
+            let logits = &r.draft_logits[j * vocab..(j + 1) * vocab];
+            let p = filtered(target, sampling);
+            let q = filtered(logits, sampling);
+            let q_all = filtered(logits, unfiltered);
+            let p_of = |x: usize| p.iter().find(|&&(i, _)| i == x).map_or(0.0, |&(_, v)| v);
+            let q_all_of = |x: usize| {
+                q_all
+                    .iter()
+                    .find(|&&(i, _)| i == x)
+                    .map_or(0.0, |&(_, v)| v)
+            };
+            let p_greedy = p_of(argmax(logits));
+            let q_map: HashMap<usize, f64> = q.into_iter().collect();
+            let overlap: f64 = p
+                .iter()
+                .map(|&(i, v)| v.min(*q_map.get(&i).unwrap_or(&0.0)))
+                .sum();
+            self.greedy[j] += p_greedy;
+            self.sampled[j] += overlap;
+            g_chain *= p_greedy;
+            s_chain *= overlap;
+            g_tokens += g_chain;
+            s_tokens += s_chain;
+
+            // Verify row j draws the token at position start + j + 1.
+            let position = u32::try_from(r.start + j + 1)?;
+            let (p_set, q_set) = (likely(&p), likely(&q_all));
+            let race_pair = |seed: u64| {
+                let key = race::draw_key(seed, position);
+                (
+                    race::pick(target, p_set.iter().copied(), temperature, key),
+                    race::pick(logits, q_set.iter().copied(), temperature, key),
+                )
+            };
+            let (drawn, coupled) = race_pair(RUN_SEED);
+            self.checked += 1;
+            self.draft_mismatches += usize::from(coupled != Some(draft as usize));
+            self.draw_mismatches += usize::from(drawn != Some(r.drawn[j] as usize));
+            self.kept[j] += f64::from(u8::from(r.accepted > j));
+            self.peak_confidence[j] += q_all.first().map_or(0.0, |&(_, v)| v);
+            self.pick_confidence[j] += q_all_of(draft as usize);
+            let mut matched = 0;
+            for (k, alive) in c_chain.iter_mut().enumerate() {
+                // Seeds of their own, away from the run's.
+                let (drawn, coupled) = race_pair(1 << 40 | k as u64);
+                let hit = drawn == coupled;
+                matched += usize::from(hit);
+                *alive &= hit;
+            }
+            self.coupled[j] += matched as f64 / seeds as f64;
+            c_tokens += c_chain.iter().filter(|&&alive| alive).count() as f64 / seeds as f64;
+        }
+        self.greedy_tokens += g_tokens;
+        self.sampled_tokens += s_tokens;
+        self.coupled_tokens += c_tokens;
+        Ok(())
+    }
+
+    /// Prints the means per round, with `measured` tokens per round from the run.
+    fn report(&self, name: &str, seeds: u64, measured: f64) {
+        let n = self.rounds as f64;
+        let per = |v: &[f64; 7]| {
+            v.iter()
+                .map(|x| format!("{:.3}", x / n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("{name}, {} rounds of the coupled draft:", self.rounds);
+        println!(
+            "  greedy draft kept [{}], expected {:.2} tokens per round",
+            per(&self.greedy),
+            self.greedy_tokens / n
+        );
+        println!(
+            "  draft sampled from q kept [{}], expected {:.2} tokens per round",
+            per(&self.sampled),
+            self.sampled_tokens / n
+        );
+        println!(
+            "  coupled draft kept [{}] over {seeds} seeds, {:.2} tokens per round",
+            per(&self.coupled),
+            self.coupled_tokens / n
+        );
+        println!(
+            "  coupled draft kept in the run [{}], measured {:.2} tokens per round",
+            per(&self.kept),
+            measured
+        );
+        println!(
+            "  confidence: largest softmax(l / T) [{}], the pick's [{}]",
+            per(&self.peak_confidence),
+            per(&self.pick_confidence)
+        );
+        println!(
+            "  host race against the GPU over {} positions: {} draft picks and {} draws differ",
+            self.checked, self.draft_mismatches, self.draw_mismatches
+        );
+    }
 }
 
 #[test]
@@ -378,41 +585,18 @@ fn draft_sampling_acceptance() -> anyhow::Result<()> {
         .iter()
         .map(|t| capture(t).map(|c| c[..c.len().min(1500)].to_vec()))
         .collect::<anyhow::Result<_>>()?;
+    let virtual_seeds = coupled_seeds();
     for (name, temperature, top_p) in [
         ("temperature 1", 1.0, 1.0),
         ("temperature 0.8, top_p 0.95", 0.8, 0.95),
     ] {
-        let sampling = Sampling::new(temperature, 0, top_p, 0.0, 5)?;
+        let sampling = Sampling::new(temperature, 0, top_p, 0.0, RUN_SEED)?;
         let totals = Arc::new(Mutex::new(Acceptance::default()));
         let sink = Arc::clone(&totals);
         s.speculator
             .set_round_hook(Some(Box::new(move |r: &RoundRecord<'_>| {
                 let mut a = sink.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-                a.rounds += 1;
-                let (mut g_chain, mut s_chain) = (1.0, 1.0);
-                let (mut g_tokens, mut s_tokens) = (1.0, 1.0);
-                for (j, &draft) in r.drafts.iter().enumerate() {
-                    let p = filtered(&r.target_logits[j * vocab..(j + 1) * vocab], sampling);
-                    let q = filtered(&r.draft_logits[j * vocab..(j + 1) * vocab], sampling);
-                    let p_draft = p
-                        .iter()
-                        .find(|&&(i, _)| i == draft as usize)
-                        .map_or(0.0, |&(_, v)| v);
-                    let q_map: HashMap<usize, f64> = q.into_iter().collect();
-                    let overlap: f64 = p
-                        .iter()
-                        .map(|&(i, v)| v.min(*q_map.get(&i).unwrap_or(&0.0)))
-                        .sum();
-                    a.greedy[j] += p_draft;
-                    a.sampled[j] += overlap;
-                    g_chain *= p_draft;
-                    s_chain *= overlap;
-                    g_tokens += g_chain;
-                    s_tokens += s_chain;
-                }
-                a.greedy_tokens += g_tokens;
-                a.sampled_tokens += s_tokens;
-                Ok(())
+                a.add_round(r, vocab, sampling, virtual_seeds)
             })));
         let mut kept = (0, 0);
         for prompt in &prompts {
@@ -426,23 +610,79 @@ fn draft_sampling_acceptance() -> anyhow::Result<()> {
         }
         s.speculator.set_round_hook(None);
         let a = totals.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-        let n = a.rounds as f64;
-        let per = |v: &[f64; 7]| {
-            v.iter()
-                .map(|x| format!("{:.3}", x / n))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        println!(
-            "{name}, {} rounds: greedy draft kept [{}], expected {:.2} tokens per round \
-             (measured {:.2}); sampled draft would be kept [{}], expected {:.2} tokens per round",
-            a.rounds,
-            per(&a.greedy),
-            a.greedy_tokens / n,
-            kept.0 as f64 / kept.1.max(1) as f64,
-            per(&a.sampled),
-            a.sampled_tokens / n,
+        a.report(name, virtual_seeds, kept.0 as f64 / kept.1.max(1) as f64);
+        // A few may differ: the logarithms round differently on the GPU, and the host's
+        // races leave out a tail of 1e-6 of the mass.
+        ensure!(
+            a.draft_mismatches * 200 <= a.checked && a.draw_mismatches * 200 <= a.checked,
+            "the host's race does not reproduce the GPU's"
         );
+    }
+    Ok(())
+}
+
+/// Speculation with the draft's argmax and with the coupled pick, end to end, at 7 drafts
+/// per round: tokens per round, each draft position's share kept and the draft's time per
+/// round. The fast bundled draft, as speculation runs it, and DFlash 2 with
+/// `SIPHON_DFLASH2` set to its directory. The output is the same in both modes; with the
+/// same seeds, the tokens per round compare directly.
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL), the captures and about 21 GB of GPU memory"]
+fn coupled_draft_acceptance() -> anyhow::Result<()> {
+    let (_gpu, mut model) = load_model(0)?;
+    let prompts: Vec<Vec<u32>> = ["regex-readme", "half", "anyhow"]
+        .iter()
+        .map(|t| capture(t).map(|c| c[..c.len().min(1500)].to_vec()))
+        .collect::<anyhow::Result<_>>()?;
+    let runs = env::var("SIPHON_COUPLED_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4u64);
+    let dflash2 = env::var_os("SIPHON_DFLASH2").map(PathBuf::from);
+    let mut drafters = vec![("bundled", DraftSource::Bundled)];
+    if let Some(dir) = &dflash2 {
+        drafters.push(("DFlash 2", DraftSource::Dflash(dir)));
+    }
+    for (drafter, source) in drafters {
+        let mut speculator = speculator_for(&mut model, source, &DraftOptions::fast())?;
+        for (name, temperature, top_p) in [
+            ("temperature 1", 1.0, 1.0),
+            ("temperature 0.8, top_p 0.95", 0.8, 0.95),
+        ] {
+            for coupled in [false, true] {
+                speculator.set_coupled_drafts(coupled);
+                let (mut rounds, mut emitted, mut draft_ms) = (0, 0, 0.0);
+                let mut kept = [0usize; 7];
+                for prompt in &prompts {
+                    for seed in 0..runs {
+                        let sampling = Sampling::new(temperature, 0, top_p, 0.0, 100 + seed)?;
+                        model.set_sampling(sampling);
+                        model.reset()?;
+                        speculator.prefill(&mut model, prompt, DEFAULT_PREFILL_CHUNK)?;
+                        speculator.generate(&mut model, 192, Drafts::Dspark)?;
+                        let stats = speculator.stats();
+                        rounds += stats.rounds;
+                        emitted += stats.emitted;
+                        draft_ms += stats.draft.as_secs_f64() * 1e3;
+                        for (k, &n) in kept.iter_mut().zip(&stats.accepted_at) {
+                            *k += n;
+                        }
+                    }
+                }
+                let n = rounds.max(1) as f64;
+                let per: Vec<String> = kept
+                    .iter()
+                    .map(|&k| format!("{:.3}", k as f64 / n))
+                    .collect();
+                println!(
+                    "{drafter}, {name}, {} drafts: {:.2} tokens per round, kept [{}], draft {:.3} ms per round",
+                    if coupled { "coupled" } else { "argmax" },
+                    emitted as f64 / n,
+                    per.join(", "),
+                    draft_ms / n
+                );
+            }
+        }
     }
     Ok(())
 }

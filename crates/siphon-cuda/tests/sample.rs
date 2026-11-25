@@ -5,12 +5,15 @@
 //!   whose counts fit the filtered distribution by a chi-square test, and never a token the
 //!   filters drop.
 //! - A row's token depends only on its logits, seed and position.
+//! - The race's noise and draws match the host port, `siphon::race`, which the draft's
+//!   measurements use.
 
 #![cfg(target_os = "linux")]
 
 use std::sync::Arc;
 
 use cudarc::driver::CudaStream;
+use siphon::race;
 use siphon_cuda::{
     Gpu,
     ops::{
@@ -300,6 +303,81 @@ fn draws_depend_on_seed_and_position_only() -> anyhow::Result<()> {
         .map(|&(s, p)| (Sampling { seed: 8, ..s }, p))
         .collect();
     assert_ne!(setup.run(&host, VOCAB, &other)?, together);
+    Ok(())
+}
+
+/// The kernel's noise against `siphon::race::race_boost`, over the whole vocabulary for a
+/// few seeds and positions: equal up to the last bits of the GPU's `logf` and `log1pf`,
+/// which are not correctly rounded. Then unfiltered draws at temperatures 1 and 0.8
+/// against the host's race over the same logits: the same token unless the host's best
+/// two scores are within rounding of each other.
+#[test]
+fn race_matches_the_host_port() -> anyhow::Result<()> {
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let mut noise = stream.alloc_zeros::<f32>(VOCAB)?;
+    let (mut equal, mut total, mut worst) = (0usize, 0usize, 0f32);
+    for (seed, position) in [
+        (0u64, 0u32),
+        (5, 1),
+        (42, 2790),
+        (1 << 32 | 7, 131_071),
+        (u64::MAX, u32::MAX),
+    ] {
+        setup.sample.noise(stream, seed, position, &mut noise)?;
+        let gpu = stream.clone_dtoh(&noise)?;
+        let key = race::draw_key(seed, position);
+        for (i, &g) in (0u32..).zip(&gpu) {
+            let h = race::race_boost(key, i);
+            equal += usize::from(g.to_bits() == h.to_bits());
+            total += 1;
+            worst = worst.max((g - h).abs() / h.abs().max(1.0));
+        }
+    }
+    eprintln!(
+        "noise: {equal} of {total} values bit-equal, largest difference {worst:.2e} \
+         (relative above 1, absolute below)"
+    );
+    assert!(
+        worst <= 8.0 * f32::EPSILON,
+        "the host's noise is {worst:.2e} off"
+    );
+
+    let rows = 64;
+    let seed = 99;
+    for temperature in [1.0f32, 0.8] {
+        let mut host = Vec::with_capacity(rows * VOCAB);
+        for r in 0..rows {
+            host.extend(logits(VOCAB, 2.0, 12, 300 + r as u64));
+        }
+        let sampling = Sampling::new(temperature, 0, 1.0, 0.0, seed)?;
+        let settings: Vec<(Sampling, usize)> = (0..rows).map(|r| (sampling, 7000 + r)).collect();
+        let got = setup.run(&host, VOCAB, &settings)?;
+        let mut near_ties = 0;
+        for (r, &token) in got.iter().enumerate() {
+            let row = &host[r * VOCAB..(r + 1) * VOCAB];
+            let key = race::draw_key(seed, u32::try_from(7000 + r)?);
+            let inv_t = 1.0 / temperature;
+            let mut scores: Vec<(f32, usize)> = (0u32..)
+                .zip(row)
+                .map(|(i, &l)| (race::score(l, inv_t, key, i), i as usize))
+                .collect();
+            scores.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            let want = race::pick(row, 0..VOCAB, temperature, key);
+            assert_eq!(want, Some(scores[0].1));
+            if usize::try_from(token)? != scores[0].1 {
+                let gap = scores[0].0 - scores[1].0;
+                assert!(
+                    gap <= 1e-5 * scores[0].0.abs().max(1.0),
+                    "temperature {temperature}, row {r}: the kernel drew {token}, the host {} \
+                     by {gap}",
+                    scores[0].1
+                );
+                near_ties += 1;
+            }
+        }
+        eprintln!("temperature {temperature}: {rows} draws, {near_ties} differ at near-ties");
+    }
     Ok(())
 }
 

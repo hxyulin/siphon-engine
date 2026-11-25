@@ -38,10 +38,11 @@ use crate::{
     ops::{
         draft::{
             ArgmaxPartials, AttentionKeys, AttentionScratch, BLOCK, CONTROL, DraftKernels,
-            F8_MAX_PRODUCTS, FoldRows, Fp8Product, Fp8Rows, KV_WIDTH, KvCache, LogitBounds, Rope,
-            TOP_K, TopkScratch,
+            F8_MAX_PRODUCTS, FoldRows, Fp8Product, Fp8Rows, KV_WIDTH, KvCache, LogitBounds,
+            RACE_WORDS, Rope, StepRace, TOP_K, TopkScratch, race_words,
         },
         linear::{Gemm, Linear, MAX_PRODUCTS},
+        sample::Sampling,
     },
     weights::{
         dflash::{DflashLayerWeights, DflashWeights},
@@ -640,6 +641,9 @@ pub struct RoundInputs {
     /// I32 `[3]`: the first position to commit, the number of positions to commit (0 to 8)
     /// and the anchor token. The block sits right after the committed positions.
     pub control: CudaSlice<i32>,
+    /// U32 `[4]`, the request's sampling as the draft reads it: the temperature's bits and
+    /// the seed's low and high words (see [`Draft::set_sampling`]).
+    pub race: CudaSlice<u32>,
 }
 
 /// A captured round and the device address of the LM head it reads.
@@ -978,6 +982,7 @@ impl Draft {
             inputs: RoundInputs {
                 taps: round_taps,
                 control: stream.alloc_zeros(CONTROL)?,
+                race: stream.alloc_zeros(RACE_WORDS)?,
             },
             graphs: Default::default(),
             backbone,
@@ -1186,6 +1191,29 @@ impl Draft {
         &mut self.inputs
     }
 
+    /// How the verify picks tokens, from the next round on. Greedy (the default) drafts
+    /// each step's argmax. A sampling request makes the bundled and DFlash 2 drafts take
+    /// the coupled pick: the best of logit / T plus the noise the verify's draw uses for
+    /// the same seed and position (`kernels/race.cuh`). The verify keeps a draft only when
+    /// it equals the draw, so the output stays the target's draw; the coupled pick is
+    /// that draw whenever the draft's logits are close enough to the target's. The
+    /// draft ignores the top-k, top-p and min-p filters, so it can propose a token the
+    /// verify filters out. The settings live in [`RoundInputs::race`], so captured
+    /// rounds replay with them. 2DSD's DFlash drafts stay greedy.
+    pub fn set_sampling(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        sampling: Sampling,
+    ) -> anyhow::Result<()> {
+        let words = if sampling.is_greedy() {
+            race_words(0.0, 0)
+        } else {
+            race_words(sampling.temperature, sampling.seed)
+        };
+        stream.memcpy_htod(&words, &mut self.inputs.race)?;
+        Ok(())
+    }
+
     /// Fills [`Self::round_inputs`] from the host: the taps of positions
     /// `start..start + rows` (BF16 `[rows, taps, 2304]` in the order of [`Self::tap_layout`], `rows` up to 8, possibly none) and
     /// the anchor token in `anchor` (one I32 on the device). The next round commits those
@@ -1286,8 +1314,11 @@ impl Draft {
 
     /// The confidence of each of the last round's drafts, F32 `[7]`: its probability under
     /// the softmax of the Markov logits, an estimate that may be off by a few percent (it
-    /// sums the E4M3 fold's logits unless the logits are recorded). A round of `k` drafts
-    /// writes the first `k`.
+    /// sums the E4M3 fold's logits unless the logits are recorded). With a sampling
+    /// request ([`Self::set_sampling`]), the largest probability under the softmax of the
+    /// logits over T instead: a coupled pick is kept at least about as often as the
+    /// argmax would be if the draft matched the target. A round of `k` drafts writes the
+    /// first `k`.
     #[must_use]
     pub fn confidences(&self) -> &CudaSlice<f32> {
         &self.s.confidence
@@ -1801,7 +1832,8 @@ impl Draft {
         s.add_norm(k, stream, Sublayer::Mlp, pending, arch.norm(), true)
     }
 
-    /// The base logits and `steps` greedy Markov steps of the block in [`Self::y`].
+    /// The base logits and `steps` Markov steps of the block in [`Self::y`], greedy or
+    /// coupled ([`Self::set_sampling`]).
     fn markov(
         &mut self,
         stream: &CudaStream,
@@ -1818,6 +1850,7 @@ impl Draft {
         let mw = &weights.markov;
         let s = &mut self.s;
         let control = &self.inputs.control;
+        let race = &self.inputs.race;
         let head = self.head.as_ref();
         // At least two rows for the BF16 GEMMs: a single row would run as a GEMV, which
         // sums in another order.
@@ -1866,6 +1899,7 @@ impl Draft {
                 state_in,
                 state_out,
                 &mut s.latent,
+                race,
             )?;
             if step < steps {
                 let base = s.base.slice(step * ld..step * ld + rows);
@@ -1879,6 +1913,11 @@ impl Draft {
                     head,
                     vocab: self.vocab,
                     softcap: self.softcap,
+                    race: StepRace {
+                        race,
+                        control,
+                        step,
+                    },
                 };
                 step_argmax.run(
                     stream,
@@ -2042,6 +2081,7 @@ impl Draft {
             self.softcap,
             &mut s.ids,
             &mut s.confidence,
+            &self.inputs.race,
         )
     }
 }
@@ -2505,13 +2545,15 @@ fn fp8_rows<'a>(
     Fp8Product { w, rows, out, ld }
 }
 
-/// One Markov step's argmax over its base logits and latent.
+/// One Markov step's argmax over its base logits and latent, or its coupled pick when
+/// the race samples.
 struct StepArgmax<'a> {
     kernels: &'a DraftKernels,
     fold: &'a Fold,
     head: Option<&'a Head>,
     vocab: usize,
     softcap: f32,
+    race: StepRace<'a>,
 }
 
 impl StepArgmax<'_> {
@@ -2545,6 +2587,7 @@ impl StepArgmax<'_> {
                 self.softcap,
                 logits,
                 partials,
+                Some(self.race),
             );
         }
         if !approx_fold {
@@ -2561,6 +2604,7 @@ impl StepArgmax<'_> {
                 self.softcap,
                 bounds,
                 partials,
+                Some(self.race),
             );
         }
         let head = self.head.context("no approximate head")?;
@@ -2581,6 +2625,7 @@ impl StepArgmax<'_> {
             list.map(|l| &l.map),
             self.softcap,
             partials,
+            Some(self.race),
         )
     }
 }

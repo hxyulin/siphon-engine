@@ -18,11 +18,14 @@
 //!
 //! With the model sampling ([`Model::set_sampling`]), each verify row draws its token from
 //! the target's filtered distribution with the request's seed and the token's position,
-//! and a draft is kept when it equals that draw. The draft proposes greedily, so this is
-//! the standard rule for a point-mass proposal: keep the draft with probability p(x), and
-//! after a rejection draw from p without it. The output follows the target's distribution
-//! exactly and equals sampling through one-row verifies with the same seed (see
-//! `docs/engine.md`).
+//! and a draft is kept when it equals that draw. The draft proposes one token per
+//! position, so this is the standard rule for a point-mass proposal: keep the draft with
+//! probability p(x), and after a rejection draw from p without it. The output follows the
+//! target's distribution exactly and equals sampling through one-row verifies with the
+//! same seed (see `docs/engine.md`). The draft's proposal is its coupled pick
+//! ([`Draft::set_sampling`]): the best of its logits over T plus the noise of the
+//! verify's draw at the same position, which is the target's draw whenever the two
+//! distributions are close enough. It changes how often drafts are kept, not the output.
 //!
 //! When no width is expected to emit tokens faster than plain decoding, a policy with
 //! plain prices ([`WidthPolicy::with_plain`]) runs plain steps instead
@@ -44,7 +47,7 @@ use siphon::Checkpoint;
 
 use crate::{
     draft::{CONTEXT_ROWS, Draft, DraftOptions, DraftRings, STEPS, WINDOW},
-    model::{Accept, LocalState, Model, PrefillLogits, SavedState, VerifyTokens},
+    model::{Accept, LocalState, Model, PrefillLogits, Sampling, SavedState, VerifyTokens},
     ops::{linear::Linear, spec::VERIFY_ROWS},
     weights::{
         dflash::DflashWeights,
@@ -406,10 +409,14 @@ pub struct Speculator {
     prefix: Option<PrefixCache>,
     /// Called after each verify round, for measurements ([`Self::set_round_hook`]).
     round_hook: Option<RoundHook>,
+    /// Whether a sampling request drafts coupled picks ([`Self::set_coupled_drafts`]).
+    coupled: bool,
 }
 
 /// What a verify round saw, for [`Speculator::set_round_hook`].
 pub struct RoundRecord<'a> {
+    /// The anchor's position: verify row `j` draws the token at `start + j + 1`.
+    pub start: usize,
     /// The drafts the round verified, after the anchor.
     pub drafts: &'a [u32],
     /// The draft's logits for each of `drafts`, F32 `[drafts, vocab]`, after
@@ -418,6 +425,8 @@ pub struct RoundRecord<'a> {
     /// The target's logits for each verified row, the anchor's first, F32
     /// `[drafts + 1, vocab]`.
     pub target_logits: &'a [f32],
+    /// Each verified row's token, greedy or drawn, the anchor's row first.
+    pub drawn: &'a [u32],
     /// Drafts kept.
     pub accepted: usize,
 }
@@ -575,6 +584,7 @@ impl Speculator {
             batched: None,
             prefix: None,
             round_hook: None,
+            coupled: true,
         })
     }
 
@@ -583,6 +593,24 @@ impl Speculator {
     /// host, so this is for measurements only.
     pub fn set_round_hook(&mut self, hook: Option<RoundHook>) {
         self.round_hook = hook;
+    }
+
+    /// Whether a sampling request's drafts take the coupled pick (the default) or the
+    /// draft's argmax, from the next generation on. For measurements: the output is the
+    /// same either way, only acceptance changes.
+    pub fn set_coupled_drafts(&mut self, coupled: bool) {
+        self.coupled = coupled;
+    }
+
+    /// Gives the draft the model's sampling, which the verify uses, or greedy when the
+    /// verify does not sample or coupled drafts are off.
+    fn sync_draft_sampling(&mut self, model: &Model) -> anyhow::Result<()> {
+        let sampling = if self.coupled && model.sampling_enabled() {
+            model.sampling()
+        } else {
+            Sampling::GREEDY
+        };
+        self.draft.set_sampling(model.stream(), sampling)
     }
 
     /// Makes the draft keep its logits from the next round on, which
@@ -968,6 +996,7 @@ impl Speculator {
         let mut run = FIRST_PLAIN_RUN;
         self.calibration = Calibration::default();
         let mut next = Next::Verify(proposals + 1);
+        self.sync_draft_sampling(model)?;
         if drafts == Drafts::Dspark {
             // Prefill committed the prompt, so the first round commits no rows.
             self.draft.set_round_inputs(
@@ -1113,9 +1142,11 @@ impl Speculator {
                 .map(|&t| u32::try_from(t))
                 .collect::<Result<_, _>>()?;
             hook(&RoundRecord {
+                start,
                 drafts: &drafts,
                 draft_logits: &draft_logits,
                 target_logits: &model.verify_logits()?,
+                drawn: &verdict.argmax,
                 accepted: a,
             })?;
         }
@@ -1300,6 +1331,7 @@ impl Speculator {
         n: usize,
     ) -> anyhow::Result<(Vec<u32>, Vec<SweepRow>)> {
         let stream = Arc::clone(model.stream());
+        self.sync_draft_sampling(model)?;
         self.draft.set_round_inputs(
             &stream,
             &self.tail.slice(..0),
