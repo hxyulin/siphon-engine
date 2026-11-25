@@ -13,9 +13,9 @@ Rust host code, CUDA kernels written for this model and `sm_120a`, and an OpenAI
 [![Model: Inkling 2 Mini](https://img.shields.io/badge/model-Inkling%202%20Mini-FFD21E?logo=huggingface)](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 [![Image](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml/badge.svg)](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml)
 
-| 889 tok/s | 999 tok/s | 81–88% | 633,856 | 0.10 s |
+| 875 · 491 tok/s | 999 tok/s | 81–88% | 633,856 | 0.10 s |
 | :---: | :---: | :---: | :---: | :---: |
-| one stream, speculative,<br>on Rust source | 8 streams together | of the DRAM floor<br>in plain decode | tokens of context<br>on a 32 GB card | to first token of a<br>103K-token follow-up |
+| one stream, speculative, on Rust<br>source: greedy · temperature 1 | 8 streams together | of the DRAM floor<br>in plain decode | tokens of context<br>on a 32 GB card | to first token of a<br>103K-token follow-up |
 
 </div>
 
@@ -52,7 +52,7 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 
 ## Performance
 
-All numbers come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default.
+All numbers come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, unless a section names another commit, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default.
 
 ### Decode
 
@@ -65,20 +65,20 @@ One token per step, 400 steps. The DRAM floor is the time to read the weights an
 
 ### Speculative decoding
 
-Greedy, 512 tokens, tok/s and speedup over plain decode. The draft proposes up to 7 tokens per round, and each round picks its verify width from the drafts' confidences. The last column runs Inco AI's DFlash 2 drafter (`--drafter`) instead of the bundled DSpark draft.
+512 tokens after each prompt, tok/s and speedup over plain decode, on main at a3fc890. Greedy is one run. Temperature 1, the checkpoint's default, is the median of 6 seeds. The draft proposes up to 7 tokens per round, and each round picks its verify width from the drafts' confidences. The DFlash 2 columns run Inco AI's drafter (`--drafter`) instead of the bundled DSpark draft.
 
-| Prompt | Context | Plain decode | DSpark draft | DFlash 2 | Tokens per round |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Rust source (`anyhow`) | 10.7K | 336 | **889** · 2.64x | 849 · 2.53x | 6.66 · 6.65 |
-| Rust source (`anyhow`) | 32K | 310 | **817** · 2.64x | 807 · 2.61x | 6.56 · 6.65 |
-| Rust source (`half`) | 2.3K | 353 | **796** · 2.26x | 662 · 1.88x | 5.67 · 4.94 |
-| Rust source (`half`) | 32K | 310 | **683** · 2.21x | 637 · 2.06x | 5.37 · 5.15 |
-| A README (`regex`) | 2.3K | 352 | 587 · 1.67x | **632** · 1.79x | 3.66 · 4.30 |
-| A README (`regex`) | 32K | 310 | 566 · 1.83x | **624** · 2.01x | 4.19 · 4.87 |
-| A chat question | 30 | 364 | 556 · 1.53x | **599** · 1.65x | 3.37 · 4.13 |
-| A coding request | 40 | 363 | 508 · 1.40x | **583** · 1.61x | 3.01 · 3.82 |
+| Prompt | Context | Plain decode | DSpark, greedy | DSpark, temp. 1 | DFlash 2, greedy | DFlash 2, temp. 1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rust source (`anyhow`) | 10.7K | 336 | **875** · 2.61x | **491** · 1.47x | 844 · 2.52x | 427 · 1.28x |
+| Rust source (`anyhow`) | 32K | 310 | **812** · 2.62x | **452** · 1.47x | 802 · 2.59x | 430 · 1.39x |
+| Rust source (`half`) | 2.3K | 352 | **787** · 2.24x | **506** · 1.45x | 662 · 1.88x | 473 · 1.35x |
+| Rust source (`half`) | 32K | 310 | **684** · 2.21x | **412** · 1.34x | 635 · 2.05x | 376 · 1.22x |
+| A README (`regex`) | 2.3K | 352 | 594 · 1.69x | **360** · 1.03x | **629** · 1.79x | 351 · 1.00x |
+| A README (`regex`) | 32K | 310 | 567 · 1.83x | **310** · 1.00x | **621** · 2.01x | **310** · 1.00x |
+| A chat question | 30 | 364 | 546 · 1.50x | 487 · 1.34x | **601** · 1.65x | **531** · 1.47x |
+| A coding request | 40 | 364 | 508 · 1.40x | 603 · 1.67x | **583** · 1.60x | **673** · 1.86x |
 
-The speedup depends on how predictable the text is. The DSpark draft's first token is accepted 89% to 96% of the time on the Rust sources, 78% to 86% on the README and 66% to 70% on the chat answers. DFlash 2 drafts prose and chat better, and the bundled draft drafts code better.
+The speedup depends on how predictable the text is. Greedy decoding continues a source file almost as written, so the drafts keep 4.9 to 6.7 tokens per round there. Sampled text is less predictable: at temperature 1 the drafts keep 2.6 to 3.1 tokens per round on the Rust sources and 1.8 to 2.1 on the README, where speculation only matches plain decode. Seeds differ widely: the six DSpark runs on `anyhow` at 10.7K ran from 429 to 740 tok/s. The coding request runs faster sampled than greedy: the DSpark draft keeps 3.9 tokens per round on its sampled answers and 3.0 on its greedy one. DFlash 2 drafts prose, chat and the coding request better, and the bundled draft drafts the Rust sources better.
 
 ### Sampling
 
@@ -92,6 +92,8 @@ Sampled text is harder to predict than greedy text, so the draft keeps fewer tok
 
 Requests with seeds gave the same 12 outputs on a second run and with `--streams 8`. Sampling adds 0.08 to 0.19 ms to an 8-row verify of 6.57 ms.
 
+Neither mode is clearly more accurate. On 23 quickbench items at a3fc890, 4 attempts each (GPQA, AIME, HumanEval+, retrieval at 30K and 124K tokens, tool calls), temperature 1 passed 68.5% and greedy 78.3%. The paired difference has a 95% interval of -1.1 to +21.7 points. Temperature 1 hit the token cap 11 times against 5 and averaged 5,682 tokens per reply against 4,741. Four of its cut-offs came at 124K tokens of context, where the thinking started copying the haystack. Greedy repeats one reply on every attempt unless the options are shuffled, so its code, retrieval and AIME rates rest on one reply per item. An earlier gpqa_diamond run on an older commit, 298 replies each with 32K tokens of output, went the other way: temperature 1 passed 87.6% against 77.2%, and repetition loops cut off 18.9% of greedy replies against 5.3% sampled.
+
 ### Concurrent requests
 
 `siphon-serve --streams N` runs up to 8 requests at once, each in its own KV cache. A request alone speculates. When others arrive, all of them decode in batched steps of one row each, and a request left alone speculates again. Tok/s in all, with tok/s per stream in brackets:
@@ -102,7 +104,7 @@ Requests with seeds gave the same 12 outputs on a second run and with `--streams
 | 10,674 | 286 | 412 (206) | 579 (145) | **804** (100) |
 | 32,768 | 264 | 376 (188) | 519 (130) | **696** (87) |
 
-A batch of one takes 3.14 ms per step against 2.71 ms for plain decode, because the batch keeps the verify pass's numerics. A request that speculates alone runs at 510 to 890 tok/s, so batching serves more in total from about three streams on.
+A batch of one takes 3.14 ms per step against 2.71 ms for plain decode, because the batch keeps the verify pass's numerics. A request that speculates alone runs at 508 to 875 tok/s greedy and 310 to 673 tok/s at temperature 1, so batching serves more in total from about three streams on. The batched steps here decode greedily. Over HTTP with `--streams 8`, temperature 1 served 734 tok/s in all against 780 greedy (see [Sampling](#sampling)).
 
 ### Prefill and the prefix cache
 
