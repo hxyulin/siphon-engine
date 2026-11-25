@@ -146,13 +146,15 @@ def main() -> None:
     r.add_argument("--serve-args", default="", help="extra siphon-serve options, such as '--kv bf16'")
     r.add_argument("--eval", help="Siphon's eval binary, for the fidelity track")
     r.add_argument("--fidelity-config", action="append",
-                   help="eval options, repeatable (default: --kv bf16 and --kv fp8 with --prefill 2048)")
+                   help="eval options, repeatable (default: fidelity.CONFIGS, the served prefill and verify)")
     r.add_argument("--refs", default=str(CACHE / "refs"), help="directory of the MLX captures")
     r.add_argument("--tracks", default="quality,speed,fidelity")
     r.add_argument("--items", default=str(HERE / "items.json"))
     r.add_argument("--attempts", type=int, default=4)
-    r.add_argument("--first-attempt", type=int, default=0,
-                   help="number the attempts from here, for extra calibration attempts")
+    # Attempts 0 to 3 picked the items, so their sampled replies are biased towards
+    # failing. Scoring starts after them.
+    r.add_argument("--first-attempt", type=int, default=4,
+                   help="number the attempts from here (0 to 3 calibrated items.json)")
     r.add_argument("--concurrency", type=int, default=8)
     r.add_argument("--temperature", type=float, default=1.0)
     r.add_argument("--top-p", type=float)

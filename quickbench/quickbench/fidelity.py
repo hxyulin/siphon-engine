@@ -7,7 +7,10 @@ import time
 from pathlib import Path
 
 TEXTS = ("fidelity-4k", "fidelity-32k", "fidelity-128k")
-CONFIGS = ("--prefill 2048 --kv bf16", "--prefill 2048 --kv fp8")
+# What siphon-serve runs by default: prefill in chunks of 2,048 rows, and the verify pass,
+# which every decoded token goes through, on FP8 weights. `eval --prefill` keeps BF16 weights
+# whatever `--weights` says, so only the verify config measures the FP8 copies.
+CONFIGS = ("--prefill 2048 --kv fp8", "--verify 8 --kv fp8 --weights fp8")
 
 ALL = re.compile(r"^all\s+\S+\s+(\d+)\s+([\d.]+)%\s+([\d.]+)\s+([\d.]+) / ([\d.]+)", re.M)
 KL = re.compile(r"KL\(MLX \|\| engine\) at (\d+) sampled positions: mean (\S+) median (\S+) max (\S+)")

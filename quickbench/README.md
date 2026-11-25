@@ -4,7 +4,7 @@ One command runs three tracks against Siphon or any OpenAI-compatible server and
 
 - **Quality**: hand-picked items that the model gets right only some of the time, each sampled 4 times with thinking on: GPQA Diamond, AIME 2025, HumanEval+ code tasks, synthetic retrieval at about 30K and 125K tokens, and tool-call checks. The report gives the pass rate per source with Wilson intervals, and counts replies cut off at the token cap and replies that loop.
 - **Speed**: 4 fixed prompts (chat, code, the lighthouse story, an agent request with tools) at temperature 0.8 with top-p 0.95 and at temperature 1.0, 6 seeds each, at 1 stream and at 8 streams. The report gives median decode tok/s, time to first token and, for siphon-serve, tokens per speculation round.
-- **Fidelity** (Siphon only): Siphon's `eval` binary over MLX captures of 4K, 32K and 128K-token texts, with the KV cache in BF16 and in FP8. It reports KL divergence, top-1 agreement and perplexity against MLX.
+- **Fidelity** (Siphon only): Siphon's `eval` binary over MLX captures of 4K, 32K and 128K-token texts, through the served prefill (chunks of 2,048 rows) and the served verify pass (8 rows, FP8 weights and KV cache). It reports KL divergence, top-1 agreement and perplexity against MLX. `eval --prefill` keeps BF16 weights whatever `--weights` says, so only the verify config measures the FP8 weight copies decode reads.
 
 ## Setup
 
@@ -73,4 +73,6 @@ Quality attempts are paired by item, seed and option order. The table gives the 
 
 Output caps are 16,384 tokens for GPQA, AIME and code, 8,192 for retrieval and 4,096 for tools (`quality.CAPS`, `--cap gpqa=12288` to change one). Items were chosen for pass rates between about 20% and 90% and for short replies, so that 4 attempts of every item fit in about 10 minutes at 8 streams.
 
-To find new items, run a pool of candidate ids with `--tracks quality --attempts 1`, then more attempts of the borderline ones with `--first-attempt 1 --attempts 3`, and copy the pass rates into `items.json`.
+Scoring uses attempts 4 to 7 (`--first-attempt 4`, the default). Attempts 0 to 3 picked the items: an item made the list because some of those sampled replies failed, so scoring them again would bias a sampled run against any other configuration. Each attempt's seed and GPQA option order come from the item and the attempt number, so a run repeats exactly.
+
+To find new items, run a pool of candidate ids with `--tracks quality --first-attempt 0 --attempts 1`, then more attempts of the borderline ones with `--first-attempt 1 --attempts 3`, and copy the pass rates into `items.json`.
