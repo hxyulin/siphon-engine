@@ -243,7 +243,7 @@ mod linux {
                 linear_fp8::{Fp8Gemv, LinearFp8},
                 linear_rows::{LinearRows, RowsProduct},
             },
-            weights::Weights,
+            weights::{Table, Weights},
         };
 
         const BANDWIDTH: f64 = 1.70e12;
@@ -349,7 +349,7 @@ mod linux {
                     })
                     .collect(),
                 Kind::Head => vec![vec![(
-                    &weights.lm_head,
+                    weights.lm_head.slice(),
                     weights.lm_head_fp8.as_ref(),
                     hidden,
                 )]],
@@ -436,6 +436,11 @@ mod linux {
                 fp8: LinearFp8::load(ctx)?,
             };
             weights.quantize_fp8(&k.fp8, stream)?;
+            // The BF16 products time device weights: copy back the LM head, which
+            // quantizing moved to host memory.
+            let mut head = stream.alloc_zeros::<bf16>(weights.lm_head.slice().len())?;
+            stream.memcpy_dtod(weights.lm_head.slice(), &mut head)?;
+            weights.lm_head = Table::Device(head);
             let visits = visits(&config);
             let x_host: Vec<bf16> = (0..8 * 4608)
                 .map(|i| bf16::from_f32(((i * 37 % 101) as f32 - 50.0) / 50.0))

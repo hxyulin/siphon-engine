@@ -276,6 +276,8 @@ mod cuda {
         outside_pool: usize,
         /// Whether a job has already gone past the plan, so that it warns once.
         warned: bool,
+        /// The peak after a job last printed, 0 before the first job.
+        reported: usize,
     }
 
     impl MemoryCheck {
@@ -291,6 +293,7 @@ mod cuda {
                 planned,
                 outside_pool,
                 warned: false,
+                reported: 0,
             };
             eprintln!(
                 "memory check: {} GiB of a planned {} GiB in use after warmup ({} GiB in \
@@ -312,7 +315,18 @@ mod cuda {
 
         fn after_job(&mut self) {
             match self.gpu.memory() {
-                Ok(now) => self.warn(&now),
+                Ok(now) => {
+                    let peak = self.peak(&now);
+                    if peak > self.reported {
+                        self.reported = peak;
+                        eprintln!(
+                            "memory check: peak {} MiB of a planned {} MiB after a job",
+                            peak >> 20,
+                            self.planned >> 20
+                        );
+                    }
+                    self.warn(&now);
+                }
                 Err(e) => eprintln!("memory check failed: {e:#}"),
             }
         }

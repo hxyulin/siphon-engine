@@ -58,7 +58,7 @@
 //! 8), priced by verify passes of each width timed at that context first. With
 //! `--fallback` it also runs plain steps when no width is expected to be faster. `--draft` takes a variant of the draft as `dspark` does: `fast` (the
 //! default, the three FP8 approximations and the shortlist), `fp8` (no shortlist),
-//! `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and
+//! `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`, `fp8-kv` and
 //! `shortlist`. The shortlist ranks tokens by `draft::counted_ranking` unless
 //! `--shortlist` names a ranking file (with `fp8`, the file adds the shortlist).
 //! `--drafter DIR` runs the drafter in DIR instead of the bundled draft, with the same

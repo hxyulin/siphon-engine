@@ -93,6 +93,7 @@ pub struct DraftApprox {
     pub fp8_backbone: bool,
     pub fp8_head: bool,
     pub fp8_fold: bool,
+    pub fp8_kv: bool,
     pub shortlist: bool,
 }
 
@@ -303,10 +304,20 @@ impl Planner {
                     + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4
                     // The speculator's prompt tail, twice, and its run of plain steps.
                     + (2 * TAIL_ROWS + PLAIN_RUN_ROWS) * taps * hidden * 2;
+                // A device copy of the BF16 LM head for the exact base logits, which the
+                // target keeps in host memory with FP8 weights.
+                let head_copy =
+                    if inputs.weights == WeightFormat::Fp8 && !approx.fp8_head && !approx.shortlist
+                    {
+                        c.vocab_size * hidden * 2
+                    } else {
+                        0
+                    };
+                let kv_bytes = if approx.fp8_kv { 1 } else { 2 };
                 (
                     verify,
-                    draft_fixed_bytes(c, d, *approx),
-                    d.global_layers * 2 * kv_dims * 2,
+                    draft_fixed_bytes(c, d, *approx) + head_copy,
+                    d.global_layers * 2 * kv_dims * kv_bytes,
                 )
             }
         };
@@ -329,7 +340,7 @@ impl Planner {
         let fixed = Plan {
             capacity: 0,
             streams,
-            weights: target_weight_bytes(inputs.checkpoint),
+            weights: target_weight_bytes(inputs.checkpoint, inputs.weights),
             fp8_copies: match inputs.weights {
                 WeightFormat::Bf16 => 0,
                 WeightFormat::Fp8 => fp8_copy_bytes(c),
@@ -394,13 +405,20 @@ impl Planner {
     }
 }
 
-/// Tensor bytes of the target's text model as uploaded: every `model.llm.` tensor, with
-/// the BF16 tensors the loader widens to F32 counted twice. The vision tower and the
-/// draft's tensors are not the target's.
-fn target_weight_bytes(checkpoint: &Checkpoint) -> usize {
+/// Tensors the target keeps in mapped host memory: the embedding table, and with FP8
+/// weights the BF16 LM head, whose FP8 copy every product reads.
+fn host_tensor(name: &str, weights: WeightFormat) -> bool {
+    name == "model.llm.embed.weight"
+        || (weights == WeightFormat::Fp8 && name == "model.llm.unembed.weight")
+}
+
+/// Device bytes of the target's text model as uploaded: every `model.llm.` tensor but those
+/// in host memory ([`host_tensor`]), with the BF16 tensors the loader widens to F32 counted
+/// twice. The vision tower and the draft's tensors are not the target's.
+fn target_weight_bytes(checkpoint: &Checkpoint, weights: WeightFormat) -> usize {
     checkpoint
         .tensors()
-        .filter(|(name, _)| name.starts_with("model.llm."))
+        .filter(|(name, _)| name.starts_with("model.llm.") && !host_tensor(name, weights))
         .map(|(name, entry)| {
             let widened = [
                 "attn_res.",
@@ -624,14 +642,19 @@ fn draft_ring_bytes(c: &TextConfig, d: &DraftShape) -> usize {
     (d.layers - d.global_layers) * d.ring_slots * 2 * kv_dims * 2
 }
 
-/// The draft's bytes that do not grow with the capacity: its weights, the bundled draft's
-/// fold, the copies its approximations make, its rings and its larger buffers.
+/// The draft's bytes that do not grow with the capacity: its weights less the BF16
+/// projections that FP8 copies replace, the bundled draft's fold, the copies its
+/// approximations make, its rings and its larger buffers.
 fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usize {
     let hidden = c.hidden_size;
     let kv_dims = c.num_key_value_heads * c.head_dim;
     let vocab = c.unpadded_vocab_size;
     let padded = c.vocab_size;
     let mut bytes = d.weights;
+    if approx.fp8_backbone {
+        // The BF16 projections only the block reads, freed for their FP8 copies.
+        bytes -= d.layers * 2 * (2 * d.q_width * hidden + 3 * d.mlp_width * hidden);
+    }
     bytes += match d.kind {
         // The fold, its bias, its E4M3 copy and the copy's error bounds.
         DraftKind::Bundled => {
@@ -769,11 +792,13 @@ mod tests {
     }
 
     #[test]
-    fn target_weights_skip_the_vision_tower_and_count_widened_tensors_twice() {
+    fn target_weights_skip_the_vision_tower_and_host_tensors_and_count_widened_tensors_twice() {
         let dir = checkpoint(
             "target",
             &[
                 ("model.llm.embed.weight", Dtype::BF16, &[100]),
+                ("model.llm.unembed.weight", Dtype::BF16, &[100]),
+                ("model.llm.norm.weight", Dtype::BF16, &[25]),
                 ("model.llm.layers.0.mlp.gate.weight", Dtype::BF16, &[10]),
                 (
                     "model.llm.layers.0.mlp.experts.w13_weight",
@@ -785,7 +810,14 @@ mod tests {
             ],
         );
         let checkpoint = Checkpoint::open(&dir).expect("opening");
-        assert_eq!(target_weight_bytes(&checkpoint), 200 + 40 + 1000);
+        assert_eq!(
+            target_weight_bytes(&checkpoint, WeightFormat::Bf16),
+            200 + 40 + 1000 + 50
+        );
+        assert_eq!(
+            target_weight_bytes(&checkpoint, WeightFormat::Fp8),
+            50 + 40 + 1000
+        );
         assert_eq!(bundled_shape(&checkpoint).expect("a draft").weights, 600);
         std::fs::remove_dir_all(dir).expect("cleaning up");
     }

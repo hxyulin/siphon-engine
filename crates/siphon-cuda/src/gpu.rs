@@ -1,10 +1,10 @@
-use std::{ffi::c_void, ptr, sync::Arc};
+use std::{ffi::c_void, mem::ManuallyDrop, ptr, sync::Arc};
 
 use anyhow::Context as _;
 use cudarc::{
     driver::{
         CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
-        DevicePtr, DevicePtrMut, LaunchConfig, sys,
+        DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PinnedHostSlice, ValidAsZeroBits, sys,
     },
     nvrtc::Ptx,
 };
@@ -70,6 +70,80 @@ impl Gpu {
             pool_reserved: attribute(A::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
             pool_reserved_peak: attribute(A::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
         })
+    }
+}
+
+/// A read-only buffer in page-locked host memory that kernels read through its mapped
+/// device address, over PCIe, without taking device memory. For tensors that kernels only
+/// gather a few rows of, such as the embedding table. The address stays valid inside CUDA
+/// graphs.
+#[derive(Debug)]
+pub struct HostMapped<T> {
+    /// A device slice of the mapped address, which this owns but never frees: it is leaked
+    /// in `drop`, before the host memory goes.
+    device: ManuallyDrop<CudaSlice<T>>,
+    host: PinnedHostSlice<T>,
+}
+
+impl<T: DeviceRepr + ValidAsZeroBits + Copy> HostMapped<T> {
+    /// Copies `values` into new page-locked, write-combined host memory mapped into the
+    /// device's address space.
+    pub fn new(stream: &Arc<CudaStream>, values: &[T]) -> anyhow::Result<Self> {
+        let ctx = stream.context();
+        // SAFETY: every element is written below before any kernel reads it.
+        let mut host = unsafe {
+            ctx.alloc_pinned_with_flags::<T>(
+                values.len(),
+                sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_WRITECOMBINED,
+            )
+        }
+        .context("allocating mapped host memory")?;
+        host.as_mut_slice()?.copy_from_slice(values);
+        let mut address: sys::CUdeviceptr = 0;
+        // SAFETY: `host` was allocated with CU_MEMHOSTALLOC_DEVICEMAP in this context, which
+        // is bound to the thread, and `address` is where the call writes its device address.
+        unsafe {
+            sys::cuMemHostGetDevicePointer_v2(
+                &raw mut address,
+                host.as_mut_ptr()?.cast::<c_void>(),
+                0,
+            )
+        }
+        .result()
+        .context("mapping host memory")?;
+        // SAFETY: `address` maps the `values.len()` elements of `host`, which outlives the
+        // slice: `drop` leaks the slice, so cudarc never frees the address as device memory.
+        let device = unsafe { stream.upgrade_device_ptr::<T>(address, values.len()) };
+        Ok(Self {
+            device: ManuallyDrop::new(device),
+            host,
+        })
+    }
+}
+
+impl<T> HostMapped<T> {
+    /// The buffer as a device slice, for kernels to read. Kernels must not write it.
+    #[must_use]
+    pub fn slice(&self) -> &CudaSlice<T> {
+        &self.device
+    }
+
+    /// Bytes of host memory the buffer takes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.host.num_bytes()
+    }
+}
+
+impl<T> Drop for HostMapped<T> {
+    fn drop(&mut self) {
+        // SAFETY: `device` is not used again. Leaking it keeps cudarc from freeing a host
+        // address as device memory; `host` frees the memory after this.
+        let device = unsafe { ManuallyDrop::take(&mut self.device) };
+        let stream = Arc::clone(device.stream());
+        let _ = device.leak();
+        // Kernels that read the buffer may still be queued.
+        let _ = stream.synchronize();
     }
 }
 

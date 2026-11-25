@@ -28,6 +28,7 @@ use crate::{
         conv::VisitConvs,
         experts::{ExpertScratch, QuantizedRows},
         linear_fp8::{Fp8Matrix, Fp8Rows},
+        linear_rows,
         misc::{GATE_SLOTS, GateRowsSlot, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{
@@ -701,7 +702,7 @@ impl Ctx {
         self.kernels.elementwise.embedding(
             &self.stream,
             &rows(&p.tokens, m, 1),
-            &self.weights.embed,
+            self.weights.embed.slice(),
             &mut rows_mut(&mut p.embedded, m, hidden),
         )?;
         self.kernels.norm.rms_norm(
@@ -871,16 +872,19 @@ impl Ctx {
             return Ok(());
         }
 
-        // The last row's logits and greedy token, in the decode buffers.
+        // The last row's logits and greedy token, in the decode buffers. With FP8 weights
+        // the BF16 LM head is in host memory, so the head reads its FP8 copy through the
+        // verify pass's products: the token a one-row verify at that position would give.
+        let fp8 = self.weights.lm_head_fp8.as_ref();
         self.gemm_rows(
             &mut [RowProduct {
-                weight: &self.weights.lm_head,
-                fp8: None,
+                weight: self.weights.lm_head.slice(),
+                fp8,
                 x: p.final_hidden.slice((m - 1) * hidden..mh),
                 out: s.logits.as_view_mut(),
             }],
             1,
-            false,
+            fp8.is_some(),
             None,
         )?;
         self.kernels.elementwise.logit_softcap(
@@ -900,17 +904,22 @@ impl Ctx {
             return Ok(());
         };
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
-        for first in (0..m).step_by(HEAD_ROWS) {
-            let n = HEAD_ROWS.min(m - first);
+        let step = if fp8.is_some() {
+            linear_rows::MAX_ROWS
+        } else {
+            HEAD_ROWS
+        };
+        for first in (0..m).step_by(step) {
+            let n = step.min(m - first);
             self.gemm_rows(
                 &mut [RowProduct {
-                    weight: &self.weights.lm_head,
-                    fp8: None,
+                    weight: self.weights.lm_head.slice(),
+                    fp8,
                     x: p.final_hidden.slice(first * hidden..(first + n) * hidden),
                     out: rows_mut(&mut p.head_logits, n, padded),
                 }],
                 n,
-                false,
+                fp8.is_some(),
                 None,
             )?;
             self.kernels.elementwise.logit_softcap(
@@ -936,7 +945,7 @@ impl Ctx {
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
         self.gemm_rows(
             &mut [RowProduct {
-                weight: &self.weights.lm_head,
+                weight: self.weights.lm_head.slice(),
                 fp8: self.weights.lm_head_fp8.as_ref(),
                 x: rows(&p.final_hidden, m, self.hidden()),
                 out: rows_mut(&mut p.head_logits, m, padded),
@@ -1004,7 +1013,7 @@ impl Ctx {
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
         self.gemm_rows(
             &mut [RowProduct {
-                weight: &self.weights.lm_head,
+                weight: self.weights.lm_head.slice(),
                 fp8: self.weights.lm_head_fp8.as_ref(),
                 x: rows(&p.final_hidden, m, self.hidden()),
                 out: rows_mut(&mut p.head_logits, m, padded),

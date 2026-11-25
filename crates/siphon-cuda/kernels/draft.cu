@@ -181,6 +181,13 @@ constexpr int kRopeF32 = 0;         // F32 cosine and sine, F32 arithmetic
 constexpr int kRopeBf16Table = 1;   // BF16 cosine and sine, F32 arithmetic
 constexpr int kRopeBf16Ops = 2;     // BF16 cosine and sine, every product and sum rounded
 
+// Stores x rounded to BF16, or for an E4M3 cache then rounded to the nearest E4M3 value,
+// ties to even, as the target's kv_append_fp8 rounds its BF16 keys and values.
+__device__ __forceinline__ void put(__nv_bfloat16* out, float x) { *out = __float2bfloat16_rn(x); }
+__device__ __forceinline__ void put(uint8_t* out, float x) {
+    *out = uint8_t(__nv_cvt_float_to_fp8(round_bf16(x), __NV_SATFINITE, __NV_E4M3));
+}
+
 // Per-head RMSNorm of the 128 values at `in` with `weight`, rounded to BF16, then NeoX
 // RoPE at `position`, written to `out`, which may equal `in`. A block of 64 threads:
 // thread i rotates elements i and i + 64. With kRopeBf16Table the cosine and sine are
@@ -188,9 +195,10 @@ constexpr int kRopeBf16Ops = 2;     // BF16 cosine and sine, every product and s
 // draft, and Transformers' Qwen3 rotary embedding it was trained with). kRopeBf16Ops
 // also rounds each product and the sum to BF16, as BF16 tensor arithmetic does
 // (SGLang's table_qk_norm_rope with a BF16 table, and Transformers in BF16).
-__device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
-                               const __nv_bfloat16* weight, const float* inv_freq,
-                               int32_t position, float eps, int rope = kRopeF32) {
+template <typename Out>
+__device__ void norm_rope_head(const __nv_bfloat16* in, Out* out, const __nv_bfloat16* weight,
+                               const float* inv_freq, int32_t position, float eps,
+                               int rope = kRopeF32) {
     __shared__ float partial[kHalf / 32];
     const int i = threadIdx.x;
     const float x1 = bf(in[i]);
@@ -210,14 +218,36 @@ __device__ void norm_rope_head(const __nv_bfloat16* in, __nv_bfloat16* out,
         cos_f = round_bf16(cos_f);
     }
     if (rope == kRopeBf16Ops) {
-        out[i] = __float2bfloat16_rn(
+        put(out + i,
             __fsub_rn(round_bf16(__fmul_rn(n1, cos_f)), round_bf16(__fmul_rn(n2, sin_f))));
-        out[i + kHalf] = __float2bfloat16_rn(
+        put(out + i + kHalf,
             __fadd_rn(round_bf16(__fmul_rn(n2, cos_f)), round_bf16(__fmul_rn(n1, sin_f))));
         return;
     }
-    out[i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(n1, cos_f), __fmul_rn(n2, sin_f)));
-    out[i + kHalf] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(n2, cos_f), __fmul_rn(n1, sin_f)));
+    put(out + i, __fsub_rn(__fmul_rn(n1, cos_f), __fmul_rn(n2, sin_f)));
+    put(out + i + kHalf, __fadd_rn(__fmul_rn(n2, cos_f), __fmul_rn(n1, sin_f)));
+}
+
+// The key head at `k` through norm_rope_head into a cache row at `cache_k`, and the value
+// head at `v` copied beside it into `cache_v`, as BF16 or, with `fp8`, as E4M3 of the
+// BF16 values. One block of 64 threads.
+__device__ void rope_store_head(const __nv_bfloat16* k, const __nv_bfloat16* v, void* cache_k,
+                                void* cache_v, size_t dst, bool fp8,
+                                const __nv_bfloat16* k_norm, const float* inv_freq,
+                                int32_t position, float eps, int rope) {
+    if (fp8) {
+        norm_rope_head(k, static_cast<uint8_t*>(cache_k) + dst, k_norm, inv_freq, position, eps,
+                       rope);
+        for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
+            put(static_cast<uint8_t*>(cache_v) + dst + i, bf(v[i]));
+        }
+        return;
+    }
+    norm_rope_head(k, static_cast<__nv_bfloat16*>(cache_k) + dst, k_norm, inv_freq, position, eps,
+                   rope);
+    for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
+        static_cast<__nv_bfloat16*>(cache_v)[dst + i] = v[i];
+    }
 }
 
 }  // namespace
@@ -235,18 +265,43 @@ draft_head_norm_rope(__nv_bfloat16* x, int32_t row_stride, const __nv_bfloat16* 
                    rope);
 }
 
+// 8 BF16 values as 8 E4M3 values, each rounded as `put` rounds it.
+__device__ __forceinline__ uint2 bf16x8_to_e4m3(uint4 x) {
+    const uint32_t w[4] = {x.x, x.y, x.z, x.w};
+    uint32_t packed[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t lo = __nv_cvt_float2_to_fp8x2(
+            make_float2(__uint_as_float(w[2 * i] << 16), __uint_as_float(w[2 * i] & 0xffff0000u)),
+            __NV_SATFINITE, __NV_E4M3);
+        const uint32_t hi = __nv_cvt_float2_to_fp8x2(
+            make_float2(__uint_as_float(w[2 * i + 1] << 16),
+                        __uint_as_float(w[2 * i + 1] & 0xffff0000u)),
+            __NV_SATFINITE, __NV_E4M3);
+        packed[i] = (lo & 0xffffu) | (hi << 16);
+    }
+    return make_uint2(packed[0], packed[1]);
+}
+
 // Copies rows of keys and values (BF16 [rows, 1024] with row stride `row_stride`) into
-// the caches (BF16 [slots, 1024]): row r goes to slot (start + r) mod slots. One block
-// per row, 128 threads of 8 elements.
+// the caches ([slots, 1024], BF16, or E4M3 with `fp8`): row r goes to slot
+// (start + r) mod slots. One block per row, 128 threads of 8 elements.
 extern "C" __global__ void __launch_bounds__(128)
-draft_store_kv(const __nv_bfloat16* k, const __nv_bfloat16* v, int32_t row_stride,
-               __nv_bfloat16* cache_k, __nv_bfloat16* cache_v, int32_t start, int32_t slots) {
+draft_store_kv(const __nv_bfloat16* k, const __nv_bfloat16* v, int32_t row_stride, void* cache_k,
+               void* cache_v, int32_t start, int32_t slots, int32_t fp8) {
     constexpr int kWidth = kKvHeads * kHeadDim;
     const size_t slot = size_t((start + static_cast<int32_t>(blockIdx.x)) % slots);
     const size_t src = size_t(blockIdx.x) * row_stride + threadIdx.x * 8;
     const size_t dst = slot * kWidth + threadIdx.x * 8;
-    *reinterpret_cast<uint4*>(cache_k + dst) = *reinterpret_cast<const uint4*>(k + src);
-    *reinterpret_cast<uint4*>(cache_v + dst) = *reinterpret_cast<const uint4*>(v + src);
+    const uint4 kx = *reinterpret_cast<const uint4*>(k + src);
+    const uint4 vx = *reinterpret_cast<const uint4*>(v + src);
+    if (fp8 != 0) {
+        *reinterpret_cast<uint2*>(static_cast<uint8_t*>(cache_k) + dst) = bf16x8_to_e4m3(kx);
+        *reinterpret_cast<uint2*>(static_cast<uint8_t*>(cache_v) + dst) = bf16x8_to_e4m3(vx);
+        return;
+    }
+    *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(cache_k) + dst) = kx;
+    *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(cache_v) + dst) = vx;
 }
 
 namespace {
@@ -293,6 +348,23 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* global) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(global) : "memory");
 }
 
+// Widens 16 E4M3 values to BF16, exactly, into 16 BF16 values at `out` (16-byte aligned).
+__device__ __forceinline__ void widen_e4m3x16(uint4 raw, __nv_bfloat16* out) {
+    const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+    uint32_t pairs[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t two = (words[i / 2] >> (16 * (i % 2))) & 0xffffu;
+        const float2 f = __half22float2(
+            __half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(two), __NV_E4M3)));
+        // Every E4M3 value is a BF16 value, so the top halves are exact.
+        pairs[i] = (__float_as_uint(f.x) >> 16) | (__float_as_uint(f.y) & 0xffff0000u);
+    }
+    auto* dst = reinterpret_cast<uint4*>(out);
+    dst[0] = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+    dst[1] = make_uint4(pairs[4], pairs[5], pairs[6], pairs[7]);
+}
+
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
@@ -319,10 +391,14 @@ __device__ __forceinline__ void cp_async_wait() {
 // over the 128 dimensions, the running max, the sum of the exponentials in key order,
 // and the output rescaled then accumulated in key order. Splits depend only on the key
 // count.
-template <int G>
-__device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
-                                                const __nv_bfloat16* cache_k,
-                                                const __nv_bfloat16* cache_v, int32_t slots,
+//
+// With FP8, the caches hold E4M3 values (bytes [slots, 8, 128]). Each thread loads 16
+// bytes of the next chunk's keys and values into registers before the current chunk's
+// arithmetic and widens them exactly to BF16 into shared memory after it, so the
+// arithmetic is the BF16 cache's over the widened values.
+template <int G, bool FP8>
+__device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const void* cache_k,
+                                                const void* cache_v, int32_t slots,
                                                 const int32_t* control, int32_t window,
                                                 int32_t row_window, int32_t first, int32_t keys,
                                                 float* partial_out, float* partial_stats) {
@@ -360,9 +436,11 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
 
     const int begin = split * per_split;
     const int end = min(keys, begin + per_split);
-    // Each thread copies 16-byte pieces: key t / 16 (and 16 more), piece t % 16.
+    // BF16: each thread copies 16-byte pieces, key t / 16 (and 16 more), piece t % 16.
     auto load_chunk = [&](int c0, int buf) {
         const int n = min(kKeyChunk, end - c0);
+        const auto* ck = static_cast<const __nv_bfloat16*>(cache_k);
+        const auto* cv = static_cast<const __nv_bfloat16*>(cache_v);
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             const int key = t / 16 + half * 16;
@@ -370,13 +448,36 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
             if (key < n) {
                 const size_t slot = size_t((first + c0 + key) % slots);
                 const size_t off = (slot * kKvHeads + kv) * kHeadDim + piece * 8;
-                cp_async16(&ks[buf][key][piece * 8], cache_k + off);
-                cp_async16(&vs[buf][key][piece * 8], cache_v + off);
+                cp_async16(&ks[buf][key][piece * 8], ck + off);
+                cp_async16(&vs[buf][key][piece * 8], cv + off);
             }
         }
         cp_async_commit();
     };
-    load_chunk(begin, 0);
+    // FP8: each thread loads 16 values of key t / 8, piece t % 8, of the keys and values.
+    static_assert(kAttnThreads * 16 == kKeyChunk * kHeadDim, "one piece per thread");
+    const int fp8_key = t / 8, fp8_piece = t % 8;
+    uint4 k_raw = make_uint4(0, 0, 0, 0), v_raw = make_uint4(0, 0, 0, 0);
+    auto load_fp8 = [&](int c0) {
+        if (fp8_key < min(kKeyChunk, end - c0)) {
+            const size_t slot = size_t((first + c0 + fp8_key) % slots);
+            const size_t off = (slot * kKvHeads + kv) * kHeadDim + fp8_piece * 16;
+            k_raw = *reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(cache_k) + off);
+            v_raw = *reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(cache_v) + off);
+        }
+    };
+    auto store_fp8 = [&](int c0, int buf) {
+        if (fp8_key < min(kKeyChunk, end - c0)) {
+            widen_e4m3x16(k_raw, &ks[buf][fp8_key][fp8_piece * 16]);
+            widen_e4m3x16(v_raw, &vs[buf][fp8_key][fp8_piece * 16]);
+        }
+    };
+    if constexpr (FP8) {
+        load_fp8(begin);
+        store_fp8(begin, 0);
+    } else {
+        load_chunk(begin, 0);
+    }
 
     for (int idx = t; idx < kQueryRows * kHeadDim; idx += kAttnThreads) {
         const int r = idx / kHeadDim, d = idx % kHeadDim;
@@ -398,7 +499,11 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
     int buf = 0;
     for (int c0 = begin; c0 < end; c0 += kKeyChunk, buf ^= 1) {
         const int n = min(kKeyChunk, end - c0);
-        if (c0 + kKeyChunk < end) {
+        if constexpr (FP8) {
+            if (c0 + kKeyChunk < end) {
+                load_fp8(c0 + kKeyChunk);
+            }
+        } else if (c0 + kKeyChunk < end) {
             load_chunk(c0 + kKeyChunk, buf ^ 1);
             cp_async_wait<1>();
         } else {
@@ -502,6 +607,12 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
                 }
             }
         }
+        // The other buffer was last read before the previous chunk's closing barrier.
+        if constexpr (FP8) {
+            if (c0 + kKeyChunk < end) {
+                store_fp8(c0 + kKeyChunk, buf ^ 1);
+            }
+        }
         __syncthreads();
     }
 
@@ -523,22 +634,29 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q,
 // attention_split with 3 query heads per KV head (the bundled draft and 2DSD's DFlash
 // draft).
 extern "C" __global__ void __launch_bounds__(kAttnThreads)
-draft_attention(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                const __nv_bfloat16* cache_v, int32_t slots, const int32_t* control,
-                int32_t window, int32_t row_window, int32_t first, int32_t keys,
-                float* partial_out, float* partial_stats) {
-    attention_split<kGroup>(q, cache_k, cache_v, slots, control, window, row_window, first, keys,
-                            partial_out, partial_stats);
+draft_attention(const __nv_bfloat16* q, const void* cache_k, const void* cache_v, int32_t slots,
+                const int32_t* control, int32_t window, int32_t row_window, int32_t first,
+                int32_t keys, float* partial_out, float* partial_stats) {
+    attention_split<kGroup, false>(q, cache_k, cache_v, slots, control, window, row_window,
+                                   first, keys, partial_out, partial_stats);
+}
+
+// draft_attention over E4M3 caches.
+extern "C" __global__ void __launch_bounds__(kAttnThreads)
+draft_attention_fp8(const __nv_bfloat16* q, const void* cache_k, const void* cache_v,
+                    int32_t slots, const int32_t* control, int32_t window, int32_t row_window,
+                    int32_t first, int32_t keys, float* partial_out, float* partial_stats) {
+    attention_split<kGroup, true>(q, cache_k, cache_v, slots, control, window, row_window, first,
+                                  keys, partial_out, partial_stats);
 }
 
 // attention_split with 4 query heads per KV head (DFlash 2).
 extern "C" __global__ void __launch_bounds__(kAttnThreads)
-draft_attention_g4(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                   const __nv_bfloat16* cache_v, int32_t slots, const int32_t* control,
-                   int32_t window, int32_t row_window, int32_t first, int32_t keys,
-                   float* partial_out, float* partial_stats) {
-    attention_split<kMaxGroup>(q, cache_k, cache_v, slots, control, window, row_window, first,
-                               keys, partial_out, partial_stats);
+draft_attention_g4(const __nv_bfloat16* q, const void* cache_k, const void* cache_v,
+                   int32_t slots, const int32_t* control, int32_t window, int32_t row_window,
+                   int32_t first, int32_t keys, float* partial_out, float* partial_stats) {
+    attention_split<kMaxGroup, false>(q, cache_k, cache_v, slots, control, window, row_window,
+                                      first, keys, partial_out, partial_stats);
 }
 
 // Combines the splits of draft_attention into out, BF16 [8, group * 8 * 128]. Grid (8
@@ -886,16 +1004,16 @@ draft_commit_mix(const __nv_bfloat16* taps, const int32_t* control, const float*
 // The round's context keys and values: for row r below control[1], KV head h and layer
 // l, the key head of ctx_k[l, r] gets draft_head_norm_rope's norm and RoPE at position
 // start + r and lands in cache slot (start + r) mod slots, with the value head of
-// ctx_v[l, r] beside it. Layer 1 skips positions at or past its slots. Grid (8 rows, 8
-// heads, 3 layers), 64 threads.
+// ctx_v[l, r] beside it. Layer l's cache is E4M3 if bit l of `fp8_layers` is set, else
+// BF16. Layer 1 skips positions at or past its slots. Grid (8 rows, 8 heads, 3 layers),
+// 64 threads.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_commit_rope_store(const __nv_bfloat16* ctx_k, const __nv_bfloat16* ctx_v,
                         const int32_t* control, const float* inv_freq, float eps,
                         const __nv_bfloat16* k_norm0, const __nv_bfloat16* k_norm1,
-                        const __nv_bfloat16* k_norm2, __nv_bfloat16* cache_k0,
-                        __nv_bfloat16* cache_v0, int32_t slots0, __nv_bfloat16* cache_k1,
-                        __nv_bfloat16* cache_v1, int32_t slots1, __nv_bfloat16* cache_k2,
-                        __nv_bfloat16* cache_v2, int32_t slots2) {
+                        const __nv_bfloat16* k_norm2, void* cache_k0, void* cache_v0,
+                        int32_t slots0, void* cache_k1, void* cache_v1, int32_t slots1,
+                        void* cache_k2, void* cache_v2, int32_t slots2, int32_t fp8_layers) {
     constexpr int kWidth = kKvHeads * kHeadDim;
     pdl_wait();
     pdl_trigger();
@@ -906,32 +1024,32 @@ draft_commit_rope_store(const __nv_bfloat16* ctx_k, const __nv_bfloat16* ctx_v,
     }
     const int32_t position = control[0] + row;
     const __nv_bfloat16* norms[3] = {k_norm0, k_norm1, k_norm2};
-    __nv_bfloat16* caches_k[3] = {cache_k0, cache_k1, cache_k2};
-    __nv_bfloat16* caches_v[3] = {cache_v0, cache_v1, cache_v2};
+    void* caches_k[3] = {cache_k0, cache_k1, cache_k2};
+    void* caches_v[3] = {cache_v0, cache_v1, cache_v2};
     const int32_t slots[3] = {slots0, slots1, slots2};
     if (position < 0 || (layer == 1 && position >= slots[1])) {
         return;
     }
     const size_t src = (size_t(layer) * kBlock + row) * kWidth + head * kHeadDim;
     const size_t dst = size_t(position % slots[layer]) * kWidth + head * kHeadDim;
-    norm_rope_head(ctx_k + src, caches_k[layer] + dst, norms[layer], inv_freq, position, eps);
-    for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
-        caches_v[layer][dst + i] = ctx_v[src + i];
-    }
+    rope_store_head(ctx_k + src, ctx_v + src, caches_k[layer], caches_v[layer], dst,
+                    (fp8_layers >> layer & 1) != 0, norms[layer], inv_freq, position, eps,
+                    kRopeF32);
 }
 
 // The block's queries, keys and values at the round's position P = start + rows: the
 // `q_heads` query heads of each row of q get draft_head_norm_rope's norm and RoPE at
 // P + row in place; the 8 key heads of each row of k get them on their way to cache slot
-// (P + row) mod slots, with the value heads of v beside them. With `limit` set,
-// positions at or past `slots` are skipped. `rope` picks the RoPE arithmetic (see
-// norm_rope_head). Grid (8 rows, q_heads + 8 heads), 64 threads.
+// (P + row) mod slots, with the value heads of v beside them; the cache is E4M3 with
+// `fp8`, else BF16. With `limit` set, positions at or past `slots` are skipped. `rope`
+// picks the RoPE arithmetic (see norm_rope_head). Grid (8 rows, q_heads + 8 heads), 64
+// threads.
 extern "C" __global__ void __launch_bounds__(kHalf)
 draft_block_rope_store(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
                        const int32_t* control, const float* inv_freq, float eps,
-                       const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
-                       __nv_bfloat16* cache_k, __nv_bfloat16* cache_v, int32_t slots,
-                       int32_t limit, int32_t rope, int32_t q_heads) {
+                       const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, void* cache_k,
+                       void* cache_v, int32_t slots, int32_t limit, int32_t rope,
+                       int32_t q_heads, int32_t fp8) {
     constexpr int kWidth = kKvHeads * kHeadDim;
     pdl_wait();
     pdl_trigger();
@@ -948,10 +1066,8 @@ draft_block_rope_store(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bflo
     }
     const size_t src = size_t(row) * kWidth + g * kHeadDim;
     const size_t dst = size_t(position % slots) * kWidth + g * kHeadDim;
-    norm_rope_head(k + src, cache_k + dst, k_norm, inv_freq, position, eps, rope);
-    for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
-        cache_v[dst + i] = v[src + i];
-    }
+    rope_store_head(k + src, v + src, cache_k, cache_v, dst, fp8 != 0, k_norm, inv_freq, position,
+                    eps, rope);
 }
 
 // The layers of draft_dflash_commit_rope_store, as `DflashCommit` in src/ops/draft.rs.
@@ -962,18 +1078,20 @@ struct DflashCommit {
     const int32_t* control;
     const float* inv_freq;
     const __nv_bfloat16* k_norm[kDflashMaxLayers];
-    __nv_bfloat16* cache_k[kDflashMaxLayers];
-    __nv_bfloat16* cache_v[kDflashMaxLayers];
+    void* cache_k[kDflashMaxLayers];
+    void* cache_v[kDflashMaxLayers];
     int32_t slots[kDflashMaxLayers];
     float eps;
     int32_t ring;  // nonzero: position p goes to slot p mod slots; else positions past slots are skipped
     int32_t rope;  // the RoPE arithmetic of norm_rope_head
+    int32_t fp8_layers;  // bit l set: layer l's cache is E4M3, else BF16
 };
 
 // The round's context keys and values of a DFlash draft: for row r below control[1], KV
 // head h and layer l, the key head of ctx_k[l, r] gets draft_head_norm_rope's norm
 // (layer l's k_norm) and RoPE (arithmetic `rope`) at position start + r and lands in
-// slot start + r of layer l's cache, with the value head of ctx_v[l, r] beside it. With
+// slot start + r of layer l's cache (E4M3 if bit l of `fp8_layers` is set, else BF16),
+// with the value head of ctx_v[l, r] beside it. With
 // `ring` the slot is the position mod the cache's slots; otherwise positions at or past
 // them are skipped. Grid (8 rows, 8 heads, layers), 64 threads.
 extern "C" __global__ void __launch_bounds__(kHalf)
@@ -992,11 +1110,9 @@ draft_dflash_commit_rope_store(const __grid_constant__ DflashCommit c) {
     }
     const size_t src = (size_t(layer) * kBlock + row) * kWidth + head * kHeadDim;
     const size_t dst = size_t(position % c.slots[layer]) * kWidth + head * kHeadDim;
-    norm_rope_head(c.ctx_k + src, c.cache_k[layer] + dst, c.k_norm[layer], c.inv_freq,
-                   position, c.eps, c.rope);
-    for (int i = threadIdx.x; i < kHeadDim; i += kHalf) {
-        c.cache_v[layer][dst + i] = c.ctx_v[src + i];
-    }
+    rope_store_head(c.ctx_k + src, c.ctx_v + src, c.cache_k[layer], c.cache_v[layer], dst,
+                    (c.fp8_layers >> layer & 1) != 0, c.k_norm[layer], c.inv_freq, position,
+                    c.eps, c.rope);
 }
 
 namespace {

@@ -34,7 +34,7 @@ SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test prefill -- -
 - `Draft::round(anchor)` runs the block at the next uncommitted position, with the anchor token read from device memory, and leaves the 7 ids in `Draft::draft_ids` and their confidences in `Draft::confidences`.
 - Each draft's confidence is its softmax probability under the Markov logits, `exp(logit - 30) / sum exp(logit_c - 30)`: the softcap bounds every logit by 30, so the sum needs no running maximum. The kernel that scans every row (`draft_markov_bound`, `draft_markov_fold` or `draft_markov_fold_any`) writes a partial sum per block, and the next step's pick divides. The pruned argmax sums the logits of the E4M3 estimates and a shortlist head sums only its rows, so the confidence is an estimate; the round takes no measurable extra time.
 - `Draft::round_inputs()` holds a round's inputs in device memory: the taps of up to 8 positions to commit, BF16 `[8, 4, 2304]`, and `control`, I32 `[start, rows, anchor]`. `Draft::run_round(steps)` commits those positions, runs the block right after them, and runs the base logits and Markov head for `steps` drafts (1 to 7). `Draft::replay_round(steps)` replays the same work as a CUDA graph, captured once per `steps`. A verify pass can write the inputs on the device and launch the draft graph right after its own; no position goes through the host. `Draft::set_round_inputs` fills the inputs from the host.
-- Layers 0 and 2 keep rings of 1032 slots, the window of 1024 and the block. Layer 1 keeps every position up to the capacity, 4 KiB each.
+- Layers 0 and 2 keep rings of 1032 slots, the window of 1024 and the block. Layer 1 keeps every position up to the capacity, 4 KiB each, or 2 KiB as E4M3 with `fp8_kv` (below).
 
 The block attention takes its split count from the key count on the device: one warp per block row, one lane per key of each chunk of 32, chunks staged with `cp.async`. The Markov head picks each step's argmax without summing every fold row. An E4M3 copy of the fold bounds each row's logit with the L1 norm of its quantization residual, and only the rows whose upper bound reaches the best lower bound get the BF16 product. The draft ids stay the same as with the full sum. Rounds that record the Markov logits (`Draft::record_logits`) still sum every row. `tests/draft_exact.rs` checks the draft ids and hashes of Y, the base logits and the Markov logits at every anchor of `regex-readme` against a golden file that the draft wrote before these changes, for `commit` and `round`, for device inputs, and for the graphs of 7, 3 and 1 drafts.
 
@@ -50,11 +50,12 @@ Round times at position 2790 (one committed position plus the round, graph repla
 
 At position 32768, where layer 1 attends over every position, the same steps take 2.169, 1.420, 1.354, 1.288 and 1.277 ms for 3 drafts, and 2.169, 1.660, 1.593, 1.450 and 1.419 ms for 7.
 
-`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond. `DraftOptions::fast` turns on all four and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon-serve`); `DraftOptions::fp8` leaves out the shortlist, and `DraftOptions::default` stays exact:
+`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond or frees memory without lowering them. `DraftOptions::fast` turns on all five and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon-serve`); `DraftOptions::fp8` leaves out the shortlist, and `DraftOptions::default` stays exact:
 
-- `fp8_backbone`: E4M3 copies of the block's and the commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`).
+- `fp8_backbone`: E4M3 copies of the block's and the round commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`). The draft then frees the BF16 query, output, gate, up and down projections, which only the block reads; the prefill's commit (`Draft::commit`, up to 512 rows) still reads the BF16 keys, values and context projections.
 - `fp8_head`: base logits from an E4M3 copy of the LM head.
 - `fp8_fold`: the Markov logits from the E4M3 fold, without the exact correction.
+- `fp8_kv`: the global layers' caches as E4M3 without a scale, as the target's FP8 cache (see [KV cache format](#kv-cache-format)): 2 KiB per position and layer instead of 4. Keys are RMS-normed per head; the block attention fixture's keys and values reach 5.2 in magnitude, far inside E4M3's 448. The stores round each BF16 value to the nearest E4M3 value. The block attention loads each chunk's E4M3 keys and values into registers before the previous chunk's arithmetic and widens them exactly to BF16 in shared memory after it, so it computes what the BF16 kernel computes over the rounded values (`tests/draft.rs` checks this bit for bit).
 - `shortlist`: Ingine's shortlist head (see below). The base and Markov logits cover only the 32,768 highest-ranked tokens, the special tokens and up to 16,384 context tokens passed to `Draft::note_tokens`. The speculator notes the tokens of the prompt's last 8,192 positions and each round's emitted tokens, so a long prompt cannot fill every context row and shut out the tokens that generation adds. The ranking is `draft::counted_ranking`, the tokens the target generates most often (`crates/siphon-cuda/data/shortlist.bin`). A ranking file of little-endian u32 token ids, as Ingine's `draft_shortlist.bin`, can replace it (`--shortlist`).
 
 The shortlist halves the round (0.51 against 0.96 ms). A shortlist in token id order (the tokenizer numbers tokens in BPE merge order) cost acceptance wherever the text used tokens above id 32,768 before they appeared in the context: reasoning text opens with ids near 150,000, and 46% of generated tokens lie above that id. Noting each round's anchor on the device, so the next round can draft it, changed neither acceptance nor speed on any prompt below, so the loss is the ranking's coverage, not the one-round lag. `bench --spec auto`, 512 tokens, FP8 weights and KV, tok/s and tokens per round (chat, coding and 32K-document prompts from the Ingine comparison, then the three texts):
@@ -103,6 +104,8 @@ DFlash 2 attends to only the last 2,048 positions (`sliding_window` in its confi
 | Shortlist, ranked by counts over a code sample | 76.7, 56.3, 43.4% | 3.691 | 0.708 ms | 0.813 ms |
 | Fast: shortlist in id order, FP8 backbone, head and fold | 79.2, 58.6, 45.0% | 3.787 | 0.491 ms | 0.628 ms |
 
+`fp8_kv` keeps acceptance: over the same anchors with the counted shortlist, `fast` without it keeps 79.0, 58.4 and 44.8% for drafts 1 to 3 and 3.777 tokens per round at k = 7, and with it 79.1, 58.4, 44.9% and 3.778; the exact draft keeps 3.793, and with only `fp8_kv` 3.789. The E4M3 cache makes the round of 7 drafts faster at long context, 0.621 against 0.633 ms at 32,768, and leaves it at 0.491 ms at 2,790 (`dspark time`, graph replay). On the 12 prompts of the server check in [Tensors in host memory](#tensors-in-host-memory), whose greedy outputs did not change, the bundled draft kept 3.086 tokens per round against 3.097 on main.
+
 FP8 fold alone saves nothing, since the pruned argmax already reads the E4M3 fold; it matters with a shortlist, which skips the pruning. That earlier counted ranking took 72 million tokens of open-source Rust crates and the CPython standard library, the evaluation texts' crates left out. Code-heavy counts drop common prose tokens that the id order keeps.
 
 In a kernel trace of the round of 7 drafts at position 2,790 (each kernel from the previous one's end), the exact draft spends 918 of its 1,315 us in BF16 GEMMs, most of it the 7-row LM-head product over the full vocabulary, and 212 us in the pruned argmax's bound pass. The fast draft takes 494 us: 339 us in the FP8 GEMMs (16 products), 42 us in attention (138 us at 32,768), 34 us in the shortlist Markov fold and 20 us in the Markov steps.
@@ -131,7 +134,7 @@ SIPHON_MODEL=<model-dir> SIPHON_DSPARK_REF=reference/out cargo test --release -p
 
 - 5 taps, the partial block entering visits 2, 31, 36, 41 and 46 (`dflash_config.target_layer_ids`). `Model::set_tap_layout` makes prefill and verify record them in place of the bundled draft's 4.
 - `fc` (`[2304, 11520]`) over the concatenated taps, then `hidden_norm`: one context row per position, which every layer projects with the same `k_proj` and `v_proj` as the block's rows.
-- 5 layers, every one attending to every position. The cache takes 20 KiB per position, against 4 KiB for the bundled draft's one global layer.
+- 5 layers, every one attending to every position. The cache takes 20 KiB per position, against 4 KiB for the bundled draft's one global layer (10 and 2 KiB with `fp8_kv`).
 - A vanilla Markov head: draft j adds `w2 · w1[t]`, with t the token before it, to its base logits, and the step takes the argmax of the uncapped BF16 sum, as the 2DSD runner does. The softcap is monotone, but in BF16 it maps neighbouring logits to one value and changes the tie-break.
 - A confidence head, `sigmoid(proj · [y_j; w1[t]] + bias)`, which `WidthPolicy` reads as each draft's acceptance chance.
 - A learned mask vector in `mask_embedding.pt`, a pickle. Convert it once in a trusted Python environment with `torch.load(path, weights_only=True)` and save its `embedding` as BF16 `mask_embedding` in `mask_embedding.safetensors` beside `model.safetensors`.
@@ -570,46 +573,46 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 
 `siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk, the number of streams and the capacity. Each stream gets its own global caches of the capacity, rings and conv states, and more than one stream adds the batched step's buffers. It counts:
 
-- the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32. The vision tower is not loaded. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
+- the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32, less the tensors in host memory (see [Tensors in host memory](#tensors-in-host-memory)): the embedding table, and with `--weights fp8` the BF16 LM head. The vision tower is not loaded. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
 - the FP8 copies of `--weights fp8`, 1.14 GB;
 - the global KV caches: 32 KiB per position, or 16 KiB with `--kv fp8`, over the 8 global visits;
 - the 40 sliding rings of 1,024 slots (160 MiB), the conv states and the decode step's vocabulary-sized buffers;
 - the prefill buffers, 0.38 MB per chunk row plus 64 MB, and the verify pass's;
-- the draft's tensors, the bundled draft's fold, the copies its approximations make (the shortlist rows of the LM head, the FP8 backbone), its rings, its buffers and the speculator's tap tails;
-- the draft's global caches, 4 KiB per position and layer: one layer of the bundled draft, every layer of a 2DSD DFlash draft, none of DFlash 2, which keeps rings of 2,056 slots;
+- the draft's tensors less the BF16 projections that `fp8_backbone` frees, the bundled draft's fold, the copies its approximations make (the shortlist rows of the LM head, the FP8 backbone), its rings, its buffers and the speculator's tap tails. A draft without an FP8 or shortlist head under `--weights fp8` keeps its own device copy of the BF16 LM head;
+- the draft's global caches, 4 KiB per position and layer, or 2 KiB with `fp8_kv` (the default): one layer of the bundled draft, every layer of a 2DSD DFlash draft, none of DFlash 2, which keeps rings of 2,056 slots;
 - the prefix cache's copies of one slot's rings and conv states and of the draft's rings (see [Prefix cache](#prefix-cache)), 171 MiB with the bundled draft and 203 MiB with DFlash 2;
 - `RUNTIME_BYTES`, 128 MiB for the module images, the CUDA graphs, the small buffers and the allocator's rounding. It was measured with a thread that sampled `cuMemGetInfo` every millisecond while `siphon-serve` loaded, prefilled more than a chunk and generated speculatively; the uncounted part came to 69 to 87 MiB.
 
 The CUDA context itself takes 507 MiB. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less a 0.5 GiB margin. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.
 
-`siphon-serve` also checks the plan against what it uses. It allocates the full prefill chunk's buffers at startup (`Model::reserve_prefill`), so every buffer the plan counts exists once the warmup has run. Every buffer comes from the device's memory pool, because cudarc allocates with `cuMemAllocAsync`. `Gpu::memory` reads the pool's reserved bytes and their peak (`cuMemPoolGetAttribute`) along with the device's free memory. The bytes outside the pool, the module images and the CUDA graphs, are the drop in free memory since the context was created less the pool's bytes, measured once after warmup. The check prints the pool's peak plus those bytes against the plan, and warns once if a later job takes the pool's peak past the plan.
+`siphon-serve` also checks the plan against what it uses. It allocates the full prefill chunk's buffers at startup (`Model::reserve_prefill`), so every buffer the plan counts exists once the warmup has run. Every buffer comes from the device's memory pool, because cudarc allocates with `cuMemAllocAsync`. `Gpu::memory` reads the pool's reserved bytes and their peak (`cuMemPoolGetAttribute`) along with the device's free memory. The bytes outside the pool, the module images and the CUDA graphs, are the drop in free memory since the context was created less the pool's bytes, measured once after warmup. The check prints the pool's peak plus those bytes against the plan, prints the peak again after a job whenever it rises, and warns once if a job takes it past the plan.
 
 `siphon-plan` draws the plan in the terminal. It plans every combination of weight format, KV format and draft (the bundled draft, a `--drafter`, none) with `siphon::memory`. It takes the free memory after the context from nvidia-smi's free memory less the 507 MiB context, which is how the context was measured.
 
-Planned against measured, as the free memory after creating the context less the lowest sample, after a 3,820-token prompt and 256 speculative tokens:
+Planned against measured, as the memory check of `siphon-serve` reports it after a request: the pool's peak plus the bytes outside the pool. At 65,536 positions the request had a 3,820-token prompt and 256 speculative tokens. At the largest capacity, the most that fit 30.46 GiB of free memory, its prompt and 512 speculative tokens left 399 to 436 positions of the cache unused:
 
 | Weights, KV cache | Draft | Capacity | Planned GiB | Measured GiB | Over, MiB |
 | --- | --- | ---: | ---: | ---: | ---: |
-| FP8, FP8 | DSpark | 65,536 | 22.284 | 22.244 | 41 |
-| FP8, FP8 | DSpark | 262,144 | 26.034 | 25.994 | 41 |
-| FP8, FP8 | DSpark | 466,944 (largest) | 29.940 | 29.900 | 41 |
-| FP8, FP8 | DFlash 2 | 65,536 | 22.350 | 22.307 | 45 |
-| FP8, FP8 | DFlash 2 | 262,144 | 25.350 | 25.307 | 45 |
-| FP8, FP8 | DFlash 2 | 563,200 (largest) | 29.944 | 29.900 | 45 |
-| BF16, BF16 | DSpark | 65,536 | 22.222 | 22.180 | 43 |
-| BF16, BF16 | DSpark | 131,072 | 24.472 | 24.430 | 43 |
-| BF16, BF16 | DSpark | 290,816 (largest) | 29.956 | 29.898 | 59 |
-| BF16, BF16 | DFlash 2 | 65,536 | 22.288 | 22.242 | 47 |
-| BF16, BF16 | DFlash 2 | 131,072 | 24.288 | 24.242 | 47 |
-| BF16, BF16 | DFlash 2 | 316,416 (largest) | 29.944 | 29.898 | 47 |
+| FP8, FP8 | DSpark | 65,536 | 20.194 | 20.154 | 41 |
+| FP8, FP8 | DSpark | 633,856 (largest) | 29.950 | 29.904 | 47 |
+| FP8, FP8 | DSpark | 77,824 x 8 streams (largest) | 29.901 | 29.859 | 43 |
+| FP8, FP8 | DFlash 2 | 65,536 | 20.232 | 20.186 | 48 |
+| FP8, FP8 | DFlash 2 | 702,464 (largest) | 29.951 | 29.904 | 48 |
+| BF16, BF16 | DSpark | 65,536 | 20.995 | 20.928 | 69 |
+| BF16, BF16 | DSpark | 342,016 (largest) | 29.960 | 29.896 | 65 |
+| BF16, BF16 | DFlash 2 | 65,536 | 21.032 | 20.990 | 43 |
+| BF16, BF16 | DFlash 2 | 357,376 (largest) | 29.938 | 29.896 | 43 |
 
-At the largest capacity, `siphon-serve` also prefilled real prompts near the end of the cache and generated 512 tokens speculatively from there, with the same peak memory:
+The prompts at the largest capacity:
 
 | Weights, KV cache | Draft | Prompt tokens | Prefill |
 | --- | --- | ---: | ---: |
-| FP8, FP8 | DSpark | 461,517 | 81.1 s |
-| FP8, FP8 | DFlash 2 | 556,964 | 111.1 s |
-| BF16, BF16 | DSpark | 287,138 | 38.5 s |
+| FP8, FP8 | DSpark | 632,917 | 90.0 s |
+| FP8, FP8 | DFlash 2 | 701,516 | 106.7 s |
+| BF16, BF16 | DSpark | 341,105 | 51.8 s |
+| BF16, BF16 | DFlash 2 | 356,465 | 55.9 s |
+
+The E4M3 draft cache, the tensors in host memory and the BF16 draft projections that `fp8_backbone` frees took the largest FP8 context with the bundled draft from 456,704 positions to 633,856 at 30.45 GiB free, and with 8 streams from 59,392 positions each to 77,824. At 65,536 positions with FP8 weights they free 2.28 GiB: 0.86 GiB each for the embedding table and the BF16 LM head, 0.43 GiB of draft projections and 0.13 GiB of draft cache.
 
 ## KV cache format
 
@@ -620,12 +623,37 @@ The global layers (5, 11, 17 and 23, 8 of the 48 layer visits) keep every earlie
 
 The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RMS-normed per head, so no element exceeds 22.7, far inside E4M3's ±448. The append kernel rounds each BF16 value to the nearest E4M3 value, ties to even. Attention decodes E4M3 exactly with the hardware converter, so it differs from BF16 only by that rounding. Ingine stores its FP8 global caches the same way.
 
+## Tensors in host memory
+
+Two BF16 tensors of 0.86 GiB each are read only a few rows at a time: the embedding table, which a step, a verify pass, a batched step, a prefill chunk and a draft round gather their tokens' rows from, and, with `--weights fp8`, the BF16 LM head once every product reads its FP8 copy. Both live in page-locked host memory mapped into the device's address space (`gpu::HostMapped`, `cuMemHostAlloc` with `CU_MEMHOSTALLOC_DEVICEMAP`), and kernels read their rows over PCIe through the mapped address, which CUDA graphs keep. The embedding gather reads the same values as before, so every result stays the same bit for bit.
+
+`Weights::quantize_fp8` moves the BF16 LM head to host memory after making its FP8 copy. Decode and verify passes read the FP8 copy already. The prefill's last row, which gives the first token of a reply, and `PrefillLogits::All` now run the verify pass's multi-row FP8 product too, so the first token is the one a one-row verify at that position would pick. The bundled draft builds its fold from the host copy at load and gathers its shortlist rows from it. A draft without an FP8 or shortlist head keeps its own device copy for its base logits, as before.
+
+Over 212 prompts (200 open-perfectblend chat prompts as `siphon-serve` renders them and the 12 prompts of the server check), the first token's logits from the FP8 head against the BF16 head, both after the same FP8 prefill: mean KL 6.8e-9, largest 5.8e-7, the same top-1 token in 212 of 212, largest logit difference 0.75. With `--weights bf16` nothing changes. `siphon-serve --greedy` gave the same tokens as before on 12 chat prompts (stories, code, explanations, a sonnet, a word problem) of 529 to 3,000 generated tokens.
+
+Times against the build before, FP8 weights and caches, `anyhow` prompt, minimum over 5 to 10 runs alternating builds in one hold of the GPU (prefill with BF16 weights and cache, whose head did not change):
+
+| Work | Context | Before, ms | After, ms | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Plain step | 0 | 2.713 | 2.710 | -0.1% |
+| Plain step | 32,768 | 3.227 | 3.214 | -0.4% |
+| Verify, 1 row | 10,674 | 3.388 | 3.368 | -0.6% |
+| Verify, 1 row | 32,768 | 3.696 | 3.683 | -0.4% |
+| Verify, 8 rows | 10,674 | 6.108 | 6.109 | 0.0% |
+| Verify, 8 rows | 32,768 | 6.485 | 6.462 | -0.4% |
+| Batched step, 8 streams | 0 | 8.229 | 8.222 | -0.1% |
+| Batched step, 8 streams | 32,768 | 11.812 | 11.818 | +0.1% |
+| Prefill of 2,048 tokens | 0 | 123.6 | 123.6 | 0.0% |
+| Prefill of 16,384 tokens | 0 | 1,055.8 | 1,057.2 | +0.1% |
+
+The medians moved by at most +0.3%. The draft round in `siphon-serve` went from 0.515 to 0.520 ms. `dspark time`, which keeps the embedding table on the device, shows no change in the round, so the 5 us are most likely the PCIe read of the anchor's row.
+
 ## Dense weight format
 
 Decode reads 3.62 GB of BF16 dense weights per token: every visit's attention input and output projections, the looped layers' message gates (113 MB), and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
 
 - `bf16`, the default, reads the checkpoint's weights.
-- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights unless `--prefill-dense fp8` (see [Prefill on FP8 tensor cores](#dense-products)). The copies take 1.14 GB of device memory: one per layer, since the looped layers' three visits share theirs.
+- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights unless `--prefill-dense fp8` (see [Prefill on FP8 tensor cores](#dense-products)), except the LM head's: its BF16 copy moves to host memory and the prefill's head reads the FP8 copy (see [Tensors in host memory](#tensors-in-host-memory)). The copies take 1.14 GB of device memory: one per layer, since the looped layers' three visits share theirs.
 
 The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
 

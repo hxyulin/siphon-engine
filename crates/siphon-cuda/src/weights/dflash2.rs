@@ -71,7 +71,7 @@ pub struct Dflash2LayerWeights {
     pub input_norm: CudaSlice<bf16>,
     pub post_attention_norm: CudaSlice<bf16>,
     /// `[4096, 2304]`.
-    pub q: CudaSlice<bf16>,
+    pub q: Option<CudaSlice<bf16>>,
     /// `[1024, 2304]` each.
     pub k: CudaSlice<bf16>,
     pub v: CudaSlice<bf16>,
@@ -79,12 +79,12 @@ pub struct Dflash2LayerWeights {
     pub q_norm: CudaSlice<bf16>,
     pub k_norm: CudaSlice<bf16>,
     /// `[2304, 4096]`.
-    pub o: CudaSlice<bf16>,
+    pub o: Option<CudaSlice<bf16>>,
     /// `[6912, 2304]` each.
-    pub gate: CudaSlice<bf16>,
-    pub up: CudaSlice<bf16>,
+    pub gate: Option<CudaSlice<bf16>>,
+    pub up: Option<CudaSlice<bf16>>,
     /// `[2304, 6912]`.
-    pub down: CudaSlice<bf16>,
+    pub down: Option<CudaSlice<bf16>>,
     pub attention_conv: ConvWeights,
     pub mlp_conv: ConvWeights,
 }
@@ -174,24 +174,24 @@ impl Dflash2LayerWeights {
             input_norm: loader.bf16(&format!("{p}input_layernorm.weight"), &[HIDDEN])?,
             post_attention_norm: loader
                 .bf16(&format!("{p}post_attention_layernorm.weight"), &[HIDDEN])?,
-            q: loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?,
+            q: Some(loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?),
             k: loader.bf16(&format!("{attn}k_proj.weight"), &[kv, HIDDEN])?,
             v: loader.bf16(&format!("{attn}v_proj.weight"), &[kv, HIDDEN])?,
             q_norm: loader.bf16(&format!("{attn}q_norm.weight"), &[HEAD_DIM])?,
             k_norm: loader.bf16(&format!("{attn}k_norm.weight"), &[HEAD_DIM])?,
-            o: loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?,
-            gate: loader.bf16(
+            o: Some(loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?),
+            gate: Some(loader.bf16(
                 &format!("{p}mlp.gate_proj.weight"),
                 &[DFLASH2_MLP_WIDTH, HIDDEN],
-            )?,
-            up: loader.bf16(
+            )?),
+            up: Some(loader.bf16(
                 &format!("{p}mlp.up_proj.weight"),
                 &[DFLASH2_MLP_WIDTH, HIDDEN],
-            )?,
-            down: loader.bf16(
+            )?),
+            down: Some(loader.bf16(
                 &format!("{p}mlp.down_proj.weight"),
                 &[HIDDEN, DFLASH2_MLP_WIDTH],
-            )?,
+            )?),
             attention_conv: conv("attention_conv")?,
             mlp_conv: conv("mlp_conv")?,
         })

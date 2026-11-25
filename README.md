@@ -13,7 +13,7 @@ Rust host code, CUDA kernels written for this model and `sm_120a`, and an OpenAI
 [![Model: Inkling 2 Mini](https://img.shields.io/badge/model-Inkling%202%20Mini-FFD21E?logo=huggingface)](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 [![Image](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml/badge.svg)](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml)
 
-| 889 tok/s | 999 tok/s | 81–88% | 456,704 | 0.10 s |
+| 889 tok/s | 999 tok/s | 81–88% | 633,856 | 0.10 s |
 | :---: | :---: | :---: | :---: | :---: |
 | one stream, speculative,<br>on Rust source | 8 streams together | of the DRAM floor<br>in plain decode | tokens of context<br>on a 32 GB card | to first token of a<br>103K-token follow-up |
 
@@ -127,8 +127,8 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 
 | Dense weights, KV cache | DSpark draft | DFlash 2 |
 | --- | ---: | ---: |
-| FP8, FP8 | 456,704 | 547,840 |
-| BF16, BF16 | 284,672 | 308,224 |
+| FP8, FP8 | 633,856 | 701,440 |
+| BF16, BF16 | 340,992 | 357,376 |
 
 `siphon-plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
 

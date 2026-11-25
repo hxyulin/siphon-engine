@@ -58,7 +58,7 @@ pub struct DraftLayerWeights {
     pub input_norm: CudaSlice<bf16>,
     pub post_attention_norm: CudaSlice<bf16>,
     /// `[3072, 2304]`.
-    pub q: CudaSlice<bf16>,
+    pub q: Option<CudaSlice<bf16>>,
     /// `[1024, 2304]` each: block keys and values.
     pub k: CudaSlice<bf16>,
     pub v: CudaSlice<bf16>,
@@ -70,12 +70,12 @@ pub struct DraftLayerWeights {
     pub k_norm: CudaSlice<bf16>,
     pub k_norm_ctx: CudaSlice<bf16>,
     /// `[2304, 3072]`.
-    pub o: CudaSlice<bf16>,
+    pub o: Option<CudaSlice<bf16>>,
     /// `[9216, 2304]` each.
-    pub gate: CudaSlice<bf16>,
-    pub up: CudaSlice<bf16>,
+    pub gate: Option<CudaSlice<bf16>>,
+    pub up: Option<CudaSlice<bf16>>,
     /// `[2304, 9216]`.
-    pub down: CudaSlice<bf16>,
+    pub down: Option<CudaSlice<bf16>>,
 }
 
 #[derive(Debug)]
@@ -104,14 +104,18 @@ pub struct SharedWeights<'a> {
     pub embed_norm: &'a CudaSlice<bf16>,
     /// `[vocab, 2304]`.
     pub lm_head: &'a CudaSlice<bf16>,
+    /// Whether `lm_head` is in mapped host memory, which kernels read over PCIe: fine for
+    /// the fold at load and for gathering rows, too slow for the exact head's products.
+    pub lm_head_on_host: bool,
 }
 
 impl<'a> From<&'a Weights> for SharedWeights<'a> {
     fn from(weights: &'a Weights) -> Self {
         Self {
-            embed: &weights.embed,
+            embed: weights.embed.slice(),
             embed_norm: &weights.embed_norm,
-            lm_head: &weights.lm_head,
+            lm_head: weights.lm_head.slice(),
+            lm_head_on_host: weights.lm_head.is_host(),
         }
     }
 }
@@ -147,6 +151,7 @@ impl<'a> From<&'a SharedTensors> for SharedWeights<'a> {
             embed: &tensors.embed,
             embed_norm: &tensors.embed_norm,
             lm_head: &tensors.lm_head,
+            lm_head_on_host: false,
         }
     }
 }
@@ -211,7 +216,7 @@ impl DraftLayerWeights {
             input_norm: loader.bf16(&format!("{p}input_layernorm.weight"), &[HIDDEN])?,
             post_attention_norm: loader
                 .bf16(&format!("{p}post_attention_layernorm.weight"), &[HIDDEN])?,
-            q: loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?,
+            q: Some(loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?),
             k: loader.bf16(&format!("{attn}k_proj.weight"), &[kv, HIDDEN])?,
             v: loader.bf16(&format!("{attn}v_proj.weight"), &[kv, HIDDEN])?,
             k_ctx: loader.bf16(&format!("{attn}k_proj_ctx.weight"), &[kv, HIDDEN])?,
@@ -219,10 +224,10 @@ impl DraftLayerWeights {
             q_norm: loader.bf16(&format!("{attn}q_norm.weight"), &[HEAD_DIM])?,
             k_norm: loader.bf16(&format!("{attn}k_norm.weight"), &[HEAD_DIM])?,
             k_norm_ctx: loader.bf16(&format!("{attn}k_norm_ctx.weight"), &[HEAD_DIM])?,
-            o: loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?,
-            gate: loader.bf16(&format!("{p}mlp.gate_proj.weight"), &[MLP_WIDTH, HIDDEN])?,
-            up: loader.bf16(&format!("{p}mlp.up_proj.weight"), &[MLP_WIDTH, HIDDEN])?,
-            down: loader.bf16(&format!("{p}mlp.down_proj.weight"), &[HIDDEN, MLP_WIDTH])?,
+            o: Some(loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?),
+            gate: Some(loader.bf16(&format!("{p}mlp.gate_proj.weight"), &[MLP_WIDTH, HIDDEN])?),
+            up: Some(loader.bf16(&format!("{p}mlp.up_proj.weight"), &[MLP_WIDTH, HIDDEN])?),
+            down: Some(loader.bf16(&format!("{p}mlp.down_proj.weight"), &[HIDDEN, MLP_WIDTH])?),
         })
     }
 }

@@ -32,7 +32,7 @@ The model keeps sequence slots. Slot 0 is the model's existing state, which `Mod
 
 The planner gives every slot the same capacity: `--streams N` slots of `capacity` positions each. It counts N sets of global caches, rings and conv states, one batch scratch (the verify pass's multi-row buffers for 8 rows and their taps), and the draft and verify buffers once. Without `--context`, the server takes the largest capacity at which N slots fit.
 
-On a 32 GB card with FP8 weights and cache, about 8.5 GiB remain after the fixed parts. Eight slots get about 55K positions each, four about 120K.
+On a 32 GB card with FP8 weights and caches and the bundled draft, about 11 GiB remain after the fixed parts. Eight slots get 77,824 positions each, four 163,840.
 
 A shared paged pool would let one long request and several short ones share the memory, but every attention kernel would have to read pages through a block table, including decode's and prefill's. That is a large change to kernels that three other efforts are tuning. Fixed slots need no change to the cache layout. A request whose prompt and limit exceed the slot capacity gets a 400 error, as it does today.
 

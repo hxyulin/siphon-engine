@@ -1003,7 +1003,7 @@ impl Model {
         ctx.kernels.misc.decode_prologue(
             &ctx.stream,
             &s.token,
-            &ctx.weights.embed,
+            ctx.weights.embed.slice(),
             &ctx.weights.embed_norm,
             input_norm,
             &mut s.hidden,
@@ -1149,7 +1149,7 @@ impl Model {
             ctx.kernels.linear.gemv_bf16(
                 &ctx.stream,
                 &mut [Gemv::new(
-                    &ctx.weights.lm_head,
+                    ctx.weights.lm_head.slice(),
                     &s.final_hidden,
                     &mut s.logits,
                 )],
@@ -1453,7 +1453,7 @@ impl Ctx {
             // LM head, which the step reads next.
             let lm_head: &dyn Prefetch = match &self.weights.lm_head_fp8 {
                 Some(fp8) => fp8,
-                None => &self.weights.lm_head,
+                None => self.weights.lm_head.slice(),
             };
             lm_head_start = PrefetchStart(lm_head, LM_HEAD_PREFETCH_BYTES);
             prefetch.push(&lm_head_start);

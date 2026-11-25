@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, ensure};
+use anyhow::{Context as _, bail, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
     DevicePtrMut as _, LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
@@ -73,6 +73,7 @@ pub struct DraftKernels {
     store_kv: CudaFunction,
     attention: CudaFunction,
     attention_g4: CudaFunction,
+    attention_fp8: CudaFunction,
     attention_combine: CudaFunction,
     silu_mul: CudaFunction,
     markov_context_input: CudaFunction,
@@ -196,6 +197,7 @@ struct DflashCommit {
     eps: f32,
     ring: i32,
     rope: i32,
+    fp8_layers: i32,
 }
 
 /// The RoPE arithmetic of the draft kernels, `kRope*` in the kernel.
@@ -296,22 +298,39 @@ impl ArgmaxPartials {
     }
 }
 
-/// One layer's draft cache: keys and values, BF16 `[slots, 8, 128]` each. Position `p`
-/// sits in slot `p % slots`.
+/// One layer's draft cache: keys and values, `[slots, 8, 128]` each, as BF16 or with
+/// `fp8` as E4M3 of the BF16 values (see `put` in the kernel). Position `p` sits in slot
+/// `p % slots`.
 pub struct KvCache {
-    pub k: CudaSlice<bf16>,
-    pub v: CudaSlice<bf16>,
+    /// The keys' and values' bytes.
+    pub k: CudaSlice<u8>,
+    pub v: CudaSlice<u8>,
     pub slots: usize,
+    pub fp8: bool,
 }
 
 impl KvCache {
+    /// A BF16 cache.
     pub fn new(stream: &Arc<CudaStream>, slots: usize) -> anyhow::Result<Self> {
+        Self::with_format(stream, slots, false)
+    }
+
+    /// A cache of BF16 values, or of E4M3 values with `fp8`.
+    pub fn with_format(stream: &Arc<CudaStream>, slots: usize, fp8: bool) -> anyhow::Result<Self> {
         ensure!(slots > 0, "a cache needs at least one slot");
+        let bytes = slots * KV_WIDTH * if fp8 { 1 } else { 2 };
         Ok(Self {
-            k: stream.alloc_zeros(slots * KV_WIDTH)?,
-            v: stream.alloc_zeros(slots * KV_WIDTH)?,
+            k: stream.alloc_zeros(bytes)?,
+            v: stream.alloc_zeros(bytes)?,
             slots,
+            fp8,
         })
+    }
+
+    /// Device bytes of the keys and values.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.k.len() + self.v.len()
     }
 }
 
@@ -375,7 +394,12 @@ impl DraftKernels {
         let f = |name: &str| module.load_function(name);
         let attention = f("draft_attention")?;
         let attention_g4 = f("draft_attention_g4")?;
-        for (func, group) in [(&attention, GROUP), (&attention_g4, MAX_GROUP)] {
+        let attention_fp8 = f("draft_attention_fp8")?;
+        for (func, group) in [
+            (&attention, GROUP),
+            (&attention_g4, MAX_GROUP),
+            (&attention_fp8, GROUP),
+        ] {
             func.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 i32::try_from(attention_smem(group))?,
@@ -390,6 +414,7 @@ impl DraftKernels {
             store_kv: f("draft_store_kv")?,
             attention,
             attention_g4,
+            attention_fp8,
             attention_combine: f("draft_attention_combine")?,
             silu_mul: f("draft_silu_mul")?,
             markov_context_input: f("draft_markov_context_input")?,
@@ -649,6 +674,7 @@ impl DraftKernels {
         let slots = i32_arg("slots", cache.slots)?;
         let start = start_arg(start, rows)?;
         let row_stride = i32_arg("row_stride", row_stride)?;
+        let fp8 = i32::from(cache.fp8);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
             block_dim: ((KV_WIDTH / 8) as u32, 1, 1),
@@ -662,10 +688,11 @@ impl DraftKernels {
             .arg(&mut cache.k)
             .arg(&mut cache.v)
             .arg(&start)
-            .arg(&slots);
-        // SAFETY: the arguments match `draft_store_kv(const bf16*, const bf16*, int, bf16*,
-        // bf16*, int, int)`. The checks above keep the 16-byte row reads inside `k` and `v`,
-        // and every slot index is below `slots`, inside the caches.
+            .arg(&slots)
+            .arg(&fp8);
+        // SAFETY: the arguments match `draft_store_kv(const bf16*, const bf16*, int, void*,
+        // void*, int, int, int)`. The checks above keep the 16-byte row reads inside `k` and
+        // `v`, and every slot index is below `slots`, inside the caches of `fp8`'s element.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -773,14 +800,15 @@ impl DraftKernels {
             .i32(count)
             .ptr_mut(&mut scratch.out, stream)
             .ptr_mut(&mut scratch.stats, stream);
-        let attention = if group == GROUP {
-            &self.attention
-        } else {
-            &self.attention_g4
+        let attention = match (group == GROUP, cache.fp8) {
+            (true, false) => &self.attention,
+            (true, true) => &self.attention_fp8,
+            (false, false) => &self.attention_g4,
+            (false, true) => bail!("no E4M3 block attention with 4 query heads per KV head"),
         };
-        // SAFETY: the arguments match `draft_attention(const bf16*, const bf16*, const bf16*,
-        // int, const int*, int, int, int, int, float*, float*)` and `draft_attention_g4`,
-        // picked by the head count of `q`. Every key position maps to a slot below
+        // SAFETY: the arguments match `draft_attention(const bf16*, const void*, const void*,
+        // int, const int*, int, int, int, int, float*, float*)`, `draft_attention_fp8` and
+        // `draft_attention_g4`, picked by the head count of `q` and the cache's element. Every key position maps to a slot below
         // `slots`; the grid covers the splits of `max_keys` keys, at most
         // MAX_ATTENTION_SPLITS, which the scratch holds for 4 query heads per KV head, and
         // blocks past the split count of the actual keys exit. The kernel reads earlier
@@ -1174,12 +1202,15 @@ impl DraftKernels {
         for norm in k_norms {
             args.ptr(norm, stream);
         }
-        for cache in caches.iter_mut() {
+        let mut fp8_layers = 0;
+        for (layer, cache) in caches.iter_mut().enumerate() {
             let slots = i32_arg("slots", cache.slots)?;
             args.ptr_mut(&mut cache.k, stream)
                 .ptr_mut(&mut cache.v, stream)
                 .i32(slots);
+            fp8_layers |= i32::from(cache.fp8) << layer;
         }
+        args.i32(fp8_layers);
         let config = LaunchConfig {
             grid_dim: (BLOCK as u32, KV_HEADS as u32, 3),
             block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
@@ -1239,15 +1270,16 @@ impl DraftKernels {
             .i32(slots)
             .i32(i32::from(limit))
             .i32(rope as i32)
-            .i32(i32_arg("q_heads", q_heads)?);
+            .i32(i32_arg("q_heads", q_heads)?)
+            .i32(i32::from(cache.fp8));
         let config = LaunchConfig {
             grid_dim: (BLOCK as u32, u32::try_from(q_heads + KV_HEADS)?, 1),
             block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `draft_block_rope_store(bf16*, const bf16*, const
-        // bf16*, const int*, const float*, float, const bf16*, const bf16*, bf16*, bf16*, int,
-        // int, int, int)`. The buffers have the checked sizes, the grid has one block per
+        // bf16*, const int*, const float*, float, const bf16*, const bf16*, void*, void*, int,
+        // int, int, int, int)`. The buffers have the checked sizes, the grid has one block per
         // query head of `q` and per KV head, and every cache slot index is below `slots`.
         unsafe { args.launch_pdl(stream, &self.block_rope_store, config) }?;
         Ok(())
@@ -1669,6 +1701,7 @@ impl DraftKernels {
             c.cache_k[l] = cache.k.device_ptr_mut(stream).0;
             c.cache_v[l] = cache.v.device_ptr_mut(stream).0;
             c.slots[l] = i32_arg("slots", cache.slots)?;
+            c.fp8_layers |= i32::from(cache.fp8) << l;
         }
         let config = LaunchConfig {
             grid_dim: (BLOCK as u32, KV_HEADS as u32, u32::try_from(layers)?),

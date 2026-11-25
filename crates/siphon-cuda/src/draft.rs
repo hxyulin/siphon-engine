@@ -90,6 +90,7 @@ const HEAD_BUCKET: usize = 1024;
 /// Approximations of the draft. Each changes the draft's tokens and so how often the
 /// target accepts them, never the target's output. The default is the exact draft.
 #[derive(Clone, Debug, Default)]
+#[expect(clippy::struct_excessive_bools, reason = "one flag per approximation")]
 pub struct DraftOptions {
     /// FP8 copies of the block's projections and of the round's context projections.
     pub fp8_backbone: bool,
@@ -97,6 +98,9 @@ pub struct DraftOptions {
     pub fp8_head: bool,
     /// An FP8 copy of the fold weight (or of its shortlist rows).
     pub fp8_fold: bool,
+    /// E4M3 global caches, 2 KiB per position and layer instead of 4 KiB, without a
+    /// scale: keys are RMS-normed per head and values stay within E4M3's range.
+    pub fp8_kv: bool,
     /// Token ids by rank, most frequent first: the base and Markov logits
     /// then cover only the first [`SHORTLIST_ROWS`] of them, the special tokens and up to
     /// [`CONTEXT_ROWS`] tokens passed to [`Draft::note_tokens`].
@@ -112,6 +116,7 @@ impl DraftOptions {
             fp8_backbone: true,
             fp8_head: true,
             fp8_fold: true,
+            fp8_kv: true,
             shortlist: None,
         }
     }
@@ -124,13 +129,14 @@ impl DraftOptions {
             fp8_backbone: true,
             fp8_head: true,
             fp8_fold: true,
+            fp8_kv: true,
             shortlist: Some(counted_ranking()),
         }
     }
 
     /// The options of a variant `spec`: `exact`, `fp8` ([`Self::fp8`]), `fast`
-    /// ([`Self::fast`]), or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and
-    /// `shortlist`, which takes `ranking`, or without one [`counted_ranking`]. `fp8` and
+    /// ([`Self::fast`]), or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`,
+    /// `fp8-kv` and `shortlist`, which takes `ranking`, or without one [`counted_ranking`]. `fp8` and
     /// `fast` with a `ranking` use it as their shortlist.
     pub fn parse(spec: &str, ranking: Option<&[u32]>) -> anyhow::Result<Self> {
         let mut options = Self::default();
@@ -154,6 +160,7 @@ impl DraftOptions {
                 "fp8-backbone" => options.fp8_backbone = true,
                 "fp8-head" => options.fp8_head = true,
                 "fp8-fold" => options.fp8_fold = true,
+                "fp8-kv" => options.fp8_kv = true,
                 "shortlist" => {
                     options.shortlist = Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
                 }
@@ -170,6 +177,7 @@ impl DraftOptions {
             fp8_backbone: self.fp8_backbone,
             fp8_head: self.fp8_head,
             fp8_fold: self.fp8_fold,
+            fp8_kv: self.fp8_kv,
             shortlist: self.shortlist.is_some(),
         }
     }
@@ -251,6 +259,9 @@ pub struct Draft {
     backbone: Option<Vec<Fp8Layer>>,
     /// The approximate Markov head, or `None` for the exact one.
     head: Option<Head>,
+    /// A device copy of the BF16 LM head for the base logits, when they read it and the
+    /// target keeps it in mapped host memory.
+    head_copy: Option<CudaSlice<bf16>>,
 }
 
 /// Copies of a draft's sliding rings at one committed position, from
@@ -266,11 +277,7 @@ impl DraftRings {
     /// Device bytes the copies take.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.caches
-            .iter()
-            .flatten()
-            .map(|c| (c.k.len() + c.v.len()) * 2)
-            .sum()
+        self.caches.iter().flatten().map(KvCache::bytes).sum()
     }
 }
 
@@ -323,18 +330,20 @@ struct ContextRefs<'a> {
 }
 
 /// The weights of one decoder layer's block forward, which both architectures share.
+/// The projections only the block reads are `None` once [`Arch::release_block_bf16`]
+/// has freed them for their FP8 copies.
 struct LayerRefs<'a> {
     input_norm: &'a CudaSlice<bf16>,
     post_attention_norm: &'a CudaSlice<bf16>,
-    q: &'a CudaSlice<bf16>,
+    q: Option<&'a CudaSlice<bf16>>,
     k: &'a CudaSlice<bf16>,
     v: &'a CudaSlice<bf16>,
-    o: &'a CudaSlice<bf16>,
+    o: Option<&'a CudaSlice<bf16>>,
     q_norm: &'a CudaSlice<bf16>,
     k_norm: &'a CudaSlice<bf16>,
-    gate: &'a CudaSlice<bf16>,
-    up: &'a CudaSlice<bf16>,
-    down: &'a CudaSlice<bf16>,
+    gate: Option<&'a CudaSlice<bf16>>,
+    up: Option<&'a CudaSlice<bf16>>,
+    down: Option<&'a CudaSlice<bf16>>,
     /// DFlash 2's convolutions around the attention and the MLP.
     convs: Option<(&'a ConvWeights, &'a ConvWeights)>,
 }
@@ -344,15 +353,15 @@ impl<'a> From<&'a DraftLayerWeights> for LayerRefs<'a> {
         Self {
             input_norm: &w.input_norm,
             post_attention_norm: &w.post_attention_norm,
-            q: &w.q,
+            q: w.q.as_ref(),
             k: &w.k,
             v: &w.v,
-            o: &w.o,
+            o: w.o.as_ref(),
             q_norm: &w.q_norm,
             k_norm: &w.k_norm,
-            gate: &w.gate,
-            up: &w.up,
-            down: &w.down,
+            gate: w.gate.as_ref(),
+            up: w.up.as_ref(),
+            down: w.down.as_ref(),
             convs: None,
         }
     }
@@ -363,15 +372,15 @@ impl<'a> From<&'a DflashLayerWeights> for LayerRefs<'a> {
         Self {
             input_norm: &w.input_norm,
             post_attention_norm: &w.post_attention_norm,
-            q: &w.q,
+            q: w.q.as_ref(),
             k: &w.k,
             v: &w.v,
-            o: &w.o,
+            o: w.o.as_ref(),
             q_norm: &w.q_norm,
             k_norm: &w.k_norm,
-            gate: &w.gate,
-            up: &w.up,
-            down: &w.down,
+            gate: w.gate.as_ref(),
+            up: w.up.as_ref(),
+            down: w.down.as_ref(),
             convs: None,
         }
     }
@@ -382,15 +391,15 @@ impl<'a> From<&'a Dflash2LayerWeights> for LayerRefs<'a> {
         Self {
             input_norm: &w.input_norm,
             post_attention_norm: &w.post_attention_norm,
-            q: &w.q,
+            q: w.q.as_ref(),
             k: &w.k,
             v: &w.v,
-            o: &w.o,
+            o: w.o.as_ref(),
             q_norm: &w.q_norm,
             k_norm: &w.k_norm,
-            gate: &w.gate,
-            up: &w.up,
-            down: &w.down,
+            gate: w.gate.as_ref(),
+            up: w.up.as_ref(),
+            down: w.down.as_ref(),
             convs: Some((&w.attention_conv, &w.mlp_conv)),
         }
     }
@@ -402,6 +411,28 @@ impl Arch {
             Self::Stock { weights, .. } => weights.layers.len(),
             Self::Dflash { weights, .. } => weights.layers.len(),
             Self::Dflash2 { weights, .. } => weights.layers.len(),
+        }
+    }
+
+    /// Frees every layer's BF16 projections that only the block reads (queries, output,
+    /// gate, up and down), once the FP8 copies of [`DraftOptions::fp8_backbone`] stand in
+    /// for them. The commit keeps reading the BF16 keys, values and context projections.
+    fn release_block_bf16(&mut self) {
+        macro_rules! release {
+            ($layers:expr) => {
+                for w in $layers {
+                    w.q = None;
+                    w.o = None;
+                    w.gate = None;
+                    w.up = None;
+                    w.down = None;
+                }
+            };
+        }
+        match self {
+            Self::Stock { weights, .. } => release!(&mut weights.layers),
+            Self::Dflash { weights, .. } => release!(&mut weights.layers),
+            Self::Dflash2 { weights, .. } => release!(&mut weights.layers),
         }
     }
 
@@ -758,7 +789,8 @@ impl Scratch {
 
 impl Draft {
     /// Uploads the fold and allocates the cache and scratch. The global layer's cache holds
-    /// `capacity` positions, 4 KiB each; the local layers' rings hold 1032.
+    /// `capacity` positions, 4 KiB each (2 KiB with [`DraftOptions::fp8_kv`]); the local
+    /// layers' rings hold 1032.
     pub fn new(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
@@ -807,7 +839,8 @@ impl Draft {
 
     /// A DFlash draft with DSpark heads ([`DflashWeights`]) in place of the bundled one,
     /// with the approximations in `options`. Every layer keeps `capacity` positions, 4 KiB
-    /// each. Its taps are [`Self::tap_layout`], which the target must record.
+    /// each (2 KiB with [`DraftOptions::fp8_kv`]). Its taps are [`Self::tap_layout`], which
+    /// the target must record.
     pub fn dflash(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
@@ -884,7 +917,7 @@ impl Draft {
         stream: &Arc<CudaStream>,
         config: &TextConfig,
         kernels: DraftKernels,
-        arch: Arch,
+        mut arch: Arch,
         shared: SharedWeights<'_>,
         capacity: usize,
         options: &DraftOptions,
@@ -901,7 +934,10 @@ impl Draft {
         let inv_freq = rope_inv_freq_theta(arch.rope_theta());
         let layers = arch.layers();
         let caches = (0..layers)
-            .map(|layer| KvCache::new(stream, arch.slots(layer, capacity)))
+            .map(|layer| {
+                let fp8 = options.fp8_kv && arch.global(layer);
+                KvCache::with_format(stream, arch.slots(layer, capacity), fp8)
+            })
             .collect::<anyhow::Result<_>>()?;
         let s = Scratch::new(stream, config, &arch)?;
         let z = |n: usize| stream.alloc_zeros::<bf16>(n);
@@ -909,6 +945,9 @@ impl Draft {
             .fp8_backbone
             .then(|| quantize_backbone(stream, &kernels, &arch))
             .transpose()?;
+        if backbone.is_some() {
+            arch.release_block_bf16();
+        }
         let round_taps = z(BLOCK * arch.tap_count() * HIDDEN)?;
         let head = Head::new(
             stream,
@@ -918,6 +957,13 @@ impl Draft {
             config.unpadded_vocab_size,
             options,
         )?;
+        let head_copy = if shared.lm_head_on_host && head.as_ref().is_none_or(|h| h.lm.is_none()) {
+            let mut copy = stream.alloc_zeros(shared.lm_head.len())?;
+            stream.memcpy_dtod(shared.lm_head, &mut copy)?;
+            Some(copy)
+        } else {
+            None
+        };
         Ok(Self {
             kernels,
             arch,
@@ -936,6 +982,7 @@ impl Draft {
             graphs: Default::default(),
             backbone,
             head,
+            head_copy,
         })
     }
 
@@ -1560,8 +1607,8 @@ impl Draft {
                         stream,
                         &mixed,
                         &mut [
-                            (&lw.k_ctx, f.and_then(|f| f.k_ctx.as_ref()), ck),
-                            (&lw.v_ctx, f.and_then(|f| f.v_ctx.as_ref()), cv),
+                            (Some(&lw.k_ctx), f.and_then(|f| f.k_ctx.as_ref()), ck),
+                            (Some(&lw.v_ctx), f.and_then(|f| f.v_ctx.as_ref()), cv),
                         ],
                     )?;
                 }
@@ -1605,7 +1652,11 @@ impl Draft {
             k,
             stream,
             &self.inputs.taps.slice(..),
-            &mut [(context.fc, context.fc_fp8, dfl.round_raw.slice_mut(..))],
+            &mut [(
+                Some(context.fc),
+                context.fc_fp8,
+                dfl.round_raw.slice_mut(..),
+            )],
         )?;
         k.add_rms_norm(
             stream,
@@ -1626,8 +1677,8 @@ impl Draft {
                 .zip(s.round_v.as_view_mut().chunks_exact_mut(layer_rows)),
         ) {
             let fp8 = self.backbone.as_ref().map(|b| &b[layer]);
-            products.push((lk, fp8.map(|f| &f.k), ck));
-            products.push((lv, fp8.map(|f| &f.v), cv));
+            products.push((Some(lk), fp8.map(|f| &f.k), ck));
+            products.push((Some(lv), fp8.map(|f| &f.v), cv));
         }
         project(
             linear,
@@ -1698,8 +1749,8 @@ impl Draft {
                 &input,
                 &mut [
                     (lw.q, f.map(|f| &f.q), s.q.slice_mut(..)),
-                    (lw.k, f.map(|f| &f.k), s.k.slice_mut(..)),
-                    (lw.v, f.map(|f| &f.v), s.v.slice_mut(..)),
+                    (Some(lw.k), f.map(|f| &f.k), s.k.slice_mut(..)),
+                    (Some(lw.v), f.map(|f| &f.v), s.v.slice_mut(..)),
                 ],
             )?;
             attend(k, stream, arch, s, control, &self.inv_freq, layer, cache)?;
@@ -1775,7 +1826,7 @@ impl Draft {
             linear,
             k,
             stream,
-            shared,
+            self.head_copy.as_ref().unwrap_or(shared.lm_head),
             head,
             s,
             steps,
@@ -1871,7 +1922,7 @@ impl Draft {
             linear,
             k,
             stream,
-            shared,
+            self.head_copy.as_ref().unwrap_or(shared.lm_head),
             head,
             s,
             steps,
@@ -1947,7 +1998,7 @@ impl Draft {
             linear,
             k,
             stream,
-            shared,
+            self.head_copy.as_ref().unwrap_or(shared.lm_head),
             head,
             s,
             steps,
@@ -2133,15 +2184,15 @@ fn sublayer_input<'a>(
     Ok(d2.conv.slice(..))
 }
 
-/// Rows 1 to `steps` of the block output [`Scratch::y`] through the LM head, or through
-/// the approximate head's rows, into [`Scratch::base`]. Returns the rows of each step's
+/// Rows 1 to `steps` of the block output [`Scratch::y`] through the BF16 LM head
+/// `lm_head`, or through the approximate head's rows, into [`Scratch::base`]. Returns the rows of each step's
 /// base logits and the elements between steps.
 #[expect(clippy::too_many_arguments, reason = "the head and the buffers")]
 fn base_logits(
     linear: &Linear,
     k: &DraftKernels,
     stream: &CudaStream,
-    shared: SharedWeights<'_>,
+    lm_head: &CudaSlice<bf16>,
     head: Option<&Head>,
     s: &mut Scratch,
     steps: usize,
@@ -2161,11 +2212,7 @@ fn base_logits(
         None => {
             let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
             let mut base = s.base.slice_mut(..m_rows * ld);
-            linear.gemm_bf16(
-                stream,
-                &mut [Gemm::new(shared.lm_head, &y, &mut base)],
-                m_rows,
-            )?;
+            linear.gemm_bf16(stream, &mut [Gemm::new(lm_head, &y, &mut base)], m_rows)?;
         }
         Some(Matrix::Bf16(w)) => {
             let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
@@ -2238,6 +2285,11 @@ fn check_lm_head(config: &TextConfig, shared: SharedWeights<'_>) -> anyhow::Resu
     Ok(())
 }
 
+/// A BF16 projection that [`Arch::release_block_bf16`] may have freed.
+fn freed(w: Option<&CudaSlice<bf16>>) -> anyhow::Result<&CudaSlice<bf16>> {
+    w.context("a BF16 projection was freed")
+}
+
 /// FP8 copies of every layer's projections.
 fn quantize_backbone(
     stream: &Arc<CudaStream>,
@@ -2263,14 +2315,15 @@ fn quantize_backbone(
                 }
                 Arch::Dflash { .. } | Arch::Dflash2 { .. } => (None, None),
             };
+
             Ok(Fp8Layer {
-                q: quantize(w.q, HIDDEN)?,
+                q: quantize(freed(w.q)?, HIDDEN)?,
                 k: quantize(w.k, HIDDEN)?,
                 v: quantize(w.v, HIDDEN)?,
-                o: quantize(w.o, arch.q_width())?,
-                gate: quantize(w.gate, HIDDEN)?,
-                up: quantize(w.up, HIDDEN)?,
-                down: quantize(w.down, arch.mlp_width())?,
+                o: quantize(freed(w.o)?, arch.q_width())?,
+                gate: quantize(freed(w.gate)?, HIDDEN)?,
+                up: quantize(freed(w.up)?, HIDDEN)?,
+                down: quantize(freed(w.down)?, arch.mlp_width())?,
                 k_ctx,
                 v_ctx,
             })
@@ -2395,15 +2448,23 @@ impl Head {
     }
 }
 
+/// One product of [`project`]: the BF16 weight, unless freed, its FP8 copy, if any, and
+/// the output.
+type Projection<'a> = (
+    Option<&'a CudaSlice<bf16>>,
+    Option<&'a Fp8Rows>,
+    CudaViewMut<'a, bf16>,
+);
+
 /// `out = x · weight^T` over the 8 block rows for each product `(weight, fp8, out)`:
-/// through the FP8 copies when every product has one, else through the BF16 weights. As
-/// few launches as the kernels' product limits allow.
+/// through the FP8 copies when every product has one, else through the BF16 weights,
+/// which must then all be there. As few launches as the kernels' product limits allow.
 fn project(
     linear: &Linear,
     kernels: &DraftKernels,
     stream: &CudaStream,
     x: &CudaView<'_, bf16>,
-    products: &mut [(&CudaSlice<bf16>, Option<&Fp8Rows>, CudaViewMut<'_, bf16>)],
+    products: &mut [Projection<'_>],
 ) -> anyhow::Result<()> {
     if products.iter().all(|p| p.1.is_some()) {
         for chunk in products.chunks_mut(F8_MAX_PRODUCTS) {
@@ -2421,8 +2482,14 @@ fn project(
     for chunk in products.chunks_mut(MAX_PRODUCTS) {
         let mut gemms: Vec<Gemm<'_, bf16>> = chunk
             .iter_mut()
-            .map(|p| Gemm::new(p.0, x, &mut p.2))
-            .collect();
+            .map(|p| {
+                Ok(Gemm::new(
+                    p.0.context("a BF16 projection was freed")?,
+                    x,
+                    &mut p.2,
+                ))
+            })
+            .collect::<anyhow::Result<_>>()?;
         linear.gemm_bf16(stream, &mut gemms, BLOCK)?;
     }
     Ok(())

@@ -220,6 +220,157 @@ fn attention_matches_reference() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The value of an E4M3 byte.
+fn e4m3(byte: u8) -> f32 {
+    let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((byte >> 3) & 0xf);
+    let mantissa = f32::from(byte & 7);
+    sign * if exponent == 0 {
+        mantissa / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    }
+}
+
+/// Widens an E4M3 cache's bytes to BF16 values on the host, checking that each is a nearest
+/// E4M3 value to the matching BF16 value of `want`.
+fn widen_checked(label: &str, bytes: &[u8], want: &[bf16]) -> Vec<bf16> {
+    // Every finite E4M3 value (0x7f and 0xff are NaN).
+    let finite: Vec<f32> = (0..=255u8).filter(|b| b & 0x7f != 0x7f).map(e4m3).collect();
+    bytes
+        .iter()
+        .zip(want)
+        .enumerate()
+        .map(|(i, (&b, w))| {
+            let got = e4m3(b);
+            let x = w.to_f32();
+            let best = finite
+                .iter()
+                .map(|v| (v - x).abs())
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                (got - x).abs() <= best,
+                "{label} element {i}: {got} is not a nearest E4M3 value to {x}"
+            );
+            bf16::from_f32(got)
+        })
+        .collect()
+}
+
+/// Prints the largest magnitude of `values` and the share below E4M3's smallest normal
+/// value, 2^-6, where E4M3 keeps fewer than 4 significant bits.
+fn print_range(label: &str, values: &[bf16]) {
+    let largest = values.iter().fold(0.0f32, |m, v| m.max(v.to_f32().abs()));
+    let small = values
+        .iter()
+        .filter(|v| v.to_f32() != 0.0 && v.to_f32().abs() < 2f32.powi(-6))
+        .count();
+    eprintln!(
+        "{label}: largest |x| {largest}, {:.3}% below 2^-6",
+        100.0 * small as f64 / values.len() as f64
+    );
+}
+
+/// An E4M3 cache holds each stored BF16 value rounded to a nearest E4M3 value, and block
+/// attention over it equals, bit for bit, attention over a BF16 cache of those values.
+#[test]
+fn fp8_cache_matches_a_bf16_cache_of_rounded_values() -> anyhow::Result<()> {
+    let t = Setup::new()?;
+    let mut scratch = AttentionScratch::new(t.stream())?;
+    let start = 1030usize;
+    let q = t.bf16(&format!("attention.{start}.q"))?;
+    let keys = t.bf16(&format!("attention.{start}.keys"))?;
+    let values = t.bf16(&format!("attention.{start}.values"))?;
+    let positions = start + 8;
+    let slots = 2048;
+    let mut fp8 = KvCache::with_format(t.stream(), slots, true)?;
+    t.kernels
+        .store_kv(t.stream(), &keys, &values, positions, KV_WIDTH, &mut fp8, 0)?;
+    let stored = positions * KV_WIDTH;
+    let k_bytes = t.stream().clone_dtoh(&fp8.k.slice(..stored))?;
+    let v_bytes = t.stream().clone_dtoh(&fp8.v.slice(..stored))?;
+    let (k_host, v_host) = (
+        t.stream().clone_dtoh(&keys)?,
+        t.stream().clone_dtoh(&values)?,
+    );
+    print_range("keys", &k_host[..stored]);
+    print_range("values", &v_host[..stored]);
+    let k_rounded = widen_checked("keys", &k_bytes, &k_host[..stored]);
+    let v_rounded = widen_checked("values", &v_bytes, &v_host[..stored]);
+    let mut bf16_cache = KvCache::new(t.stream(), slots)?;
+    t.kernels.store_kv(
+        t.stream(),
+        &t.stream().clone_htod(&k_rounded)?,
+        &t.stream().clone_htod(&v_rounded)?,
+        positions,
+        KV_WIDTH,
+        &mut bf16_cache,
+        0,
+    )?;
+    let mut outs = Vec::new();
+    for cache in [&fp8, &bf16_cache] {
+        let mut out = t.stream().alloc_zeros::<bf16>(q.len())?;
+        t.kernels
+            .attention(t.stream(), &q, cache, 0, positions, &mut scratch, &mut out)?;
+        outs.push(t.stream().clone_dtoh(&out)?);
+    }
+    assert!(outs[0] == outs[1], "attention over the E4M3 cache differs");
+
+    // The block's stores round as the copies do.
+    let rows = 8;
+    let pattern = |n: usize, seed: usize| -> Vec<bf16> {
+        (0..n)
+            .map(|i| bf16::from_f32((((i * 7919 + seed) % 2003) as f32 - 1001.0) / 97.0))
+            .collect()
+    };
+    let mut block_q = t.stream().clone_htod(&pattern(rows * 24 * HEAD_DIM, 1))?;
+    let block_k = t.stream().clone_htod(&pattern(rows * KV_WIDTH, 2))?;
+    let block_v = t.stream().clone_htod(&pattern(rows * KV_WIDTH, 3))?;
+    let norm = t.stream().clone_htod(&pattern(HEAD_DIM, 4))?;
+    let control = t.stream().clone_htod(&[100i32, 0, 0])?;
+    let inv_freq = t.stream().clone_htod(&rope_inv_freq())?;
+    let mut caches = [
+        KvCache::with_format(t.stream(), slots, false)?,
+        KvCache::with_format(t.stream(), slots, true)?,
+    ];
+    for cache in &mut caches {
+        t.kernels.block_rope_store(
+            t.stream(),
+            &mut block_q,
+            &block_k,
+            &block_v,
+            &control,
+            &inv_freq,
+            EPS,
+            &norm,
+            &norm,
+            cache,
+            false,
+            siphon_cuda::ops::draft::Rope::F32,
+        )?;
+    }
+    let range = 100 * KV_WIDTH..(100 + rows) * KV_WIDTH;
+    for (label, bf, f8) in [
+        ("block keys", &caches[0].k, &caches[1].k),
+        ("block values", &caches[0].v, &caches[1].v),
+    ] {
+        let want: Vec<bf16> = t
+            .stream()
+            .clone_dtoh(&bf.slice(2 * range.start..2 * range.end))?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        widen_checked(
+            label,
+            &t.stream().clone_dtoh(&f8.slice(range.clone()))?,
+            &want,
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn silu_mul_matches_reference() -> anyhow::Result<()> {
     let t = Setup::new()?;

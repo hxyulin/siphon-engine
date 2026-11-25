@@ -28,7 +28,8 @@ plan may use the free memory at startup less a 0.5 GiB margin.
 --drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
 or a DFlash draft exported by the 2DSD project.
 --draft picks the draft's approximations as bench does: fast (the default, FP8 plus the
-counted shortlist), fp8, exact, or a +-joined set of fp8-backbone, fp8-head, fp8-fold and shortlist.
+counted shortlist), fp8, exact, or a +-joined set of fp8-backbone, fp8-head, fp8-fold, fp8-kv
+and shortlist.
 --fallback runs plain steps where no verify width is expected to be faster. It speeds up
 free prose, but where it steps depends on timings measured at startup, so the output can
 differ between runs.

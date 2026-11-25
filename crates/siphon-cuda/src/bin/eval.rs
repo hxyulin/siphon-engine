@@ -15,7 +15,7 @@
 //! KL(MLX || engine) at the captured positions and how many greedy tokens after the
 //! text match MLX. It exits with status 1 if a check fails. `--weights fp8` makes the
 //! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
-//! the BF16 weights.
+//! the BF16 weights but for the LM head, whose BF16 copy then sits in host memory.
 //! `--expert-activations quantized` runs prefill's expert products on quantized
 //! activations (see `ExpertActivations`); stepping stays BF16. `--prefill-attention`
 //! picks prefill's global attention products over an FP8 cache (`auto` by default: FP8

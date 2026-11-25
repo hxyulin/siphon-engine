@@ -79,11 +79,13 @@ impl App {
         let mut drafts = vec![Draft::Bundled];
         drafts.extend(drafter.map(|d| Draft::Dflash(d.to_owned())));
         drafts.push(Draft::None);
-        // siphon-serve's default draft options: FP8 backbone, head and fold, and a shortlist.
+        // siphon-serve's default draft options: FP8 backbone, head, fold and cache, and a
+        // shortlist.
         let approx = DraftApprox {
             fp8_backbone: true,
             fp8_head: true,
             fp8_fold: true,
+            fp8_kv: true,
             shortlist: true,
         };
         let configs = drafts

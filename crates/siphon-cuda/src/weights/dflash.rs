@@ -56,7 +56,7 @@ pub struct DflashLayerWeights {
     pub input_norm: CudaSlice<bf16>,
     pub post_attention_norm: CudaSlice<bf16>,
     /// `[3072, 2304]`.
-    pub q: CudaSlice<bf16>,
+    pub q: Option<CudaSlice<bf16>>,
     /// `[1024, 2304]` each.
     pub k: CudaSlice<bf16>,
     pub v: CudaSlice<bf16>,
@@ -64,12 +64,12 @@ pub struct DflashLayerWeights {
     pub q_norm: CudaSlice<bf16>,
     pub k_norm: CudaSlice<bf16>,
     /// `[2304, 3072]`.
-    pub o: CudaSlice<bf16>,
+    pub o: Option<CudaSlice<bf16>>,
     /// `[9216, 2304]` each.
-    pub gate: CudaSlice<bf16>,
-    pub up: CudaSlice<bf16>,
+    pub gate: Option<CudaSlice<bf16>>,
+    pub up: Option<CudaSlice<bf16>>,
     /// `[2304, 9216]`.
-    pub down: CudaSlice<bf16>,
+    pub down: Option<CudaSlice<bf16>>,
 }
 
 impl DflashWeights {
@@ -119,15 +119,15 @@ impl DflashLayerWeights {
             input_norm: loader.bf16(&format!("{p}input_layernorm.weight"), &[HIDDEN])?,
             post_attention_norm: loader
                 .bf16(&format!("{p}post_attention_layernorm.weight"), &[HIDDEN])?,
-            q: loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?,
+            q: Some(loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?),
             k: loader.bf16(&format!("{attn}k_proj.weight"), &[kv, HIDDEN])?,
             v: loader.bf16(&format!("{attn}v_proj.weight"), &[kv, HIDDEN])?,
             q_norm: loader.bf16(&format!("{attn}q_norm.weight"), &[HEAD_DIM])?,
             k_norm: loader.bf16(&format!("{attn}k_norm.weight"), &[HEAD_DIM])?,
-            o: loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?,
-            gate: loader.bf16(&format!("{p}mlp.gate_proj.weight"), &[MLP_WIDTH, HIDDEN])?,
-            up: loader.bf16(&format!("{p}mlp.up_proj.weight"), &[MLP_WIDTH, HIDDEN])?,
-            down: loader.bf16(&format!("{p}mlp.down_proj.weight"), &[HIDDEN, MLP_WIDTH])?,
+            o: Some(loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?),
+            gate: Some(loader.bf16(&format!("{p}mlp.gate_proj.weight"), &[MLP_WIDTH, HIDDEN])?),
+            up: Some(loader.bf16(&format!("{p}mlp.up_proj.weight"), &[MLP_WIDTH, HIDDEN])?),
+            down: Some(loader.bf16(&format!("{p}mlp.down_proj.weight"), &[HIDDEN, MLP_WIDTH])?),
         })
     }
 }

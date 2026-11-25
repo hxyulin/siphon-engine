@@ -12,7 +12,11 @@
 //! and MLX's `[dims, 4, 1]` have the same bytes.
 //!
 //! [`Weights::quantize_fp8`] adds FP8 copies of the large matrices decode reads, and of the
-//! message gates, for [`WeightFormat::Fp8`]; the BF16 originals stay for prefill.
+//! message gates, for [`WeightFormat::Fp8`]; the BF16 originals stay for prefill, except
+//! the LM head's, which moves to mapped host memory.
+//!
+//! The embedding table lives in mapped host memory ([`HostMapped`]): kernels gather only
+//! the rows of the tokens they embed, over PCIe, so it takes no device memory.
 
 use std::sync::Arc;
 
@@ -22,9 +26,12 @@ use half::bf16;
 use safetensors::Dtype;
 use siphon::{Checkpoint, TextConfig};
 
-use crate::ops::{
-    linear::Prefetch,
-    linear_fp8::{Fp8Matrix, LinearFp8},
+use crate::{
+    gpu::HostMapped,
+    ops::{
+        linear::Prefetch,
+        linear_fp8::{Fp8Matrix, LinearFp8},
+    },
 };
 
 pub mod dflash;
@@ -38,19 +45,45 @@ const NVFP4_E4M3_MAX: f32 = 448.0;
 
 #[derive(Debug)]
 pub struct Weights {
-    /// `[vocab, hidden]`.
-    pub embed: CudaSlice<bf16>,
+    /// `[vocab, hidden]`, in mapped host memory.
+    pub embed: HostMapped<bf16>,
     pub embed_norm: CudaSlice<bf16>,
     pub layers: Vec<LayerWeights>,
     /// Query of the final depth attention, F32 `[hidden]`.
     pub final_query: CudaSlice<f32>,
     pub norm: CudaSlice<bf16>,
-    /// `[vocab, hidden]`.
-    pub lm_head: CudaSlice<bf16>,
+    /// `[vocab, hidden]`: on the device, or after [`Weights::quantize_fp8`] in mapped host
+    /// memory, where only the bundled draft's load and its shortlist read it.
+    pub lm_head: Table,
     /// Per looped layer, F32 `[4, hidden]`: the query, key, value and MLP message queries.
     pub message_queries: Vec<CudaSlice<f32>>,
-    /// FP8 copy of `lm_head` for decode, after [`Weights::quantize_fp8`].
+    /// FP8 copy of `lm_head`, after [`Weights::quantize_fp8`], which every LM-head product
+    /// then reads.
     pub lm_head_fp8: Option<Fp8Matrix>,
+}
+
+/// A BF16 tensor in device memory or in mapped host memory.
+#[derive(Debug)]
+pub enum Table {
+    Device(CudaSlice<bf16>),
+    Host(HostMapped<bf16>),
+}
+
+impl Table {
+    /// The tensor as a device slice: its device memory or its mapped host address.
+    #[must_use]
+    pub fn slice(&self) -> &CudaSlice<bf16> {
+        match self {
+            Self::Device(t) => t,
+            Self::Host(t) => t.slice(),
+        }
+    }
+
+    /// Whether kernels read it over PCIe.
+    #[must_use]
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host(_))
+    }
 }
 
 pub use siphon::WeightFormat;
@@ -199,15 +232,25 @@ impl Loader<'_> {
     }
 
     fn bf16(&self, name: &str, shape: &[usize]) -> anyhow::Result<CudaSlice<bf16>> {
+        let values = self.bf16_host(name, shape)?;
+        self.upload(name, &values)
+    }
+
+    fn bf16_host(&self, name: &str, shape: &[usize]) -> anyhow::Result<Vec<bf16>> {
         let (dtype, bytes) = self.entry(name, shape)?;
         ensure!(dtype == Dtype::BF16, "{name} is {dtype:?}, expected BF16");
-        let values: Vec<bf16> = bytes
+        Ok(bytes
             .as_chunks()
             .0
             .iter()
             .map(|b| bf16::from_le_bytes(*b))
-            .collect();
-        self.upload(name, &values)
+            .collect())
+    }
+
+    /// A BF16 tensor in mapped host memory.
+    fn bf16_mapped(&self, name: &str, shape: &[usize]) -> anyhow::Result<HostMapped<bf16>> {
+        let values = self.bf16_host(name, shape)?;
+        HostMapped::new(self.stream, &values).with_context(|| format!("mapping {name}"))
     }
 
     /// Loads an F32 tensor, widening it first if the checkpoint stores BF16.
@@ -243,7 +286,8 @@ impl Loader<'_> {
 }
 
 impl Weights {
-    /// Uploads every text-model weight. Takes about 19 GB of device memory.
+    /// Uploads every text-model weight but the embedding table, which goes to mapped host
+    /// memory. Takes about 18 GB of device memory.
     pub fn load(
         checkpoint: &Checkpoint,
         config: &TextConfig,
@@ -259,20 +303,20 @@ impl Weights {
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(Self {
-            embed: loader.bf16("model.llm.embed.weight", &[vocab, hidden])?,
+            embed: loader.bf16_mapped("model.llm.embed.weight", &[vocab, hidden])?,
             embed_norm: loader.bf16("model.llm.embed_norm.weight", &[hidden])?,
             layers,
             final_query: loader.f32("model.llm.attn_res.output_query", &[hidden])?,
             norm: loader.bf16("model.llm.norm.weight", &[hidden])?,
-            lm_head: loader.bf16("model.llm.unembed.weight", &[vocab, hidden])?,
+            lm_head: Table::Device(loader.bf16("model.llm.unembed.weight", &[vocab, hidden])?),
             message_queries: load_message_queries(&loader, config)?,
             lm_head_fp8: None,
         })
     }
 
     /// Quantizes every layer's attention input and output projections, its message gates
-    /// and the LM head to FP8 copies, which decode then reads. Returns the bytes the copies
-    /// take.
+    /// and the LM head to FP8 copies, which decode then reads, and moves the BF16 LM head to
+    /// mapped host memory. Returns the bytes the copies take.
     pub fn quantize_fp8(
         &mut self,
         linear: &LinearFp8,
@@ -284,6 +328,10 @@ impl Weights {
         };
         let hidden = self.embed_norm.len();
         let mut bytes = 0;
+        ensure!(
+            self.lm_head_fp8.is_none(),
+            "the weights are quantized already"
+        );
         for layer in &mut self.layers {
             let a = &layer.attention;
             let inputs = a
@@ -307,9 +355,13 @@ impl Weights {
                 gate.fp8 = Some(copies);
             }
         }
-        let lm_head = quantize(&self.lm_head, hidden)?;
+        let lm_head = quantize(self.lm_head.slice(), hidden)?;
         bytes += lm_head.bytes();
         self.lm_head_fp8 = Some(lm_head);
+        if let Table::Device(head) = &self.lm_head {
+            let host = stream.clone_dtoh(head)?;
+            self.lm_head = Table::Host(HostMapped::new(stream, &host)?);
+        }
         stream.synchronize()?;
         Ok(bytes)
     }
