@@ -58,7 +58,7 @@ pub struct Sampling {
 
 /// Why generation ended.
 #[cfg_attr(
-    not(target_os = "linux"),
+    all(not(target_os = "linux"), not(test)),
     expect(dead_code, reason = "only the Linux engine runs jobs")
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub enum Finish {
 /// any number of times, then `Done` or `Failed`. A job whose client left while it waited
 /// gets none.
 #[cfg_attr(
-    not(target_os = "linux"),
+    all(not(target_os = "linux"), not(test)),
     expect(dead_code, reason = "only the Linux engine runs jobs")
 )]
 #[derive(Debug)]

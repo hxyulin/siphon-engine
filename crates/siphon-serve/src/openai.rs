@@ -7,6 +7,8 @@
 //!   `return_token_ids`.
 //! - `POST /v1/completions`, streaming or not: a text prompt or token ids, with `stop` and
 //!   `return_token_ids`.
+//! - Anthropic's `POST /v1/messages` and `POST /v1/messages/count_tokens`
+//!   ([`crate::anthropic`]), which share the chat route's prompt rendering and output.
 //! - `GET /metrics`, which needs no API key: Prometheus metrics ([`crate::metrics`]).
 //! - `GET /v1/models` and `GET /v1/models/{id}`, with `max_model_len`.
 //! - The tokenizer routes of [`crate::tokenize`].
@@ -21,6 +23,9 @@
 //! ends at the first of them, whose id the output keeps and whose text it leaves out, as
 //! vLLM does. A choice reports the stop string or stop token that matched as vLLM's
 //! `stop_reason`.
+//!
+//! With an API key set, a request carries it as `Authorization: Bearer <key>` or as
+//! Anthropic's `x-api-key: <key>`.
 
 use std::{
     convert::Infallible,
@@ -48,6 +53,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
+    anthropic,
     chat::{self, Ending, InvalidRequest, Vocab},
     engine::{Engine, Event, Finish, Job, Refused, Sampling},
     metrics::{Metrics, Reason, Tracker},
@@ -88,6 +94,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/detokenize", post(detokenize_route))
         .route("/v1/token/encode", post(token_encode))
         .route("/v1/token/decode", post(token_decode))
+        .route("/v1/messages", post(anthropic::messages))
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .layer(DefaultBodyLimit::max(body_limit))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize))
         .route("/health", get(|| async { "ok" }))
@@ -100,24 +108,25 @@ pub fn router(app: Arc<App>) -> Router {
 }
 
 /// An OpenAI-style error response.
-struct ApiError {
-    status: StatusCode,
-    message: String,
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
         }
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 }
@@ -154,17 +163,30 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Some(key) = &app.api_key {
-        let given = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !same_bytes(given.as_bytes(), key.as_bytes()) {
-            return ApiError::new(StatusCode::UNAUTHORIZED, "invalid API key").into_response();
+    if let Some(key) = &app.api_key
+        && !authorized(&headers, key)
+    {
+        let error = ApiError::new(StatusCode::UNAUTHORIZED, "invalid API key");
+        if anthropic::serves(request.uri().path()) {
+            return anthropic::Error(error).into_response();
         }
+        return error.into_response();
     }
     next.run(request).await
+}
+
+/// Whether `headers` carry `key` as `Authorization: Bearer <key>` or as `x-api-key: <key>`,
+/// the header Anthropic's clients send.
+pub(crate) fn authorized(headers: &HeaderMap, key: &str) -> bool {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    [bearer, api_key]
+        .into_iter()
+        .flatten()
+        .any(|given| same_bytes(given.as_bytes(), key.as_bytes()))
 }
 
 /// Compares in time that depends only on the lengths.
@@ -213,7 +235,7 @@ async fn model(
 }
 
 /// Runs `f` off the async workers: tokenizing a long prompt takes milliseconds.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     app: &Arc<App>,
     f: impl FnOnce(&App) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -293,7 +315,7 @@ struct StreamOptions {
 }
 
 /// How a reply goes back to the client.
-enum Delivery {
+pub(crate) enum Delivery {
     Whole,
     /// Server-sent events, ending with a usage chunk if `include_usage`.
     Stream {
@@ -314,16 +336,16 @@ impl Delivery {
 }
 
 /// A validated request, ready for the engine.
-struct Prepared {
-    prompt: Vec<u32>,
-    max_tokens: usize,
-    delivery: Delivery,
+pub(crate) struct Prepared {
+    pub(crate) prompt: Vec<u32>,
+    pub(crate) max_tokens: usize,
+    pub(crate) delivery: Delivery,
     /// vLLM's `return_token_ids`: the prompt's and the completion's ids.
-    return_token_ids: bool,
+    pub(crate) return_token_ids: bool,
     /// vLLM's `ignore_eos`: run to `max_tokens` through the model's end tokens.
-    ignore_eos: bool,
-    sampling: Sampling,
-    output: Output,
+    pub(crate) ignore_eos: bool,
+    pub(crate) sampling: Sampling,
+    pub(crate) output: Output,
 }
 
 fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
@@ -346,34 +368,8 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     if choice == ToolChoice::None {
         tools.clear();
     }
-    // A forced call skips the model's thinking, and after it the model tends to write text
-    // about a call it did not decide on, so the output ends with the forced calls.
     let parallel = request.parallel_tool_calls != Some(false);
-    let (call, calls) = match &choice {
-        ToolChoice::Auto | ToolChoice::None => {
-            (None, if parallel { Calls::Free } else { Calls::One })
-        }
-        ToolChoice::Function(name) => (Some(Ending::Call(name)), Calls::One),
-        ToolChoice::Required => {
-            let ending = match tools.as_slice() {
-                [tool] => chat::tool_function_name(tool).map_or(Ending::AnyCall, Ending::Call),
-                _ => Ending::AnyCall,
-            };
-            (
-                Some(ending),
-                if parallel { Calls::Only } else { Calls::One },
-            )
-        }
-    };
-    let ending = match (call, ending) {
-        (None, ending) => ending,
-        (Some(call), Ending::Generate) => call,
-        (Some(_), _) => {
-            return Err(ApiError::bad_request(
-                "continue_final_message cannot be used with a forced tool call",
-            ));
-        }
-    };
+    let (ending, calls) = tool_ending(&choice, &tools, parallel, ending)?;
     let effort = chat::request_effort(
         request.reasoning_effort.as_ref(),
         request.chat_template_kwargs.as_ref(),
@@ -402,9 +398,47 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     })
 }
 
+/// How a chat prompt with `tools` ends under `choice`, given the `ending` its other fields
+/// ask for, and which tool calls end the output.
+pub(crate) fn tool_ending<'a>(
+    choice: &'a ToolChoice,
+    tools: &'a [Value],
+    parallel: bool,
+    ending: Ending<'a>,
+) -> Result<(Ending<'a>, Calls), ApiError> {
+    // A forced call skips the model's thinking, and after it the model tends to write text
+    // about a call it did not decide on, so the output ends with the forced calls.
+    let (call, calls) = match choice {
+        ToolChoice::Auto | ToolChoice::None => {
+            (None, if parallel { Calls::Free } else { Calls::One })
+        }
+        ToolChoice::Function(name) => (Some(Ending::Call(name)), Calls::One),
+        ToolChoice::Required => {
+            let ending = match tools {
+                [tool] => chat::tool_function_name(tool).map_or(Ending::AnyCall, Ending::Call),
+                _ => Ending::AnyCall,
+            };
+            (
+                Some(ending),
+                if parallel { Calls::Only } else { Calls::One },
+            )
+        }
+    };
+    let ending = match (call, ending) {
+        (None, ending) => ending,
+        (Some(call), Ending::Generate) => call,
+        (Some(_), _) => {
+            return Err(ApiError::bad_request(
+                "continue_final_message cannot be used with a forced tool call",
+            ));
+        }
+    };
+    Ok((ending, calls))
+}
+
 /// The tokens a request may generate: `requested`, or all that fit after a prompt of
 /// `prompt_len` tokens in a context of `max_context`.
-fn max_tokens(
+pub(crate) fn max_tokens(
     max_context: usize,
     prompt_len: usize,
     requested: Option<u64>,
@@ -432,7 +466,7 @@ fn max_tokens(
 }
 
 /// Queues a job and returns its events.
-fn submit(
+pub(crate) fn submit(
     app: &App,
     prompt: Vec<u32>,
     max_tokens: usize,
@@ -464,14 +498,14 @@ fn submit(
 
 /// One job's events, recorded in the metrics as they arrive. Dropping it cancels the job,
 /// and counts it as aborted unless it finished.
-struct Results {
-    receiver: mpsc::UnboundedReceiver<Event>,
-    tracker: Tracker,
+pub(crate) struct Results {
+    pub(crate) receiver: mpsc::UnboundedReceiver<Event>,
+    pub(crate) tracker: Tracker,
 }
 
 impl Results {
     /// The next event, with a closed channel as a failure.
-    async fn next(&mut self) -> Event {
+    pub(crate) async fn next(&mut self) -> Event {
         let event = self
             .receiver
             .recv()
@@ -488,7 +522,7 @@ impl Results {
     }
 
     /// Ends the job with `finish`, which a stop the output matched may have set first.
-    fn close(mut self, finish: Finish) {
+    pub(crate) fn close(mut self, finish: Finish) {
         self.tracker.finish(reason(finish));
     }
 }
@@ -637,14 +671,14 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
     Ok(Json(body).into_response())
 }
 
-fn append(message: &mut Delta, delta: Delta) {
+pub(crate) fn append(message: &mut Delta, delta: Delta) {
     message.content += &delta.content;
     message.reasoning += &delta.reasoning;
     message.tool_calls.extend(delta.tool_calls);
 }
 
 /// Turns generated ids into reply text.
-enum Decoder {
+pub(crate) enum Decoder {
     /// Chat: reasoning, content and tool calls.
     Chat(Parser),
     /// Raw completion: all the text, special tokens included.
@@ -653,7 +687,7 @@ enum Decoder {
 
 /// Which tool calls end an output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Calls {
+pub(crate) enum Calls {
     /// None do.
     Free,
     /// The first call does (`parallel_tool_calls: false`, or a named `tool_choice`).
@@ -664,7 +698,7 @@ enum Calls {
 }
 
 /// One job's output on its way to the client, cut at the first stop string or stop token.
-struct Output {
+pub(crate) struct Output {
     decoder: Decoder,
     stops: Stops,
     /// vLLM's `stop_token_ids`.
@@ -676,15 +710,15 @@ struct Output {
     /// always `<|content_model_end_sampling|>`.
     ids: Vec<u32>,
     /// Generated ids taken, the end token excluded.
-    tokens: usize,
+    pub(crate) tokens: usize,
     limit: Calls,
     calls: usize,
     /// Whether a stop string, a stop token or `limit` ended the output before the job did.
-    done: bool,
+    pub(crate) done: bool,
 }
 
 impl Output {
-    fn new(decoder: Decoder, stops: Stops, stop_ids: Vec<u32>, limit: Calls) -> Self {
+    pub(crate) fn new(decoder: Decoder, stops: Stops, stop_ids: Vec<u32>, limit: Calls) -> Self {
         Self {
             decoder,
             stops,
@@ -699,7 +733,7 @@ impl Output {
     }
 
     /// Takes generated ids, one at a time so that a stop ends the output at its token.
-    fn push(&mut self, vocab: &Vocab, ids: &[u32]) -> Delta {
+    pub(crate) fn push(&mut self, vocab: &Vocab, ids: &[u32]) -> Delta {
         let mut out = Delta::default();
         for &id in ids {
             if self.done {
@@ -729,7 +763,7 @@ impl Output {
     }
 
     /// Ends the output after the job ended with `finish`, or after `done`.
-    fn finish(&mut self, vocab: &Vocab, finish: Finish) -> Delta {
+    pub(crate) fn finish(&mut self, vocab: &Vocab, finish: Finish) -> Delta {
         let mut out = Delta::default();
         if self.done {
             return out;
@@ -783,13 +817,18 @@ impl Output {
         append(out, delta);
     }
 
-    fn finish_reason(&self, finish: Finish) -> &'static str {
+    pub(crate) fn finish_reason(&self, finish: Finish) -> &'static str {
         let finish = if self.done { Finish::Stop } else { finish };
         match finish {
             Finish::Stop if self.calls > 0 => "tool_calls",
             Finish::Stop => "stop",
             Finish::Length => "length",
         }
+    }
+
+    /// The stop string that ended the output, if one did.
+    pub(crate) fn stop_string(&self) -> Option<&str> {
+        self.stops.matched()
     }
 
     /// vLLM's `stop_reason`: the stop string or the stop token's id that matched, or null.
@@ -1074,7 +1113,7 @@ async fn stream(
     let _ = chunks.raw("[DONE]".to_owned()).await;
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

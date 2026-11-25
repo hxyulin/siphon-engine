@@ -34,7 +34,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
 | `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
 
-With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` needs `Authorization: Bearer <key>`.
+With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` needs `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 ## Routes
 
@@ -42,6 +42,8 @@ With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` 
 | --- | --- |
 | `POST /v1/chat/completions` | Messages rendered as the checkpoint's chat template renders them. Streams with `stream`, and `stream_options.include_usage` adds a usage chunk. The model's thinking comes back as `reasoning_content`. |
 | `POST /v1/completions` | A text prompt or token ids, streaming or not. The text includes any special tokens generated. |
+| `POST /v1/messages` | Anthropic's Messages API, streaming or not, for Claude Code and Anthropic's SDKs. See [Anthropic Messages API](#anthropic-messages-api). |
+| `POST /v1/messages/count_tokens` | `{"input_tokens": n}`: the tokens of the prompt that `/v1/messages` would run for the same body. |
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape, also at `/v1/tokenize` and `/v1/detokenize`: `{"prompt"}` or `{"messages", "tools"}` to `{"tokens", "count", "max_model_len"}`, and `{"tokens"}` to `{"prompt"}`. |
 | `POST /v1/token/encode`, `POST /v1/token/decode` | TabbyAPI's shape: `{"text"}`, a string or messages, to `{"tokens", "length"}`, and `{"tokens"}` to `{"text"}`. |
 | `GET /v1/models`, `GET /v1/models/{id}` | The served model, with `max_model_len`. |
@@ -61,6 +63,46 @@ With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` 
   - `continue_final_message` with `add_generation_prompt: false` continues the last assistant message.
 
 Raw completions take `stop`, `stop_token_ids`, `return_token_ids` and `ignore_eos` too. A text prompt, like the text sent to the tokenizer routes, is encoded with special-token spellings as plain text and nothing added; send token ids to use special tokens. Decoding keeps special tokens.
+
+## Anthropic Messages API
+
+`POST /v1/messages` takes Anthropic's request and answers in Anthropic's shape. The server renders the request with the same chat template as `/v1/chat/completions`, and runs it on the same engine. Query parameters, such as Claude Code's `?beta=true`, are ignored.
+
+The request maps onto the chat route as follows:
+
+- `system` is a string or text blocks. The blocks are joined with blank lines into one system message. Claude Code's `x-anthropic-billing-header` block is dropped: it changes between requests and would defeat the prefix cache.
+- `messages` take the roles `user`, `assistant` and `system`. The template renders a `system` message mid-conversation where it stands.
+- A user's `tool_result` block becomes a tool message, in its place among the user's text blocks. Its `is_error` is ignored.
+- `image` and `document` blocks, also inside a `tool_result`, become the text `[image omitted: the model cannot see images]` or `[document omitted: the model cannot read documents]`. The model sees no images, and a 400 would end Claude Code's session.
+- An assistant's `thinking` blocks become its past reasoning, which the template renders before its text and tool calls. `redacted_thinking` is dropped.
+- A last `assistant` message is a prefill, and the reply continues it.
+- `tools` entries with a `type` other than `custom` are Anthropic's server tools, such as web search, and are left out.
+- `tool_choice`: `auto`, `any`, `{"type": "tool", "name"}` and `none` work as `auto`, `required`, a named function and `none` do on the chat route. `disable_parallel_tool_use` ends the reply after its first call.
+- `thinking: {"type": "disabled"}` is effort 0. Otherwise `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) sets the effort as `reasoning_effort` does, and the default is 0.9. `budget_tokens` and unknown effort names are ignored.
+- `max_tokens` is required. A prompt and `max_tokens` that do not fit the context get a 400 with Anthropic's message, which Claude Code reads to shrink `max_tokens` or to compact.
+- `stop_sequences` are stop strings. `temperature`, `top_p` and `top_k` sample as on the chat route.
+
+The server ignores `metadata`, `cache_control` anywhere, `context_management`, `service_tier`, `output_config.format`, `container`, `mcp_servers`, the `anthropic-beta` and `anthropic-version` headers, and unknown fields.
+
+The reply holds `thinking` blocks with an empty `signature`, then `text` and `tool_use` blocks in the order the model wrote them. `stop_reason` is `end_turn`, `max_tokens`, `stop_sequence` (with `stop_sequence` set) or `tool_use`. In `usage`, `input_tokens` leaves out the prompt tokens read from the prefix cache, which `cache_read_input_tokens` counts, and `cache_creation_input_tokens` is 0. A stream sends Anthropic's events, from `message_start` to `message_stop`, and a `ping` event after 5 seconds without bytes, such as during a long prefill. A tool call arrives whole, in one `input_json_delta`.
+
+Errors on these routes take Anthropic's shape, `{"type": "error", "error": {"type", "message"}}`. A full queue answers 529 with `overloaded_error`, which Claude Code retries. A failure during a stream sends an `error` event.
+
+### Claude Code
+
+Point Claude Code at the server with these variables:
+
+```sh
+export ANTHROPIC_BASE_URL=http://<host>:8000   # no /v1
+export ANTHROPIC_AUTH_TOKEN=<key>              # or ANTHROPIC_API_KEY; any text without SIPHON_API_KEY
+export ANTHROPIC_MODEL=inkling-2-mini          # the server's --name
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=inkling-2-mini
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=<context>
+```
+
+Claude Code sends background requests, such as titles and summaries, to its Haiku model, so that name must point at this server too. It assumes a context of 1,048,576 tokens for a model it does not know. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the server's `--context`, or to the `max_model_len` that `/v1/models` lists, so that it compacts the conversation before the prompt overflows.
+
+The [prefix cache](#prefix-cache) holds one prompt. A background request that runs alone and does not start with the conversation's tokens empties the cache, or replaces it with its own prompt. The next turn of the main conversation then prefills its whole prompt again.
 
 ## Sampling
 

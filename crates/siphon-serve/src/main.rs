@@ -1,5 +1,6 @@
 //! `siphon-serve`: an OpenAI-compatible chat server for Inkling 2 Mini on one GPU.
 
+mod anthropic;
 mod chat;
 mod engine;
 mod metrics;
@@ -45,7 +46,8 @@ request samples with its temperature, top_k, top_p, min_p and seed, and the fiel
 out come from the checkpoint's generation_config.json (temperature 1 for Inkling 2 Mini).
 Speculation keeps the model's distribution exactly, and a request with a seed gets the same
 tokens on the same configuration, alone or in a batch (without --fallback).
-Set SIPHON_API_KEY to require `Authorization: Bearer <key>` on every route but /health and /version.";
+Set SIPHON_API_KEY to require `Authorization: Bearer <key>` or `x-api-key: <key>` on every route
+but /health, /version and /metrics.";
 
 /// The prompt that prices the verify widths at startup.
 const WARMUP: &str = "Explain, step by step, how a hash map handles collisions, and compare \
