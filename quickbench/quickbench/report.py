@@ -125,11 +125,16 @@ def bootstrap(values, statistic=statistics.fmean, rounds: int = 10000, seed: int
     return statistic(values), stats[int(0.025 * rounds)], stats[int(0.975 * rounds) - 1]
 
 
-def mcnemar(a_only: int, b_only: int) -> float:
-    n = a_only + b_only
+def sign_test(a_better: int, b_better: int) -> float:
+    """Two-sided exact sign test over items, ties left out.
+
+    It counts each item once, so a side that repeats one reply on every attempt (greedy
+    decoding of an item whose prompt does not change) is not counted as several samples.
+    """
+    n = a_better + b_better
     if n == 0:
         return 1.0
-    tail = sum(math.comb(n, i) for i in range(min(a_only, b_only) + 1)) / 2**n
+    tail = sum(math.comb(n, i) for i in range(min(a_better, b_better) + 1)) / 2**n
     return min(1.0, 2 * tail)
 
 
@@ -143,8 +148,10 @@ def compare(a: dict, b: dict) -> str:
         lines += ["## Quality, paired by item", "",
                   "B − A is the mean over items of the difference in pass rate. The interval "
                   "comes from a paired bootstrap over items (10,000 resamples). Attempts are "
-                  "paired by seed and option order.", "",
-                  "| Source | Items | A | B | B − A | 95% interval | Attempts A only / B only | McNemar p | Verdict |",
+                  "paired by seed and option order. The sign test counts the items each side "
+                  "passed more often. A difference counts as real when the interval excludes "
+                  "zero and the sign test gives p < 0.05.", "",
+                  "| Source | Items | A | B | B − A | 95% interval | Items A better / B better | Sign test p | Verdict |",
                   "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
         by_source = defaultdict(list)
         for key in common:
@@ -156,15 +163,16 @@ def compare(a: dict, b: dict) -> str:
                 items[key[0]][1].append(qb[key]["passed"])
             diffs = [sum(y) / len(y) - sum(x) / len(x) for x, y in items.values()]
             mean, lo, hi = bootstrap(diffs)
-            a_only = sum(qa[k]["passed"] and not qb[k]["passed"] for k in keys)
-            b_only = sum(qb[k]["passed"] and not qa[k]["passed"] for k in keys)
+            a_better = sum(d < 0 for d in diffs)
+            b_better = sum(d > 0 for d in diffs)
+            p = sign_test(a_better, b_better)
             pa = sum(qa[k]["passed"] for k in keys) / len(keys)
             pb = sum(qb[k]["passed"] for k in keys) / len(keys)
             verdict = ("too few items" if len(items) < MIN_ITEMS
-                       else "real" if lo > 0 or hi < 0 else "within noise")
+                       else "real" if (lo > 0 or hi < 0) and p < 0.05 else "within noise")
             lines.append(f"| {name} | {len(items)} | {pa:.1%} | {pb:.1%} | {mean:+.1%} | "
-                         f"{lo:+.1%} to {hi:+.1%} | {a_only} / {b_only} | "
-                         f"{mcnemar(a_only, b_only):.3f} | {verdict} |")
+                         f"{lo:+.1%} to {hi:+.1%} | {a_better} / {b_better} | "
+                         f"{p:.3f} | {verdict} |")
         for label, field in (("cut off", "length"), ("looping", None)):
             ca = sum((qa[k]["finish_reason"] == field) if field else qa[k]["looping"] for k in common)
             cb = sum((qb[k]["finish_reason"] == field) if field else qb[k]["looping"] for k in common)

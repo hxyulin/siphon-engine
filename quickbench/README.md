@@ -57,7 +57,7 @@ Each run writes `report.md`, `results.json`, the replies (`replies.jsonl`) and t
 uv run python -m quickbench compare ~/.cache/quickbench/runs/fp8-default ~/.cache/quickbench/runs/kv-bf16
 ```
 
-Quality attempts are paired by item, seed and option order. The table gives the difference in pass rate with a 95% interval from a paired bootstrap over items, the attempts only one side passed, and an exact McNemar test on those. A difference counts as real when the interval excludes zero. Speed is paired by prompt, sampling and seed. Fidelity metrics are listed side by side.
+Quality attempts are paired by item, seed and option order. The table gives the difference in pass rate with a 95% interval from a paired bootstrap over items, and an exact sign test over the items each side passed more often. A difference counts as real when the interval excludes zero and the sign test gives p < 0.05. Both count items, not attempts: greedy decoding repeats one reply on every attempt of an item whose prompt does not change, so its attempts are not independent samples. Speed is paired by prompt, sampling and seed. Fidelity metrics are listed side by side.
 
 ## Items
 
