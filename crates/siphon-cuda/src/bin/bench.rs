@@ -45,7 +45,7 @@
 //!        bench <model-dir> --prompt <capture> --spec K|auto [--widths 2,4,8]
 //!        [--draft SPEC] [--shortlist FILE] [--sweep FILE] [--contexts 0,32768]
 //!        [--steps N] [--weights bf16|fp8] [--kv bf16|fp8] [--drafter DIR]
-//!        [--fallback]
+//!        [--fallback] [--temperature T [--top-p P] [--seeds N]]
 //!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
 //!
 //! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
@@ -56,7 +56,9 @@
 //! split of a round between verify, draft and host. `--spec auto` picks each round's
 //! width from the drafts' confidences (`WidthPolicy`), among `--widths` (default 1 to
 //! 8), priced by verify passes of each width timed at that context first. With
-//! `--fallback` it also runs plain steps when no width is expected to be faster. `--draft` takes a variant of the draft as `dspark` does: `fast` (the
+//! `--fallback` it also runs plain steps when no width is expected to be faster.
+//! `--temperature` samples instead of decoding greedily, as siphon-serve does, once with
+//! each seed from 0 to `--seeds` (default 6) less 1, and reports each run and the medians. `--draft` takes a variant of the draft as `dspark` does: `fast` (the
 //! default, the three FP8 approximations and the shortlist), `fp8` (no shortlist),
 //! `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`, `fp8-kv` and
 //! `shortlist`. The shortlist ranks tokens by `draft::counted_ranking` unless
@@ -154,6 +156,10 @@ mod linux {
         verify_widths: bool,
         /// Whether `--spec auto` falls back to plain steps.
         fallback: bool,
+        /// `--spec`'s temperature and top-p, or greedy decoding.
+        sampling: Option<(f32, f32)>,
+        /// Seeds `--spec` samples with, from 0.
+        seeds: u64,
         /// Batch sizes to time batched decode at, instead of plain decode.
         batch: Option<Vec<usize>>,
         /// Whether the draft follows row 0 of the batched steps.
@@ -168,6 +174,7 @@ mod linux {
             .with_context(|| format!("{arg} takes comma-separated token counts"))
     }
 
+    #[expect(clippy::too_many_lines, reason = "one match arm per flag")]
     fn args() -> anyhow::Result<Args> {
         let mut model = None;
         let mut contexts = None;
@@ -191,6 +198,9 @@ mod linux {
         let mut sweep = None;
         let mut verify_widths = false;
         let mut fallback = false;
+        let mut temperature = None;
+        let mut top_p = None;
+        let mut seeds = 6;
         let mut batch = None;
         let mut follow = false;
         let mut it = env::args().skip(1);
@@ -221,6 +231,9 @@ mod linux {
                 "--sweep" => sweep = Some(PathBuf::from(value()?)),
                 "--verify-widths" => verify_widths = true,
                 "--fallback" => fallback = true,
+                "--temperature" => temperature = Some(value()?.parse()?),
+                "--top-p" => top_p = Some(value()?.parse()?),
+                "--seeds" => seeds = value()?.parse()?,
                 "--batch" => batch = Some(token_counts(&arg, &value()?)?),
                 "--follow" => follow = true,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
@@ -231,6 +244,11 @@ mod linux {
             }
         }
         ensure!(steps > 0, "--steps must be positive");
+        ensure!(seeds > 0, "--seeds must be positive");
+        ensure!(
+            temperature.is_some() || top_p.is_none(),
+            "--top-p needs --temperature"
+        );
         ensure!(
             (1..=MAX_PREFILL_CHUNK).contains(&chunk),
             "--chunk takes 1 to {MAX_PREFILL_CHUNK} rows"
@@ -262,6 +280,8 @@ mod linux {
             sweep,
             verify_widths,
             fallback,
+            sampling: temperature.map(|t| (t, top_p.unwrap_or(1.0))),
+            seeds,
             batch,
             follow,
         })
@@ -881,7 +901,7 @@ mod linux {
         use siphon_cuda::{
             Gpu,
             draft::{DraftOptions, read_ranking},
-            model::{DEFAULT_PREFILL_CHUNK, Model, SavedState},
+            model::{DEFAULT_PREFILL_CHUNK, Model, Sampling, SavedState},
             ops::spec::VERIFY_ROWS,
             spec::{
                 DraftSource, Drafts, Speculator, SweepRow, Width, WidthPolicy, load_draft, price,
@@ -1008,6 +1028,9 @@ mod linux {
                     .as_deref()
                     .map_or(DraftSource::Bundled, DraftSource::Dflash);
                 let draft = load_draft(&mut model, &checkpoint, source, capacity, &options)?;
+                if args.sampling.is_some() {
+                    model.enable_sampling()?;
+                }
                 let mut speculator = Speculator::with_draft(&model, draft, width)?;
                 spec(
                     &mut model,
@@ -1142,6 +1165,10 @@ mod linux {
         }
 
         #[expect(clippy::too_many_arguments, reason = "the run's inputs")]
+        #[expect(
+            clippy::too_many_lines,
+            reason = "one run per seed, reported as it goes"
+        )]
         fn spec(
             model: &mut Model,
             speculator: &mut Speculator,
@@ -1152,108 +1179,146 @@ mod linux {
             vocab: u32,
             args: &Args,
         ) -> anyhow::Result<()> {
+            let runs: Vec<Sampling> = match args.sampling {
+                None => vec![Sampling::GREEDY],
+                Some((t, p)) => (0..args.seeds)
+                    .map(|seed| Sampling::new(t, 0, p, 0.0, seed))
+                    .collect::<anyhow::Result<_>>()?,
+            };
             for &context in contexts {
                 let prompt = prompt(text, context, vocab);
-                model.reset()?;
-                let first = speculator.prefill(model, &prompt, DEFAULT_PREFILL_CHUNK)?;
-                let saved = model.save_state()?;
-                let label = set_price(
-                    model,
-                    speculator,
-                    &saved,
-                    rows,
-                    first,
-                    prompt.len(),
-                    args.fallback,
-                )?;
+                let mut rates = Vec::with_capacity(runs.len());
+                for &sampling in &runs {
+                    model.set_sampling(sampling);
+                    model.reset()?;
+                    let first = speculator.prefill(model, &prompt, DEFAULT_PREFILL_CHUNK)?;
+                    let saved = model.save_state()?;
+                    let label = set_price(
+                        model,
+                        speculator,
+                        &saved,
+                        rows,
+                        first,
+                        prompt.len(),
+                        args.fallback,
+                    )?;
 
-                // Plain decode from the same state.
-                let mut plain = Vec::with_capacity(steps);
-                let mut token = first;
-                for _ in 0..args.warmup.min(steps) {
-                    token = model.step(token, None)?;
-                }
-                model.restore_state(&saved)?;
-                token = first;
-                model.stream().synchronize()?;
-                let started = Instant::now();
-                for _ in 0..steps {
-                    token = model.step(token, None)?;
-                    plain.push(token);
-                }
-                let plain_seconds = started.elapsed().as_secs_f64();
-                let plain_clocks = gpu_state()?;
-
-                // Speculation from the same state, after one warmup run that captures the
-                // graphs.
-                model.restore_state(&saved)?;
-                speculator.restart(model, first)?;
-                speculator.generate(model, 16, Drafts::Dspark)?;
-                model.restore_state(&saved)?;
-                speculator.restart(model, first)?;
-                let out = speculator.generate(model, steps, Drafts::Dspark)?;
-                let spec_clocks = gpu_state()?;
-                let stats = speculator.stats();
-                let agree = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
-                let spec_rate = stats.emitted as f64 / stats.wall.as_secs_f64();
-                let plain_rate = steps as f64 / plain_seconds;
-                let per_round =
-                    |d: std::time::Duration| d.as_secs_f64() * 1e3 / stats.rounds as f64;
-                let acceptance: Vec<String> = stats
-                    .acceptance()
-                    .iter()
-                    .map(|a| format!("{:.1}%", a * 100.0))
-                    .collect();
-                println!("context {} tokens, {steps} generated:", prompt.len());
-                println!(
-                    "  plain decode: {plain_rate:.1} tok/s ({:.3} ms per token), SM {} MHz, mem {} MHz",
-                    plain_seconds * 1e3 / steps as f64,
-                    plain_clocks.sm_mhz,
-                    plain_clocks.mem_mhz
-                );
-                println!(
-                    "  speculation {label}: {spec_rate:.1} tok/s ({:.2}x), {} rounds, {:.3} tokens \
-                     and {:.3} verify rows per round, acceptance by position [{}], SM {} MHz, \
-                     mem {} MHz",
-                    spec_rate / plain_rate,
-                    stats.rounds,
-                    stats.tokens_per_round(),
-                    stats.rows_per_round(),
-                    acceptance.join(", "),
-                    spec_clocks.sm_mhz,
-                    spec_clocks.mem_mhz
-                );
-                println!("  rounds by width 1 to 8: {:?}", stats.widths);
-                println!(
-                    "  plain steps: {} of {} tokens, {} probes, {:.3} ms per step",
-                    stats.stepped.len(),
-                    stats.emitted,
-                    stats.probes,
-                    stats.plain.as_secs_f64() * 1e3 / stats.stepped.len().max(1) as f64
-                );
-                println!(
-                    "  per round: {:.3} ms = verify {:.3} + draft {:.3} + host {:.3}",
-                    per_round(stats.wall.saturating_sub(stats.plain)),
-                    per_round(stats.verify),
-                    per_round(stats.draft),
-                    per_round(stats.host())
-                );
-                println!(
-                    "  agreement with plain decode: first {agree} of {steps} tokens{}",
-                    if args.weights == WeightFormat::Fp8 {
-                        " (decode reads FP8 weights)"
-                    } else {
-                        ""
+                    // Plain decode from the same state.
+                    let mut plain = Vec::with_capacity(steps);
+                    let mut token = first;
+                    for _ in 0..args.warmup.min(steps) {
+                        token = model.step(token, None)?;
                     }
-                );
-                if let Some(path) = &args.sweep {
+                    model.restore_state(&saved)?;
+                    token = first;
+                    model.stream().synchronize()?;
+                    let started = Instant::now();
+                    for _ in 0..steps {
+                        token = model.step(token, None)?;
+                        plain.push(token);
+                    }
+                    let plain_seconds = started.elapsed().as_secs_f64();
+                    let plain_clocks = gpu_state()?;
+
+                    // Speculation from the same state, after one warmup run that captures the
+                    // graphs.
                     model.restore_state(&saved)?;
                     speculator.restart(model, first)?;
-                    let (tokens, rows) = speculator.sweep(model, steps)?;
-                    write_sweep(path, prompt.len(), first, &tokens, &rows)?;
+                    speculator.generate(model, 16, Drafts::Dspark)?;
+                    model.restore_state(&saved)?;
+                    speculator.restart(model, first)?;
+                    let out = speculator.generate(model, steps, Drafts::Dspark)?;
+                    let spec_clocks = gpu_state()?;
+                    let stats = speculator.stats();
+                    let agree = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
+                    let spec_rate = stats.emitted as f64 / stats.wall.as_secs_f64();
+                    let plain_rate = steps as f64 / plain_seconds;
+                    let per_round =
+                        |d: std::time::Duration| d.as_secs_f64() * 1e3 / stats.rounds as f64;
+                    let acceptance: Vec<String> = stats
+                        .acceptance()
+                        .iter()
+                        .map(|a| format!("{:.1}%", a * 100.0))
+                        .collect();
+                    rates.push((spec_rate, plain_rate, stats.tokens_per_round()));
+                    if args.sampling.is_some() {
+                        println!("seed {}:", sampling.seed);
+                    }
+                    println!("context {} tokens, {steps} generated:", prompt.len());
+                    println!(
+                        "  plain decode: {plain_rate:.1} tok/s ({:.3} ms per token), SM {} MHz, mem {} MHz",
+                        plain_seconds * 1e3 / steps as f64,
+                        plain_clocks.sm_mhz,
+                        plain_clocks.mem_mhz
+                    );
+                    println!(
+                        "  speculation {label}: {spec_rate:.1} tok/s ({:.2}x), {} rounds, {:.3} tokens \
+                     and {:.3} verify rows per round, acceptance by position [{}], SM {} MHz, \
+                     mem {} MHz",
+                        spec_rate / plain_rate,
+                        stats.rounds,
+                        stats.tokens_per_round(),
+                        stats.rows_per_round(),
+                        acceptance.join(", "),
+                        spec_clocks.sm_mhz,
+                        spec_clocks.mem_mhz
+                    );
+                    println!("  rounds by width 1 to 8: {:?}", stats.widths);
+                    println!(
+                        "  plain steps: {} of {} tokens, {} probes, {:.3} ms per step",
+                        stats.stepped.len(),
+                        stats.emitted,
+                        stats.probes,
+                        stats.plain.as_secs_f64() * 1e3 / stats.stepped.len().max(1) as f64
+                    );
+                    println!(
+                        "  per round: {:.3} ms = verify {:.3} + draft {:.3} + host {:.3}",
+                        per_round(stats.wall.saturating_sub(stats.plain)),
+                        per_round(stats.verify),
+                        per_round(stats.draft),
+                        per_round(stats.host())
+                    );
+                    println!(
+                        "  agreement with plain decode: first {agree} of {steps} tokens{}",
+                        if args.weights == WeightFormat::Fp8 {
+                            " (decode reads FP8 weights)"
+                        } else {
+                            ""
+                        }
+                    );
+                    if let Some(path) = &args.sweep {
+                        model.restore_state(&saved)?;
+                        speculator.restart(model, first)?;
+                        let (tokens, rows) = speculator.sweep(model, steps)?;
+                        write_sweep(path, prompt.len(), first, &tokens, &rows)?;
+                    }
+                }
+                if let Some((t, p)) = args.sampling {
+                    println!(
+                        "context {} tokens, temperature {t}, top-p {p}, median of {} seeds: \
+                         speculation {:.1} tok/s, plain decode {:.1} tok/s, {:.3} tokens per \
+                         round\n",
+                        prompt.len(),
+                        rates.len(),
+                        median(rates.iter().map(|r| r.0)),
+                        median(rates.iter().map(|r| r.1)),
+                        median(rates.iter().map(|r| r.2))
+                    );
                 }
             }
             Ok(())
+        }
+
+        /// The median of `values`, the mean of the middle two for an even count.
+        fn median(values: impl Iterator<Item = f64>) -> f64 {
+            let mut v: Vec<f64> = values.collect();
+            v.sort_by(f64::total_cmp);
+            let n = v.len();
+            if n % 2 == 1 {
+                v[n / 2]
+            } else {
+                f64::midpoint(v[n / 2 - 1], v[n / 2])
+            }
         }
     }
 }
