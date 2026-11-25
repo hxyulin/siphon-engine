@@ -84,6 +84,23 @@ pub struct App {
     pub started: u64,
     /// The sampling of fields a request leaves out.
     pub sampling: SamplingDefaults,
+    /// `--greedy`: every request decodes greedily, whatever its sampling fields ask.
+    pub greedy: bool,
+}
+
+/// The sampling of each of a request's `n` choices. Under `--greedy` every choice would be
+/// the same, so `n` above 1 is refused, as it is for temperature 0.
+fn choice_samplings(
+    app: &App,
+    fields: &SamplingFields,
+    n: usize,
+) -> Result<Vec<Sampling>, ApiError> {
+    if app.greedy && n > 1 {
+        return Err(ApiError::bad_request(format!(
+            "n must be 1 when the server decodes greedily (--greedy), got {n}"
+        )));
+    }
+    Ok(request::samplings(fields, &app.sampling, n)?)
 }
 
 /// Request body bytes allowed per position of the context. A prompt of English text
@@ -400,7 +417,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
         ignore_eos: request.ignore_eos.unwrap_or(false),
-        samplings: request::samplings(&request.sampling, &app.sampling, n)?,
+        samplings: choice_samplings(app, &request.sampling, n)?,
         output: Output::new(
             Decoder::Chat(Parser::new(&app.vocab, &ending)),
             Stops::new(stops),
@@ -675,7 +692,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
         ignore_eos: request.ignore_eos.unwrap_or(false),
-        samplings: request::samplings(&request.sampling, &app.sampling, n)?,
+        samplings: choice_samplings(app, &request.sampling, n)?,
         output: Output::new(
             Decoder::Text(Detokenizer::default()),
             Stops::new(stops),

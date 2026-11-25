@@ -118,13 +118,19 @@ pub fn sampling(
 /// With a request seed `s`, choice `i` gets seed `s + i`, as vLLM's parallel sampling
 /// derives its child requests' seeds (`ParentRequest._get_child_sampling_params` in
 /// `vllm/v1/engine/parallel_sampling.py`). Without one, each choice gets its own random
-/// seed.
+/// seed. Greedy choices would all be the same, so `n` above 1 with temperature 0 is
+/// refused, as vLLM's `SamplingParams` refuses it.
 pub fn samplings(
     fields: &SamplingFields,
     defaults: &SamplingDefaults,
     n: usize,
 ) -> Result<Vec<Sampling>, InvalidRequest> {
     let first = sampling(fields, defaults)?;
+    if n > 1 && first.temperature == 0.0 {
+        return Err(InvalidRequest(format!(
+            "n must be 1 when using greedy sampling, got {n}"
+        )));
+    }
     Ok((0..n)
         .zip(0_u64..)
         .map(|(_, i)| Sampling {
@@ -419,6 +425,10 @@ mod tests {
             .map(|s| s.seed)
             .collect();
         assert_eq!(wrapped, [u64::MAX, 0]);
+        // Greedy choices would be identical: n above 1 is refused, n = 1 is not.
+        let greedy: SamplingFields = serde_json::from_value(json!({"temperature": 0})).unwrap();
+        assert!(samplings(&greedy, &defaults, 2).is_err());
+        assert!(samplings(&greedy, &defaults, 1).is_ok());
         // Without a seed, each choice draws its own.
         let random = parse(json!({}), 3);
         assert_ne!(random[0].seed, random[1].seed);

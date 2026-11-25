@@ -112,7 +112,7 @@ Both routes sample with `temperature`, `top_k`, `top_p`, `min_p` and `seed`, in 
 
 ## Several choices
 
-Both routes take `n`, the number of choices to generate from one prompt, 1 by default. Choice `i` of a request with seed `s` samples with seed `s + i`, as vLLM's parallel sampling seeds its child requests. Choice 0 so gets the tokens the same request with `n: 1` gets. Without a seed, each choice gets its own random seed. Greedy choices are identical. vLLM refuses `n` above 1 with temperature 0; this server returns the identical choices.
+Both routes take `n`, the number of choices to generate from one prompt, 1 by default. Choice `i` of a request with seed `s` samples with seed `s + i`, as vLLM's parallel sampling seeds its child requests. Choice 0 so gets the tokens the same request with `n: 1` gets. Without a seed, each choice gets its own random seed. Greedy choices would all be the same, so `n` above 1 gets a 400 with temperature 0, as in vLLM, and on a server started with `--greedy`.
 
 Each choice runs as its own request in the engine, with its own slot, and has its own `index`, `finish_reason`, `stop_reason`, text, reasoning, tool calls and `token_ids`. Stop strings, `stop_token_ids`, `ignore_eos`, `tool_choice` and the reasoning parser apply to each choice alone. A choice that a stop ends stops generating; the others go on.
 

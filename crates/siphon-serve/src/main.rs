@@ -194,6 +194,7 @@ fn run() -> anyhow::Result<()> {
         api_key,
         started: openai::started(),
         sampling,
+        greedy: args.engine.greedy,
     });
     if app.api_key.is_none() && !args.address.ip().is_loopback() {
         eprintln!(
