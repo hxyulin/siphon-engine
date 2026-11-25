@@ -1,0 +1,12 @@
+[project]
+name = "quickbench"
+version = "0.1.0"
+description = "Quick quality, speed and fidelity benchmark for Siphon and other OpenAI-compatible servers"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface_hub>=0.30",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false

@@ -11,3 +11,6 @@ __pycache__/
 
 # Reference captures are regenerated, not committed.
 /reference/out/
+
+# quickbench keeps its data, captures and runs in ~/.cache/quickbench.
+/quickbench/.venv/

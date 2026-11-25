@@ -1,0 +1,143 @@
+{
+ "measured": "Siphon ca19600, FP8 weights and KV, temperature 1, thinking at the default effort, 2026-11-25. GPQA first attempts capped at 12,288 output tokens, all other attempts at the caps in quality.CAPS. tokens is the median reply length.",
+ "items": [
+  {
+   "id": "gpqa/157",
+   "passes": 1,
+   "attempts": 4,
+   "tokens": 10504
+  },
+  {
+   "id": "gpqa/192",
+   "passes": 1,
+   "attempts": 4,
+   "tokens": 2571
+  },
+  {
+   "id": "gpqa/21",
+   "passes": 1,
+   "attempts": 4,
+   "tokens": 9878
+  },
+  {
+   "id": "gpqa/24",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 11023
+  },
+  {
+   "id": "gpqa/189",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 8905
+  },
+  {
+   "id": "gpqa/7",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 11176
+  },
+  {
+   "id": "gpqa/116",
+   "passes": 2,
+   "attempts": 4,
+   "tokens": 12610
+  },
+  {
+   "id": "gpqa/89",
+   "passes": 1,
+   "attempts": 4,
+   "tokens": 13707
+  },
+  {
+   "id": "aime/22",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 12615
+  },
+  {
+   "id": "code/106",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 613
+  },
+  {
+   "id": "code/11",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 1551
+  },
+  {
+   "id": "code/151",
+   "passes": 1,
+   "attempts": 4,
+   "tokens": 2142
+  },
+  {
+   "id": "code/154",
+   "passes": 2,
+   "attempts": 4,
+   "tokens": 1690
+  },
+  {
+   "id": "code/22",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 1372
+  },
+  {
+   "id": "code/76",
+   "passes": 3,
+   "attempts": 4,
+   "tokens": 7052
+  },
+  {
+   "id": "long/30000/1",
+   "passes": 2,
+   "attempts": 2,
+   "tokens": 1544
+  },
+  {
+   "id": "long/30000/2",
+   "passes": 2,
+   "attempts": 2,
+   "tokens": 1604
+  },
+  {
+   "id": "long/124000/1",
+   "passes": 1,
+   "attempts": 2,
+   "tokens": 3529
+  },
+  {
+   "id": "long/124000/2",
+   "passes": 1,
+   "attempts": 2,
+   "tokens": 2865
+  },
+  {
+   "id": "long/124000/3",
+   "passes": 0,
+   "attempts": 2,
+   "tokens": 4096
+  },
+  {
+   "id": "tool/weather",
+   "passes": 1,
+   "attempts": 1,
+   "tokens": 119
+  },
+  {
+   "id": "tool/flights",
+   "passes": 1,
+   "attempts": 1,
+   "tokens": 161
+  },
+  {
+   "id": "tool/none",
+   "passes": 1,
+   "attempts": 1,
+   "tokens": 75
+  }
+ ]
+}

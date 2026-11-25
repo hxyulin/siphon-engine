@@ -15,6 +15,6 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 
 rsync -a --delete \
     --exclude /target --exclude .pixi --exclude /.git --exclude /reference/.venv \
-    --exclude /reference/out --exclude /experiments --exclude /releases --exclude /.claude \
+    --exclude /reference/out --exclude /quickbench/.venv --exclude /experiments --exclude /releases --exclude /.claude \
     "$root/" "$host:$dir/"
 ssh -o BatchMode=yes "$host" "cd $(printf %q "$dir") && pixi run $(printf '%q ' "$@")"
