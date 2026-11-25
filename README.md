@@ -116,12 +116,14 @@ Prefill runs in chunks of 2,048 rows on tensor-core GEMMs, an expert-grouped MoE
 | 32,768 tokens | 2.11 s | 15,510 |
 | 131,072 tokens | 9.91 s | 13,220 |
 
-Chat clients resend the whole conversation each turn. The server keeps the state of the last prompt at its last multiple of 2,048 tokens. A follow-up turn prefills only its new tokens and gets the same tokens and logits as without the cache. Time to the first token of a follow-up turn over HTTP:
+Chat clients resend the whole conversation each turn. The server keeps the state of recent prompts, one per stream, at their last multiple of 2,048 tokens. A follow-up turn prefills only its new tokens and gets the same tokens and logits as without the cache. Time to the first token of a follow-up turn over HTTP:
 
 | Conversation | Without the cache | With it | Speedup |
 | ---: | ---: | ---: | ---: |
 | 8,174 tokens | 0.53 s | 0.14 s | 3.8x |
 | 102,848 tokens | 7.70 s | 0.10 s | 79x |
+
+With `--streams 8`, eight agent-like conversations at once, each growing from 15K to 53K tokens over nine turns, got their first token after 1.37 s on average instead of 6.25 s, with the same replies (see [engine.md](docs/engine.md#prefix-cache)).
 
 ### Context length
 
@@ -137,13 +139,13 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 ## Features
 
 - **Server.** OpenAI chat completions and completions, with streaming, reasoning (`reasoning_content`), tool calls, `tool_choice`, stop strings, `reasoning_effort`, sampling and several choices per request (`n`) from one prefill. vLLM and TabbyAPI tokenizer routes, and vLLM's `return_token_ids`, `ignore_eos` and `continue_final_message`.
-- **Scheduling.** Continuous batching of up to 8 requests. Speculation for a request that runs alone, and a one-entry prefix cache.
+- **Scheduling.** Continuous batching of up to 8 requests. Speculation for a request that runs alone, and a prefix cache with an entry per stream, for batched and lone requests.
 - **Sampling.** Temperature, top-k, top-p and min-p on the GPU, applied in vLLM's order, with the checkpoint's `generation_config.json` for the fields a request leaves out (temperature 1). Each draw depends only on the logits, the request's seed and the token's position. `temperature: 0` or `--greedy` decodes greedily.
 - **Speculation.** The bundled DSpark draft by default, or Inco AI's DFlash 2 drafter or a 2DSD DFlash export with `--drafter DIR`. `--fallback` runs plain steps where the draft cannot predict the text. It speeds up free prose, but the output can then differ between runs.
 - **Formats.** FP8 dense weights (`--weights fp8`) and an FP8 global KV cache (`--kv fp8`) by default, BF16 for both on request. Prefill can opt in to quantized expert activations and FP8 dense products, which are faster and fail the quality gate on some texts.
 - **Memory planning.** The server checks the planned GPU memory against what it uses after warmup and after each job.
 
-Not yet: the presence, frequency and repetition penalties (accepted and ignored), speculation for more than one request at a time, a prefix cache with more than one entry, and image input.
+Not yet: the presence, frequency and repetition penalties (accepted and ignored), speculation for more than one request at a time, prefix cache entries shared by prompts that agree only in their first tokens, and image input.
 
 ## Build from source
 

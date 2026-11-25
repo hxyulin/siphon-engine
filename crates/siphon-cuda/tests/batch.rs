@@ -340,7 +340,7 @@ fn speculation_returns_after_batch(drafter: Option<&std::path::Path>) -> anyhow:
     let after = spec.stats().tokens_per_round();
 
     let fed: Vec<u32> = b.iter().chain(&got_b[..got_b.len() - 1]).copied().collect();
-    spec.rebuild(&mut model, 2, &fed)?;
+    spec.rebuild(&mut model, 2, 1, &fed)?;
     model.move_slot(1, 0)?;
     spec.resume(&mut model, got_b.last().copied().unwrap_or_default())?;
     got_b.extend(spec.generate(&mut model, 30, Drafts::Dspark)?);

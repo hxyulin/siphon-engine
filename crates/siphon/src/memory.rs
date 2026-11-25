@@ -122,9 +122,9 @@ pub struct PlanInputs<'a> {
     /// Sequence slots, each with its own caches of the capacity, 1 to [`VERIFY_ROWS`].
     /// More than one adds the batched step's buffers.
     pub streams: usize,
-    /// Whether the speculator keeps a prefix cache: copies of one slot's sliding rings and
-    /// conv states and of the draft's rings.
-    pub prefix_cache: bool,
+    /// Entries of the speculator's prefix cache, 0 for none: each copies one slot's
+    /// sliding rings and conv states and the draft's rings.
+    pub prefix_entries: usize,
 }
 
 /// Device bytes of one configuration at one capacity, by what holds them.
@@ -334,7 +334,7 @@ impl Planner {
             0
         };
         let prefix = match &draft {
-            Some((d, _)) if inputs.prefix_cache => slot_rings + draft_ring_bytes(c, d),
+            Some((d, _)) => inputs.prefix_entries * (slot_rings + draft_ring_bytes(c, d)),
             _ => 0,
         };
         let fixed = Plan {

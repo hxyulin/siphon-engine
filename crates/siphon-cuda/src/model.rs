@@ -326,9 +326,12 @@ pub struct Model {
     step_taps: Option<CudaSlice<bf16>>,
     /// Position of the next token.
     position: usize,
-    /// Counts the sequences slot 0 has held: [`Model::reset`], [`Model::restore_state`]
-    /// and [`Model::move_slot`] into it start a new one (see [`LocalState`]).
+    /// The sequence slot 0 holds, unique among all slots' sequences: [`Model::reset`],
+    /// [`Model::restore_state`] and [`Model::move_slot`] into a slot start a new one (see
+    /// [`Model::slot_sequence`]).
     sequence: u64,
+    /// The last sequence number handed out.
+    sequences: u64,
     /// Buffers of [`Model::prefill`], allocated on its first call.
     prefill: Option<prefill::PrefillScratch>,
     /// Buffers of [`Model::verify`], allocated on its first call.
@@ -515,6 +518,7 @@ impl Model {
             step_taps: None,
             position: 0,
             sequence: 0,
+            sequences: 0,
             prefill: None,
             verify: None,
             verify_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
@@ -661,8 +665,14 @@ impl Model {
             }
         }
         self.position = 0;
-        self.sequence += 1;
+        self.sequence = self.new_sequence();
         Ok(())
+    }
+
+    /// A sequence number no slot has held.
+    fn new_sequence(&mut self) -> u64 {
+        self.sequences += 1;
+        self.sequences
     }
 
     /// Every visit's KV cache and conv states, widened to F32, for tests that compare two
@@ -782,7 +792,7 @@ impl Model {
             }
         }
         self.position = state.position;
-        self.sequence += 1;
+        self.sequence = self.new_sequence();
         Ok(())
     }
 

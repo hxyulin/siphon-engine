@@ -45,9 +45,14 @@ use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView, sys::CUevent_fl
 use half::bf16;
 use siphon::Checkpoint;
 
+mod prefix;
+
+use prefix::PrefixCache;
+pub use prefix::PrefixHit;
+
 use crate::{
-    draft::{CONTEXT_ROWS, Draft, DraftOptions, DraftRings, STEPS, WINDOW},
-    model::{Accept, LocalState, Model, PrefillLogits, Sampling, SavedState, VerifyTokens},
+    draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
+    model::{Accept, Model, PrefillLogits, Sampling, SavedState, VerifyTokens},
     ops::{linear::Linear, spec::VERIFY_ROWS},
     weights::{
         dflash::DflashWeights,
@@ -405,8 +410,11 @@ pub struct Speculator {
     stats: SpecStats,
     /// The sequence the draft follows through batched steps, if any.
     batched: Option<Batched>,
-    /// The state of the last prompt's prefix, with [`Self::enable_prefix_cache`].
+    /// The prefix cache, with [`Self::enable_prefix_cache`].
     prefix: Option<PrefixCache>,
+    /// The sequence whose committed positions the draft's global layers hold: changes
+    /// whenever the draft starts a sequence from position 0.
+    draft_sequence: u64,
     /// Called after each verify round, for measurements ([`Self::set_round_hook`]).
     round_hook: Option<RoundHook>,
     /// Whether a sampling request drafts coupled picks ([`Self::set_coupled_drafts`]).
@@ -433,19 +441,6 @@ pub struct RoundRecord<'a> {
 
 /// A callback that sees every verify round.
 pub type RoundHook = Box<dyn FnMut(&RoundRecord<'_>) -> anyhow::Result<()> + Send>;
-
-/// What [`Speculator::prefill_cached`] keeps of the last prompt it prefilled: the state at
-/// the prompt's last chunk boundary below its end. With the global caches of slot 0 and of
-/// the draft, which later tokens do not write below that boundary, it lets the next prompt
-/// that starts with the same tokens prefill only the rest.
-struct PrefixCache {
-    /// The prompt's tokens below the boundary; empty when nothing is kept.
-    tokens: Vec<u32>,
-    /// The prefill chunk the state was prefilled with.
-    chunk: usize,
-    model: LocalState,
-    draft: DraftRings,
-}
 
 /// A sequence that left speculation for batched steps ([`Speculator::follow`]): the draft
 /// holds its state below `start`, and `plain_taps` the taps of the `tokens.len()` rows
@@ -583,6 +578,7 @@ impl Speculator {
             stats: SpecStats::default(),
             batched: None,
             prefix: None,
+            draft_sequence: 0,
             round_hook: None,
             coupled: true,
         })
@@ -649,106 +645,31 @@ impl Speculator {
             model.position() == 0,
             "the speculator prefills from position 0"
         );
+        self.prefill_saving(model, prompt, chunk, None)
+    }
+
+    /// [`Self::prefill`], which also saves the draft's rings into prefix cache entry
+    /// `entry`, whose tokens start `prompt`: prefill then stops at the entry's boundary to
+    /// copy them, which leaves its results as they were.
+    fn prefill_saving(
+        &mut self,
+        model: &mut Model,
+        prompt: &[u32],
+        chunk: usize,
+        entry: Option<usize>,
+    ) -> anyhow::Result<u32> {
         // The draft's global caches now take another sequence.
-        if let Some(cache) = self.prefix.as_mut() {
-            cache.tokens.clear();
-        }
+        self.draft_sequence += 1;
         self.start_prompt(model, prompt)?;
-        let first = self.prefill_rows(model, prompt, chunk)?;
+        let mut start = 0;
+        if let Some(i) = entry {
+            let end = self.entry_len(i);
+            self.prefill_rows(model, &prompt[..end], chunk)?;
+            self.save_entry_rings(model, i)?;
+            start = end;
+        }
+        let first = self.prefill_rows(model, &prompt[start..], chunk)?;
         self.end_prompt(model, prompt.len(), first)
-    }
-
-    /// Keeps a prefix cache for [`Self::prefill_cached`] from now on. Allocates copies of
-    /// slot 0's sliding rings and conv states and of the draft's rings, and returns their
-    /// bytes.
-    pub fn enable_prefix_cache(&mut self, model: &Model) -> anyhow::Result<usize> {
-        let cache = PrefixCache {
-            tokens: Vec::new(),
-            chunk: 0,
-            model: model.local_state()?,
-            draft: self.draft.rings(model.stream())?,
-        };
-        let bytes = cache.model.bytes() + cache.draft.bytes();
-        self.prefix = Some(cache);
-        Ok(bytes)
-    }
-
-    /// Prompt tokens whose state the prefix cache holds, 0 if none.
-    #[must_use]
-    pub fn cached_prefix(&self) -> usize {
-        self.prefix.as_ref().map_or(0, |c| c.tokens.len())
-    }
-
-    /// [`Self::prefill`] of `prompt` into slot 0, whatever it holds, through the prompt
-    /// cache ([`Self::enable_prefix_cache`]). Returns the first anchor and the prompt tokens
-    /// whose state came from the cache.
-    ///
-    /// The cache holds the state of the last prompt this prefilled at that prompt's last
-    /// multiple of `chunk` below its end: slot 0's sliding rings and conv states and the
-    /// draft's rings. When `prompt` is longer and starts with the tokens below that
-    /// boundary, and neither slot 0 nor the draft has taken another sequence since, this
-    /// restores that state and prefills only the rest. The rest is prefilled in the same
-    /// chunks as a whole prompt from position 0, so the results equal [`Self::prefill`]'s
-    /// bit for bit. Then the cache takes `prompt`'s state at its own last boundary.
-    /// Without a cache this prefills the whole prompt.
-    pub fn prefill_cached(
-        &mut self,
-        model: &mut Model,
-        prompt: &[u32],
-        chunk: usize,
-    ) -> anyhow::Result<(u32, usize)> {
-        ensure!(!prompt.is_empty(), "nothing to prefill");
-        let Some(mut cache) = self.prefix.take() else {
-            model.reset()?;
-            return Ok((self.prefill(model, prompt, chunk)?, 0));
-        };
-        let result = self.prefill_through(model, prompt, chunk, &mut cache);
-        self.prefix = Some(cache);
-        result
-    }
-
-    fn prefill_through(
-        &mut self,
-        model: &mut Model,
-        prompt: &[u32],
-        chunk: usize,
-        cache: &mut PrefixCache,
-    ) -> anyhow::Result<(u32, usize)> {
-        // Nothing is kept until the new state is saved, in case this fails midway.
-        let held = std::mem::take(&mut cache.tokens);
-        let start = if !held.is_empty()
-            && cache.chunk == chunk
-            && prompt.len() > held.len()
-            && prompt.starts_with(&held)
-            && model.can_restore_local_state(&cache.model)
-        {
-            held.len()
-        } else {
-            0
-        };
-        self.start_prompt(model, prompt)?;
-        if start > 0 {
-            model.restore_local_state(&cache.model)?;
-            self.draft.restore_rings(model.stream(), &cache.draft)?;
-        } else {
-            model.reset()?;
-        }
-        // The last chunk boundary below the end, so at least one row remains for the
-        // logits. `start` is such a boundary of a shorter prompt, so it is at most this.
-        let boundary = (prompt.len() - 1) / chunk * chunk;
-        if boundary > start {
-            // Prefill splits a chunk only at the end of its tokens, so the chunks match a
-            // prefill of the whole prompt.
-            self.prefill_rows(model, &prompt[start..boundary], chunk)?;
-            model.save_local_state(&mut cache.model)?;
-            self.draft.save_rings(model.stream(), &mut cache.draft)?;
-            cache.tokens = prompt[..boundary].to_vec();
-        } else if start > 0 {
-            cache.tokens = held;
-        }
-        cache.chunk = chunk;
-        let first = self.prefill_rows(model, &prompt[boundary..], chunk)?;
-        Ok((self.end_prompt(model, prompt.len(), first)?, start))
     }
 
     /// Readies the draft for a new prompt: forgets its committed positions and the
@@ -928,22 +849,32 @@ impl Speculator {
         model.set_verify_anchor(anchor)
     }
 
-    /// Builds the draft's state for a sequence that ran without it, whose positions 0 ..
-    /// `tokens.len()` took `tokens`: prefills them with taps into slot `slot`, whose
-    /// sequence is lost, and commits the taps. The draft then follows the sequence from
+    /// Builds the draft's state for a sequence that ran without it in slot `from`, whose
+    /// positions 0 .. `tokens.len()` took `tokens`: prefills them with taps into slot
+    /// `slot`, whose sequence is lost, and commits the taps. The draft then follows the sequence from
     /// the end of `tokens`, for [`Self::resume`]. Prefill sums in other orders than the
     /// verify pass, so the draft gets slightly different taps than speculation would have
     /// committed; that changes its drafts, never the target's tokens.
+    ///
+    /// With a prefix cache, the entry of slot `from`, the slot that holds the sequence,
+    /// also gets the draft's rings when its tokens start `tokens`, so that a later prompt
+    /// that starts with them can speculate from the cache.
     pub fn rebuild(
         &mut self,
         model: &mut Model,
         slot: usize,
+        from: usize,
         tokens: &[u32],
     ) -> anyhow::Result<()> {
+        ensure!(
+            slot != from,
+            "the draft is rebuilt in another slot than the sequence's"
+        );
+        let chunk = crate::model::DEFAULT_PREFILL_CHUNK;
+        // Before the slots swap places in `with_slot`.
+        let entry = self.entry_starting(model, from, tokens, chunk);
         model.reset_slot(slot)?;
-        model.with_slot(slot, |m| {
-            self.prefill(m, tokens, crate::model::DEFAULT_PREFILL_CHUNK)
-        })?;
+        model.with_slot(slot, |m| self.prefill_saving(m, tokens, chunk, entry))?;
         self.batched = Some(Batched {
             start: tokens.len(),
             tokens: Vec::new(),

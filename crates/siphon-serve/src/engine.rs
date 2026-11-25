@@ -16,11 +16,16 @@
 //! the same logits with its own sampling (`Model::redraw_slot`). Each copy then decodes as
 //! if it had prefilled the prompt itself.
 //!
-//! A request that runs alone prefills through the speculator's prefix cache
-//! (`Speculator::prefill_cached`): when its prompt starts with the tokens of the last such
-//! prompt up to that prompt's last multiple of the prefill chunk, it prefills only the
-//! rest. Batched requests prefill whole. Taking slot 0 for another sequence or rebuilding
-//! the draft's state empties the cache.
+//! Every request prefills through the speculator's prefix cache, which keeps one entry per
+//! slot: a prompt's state at its last multiple of the prefill chunk. A request whose prompt
+//! starts with an entry's tokens takes that entry's slot and prefills only the rest. A
+//! batched request otherwise takes a slot without an entry, else the least recently used
+//! one (`Speculator::claim_slot`). A request that runs alone speculates in slot 0, and an
+//! entry it hits moves there (`Speculator::prefill_cached`), when the entry holds the
+//! draft's state too. An entry saved by a batched prefill does not, so a request that hits
+//! one alone runs as a batch of one from the entry's slot, and returns to speculation as a
+//! request left alone by a batch does: by rebuilding the draft's state when enough tokens
+//! remain (`speculate_again`).
 //!
 //! Each request picks its tokens greedily or by sampling with its own [`Sampling`]. A
 //! sampled token depends only on the logits, the request's seed and the token's position
@@ -230,8 +235,10 @@ pub struct Options {
     pub draft: String,
     /// Whether the speculator falls back to plain steps (`WidthPolicy::with_plain`).
     pub fallback: bool,
-    /// Whether requests that run alone prefill through a prefix cache.
-    pub prefix_cache: bool,
+    /// Entries of the prefix cache, 1 to `streams`, or 0 for none.
+    pub prefix_entries: usize,
+    /// How long an unused prefix cache entry lives.
+    pub prefix_ttl: std::time::Duration,
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
@@ -522,7 +529,7 @@ mod cuda {
                 }),
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             streams: options.streams,
-            prefix_cache: options.prefix_cache,
+            prefix_entries: options.prefix_entries,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
@@ -579,9 +586,18 @@ mod cuda {
             eprintln!("serving up to {} requests at once", options.streams);
         }
         drop(saved);
-        if options.prefix_cache {
-            let bytes = speculator.enable_prefix_cache(&model)?;
-            eprintln!("prefix cache: {} MiB of copies", bytes >> 20);
+        if options.prefix_entries > 0 {
+            let bytes = speculator.enable_prefix_cache(
+                &model,
+                options.prefix_entries,
+                options.prefix_ttl,
+            )?;
+            eprintln!(
+                "prefix cache: {} entries, {} MiB of copies, {} s to live",
+                options.prefix_entries,
+                bytes >> 20,
+                options.prefix_ttl.as_secs()
+            );
         }
         // The full chunk's buffers now, so that the check below sees every planned buffer
         // and a plan that undercounts fails here rather than on the first long prompt.
@@ -783,6 +799,27 @@ mod cuda {
                         continue;
                     }
                 }
+                // A prompt whose entry lacks the draft's state prefills from that entry as
+                // a batch of one rather than whole in slot 0.
+                if streams > 1
+                    && speculator
+                        .prefix_lookup(&model, &job.prompt, DEFAULT_PREFILL_CHUNK, &[])
+                        .is_some_and(|hit| !hit.draft)
+                {
+                    waiting.push_front(job);
+                    resumed = batched(
+                        &mut model,
+                        &mut speculator,
+                        Vec::new(),
+                        &mut waiting,
+                        queue,
+                        stop,
+                        streams,
+                        greedy,
+                    );
+                    check.after_job();
+                    continue;
+                }
                 let request = Request::new(job, 0, greedy);
                 if request.done {
                     continue;
@@ -897,16 +934,17 @@ mod cuda {
     const REBUILD_RATIO: usize = 16;
 
     /// Moves a lone request from a batch back to speculation in slot 0: commits the taps
-    /// the draft kept while following it, or rebuilds the draft's state from its tokens in
-    /// a free slot, then moves it to slot 0 if it is elsewhere. Returns false when it
-    /// stays batched: it never ran with the draft and too few tokens remain to rebuild.
+    /// the draft kept while following it, or moves it to slot 0 and rebuilds the draft's
+    /// state from its tokens in an idle slot, which also gives the request's prefix cache
+    /// entry the draft's state. Returns false when it stays batched: it never ran with the
+    /// draft and too few tokens remain to rebuild.
     fn speculate_again(
         model: &mut Model,
         speculator: &mut Speculator,
         r: &mut Request,
-        streams: usize,
     ) -> anyhow::Result<bool> {
         let started = Instant::now();
+        let from = r.slot;
         let position = model.slot_position(r.slot)?;
         let next = r.next.context("the request has no next token")?;
         let how = if r.followed {
@@ -923,15 +961,17 @@ mod cuda {
                 "{} tokens fed, the slot is at {position}",
                 tokens.len()
             );
-            let free = (0..streams)
-                .find(|&s| s != r.slot)
+            // Into slot 0 first, so that the rebuild may take the slot it leaves.
+            speculator.move_to_slot0(model, r.slot)?;
+            r.slot = 0;
+            let free = speculator
+                .idle_slot(model, &[0])
                 .context("no free slot to rebuild the draft in")?;
-            speculator.rebuild(model, free, &tokens)?;
+            speculator.rebuild(model, free, 0, &tokens)?;
             r.followed = true;
             format!("rebuilt the draft in slot {free}")
         };
-        let from = r.slot;
-        model.move_slot(from, 0)?;
+        speculator.move_to_slot0(model, r.slot)?;
         r.slot = 0;
         speculator.resume(model, next)?;
         model.stream().synchronize()?;
@@ -947,7 +987,8 @@ mod cuda {
     /// in its own slot, until none is left or one is left alone. Each turn prefills one
     /// chunk of the oldest request still prefilling, then runs one batched step of the
     /// others. A request left alone with nothing waiting returns, in slot 0, to continue
-    /// with speculation (`speculate_again`).
+    /// with speculation (`speculate_again`). Each request takes its slot from the prefix
+    /// cache (`Speculator::claim_slot`), and prefills from where its entry ends.
     #[expect(clippy::too_many_arguments, reason = "the scheduler's state")]
     fn batched(
         model: &mut Model,
@@ -972,31 +1013,36 @@ mod cuda {
                 if job.events.is_closed() {
                     continue;
                 }
-                // Slot 0 last, since a new sequence there empties the prefix cache.
-                let Some(slot) = (1..streams)
-                    .chain([0])
-                    .find(|s| active.iter().all(|r| r.slot != *s))
-                else {
-                    break;
-                };
-                let mut request = Request::new(job, slot, greedy);
+                let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+                let mut request = Request::new(job, 0, greedy);
                 if request.done {
                     continue;
                 }
-                match model.reset_slot(slot) {
-                    Ok(()) => active.push(request),
+                let prompt = &request.job.prompt;
+                match speculator.claim_slot(model, prompt, DEFAULT_PREFILL_CHUNK, &busy) {
+                    Ok((slot, cached)) => {
+                        request.slot = slot;
+                        request.prefilled = cached;
+                        request.cached = cached;
+                        let _ = request.job.events.send(Event::Cached(cached));
+                        active.push(request);
+                    }
                     Err(e) => request.fail(&e),
                 }
             }
             if active.is_empty() {
                 return None;
             }
+            prefill_chunk(model, speculator, &mut active, stop);
+            // Right after its prefill, a lone request speculates before any batched step,
+            // as it would have from the start.
             if let [r] = active.as_mut_slice()
                 && r.next.is_some()
+                && !r.done
                 && !r.stay_batched
                 && waiting.is_empty()
             {
-                match speculate_again(model, speculator, r, streams) {
+                match speculate_again(model, speculator, r) {
                     Ok(true) => return active.pop(),
                     Ok(false) => {}
                     Err(e) => {
@@ -1004,31 +1050,6 @@ mod cuda {
                         speculator.forget();
                         r.followed = false;
                         r.stay_batched = true;
-                    }
-                }
-            }
-            if let Some(i) = active.iter().position(|r| r.next.is_none()) {
-                let r = &mut active[i];
-                if r.job.events.is_closed() {
-                    r.done = true;
-                } else {
-                    let end = (r.prefilled + DEFAULT_PREFILL_CHUNK).min(r.job.prompt.len());
-                    model.set_sampling(r.sampling);
-                    match model.prefill_slot(
-                        r.slot,
-                        &r.job.prompt[r.prefilled..end],
-                        DEFAULT_PREFILL_CHUNK,
-                    ) {
-                        Ok(first) => {
-                            r.prefilled = end;
-                            if end == r.job.prompt.len() {
-                                r.prefill_s = r.started.elapsed().as_secs_f64();
-                                r.next = Some(first);
-                                r.done = r.take(&[first], stop).is_break();
-                                share_prefill(model, &mut active, i, stop);
-                            }
-                        }
-                        Err(e) => r.fail(&e),
                     }
                 }
             }
@@ -1044,6 +1065,52 @@ mod cuda {
                 }
                 !r.done
             });
+        }
+    }
+
+    /// Prefills one chunk of the oldest request of `active` still prefilling, in its slot,
+    /// and keeps the prompt's state in the prefix cache when the chunk ends at the prompt's
+    /// last multiple of the chunk.
+    fn prefill_chunk(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut [Request],
+        stop: &[u32],
+    ) {
+        let Some(i) = active.iter().position(|r| r.next.is_none()) else {
+            return;
+        };
+        let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+        let r = &mut active[i];
+        if r.job.events.is_closed() {
+            r.done = true;
+            return;
+        }
+        let len = r.job.prompt.len();
+        let end = (r.prefilled + DEFAULT_PREFILL_CHUNK).min(len);
+        let boundary = len.saturating_sub(1) / DEFAULT_PREFILL_CHUNK * DEFAULT_PREFILL_CHUNK;
+        model.set_sampling(r.sampling);
+        let first = match model.prefill_slot(
+            r.slot,
+            &r.job.prompt[r.prefilled..end],
+            DEFAULT_PREFILL_CHUNK,
+        ) {
+            Ok(first) => first,
+            Err(e) => return r.fail(&e),
+        };
+        r.prefilled = end;
+        if end == boundary
+            && end > r.cached
+            && let Err(e) =
+                speculator.save_prefix(model, r.slot, &r.job.prompt, DEFAULT_PREFILL_CHUNK, &busy)
+        {
+            eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+        }
+        if end == len {
+            r.prefill_s = r.started.elapsed().as_secs_f64();
+            r.next = Some(first);
+            r.done = r.take(&[first], stop).is_break();
+            share_prefill(model, active, i, stop);
         }
     }
 

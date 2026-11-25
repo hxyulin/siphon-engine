@@ -30,7 +30,9 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--drafter DIR` | bundled DSpark | Runs Inco AI's DFlash 2 drafter or a 2DSD DFlash export instead. |
 | `--draft` | `fast` | The draft's approximations: `fast`, `fp8`, `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`. |
 | `--fallback` | off | Runs plain steps where no verify width is expected to be faster. It speeds up free prose, but the output can then differ between runs. |
-| `--no-prefix-cache` | cache on | Turns off the prefix cache and gives its 0.2 GiB to the KV cache. |
+| `--no-prefix-cache` | cache on | Turns off the prefix cache and gives its memory, about 0.17 GiB per entry, to the KV cache. |
+| `--prefix-cache-entries N` | `--streams` | Prompts the prefix cache keeps, 1 to `--streams`. |
+| `--prefix-cache-ttl SECONDS` | `600` | Drops a prefix cache entry unused for that long. |
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
 | `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
 
@@ -102,7 +104,7 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS=<context>
 
 Claude Code sends background requests, such as titles and summaries, to its Haiku model, so that name must point at this server too. It assumes a context of 1,048,576 tokens for a model it does not know. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the server's `--context`, or to the `max_model_len` that `/v1/models` lists, so that it compacts the conversation before the prompt overflows.
 
-The [prefix cache](#prefix-cache) holds one prompt. A background request that runs alone and does not start with the conversation's tokens empties the cache, or replaces it with its own prompt. The next turn of the main conversation then prefills its whole prompt again.
+With `--streams 1`, the [prefix cache](#prefix-cache) holds one prompt. A background request that does not start with the conversation's tokens then replaces it with its own prompt, and the next turn of the main conversation prefills its whole prompt again. With `--streams 2` or more, the background request's prompt takes another entry, and the conversation keeps its own.
 
 ## Sampling
 
@@ -156,9 +158,11 @@ A request that arrives at an idle server speculates. When another arrives, the f
 
 ## Prefix cache
 
-Chat clients and agents resend the whole conversation each turn. The server keeps the state of the last prompt that ran alone, at that prompt's last multiple of 2,048 tokens. A request whose prompt starts with those tokens prefills only the rest, and gets the same tokens and logits as without the cache. The usage object reports the reused tokens as `prompt_tokens_details.cached_tokens`.
+Chat clients and agents resend the whole conversation each turn. The server keeps the state of recent prompts, one per stream unless `--prefix-cache-entries` says fewer, each at its last multiple of 2,048 tokens. A request whose prompt starts with one of them prefills only the rest, batched or alone, and gets the same tokens and logits as without the cache. The usage object reports the reused tokens as `prompt_tokens_details.cached_tokens`.
 
-A request that runs batched prefills its whole prompt and leaves the cache alone, unless it takes slot 0 (see [engine.md](engine.md#prefix-cache)). The copies take 171 MiB with the bundled draft and 203 MiB with DFlash 2, whatever the context.
+Each entry belongs to a stream's KV cache, so a request that hits one runs in that stream. A new prompt takes a stream without an entry, else the one whose entry was used least recently, and an entry unused for `--prefix-cache-ttl` seconds is dropped. So up to `--streams` conversations, such as an agent and its parallel subagents, each keep their own history cached between turns. Prompts that share only a beginning, such as two conversations with the same system prompt, do not share an entry.
+
+A request that runs alone speculates. When its entry was saved by a batched request, it lacks the draft's state: the request then prefills from the entry and decodes batched, and rebuilds the draft's state, a prefill of its whole prompt, only when its `max_tokens` leaves more than 1/16 of the position to generate (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context.
 
 ## Building on macOS
 

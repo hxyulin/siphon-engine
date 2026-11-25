@@ -1,5 +1,5 @@
-//! Copies of the per-position state of slot 0 that later tokens overwrite, for a prompt
-//! cache (`Speculator::prefill_cached`).
+//! Copies of the per-position state of a slot that later tokens overwrite, for the prefix
+//! cache (`spec::PrefixCache`).
 //!
 //! Tokens after position `p` write global KV cache slots from `p` on, so the slots below
 //! `p` stay as they were. The sliding rings and the conv states do not: later tokens
@@ -13,17 +13,22 @@ use cudarc::driver::CudaSlice;
 use super::Model;
 use crate::ops::attention::KvData;
 
-/// Slot 0's sliding rings, conv states and position at one point of a sequence, from
-/// [`Model::save_local_state`].
+/// A slot's sliding rings, conv states and position at one point of a sequence, from
+/// [`Model::save_local_state`]. The copies belong to no slot: they can return any slot that
+/// holds the sequence's global caches to that point.
 pub struct LocalState {
     /// Each visit's ring, `None` for a global cache, and its four conv states.
     visits: Vec<(Option<KvData>, Vec<CudaSlice<f32>>)>,
     position: usize,
-    /// [`Model::sequence`] when saved; `None` before the first save.
-    sequence: Option<u64>,
 }
 
 impl LocalState {
+    /// The position the copies were saved at.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
     /// Device bytes the copies take.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -42,7 +47,7 @@ impl LocalState {
 }
 
 impl Model {
-    /// Allocates a [`LocalState`] for slot 0's rings and conv states, holding nothing yet.
+    /// Allocates a [`LocalState`] for a slot's rings and conv states, holding nothing yet.
     pub fn local_state(&self) -> anyhow::Result<LocalState> {
         let stream = &self.ctx.stream;
         let visits = self
@@ -71,12 +76,15 @@ impl Model {
         Ok(LocalState {
             visits,
             position: 0,
-            sequence: None,
         })
     }
 
-    /// Copies slot 0's rings, conv states and position into `state`, on the stream.
-    pub fn save_local_state(&self, state: &mut LocalState) -> anyhow::Result<()> {
+    /// Copies slot `slot`'s rings, conv states and position into `state`, on the stream.
+    pub fn save_local_state(&mut self, slot: usize, state: &mut LocalState) -> anyhow::Result<()> {
+        self.with_slot(slot, |m| m.save_slot0_state(state))
+    }
+
+    fn save_slot0_state(&self, state: &mut LocalState) -> anyhow::Result<()> {
         let stream = &self.ctx.stream;
         ensure!(
             state.visits.len() == self.visits.len(),
@@ -104,24 +112,24 @@ impl Model {
             }
         }
         state.position = self.position;
-        state.sequence = Some(self.sequence);
         Ok(())
     }
 
-    /// Whether [`Model::restore_local_state`] can return slot 0 to `state`: slot 0 still
-    /// holds the sequence `state` was saved from, at `state`'s position or later.
-    #[must_use]
-    pub fn can_restore_local_state(&self, state: &LocalState) -> bool {
-        state.sequence == Some(self.sequence) && self.position >= state.position
+    /// Returns slot `slot` to `state`: copies back its rings and conv states and moves to
+    /// its position. The caller makes sure that the slot holds the sequence `state` was
+    /// saved from, with the same [`Model::slot_sequence`] as when it was saved or copied
+    /// there: its global caches then keep the slots below that position, which the
+    /// sequence wrote before `state` was saved and has not written since.
+    pub fn restore_local_state(&mut self, slot: usize, state: &LocalState) -> anyhow::Result<()> {
+        self.with_slot(slot, |m| m.restore_slot0_state(state))
     }
 
-    /// Returns slot 0 to `state`: copies back its rings and conv states and moves to its
-    /// position. The global caches keep the slots below that position, which the sequence
-    /// wrote before `state` was saved and has not written since.
-    pub fn restore_local_state(&mut self, state: &LocalState) -> anyhow::Result<()> {
+    fn restore_slot0_state(&mut self, state: &LocalState) -> anyhow::Result<()> {
         ensure!(
-            self.can_restore_local_state(state),
-            "slot 0 no longer holds the sequence of the saved state"
+            self.position >= state.position,
+            "the slot is at {}, before the saved state's {}",
+            self.position,
+            state.position
         );
         let stream = &self.ctx.stream;
         for (v, (ring, conv)) in self.visits.iter_mut().zip(&state.visits) {

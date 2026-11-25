@@ -547,23 +547,39 @@ SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test batch -- --i
 
 Chat clients and agents resend the whole conversation each turn. Without a cache, a follow-up turn on 90,607 tokens of history prefills all of them again in 7.6 s. HTTP, the chat template and the tokenizer take about 37 ms of a 97K-token request.
 
-`Speculator::prefill_cached` keeps the state of the last prompt it prefilled, and a prompt that starts with the same tokens prefills only the rest. The state of a sequence at position `p` is:
+The speculator's prefix cache (`crates/siphon-cuda/src/spec/prefix.rs`) keeps the state of recent prompts, one entry per sequence slot, and a prompt that starts with an entry's tokens prefills only the rest. The state of a sequence at position `p` in its slot is:
 
 | State | After later tokens |
 | --- | --- |
-| Global KV caches of slot 0, slots below `p` | Unchanged: later tokens write slots from their own position on |
-| Sliding rings and conv states of slot 0 | Overwritten |
+| Global KV caches of the slot, slots below `p` | Unchanged: later tokens write slots from their own position on |
+| Sliding rings and conv states of the slot | Overwritten |
 | The draft's global caches, positions below `p` | Unchanged: commits and rounds write from the committed position on |
 | The draft's rings | Overwritten |
 | The draft's Markov context, the shortlist's noted tokens, the speculator's prompt tail | Rebuilt by every prefill |
 
-So the cache copies only what later tokens overwrite: slot 0's rings and conv states (`Model::save_local_state`, 164 MiB) and the draft's rings (`Draft::save_rings`, 8 MiB for the bundled draft, 40 MiB for DFlash 2, none for a 2DSD DFlash draft). The global caches stay where they are. A hit restores the copies, and the draft starts committing from the cached position. A miss resets slot 0 and prefills from position 0.
+So an entry copies only what later tokens overwrite: the slot's rings and conv states (`Model::save_local_state`, 164 MiB) and the draft's rings (`Draft::save_rings`, 8 MiB for the bundled draft, 40 MiB for DFlash 2, none for a 2DSD DFlash draft). The global caches stay in the slot. A hit restores the copies into the slot, and the draft starts committing from the cached position. A miss resets a slot and prefills from position 0.
 
 Prefill sums differ with the chunk boundaries, so the copies are taken at a chunk boundary: the last multiple of the prefill chunk (2,048) below the prompt's end, so at least one row remains for the logits. The speculator prefills up to that boundary, saves the copies and prefills the rest. Prefill splits chunks only at the end of its tokens, so both halves run the chunks of one prefill from position 0, and the only extra work is the first half's last-row logits. A later prompt that starts with the cached tokens restores them and prefills from the boundary in the same chunks. Its caches, logits, tokens and drafts equal those of a prefill from position 0 bit for bit. The cost is that a follow-up prefills up to 2,047 tokens of the previous prompt again, plus the previous reply and its own new tokens.
 
-Only the last prompt is kept, and only slot 0's. The copies remember which sequence slot 0 held: `Model::reset`, `restore_state` and a `move_slot` into slot 0 start a new one, and a restore needs slot 0 to hold the same sequence (`Model::can_restore_local_state`). A plain `Speculator::prefill`, and so a `rebuild`, empties the cache, since the draft then holds another sequence. In siphon-serve, a request that runs alone prefills through the cache. A request that joins a batch takes slot 0 only when the other slots are busy, so a batch of up to `--streams` - 1 new requests leaves the cache in place. A request that left speculation for a batch keeps slot 0, and its prompt stays cached.
+An entry belongs to the slot that holds its global caches. It stays live while the slot holds the same sequence: every slot's sequence has a number no other sequence has had (`Model::slot_sequence`), and `Model::reset`, `restore_state` and a `move_slot` into a slot give it a new one. Anything that starts another sequence in a slot so drops its entry, without the cache's help. An entry also dies when unused for its time to live.
 
-`tests/prefix.rs` checks a cached prefill against a prefill from position 0 with the bundled draft and with the drafter in `SIPHON_DFLASH`: the first token's logits, 97 tokens and the draft's acceptance per round must all match. It covers a miss, a hit, a prompt that diverges after the cached boundary, an exact repeat whose remainder is shorter than the 1,024-slot window, a batch beside slot 0, a batch that takes slot 0 and a rebuild. Skipping the restore of slot 0's rings makes the first token's logits differ, and skipping the draft's rings changes the rounds from 16 to 44 with the same tokens:
+The draft keeps one sequence, so not every entry can restore it. An entry holds the draft's rings only when its prompt was prefilled with the draft: alone, in slot 0, or by a rebuild (below). The bundled draft and 2DSD DFlash drafts also have global layers, which hold the positions of the last sequence the draft started from position 0. Their rings are of use only while that sequence is the entry's, which the speculator tracks with a number of its own. DFlash 2 has rings alone, so any entry's rings restore it.
+
+In siphon-serve:
+
+- A batched request takes the slot of the longest live entry its prompt starts with, restores the entry's copies there and prefills from the entry's boundary (`Speculator::claim_slot`). Otherwise it takes a slot without a live entry, slot 0 last, and else the slot of the least recently used entry. Its prefill stops at its own boundary to save its slot's state into the slot's entry (`Speculator::save_prefix`), without the draft's state.
+- A request that runs alone, with an entry that holds the draft's state, speculates in slot 0: the entry moves to slot 0 if it is elsewhere, and slot 0's own entry first moves to a slot without one (`Speculator::move_to_slot0`, a copy of 16 KiB per position with an FP8 cache). Without any entry, slot 0's entry moves aside the same way and slot 0 prefills from position 0. Either way slot 0's entry then takes the prompt's state, with the draft's rings (`Speculator::prefill_cached`).
+- A request that runs alone with an entry that lacks the draft's state prefills from that entry as a batch of one in the entry's slot. Once it has its first token it returns to speculation as any request left alone by a batch does (see [batching.md](batching.md)): it moves to slot 0 and, when enough tokens remain, rebuilds the draft's state by prefilling its tokens again with taps in an idle slot. The rebuild stops at the entry's boundary to give the entry the draft's rings, so the next turn of the same conversation speculates from the cache. Rebuilding is a whole prefill with taps, so the cache saves this request only its time to first token; when too few tokens remain to rebuild, it decodes in one-row batched steps without the prefill.
+
+`--prefix-cache-entries` sets the number of entries, 1 to `--streams`, and `--streams` by default. Fewer entries than slots work the same way: a slot without an entry is free, and a new prompt's state goes to an entry that is not live, else the least recently used one. Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context. The largest FP8/FP8 context per stream on an idle 32 GB RTX 5090, from the memory planner:
+
+| Streams | Bundled, 1 entry | Bundled, an entry per stream | DFlash 2, 1 entry | DFlash 2, an entry per stream |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 633,856 | 633,856 | 701,440 | 701,440 |
+| 4 | 163,840 | 155,648 | 165,888 | 156,672 |
+| 8 | 77,824 | 68,608 | 77,824 | 66,560 |
+
+`tests/prefix.rs` checks cached prefills against prefills from position 0 with the bundled draft, the 2DSD drafter in `SIPHON_DFLASH` and DFlash 2 in `SIPHON_DFLASH2`: the first token's logits, 97 speculated tokens and the draft's acceptance per round, or 17 batched tokens, must all match bit for bit. `prefix_cache_matches_prefill` covers a miss, a hit, a prompt that diverges after the cached boundary, an exact repeat whose remainder is shorter than the 1,024-slot window, a batch beside slot 0, a batch that takes slot 0 and a rebuild. `prefix_cache_entries` runs three conversations of three turns each with four slots: lone turns that alternate between them and each hit their own entry in another slot (the bundled draft through a batch of one and a rebuild, DFlash 2 by moving the entry and its draft rings to slot 0), the same prompts batched with 456-token remainders, a new conversation batched beside a hit, eviction of the least recently used entry, expiry, a slot taken by another conversation and a reset slot. Three negative controls fail: skipping the restore of the slot's rings and conv states changes the first token's logits of the first batched hit; skipping the draft's rings but keeping its committed position changes the bundled draft's rounds from 16 to 43 with the same tokens, and DFlash 2's tokens on the 456-token remainder; skipping the draft's restore whole stops at the draft's check that commits leave no gap.
 
 ```sh
 SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cuda --test prefix -- --ignored --nocapture --test-threads 1
@@ -578,7 +594,21 @@ Time to the first token of a follow-up chat turn through the HTTP API, FP8 weigh
 | 90,607 | 90,112 | 7.63 s | 0.11 s | 495 tokens |
 | 101,718 | 100,352 | 8.81 s | 0.20 s | 1,366 tokens |
 
-More entries would help several conversations that alternate. Each entry needs its own global caches, which slot 0 provides for the one entry. With `--streams` above 1 the idle slots could hold more entries, moved to slot 0 on a hit (`Model::move_slot`, 16 KiB per position with an FP8 cache).
+Agent swarms run several conversations at once, and each turn of each one resends its history. A client ran 4 conversations against `--streams 4`, then 8 against `--streams 8`, all at once, with `--context 65536`, FP8 weights and cache, the bundled draft, under the GPU lock with no other compute process. Each conversation starts with about 15K tokens of the repo's files as a user message. Each turn asks for a reply of at most 384 tokens at temperature 1 with a seed fixed by conversation and turn, at `reasoning_effort` low, and the next turn adds the reply, with its reasoning, and about 4,700 tokens of other files, after 0.5 s. Nine turns take each history to about 53K tokens. Replies averaged 161 and 169 tokens. Every reply was identical with the cache on and off, 36 of 36 and 72 of 72. Median time to first token over the conversations at each turn:
+
+| Turn | Prompt | Cached | 4 streams, without | 4 streams, with | 8 streams, without | 8 streams, with |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 15,450 | 0 | 2.43 s | 2.42 s | 4.64 s | 4.50 s |
+| 1 | 20,327 | 14,336 | 1.99 s | 0.52 s | 2.47 s | 0.65 s |
+| 2 | 25,281 | 18,432 | 2.45 s | 0.45 s | 3.99 s | 0.91 s |
+| 3 | 29,944 | 24,576 | 3.95 s | 0.77 s | 6.39 s | 0.79 s |
+| 4 | 34,742 | 28,672 | 6.15 s | 0.64 s | 7.87 s | 0.93 s |
+| 5 | 39,256 | 33,792 | 6.63 s | 0.94 s | 5.19 s | 0.62 s |
+| 6 | 44,144 | 38,912 | 4.61 s | 0.56 s | 6.70 s | 1.24 s |
+| 7 | 48,429 | 43,008 | 8.33 s | 0.63 s | 7.15 s | 1.09 s |
+| 8 | 53,246 | 47,104 | 5.10 s | 0.94 s | 9.80 s | 1.00 s |
+
+The prompt and cached columns are the 8-stream run's medians; the 4-stream run's are within 1,000 tokens. The mean time to first token fell from 4.81 to 0.91 s at 4 streams and from 6.25 to 1.37 s at 8, and 80% of the prompt tokens came from the cache. All turns took 29.8 s instead of 96.4 s at 4 streams (195 against 60 tok/s of replies) and 52.8 s instead of 186.9 s at 8 (231 against 65 tok/s). With short replies the prefill dominates, so the reply rate moves with it. A new prompt prefills up to 2,047 tokens of the previous one again, plus the previous reply and its new tokens. The server's memory check stayed under the plan: a peak of 30,224 MiB against 30,261 MiB planned at 8 streams. A lone request in these runs hit an entry saved by a batch, and with 384 tokens left it decoded batched rather than rebuild the draft.
 
 ## Benchmarks and profiling
 

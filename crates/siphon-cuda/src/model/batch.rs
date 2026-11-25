@@ -41,7 +41,8 @@ pub const BATCH_ROWS: usize = VERIFY_ROWS;
 pub(super) struct Slot {
     visits: Vec<VisitState>,
     position: usize,
-    /// [`Model::sequence`] while the slot stands in for slot 0 ([`Model::with_slot`]).
+    /// The slot's [`Model::slot_sequence`], swapped with slot 0's while the slot stands in
+    /// for it ([`Model::with_slot`]).
     sequence: u64,
 }
 
@@ -133,10 +134,11 @@ impl Model {
                 .iter()
                 .map(|v| empty_like(&stream, v))
                 .collect::<anyhow::Result<_>>()?;
+            let sequence = self.new_sequence();
             self.slots.push(Slot {
                 visits,
                 position: 0,
-                sequence: 0,
+                sequence,
             });
         }
         Ok(())
@@ -146,6 +148,17 @@ impl Model {
     #[must_use]
     pub fn slots(&self) -> usize {
         self.slots.len() + 1
+    }
+
+    /// The sequence slot `slot` holds: a number that changes whenever the slot starts
+    /// another sequence ([`Model::reset_slot`], [`Model::restore_state`], a
+    /// [`Model::move_slot`] into it), and that no other slot's sequence has had. While it
+    /// stays the same, the slot's global caches keep every position below its position.
+    pub fn slot_sequence(&self, slot: usize) -> anyhow::Result<u64> {
+        if slot == 0 {
+            return Ok(self.sequence);
+        }
+        Ok(self.slot(slot)?.sequence)
     }
 
     /// Position of the next token of slot `slot`.
@@ -234,11 +247,14 @@ impl Model {
                 stream.memcpy_dtod(from, to)?;
             }
         }
+        let sequence = self.new_sequence();
         if to == 0 {
             self.position = position;
-            self.sequence += 1;
+            self.sequence = sequence;
         } else {
-            self.slots[to - 1].position = position;
+            let slot = &mut self.slots[to - 1];
+            slot.position = position;
+            slot.sequence = sequence;
         }
         Ok(())
     }

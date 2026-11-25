@@ -18,7 +18,8 @@ use serde_json::json;
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
-                     [--fallback] [--no-prefix-cache] [--prefill-attention auto|bf16|fp8] [--greedy]
+                     [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
+                     [--prefill-attention auto|bf16|fp8] [--greedy]
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
@@ -35,9 +36,11 @@ and shortlist.
 --fallback runs plain steps where no verify width is expected to be faster. It speeds up
 free prose, but where it steps depends on timings measured at startup, so the output can
 differ between runs.
---no-prefix-cache turns off the prefix cache. The cache keeps the state of the last prompt
-that ran alone at its last multiple of 2,048 tokens, and a request whose prompt starts with
-those tokens prefills only the rest. It costs about 0.2 GiB, whatever the context.
+--no-prefix-cache turns off the prefix cache. The cache keeps the state of recent prompts at
+their last multiple of 2,048 tokens, one per stream, and a request whose prompt starts with
+one of them prefills only the rest. Each entry costs about 0.17 GiB, 0.2 GiB with DFlash 2,
+whatever the context. --prefix-cache-entries keeps fewer entries than --streams, to leave
+more memory for the context. --prefix-cache-ttl drops an entry unused for that many seconds.
 --prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
@@ -77,6 +80,8 @@ fn args() -> anyhow::Result<Args> {
     let mut draft = "fast".to_owned();
     let mut fallback = false;
     let mut prefix_cache = true;
+    let mut prefix_entries = None;
+    let mut prefix_ttl = 600;
     let mut prefill_attention = "auto".to_owned();
     let mut greedy = false;
     let mut it = env::args().skip(1);
@@ -108,6 +113,8 @@ fn args() -> anyhow::Result<Args> {
             "--draft" => draft = value()?,
             "--fallback" => fallback = true,
             "--no-prefix-cache" => prefix_cache = false,
+            "--prefix-cache-entries" => prefix_entries = Some(value()?.parse()?),
+            "--prefix-cache-ttl" => prefix_ttl = value()?.parse()?,
             "--prefill-attention" => prefill_attention = value()?,
             "--greedy" => greedy = true,
             "--widths" => {
@@ -145,7 +152,12 @@ fn args() -> anyhow::Result<Args> {
             drafter,
             draft,
             fallback,
-            prefix_cache,
+            prefix_entries: if prefix_cache {
+                entries(prefix_entries, streams)?
+            } else {
+                0
+            },
+            prefix_ttl: std::time::Duration::from_secs(prefix_ttl),
             prefill_attention,
             greedy,
         },
@@ -153,6 +165,16 @@ fn args() -> anyhow::Result<Args> {
         address,
         name,
     })
+}
+
+/// The prefix cache's entries: `--prefix-cache-entries`, 1 to `streams`, or `streams`.
+fn entries(entries: Option<usize>, streams: usize) -> anyhow::Result<usize> {
+    let entries = entries.unwrap_or(streams);
+    ensure!(
+        (1..=streams).contains(&entries),
+        "--prefix-cache-entries takes 1 to --streams, {streams}"
+    );
+    Ok(entries)
 }
 
 fn fp8(format: &str) -> anyhow::Result<bool> {

@@ -1046,6 +1046,14 @@ impl Draft {
         }
     }
 
+    /// Whether the draft has global layers, whose caches hold every committed position of
+    /// one sequence. [`DraftRings`] can then return the draft only to a sequence whose
+    /// positions those caches still hold.
+    #[must_use]
+    pub fn has_global_layers(&self) -> bool {
+        self.caches.iter().any(|c| c.slots >= self.capacity)
+    }
+
     /// Allocates a [`DraftRings`] for the sliding rings, holding nothing yet.
     pub fn rings(&self, stream: &Arc<CudaStream>) -> anyhow::Result<DraftRings> {
         let caches = self

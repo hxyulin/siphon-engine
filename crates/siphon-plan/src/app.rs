@@ -106,7 +106,7 @@ impl App {
                             },
                             prefill_chunk: PREFILL_CHUNK,
                             streams: 1,
-                            prefix_cache: true,
+                            prefix_entries: 1,
                         })
                         .with_context(|| format!("planning with the {} draft", draft.name()))?;
                         Ok(Config {
