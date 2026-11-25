@@ -7,6 +7,7 @@
 //!   `return_token_ids`.
 //! - `POST /v1/completions`, streaming or not: a text prompt or token ids, with `stop` and
 //!   `return_token_ids`.
+//! - `GET /metrics`, which needs no API key: Prometheus metrics ([`crate::metrics`]).
 //! - `GET /v1/models` and `GET /v1/models/{id}`, with `max_model_len`.
 //! - The tokenizer routes of [`crate::tokenize`].
 //! - `GET /health` and `GET /version`, which need no API key.
@@ -16,7 +17,9 @@
 //! ([`crate::request::sampling`]); `temperature` 0 decodes greedily. The penalties are
 //! accepted and ignored. [`crate::request`] lists the fields the server refuses, such as
 //! `logprobs` and `n` above 1. Stop strings match the reply's content,
-//! not its reasoning or tool calls, and a choice reports the one that matched as vLLM's
+//! not its reasoning or tool calls. Both routes take vLLM's `stop_token_ids`: the output
+//! ends at the first of them, whose id the output keeps and whose text it leaves out, as
+//! vLLM does. A choice reports the stop string or stop token that matched as vLLM's
 //! `stop_reason`.
 
 use std::{
@@ -47,6 +50,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     chat::{self, Ending, InvalidRequest, Vocab},
     engine::{Engine, Event, Finish, Job, Refused, Sampling},
+    metrics::{Metrics, Reason, Tracker},
     parse::{Delta, Detokenizer, Parser, ToolCall},
     request::{self, SamplingDefaults, SamplingFields, ToolChoice},
     stop::Stops,
@@ -56,6 +60,7 @@ use crate::{
 pub struct App {
     pub vocab: Vocab,
     pub engine: Engine,
+    pub metrics: Arc<Metrics>,
     /// The model id that `/v1/models` lists and responses report.
     pub name: String,
     /// The bearer token every route but `/health` and `/version` must carry, if set.
@@ -86,6 +91,7 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(DefaultBodyLimit::max(body_limit))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize))
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(metrics_route))
         .route(
             "/version",
             get(|| async { Json(json!({"version": env!("CARGO_PKG_VERSION")})) }),
@@ -178,6 +184,17 @@ fn model_card(app: &App) -> Value {
     })
 }
 
+async fn metrics_route(State(app): State<Arc<App>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        app.metrics.render(),
+    )
+        .into_response()
+}
+
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!({"object": "list", "data": [model_card(&app)]}))
 }
@@ -256,6 +273,7 @@ struct ChatRequest {
     chat_template_kwargs: Option<Value>,
     n: Option<u64>,
     stop: Option<Value>,
+    stop_token_ids: Option<Vec<Value>>,
     response_format: Option<Value>,
     /// vLLM's extensions.
     continue_final_message: Option<bool>,
@@ -313,6 +331,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     request::one_choice("n", request.n)?;
     request::response_format(request.response_format.as_ref())?;
     let stops = request::stops(request.stop.as_ref())?;
+    let stop_ids = tokenize::token_ids(&app.vocab, &request.stop_token_ids.unwrap_or_default())?;
     let ending = request::ending(
         request.continue_final_message,
         request.add_generation_prompt,
@@ -377,6 +396,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
         output: Output::new(
             Decoder::Chat(Parser::new(&app.vocab, &ending)),
             Stops::new(stops),
+            stop_ids,
             calls,
         ),
     })
@@ -411,15 +431,16 @@ fn max_tokens(
     }
 }
 
-/// Queues a job and returns the channel its events arrive on.
+/// Queues a job and returns its events.
 fn submit(
     app: &App,
     prompt: Vec<u32>,
     max_tokens: usize,
     ignore_eos: bool,
     sampling: Sampling,
-) -> Result<mpsc::UnboundedReceiver<Event>, ApiError> {
-    let (events, results) = mpsc::unbounded_channel();
+) -> Result<Results, ApiError> {
+    let (events, receiver) = mpsc::unbounded_channel();
+    let prompt_len = prompt.len();
     app.engine
         .submit(Job {
             prompt,
@@ -435,15 +456,48 @@ fn submit(
             ),
             Refused::Stopped => ApiError::internal("the engine has stopped"),
         })?;
-    Ok(results)
+    Ok(Results {
+        receiver,
+        tracker: app.metrics.track(prompt_len),
+    })
 }
 
-/// The next event of a job, with a closed channel as a failure.
-async fn next(results: &mut mpsc::UnboundedReceiver<Event>) -> Event {
-    results
-        .recv()
-        .await
-        .unwrap_or_else(|| Event::Failed("the engine dropped the request".to_owned()))
+/// One job's events, recorded in the metrics as they arrive. Dropping it cancels the job,
+/// and counts it as aborted unless it finished.
+struct Results {
+    receiver: mpsc::UnboundedReceiver<Event>,
+    tracker: Tracker,
+}
+
+impl Results {
+    /// The next event, with a closed channel as a failure.
+    async fn next(&mut self) -> Event {
+        let event = self
+            .receiver
+            .recv()
+            .await
+            .unwrap_or_else(|| Event::Failed("the engine dropped the request".to_owned()));
+        match &event {
+            Event::Started => self.tracker.started(),
+            Event::Cached(n) => self.tracker.cached(*n),
+            Event::Tokens(ids) => self.tracker.tokens(ids.len()),
+            Event::Done(finish) => self.tracker.finish(reason(*finish)),
+            Event::Failed(_) => self.tracker.finish(Reason::Error),
+        }
+        event
+    }
+
+    /// Ends the job with `finish`, which a stop the output matched may have set first.
+    fn close(mut self, finish: Finish) {
+        self.tracker.finish(reason(finish));
+    }
+}
+
+fn reason(finish: Finish) -> Reason {
+    match finish {
+        Finish::Stop => Reason::Stop,
+        Finish::Length => Reason::Length,
+    }
 }
 
 async fn chat_completions(
@@ -464,6 +518,7 @@ struct CompletionRequest {
     n: Option<u64>,
     best_of: Option<u64>,
     stop: Option<Value>,
+    stop_token_ids: Option<Vec<Value>>,
     return_token_ids: Option<bool>,
     ignore_eos: Option<bool>,
     #[serde(flatten)]
@@ -477,6 +532,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
     request::one_choice("n", request.n)?;
     request::one_choice("best_of", request.best_of)?;
     let stops = request::stops(request.stop.as_ref())?;
+    let stop_ids = tokenize::token_ids(&app.vocab, &request.stop_token_ids.unwrap_or_default())?;
     let prompt = match request.prompt {
         Value::String(text) => app.vocab.encode(&text),
         Value::Array(items) if items.iter().all(Value::is_u64) => {
@@ -507,6 +563,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
         output: Output::new(
             Decoder::Text(Detokenizer::default()),
             Stops::new(stops),
+            stop_ids,
             Calls::Free,
         ),
     })
@@ -550,7 +607,8 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
     }
     let mut message = Delta::default();
     let finish = loop {
-        match next(&mut results).await {
+        match results.next().await {
+            Event::Started => {}
             Event::Cached(n) => reply.cached_tokens = n,
             Event::Tokens(ids) => {
                 append(&mut message, output.push(&app.vocab, &ids));
@@ -563,7 +621,7 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
         }
     };
     // Ends the job if a stop string ended the output first.
-    drop(results);
+    results.close(finish);
     append(&mut message, output.finish(&app.vocab, finish));
     let mut choice = reply.choice(message);
     choice["finish_reason"] = json!(output.finish_reason(finish));
@@ -605,10 +663,14 @@ enum Calls {
     Only,
 }
 
-/// One job's output on its way to the client, cut at the first stop string.
+/// One job's output on its way to the client, cut at the first stop string or stop token.
 struct Output {
     decoder: Decoder,
     stops: Stops,
+    /// vLLM's `stop_token_ids`.
+    stop_ids: Vec<u32>,
+    /// The stop token that ended the output.
+    stopped_by: Option<u32>,
     /// The generated ids the output took, then the turn's end token if the model ended it,
     /// as vLLM returns them. The engine does not say which end token it saw, so this is
     /// always `<|content_model_end_sampling|>`.
@@ -617,15 +679,17 @@ struct Output {
     tokens: usize,
     limit: Calls,
     calls: usize,
-    /// Whether a stop string or `limit` ended the output before the job did.
+    /// Whether a stop string, a stop token or `limit` ended the output before the job did.
     done: bool,
 }
 
 impl Output {
-    fn new(decoder: Decoder, stops: Stops, limit: Calls) -> Self {
+    fn new(decoder: Decoder, stops: Stops, stop_ids: Vec<u32>, limit: Calls) -> Self {
         Self {
             decoder,
             stops,
+            stop_ids,
+            stopped_by: None,
             ids: Vec::new(),
             tokens: 0,
             limit,
@@ -643,6 +707,15 @@ impl Output {
             }
             self.ids.push(id);
             self.tokens += 1;
+            if self.stop_ids.contains(&id) {
+                // The token ends the output without its text, as an end token would.
+                self.end(vocab, &mut out);
+                if !self.done {
+                    self.stopped_by = Some(id);
+                    self.done = true;
+                }
+                break;
+            }
             let delta = match &mut self.decoder {
                 Decoder::Chat(parser) => parser.push(vocab, &[id]),
                 Decoder::Text(text) => Delta {
@@ -661,6 +734,16 @@ impl Output {
         if self.done {
             return out;
         }
+        self.end(vocab, &mut out);
+        if !self.done && finish == Finish::Stop {
+            self.ids.push(vocab.special.content_model_end_sampling);
+        }
+        out
+    }
+
+    /// Adds to `out` what the decoder and the stop strings held back, which can still
+    /// match a stop string.
+    fn end(&mut self, vocab: &Vocab, out: &mut Delta) {
         let delta = match &mut self.decoder {
             Decoder::Chat(parser) => parser.finish(vocab),
             Decoder::Text(text) => Delta {
@@ -668,14 +751,10 @@ impl Output {
                 ..Delta::default()
             },
         };
-        self.take(delta, &mut out);
+        self.take(delta, out);
         if !self.done {
             out.content += &self.stops.flush();
-            if finish == Finish::Stop {
-                self.ids.push(vocab.special.content_model_end_sampling);
-            }
         }
-        out
     }
 
     /// Cuts `delta` at a stop string or where `limit` ends the output, and adds it to `out`.
@@ -713,9 +792,13 @@ impl Output {
         }
     }
 
-    /// vLLM's `stop_reason`: the stop string that matched, or null.
+    /// vLLM's `stop_reason`: the stop string or the stop token's id that matched, or null.
     fn stop_reason(&self) -> Value {
-        self.stops.matched().map_or(Value::Null, |s| json!(s))
+        match (self.stops.matched(), self.stopped_by) {
+            (Some(stop), _) => json!(stop),
+            (None, Some(id)) => json!(id),
+            (None, None) => Value::Null,
+        }
     }
 
     fn reasoning_tokens(&self) -> usize {
@@ -918,7 +1001,7 @@ fn attach_ids(reply: &Reply, choices: &mut Vec<Value>, ids: &[u32]) {
 /// `results`, which cancels the job: when the client has left or a stop string matched.
 async fn stream(
     app: Arc<App>,
-    mut results: mpsc::UnboundedReceiver<Event>,
+    mut results: Results,
     mut output: Output,
     mut chunks: Chunks,
     include_usage: bool,
@@ -934,7 +1017,8 @@ async fn stream(
     // Ids already sent as `token_ids`.
     let mut sent = 0;
     let finish = loop {
-        let delta = match next(&mut results).await {
+        let delta = match results.next().await {
+            Event::Started => continue,
             Event::Cached(n) => {
                 chunks.reply.cached_tokens = n;
                 continue;
@@ -955,9 +1039,11 @@ async fn stream(
             break Ok(Finish::Stop);
         }
     };
-    drop(results);
     let finish = match finish {
-        Ok(finish) => finish,
+        Ok(finish) => {
+            results.close(finish);
+            finish
+        }
         Err(message) => {
             let error = json!({"error": {"message": message, "type": "server_error", "param": null, "code": null}});
             let _ = chunks.raw(error.to_string()).await;
@@ -1030,6 +1116,7 @@ mod tests {
         Output::new(
             Decoder::Chat(Parser::new(vocab, &Ending::Generate)),
             Stops::new(stops.iter().map(|&s| s.to_owned()).collect()),
+            Vec::new(),
             limit,
         )
     }
@@ -1073,6 +1160,7 @@ mod tests {
         let raw = Output::new(
             Decoder::Text(Detokenizer::default()),
             Stops::new(vec!["<|end_message|>".to_owned()]),
+            Vec::new(),
             Calls::Free,
         );
         let (all, output) = run(&vocab, raw, &ids);
@@ -1081,6 +1169,62 @@ mod tests {
             "<|content_thinking|>Think. STOP here is reasoning."
         );
         assert_eq!(output.stop_reason(), json!("<|end_message|>"));
+    }
+
+    #[test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    fn stop_tokens_end_the_output_without_their_text() {
+        let vocab = vocab();
+        let s = vocab.special;
+        let mut ids = vec![s.content_thinking];
+        ids.extend(vocab.encode("Plan."));
+        ids.extend([s.end_message, s.message_model, s.content_text]);
+        let text = vocab.encode("One, two, three.");
+        let comma = vocab.encode(",")[0];
+        assert!(text.contains(&comma), "a comma is its own token here");
+        ids.extend(&text);
+        ids.push(s.end_message);
+        let with_stops = |strings: &[&str], stop_ids: Vec<u32>| {
+            let mut output = chat_output(&vocab, strings, Calls::Free);
+            output.stop_ids = stop_ids;
+            output
+        };
+
+        // The first stop token ends the output; its id stays, its text goes.
+        let (all, output) = run(&vocab, with_stops(&[], vec![comma]), &ids);
+        assert_eq!(all.reasoning, "Plan.");
+        assert_eq!(all.content, "One");
+        assert_eq!(output.stop_reason(), json!(comma));
+        assert_eq!(output.finish_reason(Finish::Stop), "stop");
+        assert_eq!(output.ids.last(), Some(&comma));
+        assert_eq!(output.tokens, output.ids.len());
+
+        // Text held back for a stop string comes out when a stop token ends the output.
+        let (all, output) = run(&vocab, with_stops(&["One, t"], vec![comma]), &ids);
+        assert_eq!(all.content, "One");
+        assert_eq!(output.stop_reason(), json!(comma));
+
+        // A stop string that ends first wins.
+        let (all, output) = run(&vocab, with_stops(&["ne"], vec![comma]), &ids);
+        assert_eq!(all.content, "O");
+        assert_eq!(output.stop_reason(), json!("ne"));
+
+        // A special token can be a stop token, in chat and raw text.
+        let (all, output) = run(&vocab, with_stops(&[], vec![s.end_message]), &ids);
+        assert_eq!(
+            (all.reasoning.as_str(), all.content.as_str()),
+            ("Plan.", "")
+        );
+        assert_eq!(output.stop_reason(), json!(s.end_message));
+        let raw = Output::new(
+            Decoder::Text(Detokenizer::default()),
+            Stops::default(),
+            vec![s.end_message],
+            Calls::Free,
+        );
+        let (all, output) = run(&vocab, raw, &ids);
+        assert_eq!(all.content, "<|content_thinking|>Plan.");
+        assert_eq!(output.ids.len(), vocab.encode("Plan.").len() + 2);
     }
 
     #[test]
@@ -1115,7 +1259,12 @@ mod tests {
         ids.extend(vocab.encode("Why did I call that?"));
         for ending in [Ending::Call("get_weather"), Ending::AnyCall] {
             let parser = Parser::new(&vocab, &ending);
-            let forced = Output::new(Decoder::Chat(parser), Stops::default(), Calls::Only);
+            let forced = Output::new(
+                Decoder::Chat(parser),
+                Stops::default(),
+                Vec::new(),
+                Calls::Only,
+            );
             let (all, output) = run(&vocab, forced, &ids);
             assert_eq!(all.tool_calls.len(), 2);
             assert_eq!(all.tool_calls[0].name, "get_weather");
@@ -1128,6 +1277,7 @@ mod tests {
         let continued = Output::new(
             Decoder::Chat(Parser::new(&vocab, &Ending::Continue)),
             Stops::default(),
+            Vec::new(),
             Calls::Free,
         );
         let mut ids = vocab.encode("    return 1");

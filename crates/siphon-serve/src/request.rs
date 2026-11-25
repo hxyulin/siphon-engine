@@ -130,10 +130,6 @@ const REFUSED: &[(&str, &str)] = &[
     ("suffix", "suffix is not supported"),
     ("logit_bias", "logit_bias is not supported"),
     ("min_tokens", "min_tokens is not supported"),
-    (
-        "stop_token_ids",
-        "stop_token_ids is not supported; send stop strings",
-    ),
     ("bad_words", "bad_words is not supported"),
     ("allowed_token_ids", "allowed_token_ids is not supported"),
     (

@@ -34,7 +34,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
 | `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
 
-With `SIPHON_API_KEY` set, every route but `/health` and `/version` needs `Authorization: Bearer <key>`.
+With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` needs `Authorization: Bearer <key>`.
 
 ## Routes
 
@@ -46,6 +46,7 @@ With `SIPHON_API_KEY` set, every route but `/health` and `/version` needs `Autho
 | `POST /v1/token/encode`, `POST /v1/token/decode` | TabbyAPI's shape: `{"text"}`, a string or messages, to `{"tokens", "length"}`, and `{"tokens"}` to `{"text"}`. |
 | `GET /v1/models`, `GET /v1/models/{id}` | The served model, with `max_model_len`. |
 | `GET /health`, `GET /version` | No API key needed. |
+| `GET /metrics` | Prometheus metrics under vLLM's names, so tools written for vLLM read them. No API key needed. See [Metrics](#metrics). |
 
 ## Chat request fields
 
@@ -54,11 +55,12 @@ With `SIPHON_API_KEY` set, every route but `/health` and `/version` needs `Autho
 - `stop`: a string or an array of strings. Stop strings match the reply's content, not its thinking or tool calls. While streaming, text that could still begin a stop string is held back. The reply is cut before the match and finishes with `stop`.
 - vLLM's extensions:
   - `return_token_ids` adds `prompt_token_ids` and each choice's `token_ids`, streaming or not. The ids end with `<|content_model_end_sampling|>` when the model ended its turn.
-  - Each choice has `stop_reason`: the stop string that matched, or null.
+  - `stop_token_ids`: token ids that end the reply. As in vLLM, the reply keeps the stop token's id in `token_ids` and leaves its text out, and the choice finishes with `stop`. The check runs on the server's output, so the engine generates one more round before it stops.
+  - Each choice has `stop_reason`: the stop string that matched, the stop token's id, or null.
   - `ignore_eos` generates `max_tokens` tokens and passes the model's end tokens on as output, for benchmarks.
   - `continue_final_message` with `add_generation_prompt: false` continues the last assistant message.
 
-Raw completions take `stop`, `return_token_ids` and `ignore_eos` too. A text prompt, like the text sent to the tokenizer routes, is encoded with special-token spellings as plain text and nothing added; send token ids to use special tokens. Decoding keeps special tokens.
+Raw completions take `stop`, `stop_token_ids`, `return_token_ids` and `ignore_eos` too. A text prompt, like the text sent to the tokenizer routes, is encoded with special-token spellings as plain text and nothing added; send token ids to use special tokens. Decoding keeps special tokens.
 
 ## Sampling
 
@@ -70,7 +72,23 @@ Both routes sample with `temperature`, `top_k`, `top_p`, `min_p` and `seed`, in 
 
 The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) and other sampling fields are accepted and ignored. So are `user`, `skip_special_tokens` and unknown fields.
 
-Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `min_tokens`, `stop_token_ids`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`.
+Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `min_tokens`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text with vLLM's metric names and a `model_name` label. The server records them as each request's events arrive at the HTTP layer:
+
+| Metric | Type | Counts |
+| --- | --- | --- |
+| `vllm:prompt_tokens_total` | counter | Prompt tokens of requests that reached their first token. |
+| `vllm:generation_tokens_total` | counter | Tokens the engine generated, including any a stop string cut off. |
+| `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total` | counter | Prompt tokens looked up in the prefix cache, and those found there. |
+| `vllm:request_success_total` | counter | Finished requests, labelled `finished_reason`: `stop`, `length`, `abort` (the client left) or `error`. |
+| `vllm:num_requests_running`, `vllm:num_requests_waiting` | gauge | Requests the engine has started, and requests still in its queue. |
+| `vllm:request_queue_time_seconds` | histogram | Time from queueing to the engine starting the request. |
+| `vllm:time_to_first_token_seconds` | histogram | Time from queueing to the first token. |
+| `vllm:inter_token_latency_seconds` | histogram | Time per token after the first. Speculation delivers several tokens at once, so a gap that delivered n tokens counts n times as gap / n. The buckets start at 0.5 ms, below vLLM's 10 ms. |
+| `vllm:e2e_request_latency_seconds` | histogram | Time from queueing to the end of the request. |
 
 ## Concurrent requests
 

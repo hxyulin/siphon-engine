@@ -69,14 +69,17 @@ pub enum Finish {
     Length,
 }
 
-/// What the engine reports for a job, in order: `Cached` at most once, `Tokens` any number
-/// of times, then `Done` or `Failed`.
+/// What the engine reports for a job, in order: `Started`, `Cached` at most once, `Tokens`
+/// any number of times, then `Done` or `Failed`. A job whose client left while it waited
+/// gets none.
 #[cfg_attr(
     not(target_os = "linux"),
     expect(dead_code, reason = "only the Linux engine runs jobs")
 )]
 #[derive(Debug)]
 pub enum Event {
+    /// The engine took the job from its queue.
+    Started,
     /// Prompt tokens whose state came from the prefix cache.
     Cached(usize),
     Tokens(Vec<u32>),
@@ -494,6 +497,7 @@ mod cuda {
 
     impl Request {
         fn new(job: Job, slot: usize, greedy: bool) -> Self {
+            let _ = job.events.send(Event::Started);
             let (sampling, error) = match model_sampling(&job, greedy) {
                 Ok(s) => (s, None),
                 Err(e) => (ModelSampling::GREEDY, Some(e)),

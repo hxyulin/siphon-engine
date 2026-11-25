@@ -2,6 +2,7 @@
 
 mod chat;
 mod engine;
+mod metrics;
 mod openai;
 mod parse;
 mod request;
@@ -186,6 +187,7 @@ fn run() -> anyhow::Result<()> {
     let app = Arc::new(openai::App {
         vocab,
         engine,
+        metrics: Arc::new(metrics::Metrics::new(&args.name)),
         name: args.name,
         api_key,
         started: openai::started(),
