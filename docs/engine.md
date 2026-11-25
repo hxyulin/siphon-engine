@@ -462,7 +462,25 @@ The draft picks x by the target's own race. Draft k of a round, k from 1, goes t
 | Temperature 1 | 0.57, 0.49, 0.49, 0.45, 0.41, 0.37, 0.36 | 2.50 (measured 2.54) | 0.68, 0.58, 0.55, 0.51, 0.47, 0.43, 0.41 | 2.79 |
 | Temperature 0.8, top-p 0.95 | 0.68, 0.57, 0.51, 0.46, 0.46, 0.41, 0.46 | 2.89 (measured 2.90) | 0.72, 0.62, 0.56, 0.49, 0.49, 0.46, 0.52 | 3.05 |
 
-With the coupled draft in the rounds, all three columns condition on the coupled drafts drawn with the run's seed, and the other seeds reuse those rounds. Coupled draft kept by position and tokens per 8-row round: to measure. `coupled_draft_acceptance` runs speculation end to end with the argmax and with the coupled pick, for the fast bundled draft and DFlash 2: to measure.
+With the coupled draft in the rounds, all three columns condition on the coupled drafts drawn with the run's seed, and the other seeds reuse those rounds (198 rounds at temperature 1, 192 at 0.8). The coupled draft recovers most of the gap between the argmax and an independent sample from q:
+
+| | Argmax kept, by position | Tokens per round | Sampled from q kept | Tokens per round | Coupled kept, 32 seeds | Tokens per round |
+| --- | --- | ---: | --- | ---: | --- | ---: |
+| Temperature 1 | 0.59, 0.52, 0.47, 0.40, 0.40, 0.36, 0.35 | 2.60 | 0.68, 0.59, 0.53, 0.46, 0.46, 0.42, 0.43 | 2.83 | 0.67, 0.56, 0.51, 0.44, 0.44, 0.40, 0.41 | 2.75 |
+| Temperature 0.8, top-p 0.95 | 0.69, 0.58, 0.50, 0.43, 0.43, 0.40, 0.44 | 2.89 | 0.73, 0.62, 0.54, 0.46, 0.47, 0.44, 0.49 | 3.04 | 0.71, 0.61, 0.51, 0.44, 0.44, 0.42, 0.46 | 2.96 |
+
+The host's race and the GPU's agreed on every draft pick and draw, over 1,386 and 1,344 positions. The pick's own probability averaged 0.55 to 0.63 at temperature 1, against 0.66 to 0.72 for the argmax's.
+
+`coupled_draft_acceptance` runs speculation end to end with the argmax and with the coupled pick, FP8, on the same prompts and seeds:
+
+| Draft | Sampling | Argmax: tokens per round | Coupled: tokens per round | Draft time per round |
+| --- | --- | ---: | ---: | ---: |
+| Bundled, fast head | Temperature 1 | 2.42 | 2.78 | 0.525 → 0.532 ms |
+| Bundled, fast head | Temperature 0.8, top-p 0.95 | 3.07 | 3.18 | 0.526 → 0.532 ms |
+| DFlash 2 | Temperature 1 | 2.51 | 2.82 | 0.802 → 0.804 ms |
+| DFlash 2 | Temperature 0.8, top-p 0.95 | 3.14 | 3.27 | 0.802 → 0.805 ms |
+
+The first draft is kept 63% of the time instead of 53% at temperature 1. The gain is smaller at temperature 0.8, where p is sharper and its argmax already holds more of the mass. In `bench` at temperature 1, the median of 6 seeds rose by 0.1 to 12% over the argmax draft across the 16 prompt, context and drafter cases, with the same tokens for each seed.
 
 A draft that samples from q independently of the target's noise would need q over the vocabulary for each draft, which the pruned head and DFlash 2's 16 candidates do not have, and its draws would tie a request's tokens to the width schedule and to batching.
 
