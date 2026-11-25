@@ -28,20 +28,40 @@ def source(record) -> str:
     return record["item"].split("/")[0]
 
 
-def quality_table(records) -> list[str]:
+def costs(rs) -> dict:
+    """Cut-offs, loops and the token and time cost of a group of replies."""
+    n, k = len(rs), sum(r["passed"] for r in rs)
+    tokens = [r["completion_tokens"] or 0 for r in rs]
+    seconds = [r["seconds"] for r in rs]
+    return {"n": n, "passed": k, "cut": sum(r["finish_reason"] == "length" for r in rs),
+            "looping": sum(r["looping"] for r in rs),
+            "errors": sum(r["error"] is not None for r in rs),
+            "tokens": statistics.fmean(tokens), "median_tokens": statistics.median(tokens),
+            "seconds": statistics.fmean(seconds),
+            "seconds_per_pass": sum(seconds) / k if k else None,
+            "tokens_per_pass": sum(tokens) / k if k else None}
+
+
+def by_source(records) -> list[tuple[str, list]]:
     groups = defaultdict(list)
     for r in records:
         groups[source(r)].append(r)
-    lines = ["| Source | Items | Replies | Passed | Pass rate | 95% interval | Cut off | Looping | Errors | Median tokens |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for name, rs in [*sorted(groups.items()), ("all", records)]:
-        k, n = sum(r["passed"] for r in rs), len(rs)
-        lo, hi = wilson(k, n)
+    return [*sorted(groups.items()), ("all", records)]
+
+
+def quality_table(records) -> list[str]:
+    lines = ["| Source | Items | Passed | 95% interval | Cut off | Looping | Errors | Mean tokens | Median tokens | Seconds per reply | Seconds per pass | Tokens per pass |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for name, rs in by_source(records):
+        c = costs(rs)
+        lo, hi = wilson(c["passed"], c["n"])
         lines.append(
-            f"| {name} | {len({r['item'] for r in rs})} | {n} | {k} | {k / n:.1%} | "
-            f"{lo:.1%} to {hi:.1%} | {sum(r['finish_reason'] == 'length' for r in rs)} | "
-            f"{sum(r['looping'] for r in rs)} | {sum(r['error'] is not None for r in rs)} | "
-            f"{fmt(median(r['completion_tokens'] for r in rs), '{:.0f}')} |")
+            f"| {name} | {len({r['item'] for r in rs})} | {c['passed']}/{c['n']}, "
+            f"{c['passed'] / c['n']:.1%} | {lo:.1%} to {hi:.1%} | "
+            f"{c['cut']}, {c['cut'] / c['n']:.1%} | {c['looping']}, {c['looping'] / c['n']:.1%} | "
+            f"{c['errors']} | {c['tokens']:,.0f} | {c['median_tokens']:,.0f} | "
+            f"{c['seconds']:.1f} | {fmt(c['seconds_per_pass'])} | "
+            f"{fmt(c['tokens_per_pass'], '{:,.0f}')} |")
     return lines
 
 
@@ -63,6 +83,16 @@ def speed_tables(records) -> list[str]:
                 f"{fmt(median(r['ttft'] * 1e3 for r in g), '{:.0f}')} | "
                 f"{fmt(median(r.get('tokens_per_round') for r in g), '{:.2f}')} | "
                 f"{fmt(median(r['completion_tokens'] for r in g), '{:.0f}')} |")
+        long = defaultdict(list)
+        for r in rs:
+            if r.get("ttft_warm") is not None:
+                long[(r["prompt"], r["sampling"])].append(r)
+        for (prompt, sampling), g in long.items():
+            lines.append(
+                f"\n{prompt} at {sampling} ({fmt(median(r['prompt_tokens'] for r in g), '{:,.0f}')} "
+                f"prompt tokens): median TTFT {median(r['ttft'] for r in g) * 1e3:.0f} ms on a "
+                f"prefix-cache miss, {median(r['ttft_warm'] for r in g) * 1e3:.0f} ms when the "
+                "same request repeats.")
         if streams == 8:
             total = sum(r["completion_tokens"] for r in rs)
             lines.append(f"\nAll {len(rs)} requests, 8 at a time: {total} tokens in "
@@ -92,12 +122,14 @@ def fidelity_table(records) -> list[str]:
 
 def render(run: dict) -> str:
     meta = run["meta"]
-    lines = [f"# Quickbench {meta['name']}", "",
+    title = "Quickbench suite" if meta.get("mode") == "suite" else "Quickbench"
+    lines = [f"# {title} {meta['name']}", "",
              f"- Target: {meta['target']}",
              f"- Commit: {meta.get('commit') or 'unknown'}",
              f"- Started: {meta['started']}",
-             f"- Quality sampling: {meta['sampling']}, {meta['attempts']} attempts per item, "
-             f"{meta['concurrency']} at a time",
+             f"- Quality sampling: {meta['sampling']}, {meta['attempts']} "
+             f"attempt{'s' if meta['attempts'] != 1 else ''} per item, "
+             f"{meta['concurrency']} at a time, output caps {meta.get('caps')}",
              "- Wall time: " + ", ".join(f"{k} {v / 60:.1f} min" for k, v in run["timings"].items()),
              ""]
     for track, apps in run.get("gpu_others", {}).items():
@@ -112,10 +144,6 @@ def render(run: dict) -> str:
     if run.get("fidelity"):
         lines += ["## Fidelity", "", *fidelity_table(run["fidelity"]), ""]
     return "\n".join(lines) + "\n"
-
-
-# Fewer items than this get no verdict: their bootstrap interval is too coarse.
-MIN_ITEMS = 5
 
 
 def bootstrap(values, statistic=statistics.fmean, rounds: int = 10000, seed: int = 0):
@@ -138,25 +166,54 @@ def sign_test(a_better: int, b_better: int) -> float:
     return min(1.0, 2 * tail)
 
 
+# Items listed by name when replies differ.
+LISTED = 30
+
+
+def identical(qa: dict, qb: dict, common: list) -> list[str]:
+    """Replies that repeat byte for byte with equal token counts, and the items that do not.
+
+    A seeded run on an unchanged build repeats every reply, so a changed reply shows a
+    change in numerics long before pass rates move.
+    """
+    keys = [k for k in common if qa[k].get("reply_hash") and qb[k].get("reply_hash")]
+    if not keys:
+        return ["Identical replies: not known, a run has neither reply hashes nor replies.jsonl."]
+    differ = defaultdict(list)
+    for k in keys:
+        if (qa[k]["reply_hash"], qa[k]["completion_tokens"]) != (
+                qb[k]["reply_hash"], qb[k]["completion_tokens"]):
+            differ[k[0]].append(k[1])
+    same = len(keys) - sum(map(len, differ.values()))
+    lines = [f"Identical replies (reasoning, content and tool calls byte for byte, equal token "
+             f"counts): {same} of {len(keys)}."]
+    if differ:
+        items = sorted(differ)
+        more = f", and {len(items) - LISTED} more" if len(items) > LISTED else ""
+        lines.append(f"Items with a reply that differs ({len(items)}): "
+                     + ", ".join(items[:LISTED]) + more + ".")
+    return lines
+
+
 def compare(a: dict, b: dict) -> str:
     lines = [f"# Quickbench compare: A = {a['meta']['name']}, B = {b['meta']['name']}", "",
-             f"- A: {a['meta']['target']}", f"- B: {b['meta']['target']}", ""]
+             *(f"- {side}: {run['meta']['target']}, commit {run['meta'].get('commit')}, "
+               f"sampling {run['meta'].get('sampling')}" for side, run in (("A", a), ("B", b))),
+             ""]
     qa = {(r["item"], r["attempt"]): r for r in a.get("quality", [])}
     qb = {(r["item"], r["attempt"]): r for r in b.get("quality", [])}
     common = sorted(set(qa) & set(qb))
     if common:
         lines += ["## Quality, paired by item", "",
-                  "B − A is the mean over items of the difference in pass rate. The interval "
-                  "comes from a paired bootstrap over items (10,000 resamples). Attempts are "
-                  "paired by seed and option order. The sign test counts the items each side "
-                  "passed more often. A difference counts as real when the interval excludes "
-                  "zero and the sign test gives p < 0.05.", "",
-                  "| Source | Items | A | B | B − A | 95% interval | Items A better / B better | Sign test p | Verdict |",
-                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
-        by_source = defaultdict(list)
-        for key in common:
-            by_source[key[0].split("/")[0]].append(key)
-        for name, keys in [*sorted(by_source.items()), ("all", common)]:
+                  ("B − A is the mean over items of the difference in pass rate. The interval "
+                   "comes from a paired bootstrap over items (10,000 resamples). Attempts are "
+                   "paired by seed and option order. The sign test counts the items each side "
+                   "passed more often."), "",
+                  "| Source | Items | A | B | B − A | 95% interval | Items A better / B better | Sign test p |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+        groups = by_source([{"item": k[0], "key": k} for k in common])
+        for name, rows in groups:
+            keys = [r["key"] for r in rows]
             items = defaultdict(lambda: [[], []])
             for key in keys:
                 items[key[0]][0].append(qa[key]["passed"])
@@ -165,19 +222,23 @@ def compare(a: dict, b: dict) -> str:
             mean, lo, hi = bootstrap(diffs)
             a_better = sum(d < 0 for d in diffs)
             b_better = sum(d > 0 for d in diffs)
-            p = sign_test(a_better, b_better)
             pa = sum(qa[k]["passed"] for k in keys) / len(keys)
             pb = sum(qb[k]["passed"] for k in keys) / len(keys)
-            verdict = ("too few items" if len(items) < MIN_ITEMS
-                       else "real" if (lo > 0 or hi < 0) and p < 0.05 else "within noise")
             lines.append(f"| {name} | {len(items)} | {pa:.1%} | {pb:.1%} | {mean:+.1%} | "
                          f"{lo:+.1%} to {hi:+.1%} | {a_better} / {b_better} | "
-                         f"{p:.3f} | {verdict} |")
-        for label, field in (("cut off", "length"), ("looping", None)):
-            ca = sum((qa[k]["finish_reason"] == field) if field else qa[k]["looping"] for k in common)
-            cb = sum((qb[k]["finish_reason"] == field) if field else qb[k]["looping"] for k in common)
-            lines.append(f"\nReplies {label}: A {ca}, B {cb} of {len(common)}.")
-        lines.append("")
+                         f"{sign_test(a_better, b_better):.3f} |")
+        lines += ["", "Over the same replies, A / B:", "",
+                  "| Source | Cut off | Looping | Mean tokens | Seconds per reply | Seconds per pass | Tokens per pass |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"]
+        for name, rows in groups:
+            x = costs([qa[r["key"]] for r in rows])
+            y = costs([qb[r["key"]] for r in rows])
+            lines.append(
+                f"| {name} | {x['cut']} / {y['cut']} | {x['looping']} / {y['looping']} | "
+                f"{x['tokens']:,.0f} / {y['tokens']:,.0f} | {x['seconds']:.1f} / {y['seconds']:.1f} | "
+                f"{fmt(x['seconds_per_pass'])} / {fmt(y['seconds_per_pass'])} | "
+                f"{fmt(x['tokens_per_pass'], '{:,.0f}')} / {fmt(y['tokens_per_pass'], '{:,.0f}')} |")
+        lines += ["", *identical(qa, qb, common), ""]
     sa = {(r["prompt"], r["sampling"], r["seed"], r["streams"]): r for r in a.get("speed", [])}
     sb = {(r["prompt"], r["sampling"], r["seed"], r["streams"]): r for r in b.get("speed", [])}
     keys = [k for k in sorted(set(sa) & set(sb))
@@ -194,6 +255,17 @@ def compare(a: dict, b: dict) -> str:
                 f"| {prompt} | {sampling} | {streams} | {median(sa[k]['decode_tok_s'] for k in ks):.1f} | "
                 f"{median(sb[k]['decode_tok_s'] for k in ks):.1f} | "
                 f"{median(sb[k]['decode_tok_s'] / sa[k]['decode_tok_s'] for k in ks):.3f} |")
+        long = defaultdict(list)
+        for k in keys:
+            if sa[k].get("ttft_warm") is not None and sb[k].get("ttft_warm") is not None:
+                long[k[:2]].append(k)
+        for (prompt, sampling), warm in long.items():
+            lines.append(
+                f"\n{prompt} at {sampling}, TTFT medians over seeds: on a prefix-cache miss "
+                f"A {median(sa[k]['ttft'] for k in warm) * 1e3:.0f} ms, "
+                f"B {median(sb[k]['ttft'] for k in warm) * 1e3:.0f} ms; on a hit "
+                f"A {median(sa[k]['ttft_warm'] for k in warm) * 1e3:.0f} ms, "
+                f"B {median(sb[k]['ttft_warm'] for k in warm) * 1e3:.0f} ms.")
         for streams in (1, 8):
             ks = [k for k in keys if k[3] == streams]
             if ks:

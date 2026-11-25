@@ -1,12 +1,17 @@
-"""Speed track: fixed prompts, sampled with several seeds, at 1 and at 8 streams."""
+"""Speed track: fixed prompts, sampled with several seeds, at 1 and at 8 streams, and a
+32K-token prompt at 1 stream with its time to first token on a prefix-cache miss and hit."""
 
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import client
+from . import client, quality
 
-SAMPLINGS = {"t0.8-p0.95": {"temperature": 0.8, "top_p": 0.95}, "t1.0": {"temperature": 1.0}}
+SAMPLINGS = {"t1.0": {"temperature": 1.0}, "t0.8-p0.95": {"temperature": 0.8, "top_p": 0.95}}
+# The model's default: temperature 1 and no filters.
+DEFAULT_SAMPLINGS = ("t1.0",)
+# The long row: generated locker records, decoded for this many tokens.
+LONG_PROMPT, LONG_TOKENS, LONG_REPLY = "long32k", 32000, 512
 
 AGENT_SYSTEM = (
     "You are a coding agent working in a Python repository. Use the tools to read files, "
@@ -98,14 +103,28 @@ PROMPTS = {
 }
 
 
-def request(base: str, model: str, prompt: str, sampling: str, seed: int, max_tokens: int):
-    body = {"model": model, "messages": PROMPTS[prompt], "max_tokens": max_tokens,
-            "seed": seed, **SAMPLINGS[sampling]}
+def long_messages(seed: int) -> list[dict]:
+    """A 32K-token prompt of locker records. Each seed's prompt differs from its first line,
+    so its first request misses siphon-serve's one-entry prefix cache."""
+    messages, _ = quality.long_messages(LONG_TOKENS, 1000 + seed)
+    return [{"role": "user", "content": f"Record set {seed}.\n\n{messages[0]['content']}"}]
+
+
+def body(model: str, prompt: str, sampling: str, seed: int, max_tokens: int) -> dict:
+    if prompt == LONG_PROMPT:
+        return {"model": model, "messages": long_messages(seed), "max_tokens": LONG_REPLY,
+                "seed": seed, **SAMPLINGS[sampling]}
+    out = {"model": model, "messages": PROMPTS[prompt], "max_tokens": max_tokens,
+           "seed": seed, **SAMPLINGS[sampling]}
     if prompt == "agent":
         # The tools stay in the prompt, but the reply is text: a tool call arrives in one
         # chunk at the end and has no decode time to measure.
-        body |= {"tools": AGENT_TOOLS, "tool_choice": "none"}
-    reply = client.chat(base, body)
+        out |= {"tools": AGENT_TOOLS, "tool_choice": "none"}
+    return out
+
+
+def request(base: str, model: str, prompt: str, sampling: str, seed: int, max_tokens: int):
+    reply = client.chat(base, body(model, prompt, sampling, seed, max_tokens))
     n = reply["completion_tokens"] or 0
     return {"prompt": prompt, "sampling": sampling, "seed": seed, "error": reply["error"],
             "completion_tokens": n, "prompt_tokens": reply["prompt_tokens"],
@@ -116,10 +135,12 @@ def request(base: str, model: str, prompt: str, sampling: str, seed: int, max_to
             and reply["decode_s"] > 0.05 else None}
 
 
-def run(base: str, model: str, seeds: int, max_tokens: int, server=None) -> list[dict]:
-    jobs = [(p, s, seed) for p in PROMPTS for s in SAMPLINGS for seed in range(1, seeds + 1)]
+def run(base: str, model: str, seeds: int, max_tokens: int, server=None,
+        samplings=DEFAULT_SAMPLINGS) -> list[dict]:
+    jobs = [(p, s, seed) for p in PROMPTS for s in samplings for seed in range(1, seeds + 1)]
+    long = [(LONG_PROMPT, s, seed) for s in samplings for seed in range(1, seeds + 1)]
     out = []
-    for p, s, seed in jobs:
+    for p, s, seed in jobs + long:
         before = len(server.jobs()) if server else 0
         record = request(base, model, p, s, seed, max_tokens) | {"streams": 1}
         if server:
@@ -129,6 +150,10 @@ def run(base: str, model: str, seeds: int, max_tokens: int, server=None) -> list
                     break
                 time.sleep(0.05)
             record["tokens_per_round"] = new[-1]["tokens_per_round"] if new else None
+        if p == LONG_PROMPT:
+            # The same request again hits the prefix cache.
+            record["ttft_warm"] = round(
+                client.chat(base, body(model, p, s, seed, max_tokens))["ttft"], 4)
         out.append(record)
     started = time.perf_counter()
     with ThreadPoolExecutor(8) as pool:

@@ -21,8 +21,9 @@ from pathlib import Path
 
 from . import client, fetch
 
-# Output caps per source, in tokens. The thinking sources get the largest cap that
-# keeps the track inside its time budget.
+# Output caps per source, in tokens, for the build check. The suite caps every source
+# at SUITE_CAP.
+SUITE_CAP = 32768
 CAPS = {"gpqa": 16384, "aime": 16384, "code": 16384, "long": 8192, "tool": 4096}
 
 GPQA_TEMPLATE = (
@@ -263,6 +264,12 @@ def run_tests(row, content: str) -> bool:
     return done.returncode == 0
 
 
+def reply_hash(reply) -> str:
+    """A hash of the reply's text and tool calls, to find replies that changed between runs."""
+    text = json.dumps([reply["reasoning"], reply["content"], reply["tool_calls"]])
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def looping(reply) -> bool:
     """A reply whose last 4,000 characters compress below 15% repeats itself."""
     tail = (reply["reasoning"] + reply["content"])[-4000:].encode()
@@ -288,7 +295,7 @@ def run(base: str, model: str, item_ids, attempts: int, sampling: dict, concurre
                   "finish_reason": reply["finish_reason"], "error": reply["error"],
                   "completion_tokens": reply["completion_tokens"],
                   "prompt_tokens": reply["prompt_tokens"], "looping": looping(reply),
-                  "seconds": round(reply["seconds"], 2)}
+                  "seconds": round(reply["seconds"], 2), "reply_hash": reply_hash(reply)}
         if log:
             log({**record, "reasoning": reply["reasoning"], "content": reply["content"],
                  "tool_calls": reply["tool_calls"]})
