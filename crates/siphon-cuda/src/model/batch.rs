@@ -294,6 +294,28 @@ impl Model {
         self.with_slot(slot, |m| m.prefill(tokens, chunk, PrefillLogits::Last))
     }
 
+    /// The token after slot `slot`'s last prefill, picked with `sampling` instead of
+    /// [`Model::sampling`]: the token that prefill would have returned had it run with
+    /// `sampling`. It reads the last row's logits that the prefill left in the decode
+    /// buffers, so nothing may run between the two. With [`Model::move_slot`], one prefill
+    /// serves several sequences of the same prompt that sample differently.
+    pub fn redraw_slot(&mut self, slot: usize, sampling: Sampling) -> anyhow::Result<u32> {
+        if sampling.is_greedy() {
+            // A sampled draw replaces the argmax the prefill computed.
+            let s = &mut self.scratch;
+            self.ctx.kernels.misc.argmax_f32(
+                &self.ctx.stream,
+                &s.capped,
+                &mut s.next,
+                self.ctx.config.unpadded_vocab_size,
+            )?;
+        }
+        let kept = std::mem::replace(&mut self.sampling, sampling);
+        let next = self.with_slot(slot, Self::next_token);
+        self.sampling = kept;
+        next
+    }
+
     /// Runs the next token of each of `rows`' slots, `(slot, token)` with distinct slots,
     /// 1 to [`BATCH_ROWS`] of them, as one batched step at each slot's position. Returns
     /// each row's greedy next token and advances each slot by one. Each row's results

@@ -18,21 +18,30 @@
 //! with the checkpoint's `generation_config.json` for the fields a request leaves out
 //! ([`crate::request::sampling`]); `temperature` 0 decodes greedily. The penalties are
 //! accepted and ignored. [`crate::request`] lists the fields the server refuses, such as
-//! `logprobs` and `n` above 1. Stop strings match the reply's content,
+//! `logprobs`. Stop strings match the reply's content,
 //! not its reasoning or tool calls. Both routes take vLLM's `stop_token_ids`: the output
 //! ends at the first of them, whose id the output keeps and whose text it leaves out, as
 //! vLLM does. A choice reports the stop string or stop token that matched as vLLM's
 //! `stop_reason`.
+//!
+//! Both routes take `n`: the request's `n` jobs share its prompt (see [`crate::engine`]),
+//! and the reply merges them into choices 0 to n-1 ([`Fanout`]). Choice `i` of a request
+//! with a seed samples with seed + i, as vLLM does. A stream sends each choice's text in
+//! chunks of one choice each, interleaved as the engine delivers it, and each choice ends
+//! with its own chunk that holds its `finish_reason`. The usage counts the prompt once
+//! and sums the choices' tokens.
 //!
 //! With an API key set, a request carries it as `Authorization: Bearer <key>` or as
 //! Anthropic's `x-api-key: <key>`.
 
 use std::{
     convert::Infallible,
+    future::poll_fn,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll, ready},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -47,6 +56,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
@@ -344,13 +354,15 @@ pub(crate) struct Prepared {
     pub(crate) return_token_ids: bool,
     /// vLLM's `ignore_eos`: run to `max_tokens` through the model's end tokens.
     pub(crate) ignore_eos: bool,
-    pub(crate) sampling: Sampling,
+    /// Each choice's sampling, one per choice.
+    pub(crate) samplings: Vec<Sampling>,
+    /// The output of a choice before its first token, for every choice.
     pub(crate) output: Output,
 }
 
 fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     request::refuse(&request.other)?;
-    request::one_choice("n", request.n)?;
+    let n = request::choices(request.n)?;
     request::response_format(request.response_format.as_ref())?;
     let stops = request::stops(request.stop.as_ref())?;
     let stop_ids = tokenize::token_ids(&app.vocab, &request.stop_token_ids.unwrap_or_default())?;
@@ -388,7 +400,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
         ignore_eos: request.ignore_eos.unwrap_or(false),
-        sampling: request::sampling(&request.sampling, &app.sampling)?,
+        samplings: request::samplings(&request.sampling, &app.sampling, n)?,
         output: Output::new(
             Decoder::Chat(Parser::new(&app.vocab, &ending)),
             Stops::new(stops),
@@ -468,32 +480,58 @@ pub(crate) fn max_tokens(
 /// Queues a job and returns its events.
 pub(crate) fn submit(
     app: &App,
-    prompt: Vec<u32>,
+    prompt: &[u32],
     max_tokens: usize,
     ignore_eos: bool,
     sampling: Sampling,
 ) -> Result<Results, ApiError> {
-    let (events, receiver) = mpsc::unbounded_channel();
+    let mut results = submit_choices(app, prompt, max_tokens, ignore_eos, &[sampling])?;
+    results
+        .pop()
+        .ok_or_else(|| ApiError::internal("the engine took no job"))
+}
+
+/// Queues one job per entry of `samplings`, all of the same prompt, and returns their
+/// events in that order. The jobs fit the queue together or not at all.
+pub(crate) fn submit_choices(
+    app: &App,
+    prompt: &[u32],
+    max_tokens: usize,
+    ignore_eos: bool,
+    samplings: &[Sampling],
+) -> Result<Vec<Results>, ApiError> {
+    let most = app.engine.max_jobs();
+    if samplings.len() > most {
+        return Err(ApiError::bad_request(format!(
+            "n is {}, more than the {most} requests this server runs and queues at once",
+            samplings.len()
+        )));
+    }
     let prompt_len = prompt.len();
-    app.engine
-        .submit(Job {
-            prompt,
-            max_tokens,
-            ignore_eos,
-            sampling,
-            events,
+    let (jobs, receivers): (Vec<Job>, Vec<_>) = samplings
+        .iter()
+        .map(|&sampling| {
+            let (events, receiver) = mpsc::unbounded_channel();
+            let job = Job::new(prompt.to_vec(), max_tokens, ignore_eos, sampling, events);
+            (job, receiver)
         })
-        .map_err(|e| match e {
-            Refused::Busy => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the request queue is full, retry later",
-            ),
-            Refused::Stopped => ApiError::internal("the engine has stopped"),
-        })?;
-    Ok(Results {
-        receiver,
-        tracker: app.metrics.track(prompt_len),
-    })
+        .unzip();
+    app.engine.submit(jobs).map_err(|e| match e {
+        Refused::Busy => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the request queue is full, retry later",
+        ),
+        Refused::Stopped => ApiError::internal("the engine has stopped"),
+    })?;
+    // The prompt counts once in the metrics, with the first choice.
+    Ok(receivers
+        .into_iter()
+        .enumerate()
+        .map(|(i, receiver)| Results {
+            receiver,
+            tracker: app.metrics.track(if i == 0 { prompt_len } else { 0 }),
+        })
+        .collect())
 }
 
 /// One job's events, recorded in the metrics as they arrive. Dropping it cancels the job,
@@ -506,10 +544,11 @@ pub(crate) struct Results {
 impl Results {
     /// The next event, with a closed channel as a failure.
     pub(crate) async fn next(&mut self) -> Event {
-        let event = self
-            .receiver
-            .recv()
-            .await
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
+        let event = ready!(self.receiver.poll_recv(cx))
             .unwrap_or_else(|| Event::Failed("the engine dropped the request".to_owned()));
         match &event {
             Event::Started => self.tracker.started(),
@@ -518,12 +557,55 @@ impl Results {
             Event::Done(finish) => self.tracker.finish(reason(*finish)),
             Event::Failed(_) => self.tracker.finish(Reason::Error),
         }
-        event
+        Poll::Ready(event)
     }
 
     /// Ends the job with `finish`, which a stop the output matched may have set first.
     pub(crate) fn close(mut self, finish: Finish) {
         self.tracker.finish(reason(finish));
+    }
+}
+
+/// The jobs of one request's choices, merged. Dropping it cancels the jobs still open.
+pub(crate) struct Fanout {
+    /// Each choice's events, `None` once the choice has ended.
+    choices: Vec<Option<Results>>,
+    /// The choice to look at first, which turns, so that no choice waits behind another.
+    turn: usize,
+}
+
+impl Fanout {
+    pub(crate) fn new(results: Vec<Results>) -> Self {
+        Self {
+            choices: results.into_iter().map(Some).collect(),
+            turn: 0,
+        }
+    }
+
+    /// The next event of an open choice, with the choice's index. Waits forever when no
+    /// choice is open.
+    pub(crate) async fn next(&mut self) -> (usize, Event) {
+        poll_fn(|cx| {
+            let n = self.choices.len();
+            for i in (0..n).map(|k| (self.turn + k) % n) {
+                if let Some(results) = &mut self.choices[i]
+                    && let Poll::Ready(event) = results.poll_next(cx)
+                {
+                    self.turn = (i + 1) % n;
+                    return Poll::Ready((i, event));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Ends choice `i` with `finish`, which a stop the output matched may have set first,
+    /// and cancels its job if it still runs.
+    pub(crate) fn close(&mut self, i: usize, finish: Finish) {
+        if let Some(results) = self.choices[i].take() {
+            results.close(finish);
+        }
     }
 }
 
@@ -563,8 +645,8 @@ struct CompletionRequest {
 
 fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared, ApiError> {
     request::refuse(&request.other)?;
-    request::one_choice("n", request.n)?;
-    request::one_choice("best_of", request.best_of)?;
+    let n = request::choices(request.n)?;
+    request::best_of(request.best_of, n)?;
     let stops = request::stops(request.stop.as_ref())?;
     let stop_ids = tokenize::token_ids(&app.vocab, &request.stop_token_ids.unwrap_or_default())?;
     let prompt = match request.prompt {
@@ -593,7 +675,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
         ignore_eos: request.ignore_eos.unwrap_or(false),
-        sampling: request::sampling(&request.sampling, &app.sampling)?,
+        samplings: request::samplings(&request.sampling, &app.sampling, n)?,
         output: Output::new(
             Decoder::Text(Detokenizer::default()),
             Stops::new(stops),
@@ -622,12 +704,14 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
         delivery,
         return_token_ids,
         ignore_eos,
-        sampling,
-        mut output,
+        samplings,
+        output,
     } = prepared;
-    let mut reply = Reply::new(&app, prompt.len(), kind);
-    let prompt_ids = return_token_ids.then(|| prompt.clone());
-    let mut results = submit(&app, prompt, max_tokens, ignore_eos, sampling)?;
+    let reply = Reply::new(&app, prompt.len(), kind);
+    let outputs = vec![output; samplings.len()];
+    let results = submit_choices(&app, &prompt, max_tokens, ignore_eos, &samplings)?;
+    let prompt_ids = return_token_ids.then_some(prompt);
+    let fanout = Fanout::new(results);
     if let Delivery::Stream { include_usage } = delivery {
         let (out, rx) = mpsc::channel(64);
         let chunks = Chunks {
@@ -635,40 +719,77 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
             reply,
             prompt_ids,
         };
-        tokio::spawn(stream(app, results, output, chunks, include_usage));
-        let body = Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default());
+        tokio::spawn(
+            async move { stream(&app.vocab, fanout, outputs, chunks, include_usage).await },
+        );
+        let events = ReceiverStream::new(rx)
+            .map(|data: String| Ok::<_, Infallible>(SseEvent::default().data(data)));
+        let body = Sse::new(events).keep_alive(KeepAlive::default());
         return Ok(body.into_response());
     }
-    let mut message = Delta::default();
-    let finish = loop {
-        match results.next().await {
-            Event::Started => {}
-            Event::Cached(n) => reply.cached_tokens = n,
-            Event::Tokens(ids) => {
-                append(&mut message, output.push(&app.vocab, &ids));
-                if output.done {
-                    break Finish::Stop;
+    // Runs in the handler, so that a client that leaves drops the jobs.
+    let body = whole(&app.vocab, fanout, outputs, reply, prompt_ids).await?;
+    Ok(Json(body).into_response())
+}
+
+/// The body of a reply that is not streamed, with one choice per entry of `outputs`.
+async fn whole(
+    vocab: &Vocab,
+    mut fanout: Fanout,
+    mut outputs: Vec<Output>,
+    mut reply: Reply,
+    prompt_ids: Option<Vec<u32>>,
+) -> Result<Value, ApiError> {
+    let mut messages: Vec<Delta> = outputs.iter().map(|_| Delta::default()).collect();
+    let mut finishes: Vec<Option<Finish>> = vec![None; outputs.len()];
+    while finishes.iter().any(Option::is_none) {
+        let (i, event) = fanout.next().await;
+        let output = &mut outputs[i];
+        let finish = match event {
+            Event::Started => continue,
+            Event::Cached(n) => {
+                if i == 0 {
+                    reply.cached_tokens = n;
                 }
+                continue;
             }
-            Event::Done(finish) => break finish,
+            Event::Tokens(ids) => {
+                append(&mut messages[i], output.push(vocab, &ids));
+                if !output.done {
+                    continue;
+                }
+                Finish::Stop
+            }
+            Event::Done(finish) => finish,
             Event::Failed(e) => return Err(ApiError::internal(e)),
-        }
-    };
-    // Ends the job if a stop string ended the output first.
-    results.close(finish);
-    append(&mut message, output.finish(&app.vocab, finish));
-    let mut choice = reply.choice(message);
-    choice["finish_reason"] = json!(output.finish_reason(finish));
-    choice["stop_reason"] = output.stop_reason();
-    if return_token_ids {
-        choice["token_ids"] = json!(output.ids);
+        };
+        // Ends the job if a stop ended the output first.
+        fanout.close(i, finish);
+        append(&mut messages[i], output.finish(vocab, finish));
+        finishes[i] = Some(finish);
     }
-    let mut body = reply.body(false, &choice);
-    body["usage"] = reply.usage(output.tokens, output.reasoning_tokens());
+    let choices = outputs
+        .iter()
+        .zip(messages)
+        .zip(finishes)
+        .enumerate()
+        .map(|(i, ((output, message), finish))| {
+            let finish = finish.unwrap_or(Finish::Stop);
+            let mut choice = reply.choice(i, message);
+            choice["finish_reason"] = json!(output.finish_reason(finish));
+            choice["stop_reason"] = output.stop_reason();
+            if prompt_ids.is_some() {
+                choice["token_ids"] = json!(output.ids);
+            }
+            choice
+        })
+        .collect();
+    let mut body = reply.body(false, choices);
+    body["usage"] = reply.usage(&outputs);
     if let Some(ids) = prompt_ids {
         body["prompt_token_ids"] = json!(ids);
     }
-    Ok(Json(body).into_response())
+    Ok(body)
 }
 
 pub(crate) fn append(message: &mut Delta, delta: Delta) {
@@ -678,6 +799,7 @@ pub(crate) fn append(message: &mut Delta, delta: Delta) {
 }
 
 /// Turns generated ids into reply text.
+#[derive(Clone)]
 pub(crate) enum Decoder {
     /// Chat: reasoning, content and tool calls.
     Chat(Parser),
@@ -698,6 +820,7 @@ pub(crate) enum Calls {
 }
 
 /// One job's output on its way to the client, cut at the first stop string or stop token.
+#[derive(Clone)]
 pub(crate) struct Output {
     decoder: Decoder,
     stops: Stops,
@@ -884,8 +1007,8 @@ impl Reply {
         }
     }
 
-    /// A response or chunk with the one choice `choice`.
-    fn body(&self, chunk: bool, choice: &Value) -> Value {
+    /// A response or chunk with `choices`.
+    fn body(&self, chunk: bool, choices: Vec<Value>) -> Value {
         let object = match (self.kind, chunk) {
             (Kind::Chat, false) => "chat.completion",
             (Kind::Chat, true) => "chat.completion.chunk",
@@ -896,14 +1019,14 @@ impl Reply {
             "object": object,
             "created": self.created,
             "model": self.model,
-            "choices": [choice],
+            "choices": Value::Array(choices),
         })
     }
 
-    /// The choice of a whole response, without its finish reason.
-    fn choice(&self, message: Delta) -> Value {
+    /// Choice `index` of a whole response, without its finish reason.
+    fn choice(&self, index: usize, message: Delta) -> Value {
         if self.kind == Kind::Text {
-            return json!({"index": 0, "text": message.content, "logprobs": null});
+            return json!({"index": index, "text": message.content, "logprobs": null});
         }
         let mut body = json!({
             "role": "assistant",
@@ -923,28 +1046,32 @@ impl Reply {
                 .map(|call| self.tool_call(call, None))
                 .collect();
         }
-        json!({"index": 0, "message": body, "logprobs": null})
+        json!({"index": index, "message": body, "logprobs": null})
     }
 
-    /// A streamed choice with the fields of `part` and no finish reason.
-    fn streamed(part: Value) -> Value {
-        let mut choice = json!({"index": 0, "logprobs": null, "finish_reason": null});
+    /// Streamed choice `index` with the fields of `part` and no finish reason.
+    fn streamed(index: usize, part: Value) -> Value {
+        let mut choice = json!({"index": index, "logprobs": null, "finish_reason": null});
         if let (Value::Object(choice), Value::Object(part)) = (&mut choice, part) {
             choice.extend(part);
         }
         choice
     }
 
-    /// A streamed choice that adds no text.
-    fn empty(&self) -> Value {
-        Self::streamed(match self.kind {
-            Kind::Chat => json!({"delta": {}}),
-            Kind::Text => json!({"text": ""}),
-        })
+    /// Streamed choice `index` that adds no text.
+    fn empty(&self, index: usize) -> Value {
+        Self::streamed(
+            index,
+            match self.kind {
+                Kind::Chat => json!({"delta": {}}),
+                Kind::Text => json!({"text": ""}),
+            },
+        )
     }
 
-    /// The streamed choices of `delta`, one chunk each; `calls` counts tool calls sent.
-    fn deltas(&self, delta: &Delta, calls: &mut usize) -> Vec<Value> {
+    /// Choice `index`'s streamed parts of `delta`, one chunk each; `calls` counts the
+    /// choice's tool calls sent.
+    fn deltas(&self, index: usize, delta: &Delta, calls: &mut usize) -> Vec<Value> {
         let mut parts = Vec::new();
         match self.kind {
             Kind::Text => {
@@ -966,7 +1093,10 @@ impl Reply {
                 }
             }
         }
-        parts.into_iter().map(Self::streamed).collect()
+        parts
+            .into_iter()
+            .map(|part| Self::streamed(index, part))
+            .collect()
     }
 
     fn tool_call(&self, call: &ToolCall, index: Option<usize>) -> Value {
@@ -983,7 +1113,11 @@ impl Reply {
         value
     }
 
-    fn usage(&self, completion_tokens: usize, reasoning_tokens: usize) -> Value {
+    /// The usage of a reply whose choices are `outputs`: the prompt once, and the tokens of
+    /// every choice.
+    fn usage(&self, outputs: &[Output]) -> Value {
+        let completion_tokens: usize = outputs.iter().map(|o| o.tokens).sum();
+        let reasoning_tokens: usize = outputs.iter().map(Output::reasoning_tokens).sum();
         json!({
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -994,9 +1128,9 @@ impl Reply {
     }
 }
 
-/// Sends one request's server-sent chunks.
+/// Sends one request's server-sent chunks, each event's data.
 struct Chunks {
-    out: mpsc::Sender<Result<SseEvent, Infallible>>,
+    out: mpsc::Sender<String>,
     reply: Reply,
     /// The prompt's ids, sent with the first chunk (`return_token_ids`).
     prompt_ids: Option<Vec<u32>>,
@@ -1006,7 +1140,7 @@ impl Chunks {
     /// Sends one chunk per choice; false once the client has left.
     async fn send(&mut self, choices: Vec<Value>) -> bool {
         for choice in choices {
-            let mut chunk = self.reply.body(true, &choice);
+            let mut chunk = self.reply.body(true, vec![choice]);
             if let Some(ids) = self.prompt_ids.take() {
                 chunk["prompt_token_ids"] = json!(ids);
             }
@@ -1018,94 +1152,92 @@ impl Chunks {
     }
 
     async fn raw(&self, data: String) -> bool {
-        self.out
-            .send(Ok(SseEvent::default().data(data)))
-            .await
-            .is_ok()
+        self.out.send(data).await.is_ok()
     }
 }
 
-/// Puts `ids` on the first of `choices`, adding an empty choice if there is none.
-fn attach_ids(reply: &Reply, choices: &mut Vec<Value>, ids: &[u32]) {
+/// Puts `ids` on the first of `choices`, adding an empty choice `index` if there is none.
+fn attach_ids(reply: &Reply, index: usize, choices: &mut Vec<Value>, ids: &[u32]) {
     if ids.is_empty() {
         return;
     }
     if choices.is_empty() {
-        choices.push(reply.empty());
+        choices.push(reply.empty(index));
     }
     choices[0]["token_ids"] = json!(ids);
 }
 
-/// Turns the engine's events for one request into server-sent chunks. Returning drops
-/// `results`, which cancels the job: when the client has left or a stop string matched.
+/// Turns the engine's events for one request's choices into server-sent chunks of one
+/// choice each, in the order the events arrive, as vLLM and OpenAI interleave them. A chat
+/// stream starts with each choice's role chunk. Each choice ends with a chunk that holds
+/// its finish reason, and the usage chunk, if asked for, follows the last. Returning drops
+/// `fanout`, which cancels the jobs still open: when the client has left or a job failed.
 async fn stream(
-    app: Arc<App>,
-    mut results: Results,
-    mut output: Output,
+    vocab: &Vocab,
+    mut fanout: Fanout,
+    mut outputs: Vec<Output>,
     mut chunks: Chunks,
     include_usage: bool,
 ) {
+    let n = outputs.len();
     let token_ids = chunks.prompt_ids.is_some();
     if chunks.reply.kind == Kind::Chat {
-        let role = Reply::streamed(json!({"delta": {"role": "assistant", "content": ""}}));
-        if !chunks.send(vec![role]).await {
+        let roles = (0..n)
+            .map(|i| Reply::streamed(i, json!({"delta": {"role": "assistant", "content": ""}})))
+            .collect();
+        if !chunks.send(roles).await {
             return;
         }
     }
-    let mut calls = 0;
-    // Ids already sent as `token_ids`.
-    let mut sent = 0;
-    let finish = loop {
-        let delta = match results.next().await {
+    // Each choice's tool calls sent, and its ids already sent as `token_ids`.
+    let mut calls = vec![0; n];
+    let mut sent = vec![0; n];
+    let mut open = n;
+    while open > 0 {
+        let (i, event) = fanout.next().await;
+        let output = &mut outputs[i];
+        let (delta, finish) = match event {
             Event::Started => continue,
-            Event::Cached(n) => {
-                chunks.reply.cached_tokens = n;
+            Event::Cached(cached) => {
+                if i == 0 {
+                    chunks.reply.cached_tokens = cached;
+                }
                 continue;
             }
-            Event::Tokens(ids) => output.push(&app.vocab, &ids),
-            Event::Done(finish) => break Ok(finish),
-            Event::Failed(e) => break Err(e),
+            Event::Tokens(ids) => {
+                let delta = output.push(vocab, &ids);
+                (delta, output.done.then_some(Finish::Stop))
+            }
+            Event::Done(finish) => (Delta::default(), Some(finish)),
+            Event::Failed(message) => {
+                let error = json!({"error": {"message": message, "type": "server_error", "param": null, "code": null}});
+                let _ = chunks.raw(error.to_string()).await;
+                return;
+            }
         };
-        let mut choices = chunks.reply.deltas(&delta, &mut calls);
+        let mut choices = chunks.reply.deltas(i, &delta, &mut calls[i]);
+        if let Some(finish) = finish {
+            // Ends the job if a stop ended the output first.
+            fanout.close(i, finish);
+            let rest = output.finish(vocab, finish);
+            choices.extend(chunks.reply.deltas(i, &rest, &mut calls[i]));
+            let mut last = chunks.reply.empty(i);
+            last["finish_reason"] = json!(output.finish_reason(finish));
+            last["stop_reason"] = output.stop_reason();
+            choices.push(last);
+            open -= 1;
+        }
         if token_ids {
-            attach_ids(&chunks.reply, &mut choices, &output.ids[sent..]);
-            sent = output.ids.len();
+            attach_ids(&chunks.reply, i, &mut choices, &output.ids[sent[i]..]);
+            sent[i] = output.ids.len();
         }
         if !chunks.send(choices).await {
             return;
         }
-        if output.done {
-            break Ok(Finish::Stop);
-        }
-    };
-    let finish = match finish {
-        Ok(finish) => {
-            results.close(finish);
-            finish
-        }
-        Err(message) => {
-            let error = json!({"error": {"message": message, "type": "server_error", "param": null, "code": null}});
-            let _ = chunks.raw(error.to_string()).await;
-            return;
-        }
-    };
-    let mut choices = chunks
-        .reply
-        .deltas(&output.finish(&app.vocab, finish), &mut calls);
-    let mut last = chunks.reply.empty();
-    last["finish_reason"] = json!(output.finish_reason(finish));
-    last["stop_reason"] = output.stop_reason();
-    choices.push(last);
-    if token_ids {
-        attach_ids(&chunks.reply, &mut choices, &output.ids[sent..]);
-    }
-    if !chunks.send(choices).await {
-        return;
     }
     if include_usage {
-        let mut chunk = chunks.reply.body(true, &Value::Null);
-        chunk["choices"] = json!([]);
-        chunk["usage"] = chunks.reply.usage(output.tokens, output.reasoning_tokens());
+        let mut chunk = chunks.reply.body(true, Vec::new());
+        chunk["usage"] = chunks.reply.usage(&outputs);
         if !chunks.raw(chunk.to_string()).await {
             return;
         }
@@ -1325,6 +1457,269 @@ mod tests {
         assert_eq!(all.content, "    return 1");
     }
 
+    /// A fanout over one channel per entry of `events`, each holding its events, for a
+    /// prompt of `prompt` tokens. The senders stay open, as the engine's do while a job
+    /// runs.
+    fn fanout(
+        metrics: &Arc<Metrics>,
+        prompt: usize,
+        events: Vec<Vec<Event>>,
+    ) -> (Fanout, Vec<mpsc::UnboundedSender<Event>>) {
+        let mut senders = Vec::new();
+        let mut results = Vec::new();
+        for (i, list) in events.into_iter().enumerate() {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            for event in list {
+                sender.send(event).unwrap();
+            }
+            senders.push(sender);
+            results.push(Results {
+                receiver,
+                tracker: metrics.track(if i == 0 { prompt } else { 0 }),
+            });
+        }
+        (Fanout::new(results), senders)
+    }
+
+    fn reply(kind: Kind) -> Reply {
+        Reply {
+            id: "cmpl-1".to_owned(),
+            created: 1,
+            model: "m".to_owned(),
+            prompt_tokens: 3,
+            cached_tokens: 0,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_takes_turns_and_cancels_one_choice() {
+        let metrics = Arc::new(Metrics::new("m"));
+        let events = (0..3)
+            .map(|_| {
+                vec![
+                    Event::Started,
+                    Event::Tokens(vec![1]),
+                    Event::Tokens(vec![2, 3]),
+                ]
+            })
+            .collect();
+        let (mut fanout, senders) = fanout(&metrics, 10, events);
+        let mut order = Vec::new();
+        for _ in 0..9 {
+            let (i, event) = fanout.next().await;
+            order.push((i, matches!(event, Event::Tokens(_))));
+        }
+        // Each choice gets a turn in index order, whatever the others hold.
+        let want: Vec<(usize, bool)> = [false, true, true]
+            .iter()
+            .flat_map(|&tokens| (0..3).map(move |i| (i, tokens)))
+            .collect();
+        assert_eq!(order, want);
+        // Closing a choice cancels its job alone.
+        fanout.close(1, Finish::Stop);
+        assert!(senders[1].is_closed());
+        assert!(!senders[0].is_closed() && !senders[2].is_closed());
+        senders[2].send(Event::Done(Finish::Length)).unwrap();
+        assert!(matches!(
+            fanout.next().await,
+            (2, Event::Done(Finish::Length))
+        ));
+        // The prompt counts once; every choice's tokens count.
+        let text = metrics.render();
+        assert!(
+            text.contains("vllm:prompt_tokens_total{model_name=\"m\"} 10\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("vllm:generation_tokens_total{model_name=\"m\"} 9\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("vllm:prefix_cache_queries_total{model_name=\"m\"} 10\n"),
+            "{text}"
+        );
+        // Dropping the fanout cancels the open choices.
+        drop(fanout);
+        assert!(senders.iter().all(mpsc::UnboundedSender::is_closed));
+    }
+
+    #[test]
+    fn usage_counts_the_prompt_once() {
+        let mut outputs = vec![
+            Output::new(
+                Decoder::Text(Detokenizer::default()),
+                Stops::default(),
+                Vec::new(),
+                Calls::Free,
+            );
+            2
+        ];
+        outputs[0].tokens = 5;
+        outputs[1].tokens = 7;
+        let usage = reply(Kind::Text).usage(&outputs);
+        assert_eq!(usage["prompt_tokens"], 3);
+        assert_eq!(usage["completion_tokens"], 12);
+        assert_eq!(usage["total_tokens"], 15);
+    }
+
+    /// Each choice's engine events for the text of `texts`, the first two ended by the
+    /// model and the third by its token limit.
+    fn choice_events(vocab: &Vocab, texts: &[&str]) -> Vec<Vec<Event>> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut events = vec![Event::Started];
+                // A token at a time, as batched steps deliver them.
+                events.extend(
+                    vocab
+                        .encode(text)
+                        .into_iter()
+                        .map(|id| Event::Tokens(vec![id])),
+                );
+                events.push(Event::Done(if i == 2 {
+                    Finish::Length
+                } else {
+                    Finish::Stop
+                }));
+                events
+            })
+            .collect()
+    }
+
+    const TEXTS: [&str; 3] = ["Hello world. Bye.", "Stop here now.", "abc"];
+
+    #[tokio::test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    async fn whole_reply_merges_choices() {
+        let vocab = vocab();
+        let metrics = Arc::new(Metrics::new("m"));
+        let (fanout, senders) = fanout(&metrics, 3, choice_events(&vocab, &TEXTS));
+        let output = Output::new(
+            Decoder::Text(Detokenizer::default()),
+            Stops::new(vec!["here".to_owned()]),
+            Vec::new(),
+            Calls::Free,
+        );
+        let outputs = vec![output; 3];
+        let body = whole(
+            &vocab,
+            fanout,
+            outputs,
+            reply(Kind::Text),
+            Some(vec![1, 2, 3]),
+        )
+        .await
+        .unwrap();
+        let choices = body["choices"].as_array().unwrap();
+        let texts: Vec<&str> = choices
+            .iter()
+            .map(|c| c["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["Hello world. Bye.", "Stop ", "abc"]);
+        for (i, choice) in choices.iter().enumerate() {
+            assert_eq!(choice["index"], i);
+        }
+        let reasons: Vec<&Value> = choices.iter().map(|c| &c["finish_reason"]).collect();
+        assert_eq!(reasons, [&json!("stop"), &json!("stop"), &json!("length")]);
+        let stops: Vec<&Value> = choices.iter().map(|c| &c["stop_reason"]).collect();
+        assert_eq!(stops, [&Value::Null, &json!("here"), &Value::Null]);
+        // The stop string cancelled its choice's job.
+        assert!(senders[1].is_closed());
+        // The first choice's ids end with the end token, which counts as no token.
+        let ids: Vec<usize> = choices
+            .iter()
+            .map(|c| c["token_ids"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
+        assert_eq!(
+            body["usage"]["completion_tokens"],
+            ids[0] - 1 + ids[1] + ids[2]
+        );
+        assert_eq!(body["prompt_token_ids"], json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    async fn stream_interleaves_choices() {
+        let vocab = vocab();
+        let metrics = Arc::new(Metrics::new("m"));
+        let (fanout, _senders) = fanout(&metrics, 3, choice_events(&vocab, &TEXTS));
+        let output = Output::new(
+            Decoder::Chat(Parser::new(&vocab, &Ending::Continue)),
+            Stops::new(vec!["here".to_owned()]),
+            Vec::new(),
+            Calls::Free,
+        );
+        let (out, mut rx) = mpsc::channel(1024);
+        let chunks = Chunks {
+            out,
+            reply: reply(Kind::Chat),
+            prompt_ids: None,
+        };
+        stream(&vocab, fanout, vec![output; 3], chunks, true).await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        assert_eq!(frames.pop().as_deref(), Some("[DONE]"));
+        let chunks: Vec<Value> = frames
+            .iter()
+            .map(|f| serde_json::from_str(f).unwrap())
+            .collect();
+        let (usage, chunks) = chunks.split_last().unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 3);
+        // One role chunk per choice first, then one choice per chunk.
+        for (i, chunk) in chunks[..3].iter().enumerate() {
+            assert_eq!(chunk["choices"][0]["index"], i);
+            assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
+        }
+        let mut content = vec![String::new(); 3];
+        let mut finished = vec![None; 3];
+        let mut first_index = Vec::new();
+        for chunk in &chunks[3..] {
+            assert_eq!(chunk["object"], "chat.completion.chunk");
+            let [choice] = chunk["choices"].as_array().unwrap().as_slice() else {
+                panic!("a chunk holds one choice: {chunk}");
+            };
+            let i = usize::try_from(choice["index"].as_u64().unwrap()).unwrap();
+            assert!(
+                finished[i].is_none(),
+                "choice {i} sent a chunk after its end"
+            );
+            first_index.push(i);
+            if let Some(text) = choice["delta"]["content"].as_str() {
+                content[i] += text;
+            }
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                finished[i] = Some((reason.to_owned(), choice["stop_reason"].clone()));
+            }
+        }
+        assert_eq!(content, ["Hello world. Bye.", "Stop ", "abc"]);
+        assert_eq!(
+            finished,
+            [
+                Some(("stop".to_owned(), Value::Null)),
+                Some(("stop".to_owned(), json!("here"))),
+                Some(("length".to_owned(), Value::Null)),
+            ]
+        );
+        // The choices interleave rather than run one after another.
+        assert_eq!(first_index[..3], [0, 1, 2]);
+        // Every token of the first and last choice, and the second's up to the one that
+        // completed the stop string.
+        let ids: Vec<Vec<u32>> = TEXTS.iter().map(|t| vocab.encode(t)).collect();
+        let cut = (1..=ids[1].len())
+            .find(|&k| vocab.decode(&ids[1][..k]).contains("here"))
+            .unwrap();
+        assert_eq!(
+            usage["usage"]["completion_tokens"],
+            ids[0].len() + cut + ids[2].len()
+        );
+    }
+
     #[test]
     fn streamed_choice_shapes() {
         let reply = Reply {
@@ -1341,7 +1736,7 @@ mod tests {
             tool_calls: Vec::new(),
         };
         let mut calls = 0;
-        let choices = reply.deltas(&delta, &mut calls);
+        let choices = reply.deltas(0, &delta, &mut calls);
         assert_eq!(
             choices,
             [
@@ -1356,7 +1751,7 @@ mod tests {
             ..reply
         };
         let mut choices = Vec::new();
-        attach_ids(&text, &mut choices, &[7, 8]);
+        attach_ids(&text, 0, &mut choices, &[7, 8]);
         assert_eq!(
             choices,
             [
@@ -1364,7 +1759,7 @@ mod tests {
                     "token_ids": [7, 8]})
             ]
         );
-        let body = text.body(true, &choices[0]);
+        let body = text.body(true, vec![choices[0].clone()]);
         assert_eq!(body["object"], "text_completion");
     }
 }

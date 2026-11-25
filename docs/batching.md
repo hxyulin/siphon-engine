@@ -73,6 +73,8 @@ A new request takes a free slot and is prefilled into it in chunks of 2,048 rows
 
 Prefill into slot k runs the existing prefill code on that slot's caches. Prefill launches its kernels directly, not through a graph, so it can take any slot's caches.
 
+The choices of a request with `n` choices share one prompt and differ only in their seeds. When one of them finishes its prefill, the engine copies its slot into the slots of the choices that have not started prefilling (`Model::move_slot`), before the next batched step moves it past the prompt. Each copy's slot was reset when the choice joined, and `move_slot` copies the global caches up to the prompt's end and the rings and conv states whole, so the copy holds the same bytes as its own prefill would leave. Its first token is drawn from the prefill's last logits, still in the decode buffers, with its own sampling (`Model::redraw_slot`). A draw depends only on the logits, the sampling and the position, so it is the token the choice's own prefill would draw. `tests/batch.rs` (`shared_prefill_matches_separate`) checks that copies decode the tokens and logits of separate prefills with the same seeds.
+
 ## Speculation
 
 Two ways to combine speculation with batching:

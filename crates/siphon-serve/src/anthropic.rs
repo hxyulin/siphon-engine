@@ -163,7 +163,7 @@ fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
         },
         return_token_ids: false,
         ignore_eos: false,
-        sampling,
+        samplings: vec![sampling],
         output: Output::new(Decoder::Chat(parser), Stops::new(stops), Vec::new(), calls),
     })
 }
@@ -641,12 +641,16 @@ async fn respond(app: Arc<App>, prepared: Prepared) -> Result<Response, ApiError
         prompt,
         max_tokens,
         delivery,
-        sampling,
+        samplings,
         output,
         ..
     } = prepared;
     let message = Message::new(&app, prompt.len());
-    let results = submit(&app, prompt, max_tokens, false, sampling)?;
+    let sampling = samplings
+        .first()
+        .copied()
+        .ok_or_else(|| ApiError::internal("no sampling"))?;
+    let results = submit(&app, &prompt, max_tokens, false, sampling)?;
     if matches!(delivery, Delivery::Whole) {
         // Runs in the handler, so that a client that leaves drops the job.
         let (out, mut rx) = mpsc::channel(1);

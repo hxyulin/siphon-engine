@@ -14,6 +14,11 @@
 //! sequences join and leave the batch at different steps, so the batch size, the rows'
 //! order and their positions all change during the run.
 //!
+//! `shared_prefill_matches_separate` checks the server's prefill sharing for requests with
+//! `n` choices: one slot prefills a prompt, `Model::move_slot` copies it into the others,
+//! and `Model::redraw_slot` draws each copy's first token with its own seed. Each copy must
+//! decode, tokens and logits bit for bit, as the same seed does after its own prefill.
+//!
 //! `speculation_returns_after_batch_bundled` speculates, batches and speculates again with the
 //! bundled draft; `speculation_returns_after_batch_dflash` does the same with the drafter
 //! in `SIPHON_DFLASH`, and passes without it.
@@ -28,7 +33,7 @@ use siphon::{Checkpoint, TextConfig};
 use siphon_cuda::{
     Gpu,
     draft::DraftOptions,
-    model::{Accept, DEFAULT_PREFILL_CHUNK, Model, PrefillLogits, VerifyTokens},
+    model::{Accept, DEFAULT_PREFILL_CHUNK, Model, PrefillLogits, Sampling, VerifyTokens},
     ops::attention::KvFormat,
     spec::{DraftSource, Drafts, Speculator, Width, greedy_by_verify, load_draft},
     weights::{WeightFormat, Weights},
@@ -173,6 +178,114 @@ fn batch_matches_alone_fp8() -> anyhow::Result<()> {
 #[ignore = "needs the checkpoint and a GPU"]
 fn batch_matches_alone_bf16() -> anyhow::Result<()> {
     batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16)
+}
+
+/// Each slot's tokens and logits' hashes for `STEPS` batched steps of slots `0..firsts.len()`
+/// together, slot `s` from its first token `firsts[s]` with `samplings[s]`.
+fn decode_slots(
+    model: &mut Model,
+    samplings: &[Sampling],
+    firsts: &[u32],
+) -> anyhow::Result<Vec<(Vec<u32>, Vec<u64>)>> {
+    let vocab = model.config().unpadded_vocab_size;
+    let mut out: Vec<(Vec<u32>, Vec<u64>)> =
+        firsts.iter().map(|&t| (vec![t], Vec::new())).collect();
+    for _ in 0..STEPS {
+        let rows: Vec<(usize, u32)> = out
+            .iter()
+            .enumerate()
+            .map(|(slot, (tokens, _))| (slot, *tokens.last().unwrap_or(&0)))
+            .collect();
+        let next = model.step_batch_sampled(&rows, samplings)?;
+        let logits = model.batch_logits(rows.len())?;
+        for (slot, (tokens, hashes)) in out.iter_mut().enumerate() {
+            tokens.push(next[slot]);
+            hashes.push(hash(&logits[slot * vocab..(slot + 1) * vocab]));
+        }
+    }
+    Ok(out)
+}
+
+/// Choices of one prompt in `shared_prefill_matches_separate`.
+const CHOICES: usize = 4;
+/// The slot that prefills for the others, so that slot 0 is a copy.
+const SOURCE: usize = 1;
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn shared_prefill_matches_separate() -> anyhow::Result<()> {
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    model.enable_sampling()?;
+    model.add_slots(CHOICES - 1)?;
+    let capture = capture_tokens()?;
+    // Short, just under the sliding window, and past its wrap.
+    for (first, len) in [(0, 40), (5000, 1023), (3000, 2500)] {
+        let prompt = &capture[first..first + len];
+        for (name, temperature, top_p) in [
+            ("T=1", 1.0, 1.0),
+            ("T=0.8", 0.8, 0.95),
+            ("greedy", 0.0, 1.0),
+        ] {
+            // Choice i takes seed 7 + i, as the server derives them.
+            let samplings = (0..CHOICES as u64)
+                .map(|i| Sampling::new(temperature, 0, top_p, 0.0, 7 + i))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            // Each choice prefills the prompt in its own slot.
+            let mut firsts = Vec::new();
+            for (slot, &sampling) in samplings.iter().enumerate() {
+                model.reset_slot(slot)?;
+                model.set_sampling(sampling);
+                firsts.push(model.prefill_slot(slot, prompt, DEFAULT_PREFILL_CHUNK)?);
+            }
+            let want = decode_slots(&mut model, &samplings, &firsts)?;
+
+            // One prefill, copied into the other slots, which were reset as the server
+            // resets a request's slot.
+            for slot in 0..CHOICES {
+                model.reset_slot(slot)?;
+            }
+            model.set_sampling(samplings[SOURCE]);
+            let mut shared = vec![0; CHOICES];
+            shared[SOURCE] = model.prefill_slot(SOURCE, prompt, DEFAULT_PREFILL_CHUNK)?;
+            for slot in (0..CHOICES).filter(|&s| s != SOURCE) {
+                model.move_slot(SOURCE, slot)?;
+                shared[slot] = model.redraw_slot(slot, samplings[slot])?;
+                ensure!(
+                    model.slot_position(slot)? == len,
+                    "slot {slot} is not at the prompt's end"
+                );
+            }
+            ensure!(
+                model.redraw_slot(SOURCE, samplings[SOURCE])? == shared[SOURCE],
+                "{name}: a redraw with the prefill's own sampling differs from the prefill"
+            );
+            let got = decode_slots(&mut model, &samplings, &shared)?;
+
+            for (slot, (want, got)) in want.iter().zip(&got).enumerate() {
+                let tokens_differ = want.0.iter().zip(&got.0).position(|(a, b)| a != b);
+                let logits_differ = want.1.iter().zip(&got.1).position(|(a, b)| a != b);
+                println!(
+                    "{len} tokens, {name}, choice {slot}: first different token {tokens_differ:?}, first different logits {logits_differ:?}"
+                );
+                ensure!(
+                    tokens_differ.is_none() && logits_differ.is_none(),
+                    "{len} tokens, {name}, choice {slot}: the copy differs from its own prefill"
+                );
+            }
+            // Greedy choices agree; at T=1 the seeds must make them differ somewhere.
+            let distinct = want.iter().any(|(tokens, _)| *tokens != want[0].0);
+            ensure!(
+                !(samplings[0].is_greedy() && distinct),
+                "{name}: greedy choices differ"
+            );
+            ensure!(
+                distinct || name != "T=1",
+                "{name}: four seeds gave the same tokens"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Tokens of `prompt`'s greedy continuation through one-row verifies in slot 0, the first

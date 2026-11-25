@@ -110,11 +110,23 @@ Both routes sample with `temperature`, `top_k`, `top_p`, `min_p` and `seed`, in 
 
 `temperature: 0` decodes greedily and gives the same tokens as earlier greedy builds. A request with a `seed` gets the same tokens again on the same server configuration, alone or in a batch. A request without one gets a random seed. `--greedy` decodes every request greedily.
 
+## Several choices
+
+Both routes take `n`, the number of choices to generate from one prompt, 1 by default. Choice `i` of a request with seed `s` samples with seed `s + i`, as vLLM's parallel sampling seeds its child requests. Choice 0 so gets the tokens the same request with `n: 1` gets. Without a seed, each choice gets its own random seed. Greedy choices are identical. vLLM refuses `n` above 1 with temperature 0; this server returns the identical choices.
+
+Each choice runs as its own request in the engine, with its own slot, and has its own `index`, `finish_reason`, `stop_reason`, text, reasoning, tool calls and `token_ids`. Stop strings, `stop_token_ids`, `ignore_eos`, `tool_choice` and the reasoning parser apply to each choice alone. A choice that a stop ends stops generating; the others go on.
+
+A stream sends one choice per chunk, as vLLM and OpenAI do. A chat stream starts with one role chunk per choice, in index order. The choices' chunks then interleave as the engine generates them, and each choice ends with its own chunk holding its `finish_reason`. In `usage`, the prompt counts once and `completion_tokens` sums the choices. `prompt_tokens_details.cached_tokens` is choice 0's.
+
+A request with `n` choices takes `n` places among the running and queued requests: up to `--queue` may wait beyond the `--streams` that run. If they do not all fit, the request gets the queue-full 503, and none of its choices runs. An `n` above `--streams` plus `--queue` gets a 400. A client that leaves cancels every choice.
+
+With `--streams` of 2 or more, the choices run batched, not speculating. The first choice to prefill copies its state into the slots of the others, and each draws its first token from the same logits with its own seed, so the prompt is prefilled once and each choice gets the tokens of its own prefill. Choices that start later, because the slots were full, prefill the prompt themselves. With `--streams 1`, the choices run one after another, and each one after the first reads the prompt up to its last multiple of 2,048 tokens from the [prefix cache](#prefix-cache).
+
 ## Accepted, ignored and refused fields
 
 The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) and other sampling fields are accepted and ignored. So are `user`, `skip_special_tokens` and unknown fields.
 
-Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `min_tokens`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`.
+Fields the server cannot honour get a 400: `best_of` other than `n` (ranking choices needs log probabilities), `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `min_tokens`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`.
 
 ## Metrics
 
@@ -126,6 +138,8 @@ Fields the server cannot honour get a 400: `n` or `best_of` above 1, `logprobs`,
 | `vllm:generation_tokens_total` | counter | Tokens the engine generated, including any a stop string cut off. |
 | `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total` | counter | Prompt tokens looked up in the prefix cache, and those found there. |
 | `vllm:request_success_total` | counter | Finished requests, labelled `finished_reason`: `stop`, `length`, `abort` (the client left) or `error`. |
+
+Each choice of a request with `n` choices counts as a request in the request counts, the gauges and the latency histograms, since it runs as its own sequence. Its prompt counts once, with choice 0, in `vllm:prompt_tokens_total` and the prefix cache counters.
 | `vllm:num_requests_running`, `vllm:num_requests_waiting` | gauge | Requests the engine has started, and requests still in its queue. |
 | `vllm:request_queue_time_seconds` | histogram | Time from queueing to the engine starting the request. |
 | `vllm:time_to_first_token_seconds` | histogram | Time from queueing to the first token. |

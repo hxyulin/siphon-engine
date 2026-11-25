@@ -43,6 +43,7 @@ enum State {
 }
 
 /// Parses one generation, fed a few ids at a time.
+#[derive(Clone)]
 pub struct Parser {
     special: Special,
     state: State,
@@ -161,7 +162,7 @@ impl Parser {
 /// Turns ids into text a few at a time, special tokens included, holding back ids that end
 /// inside a UTF-8 character. Keeps one decoded step of context, as
 /// text-generation-inference does.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Detokenizer {
     ids: Vec<u32>,
     prefix: usize,

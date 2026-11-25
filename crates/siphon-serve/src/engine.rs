@@ -9,6 +9,13 @@
 //! same tokens, so a request's output does not depend on what else runs (see
 //! `docs/batching.md`).
 //!
+//! The jobs of one submission share a prompt: an HTTP request with `n` choices submits `n`
+//! jobs that differ only in their sampling seeds. When one of them finishes its prefill in
+//! a batch, the engine copies that slot's state into the slots of the siblings that have
+//! not started prefilling (`Model::move_slot`) and draws each sibling's first token from
+//! the same logits with its own sampling (`Model::redraw_slot`). Each copy then decodes as
+//! if it had prefilled the prompt itself.
+//!
 //! A request that runs alone prefills through the speculator's prefix cache
 //! (`Speculator::prefill_cached`): when its prompt starts with the tokens of the last such
 //! prompt up to that prompt's last multiple of the prefill chunk, it prefills only the
@@ -23,7 +30,11 @@
 
 use std::{
     path::PathBuf,
-    sync::mpsc::{SyncSender, TrySendError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{SyncSender, TrySendError},
+    },
 };
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -42,6 +53,107 @@ pub struct Job {
     pub ignore_eos: bool,
     pub sampling: Sampling,
     pub events: UnboundedSender<Event>,
+    /// The submission the job came in: jobs of one submission share their prompt.
+    group: u64,
+    /// The job's place in the engine's [`Load`], from [`Engine::submit`].
+    ticket: Option<Ticket>,
+}
+
+impl Job {
+    pub fn new(
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        ignore_eos: bool,
+        sampling: Sampling,
+        events: UnboundedSender<Event>,
+    ) -> Self {
+        Self {
+            prompt,
+            max_tokens,
+            ignore_eos,
+            sampling,
+            events,
+            group: 0,
+            ticket: None,
+        }
+    }
+
+    /// Counts the job as running rather than waiting.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only the Linux engine runs jobs")
+    )]
+    fn start(&mut self) {
+        if let Some(ticket) = &mut self.ticket {
+            ticket.start();
+        }
+    }
+}
+
+/// Jobs that wait for the engine and jobs it runs, counted across threads so that a
+/// submission of several jobs fits whole or not at all.
+#[derive(Debug, Default)]
+struct Load(Mutex<Counts>);
+
+#[derive(Debug, Default)]
+struct Counts {
+    waiting: usize,
+    running: usize,
+}
+
+impl Load {
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts `n` more waiting jobs if they fit: at most `queue` may wait beyond the
+    /// `streams` that run.
+    fn reserve(&self, n: usize, queue: usize, streams: usize) -> bool {
+        let mut counts = self.counts();
+        let idle = streams.saturating_sub(counts.running);
+        let fits = counts.waiting + n <= queue + idle;
+        if fits {
+            counts.waiting += n;
+        }
+        fits
+    }
+}
+
+/// One job's count in a [`Load`]: waiting until [`Ticket::start`], then running until
+/// dropped.
+#[derive(Debug)]
+struct Ticket {
+    load: Arc<Load>,
+    running: bool,
+}
+
+impl Ticket {
+    fn new(load: &Arc<Load>) -> Self {
+        Self {
+            load: Arc::clone(load),
+            running: false,
+        }
+    }
+
+    fn start(&mut self) {
+        if !self.running {
+            self.running = true;
+            let mut counts = self.load.counts();
+            counts.waiting -= 1;
+            counts.running += 1;
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let mut counts = self.load.counts();
+        if self.running {
+            counts.running -= 1;
+        } else {
+            counts.waiting -= 1;
+        }
+    }
 }
 
 /// How a request picks its tokens, as vLLM's sampling parameters: temperature 0 is greedy,
@@ -130,8 +242,12 @@ pub struct Options {
 /// Sends jobs to the engine thread.
 #[derive(Clone)]
 pub struct Engine {
-    jobs: SyncSender<Job>,
+    /// Submissions: the jobs of one HTTP request, which share a prompt.
+    jobs: SyncSender<Vec<Job>>,
     max_context: usize,
+    load: Arc<Load>,
+    queue: usize,
+    streams: usize,
 }
 
 /// Why the engine did not take a job.
@@ -146,9 +262,27 @@ impl Engine {
         self.max_context
     }
 
-    /// Queues `job`, or refuses it when the queue is full or the engine has stopped.
-    pub fn submit(&self, job: Job) -> Result<(), Refused> {
-        self.jobs.try_send(job).map_err(|e| match e {
+    /// Jobs that one submission may hold: as many as run and wait at once.
+    pub fn max_jobs(&self) -> usize {
+        self.queue + self.streams
+    }
+
+    /// Queues `jobs`, which share their prompt, as one submission, or refuses them all
+    /// when they do not fit the queue beside the jobs already there or the engine has
+    /// stopped.
+    pub fn submit(&self, mut jobs: Vec<Job>) -> Result<(), Refused> {
+        static GROUPS: AtomicU64 = AtomicU64::new(0);
+        if !self.load.reserve(jobs.len(), self.queue, self.streams) {
+            return Err(Refused::Busy);
+        }
+        let group = GROUPS.fetch_add(1, Ordering::Relaxed);
+        for job in &mut jobs {
+            job.group = group;
+            // Each ticket gives back its reservation when its job is dropped, so a refused
+            // send below gives them all back.
+            job.ticket = Some(Ticket::new(&self.load));
+        }
+        self.jobs.try_send(jobs).map_err(|e| match e {
             TrySendError::Full(_) => Refused::Busy,
             TrySendError::Disconnected(_) => Refused::Stopped,
         })
@@ -197,8 +331,11 @@ mod cuda {
     /// ids that end a turn.
     pub fn start(options: &Options, stop: Vec<u32>, warmup: Vec<u32>) -> anyhow::Result<Engine> {
         anyhow::ensure!(warmup.len() >= 32, "the warmup prompt is too short");
-        let (jobs, queue) = sync_channel(options.queue);
+        // Each submission holds at least one job, so the channel never holds more
+        // submissions than `Load::reserve` lets wait.
+        let (jobs, queue) = sync_channel(options.queue + options.streams);
         let (ready, loaded) = sync_channel(1);
+        let (queue_len, streams) = (options.queue, options.streams);
         let options = options.clone();
         thread::Builder::new()
             .name("engine".to_owned())
@@ -217,6 +354,9 @@ mod cuda {
         Ok(Engine {
             jobs,
             max_context: capacity - MARGIN,
+            load: std::sync::Arc::default(),
+            queue: queue_len,
+            streams,
         })
     }
 
@@ -486,6 +626,8 @@ mod cuda {
         done: bool,
         /// Whether the client got an error instead of the end of its tokens.
         failed: bool,
+        /// Whether the prompt's state came from a sibling's prefill (`share_prefill`).
+        shared: bool,
         /// Whether the draft follows this request through batched steps.
         followed: bool,
         /// Whether returning to speculation failed, so that the request stays batched.
@@ -496,7 +638,8 @@ mod cuda {
     }
 
     impl Request {
-        fn new(job: Job, slot: usize, greedy: bool) -> Self {
+        fn new(mut job: Job, slot: usize, greedy: bool) -> Self {
+            job.start();
             let _ = job.events.send(Event::Started);
             let (sampling, error) = match model_sampling(&job, greedy) {
                 Ok(s) => (s, None),
@@ -515,6 +658,7 @@ mod cuda {
                 finish: Finish::Length,
                 done: false,
                 failed: false,
+                shared: false,
                 followed: false,
                 stay_batched: false,
                 speculated: 0,
@@ -562,11 +706,12 @@ mod cuda {
             let decode_s = self.started.elapsed().as_secs_f64() - self.prefill_s;
             let events = &self.job.events;
             eprintln!(
-                "job: {} prompt tokens ({} cached), prefill {:.0} ms, {} tokens in {:.2} s \
+                "job: {} prompt tokens ({} cached), prefill {:.0} ms{}, {} tokens in {:.2} s \
                  ({:.1} tok/s, {} speculated, {} batched steps{detail}), {}",
                 self.job.prompt.len(),
                 self.cached,
                 self.prefill_s * 1e3,
+                if self.shared { " (copied)" } else { "" },
                 self.output.len(),
                 decode_s,
                 self.output.len() as f64 / decode_s.max(1e-9),
@@ -593,7 +738,7 @@ mod cuda {
         mut model: Model,
         mut speculator: Speculator,
         mut check: MemoryCheck,
-        queue: &Receiver<Job>,
+        queue: &Receiver<Vec<Job>>,
         stop: &[u32],
         options: &Options,
     ) {
@@ -605,20 +750,22 @@ mod cuda {
             let mut request = if let Some(request) = resumed.take() {
                 request
             } else {
-                let job = match waiting.pop_front() {
-                    Some(job) => job,
-                    None => match queue.recv() {
-                        Ok(job) => job,
+                if waiting.is_empty() {
+                    match queue.recv() {
+                        Ok(jobs) => waiting.extend(jobs),
                         Err(_) => return,
-                    },
+                    }
+                }
+                let Some(job) = waiting.pop_front() else {
+                    continue;
                 };
                 if job.events.is_closed() {
                     continue;
                 }
                 // Another job already waits: start them together.
                 if streams > 1 {
-                    if let Ok(next) = queue.try_recv() {
-                        waiting.push_back(next);
+                    if let Ok(jobs) = queue.try_recv() {
+                        waiting.extend(jobs);
                     }
                     if !waiting.is_empty() {
                         waiting.push_front(job);
@@ -675,7 +822,7 @@ mod cuda {
         speculator: &mut Speculator,
         request: &mut Request,
         stop: &[u32],
-        mut interrupt: Option<(&Receiver<Job>, &mut VecDeque<Job>)>,
+        mut interrupt: Option<(&Receiver<Vec<Job>>, &mut VecDeque<Job>)>,
     ) -> anyhow::Result<bool> {
         model.set_sampling(request.sampling);
         let go_on = if request.next.is_some() {
@@ -703,9 +850,9 @@ mod cuda {
                     return ControlFlow::Break(());
                 }
                 if let Some((queue, waiting)) = interrupt.as_mut()
-                    && let Ok(job) = queue.try_recv()
+                    && let Ok(jobs) = queue.try_recv()
                 {
-                    waiting.push_back(job);
+                    waiting.extend(jobs);
                     interrupted = true;
                     return ControlFlow::Break(());
                 }
@@ -807,14 +954,19 @@ mod cuda {
         speculator: &mut Speculator,
         mut active: Vec<Request>,
         waiting: &mut VecDeque<Job>,
-        queue: &Receiver<Job>,
+        queue: &Receiver<Vec<Job>>,
         stop: &[u32],
         streams: usize,
         greedy: bool,
     ) -> Option<Request> {
         loop {
             while active.len() < streams {
-                let Some(job) = waiting.pop_front().or_else(|| queue.try_recv().ok()) else {
+                if waiting.is_empty()
+                    && let Ok(jobs) = queue.try_recv()
+                {
+                    waiting.extend(jobs);
+                }
+                let Some(job) = waiting.pop_front() else {
                     break;
                 };
                 if job.events.is_closed() {
@@ -855,7 +1007,8 @@ mod cuda {
                     }
                 }
             }
-            if let Some(r) = active.iter_mut().find(|r| r.next.is_none()) {
+            if let Some(i) = active.iter().position(|r| r.next.is_none()) {
+                let r = &mut active[i];
                 if r.job.events.is_closed() {
                     r.done = true;
                 } else {
@@ -872,6 +1025,7 @@ mod cuda {
                                 r.prefill_s = r.started.elapsed().as_secs_f64();
                                 r.next = Some(first);
                                 r.done = r.take(&[first], stop).is_break();
+                                share_prefill(model, &mut active, i, stop);
                             }
                         }
                         Err(e) => r.fail(&e),
@@ -890,6 +1044,46 @@ mod cuda {
                 }
                 !r.done
             });
+        }
+    }
+
+    /// Gives the prompt state that `active[from]` has just prefilled to its siblings, the
+    /// requests of the same submission that have not started prefilling: copies its slot
+    /// into theirs and draws each one's first token from the prefill's logits with its own
+    /// sampling. Runs before anything else touches the model, since the logits live in
+    /// the decode buffers and the next step moves `from`'s slot past the prompt.
+    ///
+    /// A copy is exact: a sibling's slot was reset on admission, and `move_slot` copies the
+    /// global caches up to the prompt's end and the rings and conv states whole, so the
+    /// slot ends up byte for byte as its own prefill would leave it. Its first token is the
+    /// draw its own prefill would make, since a draw depends only on the logits, the
+    /// sampling and the position.
+    fn share_prefill(model: &mut Model, active: &mut [Request], from: usize, stop: &[u32]) {
+        let (slot, group, len) = {
+            let r = &active[from];
+            (r.slot, r.job.group, r.job.prompt.len())
+        };
+        let siblings = active.iter_mut().filter(|r| {
+            r.job.group == group
+                && r.slot != slot
+                && !r.done
+                && r.next.is_none()
+                && r.prefilled == 0
+        });
+        for r in siblings {
+            let copied = model
+                .move_slot(slot, r.slot)
+                .and_then(|()| model.redraw_slot(r.slot, r.sampling));
+            match copied {
+                Ok(first) => {
+                    r.prefilled = len;
+                    r.shared = true;
+                    r.prefill_s = r.started.elapsed().as_secs_f64();
+                    r.next = Some(first);
+                    r.done = r.take(&[first], stop).is_break();
+                }
+                Err(e) => r.fail(&e),
+            }
         }
     }
 
@@ -937,5 +1131,36 @@ mod cuda {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submissions_fit_whole_or_not_at_all() {
+        let load = Arc::new(Load::default());
+        // Two streams and a queue of 3: five jobs fit while none runs.
+        assert!(!load.reserve(6, 3, 2));
+        assert!(load.reserve(4, 3, 2));
+        let mut tickets: Vec<Ticket> = (0..4).map(|_| Ticket::new(&load)).collect();
+        assert!(!load.reserve(2, 3, 2));
+        assert!(load.reserve(1, 3, 2));
+        tickets.push(Ticket::new(&load));
+        // Starting a job moves it from waiting to running: the idle streams shrink as the
+        // waiting jobs do, so nothing more fits.
+        tickets[0].start();
+        tickets[1].start();
+        assert!(!load.reserve(1, 3, 2));
+        // A finished job and a cancelled waiting one each free a place.
+        tickets.swap_remove(0);
+        assert!(load.reserve(1, 3, 2));
+        tickets.push(Ticket::new(&load));
+        tickets.pop();
+        tickets.pop();
+        assert!(load.reserve(2, 3, 2));
+        let counts = load.counts();
+        assert_eq!((counts.waiting, counts.running), (4, 1));
     }
 }

@@ -1,7 +1,7 @@
 //! Stop strings: generated text is cut where the first of them starts.
 
 /// One request's stop strings and the text held back because it could still begin one.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Stops {
     strings: Vec<String>,
     held: String,

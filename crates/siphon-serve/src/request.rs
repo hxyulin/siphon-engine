@@ -114,6 +114,30 @@ pub fn sampling(
     })
 }
 
+/// The sampling of each of a request's `n` choices: [`sampling`] with a seed per choice.
+/// With a request seed `s`, choice `i` gets seed `s + i`, as vLLM's parallel sampling
+/// derives its child requests' seeds (`ParentRequest._get_child_sampling_params` in
+/// `vllm/v1/engine/parallel_sampling.py`). Without one, each choice gets its own random
+/// seed.
+pub fn samplings(
+    fields: &SamplingFields,
+    defaults: &SamplingDefaults,
+    n: usize,
+) -> Result<Vec<Sampling>, InvalidRequest> {
+    let first = sampling(fields, defaults)?;
+    Ok((0..n)
+        .zip(0_u64..)
+        .map(|(_, i)| Sampling {
+            seed: match fields.seed {
+                Some(_) => first.seed.wrapping_add(i),
+                None if i == 0 => first.seed,
+                None => random_seed(),
+            },
+            ..first
+        })
+        .collect())
+}
+
 /// A seed for a request that sends none.
 fn random_seed() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -171,10 +195,29 @@ fn is_set(value: &Value) -> bool {
     }
 }
 
-/// Refuses `n` or `best_of` above 1.
-pub fn one_choice(name: &str, value: Option<u64>) -> Result<(), InvalidRequest> {
-    if value.is_some_and(|n| n > 1) {
-        return Err(InvalidRequest(format!("{name}: only 1 is supported")));
+/// A request's `n`: the choices to generate, 1 when it sends none.
+pub fn choices(n: Option<u64>) -> Result<usize, InvalidRequest> {
+    match n {
+        None => Ok(1),
+        Some(0) => Err(InvalidRequest("n must be at least 1".to_owned())),
+        Some(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+    }
+}
+
+/// Accepts `best_of` only when it equals `n`: generating more choices than it returns
+/// needs log probabilities to rank them.
+pub fn best_of(best_of: Option<u64>, n: usize) -> Result<(), InvalidRequest> {
+    let Some(best_of) = best_of else {
+        return Ok(());
+    };
+    let best_of = usize::try_from(best_of).unwrap_or(usize::MAX);
+    if best_of < n {
+        return Err(InvalidRequest("best_of must be at least n".to_owned()));
+    }
+    if best_of > n {
+        return Err(InvalidRequest(
+            "best_of above n is not supported: ranking choices needs log probabilities".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -353,10 +396,46 @@ mod tests {
     }
 
     #[test]
+    fn choice_seeds() {
+        let defaults = SamplingDefaults::default();
+        let parse = |v: Value, n| {
+            let fields: SamplingFields = serde_json::from_value(v).unwrap();
+            samplings(&fields, &defaults, n).unwrap()
+        };
+        // Choice i of a seeded request gets the seed plus i, as in vLLM.
+        let seeds: Vec<u64> = parse(json!({"seed": 7, "temperature": 0.8}), 4)
+            .iter()
+            .map(|s| s.seed)
+            .collect();
+        assert_eq!(seeds, [7, 8, 9, 10]);
+        let seeded = parse(json!({"seed": 7, "temperature": 0.8}), 2);
+        let temperatures: Vec<f32> = seeded.iter().map(|s| s.temperature).collect();
+        assert_eq!(temperatures, [0.8, 0.8]);
+        // The first choice keeps the request's seed, so n = 1 is unchanged.
+        assert_eq!(parse(json!({"seed": 7}), 1)[0].seed, 7);
+        // -1 is u64::MAX, and the next seed wraps.
+        let wrapped: Vec<u64> = parse(json!({"seed": -1}), 2)
+            .iter()
+            .map(|s| s.seed)
+            .collect();
+        assert_eq!(wrapped, [u64::MAX, 0]);
+        // Without a seed, each choice draws its own.
+        let random = parse(json!({}), 3);
+        assert_ne!(random[0].seed, random[1].seed);
+        assert_ne!(random[1].seed, random[2].seed);
+    }
+
+    #[test]
     fn choices_and_formats() {
-        assert!(one_choice("n", None).is_ok());
-        assert!(one_choice("n", Some(1)).is_ok());
-        assert!(one_choice("n", Some(2)).is_err());
+        assert_eq!(choices(None).unwrap(), 1);
+        assert_eq!(choices(Some(1)).unwrap(), 1);
+        assert_eq!(choices(Some(4)).unwrap(), 4);
+        assert!(choices(Some(0)).is_err());
+        assert!(best_of(None, 4).is_ok());
+        assert!(best_of(Some(1), 1).is_ok());
+        assert!(best_of(Some(4), 4).is_ok());
+        assert!(best_of(Some(2), 4).is_err());
+        assert!(best_of(Some(2), 1).is_err());
         assert!(response_format(None).is_ok());
         assert!(response_format(Some(&json!({"type": "text"}))).is_ok());
         assert!(response_format(Some(&json!({"type": "json_object"}))).is_err());

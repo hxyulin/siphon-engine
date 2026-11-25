@@ -3,6 +3,10 @@
 //!
 //! The HTTP layer records them from each job's events ([`Tracker`]), so they count what
 //! the engine sent: generated tokens include the ones a stop string later cut off.
+//!
+//! Each choice of a request with `n` choices is its own job, and counts as a request in
+//! the request counts, gauges and latency histograms. Its prompt counts once, with the
+//! first choice, in the prompt tokens and the prefix cache lookups.
 
 use std::{
     fmt::Write as _,
@@ -149,7 +153,8 @@ impl Metrics {
         self.state.lock().expect("metrics lock poisoned")
     }
 
-    /// Starts tracking a request of `prompt` tokens that the engine queued.
+    /// Starts tracking a request of `prompt` tokens that the engine queued: 0 for every
+    /// choice of an n-choice request but the first.
     pub fn track(self: &Arc<Self>, prompt: usize) -> Tracker {
         self.state().waiting += 1;
         Tracker {
@@ -312,7 +317,9 @@ impl Tracker {
                 s.ttft.observe((now - self.submitted).as_secs_f64(), 1);
                 s.prompt_tokens += self.prompt;
                 s.cache_queries += self.prompt;
-                s.cache_hits += self.cached;
+                // A later choice of an n-choice request counts no prompt, so none of its
+                // cached tokens either.
+                s.cache_hits += self.cached.min(self.prompt);
             }
             Some(last) => {
                 #[expect(clippy::cast_precision_loss, reason = "token counts per event")]
