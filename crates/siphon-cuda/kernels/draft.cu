@@ -949,10 +949,12 @@ struct StepRace {
         return noisy(logit, token);
     }
 
-    // The term of the confidence's sum for a logit at most `softcap`: exp((logit - cap) / T).
+    // The term of the confidence's sum for a logit at most `softcap`: exp(logit - cap), at
+    // temperature 1 whatever the request's. softmax(logit / T) for T below 1 overstates
+    // how often the target keeps a coupled draft, and the width policy then verifies too
+    // many rows (docs/engine.md, Speculative sampling).
     __device__ __forceinline__ float weight(float logit, float softcap) const {
-        const float shift = logit - softcap;
-        return __expf(on ? shift * inv_t : shift);
+        return __expf(logit - softcap);
     }
 };
 
@@ -1292,9 +1294,8 @@ draft_dflash_step(int32_t step, int32_t steps, const float* partial_value,
 // from draft_markov_fold, written to ids[step - 1], with its confidence, the softmax
 // probability exp(logit - cap) / sum of the `count` partial sums, at most 1, written to
 // confidence[step - 1]. When the request samples (`race`, see StepRace), the partials
-// hold noisy scores, and the confidence is the largest probability under softmax(logit /
-// T) instead, exp((peak - cap) / T) / sum, from each block's largest logit in
-// partial_peak. Then, for state element j (one warp
+// hold noisy scores, and the confidence is the largest probability under softmax(logit)
+// instead, exp(peak - cap) / sum, from each block's largest logit in partial_peak. Then, for state element j (one warp
 // each), the three rnn_proj rows j, 256 + j and 512 + j times [state; w1[token]] with
 // linear.cu's split GEMV order, and the gate of draft_markov_gate: writes the new state
 // to state_out and the latent to latent. state_in is unused at step 0, where the state
@@ -1362,8 +1363,7 @@ draft_markov_step(int32_t pdl, int32_t step, int32_t steps, const float* partial
                 }
             }
             if (lane == 0 && blockIdx.x == 0) {
-                const float p = sampled ? __expf((peak - softcap) * (1.f / race->temperature)) / total
-                                        : __expf(value - softcap) / total;
+                const float p = __expf((sampled ? peak : value) - softcap) / total;
                 confidence[step - 1] = total > 0.f ? fminf(p, 1.f) : 0.f;
             }
         }
@@ -1432,8 +1432,8 @@ constexpr int kFoldGroup = 16;  // rows a warp sums at once, one 16-byte load pe
 // and partial_index, and each block's sum of exp(logit - cap) to partial_sum. With
 // `reverse` set, the warps walk the rows from the end, so consecutive steps meet the rows
 // the previous one read last while they are still in L2. When the request samples
-// (`race` with `control` and `step`, see StepRace), the values are noisy scores, the sums
-// take exp((logit - cap) / T), and each block's largest logit goes to partial_peak.
+// (`race` with `control` and `step`, see StepRace), the values are noisy scores, and each
+// block's largest logit goes to partial_peak.
 extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
 draft_markov_fold(int32_t pdl, int32_t reverse, const __nv_bfloat16* fold_weight,
                   const __nv_bfloat16* fold_bias, const __nv_bfloat16* base, const float* latent,
@@ -1915,8 +1915,7 @@ __device__ __forceinline__ void fold_any(const void* weight, const float* scale,
 // `rows` or, with `count` not null, *count; row n stands for token map[n], or n without
 // a map. Each block writes its best (value, token) pair and its sum of exp(logit - cap)
 // to the partials. When the request samples (`race`, as draft_markov_fold), the values
-// are noisy scores of the tokens, the sums take exp((logit - cap) / T), and each block's
-// largest logit goes to partial_peak.
+// are noisy scores of the tokens, and each block's largest logit goes to partial_peak.
 extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
 draft_markov_fold_any(const void* weight, const float* scale, const __nv_bfloat16* fold_bias,
                       const __nv_bfloat16* base, const float* latent, int32_t rows,
@@ -2019,8 +2018,8 @@ draft_fold_error(const __nv_bfloat16* w, const uint8_t* q, const float* scale, i
 // (`race`, see StepRace), both bounds become bounds of the noisy score: each widens by a
 // BF16 step first, as draft_markov_exact widens greedy bounds, then takes sample_race's
 // scaling and the row's noise. The rounded product and sum are monotone, so the bounds
-// hold for the exact row's noisy score, and the pruning stays exact. The sums then take
-// exp((logit - cap) / T), and each block's largest estimated logit goes to partial_peak.
+// hold for the exact row's noisy score, and the pruning stays exact. Each block's largest
+// estimated logit goes to partial_peak.
 // Grid FOLD_BLOCKS, 256 threads.
 extern "C" __global__ void __launch_bounds__(kFoldWarps * 32)
 draft_markov_bound(int32_t reverse, const uint8_t* q, const float* scale, const float* err,
@@ -2434,7 +2433,7 @@ constexpr int kSelectSteps = kBlock - 1;
 // softmax probability over the 16 scores is the draft's confidence. Writes draft_ids and
 // confidence [steps]. When the request samples (`race`, see StepRace), the walk picks the
 // best noisy score s / T plus the target's noise for row e's position, and the confidence
-// is the largest probability under softmax(s / T) over the 16. One block of 16 warps,
+// is the largest probability under softmax(s) over the 16, as StepRace::weight explains. One block of 16 warps,
 // warp c for candidate c; lane l holds elements 8l to 8l + 7 of each row.
 extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
 draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
@@ -2520,7 +2519,7 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
                 top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, offset));
             }
             const float sum = warp_sum(
-                lane < kTopK && s != -INFINITY ? expf((s - top) * r.inv_t) : 0.f);
+                lane < kTopK && s != -INFINITY ? expf(s - top) : 0.f);
             if (lane == 0) {
                 draft_ids[e] = cand[e * kTopK + bi];
                 confidence[e] = 1.f / sum;

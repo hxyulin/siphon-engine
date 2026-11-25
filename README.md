@@ -82,13 +82,13 @@ The speedup depends on how predictable the text is. Greedy decoding continues a 
 
 ### Sampling
 
-Sampled text is harder to predict than greedy text, so the draft keeps fewer tokens per round. The 12 prompts of the registry runs at a3fc890, before the draft proposed the verify's draw, up to 3,000 tokens each, one request at a time and then 8 at a time with `--streams 8`:
+Sampled text is harder to predict than greedy text, so the draft keeps fewer tokens per round. The 12 prompts of the registry runs, up to 3,000 tokens each, one request at a time and then 8 at a time with `--streams 8`:
 
 | Sampling | Decode tok/s, alone | Tokens per round | Tok/s, 8 streams |
 | --- | ---: | ---: | ---: |
-| Greedy (`temperature: 0`) | 537 | 3.48 | 780 |
-| Temperature 1, the checkpoint's default | 396 | 2.22 | 734 |
-| Temperature 0.8, top-p 0.95 | 438 | 2.51 | 768 |
+| Greedy (`temperature: 0`) | 536 | 3.47 | 780 |
+| Temperature 1, the checkpoint's default | 416 | 2.32 | 737 |
+| Temperature 0.8, top-p 0.95 | 445 | 2.55 | 768 |
 
 Requests with seeds gave the same 12 outputs on a second run and with `--streams 8`. Sampling adds 0.08 to 0.19 ms to an 8-row verify of 6.57 ms.
 

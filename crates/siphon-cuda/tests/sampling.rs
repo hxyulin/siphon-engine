@@ -437,8 +437,9 @@ struct Acceptance {
     sampled: [f64; 7],
     coupled: [f64; 7],
     /// Per draft position, the confidences a coupled draft could report: the largest
-    /// probability under softmax(l / T), which the kernels report, and the probability of
-    /// the run's coupled pick.
+    /// probability under softmax(l), which the kernels report, the largest under
+    /// softmax(l / T), and the probability of the run's coupled pick.
+    plain_confidence: [f64; 7],
     peak_confidence: [f64; 7],
     pick_confidence: [f64; 7],
     /// The run's drafts kept, by position.
@@ -514,6 +515,8 @@ impl Acceptance {
             self.draft_mismatches += usize::from(coupled != Some(draft as usize));
             self.draw_mismatches += usize::from(drawn != Some(r.drawn[j] as usize));
             self.kept[j] += f64::from(u8::from(r.accepted > j));
+            let plain = filtered(logits, Sampling::new(1.0, 0, 1.0, 0.0, sampling.seed)?);
+            self.plain_confidence[j] += plain.first().map_or(0.0, |&(_, v)| v);
             self.peak_confidence[j] += q_all.first().map_or(0.0, |&(_, v)| v);
             self.pick_confidence[j] += q_all_of(draft as usize);
             let mut matched = 0;
@@ -564,7 +567,8 @@ impl Acceptance {
             measured
         );
         println!(
-            "  confidence: largest softmax(l / T) [{}], the pick's [{}]",
+            "  confidence: largest softmax(l) [{}], largest softmax(l / T) [{}], the pick's [{}]",
+            per(&self.plain_confidence),
             per(&self.peak_confidence),
             per(&self.pick_confidence)
         );
