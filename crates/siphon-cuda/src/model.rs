@@ -2552,7 +2552,10 @@ impl Ctx {
     /// Runs [`Experts::expert_matmul_grouped`] or [`Experts::expert_matmul_swiglu_grouped`],
     /// which multiply each expert's pairs as one matrix product so each expert's weights are
     /// read once per call. With [`ExpertActivations::Quantized`] or [`ExpertActivations::Fp8`],
-    /// it first quantizes `x` into `quantized` and runs the quantized forms instead.
+    /// it first quantizes `x` into `quantized` (unless `prequantized` is true, when a fused
+    /// norm-quant epilogue has already populated `quantized`) and runs the quantized forms
+    /// instead.
+    #[expect(clippy::too_many_arguments, reason = "expert projection inputs and flags")]
     fn moe_rows(
         &self,
         x: &CudaView<'_, bf16>,
@@ -2560,6 +2563,7 @@ impl Ctx {
         out: &mut CudaViewMut<'_, bf16>,
         scratch: &experts::ExpertScratch,
         swiglu: bool,
+        prequantized: bool,
         quantized: &mut experts::QuantizedRows,
     ) -> anyhow::Result<()> {
         let experts = &self.kernels.experts;
@@ -2572,10 +2576,18 @@ impl Ctx {
                 experts.expert_matmul_grouped(stream, x, weights, out, scratch)
             }
             (activations @ (ExpertActivations::Quantized | ExpertActivations::Fp8), _) => {
-                if activations == ExpertActivations::Fp8 {
-                    experts.quantize_rows_fp8(stream, x, weights.k, weights.format, quantized)?;
-                } else {
-                    experts.quantize_rows(stream, x, weights.k, weights.format, quantized)?;
+                if !prequantized {
+                    if activations == ExpertActivations::Fp8 {
+                        experts.quantize_rows_fp8(
+                            stream,
+                            x,
+                            weights.k,
+                            weights.format,
+                            quantized,
+                        )?;
+                    } else {
+                        experts.quantize_rows(stream, x, weights.k, weights.format, quantized)?;
+                    }
                 }
                 if swiglu {
                     experts.expert_matmul_quantized_swiglu_grouped(

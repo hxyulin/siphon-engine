@@ -10,7 +10,10 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::{
+    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    ops::{QuantDest, QuantFormat},
+};
 
 /// Experts each token routes to.
 const SLOTS: usize = 8;
@@ -303,6 +306,25 @@ impl RowFormat {
             (ExpertFormat::Mxfp8, _) => Self::Mxfp8,
         }
     }
+
+    const fn from_quant(format: QuantFormat) -> Self {
+        match format {
+            QuantFormat::Mxfp8 => Self::Mxfp8,
+            QuantFormat::Mxfp8Paired => Self::Fp8Paired,
+            QuantFormat::Nvfp4 => Self::Nvfp4,
+        }
+    }
+}
+
+/// The [`QuantFormat`] a fused norm-quant epilogue writes for `weights`: its checkpoint
+/// format when `fp8` is false, or MXFP8 (paired for NVFP4 weights) when `fp8` is true.
+#[must_use]
+pub const fn expert_quant_format(weights: ExpertFormat<'_>, fp8: bool) -> QuantFormat {
+    match (weights, fp8) {
+        (ExpertFormat::Nvfp4 { .. }, false) => QuantFormat::Nvfp4,
+        (ExpertFormat::Nvfp4 { .. }, true) => QuantFormat::Mxfp8Paired,
+        (ExpertFormat::Mxfp8, _) => QuantFormat::Mxfp8,
+    }
 }
 
 impl QuantizedRows {
@@ -336,6 +358,53 @@ impl QuantizedRows {
     #[must_use]
     pub fn outer(&self) -> &CudaSlice<f32> {
         &self.outer
+    }
+
+    /// Returns a [`QuantDest`] viewing this buffer for a fused norm-quant kernel writing
+    /// `rows` rows of width `k` in `format`. Call [`Self::mark_quantized`] once the fused
+    /// launch succeeds so `expert_matmul_quantized_*` can consume the buffer directly.
+    pub fn as_quant_dest(
+        &mut self,
+        rows: usize,
+        k: usize,
+        format: QuantFormat,
+    ) -> anyhow::Result<QuantDest<'_>> {
+        ensure!(
+            k > 0 && k.is_multiple_of(GEMM_K_MULTIPLE),
+            "k = {k} is not a positive multiple of {GEMM_K_MULTIPLE}"
+        );
+        let val_bytes = rows * format.value_bytes(k);
+        let scale_bytes = rows * format.scale_bytes(k);
+        ensure!(
+            val_bytes <= self.values.len()
+                && scale_bytes <= self.scales.len()
+                && rows <= self.outer.len(),
+            "{rows} rows of {k} ({format:?}) do not fit in QuantizedRows"
+        );
+        self.contents = None;
+        Ok(QuantDest {
+            format,
+            values: self.values.slice_mut(..val_bytes),
+            scales: self.scales.slice_mut(..scale_bytes),
+            outer: (format == QuantFormat::Nvfp4).then(|| self.outer.slice_mut(..rows)),
+        })
+    }
+
+    /// Records that a fused norm-quant kernel wrote `rows` rows of width `k` in `format`
+    /// on `stream` into this buffer.
+    pub fn mark_quantized(
+        &mut self,
+        stream: &CudaStream,
+        rows: usize,
+        k: usize,
+        format: QuantFormat,
+    ) {
+        self.contents = Some(Quantized {
+            rows,
+            k,
+            format: RowFormat::from_quant(format),
+            stream: stream_id(stream),
+        });
     }
 }
 

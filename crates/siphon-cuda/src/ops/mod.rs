@@ -18,6 +18,93 @@ pub mod vision;
 
 use std::{fmt, str::FromStr};
 
+use anyhow::{Context as _, ensure};
+use cudarc::driver::CudaViewMut;
+
+/// Quantized activation layout written by fused norm-quant epilogues
+/// (`kernels/quant_epilogue.cuh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantFormat {
+    /// Natural MXFP8: E4M3 values `[rows, k]` and UE8M0 block scales `[rows, k / 32]`.
+    Mxfp8 = 1,
+    /// Paired MXFP8: E4M3 values `[rows, k]` in `expert_gemm_q8_nvfp4` word order and
+    /// UE8M0 block scales `[rows, k / 32]`.
+    Mxfp8Paired = 2,
+    /// NVFP4: E2M1 pairs `[rows, k / 2]`, E4M3 block scales `[rows, k / 16]`, and per-row
+    /// F32 outer scales `[rows]` (`amax / 1536`).
+    Nvfp4 = 3,
+}
+
+impl QuantFormat {
+    /// Mode constant passed to fused norm-quant kernels (`quant_epilogue::kQuant*`).
+    #[must_use]
+    pub const fn mode(self) -> i32 {
+        self as i32
+    }
+
+    /// Quantized value bytes per row of `k` elements.
+    #[must_use]
+    pub const fn value_bytes(self, k: usize) -> usize {
+        match self {
+            Self::Mxfp8 | Self::Mxfp8Paired => k,
+            Self::Nvfp4 => k / 2,
+        }
+    }
+
+    /// Block-scale bytes per row of `k` elements.
+    #[must_use]
+    pub const fn scale_bytes(self, k: usize) -> usize {
+        match self {
+            Self::Mxfp8 | Self::Mxfp8Paired => k / 32,
+            Self::Nvfp4 => k / 16,
+        }
+    }
+}
+
+/// Quantized activation destination for a fused norm-quant epilogue: `values` holds
+/// `rows * format.value_bytes(2304)` bytes, `scales` holds `rows * format.scale_bytes(2304)`
+/// bytes, and `outer` holds `rows` F32 outer scales (required for [`QuantFormat::Nvfp4`],
+/// ignored for MXFP8 formats).
+pub struct QuantDest<'a> {
+    pub format: QuantFormat,
+    pub values: CudaViewMut<'a, u8>,
+    pub scales: CudaViewMut<'a, u8>,
+    pub outer: Option<CudaViewMut<'a, f32>>,
+}
+
+impl QuantDest<'_> {
+    pub(crate) fn check(&self, rows: usize, k: usize) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA || self.format != QuantFormat::Nvfp4,
+            "NVFP4 activation quantization needs sm_120a, which this sm_89 build lacks"
+        );
+        let need_vals = rows * self.format.value_bytes(k);
+        let need_scales = rows * self.format.scale_bytes(k);
+        ensure!(
+            self.values.len() == need_vals,
+            "quantized values has {} bytes, expected {need_vals}",
+            self.values.len()
+        );
+        ensure!(
+            self.scales.len() == need_scales,
+            "quantized scales has {} bytes, expected {need_scales}",
+            self.scales.len()
+        );
+        if self.format == QuantFormat::Nvfp4 {
+            let outer = self
+                .outer
+                .as_ref()
+                .context("NVFP4 quantization requires an outer scale buffer")?;
+            ensure!(
+                outer.len() == rows,
+                "quantized outer scales has {} elements, expected {rows}",
+                outer.len()
+            );
+        }
+        Ok(())
+    }
+}
+
 /// How prefill multiplies its attention and dense products: in BF16 (F16 for attention's
 /// weighted values), or on the block-scaled FP8 tensor cores with the activations quantized
 /// to E4M3. FP8 lowers precision on purpose; decode never uses it.

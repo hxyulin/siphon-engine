@@ -182,12 +182,65 @@ impl Fp8Rows {
     pub fn bytes(max_values: usize) -> usize {
         max_values.max(1) + (max_values / 32).max(1)
     }
+
+    /// The E4M3 quantized values buffer.
+    #[must_use]
+    pub fn values(&self) -> &CudaSlice<u8> {
+        &self.values
+    }
+
+    /// The UE8M0 block-scale buffer (one byte per 32 values).
+    #[must_use]
+    pub fn scales(&self) -> &CudaSlice<u8> {
+        &self.scales
+    }
+
+    /// Splits the leading `count` slots of `rows * k` values into disjoint mutable
+    /// `(values, scales)` views for fused norm-quant epilogues.
+    pub fn split_slots_mut(
+        &mut self,
+        rows: usize,
+        k: usize,
+        count: usize,
+    ) -> anyhow::Result<Vec<(CudaViewMut<'_, u8>, CudaViewMut<'_, u8>)>> {
+        ensure!(rows > 0, "no rows");
+        ensure!(count > 0, "need at least one slot");
+        ensure!(
+            k > 0 && k.is_multiple_of(32),
+            "k = {k} is not a multiple of 32"
+        );
+        let slot_vals = rows * k;
+        let slot_scales = slot_vals / 32;
+        ensure!(
+            count * slot_vals <= self.values.len() && count * slot_scales <= self.scales.len(),
+            "the FP8 scratch holds {} values, need {}",
+            self.values.len(),
+            count * slot_vals
+        );
+        let vals = self
+            .values
+            .slice_mut(..count * slot_vals)
+            .chunks_exact_mut(slot_vals);
+        let scales = self
+            .scales
+            .slice_mut(..count * slot_scales)
+            .chunks_exact_mut(slot_scales);
+        Ok(vals.zip(scales).collect())
+    }
 }
 
 /// One product `out [m, n] = x [m, k] @ weight [n, k]^T` of [`LinearFp8::gemm`].
 pub struct Fp8Gemm<'a> {
     pub weight: &'a Fp8Matrix,
     pub x: CudaView<'a, bf16>,
+    pub out: CudaViewMut<'a, bf16>,
+}
+
+/// One product `out [m, n] = x_q [m, k] @ weight [n, k]^T` of [`LinearFp8::gemm_quantized`]
+/// whose MXFP8 input is already stored in [`Fp8Rows`] at value offset `x_offset`.
+pub struct Fp8GemmQuantized<'a> {
+    pub weight: &'a Fp8Matrix,
+    pub x_offset: usize,
     pub out: CudaViewMut<'a, bf16>,
 }
 
@@ -434,6 +487,95 @@ impl LinearFp8 {
         // scales; `partial_vals` and `partial_idxs` hold at least m * tiles_n elements.
         unsafe { args.launch(stream, &self.gemm_argmax, config) }?;
         Ok(tiles_n)
+    }
+
+    /// Runs every product `out = x_q @ weight^T` directly from MXFP8 inputs already written
+    /// into `scratch` by fused norm-quant epilogues, skipping `quantize_rows_mxfp8_dense`.
+    pub fn gemm_quantized(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Fp8GemmQuantized<'_>],
+        m: usize,
+        scratch: &Fp8Rows,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..=MAX_PRODUCTS).contains(&products.len()),
+            "{} products, expected 1 to {MAX_PRODUCTS}",
+            products.len()
+        );
+        ensure!(m > 0, "no rows");
+        let k = products[0].weight.k;
+        ensure!(
+            k.is_multiple_of(GEMM_K),
+            "the FP8 GEMM needs k a multiple of {GEMM_K}, not {k}"
+        );
+        let tiles_128: usize = m.div_ceil(GEMM_TILE)
+            * products
+                .iter()
+                .map(|p| p.weight.rows.div_ceil(GEMM_TILE))
+                .sum::<usize>();
+        let (function, tile_size, threads, shared) = if m > GEMM_SMALL_TILE && tiles_128 >= self.sms
+        {
+            (&self.gemm, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
+        } else {
+            (
+                &self.gemm_small,
+                GEMM_SMALL_TILE,
+                GEMM_SMALL_THREADS,
+                GEMM_SMALL_SHARED,
+            )
+        };
+        let mut batch = GemmBatch {
+            count: i32::try_from(products.len())?,
+            m: i32::try_from(m).context("too many rows")?,
+            k: i32::try_from(k)?,
+            ..GemmBatch::default()
+        };
+        let (values_base, _) = scratch.values.device_ptr(stream);
+        let (scales_base, _) = scratch.scales.device_ptr(stream);
+        let mut tiles = 0usize;
+        for (i, p) in products.iter_mut().enumerate() {
+            let n = p.weight.rows;
+            ensure!(
+                p.weight.k == k,
+                "product {i} has k = {}, expected {k}",
+                p.weight.k
+            );
+            ensure!(
+                p.out.len() == m * n,
+                "product {i}: out has {} elements, expected {m} x {n}",
+                p.out.len()
+            );
+            ensure!(
+                p.x_offset.is_multiple_of(32) && p.x_offset + m * k <= scratch.values.len(),
+                "product {i}: x_offset {} + {} exceeds scratch capacity {}",
+                p.x_offset,
+                m * k,
+                scratch.values.len()
+            );
+            tiles += m.div_ceil(tile_size) * n.div_ceil(tile_size);
+            let (w_ptr, _) = p.weight.data.device_ptr(stream);
+            let (out_ptr, _) = p.out.device_ptr_mut(stream);
+            batch.p[i] = GemmProduct {
+                w: w_ptr,
+                w_scale: w_ptr + u64::try_from(p.weight.padded_rows() * k)?,
+                x: values_base + u64::try_from(p.x_offset)?,
+                x_scale: scales_base + u64::try_from(p.x_offset / 32)?,
+                out: out_ptr,
+                n: i32::try_from(n).context("too many columns")?,
+                tile_end: i32::try_from(tiles).context("too many tiles")?,
+            };
+        }
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(tiles)?, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        // SAFETY: `batch` has the kernel's `gemm8::Batch` layout. Each product's `x_offset`
+        // points to `m * k` MXFP8 values and `m * k / 32` scales inside `scratch` written on
+        // this stream; each weight holds `padded_rows` rows of `k` bytes and their scales,
+        // and `out` holds `m * n` BF16 values. `k` is a multiple of 128.
+        unsafe { launch_by_value(stream, function, config, &batch, false) }
     }
 
     /// Quantizes `x` (`[rows, k]`) into `scratch` at value offset `offset` (a multiple of

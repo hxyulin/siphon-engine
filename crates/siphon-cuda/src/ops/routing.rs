@@ -10,7 +10,10 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::{
+    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    ops::QuantDest,
+};
 
 /// Hidden width of the model.
 const HIDDEN: usize = 2304;
@@ -130,6 +133,8 @@ const ROUTER_TILE_ROWS: usize = 64;
 const ROUTER_TILE_THREADS: u32 = 256;
 /// Query counts with a `depth_attention_rows_2304_<nb>_<nq>` kernel.
 const ROWS_QUERY_COUNTS: [usize; 3] = [1, 3, 4];
+/// Query counts with a `depth_attention_rows_quant_2304_<nb>_<nq>` kernel.
+const ROWS_QUANT_QUERY_COUNTS: [usize; 2] = [1, 3];
 
 /// The partial candidate of [`Routing::depth_attention_fused`].
 pub enum Partial<'a> {
@@ -266,6 +271,35 @@ pub struct NormDest<'a> {
     pub weight: Option<&'a CudaSlice<bf16>>,
 }
 
+/// A depth-attention output destination with fused MXFP8 or NVFP4 activation quantization
+/// (and an optional BF16 copy when still read downstream).
+pub struct QuantNormDest<'a> {
+    pub out: Option<CudaViewMut<'a, bf16>>,
+    /// The weight of a weighted RMS norm, or `None` for an unweighted one.
+    pub weight: Option<&'a CudaSlice<bf16>>,
+    /// Quantized destination (`values`, `scales`, optional `outer`).
+    pub quant: QuantDest<'a>,
+}
+
+/// What [`Routing::depth_attention_rows_quant`] reads and writes for a chunk of `rows` rows.
+pub struct DepthRowsQuant<'a> {
+    /// The block states, 1 to 5 runs of F32 `[rows, 2304]`.
+    pub blocks: CudaView<'a, f32>,
+    pub partial: RowsPartial<'a>,
+    /// Receives the partial as used, F32 `[rows, 2304]`.
+    pub normed_partial: Option<CudaViewMut<'a, f32>>,
+    /// The `nq` (1 or 3) queries, F32 `[nq, 2304]`.
+    pub queries: &'a CudaSlice<f32>,
+    /// Receives the output rows, F32 `[rows, nq, 2304]`.
+    pub out: Option<CudaViewMut<'a, f32>>,
+    /// Receives the weights of each output, F32 `[rows, nq, nb + 1]`.
+    pub probs: Option<CudaViewMut<'a, f32>>,
+    /// Destinations `0..3`, all using the same [`crate::ops::QuantFormat`].
+    pub dests: [Option<QuantNormDest<'a>>; 3],
+    pub dst_stride: usize,
+    pub rows: usize,
+}
+
 /// How `Routing::router_logits` treats the F32 router weight.
 ///
 /// MLX on the M5 reference machine computes an F32 matmul with one row in a GEMV at full
@@ -312,6 +346,8 @@ pub struct Routing {
     /// `depth_attention_rows_2304_<nb>_<nq>` at `[nq index][nb - 1]`, with the most blocks
     /// that run at once.
     depth_attention_rows_2304: Vec<Vec<(CudaFunction, u32)>>,
+    /// `depth_attention_rows_quant_2304_<nb>_<nq>` at `[nq index][nb - 1]` for `nq` in `[1, 3]`.
+    depth_attention_rows_quant_2304: Vec<Vec<(CudaFunction, u32)>>,
 }
 
 impl Routing {
@@ -358,6 +394,24 @@ impl Routing {
                         .map(|nb| {
                             let f = module
                                 .load_function(&format!("depth_attention_rows_2304_{nb}_{nq}"))?;
+                            let per_sm = f.occupancy_max_active_blocks_per_multiprocessor(
+                                DEPTH_THREADS,
+                                0,
+                                None,
+                            )?;
+                            Ok((f, per_sm.max(1) * sms))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
+                .collect::<anyhow::Result<_>>()?,
+            depth_attention_rows_quant_2304: ROWS_QUANT_QUERY_COUNTS
+                .iter()
+                .map(|nq| {
+                    (1..FUSED_MAX_CANDIDATES)
+                        .map(|nb| {
+                            let f = module.load_function(&format!(
+                                "depth_attention_rows_quant_2304_{nb}_{nq}"
+                            ))?;
                             let per_sm = f.occupancy_max_active_blocks_per_multiprocessor(
                                 DEPTH_THREADS,
                                 0,
@@ -993,6 +1047,142 @@ impl Routing {
         // checked above, the blocks loop over the rows and the grid's y dimension covers
         // the sets, and the kernel reads only weights (queries, norm weights, conv taps)
         // before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// [`Routing::depth_attention_rows`] with fused MXFP8 or NVFP4 activation quantization
+    /// directly in the RMSNorm epilogue (`nq` in `[1, 3]`). Every non-`None` destination
+    /// writes quantized activations from registers (and BF16 only when `dest.out` is `Some`),
+    /// matching [`Self::depth_attention_rows`] followed by the standalone quantizer bit for
+    /// bit.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates buffers and mirrors the kernel signature"
+    )]
+    pub fn depth_attention_rows_quant(
+        &self,
+        stream: &CudaStream,
+        d: DepthRowsQuant<'_>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let DepthRowsQuant {
+            blocks,
+            partial,
+            mut normed_partial,
+            queries,
+            mut out,
+            mut probs,
+            mut dests,
+            dst_stride,
+            rows,
+        } = d;
+        ensure!(rows > 0, "no rows");
+        let block_len = rows * HIDDEN;
+        ensure!(
+            blocks.len().is_multiple_of(block_len),
+            "blocks has {} elements, not a multiple of {rows} x {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / block_len;
+        ensure!(
+            (1..FUSED_MAX_CANDIDATES).contains(&nb),
+            "{nb} blocks; 1 to {} fit",
+            FUSED_MAX_CANDIDATES - 1
+        );
+        ensure!(
+            !queries.is_empty() && queries.len().is_multiple_of(HIDDEN),
+            "queries has {} elements, not whole rows of {HIDDEN}",
+            queries.len()
+        );
+        let nq = queries.len() / HIDDEN;
+        let q_index = ROWS_QUANT_QUERY_COUNTS
+            .iter()
+            .position(|&n| n == nq)
+            .with_context(|| format!("no quant rows kernel for {nq} queries"))?;
+        ensure!(
+            normed_partial.as_ref().is_none_or(|x| x.len() == block_len),
+            "normed_partial must hold {rows} x {HIDDEN} elements"
+        );
+        ensure!(
+            out.as_ref().is_none_or(|x| x.len() == rows * nq * HIDDEN),
+            "out must hold {rows} x {nq} x {HIDDEN} elements"
+        );
+        let probs_len = rows * nq * (nb + 1);
+        ensure!(
+            probs.as_ref().is_none_or(|x| x.len() == probs_len),
+            "probs must hold {rows} x {nq} x {} elements",
+            nb + 1
+        );
+        let dest_len = (rows - 1) * dst_stride + HIDDEN;
+        let mut q_mode = 0i32;
+        for dest in dests.iter().flatten() {
+            if let Some(bf16_out) = &dest.out {
+                ensure!(dst_stride >= HIDDEN, "dst_stride is below {HIDDEN}");
+                ensure!(
+                    bf16_out.len() >= dest_len,
+                    "destination BF16 buffer must reach {dest_len} elements"
+                );
+            }
+            ensure!(
+                dest.weight.is_none_or(|w| w.len() == HIDDEN),
+                "norm weights must hold {HIDDEN} elements"
+            );
+            dest.quant.check(rows, HIDDEN)?;
+            let mode = dest.quant.format.mode();
+            if q_mode == 0 {
+                q_mode = mode;
+            } else {
+                ensure!(
+                    q_mode == mode,
+                    "all depth_attention_rows_quant destinations must share one QuantFormat"
+                );
+            }
+        }
+
+        let mut args = KernelArgs::default();
+        args.ptr(&blocks, stream)
+            .i32(i32::try_from(block_len).context("too many rows")?);
+        push_rows_partial(&mut args, partial, block_len, stream)?;
+        args.opt_mut(normed_partial.as_mut(), stream)
+            .ptr(queries, stream)
+            .opt_mut(out.as_mut(), stream)
+            .opt_mut(probs.as_mut(), stream);
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().and_then(|d| d.out.as_mut()), stream);
+        }
+        // dst3 is always null for the quant variant.
+        args.u64(0)
+            .i32(i32::try_from(dst_stride).context("dst_stride too large")?);
+        for dest in &dests {
+            args.opt(dest.as_ref().and_then(|d| d.weight), stream);
+        }
+        // weight3 is always null for the quant variant.
+        args.u64(0);
+        let rows_u32 = u32::try_from(rows).context("too many rows")?;
+        args.f32(eps)
+            .f32((HIDDEN as f32).sqrt().recip())
+            .i32(i32::try_from(rows)?)
+            .i32(0)
+            .i32(0);
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().map(|d| &mut d.quant.values), stream);
+        }
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().map(|d| &mut d.quant.scales), stream);
+        }
+        for dest in &mut dests {
+            args.opt_mut(dest.as_mut().and_then(|d| d.quant.outer.as_mut()), stream);
+        }
+        args.i32(q_mode);
+        let (function, resident) = &self.depth_attention_rows_quant_2304[q_index][nb - 1];
+        let config = LaunchConfig {
+            grid_dim: (rows_u32.min(*resident), 1, 1),
+            block_dim: (DEPTH_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `depth_attention_rows_quant_2304_<nb>_<nq>`'s signature,
+        // every non-null pointer comes from a live buffer sized for `rows` as checked above,
+        // and the kernel reads only read-only weights (queries, conv taps) before `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 

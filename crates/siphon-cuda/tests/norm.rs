@@ -12,13 +12,17 @@ use common::{
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use siphon_cuda::{
-    Gpu,
+    BLOCK_SCALED_MMA, Gpu,
     ops::{
+        QuantDest, QuantFormat,
         attention::Attention,
         conv::Conv,
         elementwise::Elementwise,
-        misc::Misc,
+        experts::{ExpertFormat, Experts, QuantizedRows},
+        linear_fp8::{Fp8Gemm, Fp8GemmQuantized, Fp8Rows, LinearFp8},
+        misc::{GateNormQuant, Misc},
         norm::{AttentionPost, AttentionPostRows, KvConvWeights, Norm},
+        routing::{DepthRows, DepthRowsQuant, NormDest, QuantNormDest, Routing, RowsPartial},
     },
 };
 
@@ -577,6 +581,491 @@ fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
                 );
             }
             position += rows as u32;
+        }
+    }
+    Ok(())
+}
+
+/// Runs the standalone quantizer matching `format` on BF16 `x` (`[rows, HIDDEN]`) into `out`.
+fn quantize_reference(
+    stream: &cudarc::driver::CudaStream,
+    experts: &Experts,
+    x: &CudaSlice<bf16>,
+    format: QuantFormat,
+    dummy_global_scale: &CudaSlice<f32>,
+    out: &mut QuantizedRows,
+) -> anyhow::Result<()> {
+    match format {
+        QuantFormat::Mxfp8 => experts.quantize_rows(stream, x, HIDDEN, ExpertFormat::Mxfp8, out),
+        QuantFormat::Mxfp8Paired => experts.quantize_rows_fp8(
+            stream,
+            x,
+            HIDDEN,
+            ExpertFormat::Nvfp4 {
+                global_scale: dummy_global_scale,
+            },
+            out,
+        ),
+        QuantFormat::Nvfp4 => experts.quantize_rows(
+            stream,
+            x,
+            HIDDEN,
+            ExpertFormat::Nvfp4 {
+                global_scale: dummy_global_scale,
+            },
+            out,
+        ),
+    }
+}
+
+/// Asserts that `got` matches `want` bit for bit for `rows` rows of `HIDDEN` in `format`.
+fn assert_quant_exact(
+    label: &str,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    got: &QuantizedRows,
+    want: &QuantizedRows,
+    rows: usize,
+    format: QuantFormat,
+) -> anyhow::Result<()> {
+    let v_len = rows * format.value_bytes(HIDDEN);
+    let s_len = rows * format.scale_bytes(HIDDEN);
+    assert_eq!(
+        stream.clone_dtoh(&got.values().slice(..v_len))?,
+        stream.clone_dtoh(&want.values().slice(..v_len))?,
+        "{label}: quantized values"
+    );
+    assert_eq!(
+        stream.clone_dtoh(&got.scales().slice(..s_len))?,
+        stream.clone_dtoh(&want.scales().slice(..s_len))?,
+        "{label}: quantized scales"
+    );
+    if format == QuantFormat::Nvfp4 {
+        let g = stream.clone_dtoh(&got.outer().slice(..rows))?;
+        let w = stream.clone_dtoh(&want.outer().slice(..rows))?;
+        assert_f32_exact(&format!("{label}: outer scale"), &g, &w);
+    }
+    Ok(())
+}
+
+/// Fused `rms_norm_quant` (BF16 input) and `rms_norm_f32_quant` (F32 input) match unfused
+/// `rms_norm`/`rms_norm_f32` + standalone quantization bit for bit across MXFP8, paired
+/// MXFP8, and (on Blackwell) NVFP4, both with and without BF16 output, and feed
+/// `LinearFp8::gemm_quantized` identically to `LinearFp8::gemm`.
+#[test]
+#[expect(clippy::too_many_lines, reason = "tests BF16/F32 inputs, all formats, and FP8 GEMM")]
+fn rms_norm_quant_matches_separate() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let norm = Norm::load(gpu.context())?;
+    let experts = Experts::load(gpu.context())?;
+    let linear_fp8 = LinearFp8::load(gpu.context())?;
+    let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 801, 0.5, 1.0))?;
+    let dummy_scale = stream.alloc_zeros::<f32>(1)?;
+    let formats: Vec<QuantFormat> = if BLOCK_SCALED_MMA {
+        vec![
+            QuantFormat::Mxfp8,
+            QuantFormat::Mxfp8Paired,
+            QuantFormat::Nvfp4,
+        ]
+    } else {
+        vec![QuantFormat::Mxfp8, QuantFormat::Mxfp8Paired]
+    };
+
+    for rows in [1usize, 17, 64] {
+        let seed_off = u32::try_from(rows)?;
+        let x_bf16 = stream.clone_htod(&pseudo_random_bf16(rows * HIDDEN, 810 + seed_off, 4.0, 0.0))?;
+        let x_f32 = stream.clone_htod(&pseudo_random(rows * HIDDEN, 820 + seed_off, 4.0))?;
+        let mut ref_bf16 = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        let mut ref_f32 = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        norm.rms_norm(stream, &x_bf16, &weight, &mut ref_bf16, EPS)?;
+        norm.rms_norm_f32(stream, &x_f32, &weight, &mut ref_f32, EPS)?;
+        let ref_bf16_host = stream.clone_dtoh(&ref_bf16)?;
+        let ref_f32_host = stream.clone_dtoh(&ref_f32)?;
+
+        let mut want_q = QuantizedRows::new(stream, rows * HIDDEN, rows)?;
+        let mut got_q = QuantizedRows::new(stream, rows * HIDDEN, rows)?;
+        for &format in &formats {
+            quantize_reference(stream, &experts, &ref_bf16, format, &dummy_scale, &mut want_q)?;
+            for write_bf16 in [true, false] {
+                let mut got_bf16 = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+                let dest = got_q.as_quant_dest(rows, HIDDEN, format)?;
+                norm.rms_norm_quant(
+                    stream,
+                    &x_bf16,
+                    &weight,
+                    write_bf16.then(|| got_bf16.as_view_mut()),
+                    dest,
+                    EPS,
+                )?;
+                let label = format!("rms_norm_quant rows={rows} {format:?} bf16={write_bf16}");
+                if write_bf16 {
+                    assert_bf16_close(&label, &stream.clone_dtoh(&got_bf16)?, &ref_bf16_host, 0);
+                }
+                assert_quant_exact(&label, stream, &got_q, &want_q, rows, format)?;
+            }
+
+            quantize_reference(stream, &experts, &ref_f32, format, &dummy_scale, &mut want_q)?;
+            for write_bf16 in [true, false] {
+                let mut got_bf16 = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+                let dest = got_q.as_quant_dest(rows, HIDDEN, format)?;
+                norm.rms_norm_f32_quant(
+                    stream,
+                    &x_f32,
+                    &weight,
+                    write_bf16.then(|| got_bf16.as_view_mut()),
+                    dest,
+                    EPS,
+                )?;
+                let label = format!("rms_norm_f32_quant rows={rows} {format:?} bf16={write_bf16}");
+                if write_bf16 {
+                    assert_bf16_close(&label, &stream.clone_dtoh(&got_bf16)?, &ref_f32_host, 0);
+                }
+                assert_quant_exact(&label, stream, &got_q, &want_q, rows, format)?;
+            }
+        }
+    }
+
+    // End-to-end check: `rms_norm_quant` -> `LinearFp8::gemm_quantized` matches
+    // `rms_norm` -> `LinearFp8::gemm` bit for bit.
+    if BLOCK_SCALED_MMA {
+        const M: usize = 35;
+        const N: usize = 256;
+        let x = stream.clone_htod(&pseudo_random_bf16(M * HIDDEN, 850, 3.0, 0.0))?;
+        let w_bf16 = stream.clone_htod(&pseudo_random_bf16(N * HIDDEN, 851, 0.5, 0.0))?;
+        let w_fp8 = linear_fp8.quantize(stream, &w_bf16, N, HIDDEN)?;
+        let mut normed = stream.alloc_zeros::<bf16>(M * HIDDEN)?;
+        norm.rms_norm(stream, &x, &weight, &mut normed, EPS)?;
+        let mut scratch_ref = Fp8Rows::new(stream, M * HIDDEN)?;
+        let mut want_y = stream.alloc_zeros::<bf16>(M * N)?;
+        linear_fp8.gemm(
+            stream,
+            &mut [Fp8Gemm {
+                weight: &w_fp8,
+                x: normed.as_view(),
+                out: want_y.as_view_mut(),
+            }],
+            M,
+            &mut scratch_ref,
+        )?;
+
+        let mut scratch_got = Fp8Rows::new(stream, M * HIDDEN)?;
+        {
+            let [(values, scales)]: [_; 1] = scratch_got
+                .split_slots_mut(M, HIDDEN, 1)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected 1 dense slot"))?;
+            norm.rms_norm_quant(
+                stream,
+                &x,
+                &weight,
+                None,
+                QuantDest {
+                    format: QuantFormat::Mxfp8,
+                    values,
+                    scales,
+                    outer: None,
+                },
+                EPS,
+            )?;
+        }
+        let mut got_y = stream.alloc_zeros::<bf16>(M * N)?;
+        linear_fp8.gemm_quantized(
+            stream,
+            &mut [Fp8GemmQuantized {
+                weight: &w_fp8,
+                x_offset: 0,
+                out: got_y.as_view_mut(),
+            }],
+            M,
+            &scratch_got,
+        )?;
+        assert_bf16_close(
+            "rms_norm_quant -> gemm_quantized",
+            &stream.clone_dtoh(&got_y)?,
+            &stream.clone_dtoh(&want_y)?,
+            0,
+        );
+    }
+    Ok(())
+}
+
+/// Fused `Routing::depth_attention_rows_quant` (1 and 3 queries) and
+/// `Misc::message_gate_out_rows_quant` match unfused norm + standalone quantization bit for
+/// bit across MXFP8, paired MXFP8, and (on Blackwell) NVFP4.
+#[test]
+#[expect(clippy::too_many_lines, reason = "tests depth attention (nq=1,3) and message gate")]
+fn fused_depth_and_gate_norm_quant_match_separate() -> anyhow::Result<()> {
+    const ROWS: usize = 35;
+    const NB: usize = 2;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let misc = Misc::load(gpu.context())?;
+    let experts = Experts::load(gpu.context())?;
+    let dummy_scale = stream.alloc_zeros::<f32>(1)?;
+    let formats: Vec<QuantFormat> = if BLOCK_SCALED_MMA {
+        vec![
+            QuantFormat::Mxfp8,
+            QuantFormat::Mxfp8Paired,
+            QuantFormat::Nvfp4,
+        ]
+    } else {
+        vec![QuantFormat::Mxfp8, QuantFormat::Mxfp8Paired]
+    };
+
+    let blocks = stream.clone_htod(&pseudo_random(NB * ROWS * HIDDEN, 900, 1.5))?;
+    let partial_bf16 = stream.clone_htod(&pseudo_random_bf16(ROWS * HIDDEN, 901, 2.0, 0.0))?;
+    let q1 = stream.clone_htod(&pseudo_random(HIDDEN, 902, 1.0))?;
+    let q3 = stream.clone_htod(&pseudo_random(3 * HIDDEN, 903, 1.0))?;
+    let norm_weights: Vec<CudaSlice<bf16>> = (0..3u32)
+        .map(|k| {
+            stream
+                .clone_htod(&pseudo_random_bf16(HIDDEN, 910 + k, 0.5, 1.0))
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // 1. depth_attention_rows_quant (nq = 1): all formats, with and without BF16 output.
+    let mut ref_bf16 = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    routing.depth_attention_rows(
+        stream,
+        DepthRows {
+            blocks: blocks.as_view(),
+            partial: RowsPartial::Bf16(partial_bf16.as_view()),
+            normed_partial: None,
+            queries: &q1,
+            out: None,
+            probs: None,
+            dests: [
+                Some(NormDest {
+                    out: ref_bf16.as_view_mut(),
+                    weight: Some(&norm_weights[0]),
+                }),
+                None,
+                None,
+                None,
+            ],
+            dst_stride: HIDDEN,
+            rows: ROWS,
+        },
+        EPS,
+    )?;
+    let ref_bf16_host = stream.clone_dtoh(&ref_bf16)?;
+    let mut want_q = QuantizedRows::new(stream, ROWS * HIDDEN, ROWS)?;
+    let mut got_q = QuantizedRows::new(stream, ROWS * HIDDEN, ROWS)?;
+    for &format in &formats {
+        quantize_reference(stream, &experts, &ref_bf16, format, &dummy_scale, &mut want_q)?;
+        for write_bf16 in [true, false] {
+            let mut got_bf16 = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+            let quant = got_q.as_quant_dest(ROWS, HIDDEN, format)?;
+            routing.depth_attention_rows_quant(
+                stream,
+                DepthRowsQuant {
+                    blocks: blocks.as_view(),
+                    partial: RowsPartial::Bf16(partial_bf16.as_view()),
+                    normed_partial: None,
+                    queries: &q1,
+                    out: None,
+                    probs: None,
+                    dests: [
+                        Some(QuantNormDest {
+                            out: write_bf16.then(|| got_bf16.as_view_mut()),
+                            weight: Some(&norm_weights[0]),
+                            quant,
+                        }),
+                        None,
+                        None,
+                    ],
+                    dst_stride: HIDDEN,
+                    rows: ROWS,
+                },
+                EPS,
+            )?;
+            let label = format!("depth_attention_rows_quant nq=1 {format:?} bf16={write_bf16}");
+            if write_bf16 {
+                assert_bf16_close(&label, &stream.clone_dtoh(&got_bf16)?, &ref_bf16_host, 0);
+            }
+            assert_quant_exact(&label, stream, &got_q, &want_q, ROWS, format)?;
+        }
+    }
+
+    // 2. depth_attention_rows_quant (nq = 3): 3 MXFP8 destinations into Fp8Rows slots.
+    let mut ref_d0 = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    let mut ref_d1 = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    let mut ref_d2 = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    routing.depth_attention_rows(
+        stream,
+        DepthRows {
+            blocks: blocks.as_view(),
+            partial: RowsPartial::Bf16(partial_bf16.as_view()),
+            normed_partial: None,
+            queries: &q3,
+            out: None,
+            probs: None,
+            dests: [
+                Some(NormDest {
+                    out: ref_d0.as_view_mut(),
+                    weight: Some(&norm_weights[0]),
+                }),
+                Some(NormDest {
+                    out: ref_d1.as_view_mut(),
+                    weight: Some(&norm_weights[1]),
+                }),
+                Some(NormDest {
+                    out: ref_d2.as_view_mut(),
+                    weight: Some(&norm_weights[2]),
+                }),
+                None,
+            ],
+            dst_stride: HIDDEN,
+            rows: ROWS,
+        },
+        EPS,
+    )?;
+    let mut fp8_rows = Fp8Rows::new(stream, 3 * ROWS * HIDDEN)?;
+    {
+        let [(v0, s0), (v1, s1), (v2, s2)]: [_; 3] = fp8_rows
+            .split_slots_mut(ROWS, HIDDEN, 3)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected 3 dense slots"))?;
+        routing.depth_attention_rows_quant(
+            stream,
+            DepthRowsQuant {
+                blocks: blocks.as_view(),
+                partial: RowsPartial::Bf16(partial_bf16.as_view()),
+                normed_partial: None,
+                queries: &q3,
+                out: None,
+                probs: None,
+                dests: [
+                    Some(QuantNormDest {
+                        out: None,
+                        weight: Some(&norm_weights[0]),
+                        quant: QuantDest {
+                            format: QuantFormat::Mxfp8,
+                            values: v0,
+                            scales: s0,
+                            outer: None,
+                        },
+                    }),
+                    Some(QuantNormDest {
+                        out: None,
+                        weight: Some(&norm_weights[1]),
+                        quant: QuantDest {
+                            format: QuantFormat::Mxfp8,
+                            values: v1,
+                            scales: s1,
+                            outer: None,
+                        },
+                    }),
+                    Some(QuantNormDest {
+                        out: None,
+                        weight: Some(&norm_weights[2]),
+                        quant: QuantDest {
+                            format: QuantFormat::Mxfp8,
+                            values: v2,
+                            scales: s2,
+                            outer: None,
+                        },
+                    }),
+                ],
+                dst_stride: HIDDEN,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+    }
+    let slot_vals = ROWS * HIDDEN;
+    let slot_scales = slot_vals / 32;
+    for (k, ref_d) in [&ref_d0, &ref_d1, &ref_d2].into_iter().enumerate() {
+        quantize_reference(
+            stream,
+            &experts,
+            ref_d,
+            QuantFormat::Mxfp8,
+            &dummy_scale,
+            &mut want_q,
+        )?;
+        assert_eq!(
+            stream.clone_dtoh(&fp8_rows.values().slice(k * slot_vals..(k + 1) * slot_vals))?,
+            stream.clone_dtoh(&want_q.values().slice(..slot_vals))?,
+            "depth_attention_rows_quant nq=3 slot {k}: values"
+        );
+        assert_eq!(
+            stream.clone_dtoh(
+                &fp8_rows
+                    .scales()
+                    .slice(k * slot_scales..(k + 1) * slot_scales)
+            )?,
+            stream.clone_dtoh(&want_q.scales().slice(..slot_scales))?,
+            "depth_attention_rows_quant nq=3 slot {k}: scales"
+        );
+    }
+
+    // 3. message_gate_out_rows_quant: all formats, with and without BF16 normed output.
+    let down = stream.clone_htod(&pseudo_random_bf16(ROWS * 64, 920, 2.0, 0.0))?;
+    let forget = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 921, 0.3, 0.0))?;
+    let gain = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 922, 0.3, 0.0))?;
+    let h = stream.clone_htod(&pseudo_random(ROWS * HIDDEN, 923, 3.0))?;
+    let m_vec = stream.clone_htod(&pseudo_random(ROWS * HIDDEN, 924, 1.5))?;
+    let mut gate_out_ref = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+    let mut gate_norm_ref = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+    misc.message_gate_out_rows(
+        stream,
+        &down,
+        &forget,
+        &gain,
+        (&h, HIDDEN),
+        (&m_vec, HIDDEN),
+        None,
+        &mut gate_out_ref,
+        Some((&norm_weights[0], &mut gate_norm_ref)),
+        EPS,
+        ROWS,
+    )?;
+    let gate_out_ref_host = stream.clone_dtoh(&gate_out_ref)?;
+    let gate_norm_ref_host = stream.clone_dtoh(&gate_norm_ref)?;
+    for &format in &formats {
+        quantize_reference(
+            stream,
+            &experts,
+            &gate_norm_ref,
+            format,
+            &dummy_scale,
+            &mut want_q,
+        )?;
+        for write_bf16 in [true, false] {
+            let mut gate_out = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+            let mut gate_norm = stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?;
+            let quant = got_q.as_quant_dest(ROWS, HIDDEN, format)?;
+            misc.message_gate_out_rows_quant(
+                stream,
+                &down,
+                &forget,
+                &gain,
+                (&h, HIDDEN),
+                (&m_vec, HIDDEN),
+                None,
+                &mut gate_out,
+                GateNormQuant {
+                    weight: &norm_weights[0],
+                    normed: write_bf16.then(|| gate_norm.as_view_mut()),
+                    quant,
+                },
+                EPS,
+                ROWS,
+            )?;
+            let label = format!("message_gate_out_rows_quant {format:?} bf16={write_bf16}");
+            assert_f32_exact(&format!("{label}: out"), &stream.clone_dtoh(&gate_out)?, &gate_out_ref_host);
+            if write_bf16 {
+                assert_bf16_close(
+                    &format!("{label}: normed"),
+                    &stream.clone_dtoh(&gate_norm)?,
+                    &gate_norm_ref_host,
+                    0,
+                );
+            }
+            assert_quant_exact(&label, stream, &got_q, &want_q, ROWS, format)?;
         }
     }
     Ok(())

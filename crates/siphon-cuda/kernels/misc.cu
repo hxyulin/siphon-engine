@@ -22,6 +22,7 @@
 
 #include "cluster_sm89.cuh"
 #include "pdl.cuh"
+#include "quant_epilogue.cuh"
 
 namespace {
 
@@ -1261,6 +1262,98 @@ message_gate_norm_rows_2304(const float* out, const __nv_bfloat16* __restrict__ 
     }
     *reinterpret_cast<uint2*>(normed + at + ca) = na;
     *reinterpret_cast<uint2*>(normed + at + cb) = nb;
+}
+
+// message_gate_norm_rows_2304 with fused MXFP8 / NVFP4 quantization directly from
+// registers. `normed` may be null when downstream only reads the quantized rows.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_norm_quant_rows_2304(const float* out, const __nv_bfloat16* __restrict__ norm_weight,
+                                  __nv_bfloat16* normed, uint8_t* q_values, uint8_t* q_scales,
+                                  float* q_outer, int q_mode, float eps) {
+    __shared__ float vw[kNormVirtualWarps];
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const size_t row = blockIdx.x;
+    const size_t at = row * kHidden;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kGateThreads);
+    const uint2 wpa = *reinterpret_cast<const uint2*>(norm_weight + ca);
+    const uint2 wpb = *reinterpret_cast<const uint2*>(norm_weight + cb);
+    pdl_trigger();
+    pdl_wait();
+    const float4 av = *reinterpret_cast<const float4*>(out + at + ca);
+    const float4 bv = *reinterpret_cast<const float4*>(out + at + cb);
+    const float a[4] = {av.x, av.y, av.z, av.w};
+    const float b[4] = {bv.x, bv.y, bv.z, bv.w};
+    const auto* wa = reinterpret_cast<const __nv_bfloat16*>(&wpa);
+    const auto* wb = reinterpret_cast<const __nv_bfloat16*>(&wpb);
+    float pa = 0.f;
+    float pb = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        pa = fmaf(a[i], a[i], pa);
+        pb = fmaf(b[i], b[i], pb);
+    }
+    pa = warp_sum(pa);
+    pb = warp_sum(pb);
+    if (lane == 0) {
+        vw[warp] = pa;
+        vw[warp + kGateWarps] = pb;
+    }
+    __syncthreads();
+    const float ss = warp_sum(lane < kNormVirtualWarps ? vw[lane] : 0.f);
+    // Two correctly rounded float operations; rms_norm_f32_2304 rounds a double rsqrt once.
+    const float inv = 1.f / sqrtf(ss / static_cast<float>(kHidden) + eps);
+    uint2 na;
+    uint2 nb;
+    auto* va = reinterpret_cast<__nv_bfloat16*>(&na);
+    auto* vb = reinterpret_cast<__nv_bfloat16*>(&nb);
+    float qa[4];
+    float qb[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        va[i] = __float2bfloat16((a[i] * inv) * __bfloat162float(wa[i]));
+        vb[i] = __float2bfloat16((b[i] * inv) * __bfloat162float(wb[i]));
+        qa[i] = __bfloat162float(va[i]);
+        qb[i] = __bfloat162float(vb[i]);
+    }
+    if (normed != nullptr) {
+        *reinterpret_cast<uint2*>(normed + at + ca) = na;
+        *reinterpret_cast<uint2*>(normed + at + cb) = nb;
+    }
+    if (q_mode == quant_epilogue::kQuantMxfp8 || q_mode == quant_epilogue::kQuantMxfp8Paired) {
+        const bool paired = q_mode == quant_epilogue::kQuantMxfp8Paired;
+        uint8_t* qv = q_values + row * kHidden;
+        uint8_t* qs = q_scales + row * (kHidden / 32);
+        quant_epilogue::quantize_vec4_mxfp8(qa, t / 8, lane % 8, paired, qv, qs);
+        quant_epilogue::quantize_vec4_mxfp8(qb, 36 + t / 8, lane % 8, paired, qv, qs);
+    } else if (q_mode == quant_epilogue::kQuantNvfp4) {
+        __shared__ float warp_maxs[kGateWarps];
+        float local_max = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            local_max = fmaxf(local_max, fabsf(qa[i]));
+            local_max = fmaxf(local_max, fabsf(qb[i]));
+        }
+        local_max = quant_epilogue::warp_max(local_max);
+        if (lane == 0) {
+            warp_maxs[warp] = local_max;
+        }
+        __syncthreads();
+        float row_amax = 0.f;
+#pragma unroll
+        for (int w = 0; w < kGateWarps; ++w) {
+            row_amax = fmaxf(row_amax, warp_maxs[w]);
+        }
+        if (t == 0) {
+            q_outer[row] = __fmul_rn(row_amax, 1.f / 1536.f);
+        }
+        uint8_t* qv = q_values + row * (kHidden / 2);
+        uint8_t* qs = q_scales + row * (kHidden / 16);
+        quant_epilogue::quantize_vec4_nvfp4(qa, row_amax, t / 4, lane % 4, qv, qs);
+        quant_epilogue::quantize_vec4_nvfp4(qb, row_amax, 72 + t / 4, lane % 4, qv, qs);
+    }
 }
 
 // ---------------------------------------------------------------------------

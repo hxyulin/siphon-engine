@@ -11,7 +11,7 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::{linear::launch_by_value, linear_fp8::Fp8Matrix},
+    ops::{QuantDest, linear::launch_by_value, linear_fp8::Fp8Matrix},
 };
 
 /// Threads per block for the elementwise kernels.
@@ -259,6 +259,15 @@ pub struct MessageMix<'a> {
 /// The norm of [`Misc::message_gate_out_rows`]: its weight and the normalized rows.
 pub type GateNorm<'a> = (&'a CudaSlice<bf16>, &'a mut dyn DeviceOut<bf16>);
 
+/// Fused norm + quantization epilogue of [`Misc::message_gate_out_rows_quant`]: optional
+/// BF16 normalized rows (skip when only quantized rows are read downstream) and the
+/// quantized destination.
+pub struct GateNormQuant<'a> {
+    pub weight: &'a CudaSlice<bf16>,
+    pub normed: Option<CudaViewMut<'a, bf16>>,
+    pub quant: QuantDest<'a>,
+}
+
 #[derive(Debug)]
 pub struct Misc {
     message_gate_combine_f32: CudaFunction,
@@ -269,6 +278,7 @@ pub struct Misc {
     message_gate_out_2304: CudaFunction,
     message_gate_out_rows_2304: CudaFunction,
     message_gate_norm_rows_2304: CudaFunction,
+    message_gate_norm_quant_rows_2304: CudaFunction,
     argmax_wide_f32: CudaFunction,
     message_gate_step_2304: CudaFunction,
     message_gate_step_fp8_2304: CudaFunction,
@@ -332,6 +342,8 @@ impl Misc {
             message_gate_out_2304: module.load_function("message_gate_out_2304")?,
             message_gate_out_rows_2304: module.load_function("message_gate_out_rows_2304")?,
             message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
+            message_gate_norm_quant_rows_2304: module
+                .load_function("message_gate_norm_quant_rows_2304")?,
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
             message_gate_step_2304: cluster_function(&module, "message_gate_step_2304")?,
             message_gate_step_fp8_2304: cluster_function(&module, "message_gate_step_fp8_2304")?,
@@ -886,28 +898,20 @@ impl Misc {
         unsafe { launch_by_value(stream, function, config, &args, true) }
     }
 
-    /// [`Misc::message_gate_out`] for each of the `rows` rows of a chunk: `down`
-    /// `[rows, 64]`, `out` `[rows, 2304]`, and the rows of `h` and `m` `h_stride` and
-    /// `m_stride` elements apart. With `norm` set to `(weight, normed)`, `normed` is
-    /// `[rows, 2304]`. With `mix`, the message is rebuilt from its candidates, `m` being the
-    /// partial one. The products with the down projection run on tensor cores, so results
-    /// differ from a single-row call's by F32 rounding.
+    /// Launches `message_gate_out_rows_2304` (without the trailing RMSNorm).
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
-    pub fn message_gate_out_rows(
+    fn launch_message_gate_out_rows(
         &self,
         stream: &CudaStream,
-        down: &impl DeviceIn<bf16>,
+        down: &CudaView<'_, bf16>,
         forget: &CudaSlice<bf16>,
         gain: &CudaSlice<bf16>,
-        (h, h_stride): (&impl DeviceIn<f32>, usize),
-        (m, m_stride): (&impl DeviceIn<f32>, usize),
+        (h, h_stride): (&CudaView<'_, f32>, usize),
+        (m, m_stride): (&CudaView<'_, f32>, usize),
         mix: Option<&MessageMix<'_>>,
-        out: &mut impl DeviceOut<f32>,
-        norm: Option<GateNorm<'_>>,
-        eps: f32,
+        out: &mut CudaViewMut<'_, f32>,
         rows: usize,
     ) -> anyhow::Result<()> {
-        let (down, h, m, mut out) = (down.view(), h.view(), m.view(), out.view_mut());
         ensure!(rows > 0, "no rows");
         check_len("down", down.len(), rows * GATE_RANK)?;
         check_len("forget", forget.len(), HIDDEN * GATE_RANK)?;
@@ -951,12 +955,12 @@ impl Misc {
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
-        args.ptr(&down, stream)
+        args.ptr(down, stream)
             .ptr(forget, stream)
             .ptr(gain, stream)
-            .ptr(&h, stream)
+            .ptr(h, stream)
             .i32(i32::try_from(h_stride)?)
-            .ptr(&m, stream)
+            .ptr(m, stream)
             .i32(i32::try_from(m_stride)?);
         match mix {
             Some(mix) => args
@@ -967,15 +971,49 @@ impl Misc {
                 .i32(i32::try_from(mix.probs_stride)?),
             None => args.u64(0).i32(0).i32(0).u64(0).i32(0),
         };
-        args.ptr_mut(&mut out, stream)
+        args.ptr_mut(out, stream)
             .i32(i32::try_from(rows).context("too many rows")?);
         // SAFETY: the arguments match `message_gate_out_rows_2304(const bf16*, const bf16*,
         // const bf16*, const float*, int, const float*, int, const float*, int, int, const
         // float*, int, float*, int)`, every buffer holds `rows` rows as checked above, a null
         // `probs` leaves `blocks` unread, the grid covers the rows in tiles of 64 (the kernel
         // skips rows past `rows`), and it reads only weights before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.message_gate_out_rows_2304, config) }?;
+        unsafe { args.launch_pdl(stream, &self.message_gate_out_rows_2304, config) }
+    }
 
+    /// [`Misc::message_gate_out`] for each of the `rows` rows of a chunk: `down`
+    /// `[rows, 64]`, `out` `[rows, 2304]`, and the rows of `h` and `m` `h_stride` and
+    /// `m_stride` elements apart. With `norm` set to `(weight, normed)`, `normed` is
+    /// `[rows, 2304]`. With `mix`, the message is rebuilt from its candidates, `m` being the
+    /// partial one. The products with the down projection run on tensor cores, so results
+    /// differ from a single-row call's by F32 rounding.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn message_gate_out_rows(
+        &self,
+        stream: &CudaStream,
+        down: &impl DeviceIn<bf16>,
+        forget: &CudaSlice<bf16>,
+        gain: &CudaSlice<bf16>,
+        (h, h_stride): (&impl DeviceIn<f32>, usize),
+        (m, m_stride): (&impl DeviceIn<f32>, usize),
+        mix: Option<&MessageMix<'_>>,
+        out: &mut impl DeviceOut<f32>,
+        norm: Option<GateNorm<'_>>,
+        eps: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (down, h, m, mut out) = (down.view(), h.view(), m.view(), out.view_mut());
+        self.launch_message_gate_out_rows(
+            stream,
+            &down,
+            forget,
+            gain,
+            (&h, h_stride),
+            (&m, m_stride),
+            mix,
+            &mut out,
+            rows,
+        )?;
         let Some((weight, normed)) = norm else {
             return Ok(());
         };
@@ -996,6 +1034,62 @@ impl Misc {
         // bf16*, float)`, out and normed hold `rows` rows of 2304, the grid has one block per
         // row, and the kernel reads only the norm weight before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.message_gate_norm_rows_2304, config) }
+    }
+
+    /// [`Misc::message_gate_out_rows`] whose trailing RMSNorm fuses MXFP8 or NVFP4 activation
+    /// quantization directly from registers into `norm.quant` (and optionally writes BF16
+    /// `norm.normed`). Matches [`Self::message_gate_out_rows`] followed by the standalone
+    /// quantizer bit for bit.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn message_gate_out_rows_quant(
+        &self,
+        stream: &CudaStream,
+        down: &impl DeviceIn<bf16>,
+        forget: &CudaSlice<bf16>,
+        gain: &CudaSlice<bf16>,
+        (h, h_stride): (&impl DeviceIn<f32>, usize),
+        (m, m_stride): (&impl DeviceIn<f32>, usize),
+        mix: Option<&MessageMix<'_>>,
+        out: &mut impl DeviceOut<f32>,
+        mut norm: GateNormQuant<'_>,
+        eps: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (down, h, m, mut out) = (down.view(), h.view(), m.view(), out.view_mut());
+        check_len("norm weight", norm.weight.len(), HIDDEN)?;
+        if let Some(normed) = &norm.normed {
+            check_len("normed", normed.len(), rows * HIDDEN)?;
+        }
+        norm.quant.check(rows, HIDDEN)?;
+        self.launch_message_gate_out_rows(
+            stream,
+            &down,
+            forget,
+            gain,
+            (&h, h_stride),
+            (&m, m_stride),
+            mix,
+            &mut out,
+            rows,
+        )?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&out, stream)
+            .ptr(norm.weight, stream)
+            .opt_mut(norm.normed.as_mut(), stream)
+            .ptr_mut(&mut norm.quant.values, stream)
+            .ptr_mut(&mut norm.quant.scales, stream)
+            .opt_mut(norm.quant.outer.as_mut(), stream)
+            .i32(norm.quant.format.mode())
+            .f32(eps);
+        // SAFETY: the arguments match `message_gate_norm_quant_rows_2304(const float*, const
+        // bf16*, bf16*, u8*, u8*, float*, int, float)`, all buffers hold `rows` rows of 2304
+        // as checked above, and the kernel reads only `norm_weight` before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.message_gate_norm_quant_rows_2304, config) }
     }
 }
 

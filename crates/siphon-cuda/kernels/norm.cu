@@ -21,6 +21,7 @@
 #include <cstdint>
 
 #include "pdl.cuh"
+#include "quant_epilogue.cuh"
 
 namespace {
 
@@ -140,6 +141,89 @@ rms_norm_f32_2304(const float* x, const __nv_bfloat16* weight, __nv_bfloat16* ou
         v[i] = (v[i] * scale) * w[i];
     }
     store_bf16x4(out + offset, v);
+}
+
+namespace {
+
+// Fused weighted RMSNorm -> MXFP8 / NVFP4 quantization for 2304-wide rows. Rounds each
+// normalized value to BF16 first (optionally storing `out` if non-null), then quantizes
+// directly from registers bit-for-bit with `quantize_rows_{mxfp8_dense,mxfp8,fp8,nvfp4}`.
+template <bool kF32>
+__device__ __forceinline__ void rms_norm_quant_2304(const void* x,
+                                                    const __nv_bfloat16* __restrict__ weight,
+                                                    __nv_bfloat16* out, uint8_t* q_values,
+                                                    uint8_t* q_scales, float* q_outer, int q_mode,
+                                                    float eps) {
+    pdl_trigger();
+    pdl_wait();
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const size_t row = blockIdx.x;
+    const size_t offset = row * kHidden + t * kVec;
+    float v[kVec];
+    if constexpr (kF32) {
+        load_f32x4(reinterpret_cast<const float*>(x) + offset, v);
+    } else {
+        load_bf16x4(reinterpret_cast<const __nv_bfloat16*>(x) + offset, v);
+    }
+    const float scale = inv_rms(row_sum_squares(v), kHidden, eps);
+    float w[kVec];
+    load_bf16x4(weight + t * kVec, w);
+    uint2 packed;
+    auto* vals = reinterpret_cast<__nv_bfloat16*>(&packed);
+    float q[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        const float y = kF32 ? ((v[i] * scale) * w[i])
+                             : (__bfloat162float(__float2bfloat16(v[i] * scale)) * w[i]);
+        vals[i] = __float2bfloat16(y);
+        q[i] = __bfloat162float(vals[i]);
+    }
+    if (out != nullptr) {
+        *reinterpret_cast<uint2*>(out + offset) = packed;
+    }
+    if (q_mode == quant_epilogue::kQuantMxfp8 || q_mode == quant_epilogue::kQuantMxfp8Paired) {
+        const bool paired = q_mode == quant_epilogue::kQuantMxfp8Paired;
+        quant_epilogue::quantize_vec4_mxfp8(q, t / 8, lane % 8, paired, q_values + row * kHidden,
+                                            q_scales + row * (kHidden / 32));
+    } else if (q_mode == quant_epilogue::kQuantNvfp4) {
+        __shared__ float warp_maxs[kRowWarps];
+        float local_max = 0.f;
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            local_max = fmaxf(local_max, fabsf(q[i]));
+        }
+        local_max = quant_epilogue::warp_max(local_max);
+        if (lane == 0) {
+            warp_maxs[warp] = local_max;
+        }
+        __syncthreads();
+        const float row_amax =
+            quant_epilogue::warp_max(lane < kRowWarps ? warp_maxs[lane] : 0.f);
+        if (t == 0) {
+            q_outer[row] = __fmul_rn(row_amax, 1.f / 1536.f);
+        }
+        quant_epilogue::quantize_vec4_nvfp4(q, row_amax, t / 4, lane % 4,
+                                            q_values + row * (kHidden / 2),
+                                            q_scales + row * (kHidden / 16));
+    }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+rms_norm_quant_bf16_2304(const __nv_bfloat16* x, const __nv_bfloat16* __restrict__ weight,
+                         __nv_bfloat16* out, uint8_t* q_values, uint8_t* q_scales, float* q_outer,
+                         int q_mode, float eps) {
+    rms_norm_quant_2304<false>(x, weight, out, q_values, q_scales, q_outer, q_mode, eps);
+}
+
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+rms_norm_quant_f32_2304(const float* x, const __nv_bfloat16* __restrict__ weight,
+                        __nv_bfloat16* out, uint8_t* q_values, uint8_t* q_scales, float* q_outer,
+                        int q_mode, float eps) {
+    rms_norm_quant_2304<true>(x, weight, out, q_values, q_scales, q_outer, q_mode, eps);
 }
 
 // Unweighted RMSNorm of F32 rows.

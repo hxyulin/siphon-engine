@@ -17,6 +17,7 @@
 
 #include "cluster_sm89.cuh"
 #include "pdl.cuh"
+#include "quant_epilogue.cuh"
 
 namespace {
 
@@ -1939,7 +1940,7 @@ __device__ __forceinline__ void load8_bf16(const __nv_bfloat16* p, int ca, int c
     unpack_bf16x4(*reinterpret_cast<const uint2*>(p + cb), v + 4);
 }
 
-template <int NB, int NQ>
+template <int NB, int NQ, bool kQuant = false>
 __device__ __forceinline__ void
 depth_attention_rows(const float* blocks, int block_stride, const float* partial_f32,
                      const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,
@@ -1950,7 +1951,11 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
                      int dst_stride,
                      const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,
                      const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3,
-                     float eps, float scale, int rows, int probs_batch, int dst_batch) {
+                     float eps, float scale, int rows, int probs_batch, int dst_batch,
+                     uint8_t* q_val0 = nullptr, uint8_t* q_val1 = nullptr, uint8_t* q_val2 = nullptr,
+                     uint8_t* q_scl0 = nullptr, uint8_t* q_scl1 = nullptr, uint8_t* q_scl2 = nullptr,
+                     float* q_out0 = nullptr, float* q_out1 = nullptr, float* q_out2 = nullptr,
+                     int q_mode = 0) {
     constexpr int kCandidates = NB + 1;
     constexpr int kDots = kCandidates * NQ;
     // The dots, then the partial's sum of squares.
@@ -1958,6 +1963,7 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
     static_assert(kValues <= 32, "the first reduction fits a warp");
     __shared__ float red[2][kStepWarps][32];
     __shared__ float red_norm[2][NQ][kStepWarps];
+    __shared__ float red_amax[kQuant ? kStepWarps : 1];
     const int t = threadIdx.x;
     const int lane = t % 32;
     const int warp = t / 32;
@@ -1973,10 +1979,13 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
         dst0 != nullptr ? dst0 + batch * dst_batch : nullptr, dst1 != nullptr ? dst1 + batch * dst_batch : nullptr,
         dst2 != nullptr ? dst2 + batch * dst_batch : nullptr, dst3 != nullptr ? dst3 + batch * dst_batch : nullptr};
     const __nv_bfloat16* const weight[kDests] = {weight0, weight1, weight2, weight3};
+    uint8_t* const q_val[kDests] = {q_val0, q_val1, q_val2, nullptr};
+    uint8_t* const q_scl[kDests] = {q_scl0, q_scl1, q_scl2, nullptr};
+    float* const q_out[kDests] = {q_out0, q_out1, q_out2, nullptr};
     unsigned normed_rows = 0;
 #pragma unroll
     for (int k = 0; k < kDests; ++k) {
-        if (dst[k] != nullptr) {
+        if (dst[k] != nullptr || (kQuant && q_val[k] != nullptr)) {
             normed_rows |= 1u << min(k, NQ - 1);
         }
     }
@@ -2194,7 +2203,8 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
             const float inv = inv_rms_f32(sum, eps);
 #pragma unroll
             for (int k = 0; k < kDests; ++k) {
-                if (dst[k] == nullptr || min(k, NQ - 1) != j) {
+                const bool want_q = kQuant && q_val[k] != nullptr;
+                if ((dst[k] == nullptr && !want_q) || min(k, NQ - 1) != j) {
                     continue;
                 }
                 float y[8];
@@ -2210,11 +2220,67 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
                         y[e] *= w[e];
                     }
                 }
-                __nv_bfloat16* d = dst[k] + size_t(row) * dst_stride;
-                const float ya[4] = {y[0], y[1], y[2], y[3]};
-                const float yb[4] = {y[4], y[5], y[6], y[7]};
-                store4(d + ca, ya);
-                store4(d + cb, yb);
+                if constexpr (kQuant) {
+                    uint2 pa;
+                    uint2 pb;
+                    auto* ba = reinterpret_cast<__nv_bfloat16*>(&pa);
+                    auto* bb = reinterpret_cast<__nv_bfloat16*>(&pb);
+                    float qa[4];
+                    float qb[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        ba[e] = __float2bfloat16(y[e]);
+                        bb[e] = __float2bfloat16(y[4 + e]);
+                        qa[e] = __bfloat162float(ba[e]);
+                        qb[e] = __bfloat162float(bb[e]);
+                    }
+                    if (dst[k] != nullptr) {
+                        __nv_bfloat16* d = dst[k] + size_t(row) * dst_stride;
+                        *reinterpret_cast<uint2*>(d + ca) = pa;
+                        *reinterpret_cast<uint2*>(d + cb) = pb;
+                    }
+                    if (want_q) {
+                        if (q_mode == quant_epilogue::kQuantMxfp8 ||
+                            q_mode == quant_epilogue::kQuantMxfp8Paired) {
+                            const bool paired = q_mode == quant_epilogue::kQuantMxfp8Paired;
+                            uint8_t* qv = q_val[k] + size_t(row) * kHidden;
+                            uint8_t* qs = q_scl[k] + size_t(row) * (kHidden / 32);
+                            quant_epilogue::quantize_vec4_mxfp8(qa, t / 8, lane % 8, paired, qv, qs);
+                            quant_epilogue::quantize_vec4_mxfp8(qb, 36 + t / 8, lane % 8, paired, qv, qs);
+                        } else if (q_mode == quant_epilogue::kQuantNvfp4) {
+                            float local_max = 0.f;
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) {
+                                local_max = fmaxf(local_max, fabsf(qa[e]));
+                                local_max = fmaxf(local_max, fabsf(qb[e]));
+                            }
+                            local_max = quant_epilogue::warp_max(local_max);
+                            if (lane == 0) {
+                                red_amax[warp] = local_max;
+                            }
+                            __syncthreads();
+                            float row_amax = 0.f;
+#pragma unroll
+                            for (int w = 0; w < kStepWarps; ++w) {
+                                row_amax = fmaxf(row_amax, red_amax[w]);
+                            }
+                            if (t == 0) {
+                                q_out[k][row] = __fmul_rn(row_amax, 1.f / 1536.f);
+                            }
+                            uint8_t* qv = q_val[k] + size_t(row) * (kHidden / 2);
+                            uint8_t* qs = q_scl[k] + size_t(row) * (kHidden / 16);
+                            quant_epilogue::quantize_vec4_nvfp4(qa, row_amax, t / 4, lane % 4, qv, qs);
+                            quant_epilogue::quantize_vec4_nvfp4(qb, row_amax, 72 + t / 4, lane % 4, qv, qs);
+                            __syncthreads();
+                        }
+                    }
+                } else {
+                    __nv_bfloat16* d = dst[k] + size_t(row) * dst_stride;
+                    const float ya[4] = {y[0], y[1], y[2], y[3]};
+                    const float yb[4] = {y[4], y[5], y[6], y[7]};
+                    store4(d + ca, ya);
+                    store4(d + cb, yb);
+                }
             }
         }
     }
@@ -2250,11 +2316,10 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
         const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,                  \
         const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3, float eps,       \
         float scale, int rows, int probs_batch, int dst_batch) {                                               \
-        depth_attention_rows<NB, NQ>(blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight,        \
-                                     conv_state, conv_hidden, residual, conv_states, rows_per_seq,              \
-                                     normed_partial, queries, out, probs, dst0, dst1, dst2, dst3, dst_stride,   \
-                                     weight0, weight1, weight2, weight3, eps, scale, rows, probs_batch,         \
-                                     dst_batch);                                                                \
+        depth_attention_rows<NB, NQ, false>(                                                                    \
+            blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight, conv_state, conv_hidden,        \
+            residual, conv_states, rows_per_seq, normed_partial, queries, out, probs, dst0, dst1, dst2, dst3,   \
+            dst_stride, weight0, weight1, weight2, weight3, eps, scale, rows, probs_batch, dst_batch);          \
     }
 
 #define DEPTH_ATTENTION_ROWS_Q(NQ) \
@@ -2267,3 +2332,36 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
 DEPTH_ATTENTION_ROWS_Q(1)
 DEPTH_ATTENTION_ROWS_Q(3)
 DEPTH_ATTENTION_ROWS_Q(4)
+
+// depth_attention_rows_quant_2304_<NB>_<NQ>: depth_attention_rows with fused MXFP8 / NVFP4
+// quantization in the RMSNorm epilogue for up to 3 destinations (NQ = 1 or 3), writing
+// quantized activations directly from registers and BF16 only when dst_k is non-null.
+#define DEPTH_ATTENTION_ROWS_QUANT(NB, NQ)                                                                      \
+    extern "C" __global__ void __launch_bounds__(kStepThreads) depth_attention_rows_quant_2304_##NB##_##NQ(    \
+        const float* blocks, int block_stride, const float* partial_f32,                                       \
+        const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,            \
+        const float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,                             \
+        const unsigned long long* conv_states, int rows_per_seq,                                                \
+        float* normed_partial, const float* __restrict__ queries, float* out, float* probs,                     \
+        __nv_bfloat16* dst0, __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,    \
+        const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,                  \
+        const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3, float eps,       \
+        float scale, int rows, int probs_batch, int dst_batch, uint8_t* q_val0, uint8_t* q_val1,               \
+        uint8_t* q_val2, uint8_t* q_scl0, uint8_t* q_scl1, uint8_t* q_scl2, float* q_out0, float* q_out1,      \
+        float* q_out2, int q_mode) {                                                                            \
+        depth_attention_rows<NB, NQ, true>(                                                                     \
+            blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight, conv_state, conv_hidden,        \
+            residual, conv_states, rows_per_seq, normed_partial, queries, out, probs, dst0, dst1, dst2, dst3,   \
+            dst_stride, weight0, weight1, weight2, weight3, eps, scale, rows, probs_batch, dst_batch, q_val0,   \
+            q_val1, q_val2, q_scl0, q_scl1, q_scl2, q_out0, q_out1, q_out2, q_mode);                            \
+    }
+
+#define DEPTH_ATTENTION_ROWS_QUANT_Q(NQ) \
+    DEPTH_ATTENTION_ROWS_QUANT(1, NQ)    \
+    DEPTH_ATTENTION_ROWS_QUANT(2, NQ)    \
+    DEPTH_ATTENTION_ROWS_QUANT(3, NQ)    \
+    DEPTH_ATTENTION_ROWS_QUANT(4, NQ)    \
+    DEPTH_ATTENTION_ROWS_QUANT(5, NQ)
+
+DEPTH_ATTENTION_ROWS_QUANT_Q(1)
+DEPTH_ATTENTION_ROWS_QUANT_Q(3)

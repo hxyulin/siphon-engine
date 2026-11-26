@@ -11,7 +11,10 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::spec::{BATCH_STATE_WORDS, BatchRows},
+    ops::{
+        QuantDest,
+        spec::{BATCH_STATE_WORDS, BatchRows},
+    },
 };
 
 /// Hidden width of the model.
@@ -114,6 +117,8 @@ pub struct AttentionPostRows<'a> {
 pub struct Norm {
     rms_norm_bf16_2304: CudaFunction,
     rms_norm_f32_2304: CudaFunction,
+    rms_norm_quant_bf16_2304: CudaFunction,
+    rms_norm_quant_f32_2304: CudaFunction,
     unweighted_rms_norm_f32_2304: CudaFunction,
     unweighted_rms_norm_bf16_f32_2304: CudaFunction,
     unweighted_rms_norm_bf16_128: CudaFunction,
@@ -183,6 +188,8 @@ impl Norm {
         Ok(Self {
             rms_norm_bf16_2304: module.load_function("rms_norm_bf16_2304")?,
             rms_norm_f32_2304: module.load_function("rms_norm_f32_2304")?,
+            rms_norm_quant_bf16_2304: module.load_function("rms_norm_quant_bf16_2304")?,
+            rms_norm_quant_f32_2304: module.load_function("rms_norm_quant_f32_2304")?,
             unweighted_rms_norm_f32_2304: module.load_function("unweighted_rms_norm_f32_2304")?,
             unweighted_rms_norm_bf16_f32_2304: module
                 .load_function("unweighted_rms_norm_bf16_f32_2304")?,
@@ -215,6 +222,45 @@ impl Norm {
         Ok(())
     }
 
+    /// Weighted RMSNorm of each BF16 row of `x` (`[rows, 2304]`) with fused MXFP8 or NVFP4
+    /// activation quantization directly from registers into `quant` (plus optional BF16 `out`
+    /// when still needed downstream). Matches [`Self::rms_norm`] followed by the standalone
+    /// quantizer bit for bit.
+    pub fn rms_norm_quant(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        weight: &CudaSlice<bf16>,
+        mut out: Option<CudaViewMut<'_, bf16>>,
+        mut quant: QuantDest<'_>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let x = x.view();
+        check_weight(weight.len())?;
+        let rows_u32 = rows(x.len(), HIDDEN)?;
+        let n_rows = x.len() / HIDDEN;
+        if let Some(o) = &out {
+            check_out(o.len(), x.len())?;
+        }
+        quant.check(n_rows, HIDDEN)?;
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(weight, stream)
+            .opt_mut(out.as_mut(), stream)
+            .ptr_mut(&mut quant.values, stream)
+            .ptr_mut(&mut quant.scales, stream)
+            .opt_mut(quant.outer.as_mut(), stream)
+            .i32(quant.format.mode())
+            .f32(eps);
+        // SAFETY: the arguments match `rms_norm_quant_bf16_2304(const bf16*, const bf16*,
+        // bf16*, u8*, u8*, float*, int, float)`, all buffers hold `n_rows` rows as checked
+        // above, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.rms_norm_quant_bf16_2304, row_config(rows_u32)) }
+    }
+
     /// Weighted RMSNorm of each F32 row of `x` (shape `[rows, 2304]`), written to `out` as BF16.
     ///
     /// Equals MLX's `norm(x).astype(mx.bfloat16)` for an `nn.RMSNorm` with a BF16 weight.
@@ -236,6 +282,44 @@ impl Norm {
         // and the checks above keep every row inside `x` and `out`.
         unsafe { launch.launch(row_config(rows)) }?;
         Ok(())
+    }
+
+    /// Weighted RMSNorm of each F32 row of `x` (`[rows, 2304]`) with fused MXFP8 or NVFP4
+    /// activation quantization directly from registers into `quant` (plus optional BF16 `out`).
+    /// Matches [`Self::rms_norm_f32`] followed by the standalone quantizer bit for bit.
+    pub fn rms_norm_f32_quant(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        mut out: Option<CudaViewMut<'_, bf16>>,
+        mut quant: QuantDest<'_>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let x = x.view();
+        check_weight(weight.len())?;
+        let rows_u32 = rows(x.len(), HIDDEN)?;
+        let n_rows = x.len() / HIDDEN;
+        if let Some(o) = &out {
+            check_out(o.len(), x.len())?;
+        }
+        quant.check(n_rows, HIDDEN)?;
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(weight, stream)
+            .opt_mut(out.as_mut(), stream)
+            .ptr_mut(&mut quant.values, stream)
+            .ptr_mut(&mut quant.scales, stream)
+            .opt_mut(quant.outer.as_mut(), stream)
+            .i32(quant.format.mode())
+            .f32(eps);
+        // SAFETY: the arguments match `rms_norm_quant_f32_2304(const float*, const bf16*,
+        // bf16*, u8*, u8*, float*, int, float)`, all buffers hold `n_rows` rows as checked
+        // above, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.rms_norm_quant_f32_2304, row_config(rows_u32)) }
     }
 
     /// Unweighted RMSNorm of each F32 row of `x` (shape `[rows, 2304]`) into `out`.
