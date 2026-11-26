@@ -13,126 +13,27 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::{
     env,
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, ensure};
+use common::{Server, http};
 use serde_json::{Value, json};
 
-/// One HTTP/1.1 exchange: the status, the headers in lower case, and the body.
-fn http(port: u16, method: &str, path: &str, body: &str) -> anyhow::Result<(u16, String, String)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )?;
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    let (head, body) = reply.split_once("\r\n\r\n").context("no header end")?;
-    let status = head
-        .split(' ')
-        .nth(1)
-        .context("no status")?
-        .parse()
-        .context("a bad status")?;
-    Ok((status, head.to_lowercase(), body.to_owned()))
-}
-
-/// A free local port.
-fn free_port() -> anyhow::Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
-/// A running server and the lines of its log so far.
-struct Server {
-    child: Child,
-    port: u16,
-    log: Arc<Mutex<Vec<String>>>,
-}
-
-impl Server {
-    fn start(cache: &Path) -> anyhow::Result<Self> {
-        let model = env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?;
-        let port = free_port()?;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_siphon-serve"))
-            .arg(&model)
-            .args([
-                "--port",
-                &port.to_string(),
-                "--context",
-                "32768",
-                "--greedy",
-            ])
-            .args(["--host-cache", "2", "--cache-dir"])
-            .arg(cache)
-            .args(
-                env::var("SIPHON_KV")
-                    .map(|kv| ["--kv".to_owned(), kv])
-                    .into_iter()
-                    .flatten(),
-            )
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let stderr = child.stderr.take().context("no stderr")?;
-        let lines = Arc::clone(&log);
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                eprintln!("[server {port}] {line}");
-                lines.lock().expect("log lock").push(line);
-            }
-        });
-        let started = Instant::now();
-        while !matches!(http(port, "GET", "/health", ""), Ok((200, ..))) {
-            ensure!(
-                child.try_wait()?.is_none(),
-                "the server exited while loading"
-            );
-            ensure!(
-                started.elapsed() < Duration::from_secs(600),
-                "the server did not start"
-            );
-            thread::sleep(Duration::from_millis(500));
-        }
-        Ok(Self { child, port, log })
-    }
-
-    fn logged(&self, text: &str) -> bool {
-        self.log
-            .lock()
-            .expect("log lock")
-            .iter()
-            .any(|l| l.contains(text))
-    }
-
-    fn wait(&mut self) -> anyhow::Result<std::process::ExitStatus> {
-        Ok(self.child.wait()?)
-    }
-
-    fn terminate(&self) -> anyhow::Result<()> {
-        let status = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status()?;
-        ensure!(status.success(), "kill failed");
-        Ok(())
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// A server with a host cache that it saves to and loads from `cache`.
+fn start(cache: &Path) -> anyhow::Result<Server> {
+    let mut args: Vec<OsString> = ["--context", "32768", "--greedy", "--host-cache", "2"]
+        .map(OsString::from)
+        .into();
+    args.extend([OsString::from("--cache-dir"), cache.into()]);
+    Server::start(&args)
 }
 
 /// A chat request of about 3,000 tokens of the repository's docs, for `max_tokens` tokens.
@@ -155,7 +56,7 @@ fn request(max_tokens: usize) -> anyhow::Result<String> {
 #[ignore = "needs the checkpoint and a GPU"]
 fn drain_then_restart_from_disk() -> anyhow::Result<()> {
     let cache = env::temp_dir().join(format!("siphon-drain-test-{}", std::process::id()));
-    let mut first = Server::start(&cache)?;
+    let mut first = start(&cache)?;
     let port = first.port;
     let body = request(1500)?;
     let running = {
@@ -204,7 +105,7 @@ fn drain_then_restart_from_disk() -> anyhow::Result<()> {
         ensure!(first.logged(line), "the log lacks {line:?}");
     }
 
-    let second = Server::start(&cache)?;
+    let second = start(&cache)?;
     ensure!(
         second.logged("host cache: loaded 1 entries"),
         "the cache did not load"

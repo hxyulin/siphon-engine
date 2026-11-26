@@ -996,6 +996,21 @@ impl Speculator {
         model: &mut Model,
         n: usize,
         drafts: Drafts,
+        on_round: impl FnMut(&[u32]) -> ControlFlow<()>,
+    ) -> anyhow::Result<Vec<u32>> {
+        self.generate_with_room(model, n, drafts, |_, _, _| true, on_round)
+    }
+
+    /// [`Self::generate_with`], calling `room` with the model, the speculator and the
+    /// position below which the model writes before the draft's first round and before
+    /// each verify round or run of plain steps, so that it can free pages of the KV pool
+    /// for them. Generation stops before the work when `room` returns false.
+    pub fn generate_with_room(
+        &mut self,
+        model: &mut Model,
+        n: usize,
+        drafts: Drafts,
+        mut room: impl FnMut(&mut Model, &mut Self, usize) -> bool,
         mut on_round: impl FnMut(&[u32]) -> ControlFlow<()>,
     ) -> anyhow::Result<Vec<u32>> {
         let stream = Arc::clone(model.stream());
@@ -1008,6 +1023,9 @@ impl Speculator {
             accepted_at: vec![0; STEPS],
             ..SpecStats::default()
         };
+        if !room(model, self, model.position() + 1) {
+            return Ok(Vec::new());
+        }
         let mut timings: Vec<[CudaEvent; 3]> = Vec::new();
         let mut probes: Vec<[CudaEvent; 2]> = Vec::new();
         let started = Instant::now();
@@ -1031,6 +1049,13 @@ impl Speculator {
         // The anchor on the host, once a round or step has emitted it.
         let mut anchor = None;
         while out.len() < n {
+            let writes = match next {
+                Next::Verify(width) => width,
+                Next::Plain(steps) => steps.min(n - out.len()),
+            };
+            if !room(model, self, model.position() + writes) {
+                break;
+            }
             let width = match next {
                 Next::Verify(width) => width,
                 Next::Plain(steps) => {

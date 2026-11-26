@@ -72,7 +72,7 @@ codex -p siphon
 - **Compaction.** Codex compacts when the conversation passes `model_auto_compact_token_limit`, which defaults to 90% of the context window and cannot exceed it. At 272,000 that is 244,800, which leaves 27,200 tokens for the summary request, so the default works. Codex compacts locally for a custom provider: it sends the history and a summary prompt to `/v1/responses`, not to OpenAI's compaction endpoint.
 - **Effort.** `model_reasoning_effort` reaches the server as `reasoning.effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max` pass as they are. Codex always sends tools, so `none` runs at effort 0. Do not pick `ultra` or `persistent`: the server does not know them. Without `model_reasoning_effort`, Codex sends no effort and the server uses 0.9.
 - **Showing the thinking.** Codex sends `reasoning.summary`, and the server fills each summary with the whole thinking, which Codex shows by default. Leave `show_raw_agent_reasoning` off, or Codex shows the text twice. `hide_agent_reasoning = true` hides it.
-- **Output cap.** Codex sends no `max_output_tokens` and has no setting for one, so every turn misses the prefix cache for now.
+- **Output cap.** Codex sends no `max_output_tokens` and has no setting for one. A reply may then run to the end of the context, where the response ends `incomplete` with the reason `max_output_tokens`, which Codex shows as an error.
 - **Tools.** Codex warns that it has no metadata for the model and uses defaults: function tools such as `exec_command` and `write_stdin`, and no `apply_patch` tool, so the model edits files through the shell.
 - **Sampling.** Codex sends no temperature.
 - **Images.** Codex sends pasted images as `input_image` parts with `data:` URLs.

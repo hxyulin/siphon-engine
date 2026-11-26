@@ -1259,6 +1259,12 @@ mod cuda {
             (self.job.prompt.len() + self.job.max_tokens + MARGIN).min(capacity)
         }
 
+        /// The positions that a lone request takes room for when it starts: its prompt
+        /// and [`HEADROOM`] more, at most its final position.
+        fn first_position(&self, capacity: usize) -> usize {
+            (self.job.prompt.len() + HEADROOM).min(self.final_position(capacity))
+        }
+
         /// Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
         /// over or its client has left.
         fn take(&mut self, ids: &[u32], stop: &[u32]) -> ControlFlow<()> {
@@ -1461,12 +1467,14 @@ mod cuda {
                 if request.done {
                     continue;
                 }
-                // Alone, the request may take the whole pool: room for every position it
-                // may reach, the draft's and its entry's copies of the rings. A sequence
+                // Room for the prompt and `HEADROOM` more, the draft's and its entry's
+                // copies of the rings; `alone` maps the rest as the reply grows. A sequence
                 // that moves into or out of slot 0 first is copied while the pool has room
                 // for the copy (`Model::transfer_slot`), so the room counts the copy too:
                 // the hit's, or slot 0's entry moving aside. Only a hit in slot 0 stays.
-                let end = request.final_position(capacity);
+                // Dropping the draft's pages would drop the hit's draft state with them,
+                // and the hit with it.
+                let end = request.first_position(capacity);
                 let hit_slot = hit.and_then(|h| h.slot);
                 let mut need =
                     model.pages_for(end) + speculator.draft_pages_to(end) + model.ring_pages();
@@ -1476,7 +1484,8 @@ mod cuda {
                     need += model.pages_for(model.slot_position(0).unwrap_or(0));
                 }
                 let keep: Vec<usize> = hit_slot.into_iter().collect();
-                make_room(&mut model, &mut speculator, need, &keep);
+                let draft_hit = hit.is_some_and(|h| h.draft && h.slot.is_some());
+                make_room(&mut model, &mut speculator, need, &keep, !draft_hit);
                 request
             };
             let interrupt = (streams > 1).then_some((queue, &mut waiting));
@@ -1486,6 +1495,7 @@ mod cuda {
                 &mut tower,
                 &mut request,
                 stop,
+                capacity,
                 interrupt,
             );
             match ran {
@@ -1521,13 +1531,14 @@ mod cuda {
     /// Frees pages of the KV pool until `need` are free, from slots outside `keep`: first
     /// the pages that idle slots keep past their prefix cache entries and their rings, and
     /// the copies of entries no longer live, then whole entries with their pages, least
-    /// recently used first, then the draft's pages if it follows no request. Returns
-    /// whether `need` pages are free.
+    /// recently used first, then, with `draft`, the draft's pages if it follows no request.
+    /// Returns whether `need` pages are free.
     fn make_room(
         model: &mut Model,
         speculator: &mut Speculator,
         need: usize,
         keep: &[usize],
+        draft: bool,
     ) -> bool {
         let free = |m: &Model| m.kv_pool().map_or(usize::MAX, PagePool::free_pages);
         if free(model) >= need {
@@ -1556,6 +1567,9 @@ mod cuda {
             if free(model) >= need {
                 return true;
             }
+        }
+        if !draft {
+            return false;
         }
         match speculator.trim_draft(model) {
             Ok(0) => {}
@@ -1649,7 +1663,7 @@ mod cuda {
         loop {
             let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
             let pages = need(model, active);
-            if make_room(model, speculator, pages, &busy) {
+            if make_room(model, speculator, pages, &busy, true) {
                 return true;
             }
             let Some(v) = victim(model, active, spare, force) else {
@@ -1827,7 +1841,7 @@ mod cuda {
         };
         let mut keep = busy;
         keep.extend(slot);
-        make_room(model, speculator, mine + others, &keep)
+        make_room(model, speculator, mine + others, &keep, true)
     }
 
     /// Starts `pick`: a waiting job in the slot the prefix cache gives it, or a swapped-out
@@ -1895,12 +1909,18 @@ mod cuda {
     /// after the round in which another job arrives, moves that job to the waiting list
     /// and returns true: the request then continues in a batch from slot 0. Otherwise
     /// finishes it.
+    ///
+    /// The reply takes pages of the KV pool as it grows, [`HEADROOM`] positions at a time,
+    /// from other slots' prefix cache entries if need be (`make_room`); slot 0's entry and
+    /// the draft keep theirs. A reply that the pool cannot hold further, after every other
+    /// entry has gone, ends there with [`Finish::Length`], as at its token limit.
     fn alone(
         model: &mut Model,
         speculator: &mut Speculator,
         tower: &mut Tower,
         request: &mut Request,
         stop: &[u32],
+        capacity: usize,
         mut interrupt: Option<(&Receiver<Vec<Job>>, &mut VecDeque<Job>)>,
     ) -> anyhow::Result<bool> {
         model.set_sampling(request.sampling);
@@ -1940,7 +1960,29 @@ mod cuda {
         let started = Instant::now();
         if go_on {
             let remaining = request.job.max_tokens - request.output.len();
-            speculator.generate_with(model, remaining, Drafts::Dspark, |ids| {
+            let final_position = request.final_position(capacity);
+            // Positions below which slot 0 and the draft have their pages, mapped or free.
+            let mut held = 0;
+            let room = |model: &mut Model, speculator: &mut Speculator, end: usize| {
+                if end <= held {
+                    return true;
+                }
+                // The draft maps a few positions past the model's writes.
+                let need = |m: &Model, s: &Speculator, to: usize| {
+                    m.slot_pages_to(0, to).unwrap_or(0) + s.draft_pages_to(to + MARGIN)
+                };
+                for to in [(end + HEADROOM).min(final_position).max(end), end] {
+                    let pages = need(model, speculator, to);
+                    if make_room(model, speculator, pages, &[0], false) {
+                        held = to;
+                        return true;
+                    }
+                }
+                // The reply ends here, still with `Finish::Length`.
+                eprintln!("KV pool: full at position {}", model.position());
+                false
+            };
+            speculator.generate_with_room(model, remaining, Drafts::Dspark, room, |ids| {
                 request.speculated += ids.len();
                 let _ = request.job.events.send(Event::Round);
                 last = ids.last().copied().unwrap_or(last);
@@ -2041,7 +2083,7 @@ mod cuda {
             };
             let need =
                 model.pages_for(position) + moved + speculator.draft_pages_to(position + MARGIN);
-            if !make_room(model, speculator, need, &[r.slot]) {
+            if !make_room(model, speculator, need, &[r.slot], true) {
                 eprintln!("no room in the KV pool to rebuild the draft at position {position}");
                 return Ok(false);
             }
@@ -2323,7 +2365,7 @@ mod cuda {
         let slot = r.slot;
         // The entry copies the slot's rings into pages of the pool.
         if end == boundary && end > r.cached {
-            if make_room(model, speculator, model.ring_pages(), &busy) {
+            if make_room(model, speculator, model.ring_pages(), &busy, true) {
                 let key = active[i].job.key();
                 if let Err(e) = speculator.save_prefix(model, slot, key, chunk, &busy) {
                     eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
