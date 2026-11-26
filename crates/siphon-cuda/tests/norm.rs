@@ -533,7 +533,7 @@ fn attention_post_rows_match_single_rows() -> anyhow::Result<()> {
                     v: v.as_view_mut(),
                     q: q.as_view_mut(),
                     r: rel.as_view_mut(),
-                    log_scale: log_scale.then_some((&start, alpha, n_floor)),
+                    log_scale: log_scale.then_some((start.as_view(), alpha, n_floor)),
                     qk_threshold: QK_THRESHOLD,
                     rel_threshold: REL_THRESHOLD,
                     eps: EPS,

@@ -19,10 +19,11 @@ use half::bf16;
 use siphon::TextConfig;
 
 use super::{
-    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Scratch, Upcoming, VisitState, Window,
+    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Sampling, Scratch, Upcoming, VisitState, Window,
     batch::BatchBuffers, verify::VerifyBuffers, visit_plan, zeros,
 };
 use crate::{
+    DeviceIn,
     ops::{
         Products, attention,
         conv::VisitConvs,
@@ -36,7 +37,7 @@ use crate::{
         },
         sample::SampleBuffers,
         spec::{
-            BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, RESULT_LEN, TapLayout,
+            BATCH_ROWS, BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, RESULT_LEN, TapLayout,
             VERIFY_ROWS, VISIT_CHANNELS,
         },
     },
@@ -140,6 +141,35 @@ impl ImageRows {
 /// prefill is about to run. Prefill asks once per chunk, so the caller can encode each image
 /// only when its first chunk comes and drop it after its last.
 pub type ImageSource<'a> = &'a mut dyn FnMut(usize, usize) -> anyhow::Result<Vec<ImageRows>>;
+
+/// One sequence slice packed into [`Model::prefill_packed`].
+pub struct PackedPrefill<'a> {
+    /// Target sequence slot (must be distinct across slices in one call).
+    pub slot: usize,
+    /// Prompt tokens to prefill for this slice (non-empty).
+    pub tokens: &'a [u32],
+    /// Image rows overlapping this slice's prompt positions.
+    pub images: Vec<ImageRows>,
+    /// Whether this slice finishes its prompt and needs its first output token.
+    pub need_first_token: bool,
+    /// Sampling parameters used to draw the first token when `need_first_token` is true.
+    pub sampling: Sampling,
+}
+
+/// Callback receiving each packed slice's `(slot, start_position, taps)` on the model stream.
+pub(crate) type PackedTapsCallback<'a> =
+    &'a mut dyn FnMut(usize, usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
+
+/// Host-side metadata for one slice inside [`Ctx::prefill_packed_enqueue`].
+struct PackedSliceMeta<'a> {
+    slot: usize,
+    offset: usize,
+    len: usize,
+    start: usize,
+    images: &'a [ImageRows],
+    need_first_token: bool,
+    sampling: Sampling,
+}
 
 /// Which logits [`Model::prefill`] produces.
 pub enum PrefillLogits<'a> {
@@ -275,6 +305,10 @@ pub(super) struct PrefillScratch {
     pub(super) tokens: CudaSlice<i32>,
     /// The position of the chunk's first row.
     pub(super) start: CudaSlice<u32>,
+    /// Starting positions of each slice in [`Model::prefill_packed`], `[BATCH_ROWS]`.
+    packed_starts: CudaSlice<u32>,
+    /// First-token argmax/sample outputs of [`Model::prefill_packed`], `[BATCH_ROWS]`.
+    packed_argmax: CudaSlice<i32>,
     embedded: CudaSlice<bf16>,
     hidden: CudaSlice<bf16>,
     out: CudaSlice<bf16>,
@@ -342,6 +376,8 @@ impl PrefillScratch {
             sample: None,
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
+            packed_starts: zeros(stream, BATCH_ROWS)?,
+            packed_argmax: zeros(stream, BATCH_ROWS)?,
             embedded: zeros(stream, rows * hidden)?,
             hidden: zeros(stream, rows * hidden)?,
             out: zeros(stream, rows * hidden)?,
@@ -679,6 +715,191 @@ impl Model {
         )?;
         self.position += m;
         Ok(())
+    }
+
+    /// Prefills multiple independent sequence slices packed into a single pass of up to
+    /// `chunk` (`<= MAX_PREFILL_CHUNK`) total rows. All row-independent heavy ops (dense
+    /// projections, depth attention, message gates, MoE router + experts, and batched LM
+    /// head for finishing slices) run once across all `m = sum(tokens.len())` rows while
+    /// attention and short convolutions execute per slice against each slot's own KV cache
+    /// and conv states.
+    pub fn prefill_packed(
+        &mut self,
+        slices: &[PackedPrefill<'_>],
+        chunk: usize,
+    ) -> anyhow::Result<Vec<Option<u32>>> {
+        self.prefill_packed_with_taps(slices, chunk, None)
+    }
+
+    /// [`Self::prefill_packed`] that also records feature taps for every packed row and
+    /// passes each slice's `(slot, start_position, taps)` to `taps` on the model stream.
+    #[expect(clippy::too_many_lines, reason = "validates slices, enqueues packed pass, reads tokens")]
+    pub(crate) fn prefill_packed_with_taps(
+        &mut self,
+        slices: &[PackedPrefill<'_>],
+        chunk: usize,
+        mut taps: Option<PackedTapsCallback<'_>>,
+    ) -> anyhow::Result<Vec<Option<u32>>> {
+        ensure!(!slices.is_empty(), "nothing to prefill");
+        ensure!(
+            slices.len() <= BATCH_ROWS,
+            "at most {BATCH_ROWS} slices can be packed, got {}",
+            slices.len()
+        );
+        ensure!(
+            (1..=MAX_PREFILL_CHUNK).contains(&chunk),
+            "chunk is {chunk}, expected 1 to {MAX_PREFILL_CHUNK}"
+        );
+        ensure!(
+            self.ctx.kv_rounding.recent == 0,
+            "packed prefill does not support recent-window kv rounding"
+        );
+        let hidden = self.ctx.hidden();
+        let mut total_rows = 0usize;
+        let mut meta = Vec::with_capacity(slices.len());
+        let mut starts_u32 = Vec::with_capacity(slices.len());
+        let mut ids = Vec::new();
+        for (i, s) in slices.iter().enumerate() {
+            ensure!(!s.tokens.is_empty(), "packed slice {i} is empty");
+            ensure!(
+                slices[..i].iter().all(|prev| prev.slot != s.slot),
+                "slot {} appears twice in packed prefill",
+                s.slot
+            );
+            let start = self.slot_position(s.slot)?;
+            let last = start + s.tokens.len() - 1;
+            ensure!(
+                self.visits.iter().all(|v| v.kv.holds(last)),
+                "slot {}: the global KV caches cannot hold position {last}",
+                s.slot
+            );
+            self.map_slot(s.slot, last + 1)?;
+            u32::try_from(last).context("position does not fit the kernels")?;
+            for run in &s.images {
+                ensure!(
+                    !run.rows.is_empty() && run.rows.len().is_multiple_of(hidden),
+                    "image rows hold {} values, not whole rows of {hidden}",
+                    run.rows.len()
+                );
+            }
+            starts_u32.push(u32::try_from(start)?);
+            meta.push(PackedSliceMeta {
+                slot: s.slot,
+                offset: total_rows,
+                len: s.tokens.len(),
+                start,
+                images: &s.images,
+                need_first_token: s.need_first_token,
+                sampling: s.sampling,
+            });
+            total_rows += s.tokens.len();
+            for &t in s.tokens {
+                ids.push(i32::try_from(t)?);
+            }
+        }
+        ensure!(
+            total_rows <= chunk,
+            "packed prefill has {total_rows} rows, exceeding chunk {chunk}"
+        );
+        self.reserve_prefill(total_rows)?;
+        let p = self
+            .prefill
+            .as_mut()
+            .context("the prefill buffers are missing")?;
+        p.record_taps = taps.is_some();
+        if p.record_taps && (p.taps.is_none() || p.tap_layout != self.tap_layout) {
+            p.taps = None;
+            p.tap_layout = self.tap_layout.clone();
+            p.taps = Some(zeros(
+                &self.ctx.stream,
+                p.rows * p.tap_layout.len() * hidden,
+            )?);
+        }
+        let row_len = p.tap_layout.len() * hidden;
+        self.ctx
+            .stream
+            .memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, total_rows, 1))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&starts_u32, &mut p.packed_starts.slice_mut(..slices.len()))?;
+        let Self {
+            ctx,
+            passes,
+            visits,
+            slots,
+            max_blocks,
+            prefill,
+            sample_one,
+            sampler,
+            ..
+        } = self;
+        let p = prefill
+            .as_mut()
+            .context("the prefill buffers are missing")?;
+        let mut by_slice: Vec<Option<&mut [VisitState]>> =
+            (0..slices.len()).map(|_| None).collect();
+        if let Some(pos) = slices.iter().position(|s| s.slot == 0) {
+            by_slice[pos] = Some(visits.as_mut_slice());
+        }
+        for (idx, slot_state) in slots.iter_mut().enumerate() {
+            if let Some(pos) = slices.iter().position(|s| s.slot == idx + 1) {
+                by_slice[pos] = Some(slot_state.visits.as_mut_slice());
+            }
+        }
+        let mut slice_visits: Vec<&mut [VisitState]> = by_slice
+            .into_iter()
+            .map(|v| v.context("missing visit states for packed slot"))
+            .collect::<anyhow::Result<_>>()?;
+        ctx.prefill_packed_enqueue(
+            p,
+            &mut slice_visits,
+            *passes,
+            *max_blocks,
+            &meta,
+            total_rows,
+            sample_one,
+            *sampler,
+        )?;
+        for s in slices {
+            if s.slot == 0 {
+                self.position += s.tokens.len();
+            } else {
+                self.slots[s.slot - 1].position += s.tokens.len();
+            }
+        }
+        if let Some(taps) = taps.as_mut() {
+            let p = self
+                .prefill
+                .as_ref()
+                .context("the prefill buffers are missing")?;
+            let buffer = p.taps.as_ref().context("the taps buffer is missing")?;
+            for m_info in &meta {
+                let view =
+                    buffer.slice(m_info.offset * row_len..(m_info.offset + m_info.len) * row_len);
+                taps(m_info.slot, m_info.start, view)?;
+            }
+        }
+        let finishing: Vec<usize> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.need_first_token)
+            .map(|(i, _)| i)
+            .collect();
+        let mut out = vec![None; slices.len()];
+        if !finishing.is_empty() {
+            let p = self
+                .prefill
+                .as_ref()
+                .context("the prefill buffers are missing")?;
+            let raw = self
+                .ctx
+                .stream
+                .clone_dtoh(&p.packed_argmax.slice(..finishing.len()))?;
+            for (idx, tok) in finishing.into_iter().zip(raw) {
+                out[idx] = Some(u32::try_from(tok).context("argmax returned a negative index")?);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1826,7 +2047,7 @@ impl Ctx {
                 q: rows_mut(&mut t.q, m, q_dims),
                 r: rows_mut(&mut t.r, m, rel_dims),
                 log_scale: (!sliding).then_some((
-                    start,
+                    start.as_view(),
                     cfg.log_scaling_alpha,
                     cfg.log_scaling_n_floor as f32,
                 )),
@@ -2185,5 +2406,629 @@ impl Ctx {
             false,
             &mut t.quantized,
         )
+    }
+
+    /// Packed multi-prompt prefill forward pass: executes all row-independent ops once across
+    /// all `m` packed rows and per-slice attention and short convolutions against each slot's
+    /// own KV cache and conv states.
+    #[expect(clippy::too_many_arguments, reason = "packed prefill state and slices")]
+    #[expect(clippy::too_many_lines, reason = "mirrors prefill_enqueue top to bottom")]
+    fn prefill_packed_enqueue(
+        &self,
+        p: &mut PrefillScratch,
+        slice_visits: &mut [&mut [VisitState]],
+        passes: usize,
+        max_blocks: usize,
+        meta: &[PackedSliceMeta<'_>],
+        m: usize,
+        sample_one: &mut SampleBuffers,
+        sampler: bool,
+    ) -> anyhow::Result<()> {
+        let cfg = &self.config;
+        let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
+        let hidden = self.hidden();
+        let mh = m * hidden;
+        self.kernels.elementwise.embedding(
+            &self.stream,
+            &rows(&p.tokens, m, 1),
+            self.weights.embed.slice(),
+            &mut rows_mut(&mut p.embedded, m, hidden),
+        )?;
+        self.kernels.norm.rms_norm(
+            &self.stream,
+            &rows(&p.embedded, m, hidden),
+            &self.weights.embed_norm,
+            &mut rows_mut(&mut p.hidden, m, hidden),
+            self.eps(),
+        )?;
+        for s in meta {
+            for image in s.images {
+                let first = image.position.max(s.start);
+                let end = (image.position + image.len(hidden)).min(s.start + s.len);
+                if first < end {
+                    let from = (first - image.position) * hidden;
+                    let to = (s.offset + first - s.start) * hidden;
+                    let len = (end - first) * hidden;
+                    self.stream.memcpy_dtod(
+                        &image.rows.slice(from..from + len),
+                        &mut p.hidden.slice_mut(to..to + len),
+                    )?;
+                }
+            }
+        }
+        let mut blocks = Blocks {
+            len: 0,
+            max: max_blocks,
+        };
+        let mut visit_index = 0usize;
+        for layer in 0..core_start {
+            self.visit_packed_rows(p, slice_visits, visit_index, layer, &mut blocks, false, meta, m)?;
+            visit_index += 1;
+        }
+        self.stream.memcpy_dtod(
+            &rows(&p.hidden, m, hidden),
+            &mut rows_mut(&mut p.prelude_hidden, m, hidden),
+        )?;
+        let prelude_blocks = blocks.len;
+        for pass in 0..passes {
+            if pass > 0 {
+                self.kernels.norm.unweighted_rms_norm_bf16(
+                    &self.stream,
+                    &rows(&p.hidden, m, hidden),
+                    &mut rows_mut(&mut p.bank_normed, m, hidden),
+                    self.eps(),
+                )?;
+                p.bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
+                ensure!(p.bank_rows > 0, "the message bank needs a block state");
+                ensure!(
+                    p.bank_rows < FUSED_MAX_CANDIDATES,
+                    "{} bank states; at most {} fit",
+                    p.bank_rows,
+                    FUSED_MAX_CANDIDATES - 1
+                );
+                self.stream.memcpy_dtod(
+                    &p.blocks.slice((prelude_blocks + 1) * mh..blocks.len * mh),
+                    &mut p.bank.slice_mut(..p.bank_rows * mh),
+                )?;
+                self.stream.memcpy_dtod(
+                    &rows(&p.prelude_hidden, m, hidden),
+                    &mut rows_mut(&mut p.hidden, m, hidden),
+                )?;
+                blocks.len = prelude_blocks;
+            }
+            for (i, layer) in (core_start..core_end).enumerate() {
+                if pass > 0 {
+                    let bank_rows = p.bank_rows;
+                    let dests = p.gate.inputs.each_mut().map(|x| {
+                        Some(NormDest {
+                            out: strided_mut(x, m, 2 * hidden, hidden, hidden),
+                            weight: None,
+                        })
+                    });
+                    self.kernels.routing.depth_attention_rows(
+                        &self.stream,
+                        DepthRows {
+                            blocks: p.bank.slice(..bank_rows * mh),
+                            partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
+                            normed_partial: None,
+                            queries: &self.weights.message_queries[i],
+                            out: None,
+                            probs: Some(rows_mut(
+                                &mut p.message_probs,
+                                m,
+                                MESSAGE_SLOTS * (bank_rows + 1),
+                            )),
+                            dests,
+                            dst_stride: 2 * hidden,
+                            rows: m,
+                        },
+                        self.eps(),
+                    )?;
+                }
+                self.visit_packed_rows(
+                    p,
+                    slice_visits,
+                    visit_index,
+                    layer,
+                    &mut blocks,
+                    pass > 0,
+                    meta,
+                    m,
+                )?;
+                visit_index += 1;
+            }
+        }
+        for layer in core_end..cfg.num_hidden_layers {
+            self.visit_packed_rows(p, slice_visits, visit_index, layer, &mut blocks, false, meta, m)?;
+            visit_index += 1;
+        }
+        let finishing: Vec<usize> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.need_first_token)
+            .map(|(i, _)| i)
+            .collect();
+        if finishing.is_empty() && !p.record_taps {
+            return Ok(());
+        }
+        self.kernels.routing.depth_attention_rows(
+            &self.stream,
+            DepthRows {
+                blocks: blocks.rows(&p.blocks, mh)?,
+                partial: RowsPartial::Bf16(rows(&p.hidden, m, hidden)),
+                normed_partial: None,
+                queries: &self.weights.final_query,
+                out: None,
+                probs: None,
+                dests: [
+                    Some(NormDest {
+                        out: rows_mut(&mut p.final_hidden, m, hidden),
+                        weight: Some(&self.weights.norm),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                dst_stride: hidden,
+                rows: m,
+            },
+            self.eps(),
+        )?;
+        if p.record_taps && p.tap_layout.final_hidden {
+            let count = p.tap_layout.len();
+            let taps = p.taps.as_mut().context("the taps buffer is missing")?;
+            self.kernels.spec.copy_tap(
+                &self.stream,
+                &rows(&p.final_hidden, m, hidden),
+                &mut rows_mut(taps, m, count * hidden),
+                count - 1,
+                count,
+            )?;
+        }
+        if finishing.is_empty() {
+            return Ok(());
+        }
+        // Gather each finishing slice's final hidden row into contiguous `p.out[..finishing.len()]`.
+        for (k, &si) in finishing.iter().enumerate() {
+            let last_row = meta[si].offset + meta[si].len - 1;
+            self.stream.memcpy_dtod(
+                &p.final_hidden.slice(last_row * hidden..(last_row + 1) * hidden),
+                &mut p.out.slice_mut(k * hidden..(k + 1) * hidden),
+            )?;
+        }
+        let fp8 = self.weights.lm_head_fp8.as_ref();
+        let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
+        let step = if fp8.is_some() {
+            HEAD_ROWS.min(linear_rows::MAX_ROWS)
+        } else {
+            HEAD_ROWS
+        };
+        for first in (0..finishing.len()).step_by(step) {
+            let n = step.min(finishing.len() - first);
+            self.gemm_rows(
+                &mut [RowProduct {
+                    weight: self.weights.lm_head.slice(),
+                    fp8,
+                    x: p.out.slice(first * hidden..(first + n) * hidden),
+                    out: rows_mut(&mut p.head_logits, n, padded),
+                }],
+                n,
+                fp8.is_some(),
+                None,
+            )?;
+            self.kernels.elementwise.logit_softcap(
+                &self.stream,
+                &rows(&p.head_logits, n, padded),
+                &mut rows_mut(&mut p.head_capped, n, vocab),
+                cfg.final_logit_softcapping,
+            )?;
+            let all_greedy = !sampler
+                || finishing[first..first + n]
+                    .iter()
+                    .all(|&si| meta[si].sampling.is_greedy());
+            if all_greedy {
+                self.kernels.misc.argmax_f32(
+                    &self.stream,
+                    &rows(&p.head_capped, n, vocab),
+                    &mut p.packed_argmax.slice_mut(first..first + n),
+                    vocab,
+                )?;
+            } else {
+                for (j, &si) in finishing[first..first + n].iter().enumerate() {
+                    let s = &meta[si];
+                    let row_logits = p.head_capped.slice(j * vocab..(j + 1) * vocab);
+                    let mut dst = p.packed_argmax.slice_mut((first + j)..=(first + j));
+                    if s.sampling.is_greedy() {
+                        self.kernels
+                            .misc
+                            .argmax_f32(&self.stream, &row_logits, &mut dst, vocab)?;
+                    } else {
+                        sample_one.upload(&self.stream, &[(s.sampling, s.start + s.len)])?;
+                        self.kernels.sample.run(
+                            &self.stream,
+                            &row_logits,
+                            vocab,
+                            sample_one,
+                            &mut dst,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One decoder-layer visit for a packed multi-prompt prefill pass.
+    #[expect(clippy::too_many_arguments, reason = "packed visit state")]
+    #[expect(clippy::too_many_lines, reason = "mirrors visit_rows with per-slice conv/attention")]
+    fn visit_packed_rows(
+        &self,
+        p: &mut PrefillScratch,
+        slice_visits: &mut [&mut [VisitState]],
+        index: usize,
+        layer: usize,
+        blocks: &mut Blocks,
+        messages: bool,
+        meta: &[PackedSliceMeta<'_>],
+        m: usize,
+    ) -> anyhow::Result<()> {
+        let cfg = &self.config;
+        let layer_w = &self.weights.layers[layer];
+        let attn_w = &layer_w.attention;
+        let sliding = cfg.is_sliding(layer);
+        let hidden = self.hidden();
+        let heads = cfg.num_attention_heads;
+        let q_dims = heads * cfg.head_dim;
+        let kv_dims = cfg.num_key_value_heads * cfg.head_dim;
+        let rel_dims = heads * cfg.d_rel;
+        let bias_w = heads * cfg.rel_extent;
+        let taps_w = cfg.num_key_value_heads * cfg.sconv_kernel_size;
+        let mh = m * hidden;
+
+        if p.record_taps
+            && let Some(tap) = p.tap_layout.visits.iter().position(|&v| v == index)
+        {
+            let count = p.tap_layout.len();
+            let taps = p.taps.as_mut().context("the taps buffer is missing")?;
+            self.kernels.spec.copy_tap(
+                &self.stream,
+                &rows(&p.hidden, m, hidden),
+                &mut rows_mut(taps, m, count * hidden),
+                tap,
+                count,
+            )?;
+        }
+        let block_start = layer.is_multiple_of(cfg.n_layers_per_attn_res_block);
+        ensure!(
+            !block_start || blocks.len < blocks.max,
+            "more block states than planned"
+        );
+        let gates = if messages {
+            layer_w.message_gates.as_ref()
+        } else {
+            None
+        };
+        let loops = cfg.loop_config;
+        let looped = (
+            layer.saturating_sub(loops.core_start),
+            loops.core_end - loops.core_start,
+        );
+
+        let (states, mut rest) = p.blocks.split_at_mut(blocks.len * mh);
+        let normed = block_start.then(|| rest.slice_mut(..mh));
+        let one_input = self.attention_inputs_rows(
+            layer_w,
+            AttentionInputsRows {
+                x: rows(&p.hidden, m, hidden),
+                states: states.slice(..),
+                normed,
+                inputs: &mut p.attention_inputs,
+                qkv_in: &mut p.qkv_in,
+                gate: &mut p.gate,
+                messages: gates.map(|g| {
+                    (
+                        g,
+                        Messages::new(
+                            &p.bank,
+                            p.bank_rows,
+                            &p.bank_normed,
+                            &p.message_probs,
+                            p.message_x.as_ref(),
+                            m,
+                            hidden,
+                            looped,
+                        ),
+                    )
+                }),
+            },
+            sliding,
+            m,
+        )?;
+        if block_start {
+            blocks.len += 1;
+        }
+        let [q_in, k_in, v_in] = &p.qkv_in;
+        let (k_in, v_in) = if one_input {
+            (q_in, q_in)
+        } else {
+            (k_in, v_in)
+        };
+        let [q_in, k_in, v_in] = [q_in, k_in, v_in].map(|x| rows(x, m, hidden));
+
+        // 1. Attention input projections once across all `m` packed rows.
+        let attn = &mut p.attention;
+        let fp8 = |i: usize| layer_w.fp8.as_ref().map(|f| &f.inputs[i]);
+        let mut products = vec![
+            RowProduct {
+                weight: &attn_w.q,
+                fp8: fp8(0),
+                x: q_in.slice(..),
+                out: rows_mut(&mut attn.q_raw, m, q_dims),
+            },
+            RowProduct {
+                weight: &attn_w.r,
+                fp8: fp8(1),
+                x: q_in.slice(..),
+                out: rows_mut(&mut attn.r_raw, m, rel_dims),
+            },
+            RowProduct {
+                weight: &attn_w.gate,
+                fp8: fp8(2),
+                x: q_in.slice(..),
+                out: rows_mut(&mut attn.gate, m, q_dims),
+            },
+            RowProduct {
+                weight: &attn_w.sink,
+                fp8: fp8(3),
+                x: q_in.slice(..),
+                out: rows_mut(&mut attn.sinks, m, heads),
+            },
+            RowProduct {
+                weight: &attn_w.k,
+                fp8: fp8(4),
+                x: k_in.slice(..),
+                out: rows_mut(&mut attn.k_raw, m, kv_dims),
+            },
+            RowProduct {
+                weight: &attn_w.v,
+                fp8: fp8(5),
+                x: v_in.slice(..),
+                out: rows_mut(&mut attn.v_raw, m, kv_dims),
+            },
+        ];
+        if let KvConv::Dynamic { k_proj, v_proj, .. } = &attn_w.kv_conv {
+            products.push(RowProduct {
+                weight: k_proj,
+                fp8: fp8(6),
+                x: k_in.slice(..),
+                out: rows_mut(&mut attn.k_dynamic, m, taps_w),
+            });
+            products.push(RowProduct {
+                weight: v_proj,
+                fp8: fp8(7),
+                x: v_in.slice(..),
+                out: rows_mut(&mut attn.v_dynamic, m, taps_w),
+            });
+        }
+        self.gemm_rows(&mut products, m, false, Some(&mut p.gate.dense))?;
+        drop(products);
+
+        // 2. Per-slice attention_post_rows + K/V conv state shift.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            let conv = match &attn_w.kv_conv {
+                KvConv::Static { k, v } => KvConvWeights::Static { k, v },
+                KvConv::Dynamic {
+                    k_static, v_static, ..
+                } => KvConvWeights::Dynamic {
+                    k_dynamic: attn.k_dynamic.slice(off * taps_w..(off + len) * taps_w),
+                    v_dynamic: attn.v_dynamic.slice(off * taps_w..(off + len) * taps_w),
+                    k_static,
+                    v_static,
+                },
+            };
+            self.kernels.norm.attention_post_rows(
+                &self.stream,
+                AttentionPostRows {
+                    k_raw: attn.k_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                    v_raw: attn.v_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                    conv,
+                    k_state: &state.conv[0],
+                    v_state: &state.conv[1],
+                    q_raw: attn.q_raw.slice(off * q_dims..(off + len) * q_dims),
+                    q_scale: &attn_w.q_clip_scale,
+                    r_raw: attn.r_raw.slice(off * rel_dims..(off + len) * rel_dims),
+                    r_scale: &attn_w.rel_clip_scale,
+                    k: attn.k.slice_mut(off * kv_dims..(off + len) * kv_dims),
+                    v: attn.v.slice_mut(off * kv_dims..(off + len) * kv_dims),
+                    q: attn.q.slice_mut(off * q_dims..(off + len) * q_dims),
+                    r: attn.r.slice_mut(off * rel_dims..(off + len) * rel_dims),
+                    log_scale: (!sliding).then_some((
+                        p.packed_starts.slice(si..=si),
+                        cfg.log_scaling_alpha,
+                        cfg.log_scaling_n_floor as f32,
+                    )),
+                    qk_threshold: cfg.qk_l2_clip_threshold,
+                    rel_threshold: cfg.rel_l2_clip_threshold,
+                    eps: self.eps(),
+                    bias: None,
+                    batch: None,
+                },
+                len,
+            )?;
+            let [k_state, v_state, ..] = &mut state.conv;
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &attn.k_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                k_state,
+                kv_dims,
+                len,
+            )?;
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &attn.v_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                v_state,
+                kv_dims,
+                len,
+            )?;
+        }
+
+        // 3. Relative bias and optional KV rounding once across all `m` rows.
+        self.kernels.attention.relative_bias_rows(
+            &self.stream,
+            &rows(&attn.r, m, rel_dims),
+            &attn_w.rel_table,
+            &mut rows_mut(&mut attn.bias, m, bias_w),
+        )?;
+        if slice_visits[0][index].round {
+            self.kernels.attention.round_rows(
+                &self.stream,
+                &mut rows_mut(&mut attn.k, m, kv_dims),
+                &mut rows_mut(&mut attn.v, m, kv_dims),
+                m,
+                self.kv_rounding,
+            )?;
+        }
+
+        // 4. Per-slice flash prefill attention against each slot's KV cache.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            self.kernels.attention.prefill_attention(
+                &self.stream,
+                &attn.q.slice(off * q_dims..(off + len) * q_dims),
+                &attn.k.slice(off * kv_dims..(off + len) * kv_dims),
+                &attn.v.slice(off * kv_dims..(off + len) * kv_dims),
+                &mut state.kv,
+                &p.packed_starts.slice(si..=si),
+                len,
+                &attn.bias.slice(off * bias_w..(off + len) * bias_w),
+                &attn.sinks.slice(off * heads..(off + len) * heads),
+                &mut attn.partials,
+                &mut attn.out.slice_mut(off * q_dims..(off + len) * q_dims),
+                self.prefill_attention.products(slice.start + len),
+            )?;
+        }
+
+        // 5. Attention gate + output projection once across all `m` rows.
+        self.kernels.elementwise.attention_gate(
+            &self.stream,
+            &rows(&attn.out, m, q_dims),
+            &rows(&attn.gate, m, q_dims),
+            &mut rows_mut(&mut attn.gated, m, q_dims),
+        )?;
+        self.gemm_rows(
+            &mut [RowProduct {
+                weight: &attn_w.o,
+                fp8: layer_w.fp8.as_ref().and_then(|f| f.o.as_ref()),
+                x: rows(&attn.gated, m, q_dims),
+                out: rows_mut(&mut attn.proj, m, hidden),
+            }],
+            m,
+            false,
+            None,
+        )?;
+
+        // 6. Per-slice post-attention conv + residual add (shifts conv[2] per slice),
+        //    then one depth_attention_rows over all `m` rows.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            let hidden_slice =
+                (!block_start).then(|| p.hidden.slice(off * hidden..(off + len) * hidden));
+            self.kernels.conv.short_conv_residual_rows(
+                &self.stream,
+                &p.attention.proj.slice(off * hidden..(off + len) * hidden),
+                &layer_w.post_attention_conv,
+                &mut state.conv[2],
+                hidden_slice.as_ref().map(|v| v as &dyn DeviceIn<bf16>),
+                &mut p.residual.slice_mut(off * hidden..(off + len) * hidden),
+                len,
+            )?;
+        }
+        let (mlp_out, dests) = match gates {
+            Some(_) => (
+                Some(rows_mut(&mut p.mlp_input, m, hidden)),
+                [
+                    None,
+                    None,
+                    None,
+                    Some(NormDest {
+                        out: strided_mut(&mut p.gate.inputs[3], m, 2 * hidden, 0, hidden),
+                        weight: None,
+                    }),
+                ],
+            ),
+            None => (
+                None,
+                [
+                    Some(NormDest {
+                        out: rows_mut(&mut p.mlp_x, m, hidden),
+                        weight: Some(&layer_w.mlp_norm),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+            ),
+        };
+        self.kernels.routing.depth_attention_rows(
+            &self.stream,
+            DepthRows {
+                blocks: blocks.rows(&p.blocks, mh)?,
+                partial: RowsPartial::F32(rows(&p.residual, m, hidden)),
+                normed_partial: None,
+                queries: &layer_w.mlp_query,
+                out: mlp_out,
+                probs: None,
+                dests,
+                dst_stride: if gates.is_some() { 2 * hidden } else { hidden },
+                rows: m,
+            },
+            self.eps(),
+        )?;
+        if let Some(gates) = gates {
+            self.message_gate_rows(
+                &gates[3..],
+                &mut p.gate,
+                3,
+                (rows(&p.mlp_input, m, hidden), hidden, 0),
+                &Messages::new(
+                    &p.bank,
+                    p.bank_rows,
+                    &p.bank_normed,
+                    &p.message_probs,
+                    p.message_x.as_ref(),
+                    m,
+                    hidden,
+                    looped,
+                ),
+                vec![(&layer_w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))],
+                m,
+            )?;
+        }
+
+        // 7. MoE router + grouping + expert GEMMs once across all `m` rows.
+        self.moe_block_rows(layer_w, &mut p.moe, &p.mlp_x, m)?;
+
+        // 8. Per-slice post-MLP conv + residual add (shifts conv[3] per slice).
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            self.kernels.conv.moe_conv_residual_rows(
+                &self.stream,
+                &p.moe.down.slice(off * 8 * hidden..(off + len) * 8 * hidden),
+                &p.moe.weights.slice(off * 8..(off + len) * 8),
+                &layer_w.post_mlp_conv,
+                &mut state.conv[3],
+                &p.residual.slice(off * hidden..(off + len) * hidden),
+                &mut p.moe.combined.slice_mut(off * hidden..(off + len) * hidden),
+                &mut p.out.slice_mut(off * hidden..(off + len) * hidden),
+                len,
+            )?;
+        }
+        std::mem::swap(&mut p.hidden, &mut p.out);
+        Ok(())
     }
 }

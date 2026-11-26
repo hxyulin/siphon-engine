@@ -35,8 +35,8 @@ use siphon_cuda::{
     Gpu,
     draft::DraftOptions,
     model::{
-        Accept, BatchVerifyTokens, DEFAULT_PREFILL_CHUNK, Model, PrefillLogits, Sampling,
-        VerifyTokens,
+        Accept, BatchVerifyTokens, DEFAULT_PREFILL_CHUNK, Model, PackedPrefill, PrefillLogits,
+        Sampling, VerifyTokens,
     },
     ops::attention::KvFormat,
     spec::{DraftSource, Drafts, Prompt, Speculator, Width, greedy_by_verify, load_draft},
@@ -959,6 +959,126 @@ fn batch_dflash2_profile() -> anyhow::Result<()> {
             draft_ms[mid],
             tot_ms[mid],
             tot_ms[mid] / (b * w) as f64,
+        );
+    }
+    Ok(())
+}
+
+/// Parity check for `Model::prefill_packed`: packing 6 prompts of mixed lengths (spanning
+/// both sides of the sliding-window boundary and mixed greedy/sampled first tokens) into one
+/// 2048-row prefill pass must match separate `prefill_slot` calls on first tokens and
+/// subsequent batched decode trajectories.
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end packed prefill parity test")]
+fn packed_prefill_matches_separate_fp8() -> anyhow::Result<()> {
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    model.enable_sampling()?;
+    let capture = capture_tokens()?;
+    let specs: [(usize, usize, Sampling); 6] = [
+        (0, 64, Sampling::GREEDY),
+        (200, 256, Sampling::GREEDY),
+        (600, 310, Sampling::new(0.8, 0, 0.95, 0.0, 42)?),
+        (1000, 1050, Sampling::GREEDY),
+        (2200, 180, Sampling::new(0.7, 40, 0.9, 0.0, 99)?),
+        (3000, 188, Sampling::GREEDY),
+    ];
+    let n = specs.len();
+    model.add_slots(n - 1)?;
+
+    // Reference: prefill each slot separately, then check first token + 1-step batched logits.
+    let vocab = model.config().unpadded_vocab_size;
+    let mut want_first = Vec::with_capacity(n);
+    let mut want_logits = Vec::with_capacity(n);
+    for (slot, &(first, len, sampling)) in specs.iter().enumerate() {
+        model.reset_slot(slot)?;
+        model.set_sampling(sampling);
+        let tok = model.prefill_slot(slot, &capture[first..first + len], DEFAULT_PREFILL_CHUNK)?;
+        let _ = model.step_batch_sampled(&[(slot, tok)], &[sampling])?;
+        want_first.push(tok);
+        want_logits.push(model.batch_logits(1)?);
+    }
+
+    // 1. Single-slice packed prefill (M=64) must match separate `prefill_slot` (M=64) bit-for-bit.
+    model.reset_slot(0)?;
+    let one = model.prefill_packed(
+        &[PackedPrefill {
+            slot: 0,
+            tokens: &capture[specs[0].0..specs[0].0 + specs[0].1],
+            images: Vec::new(),
+            need_first_token: true,
+            sampling: specs[0].2,
+        }],
+        DEFAULT_PREFILL_CHUNK,
+    )?;
+    let one_tok = one[0].context("missing first token for single packed slice")?;
+    let _ = model.step_batch_sampled(&[(0, one_tok)], &[specs[0].2])?;
+    let one_logits = model.batch_logits(1)?;
+    let one_max_diff = one_logits
+        .iter()
+        .zip(&want_logits[0])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "single-slice packed (len=64): first want={} got={} max_diff={one_max_diff:.6}",
+        want_first[0], one_tok
+    );
+    ensure!(
+        one_tok == want_first[0] && one_max_diff == 0.0,
+        "single-slice packed prefill differed from prefill_slot: max_diff={one_max_diff}"
+    );
+
+    // 2. Packed: reset all slots and prefill all 6 prompts (sum = 2048 rows) in ONE pass.
+    //    cuBLASLt picks M-dependent GEMM tiles between M=64..1050 and M=2048, so step-0 logits
+    //    have small BF16 rounding differences while all first tokens stay identical.
+    for slot in 0..n {
+        model.reset_slot(slot)?;
+    }
+    let slices: Vec<PackedPrefill<'_>> = specs
+        .iter()
+        .enumerate()
+        .map(|(slot, &(first, len, sampling))| PackedPrefill {
+            slot,
+            tokens: &capture[first..first + len],
+            images: Vec::new(),
+            need_first_token: true,
+            sampling,
+        })
+        .collect();
+    let firsts = model.prefill_packed(&slices, DEFAULT_PREFILL_CHUNK)?;
+    let toks: Vec<u32> = firsts
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| t.with_context(|| format!("missing first token for slice {i}")))
+        .collect::<anyhow::Result<_>>()?;
+    let samplings: Vec<Sampling> = specs.iter().map(|s| s.2).collect();
+    let rows: Vec<(usize, u32)> = toks.iter().copied().enumerate().collect();
+    let _ = model.step_batch_sampled(&rows, &samplings)?;
+    let got_logits = model.batch_logits(n)?;
+    for i in 0..n {
+        let got_row = &got_logits[i * vocab..(i + 1) * vocab];
+        let want_row = &want_logits[i];
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f64;
+        for (&g, &w) in got_row.iter().zip(want_row) {
+            let d = (g - w).abs();
+            max_diff = max_diff.max(d);
+            sum_diff += f64::from(d);
+        }
+        let mean_diff = sum_diff / vocab as f64;
+        println!(
+            "slice {i} (len={:4}): first want={} got={}  step0 logits max_diff={max_diff:.4} mean_diff={mean_diff:.5}",
+            specs[i].1, want_first[i], toks[i]
+        );
+        ensure!(
+            toks[i] == want_first[i],
+            "packed prefill slice {i} first token diverged: got {}, want {}",
+            toks[i],
+            want_first[i]
+        );
+        ensure!(
+            max_diff < 3.0 && mean_diff < 0.6,
+            "packed prefill slice {i} logits drifted too far: max_diff={max_diff:.4}, mean_diff={mean_diff:.5}"
         );
     }
     Ok(())

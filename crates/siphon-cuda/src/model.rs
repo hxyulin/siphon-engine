@@ -22,7 +22,7 @@ mod verify;
 pub use batch::{BATCH_ROWS, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, PendingBatchVerify};
 pub use prefill::{
     DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, FP8_ATTENTION_KEYS, ImageRows, ImageSource,
-    MAX_PREFILL_CHUNK, PrefillAttention, PrefillLogits,
+    MAX_PREFILL_CHUNK, PackedPrefill, PrefillAttention, PrefillLogits,
 };
 pub use prefix::{DeviceSpan, GlobalKv, LocalState};
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
@@ -2535,7 +2535,7 @@ impl Ctx {
         k: &CudaView<'_, bf16>,
         v: &CudaView<'_, bf16>,
         cache: &mut KvCache,
-        start: &CudaSlice<u32>,
+        start: &impl DeviceIn<u32>,
         m: usize,
         bias: &CudaView<'_, bf16>,
         sinks: &CudaView<'_, bf16>,

@@ -159,7 +159,7 @@ impl BatchVerifyState {
 #[derive(Debug)]
 pub(super) struct Slot {
     pub(super) visits: Vec<VisitState>,
-    position: usize,
+    pub(super) position: usize,
     /// The slot's [`Model::slot_sequence`], swapped with slot 0's while the slot stands in
     /// for it ([`Model::with_slot`]).
     sequence: u64,

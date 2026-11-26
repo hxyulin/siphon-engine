@@ -55,8 +55,8 @@ pub use prefix::PrefixHit;
 use crate::{
     draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
     model::{
-        Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, ImageSource, Model, PrefillLogits,
-        Sampling, SavedState, Verdict, VerifyTokens,
+        Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, ImageSource, Model, PackedPrefill,
+        PrefillLogits, Sampling, SavedState, Verdict, VerifyTokens,
     },
     ops::{draft::MAX_BATCH_SEQS, linear::Linear, spec::VERIFY_ROWS},
     weights::{
@@ -820,6 +820,56 @@ impl Speculator {
                 images,
             ),
             None => model.prefill_slot_with_taps(slot, tokens, chunk, &mut commit),
+        }
+    }
+
+    /// Prefills multiple independent prompt slices packed into a single pass of up to `chunk`
+    /// total rows, committing feature taps into each DFlash 2-ready slot's sliding rings.
+    pub fn prefill_packed_batch(
+        &mut self,
+        model: &mut Model,
+        slices: &[PackedPrefill<'_>],
+        commit_draft: &[bool],
+        reset_draft: &[bool],
+        chunk: usize,
+    ) -> anyhow::Result<Vec<Option<u32>>> {
+        ensure!(
+            commit_draft.len() == slices.len() && reset_draft.len() == slices.len(),
+            "mismatched packed prefill draft flags"
+        );
+        self.batch_drafted.clear();
+        let stream = Arc::clone(model.stream());
+        let any_draft = commit_draft.iter().any(|&c| c);
+        if any_draft {
+            let mut noted = Vec::new();
+            let per_slice = (NOTED_PROMPT.min(256) / slices.len().max(1)).max(32);
+            for ((s, &commit), &reset) in slices.iter().zip(commit_draft).zip(reset_draft) {
+                if !commit {
+                    continue;
+                }
+                if reset {
+                    self.draft.reset_slot(s.slot);
+                }
+                for &t in s.tokens.iter().rev().take(per_slice) {
+                    noted.push(i32::try_from(t)?);
+                }
+            }
+            if !noted.is_empty() {
+                self.draft
+                    .note_tokens(&stream, model.draft_shared(), &noted)?;
+            }
+            let Self { draft, linear, .. } = self;
+            let mut commit_fn = |slot: usize, start: usize, taps: CudaView<'_, bf16>| {
+                if let Some(pos) = slices.iter().position(|s| s.slot == slot)
+                    && commit_draft[pos]
+                {
+                    draft.commit_slot(&stream, linear, slot, &taps, start)?;
+                }
+                Ok(())
+            };
+            model.prefill_packed_with_taps(slices, chunk, Some(&mut commit_fn))
+        } else {
+            model.prefill_packed(slices, chunk)
         }
     }
 

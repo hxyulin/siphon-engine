@@ -97,7 +97,7 @@ pub struct AttentionPostRows<'a> {
     pub q: CudaViewMut<'a, bf16>,
     pub r: CudaViewMut<'a, bf16>,
     /// For full attention, the position of row 0 (one value), alpha and n_floor.
-    pub log_scale: Option<(&'a CudaSlice<u32>, f32, f32)>,
+    pub log_scale: Option<(CudaView<'a, u32>, f32, f32)>,
     pub qk_threshold: f32,
     pub rel_threshold: f32,
     pub eps: f32,
@@ -568,7 +568,7 @@ impl Norm {
             .ptr_mut(&mut v_out, stream)
             .ptr_mut(&mut q_out, stream)
             .ptr_mut(&mut r_out, stream)
-            .opt(start, stream)
+            .opt(start.as_ref(), stream)
             .i32(log_scale)
             .f32(alpha)
             .f32(n_floor)

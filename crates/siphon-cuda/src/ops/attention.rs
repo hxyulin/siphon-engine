@@ -1548,11 +1548,12 @@ impl Attention {
         &self,
         stream: &CudaStream,
         cache: &mut KvCache,
-        start: &CudaSlice<u32>,
+        start: &impl DeviceIn<u32>,
         rows: usize,
         k: &CudaView<'_, bf16>,
         v: &CudaView<'_, bf16>,
     ) -> anyhow::Result<()> {
+        let start = start.view();
         let slots = u32::try_from(cache.slots)?;
         // One thread per 8 values, or for NVFP4 per group of 16.
         let threads = if cache.format() == KvFormat::Nvfp4 {
@@ -1578,7 +1579,7 @@ impl Attention {
                 launch.arg(keys).arg(values)
             }
         };
-        launch.arg(start).arg(&slots);
+        launch.arg(&start).arg(&slots);
         // SAFETY: the arguments match `kv_append_rows_bf16(const bf16*, const bf16*, bf16*,
         // bf16*, const unsigned*, unsigned)`, or `kv_append_rows_fp8` and `kv_append_rows_fp4`
         // with `uint8_t*` caches.
@@ -1624,7 +1625,7 @@ impl Attention {
         k: &impl DeviceIn<bf16>,
         v: &impl DeviceIn<bf16>,
         cache: &mut KvCache,
-        start: &CudaSlice<u32>,
+        start: &impl DeviceIn<u32>,
         rows: usize,
         bias: &impl DeviceIn<bf16>,
         sinks: &impl DeviceIn<bf16>,
@@ -1633,6 +1634,7 @@ impl Attention {
         products: Products,
     ) -> anyhow::Result<()> {
         let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
+        let start = start.view();
         let mut out = out.view_mut();
         ensure!(
             (1..=scratch.max_rows).contains(&rows),
@@ -1653,12 +1655,12 @@ impl Attention {
         if rows == 1 && cache.format() != KvFormat::Nvfp4 {
             // Decode attention streams the cache faster than a block of 128 rows with 3
             // used ones, and computes the same thing.
-            self.append(stream, cache, start, &k, &v)?;
+            self.append(stream, cache, &start, &k, &v)?;
             return self.decode_attention(
                 stream,
                 &q,
                 cache,
-                start,
+                &start,
                 &bias,
                 &sinks,
                 &mut scratch.decode,
@@ -1675,7 +1677,7 @@ impl Attention {
             "sliding caches are BF16 or FP8"
         );
         if input_keys == 0 {
-            self.append_rows(stream, cache, start, rows, &k, &v)?;
+            self.append_rows(stream, cache, &start, rows, &k, &v)?;
         }
 
         let function = match (&*cache.data, products) {
@@ -1698,7 +1700,7 @@ impl Attention {
             .arg(&mut scratch.partials)
             .arg(&mut scratch.counters)
             .arg(&mut out)
-            .arg(start)
+            .arg(&start)
             .arg(&rows_u32)
             .arg(&slots)
             .arg(&window)
@@ -1726,7 +1728,7 @@ impl Attention {
         unsafe { launch.launch(config) }?;
 
         if input_keys == 1 {
-            self.append_rows(stream, cache, start, rows, &k, &v)?;
+            self.append_rows(stream, cache, &start, rows, &k, &v)?;
         }
         Ok(())
     }
