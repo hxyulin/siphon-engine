@@ -16,6 +16,9 @@
 //! text match MLX. It exits with status 1 if a check fails. `--weights fp8` makes the
 //! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
 //! the BF16 weights but for the LM head, whose BF16 copy then sits in host memory.
+//! `--dump FILE` writes one line per position: the position, the engine's and MLX's
+//! log-probability of the next token, and their top-1 tokens, to compare with other
+//! captures of the text.
 //! `--expert-activations quantized` runs prefill's expert products on quantized
 //! activations (see `ExpertActivations`); stepping stays BF16. `--prefill-attention`
 //! picks prefill's global attention products over an FP8 cache (`auto` by default: FP8
@@ -37,7 +40,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::{env, fs, path::PathBuf, time::Instant};
+    use std::{env, fmt::Write as _, fs, path::PathBuf, time::Instant};
 
     use anyhow::{Context as _, ensure};
     use safetensors::{Dtype, SafeTensors};
@@ -76,6 +79,7 @@ mod linux {
         passes: Option<usize>,
         kv: KvFormat,
         weights: WeightFormat,
+        dump: Option<PathBuf>,
         /// Chunk size for `Model::prefill`, or `None` to step token by token.
         prefill: Option<usize>,
         /// Rows per `Model::verify` pass, instead of stepping or prefill.
@@ -90,6 +94,7 @@ mod linux {
         let mut passes = None;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut dump = None;
         let mut prefill = None;
         let mut verify = None;
         let mut expert_activations = ExpertActivations::Bf16;
@@ -103,6 +108,8 @@ mod linux {
                 kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
             } else if arg == "--weights" {
                 weights = it.next().context("--weights needs bf16 or fp8")?.parse()?;
+            } else if arg == "--dump" {
+                dump = Some(PathBuf::from(it.next().context("--dump needs a file")?));
             } else if arg == "--expert-activations" {
                 expert_activations = it
                     .next()
@@ -138,7 +145,7 @@ mod linux {
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
-             [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH] \
+             [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH] [--dump FILE] \
              [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
              [--prefill-dense bf16|fp8]",
         )?;
@@ -152,6 +159,7 @@ mod linux {
             passes,
             kv,
             weights,
+            dump,
             prefill,
             verify,
             expert_activations,
@@ -397,6 +405,9 @@ mod linux {
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)
         let mut kls: Vec<(usize, f64, u32, u32)> = Vec::new();
+        // With --dump, per position: the engine's and MLX's log-probability of the next
+        // token and their top-1 tokens.
+        let mut dumped: Vec<(usize, f64, f64, u32, u32)> = Vec::new();
         let started = Instant::now();
         // Scores the engine's logits at position i, whose top-1 token is `next`.
         let mut score = |i: usize, logits: &[f32], next: u32| -> anyhow::Result<()> {
@@ -410,6 +421,9 @@ mod linux {
                 let mlx = f64::from(capture.target_logprobs[i]);
                 (logprob(logits, t), mlx)
             });
+            if let Some((engine, mlx)) = target {
+                dumped.push((i, engine, mlx, next, mlx_next));
+            }
             for range in ranges
                 .iter_mut()
                 .filter(|r| (r.start..r.end).contains(&i))
@@ -458,6 +472,13 @@ mod linux {
             }
         }
         let forced_seconds = started.elapsed().as_secs_f64();
+        if let Some(path) = &args.dump {
+            let mut text = String::new();
+            for (i, engine, mlx, top, mlx_top) in &dumped {
+                writeln!(text, "{i} {engine} {mlx} {top} {mlx_top}")?;
+            }
+            fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        }
 
         // Greedy continuation from the engine's own predictions.
         let mut continuation = vec![next];
