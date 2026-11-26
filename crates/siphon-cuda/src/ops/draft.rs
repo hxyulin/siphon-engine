@@ -7,7 +7,8 @@ use std::{mem::ManuallyDrop, sync::Arc};
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
-    DevicePtrMut as _, LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
+    DevicePtrMut as _, LaunchConfig, PushKernelArg as _,
+    sys::{CUdevice_attribute, CUfunction_attribute},
 };
 use half::bf16;
 
@@ -120,9 +121,16 @@ pub struct DraftKernels {
     block_rope_store_batch: CudaFunction,
     attention_g4_batch: CudaFunction,
     attention_g4_batch_fp8: CudaFunction,
+    attention_g4_batch_nosplit: CudaFunction,
+    attention_g4_batch_nosplit_fp8: CudaFunction,
     attention_combine_batch: CudaFunction,
     gather_mask_rows: CudaFunction,
     select_batch: CudaFunction,
+    /// Streaming multiprocessors of the device.
+    sms: usize,
+    /// Concurrent resident CTAs of `draft_attention_g4_batch[_fp8]` across the device
+    /// (`sms * max_active_blocks_per_sm`).
+    attention_batch_slots: usize,
 }
 
 /// A matrix `[rows, k]` of E4M3 values with one F32 scale per row, `amax / 448`, as
@@ -283,27 +291,141 @@ impl AttentionScratch {
     }
 }
 
-/// Split partials of batched DFlash 2 attention for up to `max_seqs` sequences.
+/// Split-K policy for [`DraftKernels::attention_g4_batch`] and
+/// [`DraftKernels::attention_g4_batch_with_mode`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DraftBatchSplitMode {
+    /// Occupancy-aware adaptive split-K: `(active_slots / (KV_HEADS * seqs)).clamp(1, key_bound)`
+    /// where `active_slots = sms * max_active_blocks_per_sm` (1 CTA/SM at 54 KiB SMEM on
+    /// `sm_89`/`sm_120a`, scaling automatically on architectures with larger shared memory).
+    /// Dispatches to the fused single-split no-combine kernel when the chosen split count is `1`.
+    #[default]
+    Adaptive,
+    /// Fixed full split-K (`max_keys.div_ceil(128).clamp(1, DFLASH2_MAX_SPLITS)`), matching
+    /// the pre-adaptive reference path (`17` splits for `DFLASH2_SLOTS = 2056`).
+    Reference,
+    /// Forces a specific split cap in `1..=DFLASH2_MAX_SPLITS` (also bounded by `max_keys`),
+    /// dispatching to the fused single-split no-combine kernel when the result is `1`.
+    Fixed(usize),
+}
+
+/// Split count for batched DFlash 2 attention given `active_slots` concurrent resident CTAs
+/// (`sms * max_active_blocks_per_sm`), `seqs` sequences, and at most `max_keys` keys.
+///
+/// Returns `1` when the fused single-split no-combine kernel (`draft_attention_g4_batch_nosplit*`)
+/// should run, or `2..=max_splits` for adaptive split-K + combine.
+///
+/// Deterministic in `(active_slots, seqs, max_keys, max_splits, mode)` — never inspects
+/// runtime per-sequence positions — so CUDA graph capture keyed by `(seqs, ...)` stays exact.
+#[must_use]
+pub fn batch_attention_splits(
+    active_slots: usize,
+    seqs: usize,
+    max_keys: usize,
+    max_splits: usize,
+    mode: DraftBatchSplitMode,
+) -> usize {
+    let key_bound = max_keys
+        .div_ceil(MIN_KEYS_PER_SPLIT)
+        .clamp(1, max_splits.max(1));
+    match mode {
+        DraftBatchSplitMode::Adaptive => {
+            let kv_blocks = seqs.saturating_mul(KV_HEADS).max(1);
+            (active_slots / kv_blocks).clamp(1, key_bound)
+        }
+        DraftBatchSplitMode::Reference => key_bound,
+        DraftBatchSplitMode::Fixed(n) => n.clamp(1, key_bound),
+    }
+}
+
+/// Peak `(seq, split)` partial slices needed across all batch sizes `1..=max_seqs` under
+/// [`DraftBatchSplitMode::Adaptive`].
+///
+/// Launches with `splits == 1` use the fused single-split kernel and do not touch partial
+/// buffers, so only batch sizes with `splits >= 2` contribute.
+#[must_use]
+pub fn adaptive_batch_scratch_slots(
+    active_slots: usize,
+    max_seqs: usize,
+    max_keys: usize,
+    max_splits: usize,
+) -> usize {
+    let mut peak = 0usize;
+    for seqs in 1..=max_seqs {
+        let splits = batch_attention_splits(
+            active_slots,
+            seqs,
+            max_keys,
+            max_splits,
+            DraftBatchSplitMode::Adaptive,
+        );
+        if splits > 1 {
+            peak = peak.max(seqs * splits);
+        }
+    }
+    peak
+}
+
+/// Split partials of batched DFlash 2 attention.
+///
+/// Holds `max_seq_splits` `(seq, split)` slices, each covering `KV_HEADS * BLOCK * MAX_GROUP`
+/// query rows. With [`Self::for_adaptive`], only batch sizes with `splits >= 2` touch this
+/// buffer (e.g. 21 slices = 2.67 MiB on a 170-SM RTX 5090 vs `32 * 17 = 544` slices = 69.06
+/// MiB for fixed full split-K).
 pub struct BatchAttentionScratch {
     out: CudaSlice<f32>,
     stats: CudaSlice<f32>,
-    max_seqs: usize,
-    max_splits: usize,
+    max_seq_splits: usize,
 }
 
 impl BatchAttentionScratch {
+    /// Allocates partial storage for `max_seqs * max_splits` `(seq, split)` slices.
     pub fn new(
         stream: &Arc<CudaStream>,
         max_seqs: usize,
         max_splits: usize,
     ) -> anyhow::Result<Self> {
-        let rows = max_seqs * max_splits * KV_HEADS * BLOCK * MAX_GROUP;
+        Self::with_seq_splits(stream, max_seqs.saturating_mul(max_splits))
+    }
+
+    /// Allocates the minimal partial storage required by [`DraftBatchSplitMode::Adaptive`]
+    /// across all batch sizes `1..=max_seqs` on a device with `active_slots` concurrent
+    /// attention CTAs.
+    pub fn for_adaptive(
+        stream: &Arc<CudaStream>,
+        active_slots: usize,
+        max_seqs: usize,
+        max_keys: usize,
+        max_splits: usize,
+    ) -> anyhow::Result<Self> {
+        let seq_splits =
+            adaptive_batch_scratch_slots(active_slots, max_seqs, max_keys, max_splits);
+        Self::with_seq_splits(stream, seq_splits)
+    }
+
+    /// Allocates partial storage for `max_seq_splits` `(seq, split)` slices.
+    pub fn with_seq_splits(
+        stream: &Arc<CudaStream>,
+        max_seq_splits: usize,
+    ) -> anyhow::Result<Self> {
+        let rows = max_seq_splits.max(1) * KV_HEADS * BLOCK * MAX_GROUP;
         Ok(Self {
             out: stream.alloc_zeros(rows * HEAD_DIM)?,
             stats: stream.alloc_zeros(rows * 2)?,
-            max_seqs,
-            max_splits,
+            max_seq_splits,
         })
+    }
+
+    /// Number of `(seq, split)` partial slices this scratch can hold.
+    #[must_use]
+    pub fn max_seq_splits(&self) -> usize {
+        self.max_seq_splits
+    }
+
+    /// Device bytes occupied by the partial output and stats buffers.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        (self.out.len() + self.stats.len()) * size_of::<f32>()
     }
 }
 
@@ -610,6 +732,24 @@ pub fn attention_splits(keys: usize) -> (usize, usize) {
     (keys.div_ceil(per_split), per_split)
 }
 
+/// Concurrent resident CTAs of `draft_attention_g4_batch[_fp8]` across the device.
+fn query_attention_batch_slots(
+    ctx: &Arc<CudaContext>,
+    bf16_kernel: &CudaFunction,
+    fp8_kernel: &CudaFunction,
+) -> anyhow::Result<(usize, usize)> {
+    let sms = usize::try_from(
+        ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+    )?;
+    let smem = usize::try_from(attention_smem(MAX_GROUP))?;
+    let threads = (BLOCK * 32) as u32;
+    let per_sm_bf16 =
+        usize::try_from(bf16_kernel.occupancy_max_active_blocks_per_multiprocessor(threads, smem, None)?)?;
+    let per_sm_fp8 =
+        usize::try_from(fp8_kernel.occupancy_max_active_blocks_per_multiprocessor(threads, smem, None)?)?;
+    Ok((sms, sms * per_sm_bf16.min(per_sm_fp8).max(1)))
+}
+
 impl DraftKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "draft", cubin!("draft"))?;
@@ -620,6 +760,8 @@ impl DraftKernels {
         let attention_fp8 = f("draft_attention_fp8")?;
         let attention_g4_batch = f("draft_attention_g4_batch")?;
         let attention_g4_batch_fp8 = f("draft_attention_g4_batch_fp8")?;
+        let attention_g4_batch_nosplit = f("draft_attention_g4_batch_nosplit")?;
+        let attention_g4_batch_nosplit_fp8 = f("draft_attention_g4_batch_nosplit_fp8")?;
         for (func, group) in [
             (&attention, GROUP),
             (&attention_g4, MAX_GROUP),
@@ -627,6 +769,8 @@ impl DraftKernels {
             (&attention_fp8, GROUP),
             (&attention_g4_batch, MAX_GROUP),
             (&attention_g4_batch_fp8, MAX_GROUP),
+            (&attention_g4_batch_nosplit, MAX_GROUP),
+            (&attention_g4_batch_nosplit_fp8, MAX_GROUP),
         ] {
             func.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -634,6 +778,8 @@ impl DraftKernels {
             )
             .context("raising the shared memory of the block attention")?;
         }
+        let (sms, attention_batch_slots) =
+            query_attention_batch_slots(ctx, &attention_g4_batch, &attention_g4_batch_fp8)?;
         Ok(Self {
             mix_rms_norm: f("draft_mix_rms_norm")?,
             add_rms_norm: f("draft_add_rms_norm")?,
@@ -684,10 +830,26 @@ impl DraftKernels {
             block_rope_store_batch: f("draft_block_rope_store_batch")?,
             attention_g4_batch,
             attention_g4_batch_fp8,
+            attention_g4_batch_nosplit,
+            attention_g4_batch_nosplit_fp8,
             attention_combine_batch: f("draft_attention_combine_batch")?,
             gather_mask_rows: f("draft_gather_mask_rows")?,
             select_batch: f("draft_select_batch")?,
+            sms,
+            attention_batch_slots,
         })
+    }
+
+    /// Streaming multiprocessors of the device these kernels were loaded for.
+    #[must_use]
+    pub fn sms(&self) -> usize {
+        self.sms
+    }
+
+    /// Concurrent resident CTAs of `draft_attention_g4_batch[_fp8]` across the device.
+    #[must_use]
+    pub fn attention_batch_slots(&self) -> usize {
+        self.attention_batch_slots
     }
 
     /// `out[r] = rms_norm(Σ_j alpha[j] taps[r, j]; weight)` for taps BF16 `[rows, 4, 2304]`
@@ -2706,7 +2868,9 @@ impl DraftKernels {
         Ok(())
     }
 
-    /// Batched DFlash 2 block attention (`G = 4`) + combine across `seqs` sequences.
+    /// Batched DFlash 2 block attention (`G = 4`) across `seqs` sequences using occupancy-aware
+    /// adaptive split-K (fusing into `draft_attention_g4_batch_nosplit[_fp8]` with no partial
+    /// scratch or combine pass when `target_splits == 1`).
     #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
     pub fn attention_g4_batch(
         &self,
@@ -2725,19 +2889,86 @@ impl DraftKernels {
         scratch: &mut BatchAttentionScratch,
         out: &mut impl DeviceOut<bf16>,
     ) -> anyhow::Result<()> {
+        self.attention_g4_batch_with_mode(
+            stream,
+            q,
+            cache_table,
+            layer,
+            layers,
+            slots,
+            controls,
+            window,
+            row_window,
+            max_keys,
+            seqs,
+            fp8,
+            scratch,
+            out,
+            DraftBatchSplitMode::Adaptive,
+        )
+    }
+
+    /// [`Self::attention_g4_batch`] with an explicit [`DraftBatchSplitMode`].
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn attention_g4_batch_with_mode(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        cache_table: &impl DeviceIn<u64>,
+        layer: usize,
+        layers: usize,
+        slots: usize,
+        controls: &impl DeviceIn<i32>,
+        window: usize,
+        row_window: usize,
+        max_keys: usize,
+        seqs: usize,
+        fp8: bool,
+        scratch: &mut BatchAttentionScratch,
+        out: &mut impl DeviceOut<bf16>,
+        mode: DraftBatchSplitMode,
+    ) -> anyhow::Result<()> {
         let (q, cache_table, controls) = (q.view(), cache_table.view(), controls.view());
         let mut out = out.view_mut();
         ensure!(
-            seqs > 0 && seqs <= scratch.max_seqs && layer < layers && max_keys <= slots,
+            seqs > 0 && layer < layers && max_keys > 0 && max_keys <= slots,
             "invalid attention_g4_batch dims"
         );
         check_len("q", q.len(), seqs * BLOCK * MAX_GROUP * KV_WIDTH)?;
         check_len("out", out.len(), q.len())?;
         check_len("controls", controls.len(), seqs * CONTROL)?;
         check_len("cache_table", cache_table.len(), seqs * layers * 2)?;
-        let grid_splits = max_keys
-            .div_ceil(MIN_KEYS_PER_SPLIT)
-            .clamp(1, scratch.max_splits);
+
+        let grid_splits = batch_attention_splits(
+            self.attention_batch_slots,
+            seqs,
+            max_keys,
+            DFLASH2_MAX_SPLITS,
+            mode,
+        );
+        if grid_splits == 1 {
+            return self.launch_attention_g4_batch_nosplit(
+                stream,
+                &q,
+                &cache_table,
+                layer,
+                layers,
+                slots,
+                &controls,
+                window,
+                row_window,
+                seqs,
+                fp8,
+                &mut out,
+            );
+        }
+
+        ensure!(
+            seqs.saturating_mul(grid_splits) <= scratch.max_seq_splits,
+            "attention_g4_batch needs {} seq-splits ({seqs} x {grid_splits}), scratch holds {}",
+            seqs * grid_splits,
+            scratch.max_seq_splits
+        );
         let config = LaunchConfig {
             grid_dim: (
                 KV_HEADS as u32,
@@ -2756,7 +2987,7 @@ impl DraftKernels {
             .ptr(&controls, stream)
             .i32(i32_arg("window", window)?)
             .i32(i32_arg("row_window", row_window)?)
-            .i32(i32_arg("max_splits", scratch.max_splits)?)
+            .i32(i32_arg("max_splits", grid_splits)?)
             .ptr_mut(&mut scratch.out, stream)
             .ptr_mut(&mut scratch.stats, stream);
         let kernel = if fp8 {
@@ -2781,11 +3012,52 @@ impl DraftKernels {
             .ptr(&scratch.stats, stream)
             .ptr(&controls, stream)
             .i32(i32_arg("window", window)?)
-            .i32(i32_arg("max_splits", scratch.max_splits)?)
+            .i32(i32_arg("max_splits", grid_splits)?)
             .i32(i32_arg("group", MAX_GROUP)?)
             .ptr_mut(&mut out, stream);
         // SAFETY: matches `draft_attention_combine_batch`.
         unsafe { args.launch_pdl(stream, &self.attention_combine_batch, config) }?;
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    fn launch_attention_g4_batch_nosplit(
+        &self,
+        stream: &CudaStream,
+        q: &CudaView<'_, bf16>,
+        cache_table: &CudaView<'_, u64>,
+        layer: usize,
+        layers: usize,
+        slots: usize,
+        controls: &CudaView<'_, i32>,
+        window: usize,
+        row_window: usize,
+        seqs: usize,
+        fp8: bool,
+        out: &mut CudaViewMut<'_, bf16>,
+    ) -> anyhow::Result<()> {
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, 1, u32::try_from(seqs)?),
+            block_dim: ((BLOCK * 32) as u32, 1, 1),
+            shared_mem_bytes: attention_smem(MAX_GROUP),
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(q, stream)
+            .ptr(cache_table, stream)
+            .i32(i32_arg("layer", layer)?)
+            .i32(i32_arg("layers", layers)?)
+            .i32(i32_arg("slots", slots)?)
+            .ptr(controls, stream)
+            .i32(i32_arg("window", window)?)
+            .i32(i32_arg("row_window", row_window)?)
+            .ptr_mut(out, stream);
+        let kernel = if fp8 {
+            &self.attention_g4_batch_nosplit_fp8
+        } else {
+            &self.attention_g4_batch_nosplit
+        };
+        // SAFETY: matches `draft_attention_g4_batch_nosplit[_fp8]`.
+        unsafe { args.launch_pdl(stream, kernel, config) }?;
         Ok(())
     }
 

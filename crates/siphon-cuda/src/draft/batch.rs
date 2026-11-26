@@ -143,6 +143,10 @@ pub(super) struct BatchDflash2 {
 }
 
 impl BatchDflash2 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "sizes batched DFlash 2 scratch and adaptive attention buffers"
+    )]
     fn new(
         stream: &Arc<CudaStream>,
         layers: usize,
@@ -151,6 +155,7 @@ impl BatchDflash2 {
         base_ld: usize,
         fp8_kv: bool,
         max_seqs: usize,
+        attention_batch_slots: usize,
     ) -> anyhow::Result<Self> {
         let max_rows = max_seqs * BLOCK;
         let max_steps = max_seqs * STEPS;
@@ -193,7 +198,13 @@ impl BatchDflash2 {
             act: z(max_rows * mlp_width)?,
             mlp: z(max_rows * HIDDEN)?,
             y: z(max_rows * HIDDEN)?,
-            attention: BatchAttentionScratch::new(stream, max_seqs, DFLASH2_MAX_SPLITS)?,
+            attention: BatchAttentionScratch::for_adaptive(
+                stream,
+                attention_batch_slots,
+                max_seqs,
+                DFLASH2_SLOTS,
+                DFLASH2_MAX_SPLITS,
+            )?,
             y_steps: z(max_steps * HIDDEN)?,
             base: z(max_steps * base_ld)?,
             topk: TopkScratch::new_for_rows(stream, max_steps)?,
@@ -316,6 +327,7 @@ impl Draft {
                 base_ld,
                 fp8_kv,
                 max_seqs,
+                self.kernels.attention_batch_slots(),
             )?;
             if let Some(mut prev) = prev_extra {
                 b.extra_slots = std::mem::take(&mut prev.extra_slots);

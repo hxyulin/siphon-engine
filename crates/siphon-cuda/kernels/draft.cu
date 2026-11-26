@@ -343,9 +343,9 @@ static_assert(attention_smem(kGroup) == 50176, "attention_smem in src/ops/draft.
 static_assert(attention_smem(kMaxGroup) == 54272, "attention_smem in src/ops/draft.rs");
 
 // The keys of each split of a block attention over `keys` keys, as attention_splits in
-// src/ops/draft.rs: a multiple of 32, at least 128.
-__device__ __forceinline__ int keys_per_split(int keys) {
-    const int per = max((keys + kMaxSplits - 1) / kMaxSplits, kMinKeysPerSplit);
+// src/ops/draft.rs: a multiple of 32, at least 128, capped to at most `max_splits` splits.
+__device__ __forceinline__ int keys_per_split(int keys, int max_splits = kMaxSplits) {
+    const int per = max((keys + max_splits - 1) / max_splits, kMinKeysPerSplit);
     return (per + 31) / 32 * 32;
 }
 
@@ -417,12 +417,17 @@ __device__ __forceinline__ void cp_async_wait() {
 // bytes of the next chunk's keys and values into registers before the current chunk's
 // arithmetic and widens them exactly to BF16 into shared memory after it, so the
 // arithmetic is the BF16 cache's over the widened values.
-template <int G, bool FP8, bool kPdl = true>
+// With kSingleSplit, one block covers all keys 0..keys, normalizes value / sum directly in
+// registers, and writes BF16 `direct_out` [8, G * 8 * 128], skipping partial buffers and
+// combine. With kPdl false, the caller already ran pdl_wait() and pdl_trigger().
+template <int G, bool FP8, bool kSingleSplit = false, bool kPdl = true>
 __device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const void* cache_k,
                                                 const void* cache_v, int32_t slots,
                                                 const int32_t* control, int32_t window,
                                                 int32_t row_window, int32_t first, int32_t keys,
-                                                float* partial_out, float* partial_stats) {
+                                                float* partial_out, float* partial_stats,
+                                                int32_t max_splits = kMaxSplits,
+                                                __nv_bfloat16* direct_out = nullptr) {
     constexpr int kQueryRows = kBlock * G;
     // Dynamic shared memory, attention_smem(G) bytes: the queries, two chunks of keys and
     // values, and each warp's exponentials (one per query row).
@@ -441,12 +446,19 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const vo
         pdl_trigger();
     }
     attention_range(control, window, first, keys);
-    const int per_split = keys_per_split(keys);
-    const int splits = (keys + per_split - 1) / per_split;
     const int kv = blockIdx.x;
-    const int split = blockIdx.y;
-    if (split >= splits) {
-        return;
+    int split = 0;
+    int begin = 0;
+    int end = keys;
+    if constexpr (!kSingleSplit) {
+        const int per_split = keys_per_split(keys, max_splits);
+        const int splits = (keys + per_split - 1) / per_split;
+        split = blockIdx.y;
+        if (split >= splits) {
+            return;
+        }
+        begin = split * per_split;
+        end = min(keys, begin + per_split);
     }
     const int t = threadIdx.x;
     const int warp = t / 32, lane = t % 32;
@@ -456,9 +468,6 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const vo
     if (control != nullptr && row_window > 0) {
         row_first = control[0] + control[1] + warp - (row_window - 1);
     }
-
-    const int begin = split * per_split;
-    const int end = min(keys, begin + per_split);
     // BF16: each thread copies 16-byte pieces, key t / 16 (and 16 more), piece t % 16.
     auto load_chunk = [&](int c0, int buf) {
         const int n = min(kKeyChunk, end - c0);
@@ -639,15 +648,34 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const vo
         __syncthreads();
     }
 
-    const size_t base = (size_t(split) * kKvHeads + kv) * kQueryRows;
+    if constexpr (kSingleSplit) {
 #pragma unroll
-    for (int i = 0; i < G; ++i) {
-        const size_t r = base + warp * G + i;
-        *reinterpret_cast<float4*>(&partial_out[r * kHeadDim + 4 * lane]) =
-            make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
-        if (lane == 0) {
-            partial_stats[r * 2] = row_max[i];
-            partial_stats[r * 2 + 1] = row_sum[i];
+        for (int i = 0; i < G; ++i) {
+            const int head = kv * G + i;
+            const uint16_t b0 =
+                __bfloat16_as_ushort(__float2bfloat16_rn(acc[i][0] / row_sum[i]));
+            const uint16_t b1 =
+                __bfloat16_as_ushort(__float2bfloat16_rn(acc[i][1] / row_sum[i]));
+            const uint16_t b2 =
+                __bfloat16_as_ushort(__float2bfloat16_rn(acc[i][2] / row_sum[i]));
+            const uint16_t b3 =
+                __bfloat16_as_ushort(__float2bfloat16_rn(acc[i][3] / row_sum[i]));
+            *reinterpret_cast<uint2*>(direct_out + size_t(warp) * G * kKvHeads * kHeadDim +
+                                      head * kHeadDim + 4 * lane) =
+                make_uint2(uint32_t(b0) | (uint32_t(b1) << 16),
+                           uint32_t(b2) | (uint32_t(b3) << 16));
+        }
+    } else {
+        const size_t base = (size_t(split) * kKvHeads + kv) * kQueryRows;
+#pragma unroll
+        for (int i = 0; i < G; ++i) {
+            const size_t r = base + warp * G + i;
+            *reinterpret_cast<float4*>(&partial_out[r * kHeadDim + 4 * lane]) =
+                make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+            if (lane == 0) {
+                partial_stats[r * 2] = row_max[i];
+                partial_stats[r * 2 + 1] = row_sum[i];
+            }
         }
     }
 }
@@ -2787,8 +2815,10 @@ draft_block_rope_store_batch(__nv_bfloat16* q, const __nv_bfloat16* k, const __n
     rope_store_head(k + src, v + src, ck, cv, dst, fp8 != 0, k_norm, inv_freq, position, eps, rope);
 }
 
-// Batched DFlash 2 block attention (G=4, BF16 rings). Grid: (8, max_splits, seqs), 256 threads.
-extern "C" __global__ void __launch_bounds__(kAttnThreads)
+// Batched DFlash 2 block attention (G=4, BF16 rings, split-K).
+// Grid: (8, max_splits, seqs), 256 threads. `max_splits` caps the split count per sequence
+// and gives the sequence stride in `partial_out` / `partial_stats`.
+extern "C" __global__ void __launch_bounds__(kAttnThreads, 2)
 draft_attention_g4_batch(const __nv_bfloat16* q, const unsigned long long* cache_table,
                          int32_t layer, int32_t layers, int32_t slots, const int32_t* controls,
                          int32_t window, int32_t row_window, int32_t max_splits,
@@ -2801,14 +2831,14 @@ draft_attention_g4_batch(const __nv_bfloat16* q, const unsigned long long* cache
     const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
     const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
     const size_t p_rows = size_t(seq) * max_splits * kKvHeads * kBlock * kMaxGroup;
-    attention_split<kMaxGroup, false, false>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3,
-                                             window, row_window, 0, 0,
-                                             partial_out + p_rows * kHeadDim,
-                                             partial_stats + p_rows * 2);
+    attention_split<kMaxGroup, false, false, false>(
+        q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window, row_window, 0, 0,
+        partial_out + p_rows * kHeadDim, partial_stats + p_rows * 2, max_splits, nullptr);
 }
 
-// Batched DFlash 2 block attention (G=4, E4M3 FP8 rings). Grid: (8, max_splits, seqs), 256 threads.
-extern "C" __global__ void __launch_bounds__(kAttnThreads)
+// Batched DFlash 2 block attention (G=4, E4M3 FP8 rings, split-K).
+// Grid: (8, max_splits, seqs), 256 threads.
+extern "C" __global__ void __launch_bounds__(kAttnThreads, 2)
 draft_attention_g4_batch_fp8(const __nv_bfloat16* q, const unsigned long long* cache_table,
                              int32_t layer, int32_t layers, int32_t slots, const int32_t* controls,
                              int32_t window, int32_t row_window, int32_t max_splits,
@@ -2821,13 +2851,52 @@ draft_attention_g4_batch_fp8(const __nv_bfloat16* q, const unsigned long long* c
     const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
     const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
     const size_t p_rows = size_t(seq) * max_splits * kKvHeads * kBlock * kMaxGroup;
-    attention_split<kMaxGroup, true, false>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3,
-                                            window, row_window, 0, 0,
-                                            partial_out + p_rows * kHeadDim,
-                                            partial_stats + p_rows * 2);
+    attention_split<kMaxGroup, true, false, false>(
+        q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window, row_window, 0, 0,
+        partial_out + p_rows * kHeadDim, partial_stats + p_rows * 2, max_splits, nullptr);
+}
+
+// Batched DFlash 2 block attention (G=4, BF16 rings, fused single-split no-combine).
+// Grid: (8, 1, seqs), 256 threads. Normalizes value / sum directly in registers and writes
+// BF16 `out`, skipping partial scratch and `draft_attention_combine_batch`.
+extern "C" __global__ void __launch_bounds__(kAttnThreads, 2)
+draft_attention_g4_batch_nosplit(const __nv_bfloat16* q, const unsigned long long* cache_table,
+                                 int32_t layer, int32_t layers, int32_t slots,
+                                 const int32_t* controls, int32_t window, int32_t row_window,
+                                 __nv_bfloat16* out) {
+    pdl_wait();
+    pdl_trigger();
+    const int seq = blockIdx.z;
+    const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
+    const void* ck = reinterpret_cast<const void*>(cache_table[entry]);
+    const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
+    const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
+    attention_split<kMaxGroup, false, true, false>(
+        q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window, row_window, 0, 0,
+        nullptr, nullptr, 1, out + q_off);
+}
+
+// Batched DFlash 2 block attention (G=4, E4M3 FP8 rings, fused single-split no-combine).
+// Grid: (8, 1, seqs), 256 threads.
+extern "C" __global__ void __launch_bounds__(kAttnThreads, 2)
+draft_attention_g4_batch_nosplit_fp8(const __nv_bfloat16* q, const unsigned long long* cache_table,
+                                     int32_t layer, int32_t layers, int32_t slots,
+                                     const int32_t* controls, int32_t window, int32_t row_window,
+                                     __nv_bfloat16* out) {
+    pdl_wait();
+    pdl_trigger();
+    const int seq = blockIdx.z;
+    const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
+    const void* ck = reinterpret_cast<const void*>(cache_table[entry]);
+    const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
+    const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
+    attention_split<kMaxGroup, true, true, false>(
+        q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window, row_window, 0, 0,
+        nullptr, nullptr, 1, out + q_off);
 }
 
 // Batched draft_attention_combine for seqs blocks. Grid: (8, 8 * group, seqs), 128 threads.
+// `max_splits` matches the split cap passed to `draft_attention_g4_batch[_fp8]`.
 extern "C" __global__ void __launch_bounds__(kHeadDim)
 draft_attention_combine_batch(const float* partial_out, const float* partial_stats,
                               const int32_t* controls, int32_t window, int32_t max_splits,
@@ -2838,7 +2907,7 @@ draft_attention_combine_batch(const float* partial_out, const float* partial_sta
     const int32_t* ctrl = controls + size_t(seq) * 3;
     int32_t first = 0, keys = 0;
     attention_range(ctrl, window, first, keys);
-    const int per_split = keys_per_split(keys);
+    const int per_split = keys_per_split(keys, max_splits);
     const int splits = (keys + per_split - 1) / per_split;
     const int query_rows = kBlock * group;
     const int kv = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
