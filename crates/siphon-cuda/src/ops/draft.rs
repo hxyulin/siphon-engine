@@ -902,17 +902,16 @@ impl DraftKernels {
         }
         check_len("weight", weight.len(), HIDDEN)?;
         check_len("out", out.len(), residual.len())?;
-        let null = 0u64;
-        let mut launch = stream.launch_builder(&self.add_rms_norm);
-        match x {
-            Some(x) => launch.arg(x),
-            None => launch.arg(&null),
-        };
-        launch.arg(residual).arg(weight).arg(out).arg(&eps);
+        let mut args = KernelArgs::default();
+        args.opt(x, stream)
+            .ptr_mut(residual, stream)
+            .ptr(weight, stream)
+            .ptr_mut(out, stream)
+            .f32(eps);
         // SAFETY: the arguments match `draft_add_rms_norm(const bf16*, bf16*, const bf16*,
         // bf16*, float)`, with a null `x` passed as a zero pointer, which the kernel checks.
-        // The buffers hold `rows` rows.
-        unsafe { launch.launch(row_config(rows)?) }?;
+        // The buffers hold `rows` rows, and the kernel reads only `weight` before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.add_rms_norm, row_config(rows)?) }?;
         Ok(())
     }
 
@@ -935,19 +934,19 @@ impl DraftKernels {
         check_len("embed_norm", embed_norm.len(), HIDDEN)?;
         check_len("mask_embed", mask_embed.len(), HIDDEN)?;
         check_len("out", out.len(), BLOCK * HIDDEN)?;
-        let mut launch = stream.launch_builder(&self.block_input);
-        launch
-            .arg(&anchor)
-            .arg(embed)
-            .arg(&vocab)
-            .arg(embed_norm)
-            .arg(mask_embed)
-            .arg(out)
-            .arg(&eps);
+        let mut args = KernelArgs::default();
+        args.ptr(&anchor, stream)
+            .ptr(embed, stream)
+            .i32(vocab)
+            .ptr(embed_norm, stream)
+            .ptr(mask_embed, stream)
+            .ptr_mut(out, stream)
+            .f32(eps);
         // SAFETY: the arguments match `draft_block_input(const int*, const bf16*, int, const
         // bf16*, const bf16*, bf16*, float)`. The kernel bounds-checks the anchor against
-        // `vocab` and writes the 8 rows of `out`, one block each.
-        unsafe { launch.launch(row_config(BLOCK)?) }?;
+        // `vocab`, reads only `embed_norm` and `mask_embed` before `pdl_wait`, and writes
+        // the 8 rows of `out`, one block each.
+        unsafe { args.launch_pdl(stream, &self.block_input, row_config(BLOCK)?) }?;
         Ok(())
     }
 
@@ -1255,11 +1254,15 @@ impl DraftKernels {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.silu_mul);
-        launch.arg(gate).arg(up).arg(out).arg(&n);
+        let mut args = KernelArgs::default();
+        args.ptr(gate, stream)
+            .ptr(up, stream)
+            .ptr_mut(out, stream)
+            .u64(u64::try_from(n)?);
         // SAFETY: the arguments match `draft_silu_mul(const bf16*, const bf16*, bf16*,
-        // size_t)`, and all three buffers hold `n` elements.
-        unsafe { launch.launch(config) }?;
+        // size_t)`, all three buffers hold `n` elements, and the kernel calls `pdl_wait()`
+        // before reading anything.
+        unsafe { args.launch_pdl(stream, &self.silu_mul, config) }?;
         Ok(())
     }
 
@@ -1275,11 +1278,12 @@ impl DraftKernels {
         check_len("y", y.len(), BLOCK * HIDDEN)?;
         check_len("f", f.len(), HIDDEN)?;
         check_len("out", out.len(), (BLOCK - 1) * 2 * HIDDEN)?;
-        let mut launch = stream.launch_builder(&self.markov_context_input);
-        launch.arg(y).arg(f).arg(out);
+        let mut args = KernelArgs::default();
+        args.ptr(y, stream).ptr(f, stream).ptr_mut(out, stream);
         // SAFETY: the arguments match `draft_markov_context_input(const bf16*, const bf16*,
-        // float*)`, with one block per output row, inside the checked sizes.
-        unsafe { launch.launch(row_config(BLOCK - 1)?) }?;
+        // float*)`, with one block per output row inside the checked sizes, and the kernel
+        // calls `pdl_wait()` before reading anything.
+        unsafe { args.launch_pdl(stream, &self.markov_context_input, row_config(BLOCK - 1)?) }?;
         Ok(())
     }
 
@@ -2544,19 +2548,15 @@ impl DraftKernels {
         }
         check_len("weight", weight.len(), HIDDEN)?;
         check_len("out", out.len(), residual.len())?;
-        let null = 0u64;
-        let mut launch = stream.launch_builder(&self.add_rms_norm);
-        match x {
-            Some(x) => launch.arg(x),
-            None => launch.arg(&null),
-        };
-        launch
-            .arg(&mut residual)
-            .arg(weight)
-            .arg(&mut out)
-            .arg(&eps);
-        // SAFETY: matches `draft_add_rms_norm(const bf16*, bf16*, const bf16*, bf16*, float)`.
-        unsafe { launch.launch(row_config(rows)?) }?;
+        let mut args = KernelArgs::default();
+        args.opt(x, stream)
+            .ptr_mut(&mut residual, stream)
+            .ptr(weight, stream)
+            .ptr_mut(&mut out, stream)
+            .f32(eps);
+        // SAFETY: matches `draft_add_rms_norm(const bf16*, bf16*, const bf16*, bf16*, float)`,
+        // and the kernel reads only `weight` before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.add_rms_norm, row_config(rows)?) }?;
         Ok(())
     }
 
@@ -2578,10 +2578,14 @@ impl DraftKernels {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.silu_mul);
-        launch.arg(&gate).arg(&up).arg(&mut out).arg(&n);
-        // SAFETY: matches `draft_silu_mul(const bf16*, const bf16*, bf16*, size_t)`.
-        unsafe { launch.launch(config) }?;
+        let mut args = KernelArgs::default();
+        args.ptr(&gate, stream)
+            .ptr(&up, stream)
+            .ptr_mut(&mut out, stream)
+            .u64(u64::try_from(n)?);
+        // SAFETY: matches `draft_silu_mul(const bf16*, const bf16*, bf16*, size_t)`, and the
+        // kernel calls `pdl_wait()` before reading anything.
+        unsafe { args.launch_pdl(stream, &self.silu_mul, config) }?;
         Ok(())
     }
 

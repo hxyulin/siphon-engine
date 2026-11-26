@@ -70,9 +70,10 @@ __device__ __forceinline__ float inv_rms(float sum_squares, int n, float eps) {
     return 1.f / sqrtf(sum_squares / static_cast<float>(n) + eps);
 }
 
-// Writes bf16(v * inv_rms(v) * weight) for one 2304-wide row held as 9 values per thread.
-__device__ void store_normed_row(const float (&v)[kRowVec], const __nv_bfloat16* weight,
-                                 __nv_bfloat16* out, float eps) {
+// Writes bf16(v * inv_rms(v) * w) for one 2304-wide row held as 9 values per thread, with
+// preloaded weights `w`.
+__device__ void store_normed_row_w(const float (&v)[kRowVec], const float (&w)[kRowVec],
+                                   __nv_bfloat16* out, float eps) {
     float squares = 0.f;
 #pragma unroll
     for (int i = 0; i < kRowVec; ++i) {
@@ -82,8 +83,19 @@ __device__ void store_normed_row(const float (&v)[kRowVec], const __nv_bfloat16*
 #pragma unroll
     for (int i = 0; i < kRowVec; ++i) {
         const int c = threadIdx.x + i * kRowThreads;
-        out[c] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(v[i], inv), bf(weight[c])));
+        out[c] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(v[i], inv), w[i]));
     }
+}
+
+// Writes bf16(v * inv_rms(v) * weight) for one 2304-wide row held as 9 values per thread.
+__device__ void store_normed_row(const float (&v)[kRowVec], const __nv_bfloat16* weight,
+                                 __nv_bfloat16* out, float eps) {
+    float w[kRowVec];
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        w[i] = bf(weight[threadIdx.x + i * kRowThreads]);
+    }
+    store_normed_row_w(v, w, out, eps);
 }
 
 // Copies one 2304-wide BF16 row across `kRowThreads` threads, using 16-byte loads/stores
@@ -152,9 +164,16 @@ draft_mix_rms_norm(const __nv_bfloat16* taps, const float* alpha, const __nv_bfl
 // residual = bf16(sum), out = rms_norm(sum; weight). With x null, the residual is only
 // read and normalized.
 extern "C" __global__ void __launch_bounds__(kRowThreads)
-draft_add_rms_norm(const __nv_bfloat16* x, __nv_bfloat16* residual, const __nv_bfloat16* weight,
-                   __nv_bfloat16* out, float eps) {
-    pdl_wait();
+draft_add_rms_norm(const __nv_bfloat16* x, __nv_bfloat16* residual,
+                   const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* out, float eps) {
+    float w[kRowVec];
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        w[i] = bf(weight[threadIdx.x + i * kRowThreads]);
+    }
+    if (residual != nullptr) {
+        pdl_wait();
+    }
     pdl_trigger();
     const size_t base = size_t(blockIdx.x) * kHidden;
     float v[kRowVec];
@@ -167,23 +186,42 @@ draft_add_rms_norm(const __nv_bfloat16* x, __nv_bfloat16* residual, const __nv_b
             residual[c] = __float2bfloat16_rn(v[i]);
         }
     }
-    store_normed_row(v, weight, out + base, eps);
+    store_normed_row_w(v, w, out + base, eps);
 }
 
 // The block's input rows, BF16 [8, 2304]: row 0 is rms_norm(embed[anchor]; embed_norm),
 // the anchor's normalized target embedding, and rows 1 to 7 are mask_embed. One block
 // per row. An anchor outside [0, vocab) gives a zero embedding.
 extern "C" __global__ void __launch_bounds__(kRowThreads)
-draft_block_input(const int32_t* anchor, const __nv_bfloat16* embed, int32_t vocab,
-                  const __nv_bfloat16* embed_norm, const __nv_bfloat16* mask_embed,
-                  __nv_bfloat16* out, float eps) {
-    pdl_wait();
-    pdl_trigger();
+draft_block_input(const int32_t* anchor, const __nv_bfloat16* __restrict__ embed, int32_t vocab,
+                  const __nv_bfloat16* __restrict__ embed_norm,
+                  const __nv_bfloat16* __restrict__ mask_embed, __nv_bfloat16* out, float eps) {
     __nv_bfloat16* row = out + size_t(blockIdx.x) * kHidden;
     if (blockIdx.x > 0) {
-        copy_hidden_row(mask_embed, row);
+        __nv_bfloat16 m[kRowVec];
+#pragma unroll
+        for (int i = 0; i < kRowVec; ++i) {
+            m[i] = mask_embed[threadIdx.x + i * kRowThreads];
+        }
+        if (anchor != nullptr) {
+            pdl_wait();
+        }
+        pdl_trigger();
+#pragma unroll
+        for (int i = 0; i < kRowVec; ++i) {
+            row[threadIdx.x + i * kRowThreads] = m[i];
+        }
         return;
     }
+    float w[kRowVec];
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        w[i] = bf(embed_norm[threadIdx.x + i * kRowThreads]);
+    }
+    if (anchor != nullptr) {
+        pdl_wait();
+    }
+    pdl_trigger();
     const int32_t id = *anchor;
     const bool valid = id >= 0 && id < vocab;
     float v[kRowVec];
@@ -192,7 +230,7 @@ draft_block_input(const int32_t* anchor, const __nv_bfloat16* embed, int32_t voc
         const int c = threadIdx.x + i * kRowThreads;
         v[i] = valid ? bf(embed[size_t(id) * kHidden + c]) : 0.f;
     }
-    store_normed_row(v, embed_norm, row, eps);
+    store_normed_row_w(v, w, row, eps);
 }
 
 namespace {
@@ -800,6 +838,8 @@ extern "C" __global__ void draft_silu_mul(const __nv_bfloat16* gate, const __nv_
 // [y[i + 1]; f], the draft output of mask row i + 1 and the head's mixed taps, widened.
 extern "C" __global__ void draft_markov_context_input(const __nv_bfloat16* y,
                                                       const __nv_bfloat16* f, float* out) {
+    pdl_wait();
+    pdl_trigger();
     const int row = blockIdx.x;
     for (int c = threadIdx.x; c < 2 * kHidden; c += blockDim.x) {
         const float v = c < kHidden ? bf(y[size_t(row + 1) * kHidden + c]) : bf(f[c - kHidden]);

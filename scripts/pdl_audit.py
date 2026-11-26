@@ -68,6 +68,8 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     "attention_post_bf16": {"position"},
     # The embedding norm and the first layer's input norm.
     "decode_prologue_2304": {"embed_norm", "input_norm"},
+    # The draft's block input kernel preloads embed_norm / mask_embed and reads embed.
+    "draft_block_input": {"embed", "embed_norm", "mask_embed"},
     # The multi-row attention copies its first cache tiles before the wait: the host
     # uploads the start before the pass, and only the kernel's own combining blocks
     # append to the cache, after the wait.
