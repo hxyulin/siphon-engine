@@ -2377,7 +2377,11 @@ mod cuda {
     /// A request left alone with nothing waiting returns, in slot 0, to continue with
     /// speculation (`speculate_again`). Each request takes its slot from the prefix cache
     /// (`Speculator::claim_slot`), and prefills from where its entry ends.
-    #[expect(clippy::too_many_arguments, reason = "the scheduler's state")]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the scheduler's state and loop"
+    )]
     fn batched(
         model: &mut Model,
         speculator: &mut Speculator,
@@ -2414,8 +2418,27 @@ mod cuda {
                 }
                 continue;
             }
-            let chunked = prefill_chunk(model, speculator, tower, &mut active, &mut parked, stop);
-            retire(model, speculator, &mut active);
+            // Drain short prefills up to one full prefill-chunk token budget per turn so a
+            // burst of short prompts doesn't stall behind per-request decode rounds and graph
+            // size churn.
+            let prefill_budget = speculator.prefill_chunk();
+            let mut prefilled_tokens = 0usize;
+            loop {
+                let n = prefill_chunk(model, speculator, tower, &mut active, &mut parked, stop);
+                if n == 0 {
+                    break;
+                }
+                prefilled_tokens += n;
+                retire(model, speculator, &mut active);
+                if prefilled_tokens >= prefill_budget {
+                    break;
+                }
+                while let Ok(jobs) = queue.try_recv() {
+                    waiting.extend(jobs);
+                }
+                admit(model, speculator, &mut active, waiting, &mut parked, sched);
+            }
+            let chunked = prefilled_tokens > 0;
             let alone = waiting.is_empty() && parked.is_empty();
             let chunked =
                 chunked || (alone && rebuild_turn(model, speculator, tower, &mut active, rebuild));
@@ -2527,7 +2550,7 @@ mod cuda {
 
     /// Prefills one chunk of the oldest request of `active` still prefilling, in its slot,
     /// and keeps the prompt's state in the prefix cache when the chunk ends at the prompt's
-    /// last multiple of the chunk. Returns whether it ran one.
+    /// last multiple of the chunk. Returns the number of prompt tokens processed (0 if none).
     #[expect(clippy::too_many_lines, reason = "prefill chunk with taps, images, and prefix cache")]
     fn prefill_chunk(
         model: &mut Model,
@@ -2536,7 +2559,7 @@ mod cuda {
         active: &mut Vec<Request>,
         parked: &mut Vec<Request>,
         stop: &[u32],
-    ) -> bool {
+    ) -> usize {
         // The fewest prompt tokens left first, but a request past the age limit first of
         // all, in arrival order.
         let pick = |active: &[Request]| {
@@ -2553,7 +2576,7 @@ mod cuda {
                 .map(|(i, _)| i)
         };
         let Some(i) = pick(active) else {
-            return false;
+            return 0;
         };
         // Room for the chunk, swapping out others if need be; the chunk's request may go
         // too, and then another prefills.
@@ -2573,24 +2596,25 @@ mod cuda {
             |m, a| a.iter().find(|r| r.slot == slot).map_or(0, |r| want(m, r)),
         );
         let Some(i) = active.iter().position(|r| r.slot == slot) else {
-            return false;
+            return 0;
         };
         if !room {
             active[i].fail(&anyhow::anyhow!("the KV pool is full"));
-            return true;
+            return 1;
         }
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
         let r = &mut active[i];
         if r.job.events.is_closed() {
             r.done = true;
-            return false;
+            return 0;
         }
         if r.job.cancelled() {
             r.fail(&anyhow::anyhow!(CANCELLED));
-            return false;
+            return 0;
         }
         let len = r.job.prompt.len();
         let end = (r.prefilled + chunk).min(len);
+        let processed = end - r.prefilled;
         let boundary = len.saturating_sub(1) / chunk * chunk;
         model.set_sampling(r.sampling);
         let tokens = &r.job.prompt[r.prefilled..end];
@@ -2630,7 +2654,7 @@ mod cuda {
             Ok(first) => first,
             Err(e) => {
                 r.fail(&e);
-                return true;
+                return processed.max(1);
             }
         };
         r.prefilled = end;
@@ -2656,7 +2680,7 @@ mod cuda {
             r.done = r.take(&[first], stop).is_break();
             share_prefill(model, speculator, active, i, stop);
         }
-        true
+        processed.max(1)
     }
 
     /// Gives the prompt state that `active[from]` has just prefilled to its siblings, the
