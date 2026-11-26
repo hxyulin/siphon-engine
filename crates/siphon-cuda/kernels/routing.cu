@@ -35,6 +35,11 @@ __device__ float warp_sum(float v) {
     return v;
 }
 
+#if SIPHON_FAST_MATH
+__device__ __forceinline__ float apple_exp2(float x) { return exp2f(x); }
+__device__ __forceinline__ float apple_fast_exp(float x) { return __expf(x); }
+__device__ __forceinline__ float apple_precise_exp(float x) { return __expf(x); }
+#else
 // The Apple GPU exp2, as measured on 17.8 million inputs with normal results.
 // The hardware floors x to 23 fraction bits, x = n + j / 2^23, and returns
 // 2^n * T[j]; inputs in (-2^-23, 0) return 1. T[j] equals the correctly
@@ -73,6 +78,7 @@ __device__ float apple_precise_exp(float x) {
     const float e = apple_exp2(hi);
     return fmaf(e, __fmul_rn(lo, ln2), e);
 }
+#endif
 
 }  // namespace
 
@@ -321,13 +327,21 @@ __device__ float norm_sum_squares(const float (&a)[4], const float (&b)[4], floa
 // 1 / sqrt(mean + eps) with two correctly rounded float operations. The norm kernels
 // round a double rsqrt once instead; the two differ by at most one ulp.
 __device__ float inv_rms_f32(float sum_squares, float eps) {
+#if SIPHON_FAST_MATH
+    return rsqrtf(sum_squares / static_cast<float>(kHidden) + eps);
+#else
     return 1.f / sqrtf(sum_squares / static_cast<float>(kHidden) + eps);
+#endif
 }
 
 // MLX's fast-math exp, exp2(x * log2(e)) with the product rounded, through CUDA's
 // exp2f rather than apple_exp2's FP64 emulation of the Apple table.
 __device__ float fast_exp(float x) {
+#if SIPHON_FAST_MATH
+    return __expf(x);
+#else
     return exp2f(__fmul_rn(x, 1.4426950408889634f));
+#endif
 }
 
 __device__ void load4(const float* p, float (&v)[4]) {
@@ -955,7 +969,7 @@ constexpr int kStepSquares = (kStepPartial + 1) * kStepQueries;
 static_assert(kStepSquares < 32, "the first reduction fits a warp");
 static_assert(kStepThreads * 8 == kHidden, "two runs of 4 per thread cover the row");
 
-// How depth_attention_step_2304 gets its partial candidate.
+// How depth_attention_step_2304 and depth_attention_rows_2304 get their partial candidate.
 enum StepPartial : int {
     // An F32 row, already normalized.
     kPartialNormalized = 0,
@@ -966,7 +980,14 @@ enum StepPartial : int {
     // The post-attention conv and residual add of short_conv_residual_2304, then an
     // unweighted RMS norm.
     kPartialConvResidual = 3,
+    // Batched post-attention conv and residual add (conv_residual_batch_2304): each
+    // sequence of `rows_per_seq` rows reads its post-attention conv state from word 4
+    // of `conv_states`.
+    kPartialConvResidualBatch = 4,
 };
+
+// Words per sequence in a batched step's state table (see conv.cu).
+constexpr int kBatchStateWords = 6;
 
 constexpr float kShortConvDivisor = static_cast<float>(2.23606797749979);  // sqrt(K + 1)
 
@@ -1862,6 +1883,7 @@ __device__ __forceinline__ void
 depth_attention_rows(const float* blocks, int block_stride, const float* partial_f32,
                      const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,
                      const float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,
+                     const unsigned long long* conv_states, int rows_per_seq,
                      float* normed_partial, const float* __restrict__ queries, float* out, float* probs,
                      __nv_bfloat16* dst0, __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3,
                      int dst_stride,
@@ -1907,15 +1929,16 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
     pdl_trigger();
     // The conv taps of this thread's 8 channels, 4 per channel, and the conv state in L2:
     // both were last read a visit of this layer ago.
+    const bool conv_mode = mode == kPartialConvResidual || mode == kPartialConvResidualBatch;
     uint4 taps[4] = {};
-    if (mode == kPartialConvResidual) {
+    if (conv_mode) {
         const uint4* wa = reinterpret_cast<const uint4*>(conv_weight + 4 * ca);
         const uint4* wb = reinterpret_cast<const uint4*>(conv_weight + 4 * cb);
         taps[0] = wa[0];
         taps[1] = wa[1];
         taps[2] = wb[0];
         taps[3] = wb[1];
-        if (t % 8 == 0) {
+        if (mode == kPartialConvResidual && t % 8 == 0) {
 #pragma unroll
             for (int k = 0; k < 3; ++k) {
                 prefetch_l2(conv_state + size_t(k) * kHidden + ca);
@@ -1937,17 +1960,24 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
             load8(blocks + size_t(i) * block_stride + at, ca, cb, s[i]);
         }
         float p[8];
-        if (mode == kPartialConvResidual) {
-            // short_conv_residual_rows_2304 for this row: the window is rows row - 3 .. row
-            // of the attention output, reaching into the conv state before the chunk.
+        if (conv_mode) {
+            // short_conv_residual_rows_2304 / conv_residual_batch_2304 for this row:
+            // the window is rows local - 3 .. local of the sequence's attention output,
+            // reaching into the sequence's conv state before its first row.
+            const bool batched = mode == kPartialConvResidualBatch;
+            const int seq = batched ? row / rows_per_seq : 0;
+            const int local = batched ? row % rows_per_seq : row;
+            const int first = batched ? seq * rows_per_seq : 0;
+            const float* row_state =
+                batched ? reinterpret_cast<const float*>(conv_states[size_t(seq) * kBatchStateWords + 4]) : conv_state;
             float win[4][8];
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const int r = row - 3 + k;
+                const int r = local - 3 + k;
                 if (r >= 0) {
-                    load8_bf16(partial_bf16 + size_t(r) * kHidden, ca, cb, win[k]);
+                    load8_bf16(partial_bf16 + size_t(first + r) * kHidden, ca, cb, win[k]);
                 } else {
-                    load8(conv_state + size_t(3 + r) * kHidden, ca, cb, win[k]);
+                    load8(row_state + size_t(3 + r) * kHidden, ca, cb, win[k]);
                 }
             }
             float hid[8];
@@ -2136,6 +2166,8 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
 // `mode` picks the partial as in depth_attention_step_2304; with kPartialConvResidual,
 // partial_bf16 is the attention output [rows, 2304], conv_state ([3, 2304] F32, only
 // read) holds the rows before the chunk, and each row's residual goes to `residual`.
+// With kPartialConvResidualBatch, each sequence of `rows_per_seq` rows reads its
+// post-attention conv state from word 4 of `conv_states` ([seqs * 6] device addresses).
 // out is [rows, NQ, 2304]. probs, if not null, receives each output's weights
 // ([rows, NQ, NB + 1]): out = fmaf(w_NB, partial, sum over i < NB of w_i * block_i, the
 // products chained by fmaf in order from 0), with the partial as given, for kernels that
@@ -2151,15 +2183,17 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
         const float* blocks, int block_stride, const float* partial_f32,                                       \
         const __nv_bfloat16* partial_bf16, int mode, const __nv_bfloat16* __restrict__ conv_weight,            \
         const float* conv_state, const __nv_bfloat16* conv_hidden, float* residual,                             \
+        const unsigned long long* conv_states, int rows_per_seq,                                                \
         float* normed_partial, const float* __restrict__ queries, float* out, float* probs,                     \
         __nv_bfloat16* dst0, __nv_bfloat16* dst1, __nv_bfloat16* dst2, __nv_bfloat16* dst3, int dst_stride,    \
         const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,                  \
         const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3, float eps,       \
         float scale, int rows, int probs_batch, int dst_batch) {                                               \
         depth_attention_rows<NB, NQ>(blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight,        \
-                                     conv_state, conv_hidden, residual, normed_partial, queries, out, probs,    \
-                                     dst0, dst1, dst2, dst3, dst_stride, weight0, weight1, weight2, weight3,    \
-                                     eps, scale, rows, probs_batch, dst_batch);                                \
+                                     conv_state, conv_hidden, residual, conv_states, rows_per_seq,              \
+                                     normed_partial, queries, out, probs, dst0, dst1, dst2, dst3, dst_stride,   \
+                                     weight0, weight1, weight2, weight3, eps, scale, rows, probs_batch,         \
+                                     dst_batch);                                                                \
     }
 
 #define DEPTH_ATTENTION_ROWS_Q(NQ) \

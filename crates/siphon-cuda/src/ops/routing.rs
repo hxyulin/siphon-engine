@@ -128,6 +128,25 @@ pub enum RowsPartial<'a> {
         /// Receives the residual, F32 `[rows, 2304]`.
         residual: CudaViewMut<'a, f32>,
     },
+    /// The post-attention conv and residual add of
+    /// [`crate::ops::conv::Conv::conv_residual_batch`], computed in the kernel and
+    /// written to `residual`, then an unweighted RMS norm: each sequence of
+    /// `rows_per_seq` rows reads its post-attention conv state from word 4 of `states`.
+    ConvResidualBatch {
+        /// The attention output, BF16 `[rows, 2304]`.
+        x: CudaView<'a, bf16>,
+        /// The conv weight, BF16 `[2304, 4]`.
+        weight: &'a CudaSlice<bf16>,
+        /// Per-sequence state table, `[seqs * BATCH_STATE_WORDS]` device addresses
+        /// (word 4 is the post-attention conv state, F32 `[3, 2304]`, only read).
+        states: CudaView<'a, u64>,
+        /// Consecutive rows belonging to each sequence (`1..=8`).
+        rows_per_seq: usize,
+        /// The visit input added to the conv output, or `None` at a block start.
+        hidden: Option<CudaView<'a, bf16>>,
+        /// Receives the residual, F32 `[rows, 2304]`.
+        residual: CudaViewMut<'a, f32>,
+    },
 }
 
 /// What [`Routing::depth_attention_rows`] reads and writes for a chunk of `rows` rows.
@@ -759,7 +778,10 @@ impl Routing {
             count == 1
                 || (out.is_none()
                     && normed_partial.is_none()
-                    && !matches!(partial, RowsPartial::ConvResidual { .. })),
+                    && !matches!(
+                        partial,
+                        RowsPartial::ConvResidual { .. } | RowsPartial::ConvResidualBatch { .. }
+                    )),
             "a batch of sets writes only weights and destinations"
         );
         let nq = queries.len() / (count * HIDDEN);
@@ -1038,8 +1060,12 @@ impl Routing {
 }
 
 /// The partial's arguments of `depth_attention_rows_2304_<nb>_<nq>`: its F32 and BF16
-/// pointers, its mode, and the conv's weight, state, hidden state and residual, for
-/// partials of `len` elements.
+/// pointers, its mode, the conv's weight, state, hidden state and residual, and the batched
+/// conv's state table and rows per sequence, for partials of `len` elements.
+#[expect(
+    clippy::too_many_lines,
+    reason = "pushes kernel arguments for each RowsPartial variant"
+)]
 fn push_rows_partial(
     args: &mut KernelArgs,
     partial: RowsPartial<'_>,
@@ -1059,7 +1085,9 @@ fn push_rows_partial(
                 .u64(0)
                 .u64(0)
                 .u64(0)
-                .u64(0);
+                .u64(0)
+                .u64(0)
+                .i32(0);
         }
         RowsPartial::F32(x) => {
             check(x.len())?;
@@ -1069,7 +1097,9 @@ fn push_rows_partial(
                 .u64(0)
                 .u64(0)
                 .u64(0)
-                .u64(0);
+                .u64(0)
+                .u64(0)
+                .i32(0);
         }
         RowsPartial::Bf16(x) => {
             check(x.len())?;
@@ -1079,7 +1109,9 @@ fn push_rows_partial(
                 .u64(0)
                 .u64(0)
                 .u64(0)
-                .u64(0);
+                .u64(0)
+                .u64(0)
+                .i32(0);
         }
         RowsPartial::ConvResidual {
             x,
@@ -1102,7 +1134,42 @@ fn push_rows_partial(
                 .ptr(weight, stream)
                 .ptr(&state, stream)
                 .opt(hidden.as_ref(), stream)
-                .ptr_mut(&mut residual, stream);
+                .ptr_mut(&mut residual, stream)
+                .u64(0)
+                .i32(0);
+        }
+        RowsPartial::ConvResidualBatch {
+            x,
+            weight,
+            states,
+            rows_per_seq,
+            hidden,
+            mut residual,
+        } => {
+            check(x.len())?;
+            check(residual.len())?;
+            let rows = len / HIDDEN;
+            ensure!(
+                (1..=crate::ops::spec::VERIFY_ROWS).contains(&rows_per_seq)
+                    && rows.is_multiple_of(rows_per_seq),
+                "{rows} rows is not a multiple of rows_per_seq {rows_per_seq}"
+            );
+            let seqs = rows / rows_per_seq;
+            ensure!(
+                weight.len() == 4 * HIDDEN
+                    && states.len() == seqs * crate::ops::spec::BATCH_STATE_WORDS
+                    && hidden.as_ref().is_none_or(|h| h.len() == len),
+                "batched conv partial lengths"
+            );
+            args.u64(0)
+                .ptr(&x, stream)
+                .i32(4)
+                .ptr(weight, stream)
+                .u64(0)
+                .opt(hidden.as_ref(), stream)
+                .ptr_mut(&mut residual, stream)
+                .ptr(&states, stream)
+                .i32(i32::try_from(rows_per_seq)?);
         }
     }
     Ok(())

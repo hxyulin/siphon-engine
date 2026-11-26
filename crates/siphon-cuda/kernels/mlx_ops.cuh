@@ -8,6 +8,20 @@
 
 namespace {
 
+#if SIPHON_FAST_MATH
+__device__ __forceinline__ float fadd(float a, float b) { return a + b; }
+__device__ __forceinline__ float fsub(float a, float b) { return a - b; }
+__device__ __forceinline__ float fmul(float a, float b) { return a * b; }
+__device__ __forceinline__ float fdiv(float a, float b) { return a / b; }
+
+__device__ __forceinline__ __nv_bfloat16 to_bf16(float x) {
+    return __float2bfloat16(x);
+}
+
+__device__ __forceinline__ float mlx_sigmoid(float x) {
+    return 1.f / (1.f + __expf(-x));
+}
+#else
 __device__ __forceinline__ float fadd(float a, float b) {
     float r;
     asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
@@ -44,6 +58,7 @@ __device__ __forceinline__ float mlx_sigmoid(float x) {
     const float y = fdiv(1.f, fadd(1.f, expf(fabsf(x))));
     return x < 0.f ? y : fsub(1.f, y);
 }
+#endif
 
 // The SwiGLU softcap with CUDA's tanhf (at most 2 ulps from the true value), which
 // avoids the FP64 tanh of elementwise.cu's softcap. SwiGLU runs on 9216 values per

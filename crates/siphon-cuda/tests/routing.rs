@@ -1428,3 +1428,125 @@ fn message_gate_rebuilds_messages_bit_for_bit() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Fused `RowsPartial::ConvResidualBatch` inside `depth_attention_rows` must match
+/// `Conv::conv_residual_batch` followed by `RowsPartial::F32` bit for bit across single-row
+/// batched steps (`rows_per_seq == 1`) and batched verify widths (`2..=8`), with and without
+/// `hidden`.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks fused conv_residual_batch against unfused across shapes"
+)]
+fn depth_attention_rows_conv_residual_batch_matches_unfused() -> anyhow::Result<()> {
+    use cudarc::driver::DevicePtr as _;
+    use siphon_cuda::ops::spec::BATCH_STATE_WORDS;
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let conv = Conv::load(gpu.context())?;
+    let conv_weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 4, 701, 0.5, 0.0))?;
+    let norm_weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 702, 0.5, 1.0))?;
+
+    for &(seqs, rows_per_seq, has_hidden) in &[
+        (7usize, 1usize, true),
+        (4, 2, false),
+        (5, 3, true),
+        (3, 5, true),
+        (4, 8, true),
+    ] {
+        let rows = seqs * rows_per_seq;
+        let proj = stream.clone_htod(&pseudo_random_bf16(rows * HIDDEN, 710, 2.0, 0.0))?;
+        let hidden = stream.clone_htod(&pseudo_random_bf16(rows * HIDDEN, 711, 3.0, 0.0))?;
+        let conv_states: Vec<CudaSlice<f32>> = (0..seqs)
+            .map(|s| Ok(stream.clone_htod(&pseudo_random(3 * HIDDEN, 720 + s as u32, 2.0))?))
+            .collect::<anyhow::Result<_>>()?;
+        let mut table = vec![0u64; seqs * BATCH_STATE_WORDS];
+        for (s, st) in conv_states.iter().enumerate() {
+            table[s * BATCH_STATE_WORDS + 4] = st.device_ptr(stream).0;
+        }
+        let states_dev = stream.clone_htod(&table)?;
+
+        for nb in [1usize, 3, 5] {
+            let blocks = stream.clone_htod(&pseudo_random(nb * rows * HIDDEN, 730 + nb as u32, 1.0))?;
+            let queries = stream.clone_htod(&pseudo_random(HIDDEN, 740, 1.0))?;
+
+            let mut residual_want = stream.alloc_zeros::<f32>(rows * HIDDEN)?;
+            conv.conv_residual_batch(
+                stream,
+                &proj,
+                &conv_weight,
+                &states_dev.slice(..),
+                has_hidden.then(|| hidden.as_view()).as_ref(),
+                &mut residual_want,
+                rows,
+                rows_per_seq,
+            )?;
+            let mut out_want = stream.alloc_zeros::<f32>(rows * HIDDEN)?;
+            let mut dst_want = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+            routing.depth_attention_rows(
+                stream,
+                DepthRows {
+                    blocks: blocks.as_view(),
+                    partial: RowsPartial::F32(residual_want.as_view()),
+                    normed_partial: None,
+                    queries: &queries,
+                    out: Some(out_want.as_view_mut()),
+                    probs: None,
+                    dests: [Some(norm_dest(&mut dst_want, Some(&norm_weight))), None, None, None],
+                    dst_stride: HIDDEN,
+                    rows,
+                },
+                EPS,
+            )?;
+
+            let mut residual_got = stream.alloc_zeros::<f32>(rows * HIDDEN)?;
+            let mut out_got = stream.alloc_zeros::<f32>(rows * HIDDEN)?;
+            let mut dst_got = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+            routing.depth_attention_rows(
+                stream,
+                DepthRows {
+                    blocks: blocks.as_view(),
+                    partial: RowsPartial::ConvResidualBatch {
+                        x: proj.as_view(),
+                        weight: &conv_weight,
+                        states: states_dev.slice(..),
+                        rows_per_seq,
+                        hidden: has_hidden.then(|| hidden.as_view()),
+                        residual: residual_got.as_view_mut(),
+                    },
+                    normed_partial: None,
+                    queries: &queries,
+                    out: Some(out_got.as_view_mut()),
+                    probs: None,
+                    dests: [Some(norm_dest(&mut dst_got, Some(&norm_weight))), None, None, None],
+                    dst_stride: HIDDEN,
+                    rows,
+                },
+                EPS,
+            )?;
+
+            let label = format!("seqs={seqs} w={rows_per_seq} hidden={has_hidden} nb={nb}");
+            assert_f32_within_ulps(
+                &format!("{label}: residual"),
+                &stream.clone_dtoh(&residual_got)?,
+                &stream.clone_dtoh(&residual_want)?,
+                0,
+            );
+            assert_f32_within_ulps(
+                &format!("{label}: out"),
+                &stream.clone_dtoh(&out_got)?,
+                &stream.clone_dtoh(&out_want)?,
+                0,
+            );
+            assert_bf16_close(
+                &format!("{label}: dst"),
+                &stream.clone_dtoh(&dst_got)?,
+                &stream.clone_dtoh(&dst_want)?,
+                0,
+            );
+        }
+    }
+    Ok(())
+}

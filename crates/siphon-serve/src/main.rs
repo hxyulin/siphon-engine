@@ -29,6 +29,10 @@ const _: () = assert!(*STREAMS.end() == siphon::memory::BATCH_ROWS);
 const PREFILL_CHUNK: std::ops::RangeInclusive<usize> = 1..=2048;
 #[cfg(target_os = "linux")]
 const _: () = assert!(*PREFILL_CHUNK.end() == siphon::memory::MAX_PREFILL_CHUNK);
+/// Granularity of `--draft-shortlist` and `--draft-context-rows`.
+const DRAFT_HEAD_BUCKET: usize = 1024;
+#[cfg(target_os = "linux")]
+const _: () = assert!(DRAFT_HEAD_BUCKET == siphon_cuda::draft::HEAD_BUCKET);
 
 /// Tokens per second each decoding request gets at least while another prefills.
 const DECODE_FLOOR: f64 = 20.0;
@@ -37,6 +41,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] \
                      [--output-projection bf16|fp8] [--kv fp8|bf16|nvfp4|mixed] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
+                     [--draft-shortlist N] [--draft-context-rows N] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
@@ -65,7 +70,10 @@ model; bf16 (the default) reads its BF16 weights.
 or a DFlash draft exported by the 2DSD project.
 --draft picks the draft's approximations as bench does: fast (the default, FP8 plus the
 counted shortlist), fp8, exact, or a +-joined set of fp8-backbone, fp8-head, fp8-fold, fp8-kv
-and shortlist.
+and shortlist (or shortlist=N, context=N).
+--draft-shortlist sets the shortlist's ranked-token budget (multiple of 1024, 1024 to 32768;
+default 32768). --draft-context-rows sets the shortlist's context-token budget (multiple of
+1024, 0 to 16384; default 16384).
 --fallback runs plain steps where no verify width is expected to be faster. It speeds up
 free prose, but where it steps depends on timings measured at startup, so the output can
 differ between runs.
@@ -151,6 +159,8 @@ fn args() -> anyhow::Result<Args> {
     let mut widths: Vec<usize> = (1..=8).collect();
     let mut drafter = None;
     let mut draft = "fast".to_owned();
+    let mut draft_shortlist = None;
+    let mut draft_context_rows = None;
     let mut fallback = false;
     let mut prefix_cache = true;
     let mut prefix_entries = None;
@@ -197,6 +207,30 @@ fn args() -> anyhow::Result<Args> {
             }
             "--drafter" => drafter = Some(PathBuf::from(value()?)),
             "--draft" => draft = value()?,
+            "--draft-shortlist" => {
+                let n: usize = value()?
+                    .parse()
+                    .context("--draft-shortlist takes a row count")?;
+                ensure!(
+                    (DRAFT_HEAD_BUCKET..=siphon::memory::SHORTLIST_ROWS).contains(&n)
+                        && n.is_multiple_of(DRAFT_HEAD_BUCKET),
+                    "--draft-shortlist takes a multiple of {DRAFT_HEAD_BUCKET} in {DRAFT_HEAD_BUCKET}..={}",
+                    siphon::memory::SHORTLIST_ROWS
+                );
+                draft_shortlist = Some(n);
+            }
+            "--draft-context-rows" => {
+                let n: usize = value()?
+                    .parse()
+                    .context("--draft-context-rows takes a row count")?;
+                ensure!(
+                    n <= siphon::memory::SHORTLIST_CONTEXT_ROWS
+                        && n.is_multiple_of(DRAFT_HEAD_BUCKET),
+                    "--draft-context-rows takes a multiple of {DRAFT_HEAD_BUCKET} in 0..={}",
+                    siphon::memory::SHORTLIST_CONTEXT_ROWS
+                );
+                draft_context_rows = Some(n);
+            }
             "--fallback" => fallback = true,
             "--no-prefix-cache" => prefix_cache = false,
             "--prefix-cache-entries" => prefix_entries = Some(value()?.parse()?),
@@ -285,6 +319,8 @@ fn args() -> anyhow::Result<Args> {
             streams,
             drafter,
             draft,
+            draft_shortlist,
+            draft_context_rows,
             fallback,
             prefix_entries: if prefix_cache {
                 entries(prefix_entries, streams)?

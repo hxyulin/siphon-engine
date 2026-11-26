@@ -318,6 +318,10 @@ pub struct Options {
     pub drafter: Option<PathBuf>,
     /// The draft's approximations, as `DraftOptions::parse` takes them.
     pub draft: String,
+    /// Optional shortlist ranked-token budget (`--draft-shortlist`).
+    pub draft_shortlist: Option<usize>,
+    /// Optional shortlist context-token budget (`--draft-context-rows`).
+    pub draft_context_rows: Option<usize>,
     /// Whether the speculator falls back to plain steps (`WidthPolicy::with_plain`).
     pub fallback: bool,
     /// Entries of the prefix cache, 1 to `streams`, or 0 for none.
@@ -816,7 +820,8 @@ mod cuda {
         let (free, _) = gpu.context().mem_get_info()?;
         let checkpoint = Checkpoint::open(&options.model_dir)?;
         let (weight_format, kv) = formats(options)?;
-        let draft_options = DraftOptions::parse(&options.draft, None)?;
+        let draft_options = DraftOptions::parse(&options.draft, None)?
+            .with_shortlist_budget(options.draft_shortlist, options.draft_context_rows)?;
         let chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK);
         let kv_options = kv_options(options)?;
         let planner = Planner::new(&PlanInputs {

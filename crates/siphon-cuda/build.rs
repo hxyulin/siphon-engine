@@ -9,14 +9,19 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo::rerun-if-changed=kernels");
-    for var in ["NVCC", "CUDA_HOME", "SIPHON_CUDA_ARCH"] {
+    for var in ["NVCC", "CUDA_HOME", "SIPHON_CUDA_ARCH", "SIPHON_FAST_MATH"] {
         println!("cargo::rerun-if-env-changed={var}");
     }
     let arch = env::var("SIPHON_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".to_owned());
+    let fast_math = env::var("SIPHON_FAST_MATH").as_deref() == Ok("1");
     println!("cargo::rustc-env=SIPHON_CUDA_ARCH={arch}");
     println!("cargo::rustc-check-cfg=cfg(sm89)");
+    println!("cargo::rustc-check-cfg=cfg(fast_math)");
     if arch == "sm_89" {
         println!("cargo::rustc-cfg=sm89");
+    }
+    if fast_math {
+        println!("cargo::rustc-cfg=fast_math");
     }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         println!("cargo::rustc-env=SIPHON_KERNELS_HASH=none");
@@ -50,10 +55,14 @@ fn main() {
             .expect("kernel file has a name")
             .to_owned();
         let cubin = out_dir.join(&stem).with_extension("cubin");
-        let status = Command::new(&nvcc)
-            .args(["-cubin", "-O3", "-std=c++20", "-lineinfo"])
+        let mut cmd = Command::new(&nvcc);
+        cmd.args(["-cubin", "-O3", "-std=c++20", "-lineinfo"])
             .arg(format!("-arch={arch}"))
-            .args(["-I", "kernels"])
+            .args(["-I", "kernels"]);
+        if fast_math {
+            cmd.args(["--use_fast_math", "-DSIPHON_FAST_MATH=1"]);
+        }
+        let status = cmd
             .arg("-o")
             .arg(&cubin)
             .arg(&source)

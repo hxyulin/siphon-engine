@@ -68,10 +68,14 @@ __device__ float row_sum_squares(const float (&v)[kVec]) {
 
 __device__ float inv_rms(float sum_squares, int n, float eps) {
     const float mean_eps = sum_squares / static_cast<float>(n) + eps;
+#if SIPHON_FAST_MATH
+    return rsqrtf(mean_eps);
+#else
     // IEEE double sqrt and divide, then one rounding to float, equal
     // `metal::precise::rsqrt` for every normal float (checked exhaustively on
     // the Mac against both exponent parities).
     return static_cast<float>(1.0 / sqrt(static_cast<double>(mean_eps)));
+#endif
 }
 
 __device__ void load_bf16x4(const __nv_bfloat16* p, float (&v)[kVec]) {
@@ -288,7 +292,11 @@ constexpr int kRBlock = kQBlock0 + kQHeads / kHeadsPerBlock;
 // 1 / sqrt(mean + eps) with two correctly rounded float operations; inv_rms rounds a
 // double rsqrt once. They differ by at most one ulp.
 __device__ float inv_rms_f32(float sum_squares, int n, float eps) {
+#if SIPHON_FAST_MATH
+    return rsqrtf(sum_squares / static_cast<float>(n) + eps);
+#else
     return 1.f / sqrtf(sum_squares / static_cast<float>(n) + eps);
+#endif
 }
 
 // The `FullAttention` query scale for the row at `position`, as log_scale_bf16 computes it.

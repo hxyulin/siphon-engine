@@ -91,7 +91,27 @@ const _: () = assert!(CONTEXT_ROWS == siphon::memory::SHORTLIST_CONTEXT_ROWS);
 const FIRST_SPECIAL: usize = 199_990;
 const _: () = assert!(FIRST_SPECIAL == siphon::memory::FIRST_SPECIAL);
 /// A shortlist head's base logits cover its rows in use rounded up to this.
-const HEAD_BUCKET: usize = 1024;
+pub const HEAD_BUCKET: usize = 1024;
+
+/// Validates a configured shortlist ranked-token budget: a multiple of [`HEAD_BUCKET`] in
+/// `HEAD_BUCKET..=SHORTLIST_ROWS`.
+pub fn validate_shortlist_rows(n: usize) -> anyhow::Result<usize> {
+    ensure!(
+        (HEAD_BUCKET..=SHORTLIST_ROWS).contains(&n) && n.is_multiple_of(HEAD_BUCKET),
+        "draft shortlist rows must be a multiple of {HEAD_BUCKET} in {HEAD_BUCKET}..={SHORTLIST_ROWS}, not {n}"
+    );
+    Ok(n)
+}
+
+/// Validates a configured shortlist context-token budget: a multiple of [`HEAD_BUCKET`] in
+/// `0..=CONTEXT_ROWS`.
+pub fn validate_context_rows(n: usize) -> anyhow::Result<usize> {
+    ensure!(
+        n <= CONTEXT_ROWS && n.is_multiple_of(HEAD_BUCKET),
+        "draft context rows must be a multiple of {HEAD_BUCKET} in 0..={CONTEXT_ROWS}, not {n}"
+    );
+    Ok(n)
+}
 
 /// Approximations of the draft. Each changes the draft's tokens and so how often the
 /// target accepts them, never the target's output. The default is the exact draft.
@@ -108,9 +128,16 @@ pub struct DraftOptions {
     /// scale: keys are RMS-normed per head and values stay within E4M3's range.
     pub fp8_kv: bool,
     /// Token ids by rank, most frequent first: the base and Markov logits
-    /// then cover only the first [`SHORTLIST_ROWS`] of them, the special tokens and up to
-    /// [`CONTEXT_ROWS`] tokens passed to [`Draft::note_tokens`].
+    /// then cover only the first `shortlist_rows` (default [`SHORTLIST_ROWS`]) of them,
+    /// the special tokens and up to `context_rows` (default [`CONTEXT_ROWS`]) tokens
+    /// passed to [`Draft::note_tokens`].
     pub shortlist: Option<Vec<u32>>,
+    /// Ranked tokens a shortlist head keeps (`HEAD_BUCKET..=SHORTLIST_ROWS`, multiple of
+    /// [`HEAD_BUCKET`]); `None` uses [`SHORTLIST_ROWS`].
+    pub shortlist_rows: Option<usize>,
+    /// Context tokens a shortlist head adds at most (`0..=CONTEXT_ROWS`, multiple of
+    /// [`HEAD_BUCKET`]); `None` uses [`CONTEXT_ROWS`].
+    pub context_rows: Option<usize>,
 }
 
 impl DraftOptions {
@@ -124,6 +151,8 @@ impl DraftOptions {
             fp8_fold: true,
             fp8_kv: true,
             shortlist: None,
+            shortlist_rows: None,
+            context_rows: None,
         }
     }
 
@@ -137,40 +166,74 @@ impl DraftOptions {
             fp8_fold: true,
             fp8_kv: true,
             shortlist: Some(counted_ranking()),
+            shortlist_rows: None,
+            context_rows: None,
         }
+    }
+
+    /// Applies optional shortlist ranked-token and context-token budgets after validating
+    /// them against [`HEAD_BUCKET`], [`SHORTLIST_ROWS`] and [`CONTEXT_ROWS`].
+    pub fn with_shortlist_budget(
+        mut self,
+        shortlist_rows: Option<usize>,
+        context_rows: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        if let Some(n) = shortlist_rows {
+            self.shortlist_rows = Some(validate_shortlist_rows(n)?);
+        }
+        if let Some(n) = context_rows {
+            self.context_rows = Some(validate_context_rows(n)?);
+        }
+        Ok(self)
     }
 
     /// The options of a variant `spec`: `exact`, `fp8` ([`Self::fp8`]), `fast`
     /// ([`Self::fast`]), or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`,
-    /// `fp8-kv` and `shortlist`, which takes `ranking`, or without one [`counted_ranking`]. `fp8` and
-    /// `fast` with a `ranking` use it as their shortlist.
+    /// `fp8-kv`, `shortlist`, `shortlist=<N>` and `context=<N>`. `shortlist` takes
+    /// `ranking`, or without one [`counted_ranking`]; `fp8` and `fast` with a `ranking`
+    /// use it as their shortlist.
     pub fn parse(spec: &str, ranking: Option<&[u32]>) -> anyhow::Result<Self> {
         let mut options = Self::default();
-        match spec {
-            "exact" => return Ok(options),
-            "fp8" | "fast" => {
-                options = if spec == "fp8" {
-                    Self::fp8()
-                } else {
-                    Self::fast()
-                };
-                if let Some(r) = ranking {
-                    options.shortlist = Some(r.to_vec());
-                }
-                return Ok(options);
-            }
-            _ => {}
-        }
         for part in spec.split('+') {
             match part {
+                "exact" => options = Self::default(),
+                "fp8" => {
+                    options = Self::fp8();
+                    if let Some(r) = ranking {
+                        options.shortlist = Some(r.to_vec());
+                    }
+                }
+                "fast" => {
+                    options = Self::fast();
+                    if let Some(r) = ranking {
+                        options.shortlist = Some(r.to_vec());
+                    }
+                }
                 "fp8-backbone" => options.fp8_backbone = true,
                 "fp8-head" => options.fp8_head = true,
                 "fp8-fold" => options.fp8_fold = true,
                 "fp8-kv" => options.fp8_kv = true,
                 "shortlist" => {
-                    options.shortlist = Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
+                    options.shortlist =
+                        Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
                 }
-                _ => anyhow::bail!("unknown draft variant part {part:?}"),
+                other => {
+                    if let Some(v) = other.strip_prefix("shortlist=") {
+                        let n: usize = v
+                            .parse()
+                            .with_context(|| format!("bad shortlist size {v:?}"))?;
+                        options.shortlist_rows = Some(validate_shortlist_rows(n)?);
+                        options.shortlist =
+                            Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
+                    } else if let Some(v) = other.strip_prefix("context=") {
+                        let n: usize = v
+                            .parse()
+                            .with_context(|| format!("bad context size {v:?}"))?;
+                        options.context_rows = Some(validate_context_rows(n)?);
+                    } else {
+                        anyhow::bail!("unknown draft variant part {other:?}");
+                    }
+                }
             }
         }
         Ok(options)
@@ -633,13 +696,14 @@ struct Head {
 }
 
 /// The tokens of a shortlist head: rows `0..ranked` are the ranked and special tokens in
-/// ascending id order, then context tokens.
+/// ascending id order, then up to `context_cap` context tokens.
 struct Shortlist {
     ranked: usize,
+    context_cap: usize,
     used: usize,
     member: Vec<bool>,
     context: Vec<i32>,
-    /// Row to token id, I32 `[ranked + CONTEXT_ROWS]`.
+    /// Row to token id, I32 `[ranked + context_cap]`.
     map: CudaSlice<i32>,
     /// Rows in use, I32 `[1]`.
     count: CudaSlice<i32>,
@@ -649,7 +713,7 @@ struct Shortlist {
 
 impl Shortlist {
     fn capacity(&self) -> usize {
-        self.ranked + CONTEXT_ROWS
+        self.ranked + self.context_cap
     }
 
     /// Rows the base logits cover.
@@ -1265,9 +1329,18 @@ impl Draft {
         Ok(())
     }
 
+    /// Maximum context tokens the shortlist head can add (0 without a shortlist).
+    #[must_use]
+    pub fn context_capacity(&self) -> usize {
+        self.head
+            .as_ref()
+            .and_then(|h| h.shortlist.as_ref())
+            .map_or(0, |s| s.context_cap)
+    }
+
     /// Adds the tokens of the context (prompt and generated) that a shortlist head lacks to
-    /// it, up to [`CONTEXT_ROWS`] since the last [`Self::reset`], so the draft can propose
-    /// them. Does nothing without a shortlist.
+    /// it, up to [`Self::context_capacity`] since the last [`Self::reset`], so the draft can
+    /// propose them. Does nothing without a shortlist.
     pub fn note_tokens(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -2630,11 +2703,19 @@ impl Head {
                 shortlist: None,
             }));
         };
+        let shortlist_rows = match options.shortlist_rows {
+            Some(n) => validate_shortlist_rows(n)?,
+            None => SHORTLIST_ROWS,
+        };
+        let context_cap = match options.context_rows {
+            Some(n) => validate_context_rows(n)?,
+            None => CONTEXT_ROWS,
+        };
         let mut member = vec![false; vocab];
         let mut taken = 0;
         for &t in ranking {
             let t = t as usize;
-            if taken == SHORTLIST_ROWS {
+            if taken == shortlist_rows {
                 break;
             }
             if t < vocab && !member[t] {
@@ -2650,7 +2731,7 @@ impl Head {
             .map(i32::try_from)
             .collect::<Result<_, _>>()?;
         let ranked = ids.len();
-        let capacity = ranked + CONTEXT_ROWS;
+        let capacity = ranked + context_cap;
         let mut map = stream.alloc_zeros::<i32>(capacity)?;
         stream.memcpy_htod(&ids, &mut map.slice_mut(..ranked))?;
         let count = stream.clone_htod(&[i32::try_from(ranked)?])?;
@@ -2668,6 +2749,7 @@ impl Head {
             fold_bias: fold.map(|_| stream.alloc_zeros(capacity)).transpose()?,
             shortlist: Some(Shortlist {
                 ranked,
+                context_cap,
                 used: ranked,
                 member,
                 context: Vec::new(),
@@ -2874,5 +2956,60 @@ impl StepArgmax<'_> {
             partials,
             Some(self.race),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortlist_budget_validation() {
+        assert_eq!(validate_shortlist_rows(HEAD_BUCKET).unwrap(), HEAD_BUCKET);
+        assert_eq!(validate_shortlist_rows(8192).unwrap(), 8192);
+        assert_eq!(
+            validate_shortlist_rows(SHORTLIST_ROWS).unwrap(),
+            SHORTLIST_ROWS
+        );
+        assert!(validate_shortlist_rows(0).is_err());
+        assert!(validate_shortlist_rows(512).is_err());
+        assert!(validate_shortlist_rows(8193).is_err());
+        assert!(validate_shortlist_rows(SHORTLIST_ROWS + HEAD_BUCKET).is_err());
+
+        assert_eq!(validate_context_rows(0).unwrap(), 0);
+        assert_eq!(validate_context_rows(4096).unwrap(), 4096);
+        assert_eq!(validate_context_rows(CONTEXT_ROWS).unwrap(), CONTEXT_ROWS);
+        assert!(validate_context_rows(512).is_err());
+        assert!(validate_context_rows(CONTEXT_ROWS + HEAD_BUCKET).is_err());
+    }
+
+    #[test]
+    fn parse_shortlist_and_context_specs() {
+        let fast = DraftOptions::parse("fast", None).unwrap();
+        assert!(fast.shortlist.is_some());
+        assert_eq!(fast.shortlist_rows, None);
+        assert_eq!(fast.context_rows, None);
+
+        let shrunk = DraftOptions::parse("fast+shortlist=8192+context=4096", None).unwrap();
+        assert!(shrunk.fp8_backbone && shrunk.fp8_head && shrunk.fp8_fold && shrunk.fp8_kv);
+        assert!(shrunk.shortlist.is_some());
+        assert_eq!(shrunk.shortlist_rows, Some(8192));
+        assert_eq!(shrunk.context_rows, Some(4096));
+
+        let custom = DraftOptions::parse("shortlist=16384+context=0", Some(&[1, 2, 3])).unwrap();
+        assert_eq!(custom.shortlist.as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(custom.shortlist_rows, Some(16384));
+        assert_eq!(custom.context_rows, Some(0));
+
+        let overridden = fast
+            .with_shortlist_budget(Some(8192), Some(0))
+            .unwrap();
+        assert_eq!(overridden.shortlist_rows, Some(8192));
+        assert_eq!(overridden.context_rows, Some(0));
+
+        assert!(DraftOptions::parse("fast+shortlist=1000", None).is_err());
+        assert!(DraftOptions::parse("fast+context=1000", None).is_err());
+        assert!(DraftOptions::parse("fast+shortlist=65536", None).is_err());
+        assert!(DraftOptions::parse("fast+context=32768", None).is_err());
     }
 }

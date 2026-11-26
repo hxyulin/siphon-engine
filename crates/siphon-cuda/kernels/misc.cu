@@ -36,6 +36,12 @@ __device__ __forceinline__ size_t grid_stride() {
     return size_t(gridDim.x) * blockDim.x;
 }
 
+#if SIPHON_FAST_MATH
+__device__ __forceinline__ float fadd(float a, float b) { return a + b; }
+__device__ __forceinline__ float fsub(float a, float b) { return a - b; }
+__device__ __forceinline__ float fmul(float a, float b) { return a * b; }
+__device__ __forceinline__ float mlx_tanh(float x) { return tanhf(x); }
+#else
 __device__ __forceinline__ float fadd(float a, float b) {
     float r;
     asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
@@ -57,6 +63,7 @@ __device__ __forceinline__ float fmul(float a, float b) {
 __device__ __forceinline__ float mlx_tanh(float x) {
     return float(tanh(double(x)));
 }
+#endif
 
 __device__ __forceinline__ uint16_t f32_to_bf16_bits(float x) {
     if (isnan(x)) {

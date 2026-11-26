@@ -46,9 +46,9 @@
 //! with a `tokens` tensor such as `reference/capture_eval.py` writes):
 //!
 //!        bench <model-dir> --prompt <capture> --spec K|auto [--widths 2,4,8]
-//!        [--draft SPEC] [--shortlist FILE] [--sweep FILE] [--contexts 0,32768]
-//!        [--steps N] [--weights bf16|fp8] [--kv bf16|fp8] [--drafter DIR]
-//!        [--fallback] [--temperature T [--top-p P] [--seeds N]]
+//!        [--draft SPEC] [--draft-shortlist N] [--draft-context-rows N] [--shortlist FILE]
+//!        [--sweep FILE] [--contexts 0,32768] [--steps N] [--weights bf16|fp8] [--kv bf16|fp8]
+//!        [--drafter DIR] [--fallback] [--temperature T [--top-p P] [--seeds N]]
 //!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
 //!
 //! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
@@ -99,7 +99,7 @@ mod linux {
     };
     use siphon_cuda::{
         Gpu,
-        draft::DraftOptions,
+        draft::{DraftOptions, validate_context_rows, validate_shortlist_rows},
         kv_options::KvOptions,
         model::{
             Accept, BATCH_ROWS, DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK,
@@ -153,9 +153,11 @@ mod linux {
         spec: Option<usize>,
         /// The widths `--spec auto` picks from.
         widths: Vec<usize>,
-        /// The draft variant and the shortlist ranking file.
+        /// The draft variant, shortlist ranking file and optional shortlist budgets.
         draft: String,
         shortlist: Option<PathBuf>,
+        draft_shortlist: Option<usize>,
+        draft_context_rows: Option<usize>,
         /// A DFlash draft's export directory, in place of the bundled draft.
         drafter: Option<PathBuf>,
         /// Where `--spec` writes the sweep, if anywhere.
@@ -203,6 +205,8 @@ mod linux {
         let mut widths = (1..=8).collect();
         let mut draft = "fast".to_owned();
         let mut shortlist = None;
+        let mut draft_shortlist = None;
+        let mut draft_context_rows = None;
         let mut drafter = None;
         let mut sweep = None;
         let mut verify_widths = false;
@@ -241,6 +245,12 @@ mod linux {
                 "--widths" => widths = token_counts(&arg, &value()?)?,
                 "--draft" => draft = value()?,
                 "--shortlist" => shortlist = Some(PathBuf::from(value()?)),
+                "--draft-shortlist" => {
+                    draft_shortlist = Some(validate_shortlist_rows(value()?.parse()?)?);
+                }
+                "--draft-context-rows" => {
+                    draft_context_rows = Some(validate_context_rows(value()?.parse()?)?);
+                }
                 "--drafter" => drafter = Some(PathBuf::from(value()?)),
                 "--sweep" => sweep = Some(PathBuf::from(value()?)),
                 "--verify-widths" => verify_widths = true,
@@ -291,6 +301,8 @@ mod linux {
             widths,
             draft,
             shortlist,
+            draft_shortlist,
+            draft_context_rows,
             drafter,
             sweep,
             verify_widths,
@@ -715,13 +727,9 @@ mod linux {
         model.set_prefill_dense(args.prefill_dense)?;
         model.add_slots(largest - 1)?;
         let mut speculator = if args.follow {
-            let draft = load_draft(
-                &mut model,
-                &checkpoint,
-                DraftSource::Bundled,
-                capacity,
-                &DraftOptions::fast(),
-            )?;
+            let options = DraftOptions::fast()
+                .with_shortlist_budget(args.draft_shortlist, args.draft_context_rows)?;
+            let draft = load_draft(&mut model, &checkpoint, DraftSource::Bundled, capacity, &options)?;
             model.set_batch_taps(true);
             Some(Speculator::with_draft(
                 &model,
@@ -1047,7 +1055,8 @@ mod linux {
             }
             if let Some(k) = args.spec {
                 let ranking = args.shortlist.as_deref().map(read_ranking).transpose()?;
-                let options = DraftOptions::parse(&args.draft, ranking.as_deref())?;
+                let options = DraftOptions::parse(&args.draft, ranking.as_deref())?
+                    .with_shortlist_budget(args.draft_shortlist, args.draft_context_rows)?;
                 let width = if k == 0 {
                     // Priced at each context before its run.
                     Width::Adaptive(WidthPolicy::new(&args.widths, [1.0; VERIFY_ROWS])?)

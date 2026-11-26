@@ -1670,22 +1670,15 @@ impl Ctx {
                 ],
             ),
         };
-        // A batched step convolves each row with its own state first, and depth attention
-        // reads the residual back; the values are the fused kernel's.
-        if let Some(batch) = &batch {
-            self.kernels.conv.conv_residual_batch(
-                &self.stream,
-                &rows(&p.attention.proj, m, hidden),
-                &w.post_attention_conv,
-                &batch.states,
-                (!block_start).then(|| rows(&p.hidden, m, hidden)).as_ref(),
-                &mut rows_mut(&mut p.residual, m, hidden),
-                m,
-                batch.rows_per_seq,
-            )?;
-        }
-        let partial = if batch.is_some() {
-            RowsPartial::F32(rows(&p.residual, m, hidden))
+        let partial = if let Some(batch) = batch {
+            RowsPartial::ConvResidualBatch {
+                x: rows(&p.attention.proj, m, hidden),
+                weight: &w.post_attention_conv,
+                states: batch.states,
+                rows_per_seq: batch.rows_per_seq,
+                hidden: (!block_start).then(|| rows(&p.hidden, m, hidden)),
+                residual: rows_mut(&mut p.residual, m, hidden),
+            }
         } else {
             RowsPartial::ConvResidual {
                 x: rows(&p.attention.proj, m, hidden),
@@ -1753,7 +1746,6 @@ impl Ctx {
             self.prefetch_rest(layer, messages, after, true, after_window)?;
         }
 
-        let _ = batch;
         if let Some(b) = p.batch.as_mut() {
             let max_seqs = b.max_seqs;
             let at = index * max_seqs * BATCH_STATE_WORDS;

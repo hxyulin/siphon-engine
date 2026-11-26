@@ -53,7 +53,7 @@ use prefix::PrefixCache;
 pub use prefix::PrefixHit;
 
 use crate::{
-    draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
+    draft::{Draft, DraftOptions, STEPS, WINDOW},
     model::{
         Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, ImageSource, Model, PackedPrefill,
         PrefillLogits, Sampling, SavedState, Verdict, VerifyTokens,
@@ -121,12 +121,6 @@ impl<'a> Prompt<'a> {
         Ok(())
     }
 }
-
-/// Prompt positions whose tokens a shortlist head adds to its context rows, the last
-/// ones: at most half of [`CONTEXT_ROWS`], so the tokens that generation emits keep room.
-/// A prompt of random ids that filled every row left the draft unable to propose the new
-/// tokens of the continuation.
-const NOTED_PROMPT: usize = CONTEXT_ROWS / 2;
 
 /// Plain steps in the first run after a draft round prefers them. Each run whose draft
 /// round still prefers plain steps doubles the next run, up to [`MAX_PLAIN_RUN`]. One
@@ -797,10 +791,11 @@ impl Speculator {
         }
         // Note a bounded tail of each prompt chunk for shortlist heads without thrashing the
         // shared context table across many concurrent streams.
+        let noted_cap = (self.draft.context_capacity() / 2).min(256);
         let latest: Vec<i32> = tokens
             .iter()
             .rev()
-            .take(NOTED_PROMPT.min(256))
+            .take(noted_cap)
             .map(|&t| i32::try_from(t))
             .collect::<Result<_, _>>()?;
         if !latest.is_empty() {
@@ -842,7 +837,12 @@ impl Speculator {
         let any_draft = commit_draft.iter().any(|&c| c);
         if any_draft {
             let mut noted = Vec::new();
-            let per_slice = (NOTED_PROMPT.min(256) / slices.len().max(1)).max(32);
+            let noted_cap = (self.draft.context_capacity() / 2).min(256);
+            let per_slice = if noted_cap == 0 {
+                0
+            } else {
+                (noted_cap / slices.len().max(1)).max(32).min(noted_cap)
+            };
             for ((s, &commit), &reset) in slices.iter().zip(commit_draft).zip(reset_draft) {
                 if !commit {
                     continue;
@@ -1171,11 +1171,15 @@ impl Speculator {
         self.tail_rows = 0;
         self.prompt_len = 0;
         // A shortlist head takes the tokens of the prompt's last positions, latest first,
-        // and keeps room for the tokens the rounds emit.
+        // and keeps half of its context budget free for the tokens the rounds emit.
+        let noted = self.draft.context_capacity() / 2;
+        if noted == 0 {
+            return Ok(());
+        }
         let latest: Vec<i32> = prompt
             .iter()
             .rev()
-            .take(NOTED_PROMPT)
+            .take(noted)
             .map(|&t| i32::try_from(t))
             .collect::<Result<_, _>>()?;
         self.draft
@@ -1496,14 +1500,17 @@ impl Speculator {
             rebuild.sequence == self.draft_sequence && self.draft.committed() == len,
             "something else used the draft"
         );
-        let latest: Vec<i32> = tokens
-            .iter()
-            .rev()
-            .take(NOTED_PROMPT)
-            .map(|&t| i32::try_from(t))
-            .collect::<Result<_, _>>()?;
-        self.draft
-            .note_tokens(model.stream(), model.draft_shared(), &latest)?;
+        let noted = self.draft.context_capacity() / 2;
+        if noted > 0 {
+            let latest: Vec<i32> = tokens
+                .iter()
+                .rev()
+                .take(noted)
+                .map(|&t| i32::try_from(t))
+                .collect::<Result<_, _>>()?;
+            self.draft
+                .note_tokens(model.stream(), model.draft_shared(), &latest)?;
+        }
         self.prompt_len = len;
         self.batched = Some(Batched {
             start: len,
