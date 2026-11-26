@@ -72,6 +72,12 @@ pub struct Job {
     ticket: Option<Ticket>,
     /// The engine's drain state, from [`Engine::submit`].
     control: Option<Arc<Control>>,
+    /// When the job was made, for the queue's order.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only the Linux engine runs jobs")
+    )]
+    queued: std::time::Instant,
 }
 
 impl Job {
@@ -93,6 +99,7 @@ impl Job {
             group: 0,
             ticket: None,
             control: None,
+            queued: std::time::Instant::now(),
         }
     }
 
@@ -271,7 +278,8 @@ pub enum Event {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub model_dir: PathBuf,
-    /// Positions of the global KV cache: the prompt and the generated tokens. `None` takes
+    /// Positions of the KV cache pool, which every running request shares and one request
+    /// may fill: prompts and generated tokens. `None` takes
     /// the most that fit the memory budget.
     pub capacity: Option<usize>,
     /// Bytes of GPU memory the plan may use, the CUDA context included.
@@ -456,13 +464,16 @@ mod cuda {
         Gpu, MemoryUse,
         draft::DraftOptions,
         kv_options::KvOptions,
-        model::{DEFAULT_PREFILL_CHUNK, ImageRows, Model, Sampling as ModelSampling},
+        model::{
+            DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS, Model, Sampling as ModelSampling,
+        },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
             DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Prompt, Speculator, Width,
             WidthPolicy, load_draft, price,
         },
         vision::{VisionFormat, VisionTower},
+        vmm::{PagePool, granularity},
         weights::{OutputProjection, WeightFormat, Weights},
     };
 
@@ -522,6 +533,26 @@ mod cuda {
 
     /// Positions past the last generated token that a round may write: a full verify.
     const MARGIN: usize = VERIFY_ROWS + 1;
+
+    /// Positions past its prompt that a request needs room for in the KV pool to start:
+    /// one chunk of the pool, so that it decodes that far before it needs more.
+    const HEADROOM: usize = MAP_POSITIONS;
+
+    /// How long a request may wait before it goes ahead of shorter ones: until then the
+    /// queue starts the shortest prompts first.
+    const AGE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Bytes per second that a parked sequence returns from host memory at, a low
+    /// estimate of the 26.5 to 27.4 GB/s measured over PCIe 4.0 x16.
+    const RESTORE_RATE: f64 = 20e9;
+
+    /// The share of the time that swapping may take when sequences that do not fit the
+    /// KV pool together take turns: a request runs at least this many times as long as it
+    /// takes to swap it out and back before it may be swapped out again.
+    const SWAP_SHARE: f64 = 0.1;
+
+    /// The shortest turn a request gets before round robin may swap it out.
+    const MIN_QUANTUM: f64 = 1.0;
 
     /// Loads the model on a new thread, prices the verify widths on `warmup` (a prompt
     /// of at least 32 tokens), and returns once the thread takes jobs. `stop` holds the
@@ -636,11 +667,18 @@ mod cuda {
     impl MemoryCheck {
         /// Measures the use after warmup against `planned`, with `free` the device's free
         /// memory right after creating the context.
-        fn new(gpu: Gpu, planned: usize, free: usize) -> anyhow::Result<Self> {
+        /// `kv_pool_bytes` is the KV pool, which lies outside the memory pool too.
+        fn new(
+            gpu: Gpu,
+            planned: usize,
+            free: usize,
+            kv_pool_bytes: usize,
+        ) -> anyhow::Result<Self> {
             let now = gpu.memory()?;
             // Other processes can change the free memory meanwhile; the pool is exact.
             let used = free.saturating_sub(now.free);
             let outside_pool = used.saturating_sub(now.pool_reserved);
+            let kv_pool = kv_pool_bytes.min(outside_pool);
             let mut check = Self {
                 gpu,
                 planned,
@@ -650,12 +688,13 @@ mod cuda {
             };
             eprintln!(
                 "memory check: {} GiB of a planned {} GiB in use after warmup ({} GiB in \
-                 buffers, peak {} GiB; {} GiB in modules and graphs)",
+                 buffers, peak {} GiB; {} GiB in the KV pool; {} GiB in modules and graphs)",
                 gib(check.peak(&now)),
                 gib(planned),
                 gib(now.pool_reserved),
                 gib(now.pool_reserved_peak),
-                gib(outside_pool),
+                gib(kv_pool),
+                gib(outside_pool - kv_pool),
             );
             check.warn(&now);
             Ok(check)
@@ -698,6 +737,7 @@ mod cuda {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "startup, step by step")]
     fn load(
         options: &Options,
         warmup: &[u32],
@@ -726,6 +766,7 @@ mod cuda {
                 }),
             prefill_chunk: chunk,
             streams: options.streams,
+            pooled: true,
             prefix_entries: options.prefix_entries,
             sms: gpu.sms()?,
             vision: vision_inputs(options)?,
@@ -733,8 +774,35 @@ mod cuda {
         let capacity = plan(options, &planner, free, warmup.len())?;
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = output_projection(options);
-        let mut model =
-            Model::with_formats(&gpu, config, weights, passes, capacity, kv, weight_format)?;
+        let (page, _) = granularity(gpu.context())?;
+        if page != memory::KV_PAGE_BYTES {
+            eprintln!(
+                "warning: the device maps pages of {} KiB, the plan assumes {} KiB",
+                page >> 10,
+                memory::KV_PAGE_BYTES >> 10
+            );
+        }
+        let pool_started = Instant::now();
+        let pool = PagePool::new(gpu.context(), planner.plan(capacity).kv.div_ceil(page))?;
+        eprintln!(
+            "KV pool: {} pages of {} MiB ({} GiB) in {:.2} s, for {capacity} positions over \
+             up to {} streams",
+            pool.total_pages(),
+            page >> 20,
+            gib(pool.total_pages() * page),
+            pool_started.elapsed().as_secs_f64(),
+            options.streams
+        );
+        let mut model = Model::with_kv_pool(
+            &gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            kv,
+            weight_format,
+            Some(pool),
+        )?;
         kv_options.apply(&mut model)?;
         model.set_prefill_attention(options.prefill_attention.parse()?);
         if !options.greedy {
@@ -789,6 +857,9 @@ mod cuda {
             eprintln!("serving up to {} requests at once", options.streams);
         }
         drop(saved);
+        // Pricing left the draft's caches mapped; the pool starts empty.
+        speculator.trim_draft(&model)?;
+        model.reset()?;
         if options.prefix_entries > 0 {
             let bytes = speculator.enable_prefix_cache(
                 &model,
@@ -796,7 +867,8 @@ mod cuda {
                 options.prefix_ttl,
             )?;
             eprintln!(
-                "prefix cache: {} entries, {} MiB of copies, {} s to live",
+                "prefix cache: {} entries, {} MiB of copies besides their rings' in the KV pool, \
+                 {} s to live",
                 options.prefix_entries,
                 bytes >> 20,
                 options.prefix_ttl.as_secs()
@@ -808,7 +880,10 @@ mod cuda {
         // After pricing, so that they reuse the memory pricing freed, as a long prompt's
         // prefill would.
         model.reserve_prefill(chunk)?;
-        let check = MemoryCheck::new(gpu, planner.plan(capacity).total(), free)?;
+        let kv_pool = model
+            .kv_pool()
+            .map_or(0, |p| p.total_pages() * p.page_bytes());
+        let check = MemoryCheck::new(gpu, planner.plan(capacity).total(), free, kv_pool)?;
         Ok((model, speculator, tower, capacity, check))
     }
 
@@ -1044,6 +1119,13 @@ mod cuda {
         batched: usize,
         /// The image a batched prefill chunk encoded for the next one.
         kept: Kept,
+        /// When the request last started to run: admitted, or back from the host tier.
+        since: Instant,
+        /// Its id in the host tier while swapped out (`park`).
+        parked: Option<usize>,
+        /// Times it was swapped out, and the seconds it spent swapped out.
+        parks: usize,
+        parked_s: f64,
     }
 
     impl Request {
@@ -1073,6 +1155,10 @@ mod cuda {
                 speculated: 0,
                 batched: 0,
                 kept: None,
+                since: Instant::now(),
+                parked: None,
+                parks: 0,
+                parked_s: 0.0,
             };
             if let Some(e) = error {
                 request.fail(&e);
@@ -1080,6 +1166,33 @@ mod cuda {
                 request.fail(&anyhow::anyhow!(CANCELLED));
             }
             request
+        }
+
+        /// Positions its slot holds: the prompt prefilled so far, then every generated
+        /// token but the last, which is fed next.
+        fn position(&self) -> usize {
+            if self.next.is_some() {
+                self.job.prompt.len() + self.output.len() - 1
+            } else {
+                self.prefilled
+            }
+        }
+
+        /// The ids at its positions: the prompt's key ([`Job::key`]), then the generated
+        /// tokens, which are their own keys.
+        fn fed(&self) -> Vec<u32> {
+            let key = self.job.key();
+            if self.next.is_some() {
+                let generated = &self.output[..self.output.len() - 1];
+                key.iter().chain(generated).copied().collect()
+            } else {
+                key[..self.prefilled].to_vec()
+            }
+        }
+
+        /// The most positions it can reach: its prompt and every token it may generate.
+        fn final_position(&self, capacity: usize) -> usize {
+            (self.job.prompt.len() + self.job.max_tokens + MARGIN).min(capacity)
         }
 
         /// Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
@@ -1125,9 +1238,17 @@ mod cuda {
                 0 => String::new(),
                 n => format!(", {n} images"),
             };
+            let parks = if self.parks > 0 {
+                format!(
+                    ", swapped out {} times for {:.2} s",
+                    self.parks, self.parked_s
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
                 "job: {} prompt tokens ({} cached{images}), prefill {:.0} ms{}, {} tokens in \
-                 {:.2} s ({:.1} tok/s, {} speculated, {} batched steps{detail}), {}",
+                 {:.2} s ({:.1} tok/s, {} speculated, {} batched steps{parks}{detail}), {}",
                 self.job.prompt.len(),
                 self.cached,
                 self.prefill_s * 1e3,
@@ -1154,6 +1275,16 @@ mod cuda {
         }
     }
 
+    /// What the scheduler goes by.
+    struct Sched {
+        streams: usize,
+        greedy: bool,
+        /// Tokens per second each decoding request gets at least while another prefills.
+        floor: f64,
+        /// Positions of the KV pool: the most one request may hold.
+        capacity: usize,
+    }
+
     #[expect(clippy::too_many_arguments, reason = "the engine thread's state")]
     #[expect(
         clippy::too_many_lines,
@@ -1169,7 +1300,14 @@ mod cuda {
         options: &Options,
         control: &Control,
     ) {
-        let (streams, greedy) = (options.streams, options.greedy);
+        let capacity = model.slot_capacity();
+        let sched = Sched {
+            streams: options.streams,
+            greedy: options.greedy,
+            floor: options.decode_floor,
+            capacity,
+        };
+        let (streams, greedy) = (sched.streams, sched.greedy);
         let mut waiting = VecDeque::new();
         // A request that a batch left alone, to continue with speculation.
         let mut resumed = None;
@@ -1200,7 +1338,7 @@ mod cuda {
                 }
                 // Another job already waits: start them together.
                 if streams > 1 {
-                    if let Ok(jobs) = queue.try_recv() {
+                    while let Ok(jobs) = queue.try_recv() {
                         waiting.extend(jobs);
                     }
                     if !waiting.is_empty() {
@@ -1213,9 +1351,7 @@ mod cuda {
                             &mut waiting,
                             queue,
                             stop,
-                            streams,
-                            greedy,
-                            options.decode_floor,
+                            &sched,
                         );
                         check.after_job();
                         continue;
@@ -1223,11 +1359,9 @@ mod cuda {
                 }
                 // A prompt whose entry lacks the draft's state prefills from that entry as
                 // a batch of one rather than whole in slot 0.
-                if streams > 1
-                    && speculator
-                        .prefix_lookup(&model, job.key(), speculator.prefill_chunk(), &[])
-                        .is_some_and(|hit| !hit.draft)
-                {
+                let hit =
+                    speculator.prefix_lookup(&model, job.key(), speculator.prefill_chunk(), &[]);
+                if streams > 1 && hit.is_some_and(|hit| !hit.draft) {
                     waiting.push_front(job);
                     resumed = batched(
                         &mut model,
@@ -1237,9 +1371,7 @@ mod cuda {
                         &mut waiting,
                         queue,
                         stop,
-                        streams,
-                        greedy,
-                        options.decode_floor,
+                        &sched,
                     );
                     check.after_job();
                     continue;
@@ -1248,17 +1380,34 @@ mod cuda {
                 if request.done {
                     continue;
                 }
+                // Alone, the request may take the whole pool: room for every position it
+                // may reach, the draft's and its entry's copies of the rings. A sequence
+                // that moves into or out of slot 0 first is copied while the pool has room
+                // for the copy (`Model::transfer_slot`), so the room counts the copy too:
+                // the hit's, or slot 0's entry moving aside. Only a hit in slot 0 stays.
+                let end = request.final_position(capacity);
+                let hit_slot = hit.and_then(|h| h.slot);
+                let mut need =
+                    model.pages_for(end) + speculator.draft_pages_to(end) + model.ring_pages();
+                if hit_slot == Some(0) {
+                    need = need.saturating_sub(model.slot_pages(0).unwrap_or(0));
+                } else {
+                    need += model.pages_for(model.slot_position(0).unwrap_or(0));
+                }
+                let keep: Vec<usize> = hit_slot.into_iter().collect();
+                make_room(&mut model, &mut speculator, need, &keep);
                 request
             };
             let interrupt = (streams > 1).then_some((queue, &mut waiting));
-            match alone(
+            let ran = alone(
                 &mut model,
                 &mut speculator,
                 &mut tower,
                 &mut request,
                 stop,
                 interrupt,
-            ) {
+            );
+            match ran {
                 Ok(true) => {
                     speculator.follow(&model);
                     request.followed = true;
@@ -1270,15 +1419,393 @@ mod cuda {
                         &mut waiting,
                         queue,
                         stop,
-                        streams,
-                        greedy,
-                        options.decode_floor,
+                        &sched,
                     );
                 }
                 Ok(false) => {}
                 Err(e) => request.fail(&e),
             }
             check.after_job();
+        }
+    }
+
+    /// Returns the pages of idle slot `slot` that its prefix cache entry does not need to
+    /// the KV pool. A failure goes to the log.
+    fn release(model: &mut Model, speculator: &mut Speculator, slot: usize) {
+        if let Err(e) = speculator.release_slot(model, slot) {
+            eprintln!("returning slot {slot}'s pages failed: {e:#}");
+        }
+    }
+
+    /// Frees pages of the KV pool until `need` are free, from slots outside `keep`: first
+    /// the pages that idle slots keep past their prefix cache entries and their rings, and
+    /// the copies of entries no longer live, then whole entries with their pages, least
+    /// recently used first, then the draft's pages if it follows no request. Returns
+    /// whether `need` pages are free.
+    fn make_room(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        need: usize,
+        keep: &[usize],
+    ) -> bool {
+        let free = |m: &Model| m.kv_pool().map_or(usize::MAX, PagePool::free_pages);
+        if free(model) >= need {
+            return true;
+        }
+        if let Err(e) = speculator.release_dead_entries(model) {
+            eprintln!("returning the pages of dropped prefix cache entries failed: {e:#}");
+        }
+        if free(model) >= need {
+            return true;
+        }
+        for slot in (0..model.slots()).filter(|s| !keep.contains(s)) {
+            release(model, speculator, slot);
+            if free(model) >= need {
+                return true;
+            }
+        }
+        for (slot, pages) in speculator.evictable_slots(model, keep) {
+            match speculator.evict_slot(model, slot) {
+                Ok(()) => eprintln!(
+                    "KV pool: dropped slot {slot}'s cached prompt, {pages} pages, for {need} \
+                     pages"
+                ),
+                Err(e) => eprintln!("dropping slot {slot}'s cached prompt failed: {e:#}"),
+            }
+            if free(model) >= need {
+                return true;
+            }
+        }
+        match speculator.trim_draft(model) {
+            Ok(0) => {}
+            Ok(pages) => eprintln!("KV pool: dropped the draft's {pages} pages"),
+            Err(e) => eprintln!("dropping the draft's pages failed: {e:#}"),
+        }
+        free(model) >= need
+    }
+
+    /// Seconds a request of `positions` must run before round robin may swap it out:
+    /// swapping it out and back, at [`RESTORE_RATE`] each way, takes [`SWAP_SHARE`] of
+    /// its turn.
+    fn quantum(model: &Model, positions: usize) -> f64 {
+        let page = model.kv_pool().map_or(0, PagePool::page_bytes);
+        let bytes = (model.pages_for(positions) * page) as f64;
+        let swap = 2.0 * bytes / RESTORE_RATE;
+        (swap * (1.0 - SWAP_SHARE) / SWAP_SHARE).max(MIN_QUANTUM)
+    }
+
+    /// The request of `active` to swap out for room: one still prefilling, the latest to
+    /// start first, since its client sees no tokens yet; else the decoding request that
+    /// has run longest since it started. Only one that has had its turn ([`quantum`])
+    /// unless `force`. Never the request in slot `spare`.
+    fn victim(
+        model: &Model,
+        active: &[Request],
+        spare: Option<usize>,
+        force: bool,
+    ) -> Option<usize> {
+        let had_turn =
+            |r: &Request| force || r.since.elapsed().as_secs_f64() >= quantum(model, r.position());
+        let candidates = || {
+            active.iter().enumerate().filter(|&(_, r)| {
+                Some(r.slot) != spare && !r.done && r.position() > 0 && had_turn(r)
+            })
+        };
+        candidates()
+            .filter(|(_, r)| r.next.is_none())
+            .max_by_key(|(_, r)| r.since)
+            .or_else(|| candidates().min_by_key(|(_, r)| r.since))
+            .map(|(i, _)| i)
+    }
+
+    /// Swaps `r` out to the host tier, freeing its slot and its pages. Returns false, and
+    /// leaves it running, when there is no host tier or it does not fit there.
+    fn park(model: &mut Model, speculator: &mut Speculator, r: &mut Request) -> bool {
+        let fed = r.fed();
+        let parked = speculator.park(model, r.slot, &fed, r.job.prompt.len());
+        log_host(speculator);
+        match parked {
+            Ok(Some(id)) => {
+                if r.followed {
+                    speculator.forget();
+                    r.followed = false;
+                }
+                eprintln!(
+                    "round robin: swapped out a request at position {} after {:.2} s",
+                    fed.len(),
+                    r.since.elapsed().as_secs_f64()
+                );
+                r.parked = Some(id);
+                // An image that a prefill chunk kept for the next one is encoded again
+                // when the request returns, rather than held in GPU memory meanwhile.
+                r.kept = None;
+                r.parks += 1;
+                r.since = Instant::now();
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                // The slot may be half freed: the request ends.
+                r.fail(&e);
+                false
+            }
+        }
+    }
+
+    /// Swaps requests of `active` out (`victim`, `park`) until `need(active)` pages of
+    /// the KV pool are free, after dropping what `make_room` drops. Only requests that
+    /// have had their turn unless `force`; never the one in slot `spare`. Returns whether
+    /// the room is there.
+    fn room_for(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut Vec<Request>,
+        parked: &mut Vec<Request>,
+        spare: Option<usize>,
+        force: bool,
+        need: impl Fn(&Model, &[Request]) -> usize,
+    ) -> bool {
+        loop {
+            let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+            let pages = need(model, active);
+            if make_room(model, speculator, pages, &busy) {
+                return true;
+            }
+            let Some(v) = victim(model, active, spare, force) else {
+                return false;
+            };
+            if !park(model, speculator, &mut active[v]) {
+                return false;
+            }
+            parked.push(active.remove(v));
+        }
+    }
+
+    /// Pages that the requests of `active` may still take beyond what they hold, when they
+    /// cannot be swapped out: their every position (`Request::final_position`).
+    fn growth(model: &Model, active: &[Request], capacity: usize) -> usize {
+        active
+            .iter()
+            .filter(|r| !r.done)
+            .map(|r| {
+                model
+                    .pages_for(r.final_position(capacity))
+                    .saturating_sub(model.slot_pages(r.slot).unwrap_or(0))
+            })
+            .sum()
+    }
+
+    /// Pages that the requests of `active` still prefilling will map for the rest of their
+    /// prompts, [`HEADROOM`] more, and their prefix cache entries' copies of the rings.
+    fn prefill_growth(model: &Model, active: &[Request], capacity: usize) -> usize {
+        active
+            .iter()
+            .filter(|r| !r.done && r.next.is_none())
+            .map(|r| {
+                let end = (r.job.prompt.len() + HEADROOM).min(capacity);
+                (model.pages_for(end) + model.ring_pages())
+                    .saturating_sub(model.slot_pages(r.slot).unwrap_or(0))
+            })
+            .sum()
+    }
+
+    /// What `admit` may start next.
+    #[derive(Clone, Copy)]
+    enum Pick {
+        Waiting(usize),
+        Parked(usize),
+    }
+
+    /// Starts waiting jobs and swapped-out requests while they fit: a free slot, and room in
+    /// the KV pool for their positions and [`HEADROOM`] more, or without a host tier for
+    /// every position they may reach. Jobs that waited past [`AGE_LIMIT`] go first, in
+    /// arrival order, then swapped-out requests in the order they left, then the other
+    /// jobs from the shortest prompt. When one does not fit, running requests that have
+    /// had their turn are swapped out for it (round robin); a job past the age limit that
+    /// still does not fit stops the others from passing it.
+    fn admit(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut Vec<Request>,
+        waiting: &mut VecDeque<Job>,
+        parked: &mut Vec<Request>,
+        sched: &Sched,
+    ) {
+        let can_park = speculator.can_park();
+        loop {
+            waiting.retain(|j| !j.events.is_closed());
+            parked.retain_mut(|r| {
+                let gone = r.job.events.is_closed() || r.job.cancelled();
+                if gone {
+                    if let Some(id) = r.parked.take() {
+                        speculator.drop_parked(id);
+                    }
+                    if r.job.cancelled() {
+                        r.fail(&anyhow::anyhow!(CANCELLED));
+                    }
+                }
+                !gone
+            });
+            let now = Instant::now();
+            let aged = |j: &Job| now.duration_since(j.queued) >= AGE_LIMIT;
+            let mut order: Vec<(Pick, bool)> = (0..waiting.len())
+                .filter(|&i| aged(&waiting[i]))
+                .map(|i| (Pick::Waiting(i), true))
+                .collect();
+            order.extend((0..parked.len()).map(|i| (Pick::Parked(i), false)));
+            let mut young: Vec<usize> =
+                (0..waiting.len()).filter(|&i| !aged(&waiting[i])).collect();
+            young.sort_by_key(|&i| waiting[i].prompt.len());
+            order.extend(young.into_iter().map(|i| (Pick::Waiting(i), false)));
+            let mut started = false;
+            for (pick, firm) in order {
+                let fits = pick_room(model, speculator, active, waiting, parked, pick, sched);
+                let fits = fits
+                    || (can_park && {
+                        let mut room = false;
+                        while let Some(v) = victim(model, active, None, false) {
+                            if !park(model, speculator, &mut active[v]) {
+                                break;
+                            }
+                            parked.push(active.remove(v));
+                            if pick_room(model, speculator, active, waiting, parked, pick, sched) {
+                                room = true;
+                                break;
+                            }
+                        }
+                        room
+                    });
+                if fits {
+                    start_pick(
+                        model,
+                        speculator,
+                        active,
+                        waiting,
+                        parked,
+                        pick,
+                        sched.greedy,
+                    );
+                    started = true;
+                    break;
+                }
+                if firm {
+                    return;
+                }
+            }
+            if !started {
+                return;
+            }
+        }
+    }
+
+    /// Whether `pick` fits now, after `make_room`: a free slot, and pages for its positions
+    /// and [`HEADROOM`] more and its entry's copies of the rings, beside what the running
+    /// requests still prefill, or without a host tier every position they may reach. The
+    /// slot it will take keeps its pages: a waiting job's prefix cache slot, or the idle
+    /// slot a swapped-out request returns to.
+    fn pick_room(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &[Request],
+        waiting: &VecDeque<Job>,
+        parked: &[Request],
+        pick: Pick,
+        sched: &Sched,
+    ) -> bool {
+        if active.len() >= sched.streams {
+            return false;
+        }
+        let can_park = speculator.can_park();
+        let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+        let (positions, slot) = match pick {
+            Pick::Waiting(i) => {
+                let job = &waiting[i];
+                let hit = speculator
+                    .prefix_lookup(model, job.key(), speculator.prefill_chunk(), &busy)
+                    .and_then(|h| h.slot);
+                let end = if can_park {
+                    job.prompt.len() + HEADROOM
+                } else {
+                    job.prompt.len() + job.max_tokens + MARGIN
+                };
+                (end, hit)
+            }
+            Pick::Parked(i) => (
+                parked[i].position() + HEADROOM,
+                speculator.return_slot(model, &busy),
+            ),
+        };
+        let positions = positions.min(sched.capacity);
+        let held = slot.map_or(0, |s| model.slot_pages(s).unwrap_or(0));
+        // Its prefix cache entry copies its rings too.
+        let mine = (model.pages_for(positions) + model.ring_pages()).saturating_sub(held);
+        let others = if can_park {
+            prefill_growth(model, active, sched.capacity)
+        } else {
+            growth(model, active, sched.capacity)
+        };
+        let mut keep = busy;
+        keep.extend(slot);
+        make_room(model, speculator, mine + others, &keep)
+    }
+
+    /// Starts `pick`: a waiting job in the slot the prefix cache gives it, or a swapped-out
+    /// request back from the host tier.
+    fn start_pick(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut Vec<Request>,
+        waiting: &mut VecDeque<Job>,
+        parked: &mut Vec<Request>,
+        pick: Pick,
+        greedy: bool,
+    ) {
+        let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+        match pick {
+            Pick::Waiting(i) => {
+                let Some(job) = waiting.remove(i) else { return };
+                let mut request = Request::new(job, 0, greedy);
+                if request.done {
+                    return;
+                }
+                let key = request.job.key();
+                let claimed = speculator.claim_slot(model, key, speculator.prefill_chunk(), &busy);
+                log_host(speculator);
+                match claimed {
+                    Ok((slot, cached)) => {
+                        request.slot = slot;
+                        request.prefilled = cached;
+                        request.cached = cached;
+                        let _ = request.job.events.send(Event::Cached(cached));
+                        active.push(request);
+                    }
+                    Err(e) => request.fail(&e),
+                }
+            }
+            Pick::Parked(i) => {
+                let mut r = parked.remove(i);
+                let Some(id) = r.parked.take() else { return };
+                let back = speculator.unpark(model, id, &busy);
+                log_host(speculator);
+                match back {
+                    Ok((slot, position)) if position == r.position() => {
+                        r.parked_s += r.since.elapsed().as_secs_f64();
+                        eprintln!(
+                            "round robin: a request at position {position} returned to slot \
+                             {slot} after {:.2} s",
+                            r.since.elapsed().as_secs_f64()
+                        );
+                        r.slot = slot;
+                        r.since = Instant::now();
+                        active.push(r);
+                    }
+                    Ok((_, position)) => r.fail(&anyhow::anyhow!(
+                        "a swapped-out request came back at position {position}, not {}",
+                        r.position()
+                    )),
+                    Err(e) => r.fail(&e),
+                }
+            }
         }
     }
 
@@ -1420,6 +1947,20 @@ mod cuda {
                 "{} tokens fed, the slot is at {position}",
                 tokens.len()
             );
+            // The rebuild prefills every position again in another slot, and the draft
+            // commits them: without room for both, the request stays batched. Moving the
+            // request into slot 0 first copies it while the pool has room for the copy.
+            let moved = if r.slot == 0 {
+                0
+            } else {
+                model.pages_for(position)
+            };
+            let need =
+                model.pages_for(position) + moved + speculator.draft_pages_to(position + MARGIN);
+            if !make_room(model, speculator, need, &[r.slot]) {
+                eprintln!("no room in the KV pool to rebuild the draft at position {position}");
+                return Ok(false);
+            }
             // Into slot 0 first, so that the rebuild may take the slot it leaves.
             speculator.move_to_slot0(model, r.slot)?;
             r.slot = 0;
@@ -1459,12 +2000,15 @@ mod cuda {
     }
 
     /// Runs `active` and the jobs that arrive while any runs, up to `streams` at once, each
-    /// in its own slot, until none is left or one is left alone. Each turn prefills one
-    /// chunk of the oldest request still prefilling, then runs batched steps of the others:
-    /// one, or after a chunk as many as give each decoding request `floor` tokens per
-    /// second of the time since the last step (`floor_steps`). A request left alone with
-    /// nothing waiting returns, in slot 0, to continue with speculation (`speculate_again`). Each request takes its slot from the prefix
-    /// cache (`Speculator::claim_slot`), and prefills from where its entry ends.
+    /// in its own slot, until none is left or one is left alone. Starts every waiting job
+    /// that fits the KV pool (`admit`), swapping running requests out to the host tier and
+    /// back in turns when they do not fit together. Each turn prefills one chunk of a
+    /// request still prefilling, the one with the fewest prompt tokens left, then runs
+    /// batched steps of the others: one, or after a chunk as many as give each decoding
+    /// request `floor` tokens per second of the time since the last step (`floor_steps`).
+    /// A request left alone with nothing waiting returns, in slot 0, to continue with
+    /// speculation (`speculate_again`). Each request takes its slot from the prefix cache
+    /// (`Speculator::claim_slot`), and prefills from where its entry ends.
     #[expect(clippy::too_many_arguments, reason = "the scheduler's state")]
     fn batched(
         model: &mut Model,
@@ -1474,48 +2018,35 @@ mod cuda {
         waiting: &mut VecDeque<Job>,
         queue: &Receiver<Vec<Job>>,
         stop: &[u32],
-        streams: usize,
-        greedy: bool,
-        floor: f64,
+        sched: &Sched,
     ) -> Option<Request> {
+        // Requests swapped out to the host tier, to return when they fit.
+        let mut parked: Vec<Request> = Vec::new();
         // When the last batched step synced: the decoding requests have waited since then.
         let mut synced = Instant::now();
         loop {
-            while active.len() < streams {
-                if waiting.is_empty()
-                    && let Ok(jobs) = queue.try_recv()
-                {
-                    waiting.extend(jobs);
-                }
-                let Some(job) = waiting.pop_front() else {
-                    break;
-                };
-                if job.events.is_closed() {
-                    continue;
-                }
-                let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
-                let mut request = Request::new(job, 0, greedy);
-                if request.done {
-                    continue;
-                }
-                let key = request.job.key();
-                let claimed = speculator.claim_slot(model, key, speculator.prefill_chunk(), &busy);
-                log_host(speculator);
-                match claimed {
-                    Ok((slot, cached)) => {
-                        request.slot = slot;
-                        request.prefilled = cached;
-                        request.cached = cached;
-                        let _ = request.job.events.send(Event::Cached(cached));
-                        active.push(request);
-                    }
-                    Err(e) => request.fail(&e),
-                }
+            while let Ok(jobs) = queue.try_recv() {
+                waiting.extend(jobs);
             }
+            admit(model, speculator, &mut active, waiting, &mut parked, sched);
             if active.is_empty() {
-                return None;
+                if waiting.is_empty() && parked.is_empty() {
+                    return None;
+                }
+                // Nothing fits an empty pool: the first in line fails rather than wait.
+                if let Some(mut r) = parked.pop() {
+                    if let Some(id) = r.parked.take() {
+                        speculator.drop_parked(id);
+                    }
+                    r.fail(&anyhow::anyhow!("the request no longer fits the KV pool"));
+                } else if let Some(job) = waiting.pop_front() {
+                    let mut r = Request::new(job, 0, sched.greedy);
+                    r.fail(&anyhow::anyhow!("the request does not fit the KV pool"));
+                }
+                continue;
             }
-            let chunked = prefill_chunk(model, speculator, tower, &mut active, stop);
+            let chunked = prefill_chunk(model, speculator, tower, &mut active, &mut parked, stop);
+            retire(model, speculator, &mut active);
             // Right after its prefill, a lone request speculates before any batched step,
             // as it would have from the start.
             if let [r] = active.as_mut_slice()
@@ -1523,6 +2054,7 @@ mod cuda {
                 && !r.done
                 && !r.stay_batched
                 && waiting.is_empty()
+                && parked.is_empty()
             {
                 match speculate_again(model, speculator, tower, r) {
                     Ok(true) => return active.pop(),
@@ -1537,14 +2069,45 @@ mod cuda {
             }
             let first_step = Instant::now();
             let mut steps = 0;
-            while step_rows(model, speculator, &mut active, stop) {
-                retire(speculator, &mut active);
+            loop {
+                // Room for every row's next position, swapping requests out if need be. When
+                // none can go to the host tier, the latest to start of those that need pages
+                // fail until the rest fit.
+                let next_pages =
+                    |m: &Model, r: &Request| m.slot_pages_to(r.slot, r.position() + 1).unwrap_or(0);
+                while !room_for(
+                    model,
+                    speculator,
+                    &mut active,
+                    &mut parked,
+                    None,
+                    true,
+                    |m, a| {
+                        a.iter()
+                            .filter(|r| !r.done && r.next.is_some())
+                            .map(|r| next_pages(m, r))
+                            .sum()
+                    },
+                ) {
+                    let Some(r) = active
+                        .iter_mut()
+                        .filter(|r| !r.done && r.next.is_some() && next_pages(model, r) > 0)
+                        .max_by_key(|r| r.since)
+                    else {
+                        break;
+                    };
+                    r.fail(&anyhow::anyhow!("the KV pool is full"));
+                }
+                if !step_rows(model, speculator, &mut active, stop) {
+                    break;
+                }
+                retire(model, speculator, &mut active);
                 steps += 1;
-                if !chunked || !floor_steps(floor, steps, synced, first_step) {
+                if !chunked || !floor_steps(sched.floor, steps, synced, first_step) {
                     break;
                 }
             }
-            retire(speculator, &mut active);
+            retire(model, speculator, &mut active);
             synced = Instant::now();
         }
     }
@@ -1563,8 +2126,9 @@ mod cuda {
     }
 
     /// Drops the requests of `active` that are done, and finishes those that ended without
-    /// a failure.
-    fn retire(speculator: &mut Speculator, active: &mut Vec<Request>) {
+    /// a failure. Their slots keep their pages until the KV pool runs short (`make_room`),
+    /// so that the next request in a slot maps none.
+    fn retire(model: &mut Model, speculator: &mut Speculator, active: &mut Vec<Request>) {
         active.retain(|r| {
             if r.done {
                 if r.followed {
@@ -1572,6 +2136,9 @@ mod cuda {
                 }
                 if !r.failed && r.next.is_some() {
                     r.finish("");
+                }
+                if r.failed {
+                    release(model, speculator, r.slot);
                 }
             }
             !r.done
@@ -1585,12 +2152,52 @@ mod cuda {
         model: &mut Model,
         speculator: &mut Speculator,
         tower: &mut Tower,
-        active: &mut [Request],
+        active: &mut Vec<Request>,
+        parked: &mut Vec<Request>,
         stop: &[u32],
     ) -> bool {
-        let Some(i) = active.iter().position(|r| r.next.is_none()) else {
+        // The fewest prompt tokens left first, but a request past the age limit first of
+        // all, in arrival order.
+        let pick = |active: &[Request]| {
+            let prefilling = || {
+                active
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.next.is_none() && !r.done)
+            };
+            prefilling()
+                .filter(|(_, r)| r.job.queued.elapsed() >= AGE_LIMIT)
+                .min_by_key(|(_, r)| r.job.queued)
+                .or_else(|| prefilling().min_by_key(|(_, r)| r.job.prompt.len() - r.prefilled))
+                .map(|(i, _)| i)
+        };
+        let Some(i) = pick(active) else {
             return false;
         };
+        // Room for the chunk, swapping out others if need be; the chunk's request may go
+        // too, and then another prefills.
+        let chunk = speculator.prefill_chunk();
+        let want = |m: &Model, r: &Request| {
+            let end = (r.prefilled + chunk).min(r.job.prompt.len());
+            m.slot_pages_to(r.slot, end).unwrap_or(0)
+        };
+        let slot = active[i].slot;
+        let room = room_for(
+            model,
+            speculator,
+            active,
+            parked,
+            Some(slot),
+            true,
+            |m, a| a.iter().find(|r| r.slot == slot).map_or(0, |r| want(m, r)),
+        );
+        let Some(i) = active.iter().position(|r| r.slot == slot) else {
+            return false;
+        };
+        if !room {
+            active[i].fail(&anyhow::anyhow!("the KV pool is full"));
+            return true;
+        }
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
         let r = &mut active[i];
         if r.job.events.is_closed() {
@@ -1602,7 +2209,6 @@ mod cuda {
             return false;
         }
         let len = r.job.prompt.len();
-        let chunk = speculator.prefill_chunk();
         let end = (r.prefilled + chunk).min(len);
         let boundary = len.saturating_sub(1) / chunk * chunk;
         model.set_sampling(r.sampling);
@@ -1626,12 +2232,19 @@ mod cuda {
             }
         };
         r.prefilled = end;
-        if end == boundary
-            && end > r.cached
-            && let Err(e) = speculator.save_prefix(model, r.slot, r.job.key(), chunk, &busy)
-        {
-            eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+        let slot = r.slot;
+        // The entry copies the slot's rings into pages of the pool.
+        if end == boundary && end > r.cached {
+            if make_room(model, speculator, model.ring_pages(), &busy) {
+                let key = active[i].job.key();
+                if let Err(e) = speculator.save_prefix(model, slot, key, chunk, &busy) {
+                    eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+                }
+            } else {
+                eprintln!("no room in the KV pool to keep a prompt in the prefix cache");
+            }
         }
+        let r = &mut active[i];
         log_host(speculator);
         if end == len {
             r.kept = None;

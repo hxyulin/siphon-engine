@@ -36,12 +36,15 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
                      [--decode-floor 20] [--greedy] [--vision] \
                      [--max-image-pixels 2073600] [--max-images 16]
---context sets the positions of the KV cache: the prompt and the generated tokens. Without it
-the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
-way it plans the memory before loading the weights and stops if the plan does not fit.
---streams runs up to N requests at once (1 to 32), each with its own KV cache of --context
-positions. A request alone speculates; once another arrives, all run batched plain decode.
-Either way a request gets the same tokens. Up to --queue more requests wait.
+--context sets the positions of the KV cache pool: the prompts and generated tokens of every
+running request together. One request may take all of them, up to the model's limit of
+1,048,576. Without it the server takes the most that fit in GPU memory. Either way it plans
+the memory before loading the weights and stops if the plan does not fit.
+--streams runs up to N requests at once (1 to 32), as many as the pool holds; each stream
+costs its sliding rings and prefix cache entry, about 0.33 GiB. A request alone speculates;
+once another arrives, all run batched plain decode. Either way a request gets the same
+tokens. With --host-cache, requests that do not fit the pool together take turns, swapped
+out to host memory and back. Up to --queue more requests wait.
 --decode-floor gives each decoding request at least that many tokens per second while
 another request's prompt prefills, by running more batched steps between its chunks of
 --prefill-chunk tokens. The prefill keeps at least half of the time. 0 runs one step per chunk.

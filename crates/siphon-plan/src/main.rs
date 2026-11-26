@@ -52,8 +52,9 @@ siphon-serve's --output-projection does (bf16 by default).
 --free sets the free memory right after creating the CUDA context instead of asking
 nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
---streams plans N streams, 1 to 32, as siphon-serve's --streams does: N sets of caches of
-the context each, the batched step's buffers and a prefix cache entry per stream.
+--streams plans N streams, 1 to 32, as siphon-serve's --streams does: one pool of the
+context's positions that the streams share, the batched step's buffers and a prefix cache
+entry per stream.
 --vision adds the vision tower and its buffers for images shrunk to --max-image-pixels
 (default 1920 x 1080), as siphon-serve's flags of the same names do.
 --print prints one frame as text and exits.";

@@ -162,10 +162,14 @@ fn all_parts(app: &App) -> Vec<Part> {
             "decode matrices",
         ),
         Part::new(
-            "KV cache",
+            if plan.pooled { "KV pool" } else { "KV cache" },
             plan.kv,
             Color::Rgb(80, 200, 140),
-            per_position(one.kv),
+            if plan.pooled {
+                format!("{} + rings", thousands(context))
+            } else {
+                per_position(one.kv)
+            },
         ),
         Part::new(
             "Draft KV cache",
@@ -198,16 +202,28 @@ fn all_parts(app: &App) -> Vec<Part> {
             format!("{} rows", app.streams),
         ),
         Part::new(
-            "Rings, conv",
+            if plan.pooled {
+                "Conv states"
+            } else {
+                "Rings, conv"
+            },
             plan.rings,
             Color::Rgb(80, 196, 205),
-            "windows, conv states",
+            if plan.pooled {
+                "per stream"
+            } else {
+                "windows, conv states"
+            },
         ),
         Part::new(
             "Prefix cache",
             plan.prefix,
             Color::Rgb(148, 226, 213),
-            "copies of rings, conv",
+            if plan.pooled {
+                "copies of conv states"
+            } else {
+                "copies of rings, conv"
+            },
         ),
         Part::new(
             "Vision",

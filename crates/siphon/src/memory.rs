@@ -52,6 +52,11 @@ pub const DEFAULT_MARGIN: usize = 256 << 20;
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 pub const MAX_PREFILL_CHUNK: usize = 2048;
 
+/// What a KV pool adds beyond its pages: the page tables of every slot's reservations and
+/// copies between them. On an RTX PRO 6000 Blackwell, two sequences of 300,000 positions
+/// that took turns in a pool of 524,288 peaked 17 MiB past a plan without it.
+pub const POOL_RUNTIME_BYTES: usize = 64 << 20;
+
 /// Rows of the largest verify pass.
 pub const VERIFY_ROWS: usize = 8;
 /// Rows of the largest batched step: one per stream.
@@ -98,6 +103,12 @@ pub const ROUTER_SPLITS: usize = 9;
 pub const FUSED_MAX_CANDIDATES: usize = 6;
 /// Capacities are multiples of this.
 pub const CAPACITY_STEP: usize = 1024;
+/// Positions of the global caches that a pooled KV cache maps at a time: the default prefill
+/// chunk, at whose multiples the prefix cache saves.
+pub const POOL_CHUNK: usize = 2048;
+/// Bytes of a page of the KV pool: the allocation granularity of the RTX 5090 and the RTX
+/// PRO 6000 Blackwell. `siphon-serve` checks it against the device's.
+pub const KV_PAGE_BYTES: usize = 2 << 20;
 
 /// Approximations of the draft that allocate copies (`siphon_cuda::draft::DraftOptions`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -157,6 +168,10 @@ pub struct PlanInputs<'a> {
     /// Sequence slots, each with its own caches of the capacity, 1 to [`BATCH_ROWS`].
     /// More than one adds the batched step's buffers, sized for one row per slot.
     pub streams: usize,
+    /// Whether the global caches of every slot and of the draft share one pool of pages,
+    /// as `siphon-serve` runs them: the capacity is then the positions the pool holds over
+    /// every sequence, and one sequence may take all of them.
+    pub pooled: bool,
     /// Entries of the speculator's prefix cache, 0 for none: each copies one slot's
     /// sliding rings and conv states and the draft's rings.
     pub prefix_entries: usize,
@@ -170,15 +185,18 @@ pub struct PlanInputs<'a> {
 /// Device bytes of one configuration at one capacity, by what holds them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// Positions of the global KV caches.
+    /// Positions of the global KV caches: of each slot, or with a pool, of the pool.
     pub capacity: usize,
+    /// Whether the global caches share one pool of pages ([`PlanInputs::pooled`]).
+    pub pooled: bool,
     /// Sequence slots, each with caches of `capacity` positions.
     pub streams: usize,
     /// The target's checkpoint tensors.
     pub weights: usize,
     /// The FP8 copies decode reads ([`WeightFormat::Fp8`]).
     pub fp8_copies: usize,
-    /// The target's global KV caches, of every slot.
+    /// The target's global KV caches, of every slot, or the pool of pages that the target's
+    /// and the draft's global caches share.
     pub kv: usize,
     /// The sliding rings and the conv states of every slot, and the decode step's buffers.
     pub rings: usize,
@@ -241,7 +259,7 @@ impl fmt::Display for Plan {
         let parts = [
             ("weights", self.weights),
             ("FP8 copies", self.fp8_copies),
-            ("KV", self.kv),
+            (if self.pooled { "KV pool" } else { "KV" }, self.kv),
             ("rings", self.rings),
             ("batch", self.batch),
             ("prefill", self.prefill),
@@ -257,10 +275,10 @@ impl fmt::Display for Plan {
             .filter(|(_, bytes)| *bytes > 0)
             .map(|(name, bytes)| format!("{name} {}", gib(*bytes)))
             .collect();
-        let streams = if self.streams > 1 {
-            format!(" x {} streams", self.streams)
-        } else {
-            String::new()
+        let streams = match (self.pooled, self.streams) {
+            (true, n) => format!(" shared by up to {n} streams"),
+            (false, 1) => String::new(),
+            (false, n) => format!(" x {n} streams"),
         };
         write!(
             f,
@@ -281,6 +299,30 @@ pub struct Planner {
     kv_per_position: usize,
     draft_kv_per_position: usize,
     max_positions: usize,
+    /// The pool's shape, with [`PlanInputs::pooled`].
+    pool: Option<PoolShape>,
+}
+
+/// What a pool holds for one sequence ([`Planner::plan`]).
+#[derive(Clone, Debug)]
+struct PoolShape {
+    /// Bytes of one position in each key and value buffer of a slot's global caches, which
+    /// differ in a mixed layout, and in each of the draft's.
+    target_rows: Vec<usize>,
+    draft_rows: Vec<usize>,
+    /// Bytes of one sequence's rings and of a prefix cache entry's copies of them.
+    rings: usize,
+}
+
+impl PoolShape {
+    /// Bytes of the pages that buffers of `rows` bytes per position take for `positions`,
+    /// in whole chunks of [`POOL_CHUNK`], each buffer rounded up to whole pages.
+    fn pages_bytes(rows: &[usize], positions: usize) -> usize {
+        let positions = positions.next_multiple_of(POOL_CHUNK);
+        rows.iter()
+            .map(|r| (positions * r).next_multiple_of(KV_PAGE_BYTES))
+            .sum()
+    }
 }
 
 /// The draft's shapes that its memory depends on.
@@ -308,6 +350,7 @@ enum DraftKind {
 impl Planner {
     /// Reads the shapes `inputs` names: the target's from its config and headers, the
     /// draft's from its headers and, for a DFlash drafter, its `config.json`.
+    #[expect(clippy::too_many_lines, reason = "one term per buffer")]
     pub fn new(inputs: &PlanInputs<'_>) -> anyhow::Result<Self> {
         let c = inputs.config;
         let hidden = c.hidden_size;
@@ -328,10 +371,18 @@ impl Planner {
             (1..=BATCH_ROWS).contains(&streams),
             "{streams} streams; 1 to {BATCH_ROWS} fit a batched step"
         );
-        // One slot's sliding rings and conv states.
-        let slot_rings = sliding_visits * c.sliding_window_size * 2 * kv_dims * 2
-            + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4;
-        let rings = streams * slot_rings + c.vocab_size * 2 + c.unpadded_vocab_size * 4;
+        // One slot's sliding rings and conv states. With a pool, a slot's rings and an
+        // entry's copies of them come from the pool while in use, and only the conv states
+        // stay fixed.
+        let ring_bytes = sliding_visits * c.sliding_window_size * 2 * kv_dims * 2;
+        let conv_bytes = visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4;
+        let slot_rings = ring_bytes + conv_bytes;
+        let fixed_rings = if inputs.pooled {
+            conv_bytes
+        } else {
+            slot_rings
+        };
+        let rings = streams * fixed_rings + c.vocab_size * 2 + c.unpadded_vocab_size * 4;
         let prefill = if inputs.prefill_chunk == 0 {
             0
         } else {
@@ -366,7 +417,33 @@ impl Planner {
                 )
             }
         };
-        let kv_per_position = streams * c.global_cache_bytes(c.loop_config.num_passes, inputs.kv);
+        let slot_kv_per_position = c.global_cache_bytes(c.loop_config.num_passes, inputs.kv);
+        let kv_per_position = if inputs.pooled {
+            slot_kv_per_position
+        } else {
+            streams * slot_kv_per_position
+        };
+        let pool = inputs.pooled.then(|| PoolShape {
+            // Each global cache's keys and values in its own format: a mixed layout has
+            // FP8 and NVFP4 caches.
+            target_rows: c
+                .cache_formats(c.loop_config.num_passes, inputs.kv)
+                .into_iter()
+                .flatten()
+                .flat_map(|f| [f.row_bytes(kv_dims); 2])
+                .collect(),
+            draft_rows: match &draft {
+                Some((d, approx)) => {
+                    vec![kv_dims * if approx.fp8_kv { 1 } else { 2 }; 2 * d.global_layers]
+                }
+                None => Vec::new(),
+            },
+            // One sequence's rings and its prefix cache entry's copies of them.
+            rings: 2
+                * 2
+                * sliding_visits
+                * (c.sliding_window_size * kv_dims * 2).next_multiple_of(KV_PAGE_BYTES),
+        });
         // The batched step's chunk buffers for one row per stream, its state tables,
         // positions and tokens, and its rows' taps for the draft.
         let batch = if streams > 1 {
@@ -379,7 +456,7 @@ impl Planner {
             0
         };
         let prefix = match &draft {
-            Some((d, _)) => inputs.prefix_entries * (slot_rings + draft_ring_bytes(c, d)),
+            Some((d, _)) => inputs.prefix_entries * (fixed_rings + draft_ring_bytes(c, d)),
             _ => 0,
         };
         // Prefill holds the rows of the images that overlap its chunk: the chunk's rows, and
@@ -392,6 +469,7 @@ impl Planner {
         });
         let fixed = Plan {
             capacity: 0,
+            pooled: inputs.pooled,
             streams,
             weights: target_weight_bytes(inputs.checkpoint, inputs.weights),
             fp8_copies: match inputs.weights {
@@ -404,22 +482,36 @@ impl Planner {
             prefill,
             verify,
             draft: draft_bytes,
-            draft_kv: (DRAFT_STEPS + 1) * draft_kv_per_position,
+            draft_kv: if inputs.pooled {
+                0
+            } else {
+                (DRAFT_STEPS + 1) * draft_kv_per_position
+            },
             prefix,
             vision,
-            runtime: RUNTIME_BYTES + (streams - 1) * STREAM_RUNTIME_BYTES,
+            runtime: RUNTIME_BYTES
+                + (streams - 1) * STREAM_RUNTIME_BYTES
+                + if inputs.pooled { POOL_RUNTIME_BYTES } else { 0 },
         };
         Ok(Self {
             fixed,
             kv_per_position,
             draft_kv_per_position,
             max_positions: c.model_max_length,
+            pool,
         })
     }
 
     /// The plan at `capacity` positions.
     #[must_use]
     pub fn plan(&self, capacity: usize) -> Plan {
+        if let Some(pool) = &self.pool {
+            return Plan {
+                capacity,
+                kv: Self::pool_bytes(capacity, pool) + pool.rings,
+                ..self.fixed
+            };
+        }
         Plan {
             capacity,
             kv: capacity * self.kv_per_position,
@@ -428,10 +520,31 @@ impl Planner {
         }
     }
 
+    /// The global caches' part of the pool: `capacity` positions of target caches, in
+    /// whole chunks, and the draft's caches for one sequence of that length. Sequences map
+    /// whole chunks, so several together hold up to a chunk each less than `capacity`.
+    fn pool_bytes(capacity: usize, pool: &PoolShape) -> usize {
+        PoolShape::pages_bytes(&pool.target_rows, capacity)
+            + PoolShape::pages_bytes(&pool.draft_rows, capacity + DRAFT_STEPS + 1)
+    }
+
+    /// Pages of [`KV_PAGE_BYTES`] in the plan's pool, 0 without one.
+    #[must_use]
+    pub fn pool_pages(&self, capacity: usize) -> usize {
+        if self.pool.is_some() {
+            self.plan(capacity).kv / KV_PAGE_BYTES
+        } else {
+            0
+        }
+    }
+
     /// Bytes each position adds: the target's and the draft's global KV caches.
     #[must_use]
     pub fn bytes_per_position(&self) -> usize {
-        self.kv_per_position + self.draft_kv_per_position
+        match &self.pool {
+            Some(pool) => pool.target_rows.iter().chain(&pool.draft_rows).sum(),
+            None => self.kv_per_position + self.draft_kv_per_position,
+        }
     }
 
     /// The model's longest sequence (`model_max_length`).
@@ -446,15 +559,16 @@ impl Planner {
     #[must_use]
     pub fn max_capacity(&self, budget: usize) -> Option<usize> {
         let room = budget.checked_sub(self.fixed.total())?;
-        let capacity = (room / self.bytes_per_position())
+        let mut capacity = (room / self.bytes_per_position())
             .min(self.max_positions)
             .next_multiple_of(CAPACITY_STEP);
-        // `next_multiple_of` rounded up; step back to a multiple that fits.
-        let capacity = if self.plan(capacity).total() <= budget && capacity <= self.max_positions {
-            capacity
-        } else {
-            capacity.saturating_sub(CAPACITY_STEP)
-        };
+        // `next_multiple_of` rounded up, and a pool adds a chunk per stream; step back to
+        // a multiple that fits.
+        while capacity > 0
+            && (capacity > self.max_positions || self.plan(capacity).total() > budget)
+        {
+            capacity -= CAPACITY_STEP;
+        }
         (capacity > 0).then_some(capacity)
     }
 }
@@ -883,6 +997,20 @@ mod tests {
             kv_per_position: 16 << 10,
             draft_kv_per_position: 4 << 10,
             max_positions: 1 << 20,
+            pool: None,
+        };
+        let budget = 30 << 30;
+        let capacity = planner.max_capacity(budget).expect("something fits");
+        assert_eq!(capacity % CAPACITY_STEP, 0);
+        assert!(planner.plan(capacity).total() <= budget);
+        assert!(planner.plan(capacity + CAPACITY_STEP).total() > budget);
+        let planner = Planner {
+            pool: Some(PoolShape {
+                target_rows: vec![1024; 32],
+                draft_rows: vec![1024; 4],
+                rings: 320 << 20,
+            }),
+            ..planner
         };
         let budget = 30 << 30;
         let capacity = planner.max_capacity(budget).expect("something fits");
@@ -986,6 +1114,7 @@ mod tests {
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
                 streams: 1,
+                pooled: false,
                 prefix_entries: 0,
                 sms: 170,
                 vision,
@@ -1005,6 +1134,48 @@ mod tests {
             on.vision,
             vision_bytes(VisionFormat::Bf16, 400) + (2048 + 100) * 2304 * 2
         );
+        std::fs::remove_dir_all(dir).expect("cleaning up");
+    }
+
+    #[test]
+    fn pool_pages_follow_each_caches_format() {
+        let dir = checkpoint("pool", &[("model.llm.norm.weight", Dtype::BF16, &[25])]);
+        let checkpoint = Checkpoint::open(&dir).expect("opening");
+        let c = config();
+        let pool = |kv| {
+            Planner::new(&PlanInputs {
+                config: &c,
+                checkpoint: &checkpoint,
+                weights: WeightFormat::Fp8,
+                output: OutputProjection::default(),
+                kv,
+                draft: DraftChoice::None,
+                prefill_chunk: 2048,
+                streams: 1,
+                pooled: true,
+                prefix_entries: 0,
+                sms: 170,
+                vision: None,
+            })
+            .expect("a plan")
+        };
+        let mib = 1 << 20;
+        // 8 global caches of keys and values, then one sequence's rings and its entry's
+        // copies of them, 320 MiB.
+        let rings = pool(KvFormat::Fp8).plan(0).kv;
+        assert_eq!(rings, 320 * mib);
+        // FP8: 1,024 bytes per position, 2 MiB per buffer and chunk of 2,048 positions.
+        assert_eq!(pool(KvFormat::Fp8).plan(4096).kv - rings, 16 * 4 * mib);
+        // NVFP4: 576 bytes per position and buffer; 4,096 positions take 2.25 MiB, 2 pages
+        // of each buffer, 6,144 take 3.375 MiB, 2 pages, not 3.
+        assert_eq!(pool(KvFormat::Nvfp4).plan(4096).kv - rings, 16 * 4 * mib);
+        assert_eq!(pool(KvFormat::Nvfp4).plan(6144).kv - rings, 16 * 4 * mib);
+        // Mixed: 4 FP8 buffers of 3 chunks, 12 NVFP4 buffers in 2 pages each.
+        assert_eq!(
+            pool(KvFormat::Mixed).plan(6144).kv - rings,
+            (4 * 6 + 12 * 4) * mib
+        );
+        assert_eq!(pool(KvFormat::Nvfp4).bytes_per_position(), 9 << 10);
         std::fs::remove_dir_all(dir).expect("cleaning up");
     }
 

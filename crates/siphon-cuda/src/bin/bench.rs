@@ -582,6 +582,7 @@ mod linux {
             draft: DraftChoice::None,
             prefill_chunk: 0,
             streams: 1,
+            pooled: false,
             prefix_entries: 0,
             sms: gpu.sms()?,
             vision: None,

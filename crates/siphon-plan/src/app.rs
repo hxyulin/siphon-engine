@@ -143,6 +143,7 @@ impl App {
                             },
                             prefill_chunk,
                             streams,
+                            pooled: true,
                             prefix_entries: streams,
                             sms: device.sms,
                             vision,
