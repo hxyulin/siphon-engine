@@ -46,6 +46,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
                      [--decode-floor 20] [--greedy] [--vision] \
+                     [--accept-margin 0.0] [--group-by-confidence] \
                      [--max-image-pixels 2073600] [--max-images 16] \
                      [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] [--moe-min-k 1..=8]
 --context sets the positions of the KV cache pool: the prompts and generated tokens of every
@@ -128,6 +129,13 @@ request samples with its temperature, top_k, top_p, min_p and seed, and the fiel
 out come from the checkpoint's generation_config.json (temperature 1 for Inkling 2 Mini).
 Speculation keeps the model's distribution exactly, and a request with a seed gets the same
 tokens on the same configuration, alone or in a batch (without --fallback).
+--accept-margin M enables opt-in margin-tolerant speculative acceptance (default 0.0, exact
+lossless acceptance): when M > 0, a draft token whose softcapped target logit is within M of
+the target's chosen token is also accepted.
+--group-by-confidence splits mixed-confidence batched DFlash 2 speculation rounds into high-
+and low-confidence micro-batches so low-confidence requests do not narrow verify widths for
+high-confidence requests (multiple micro-batches past 32 streams are always sorted by
+confidence).
 Set SIPHON_API_KEY to require `Authorization: Bearer <key>` or `x-api-key: <key>` on every route
 but /health, /version and /metrics.";
 
@@ -182,6 +190,8 @@ fn args() -> anyhow::Result<Args> {
     let mut vision = false;
     let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
     let mut max_images = vision::DEFAULT_MAX_IMAGES;
+    let mut accept_margin = 0.0f32;
+    let mut group_by_confidence = false;
     let mut kv_args = Vec::new();
     let mut moe_top_k = None;
     let mut moe_min_k = None;
@@ -264,6 +274,16 @@ fn args() -> anyhow::Result<Args> {
             }
             "--greedy" => greedy = true,
             "--vision" => vision = true,
+            "--accept-margin" => {
+                accept_margin = value()?
+                    .parse()
+                    .context("--accept-margin takes a non-negative logit margin")?;
+                ensure!(
+                    accept_margin.is_finite() && accept_margin >= 0.0,
+                    "--accept-margin takes a finite non-negative logit margin"
+                );
+            }
+            "--group-by-confidence" => group_by_confidence = true,
             "--max-image-pixels" => {
                 max_image_pixels = value()?
                     .parse()
@@ -367,6 +387,8 @@ fn args() -> anyhow::Result<Args> {
             vision: vision.then_some(engine::VisionOptions {
                 max_pixels: max_image_pixels,
             }),
+            accept_margin,
+            group_by_confidence,
             kv_args,
             moe_top_k,
             moe_min_k,

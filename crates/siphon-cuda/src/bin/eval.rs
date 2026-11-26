@@ -3,10 +3,10 @@
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
 //!        [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
-//!        [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8]
-//!        [--prefill-dense bf16|fp8] [--kv-quant none|nvfp4|q4_0] [--kv-rotate]
-//!        [--kv-quant-visits V,V,...] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0]
-//!        [--moe-min-k 1..=8]
+//!        [--accept-margin M] [--expert-activations bf16|quantized|fp8]
+//!        [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8]
+//!        [--kv-quant none|nvfp4|q4_0] [--kv-rotate] [--kv-quant-visits V,V,...]
+//!        [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] [--moe-min-k 1..=8]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -92,6 +92,7 @@ mod linux {
         expert_activations: ExpertActivations,
         prefill_attention: PrefillAttention,
         prefill_dense: Products,
+        accept_margin: f32,
         kv_options: KvOptions,
         moe_pruning: MoePruning,
     }
@@ -109,6 +110,7 @@ mod linux {
         let mut expert_activations = ExpertActivations::Bf16;
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         let mut prefill_dense = Products::Bf16;
+        let mut accept_margin = 0.0f32;
         let mut kv_options = KvOptions::default();
         let mut moe_top_k = None;
         let mut moe_min_k = None;
@@ -150,6 +152,15 @@ mod linux {
                 moe_min_k = Some(it.next().context("--moe-min-k needs 1..=8")?.parse()?);
             } else if arg == "--moe-prune" {
                 moe_prune = Some(it.next().context("--moe-prune needs 0.0..=1.0")?.parse()?);
+            } else if arg == "--accept-margin" {
+                accept_margin = it
+                    .next()
+                    .context("--accept-margin needs a non-negative logit margin")?
+                    .parse()?;
+                ensure!(
+                    accept_margin.is_finite() && accept_margin >= 0.0,
+                    "--accept-margin must be finite and non-negative"
+                );
             } else if arg == "--prefill" {
                 let chunk: usize = it.next().context("--prefill needs a chunk size")?.parse()?;
                 ensure!(
@@ -171,7 +182,7 @@ mod linux {
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
              [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] \
-             [--verify WIDTH] [--dump FILE] \
+             [--verify WIDTH] [--accept-margin MARGIN] [--dump FILE] \
              [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
              [--prefill-dense bf16|fp8] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] \
              [--moe-min-k 1..=8] [kv options]",
@@ -201,6 +212,7 @@ mod linux {
             expert_activations,
             prefill_attention,
             prefill_dense,
+            accept_margin,
             kv_options,
             moe_pruning,
         })
@@ -442,6 +454,7 @@ mod linux {
         model.set_expert_activations(args.expert_activations)?;
         model.set_prefill_attention(args.prefill_attention)?;
         model.set_prefill_dense(args.prefill_dense)?;
+        model.set_accept_margin(args.accept_margin)?;
 
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();
         // (position, KL, engine top-1, MLX top-1)
@@ -540,10 +553,19 @@ mod linux {
                  products",
                 args.expert_activations, args.prefill_attention, args.prefill_dense
             ),
-            (None, Some(width)) => format!(
-                "verify passes of {width} rows, {} expert activations",
-                args.expert_activations
-            ),
+            (None, Some(width)) => {
+                if args.accept_margin > 0.0 {
+                    format!(
+                        "verify passes of {width} rows (accept margin {:.3}), {} expert activations",
+                        args.accept_margin, args.expert_activations
+                    )
+                } else {
+                    format!(
+                        "verify passes of {width} rows, {} expert activations",
+                        args.expert_activations
+                    )
+                }
+            }
             (None, None) => "token by token".to_owned(),
         };
         let pruning = if args.moe_pruning.is_active() {

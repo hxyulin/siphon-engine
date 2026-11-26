@@ -161,6 +161,45 @@ extern "C" __global__ void accept_greedy(const int* tokens, const int* argmax, c
     *anchor = argmax[accepted];
 }
 
+// Margin-tolerant speculative acceptance of a verify of m rows: tokens [m] holds the anchor
+// and m - 1 drafts, argmax [m] each row's target token (greedy argmax or sampled draw), and
+// logits [m, vocab] each row's F32 softcapped target logits. Accepts the longest prefix of
+// drafts where draft == target, or (margin > 0 and logits[accepted, draft] >=
+// logits[accepted, target] - margin), or exactly *keep - 1 drafts when *keep is nonzero.
+// Writes result = [accepted, tokens[0..8], argmax[0..8]] (rows past m left alone) and the
+// next anchor, argmax[accepted], to anchor. One thread.
+extern "C" __global__ void accept_margin(const int* tokens, const int* argmax, const float* logits,
+                                         int vocab, const unsigned* keep, int m, float margin,
+                                         int* result, int* anchor) {
+    int accepted = 0;
+    if (*keep != 0) {
+        accepted = min(int(*keep), m) - 1;
+    } else {
+        while (accepted + 1 < m) {
+            const int draft = tokens[accepted + 1];
+            const int target = argmax[accepted];
+            if (draft == target) {
+                ++accepted;
+                continue;
+            }
+            if (margin > 0.f && draft >= 0 && draft < vocab && target >= 0 && target < vocab) {
+                const float* row = logits + size_t(accepted) * size_t(vocab);
+                if (row[draft] >= row[target] - margin) {
+                    ++accepted;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = tokens[i];
+        result[1 + kVerifyRows + i] = argmax[i];
+    }
+    *anchor = argmax[accepted];
+}
+
 // ---------------------------------------------------------------------------------------
 // Batched verify: `seqs` sequences verified in parallel, each with `m` (1..=8) rows, using
 // the visit state table `tables` [visits, max_seqs, 6] (words 0..1 KV caches, 2..5 conv
@@ -283,6 +322,49 @@ extern "C" __global__ void accept_greedy_batch(const int* tokens, const int* arg
     } else {
         while (accepted + 1 < m && seq_tokens[accepted + 1] == seq_argmax[accepted]) {
             ++accepted;
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = seq_tokens[i];
+        result[1 + kVerifyRows + i] = seq_argmax[i];
+    }
+    anchors[seq] = seq_argmax[accepted];
+}
+
+// Margin-tolerant acceptance for `seqs` sequences, each of `m` rows. tokens and argmax are
+// [seqs, m]; logits is [seqs, m, vocab] (F32 softcapped target logits); keep is [seqs]
+// (0 for margin acceptance, else exact rows to keep); results is [seqs, kResultLen];
+// anchors is [seqs]. Grid: (seqs, 1, 1), 1 thread.
+extern "C" __global__ void accept_margin_batch(const int* tokens, const int* argmax,
+                                               const float* logits, int vocab,
+                                               const unsigned* keep, int m, float margin,
+                                               int* results, int* anchors) {
+    const int seq = blockIdx.x;
+    const int* seq_tokens = tokens + size_t(seq) * size_t(m);
+    const int* seq_argmax = argmax + size_t(seq) * size_t(m);
+    const float* seq_logits = logits + size_t(seq) * size_t(m) * size_t(vocab);
+    int* result = results + size_t(seq) * kResultLen;
+    int accepted = 0;
+    const unsigned k = keep[seq];
+    if (k != 0) {
+        accepted = min(int(k), m) - 1;
+    } else {
+        while (accepted + 1 < m) {
+            const int draft = seq_tokens[accepted + 1];
+            const int target = seq_argmax[accepted];
+            if (draft == target) {
+                ++accepted;
+                continue;
+            }
+            if (margin > 0.f && draft >= 0 && draft < vocab && target >= 0 && target < vocab) {
+                const float* row = seq_logits + size_t(accepted) * size_t(vocab);
+                if (row[draft] >= row[target] - margin) {
+                    ++accepted;
+                    continue;
+                }
+            }
+            break;
         }
     }
     result[0] = accepted;

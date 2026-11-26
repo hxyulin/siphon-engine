@@ -347,6 +347,10 @@ pub struct Options {
     pub decode_floor: f64,
     /// The vision tower, with `--vision`.
     pub vision: Option<VisionOptions>,
+    /// Opt-in logit margin for speculative acceptance (`0.0` for exact lossless acceptance).
+    pub accept_margin: f32,
+    /// Split mixed-confidence batched DFlash 2 rounds into high/low confidence micro-batches.
+    pub group_by_confidence: bool,
     /// The KV options of `siphon_cuda::kv_options` as given on the command line.
     pub kv_args: Vec<String>,
     /// Maximum MoE experts per token (`1..=8`, `--moe-top-k`).
@@ -898,6 +902,13 @@ mod cuda {
         if !options.greedy {
             model.enable_sampling()?;
         }
+        model.set_accept_margin(options.accept_margin)?;
+        if options.accept_margin > 0.0 {
+            eprintln!(
+                "speculative margin acceptance enabled (margin {:.3})",
+                options.accept_margin
+            );
+        }
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
         let source = options
             .drafter
@@ -1420,6 +1431,8 @@ mod cuda {
         floor: f64,
         /// Positions of the KV pool: the most one request may hold.
         capacity: usize,
+        /// Split mixed-confidence batched DFlash 2 rounds into high/low micro-batches.
+        group_by_confidence: bool,
     }
 
     #[expect(clippy::too_many_arguments, reason = "the engine thread's state")]
@@ -1443,6 +1456,7 @@ mod cuda {
             greedy: options.greedy,
             floor: options.decode_floor,
             capacity,
+            group_by_confidence: options.group_by_confidence,
         };
         let (streams, greedy) = (sched.streams, sched.greedy);
         let mut waiting = VecDeque::new();
@@ -2533,7 +2547,13 @@ mod cuda {
                     };
                     r.fail(&anyhow::anyhow!("the KV pool is full"));
                 }
-                let emitted = step_rows(model, speculator, &mut active, stop);
+                let emitted = step_rows(
+                    model,
+                    speculator,
+                    &mut active,
+                    stop,
+                    sched.group_by_confidence,
+                );
                 if emitted == 0 {
                     break;
                 }
@@ -2958,6 +2978,7 @@ mod cuda {
         speculator: &mut Speculator,
         active: &mut [Request],
         stop: &[u32],
+        group_by_confidence: bool,
     ) -> usize {
         let batch_spec = speculator.supports_batch_spec();
         let mut spec_indices = Vec::new();
@@ -2978,7 +2999,14 @@ mod cuda {
         let mut min_emitted = usize::MAX;
         if !spec_indices.is_empty() {
             let max_seqs = speculator.max_batch_spec_seqs();
-            for chunk in spec_indices.chunks(max_seqs) {
+            let candidates: Vec<(usize, usize, Option<f32>)> = spec_indices
+                .iter()
+                .map(|&i| {
+                    let slot = active[i].slot;
+                    (i, slot, speculator.batch_slot_confidence(slot))
+                })
+                .collect();
+            for chunk in &super::group_spec_chunks(&candidates, max_seqs, group_by_confidence) {
                 let width = (BATCH_VERIFY_MAX_ROWS / chunk.len()).min(VERIFY_ROWS);
                 let slots: Vec<usize> = chunk.iter().map(|&i| active[i].slot).collect();
                 let anchors: Vec<u32> = chunk
@@ -3052,6 +3080,81 @@ mod cuda {
     }
 }
 
+/// Partitions speculative decoding candidates `(idx, slot, confidence)` into micro-batches
+/// of at most `max_seqs` entries.
+///
+/// When `items.len() > max_seqs`, sorts descending by calibrated confidence before chunking
+/// so high-confidence requests batch together (picking wider verify widths) and low-confidence
+/// requests batch together. When `group_by_confidence` is set and `items.len() <= max_seqs`,
+/// splits a mixed-confidence batch (`max - min >= 0.30` across known confidences) into high
+/// (`>= 0.50`) and low (`< 0.50`) groups. Each chunk is canonicalized in ascending `slot`
+/// order so pre-drafted slot caches remain hits when group membership is unchanged.
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "only the Linux engine schedules micro-batches")
+)]
+fn group_spec_chunks(
+    items: &[(usize, usize, Option<f32>)],
+    max_seqs: usize,
+    group_by_confidence: bool,
+) -> Vec<Vec<usize>> {
+    const SPLIT_SPREAD: f32 = 0.30;
+    const SPLIT_THRESHOLD: f32 = 0.50;
+
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() <= max_seqs && !group_by_confidence {
+        return vec![items.iter().map(|&(idx, _, _)| idx).collect()];
+    }
+    let mut ranked = items.to_vec();
+    ranked.sort_by(|a, b| {
+        let ca = a.2.unwrap_or(SPLIT_THRESHOLD);
+        let cb = b.2.unwrap_or(SPLIT_THRESHOLD);
+        cb.total_cmp(&ca).then_with(|| a.1.cmp(&b.1))
+    });
+    let mut chunks: Vec<Vec<(usize, usize)>> = if ranked.len() > max_seqs {
+        ranked
+            .chunks(max_seqs)
+            .map(|c| c.iter().map(|&(idx, slot, _)| (idx, slot)).collect())
+            .collect()
+    } else {
+        let mut min_c = f32::INFINITY;
+        let mut max_c = f32::NEG_INFINITY;
+        for &(_, _, conf) in &ranked {
+            if let Some(c) = conf {
+                min_c = min_c.min(c);
+                max_c = max_c.max(c);
+            }
+        }
+        if min_c.is_finite() && max_c - min_c >= SPLIT_SPREAD {
+            let mut high = Vec::new();
+            let mut low = Vec::new();
+            for &(idx, slot, conf) in &ranked {
+                if conf.unwrap_or(SPLIT_THRESHOLD) >= SPLIT_THRESHOLD {
+                    high.push((idx, slot));
+                } else {
+                    low.push((idx, slot));
+                }
+            }
+            if !high.is_empty() && !low.is_empty() {
+                vec![high, low]
+            } else {
+                vec![ranked.iter().map(|&(idx, slot, _)| (idx, slot)).collect()]
+            }
+        } else {
+            vec![ranked.iter().map(|&(idx, slot, _)| (idx, slot)).collect()]
+        }
+    };
+    for chunk in &mut chunks {
+        chunk.sort_by_key(|&(_, slot)| slot);
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| chunk.into_iter().map(|(idx, _)| idx).collect())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3080,5 +3183,31 @@ mod tests {
         assert!(load.reserve(2, 3, 2));
         let counts = load.counts();
         assert_eq!((counts.waiting, counts.running), (4, 1));
+    }
+
+    #[test]
+    fn confidence_grouping_sorts_multi_chunks_and_splits_mixed() {
+        // Multi-chunk (> max_seqs): sorts descending by confidence, canonicalizes each chunk by slot.
+        let items = [
+            (0, 3, Some(0.20)),
+            (1, 1, Some(0.90)),
+            (2, 4, Some(0.15)),
+            (3, 0, Some(0.85)),
+        ];
+        assert_eq!(group_spec_chunks(&items, 2, false), vec![vec![3, 1], vec![0, 2]]);
+
+        // Single chunk with grouping off preserves input order unchanged.
+        assert_eq!(group_spec_chunks(&items, 4, false), vec![vec![0, 1, 2, 3]]);
+
+        // Single chunk with grouping on splits wide spread into high/low, each in slot order.
+        assert_eq!(group_spec_chunks(&items, 4, true), vec![vec![3, 1], vec![0, 2]]);
+
+        // Homogeneous batch with grouping on stays one chunk (no extra verify launch).
+        let homogeneous = [
+            (0, 2, Some(0.80)),
+            (1, 0, Some(0.72)),
+            (2, 1, Some(0.75)),
+        ];
+        assert_eq!(group_spec_chunks(&homogeneous, 4, true), vec![vec![1, 2, 0]]);
     }
 }

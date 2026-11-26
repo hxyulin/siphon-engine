@@ -1410,15 +1410,30 @@ impl Ctx {
                 vocab,
             )?,
         }
-        spec.accept_greedy(
-            &self.stream,
-            &rows(&p.tokens, m, 1),
-            &v.argmax.slice(..m),
-            &v.keep,
-            m,
-            &mut v.result,
-            &mut v.anchor,
-        )?;
+        if self.accept_margin > 0.0 {
+            spec.accept_margin(
+                &self.stream,
+                &rows(&p.tokens, m, 1),
+                &v.argmax.slice(..m),
+                &rows(&p.head_capped, m, vocab),
+                vocab,
+                &v.keep,
+                m,
+                self.accept_margin,
+                &mut v.result,
+                &mut v.anchor,
+            )?;
+        } else {
+            spec.accept_greedy(
+                &self.stream,
+                &rows(&p.tokens, m, 1),
+                &v.argmax.slice(..m),
+                &v.keep,
+                m,
+                &mut v.result,
+                &mut v.anchor,
+            )?;
+        }
         spec.conv_rollback(
             &self.stream,
             &v.states,
@@ -1485,16 +1500,36 @@ impl Ctx {
             let width = bv.width;
             let seqs = m / width;
             let spec = &self.kernels.spec;
-            spec.accept_greedy_batch(
-                &self.stream,
-                &rows(&p.tokens, m, 1),
-                &b.argmax.slice(..m),
-                &bv.keep.slice(..seqs),
-                seqs,
-                width,
-                &mut bv.results.slice_mut(..seqs * RESULT_LEN),
-                &mut bv.anchors.slice_mut(..seqs),
-            )?;
+            let (tokens, argmax) = (rows(&p.tokens, m, 1), b.argmax.slice(..m));
+            let keep = bv.keep.slice(..seqs);
+            let mut results = bv.results.slice_mut(..seqs * RESULT_LEN);
+            let mut anchors = bv.anchors.slice_mut(..seqs);
+            if self.accept_margin > 0.0 {
+                spec.accept_margin_batch(
+                    &self.stream,
+                    &tokens,
+                    &argmax,
+                    &rows(&p.head_capped, m, vocab),
+                    vocab,
+                    &keep,
+                    seqs,
+                    width,
+                    self.accept_margin,
+                    &mut results,
+                    &mut anchors,
+                )?;
+            } else {
+                spec.accept_greedy_batch(
+                    &self.stream,
+                    &tokens,
+                    &argmax,
+                    &keep,
+                    seqs,
+                    width,
+                    &mut results,
+                    &mut anchors,
+                )?;
+            }
             spec.conv_rollback_batch(
                 &self.stream,
                 &b.tables,

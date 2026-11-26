@@ -458,6 +458,8 @@ struct Ctx {
     kv_rounding: KvRounding,
     /// Opt-in MoE dynamic top-k and probability-threshold expert pruning.
     moe_pruning: MoePruning,
+    /// Opt-in logit margin for speculative acceptance (`0.0` for exact lossless acceptance).
+    accept_margin: f32,
 }
 
 impl std::fmt::Debug for Model {
@@ -666,6 +668,7 @@ impl Model {
                     KvRounding::default()
                 },
                 moe_pruning: MoePruning::default(),
+                accept_margin: 0.0,
             },
             passes,
             rounded_below: 0,
@@ -1315,6 +1318,29 @@ impl Model {
     #[must_use]
     pub fn sampling_enabled(&self) -> bool {
         self.sampler
+    }
+
+    /// Sets the opt-in logit margin for speculative acceptance (`0.0` by default, exact
+    /// lossless acceptance). When positive, a draft token whose softcapped target logit is
+    /// within `margin` of the target's chosen token is accepted as well. Drops any captured
+    /// verify and batched-verify graphs when the value changes.
+    pub fn set_accept_margin(&mut self, margin: f32) -> anyhow::Result<()> {
+        ensure!(
+            margin.is_finite() && margin >= 0.0,
+            "accept_margin must be finite and non-negative, got {margin}"
+        );
+        if self.ctx.accept_margin.to_bits() != margin.to_bits() {
+            self.ctx.accept_margin = margin;
+            self.verify_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch_verify_graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// The logit margin used for speculative acceptance (`0.0` for exact lossless acceptance).
+    #[must_use]
+    pub fn accept_margin(&self) -> f32 {
+        self.ctx.accept_margin
     }
 
     /// The token after a step or prefill, whose logits are in the decode buffers: the

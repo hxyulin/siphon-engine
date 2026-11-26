@@ -113,11 +113,13 @@ pub struct Spec {
     ring_backup: CudaFunction,
     ring_restore: CudaFunction,
     accept_greedy: CudaFunction,
+    accept_margin: CudaFunction,
     conv_backup_batch: CudaFunction,
     conv_rollback_batch: CudaFunction,
     ring_backup_batch: CudaFunction,
     ring_restore_batch: CudaFunction,
     accept_greedy_batch: CudaFunction,
+    accept_margin_batch: CudaFunction,
 }
 
 impl Spec {
@@ -131,11 +133,13 @@ impl Spec {
             ring_backup: f("ring_backup")?,
             ring_restore: f("ring_restore")?,
             accept_greedy: f("accept_greedy")?,
+            accept_margin: f("accept_margin")?,
             conv_backup_batch: f("conv_backup_batch")?,
             conv_rollback_batch: f("conv_rollback_batch")?,
             ring_backup_batch: f("ring_backup_batch")?,
             ring_restore_batch: f("ring_restore_batch")?,
             accept_greedy_batch: f("accept_greedy_batch")?,
+            accept_margin_batch: f("accept_margin_batch")?,
         })
     }
 
@@ -328,6 +332,60 @@ impl Spec {
         // SAFETY: the arguments match `accept_greedy(const int*, const int*, const unsigned*,
         // int, int*, int*)`; the one thread reads `rows` tokens and argmax values and writes
         // at most `RESULT_LEN` results and one anchor.
+        unsafe { launch.launch(one_block(1)) }?;
+        Ok(())
+    }
+
+    /// Margin-tolerant acceptance of a verify of `rows` rows: like [`Self::accept_greedy`],
+    /// but also accepts a draft token whose softcapped target logit in `logits`
+    /// (`[rows, vocab]`) is within `margin` of the target's chosen token (`argmax[accepted]`).
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_margin(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        logits: &impl DeviceIn<f32>,
+        vocab: usize,
+        keep: &CudaSlice<u32>,
+        rows: usize,
+        margin: f32,
+        result: &mut CudaSlice<i32>,
+        anchor: &mut CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax, logits) = (tokens.view(), argmax.view(), logits.view());
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        ensure!(vocab > 0, "vocab must be positive");
+        ensure!(
+            margin.is_finite() && margin >= 0.0,
+            "margin must be finite and non-negative, got {margin}"
+        );
+        check_len("tokens", tokens.len(), rows)?;
+        check_len("argmax", argmax.len(), rows)?;
+        check_len("logits", logits.len(), rows * vocab)?;
+        check_len("keep", keep.len(), 1)?;
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("anchor", anchor.len(), 1)?;
+        let vocab_arg = i32::try_from(vocab)?;
+        let rows_arg = i32::try_from(rows)?;
+        let mut launch = stream.launch_builder(&self.accept_margin);
+        launch
+            .arg(&tokens)
+            .arg(&argmax)
+            .arg(&logits)
+            .arg(&vocab_arg)
+            .arg(keep)
+            .arg(&rows_arg)
+            .arg(&margin)
+            .arg(result)
+            .arg(anchor);
+        // SAFETY: the arguments match `accept_margin(const int*, const int*, const float*,
+        // int, const unsigned*, int, float, int*, int*)`; the one thread reads `rows` tokens
+        // and argmax values, bounds-checks indices against `vocab` before indexing `logits`
+        // (`rows * vocab` floats), and writes at most `RESULT_LEN` results and one anchor.
         unsafe { launch.launch(one_block(1)) }?;
         Ok(())
     }
@@ -542,6 +600,64 @@ impl Spec {
             .arg(anchors);
         // SAFETY: the arguments match `accept_greedy_batch(const int*, const int*, const
         // unsigned*, int, int*, int*)`; block `seq` accesses its own slice of each buffer.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::accept_margin`] for `seqs` sequences, each verifying `rows` tokens.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_margin_batch(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        logits: &impl DeviceIn<f32>,
+        vocab: usize,
+        keep: &CudaView<'_, u32>,
+        seqs: usize,
+        rows: usize,
+        margin: f32,
+        results: &mut CudaViewMut<'_, i32>,
+        anchors: &mut CudaViewMut<'_, i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax, logits) = (tokens.view(), argmax.view(), logits.view());
+        ensure!(seqs > 0, "no sequences");
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        ensure!(vocab > 0, "vocab must be positive");
+        ensure!(
+            margin.is_finite() && margin >= 0.0,
+            "margin must be finite and non-negative, got {margin}"
+        );
+        check_len("tokens", tokens.len(), seqs * rows)?;
+        check_len("argmax", argmax.len(), seqs * rows)?;
+        check_len("logits", logits.len(), seqs * rows * vocab)?;
+        check_len("keep", keep.len(), seqs)?;
+        check_len("results", results.len(), seqs * RESULT_LEN)?;
+        check_len("anchors", anchors.len(), seqs)?;
+        let vocab_arg = i32::try_from(vocab)?;
+        let rows_arg = i32::try_from(rows)?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(seqs)?, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = stream.launch_builder(&self.accept_margin_batch);
+        launch
+            .arg(&tokens)
+            .arg(&argmax)
+            .arg(&logits)
+            .arg(&vocab_arg)
+            .arg(keep)
+            .arg(&rows_arg)
+            .arg(&margin)
+            .arg(results)
+            .arg(anchors);
+        // SAFETY: the arguments match `accept_margin_batch(const int*, const int*, const
+        // float*, int, const unsigned*, int, float, int*, int*)`; block `seq` accesses its
+        // own slice of each buffer and bounds-checks token indices against `vocab`.
         unsafe { launch.launch(config) }?;
         Ok(())
     }

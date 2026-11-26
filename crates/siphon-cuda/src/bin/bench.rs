@@ -48,7 +48,8 @@
 //!        bench <model-dir> --prompt <capture> --spec K|auto [--widths 2,4,8]
 //!        [--draft SPEC] [--draft-shortlist N] [--draft-context-rows N] [--shortlist FILE]
 //!        [--sweep FILE] [--contexts 0,32768] [--steps N] [--weights bf16|fp8] [--kv bf16|fp8]
-//!        [--drafter DIR] [--fallback] [--temperature T [--top-p P] [--seeds N]]
+//!        [--drafter DIR] [--fallback] [--accept-margin M]
+//!        [--temperature T [--top-p P] [--seeds N]]
 //!        bench <model-dir> --prompt <capture> --verify-widths [--contexts 0,32768]
 //!
 //! The prompt is the capture's tokens except the last 512, which `--verify-widths` uses
@@ -174,6 +175,8 @@ mod linux {
         batch: Option<Vec<usize>>,
         /// Whether the draft follows row 0 of the batched steps.
         follow: bool,
+        /// Opt-in logit margin for speculative acceptance (`0.0` = exact lossless).
+        accept_margin: f32,
         kv_options: KvOptions,
         moe_pruning: MoePruning,
     }
@@ -218,6 +221,7 @@ mod linux {
         let mut seeds = 6;
         let mut batch = None;
         let mut follow = false;
+        let mut accept_margin = 0.0f32;
         let mut kv_options = KvOptions::default();
         let mut moe_top_k = None;
         let mut moe_min_k = None;
@@ -268,6 +272,7 @@ mod linux {
                 "--moe-top-k" => moe_top_k = Some(value()?.parse()?),
                 "--moe-min-k" => moe_min_k = Some(value()?.parse()?),
                 "--moe-prune" => moe_prune = Some(value()?.parse()?),
+                "--accept-margin" => accept_margin = value()?.parse()?,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -277,6 +282,10 @@ mod linux {
         }
         ensure!(steps > 0, "--steps must be positive");
         ensure!(seeds > 0, "--seeds must be positive");
+        ensure!(
+            accept_margin.is_finite() && accept_margin >= 0.0,
+            "--accept-margin must be finite and non-negative"
+        );
         ensure!(
             temperature.is_some() || top_p.is_none(),
             "--top-p needs --temperature"
@@ -327,6 +336,7 @@ mod linux {
             seeds,
             batch,
             follow,
+            accept_margin,
             kv_options,
             moe_pruning,
         })
@@ -757,6 +767,7 @@ mod linux {
         args.kv_options.apply(&mut model)?;
         model.set_prefill_dense(args.prefill_dense)?;
         model.set_moe_pruning(args.moe_pruning)?;
+        model.set_accept_margin(args.accept_margin)?;
         model.add_slots(largest - 1)?;
         let mut speculator = if args.follow {
             let options = DraftOptions::fast()
@@ -1027,6 +1038,10 @@ mod linux {
             bytes / EFFECTIVE_BANDWIDTH * 1e3
         }
 
+        #[expect(
+            clippy::too_many_lines,
+            reason = "speculative benchmark setup and dispatch"
+        )]
         pub fn run(args: &Args) -> anyhow::Result<()> {
             let path = args
                 .prompt
@@ -1065,6 +1080,7 @@ mod linux {
             args.kv_options.apply(&mut model)?;
             model.set_prefill_dense(args.prefill_dense)?;
             model.set_moe_pruning(args.moe_pruning)?;
+            model.set_accept_margin(args.accept_margin)?;
             println!(
                 "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
                  before load: {}",
@@ -1079,9 +1095,14 @@ mod linux {
                     before.processes.join(" ")
                 },
             );
+            let margin_note = if args.accept_margin > 0.0 {
+                format!(", accept margin {:.3}", args.accept_margin)
+            } else {
+                String::new()
+            };
             println!(
                 "passes {passes}, {} global KV cache, {} weights for decode, verify and the \
-                 draft's LM head, draft {} {}, prompt {} ({} tokens)\n",
+                 draft's LM head, draft {} {}{margin_note}, prompt {} ({} tokens)\n",
                 args.kv,
                 args.weights,
                 args.drafter

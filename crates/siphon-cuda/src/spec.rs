@@ -714,6 +714,25 @@ impl Speculator {
         self.batch_drafted.clear();
     }
 
+    /// Returns the mean calibrated draft confidence of `slot` from the most recent
+    /// pre-drafted batched speculation state, or `None` if `slot` has no cached draft
+    /// confidences yet.
+    #[must_use]
+    pub fn batch_slot_confidence(&self, slot: usize) -> Option<f32> {
+        for entry in self.batch_drafted.iter().rev() {
+            if let Some(pos) = entry.slots.iter().position(|&s| s == slot) {
+                let start = pos * STEPS;
+                let end = start + STEPS;
+                if let Some(row) = entry.confidences.get(start..end) {
+                    let cal = self.batch_calibration.apply(row);
+                    let sum: f32 = cal.iter().copied().sum();
+                    return Some(sum / STEPS as f32);
+                }
+            }
+        }
+        None
+    }
+
     /// Pre-allocates batched DFlash 2 rings and scratch buffers for up to `max_seqs`
     /// concurrent sequences and slots `0..=max_slot`.
     pub fn reserve_batch_spec(
