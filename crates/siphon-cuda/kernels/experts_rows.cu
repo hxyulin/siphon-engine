@@ -334,6 +334,148 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
     }
 }
 
+// Multi-group form of `tile_product` for `expert_mlp_rows_wide`: processes `ng` (1..=4)
+// column groups of 8 pairs (up to 32 pairs) against a single DRAM load and dequantization
+// of the 16-row weight tile. Each group runs the exact same mma.sync instructions in the
+// same k order as `tile_product`, keeping every output bit-identical.
+template <bool kFp4, int K, int kRing>
+__device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_t* s, int row0,
+                                                  const __nv_bfloat16* const x_ptrs[4], int ng,
+                                                  uint4* ring, int lane, uint64_t policy,
+                                                  float acc[4][4]) {
+    using G = Geometry<kFp4, K>;
+    constexpr int kJ = G::kChunks / 4;
+    constexpr int kXVecs = G::kValues / 8;
+    const int g = lane / 4;
+    const int t = lane % 4;
+
+    auto issue = [&](int i) {
+        if (i < G::kStages) {
+            uint4* slot = ring + i % kRing * kSlotVecs;
+#pragma unroll
+            for (int q = 0; q < 16 * G::kChunks / 32; ++q) {
+                const int idx = q * 32 + lane;
+                const int r = idx / G::kChunks;
+                const int c = idx % G::kChunks;
+                copy16(slot + slot_index<G::kChunks>(r, c),
+                       w + size_t(row0 + r) * G::kRowBytes + i * G::kStageBytes + c * 16, policy);
+            }
+            if (lane < 16) {
+                copy_scales<G::kStageScales>(
+                    slot + kSlotWeightVecs + lane,
+                    s + size_t(row0 + lane) * G::kRowScales + i * G::kStageScales, policy);
+            }
+        }
+        commit();
+    };
+#pragma unroll
+    for (int q = 0; q < kRing - 1; ++q) {
+        issue(q);
+    }
+    for (int i = 0; i < G::kStages; ++i) {
+        issue(i + kRing - 1);
+        uint4 xv0[kJ][kXVecs];
+        const __nv_bfloat16* const x0 = x_ptrs[0];
+#pragma unroll
+        for (int j = 0; j < kJ; ++j) {
+            const int k = i * G::kKPerStage + (4 * j + t) * G::kValues;
+#pragma unroll
+            for (int h = 0; h < kXVecs; ++h) {
+                xv0[j][h] = x0 != nullptr ? reinterpret_cast<const uint4*>(x0 + k)[h]
+                                          : make_uint4(0, 0, 0, 0);
+            }
+        }
+        wait_copies<kRing - 1>();
+        __syncwarp();
+        const uint4* slot = ring + i % kRing * kSlotVecs;
+        const auto* scales = reinterpret_cast<const uint8_t*>(slot + kSlotWeightVecs);
+#pragma unroll
+        for (int j = 0; j < kJ; ++j) {
+            const int c = 4 * j + t;
+            const int k = i * G::kKPerStage + c * G::kValues;
+            const int sc = c * G::kValues / G::kGroup;
+            const uint32_t sa = kFp4 ? *reinterpret_cast<const uint16_t*>(scales + g * 16 + sc)
+                                     : scales[g * 16 + sc];
+            const uint32_t sb = kFp4 ? *reinterpret_cast<const uint16_t*>(scales + (g + 8) * 16 + sc)
+                                     : scales[(g + 8) * 16 + sc];
+            const uint4 av = slot[slot_index<G::kChunks>(g, c)];
+            const uint4 bv = slot[slot_index<G::kChunks>(g + 8, c)];
+            const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
+            const uint32_t bw[4] = {bv.x, bv.y, bv.z, bv.w};
+            uint32_t a[G::kValues / 2];
+            uint32_t b[G::kValues / 2];
+            if constexpr (kFp4) {
+                const uint32_t scale_a[2] = {scale_pair(e4m3(sa & 0xff)), scale_pair(e4m3(sa >> 8))};
+                const uint32_t scale_b[2] = {scale_pair(e4m3(sb & 0xff)), scale_pair(e4m3(sb >> 8))};
+#pragma unroll
+                for (int wi = 0; wi < 4; ++wi) {
+#pragma unroll
+                    for (int byte = 0; byte < 4; ++byte) {
+                        a[4 * wi + byte] = bf16x2_mul(
+                            f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2((aw[wi] >> (8 * byte)) & 0xff)),
+                            scale_a[wi / 2]);
+                        b[4 * wi + byte] = bf16x2_mul(
+                            f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2((bw[wi] >> (8 * byte)) & 0xff)),
+                            scale_b[wi / 2]);
+                    }
+                }
+            } else {
+                const uint32_t scale_a = scale_pair(e8m0(sa));
+                const uint32_t scale_b = scale_pair(e8m0(sb));
+#pragma unroll
+                for (int wi = 0; wi < 4; ++wi) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        a[2 * wi + h] = bf16x2_mul(
+                            f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2((aw[wi] >> (16 * h)) & 0xffff)),
+                            scale_a);
+                        b[2 * wi + h] = bf16x2_mul(
+                            f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2((bw[wi] >> (16 * h)) & 0xffff)),
+                            scale_b);
+                    }
+                }
+            }
+            {
+                uint32_t xw[G::kValues / 2];
+#pragma unroll
+                for (int h = 0; h < kXVecs; ++h) {
+                    xw[4 * h] = xv0[j][h].x;
+                    xw[4 * h + 1] = xv0[j][h].y;
+                    xw[4 * h + 2] = xv0[j][h].z;
+                    xw[4 * h + 3] = xv0[j][h].w;
+                }
+#pragma unroll
+                for (int q = 0; q < G::kValues / 4; ++q) {
+                    mma(acc[0], a[2 * q], b[2 * q], a[2 * q + 1], b[2 * q + 1], xw[2 * q],
+                        xw[2 * q + 1]);
+                }
+            }
+#pragma unroll
+            for (int u = 1; u < 4; ++u) {
+                if (u < ng) {
+                    const __nv_bfloat16* const xu = x_ptrs[u];
+                    uint32_t xw[G::kValues / 2];
+#pragma unroll
+                    for (int h = 0; h < kXVecs; ++h) {
+                        const uint4 v = xu != nullptr ? reinterpret_cast<const uint4*>(xu + k)[h]
+                                                      : make_uint4(0, 0, 0, 0);
+                        xw[4 * h] = v.x;
+                        xw[4 * h + 1] = v.y;
+                        xw[4 * h + 2] = v.z;
+                        xw[4 * h + 3] = v.w;
+                    }
+#pragma unroll
+                    for (int q = 0; q < G::kValues / 4; ++q) {
+                        mma(acc[u], a[2 * q], b[2 * q], a[2 * q + 1], b[2 * q + 1], xw[2 * q],
+                            xw[2 * q + 1]);
+                    }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+
 template <bool kFp4, int kRing>
 __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const int32_t* indices,
                                                 int m, const uint8_t* w13, const uint8_t* s13,
@@ -664,61 +806,84 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
             }
         }
         const int ordinal = lo;
-        const int groups = int(vstart[lo + 1]) - int(vstart[lo]);
+        const int chunks = int(vstart[lo + 1]) - int(vstart[lo]);
         const int local = flat - int(vstart[lo]) * kTiles;
-        const int row0 = local / groups * 16;
-        const int group = int(vstart[lo]) + local % groups;
+        const int row0 = local / chunks * 16;
+        const int chunk = int(vstart[lo]) + local % chunks;
         const int e = int(expert_id[ordinal]);
-        const int col0 = 8 * (group - int(vstart[ordinal]));
+        const int col0 = 32 * (chunk - int(vstart[ordinal]));
         const uint16_t* const pairs_of = &meta->pair_list[int(pstart[ordinal]) + col0];
-        const int count = min(int(expert_count[ordinal]) - col0, 8);
-        const int mine = g < count ? int(pairs_of[g]) : -1;
-        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        const int count = min(int(expert_count[ordinal]) - col0, 32);
+        const int ng = (count + 7) / 8;
+        const __nv_bfloat16* x_ptrs[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int idx = u * 8 + g;
+            if (idx < count) {
+                const int pair = int(pairs_of[idx]);
+                x_ptrs[u] = up_proj ? (x + size_t(pair / 8) * kK13) : (act + size_t(pair) * kK2);
+            } else {
+                x_ptrs[u] = nullptr;
+            }
+        }
+        float acc[4][4] = {{0.f, 0.f, 0.f, 0.f},
+                           {0.f, 0.f, 0.f, 0.f},
+                           {0.f, 0.f, 0.f, 0.f},
+                           {0.f, 0.f, 0.f, 0.f}};
         if (up_proj) {
-            tile_product<kFp4, kK13, kRing>(w13 + size_t(e) * kN13 * G13::kRowBytes,
-                                     s13 + size_t(e) * kN13 * G13::kRowScales, row0,
-                                     mine >= 0 ? x + size_t(mine / 8) * kK13 : nullptr, ring,
-                                     lane, policy, acc, [] {});
+            tile_product_wide<kFp4, kK13, kRing>(w13 + size_t(e) * kN13 * G13::kRowBytes,
+                                                 s13 + size_t(e) * kN13 * G13::kRowScales, row0,
+                                                 x_ptrs, ng, ring, lane, policy, acc);
             const float scale = kFp4 ? __fdiv_rn(g13[e], kNvfp4ScaleEnc) : 1.f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float gate = acc[i] * scale;
-                const float up = __shfl_down_sync(0xffffffffu, gate, 4);
-                const int column = 2 * t + (i & 1);
-                if (g % 2 == 0 && column < count) {
-                    const int row = row0 + g + (i >> 1) * 8;
-                    const int pair = int(pairs_of[column]);
-                    act[size_t(pair) * kK2 + row / 2] = softcapped_swiglu(
-                        __bfloat162float(__float2bfloat16(gate)),
-                        __bfloat162float(__float2bfloat16(up)), gate_softcap, up_softcap);
+            for (int u = 0; u < 4; ++u) {
+                if (u < ng) {
+                    const int col_off = u * 8;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float gate = acc[u][i] * scale;
+                        const float up = __shfl_down_sync(0xffffffffu, gate, 4);
+                        const int column = col_off + 2 * t + (i & 1);
+                        if (g % 2 == 0 && column < count) {
+                            const int row = row0 + g + (i >> 1) * 8;
+                            const int pair = int(pairs_of[column]);
+                            act[size_t(pair) * kK2 + row / 2] = softcapped_swiglu(
+                                __bfloat162float(__float2bfloat16(gate)),
+                                __bfloat162float(__float2bfloat16(up)), gate_softcap, up_softcap);
+                        }
+                    }
                 }
             }
             __threadfence();
             __syncwarp();
             if (lane == 0) {
-                atomicAdd(&sync[1 + group], 1u);
+                atomicAdd(&sync[1 + chunk], 1u);
             }
         } else {
+            if (lane == 0) {
+                while (load_relaxed(&sync[1 + chunk]) < kTiles) {
+                    __nanosleep(64);
+                }
+                __threadfence();
+            }
+            __syncwarp();
             const uint8_t* w2e = w2 + size_t(e) * kN2 * G2::kRowBytes;
-            tile_product<kFp4, kK2, kRing>(w2e, s2 + size_t(e) * kN2 * G2::kRowScales, row0,
-                                    mine >= 0 ? act + size_t(mine) * kK2 : nullptr, ring, lane,
-                                    policy, acc, [&] {
-                                        if (lane == 0) {
-                                            while (load_relaxed(&sync[1 + group]) < kTiles) {
-                                                __nanosleep(64);
-                                            }
-                                            __threadfence();
-                                        }
-                                        __syncwarp();
-                                    });
+            tile_product_wide<kFp4, kK2, kRing>(w2e, s2 + size_t(e) * kN2 * G2::kRowScales, row0,
+                                                x_ptrs, ng, ring, lane, policy, acc);
             const float scale = kFp4 ? __fdiv_rn(g2[e], kNvfp4ScaleEnc) : 1.f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int column = 2 * t + (i & 1);
-                if (column < count) {
-                    const int row = row0 + g + (i >> 1) * 8;
-                    const int pair = int(pairs_of[column]);
-                    out[size_t(pair) * kN2 + row] = __float2bfloat16(acc[i] * scale);
+            for (int u = 0; u < 4; ++u) {
+                if (u < ng) {
+                    const int col_off = u * 8;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int column = col_off + 2 * t + (i & 1);
+                        if (column < count) {
+                            const int row = row0 + g + (i >> 1) * 8;
+                            const int pair = int(pairs_of[column]);
+                            out[size_t(pair) * kN2 + row] = __float2bfloat16(acc[u][i] * scale);
+                        }
+                    }
                 }
             }
         }
@@ -816,7 +981,7 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32)
 
     const int d = distinct;
     int cnt = tid < d ? int(expert_count[tid]) : 0;
-    int grps = (cnt + 7) / 8;
+    int grps = (cnt + 31) / 32;
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
         const int vg = __shfl_up_sync(0xffffffffu, grps, o);
