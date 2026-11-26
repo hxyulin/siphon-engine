@@ -8,10 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Cell, Paragraph, Row, Table, Widget as _},
 };
-use siphon::{
-    KvFormat, WeightFormat,
-    memory::{CONTEXT_BYTES, gib},
-};
+use siphon::{KvFormat, WeightFormat, memory::gib};
 
 use crate::{
     app::{App, FORMATS},
@@ -128,7 +125,7 @@ fn parts(app: &App) -> Vec<Part> {
         ),
         Part::new(
             "CUDA context",
-            CONTEXT_BYTES,
+            app.device.context,
             Color::Rgb(120, 126, 138),
             "measured",
         ),
@@ -203,7 +200,7 @@ fn parts(app: &App) -> Vec<Part> {
             "Unused",
             left - margin,
             DIM,
-            if left - margin >= CONTEXT_BYTES / 2 {
+            if left - margin >= app.device.context / 2 {
                 "room for more".to_owned()
             } else {
                 "rounding".to_owned()
@@ -354,7 +351,7 @@ fn draw_bar(app: &App, parts: &[Part], area: Rect, buf: &mut Buffer) {
         bar,
         Line::from(Span::raw(ruler).fg(DIM)),
     ];
-    let device = app.device.others + CONTEXT_BYTES + app.device.free;
+    let device = app.device.others + app.device.context + app.device.free;
     let title = format!("GPU memory, {} GiB", gib(device));
     Paragraph::new(lines)
         .block(block(&title).padding(ratatui::widgets::Padding::horizontal(1)))

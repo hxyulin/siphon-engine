@@ -13,6 +13,19 @@ const RTX_5090_IDLE_HELD: usize = (459 + 454) << 20;
 /// Streaming multiprocessors by device name, which nvidia-smi does not report.
 const SMS: [(&str, usize); 2] = [("RTX 5090", 170), ("RTX PRO 6000 Blackwell", 188)];
 
+/// The CUDA context by device name where it differs from `CONTEXT_BYTES`, the RTX 5090's:
+/// measured as nvidia-smi's free memory less the free memory right after creating the
+/// context. 392 MiB on an RTX 4090 with driver 595.
+const CONTEXTS: [(&str, usize); 1] = [("RTX 4090", 392 << 20)];
+
+/// The CUDA context of the device `name`.
+fn context(name: &str) -> usize {
+    CONTEXTS
+        .iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map_or(CONTEXT_BYTES, |&(_, bytes)| bytes)
+}
+
 /// The SM count of the device `name`, or the largest known for another device, since the
 /// plan's buffers grow with it.
 fn sms(name: &str) -> usize {
@@ -41,6 +54,8 @@ pub struct Device {
     pub total: usize,
     /// Bytes the driver reserves and other processes hold.
     pub others: usize,
+    /// Bytes the CUDA context takes.
+    pub context: usize,
     /// Bytes free once the CUDA context exists: what a plan must fit, as
     /// `siphon_cuda`'s `cuMemGetInfo` after creating the context reads it.
     pub free: usize,
@@ -57,13 +72,14 @@ impl Device {
             name: "RTX 5090".to_owned(),
             total: RTX_5090_TOTAL,
             others: RTX_5090_IDLE_HELD,
+            context: CONTEXT_BYTES,
             free: RTX_5090_TOTAL - RTX_5090_IDLE_HELD - CONTEXT_BYTES,
             sms: sms("RTX 5090"),
             source: Source::Assumed,
         });
         match free {
             Some(free) => Self {
-                others: device.total.saturating_sub(free + CONTEXT_BYTES),
+                others: device.total.saturating_sub(free + device.context),
                 free,
                 source: Source::Given,
                 ..device
@@ -102,9 +118,8 @@ fn query() -> Option<Device> {
         sms: sms(name),
         total,
         others: reserved + used,
-        // CONTEXT_BYTES was measured as nvidia-smi's free memory less the free memory the
-        // process reads right after creating its context.
-        free: free.saturating_sub(CONTEXT_BYTES),
+        context: context(name),
+        free: free.saturating_sub(context(name)),
         source: Source::NvidiaSmi,
     })
 }
