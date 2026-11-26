@@ -791,7 +791,7 @@ mod linux {
     fn default_contexts(planner: &Planner, free: usize, tail: usize) -> Vec<usize> {
         let mut contexts = DEFAULT_CONTEXTS.to_vec();
         let plan = planner.plan(LONG_CONTEXT + tail);
-        if plan.total() <= memory::budget(free, None) {
+        if plan.total() <= memory::budget(free, None, memory::DEFAULT_MARGIN) {
             contexts.push(LONG_CONTEXT);
         } else {
             eprintln!(

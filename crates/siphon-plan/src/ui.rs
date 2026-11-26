@@ -10,7 +10,7 @@ use ratatui::{
 };
 use siphon::{
     KvFormat, WeightFormat,
-    memory::{CONTEXT_BYTES, SAFETY_MARGIN, gib},
+    memory::{CONTEXT_BYTES, gib},
 };
 
 use crate::{
@@ -114,7 +114,7 @@ fn parts(app: &App) -> Vec<Part> {
         |bytes: usize| format!("{} KiB × {}", bytes.div_ceil(1024), thousands(context));
     let left = app.device.free.saturating_sub(plan.total());
     let margin = left.min(app.device.free - app.budget.min(app.device.free));
-    let margin_name = if app.limit.is_some() && app.budget + SAFETY_MARGIN < app.device.free {
+    let margin_name = if app.limit.is_some() && app.budget + app.margin < app.device.free {
         "Past --memory"
     } else {
         "Safety margin"
@@ -166,7 +166,7 @@ fn parts(app: &App) -> Vec<Part> {
             "Prefill",
             plan.prefill,
             Color::Rgb(245, 194, 90),
-            "2,048-row chunk",
+            format!("{}-row chunk", thousands(app.prefill_chunk)),
         ),
         Part::new(
             "Verify",
@@ -226,7 +226,7 @@ fn draw_header(app: &App, area: Rect, buf: &mut Buffer) {
         Span::raw(format!(
             ": {} GiB free less a {} GiB margin",
             gib(device.free),
-            gib(SAFETY_MARGIN)
+            gib(app.margin)
         ))
         .fg(DIM),
     ];

@@ -11,8 +11,6 @@ use siphon::{
 
 use crate::device::Device;
 
-/// Rows of the prefill chunk siphon-serve runs (`siphon_cuda::model::DEFAULT_PREFILL_CHUNK`).
-const PREFILL_CHUNK: usize = 2048;
 /// Positions the arrow keys move the context by: left and right, up and down.
 const SMALL_STEP: usize = 8 * 1024;
 const LARGE_STEP: usize = 64 * 1024;
@@ -50,11 +48,29 @@ pub struct Config {
     pub planner: Planner,
 }
 
+/// The command-line choices the plans follow.
+pub struct Settings {
+    /// `--memory`.
+    pub limit: Option<usize>,
+    /// `--margin`.
+    pub margin: usize,
+    /// `--prefill-chunk`.
+    pub prefill_chunk: usize,
+    /// `--context`.
+    pub context: Option<usize>,
+    /// `--streams`.
+    pub streams: usize,
+}
+
 pub struct App {
     pub model: String,
     pub device: Device,
     /// `--memory`.
     pub limit: Option<usize>,
+    /// `--margin`.
+    pub margin: usize,
+    /// `--prefill-chunk`.
+    pub prefill_chunk: usize,
     /// Bytes a plan may take.
     pub budget: usize,
     pub drafts: Vec<Draft>,
@@ -73,10 +89,15 @@ impl App {
         model_dir: &Path,
         drafter: Option<&Path>,
         device: Device,
-        limit: Option<usize>,
-        context: Option<usize>,
-        streams: usize,
+        settings: &Settings,
     ) -> anyhow::Result<Self> {
+        let &Settings {
+            limit,
+            margin,
+            prefill_chunk,
+            context,
+            streams,
+        } = settings;
         let config = TextConfig::load(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir)?;
         let mut drafts = vec![Draft::Bundled];
@@ -107,7 +128,7 @@ impl App {
                                 Draft::Dflash(dir) => DraftChoice::Dflash(dir, approx),
                                 Draft::None => DraftChoice::None,
                             },
-                            prefill_chunk: PREFILL_CHUNK,
+                            prefill_chunk,
                             streams,
                             prefix_entries: streams,
                             sms: device.sms,
@@ -125,11 +146,13 @@ impl App {
         let model = model_dir
             .file_name()
             .map_or_else(|| "model".to_owned(), |n| n.to_string_lossy().into_owned());
-        let budget = memory::budget(device.free, limit);
+        let budget = memory::budget(device.free, limit, margin);
         Ok(Self {
             model,
             device,
             limit,
+            margin,
+            prefill_chunk,
             budget,
             drafts,
             configs,

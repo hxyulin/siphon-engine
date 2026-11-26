@@ -19,9 +19,13 @@ use serde_json::json;
 const STREAMS: std::ops::RangeInclusive<usize> = 1..=32;
 #[cfg(target_os = "linux")]
 const _: () = assert!(*STREAMS.end() == siphon::memory::BATCH_ROWS);
+/// Rows of a prefill chunk.
+const PREFILL_CHUNK: std::ops::RangeInclusive<usize> = 1..=2048;
+#[cfg(target_os = "linux")]
+const _: () = assert!(*PREFILL_CHUNK.end() == siphon::memory::MAX_PREFILL_CHUNK);
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
-                     [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
+                     [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--prefill-attention auto|bf16|fp8] [--greedy]
@@ -32,7 +36,9 @@ way it plans the memory before loading the weights and stops if the plan does no
 positions. A request alone speculates; once another arrives, all run batched plain decode.
 Either way a request gets the same tokens. Up to --queue more requests wait.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
-plan may use the free memory at startup less a 0.5 GiB margin.
+plan may use the free memory at startup less --margin, 0.5 GiB by default.
+--prefill-chunk runs prompts in chunks of N rows, 1 to 2048. Its buffers grow with N: 0.85 GiB
+at 2048 rows and 0.47 GiB at 1024, and the memory they free goes to the context.
 --drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
 or a DFlash draft exported by the 2DSD project.
 --draft picks the draft's approximations as bench does: fast (the default, FP8 plus the
@@ -42,7 +48,7 @@ and shortlist.
 free prose, but where it steps depends on timings measured at startup, so the output can
 differ between runs.
 --no-prefix-cache turns off the prefix cache. The cache keeps the state of recent prompts at
-their last multiple of 2,048 tokens, one per stream, and a request whose prompt starts with
+their last multiple of --prefill-chunk tokens, one per stream, and a request whose prompt starts with
 one of them prefills only the rest. Each entry costs about 0.17 GiB, 0.2 GiB with DFlash 2,
 whatever the context. --prefix-cache-entries keeps fewer entries than --streams, to leave
 more memory for the context. --prefix-cache-ttl drops an entry unused for that many seconds.
@@ -76,6 +82,8 @@ fn args() -> anyhow::Result<Args> {
     let mut name = "inkling-2-mini".to_owned();
     let mut capacity = None;
     let mut memory = None;
+    let mut margin = None;
+    let mut prefill_chunk = None;
     let mut fp8_weights = true;
     let mut fp8_kv = true;
     let mut queue = 8;
@@ -100,13 +108,9 @@ fn args() -> anyhow::Result<Args> {
             "--port" => port = value()?.parse()?,
             "--name" => name = value()?,
             "--context" => capacity = Some(value()?.parse()?),
-            "--memory" => {
-                let gib: f64 = value()?.parse().context("--memory takes GiB")?;
-                ensure!(gib > 0.0, "--memory takes a positive number of GiB");
-                #[expect(clippy::cast_sign_loss, reason = "gib is positive")]
-                let bytes = (gib * f64::from(1u32 << 30)) as usize;
-                memory = Some(bytes);
-            }
+            "--memory" => memory = Some(gib_bytes(&value()?, "--memory", false)?),
+            "--margin" => margin = Some(gib_bytes(&value()?, "--margin", true)?),
+            "--prefill-chunk" => prefill_chunk = Some(chunk_rows(&value()?)?),
             "--weights" => fp8_weights = fp8(&value()?)?,
             "--kv" => fp8_kv = fp8(&value()?)?,
             "--queue" => queue = value()?.parse()?,
@@ -149,6 +153,8 @@ fn args() -> anyhow::Result<Args> {
             model_dir: model_dir.clone(),
             capacity,
             memory,
+            margin,
+            prefill_chunk,
             fp8_weights,
             fp8_kv,
             widths,
@@ -170,6 +176,28 @@ fn args() -> anyhow::Result<Args> {
         address,
         name,
     })
+}
+
+/// The bytes of `flag`'s value in GiB: positive, or with `zero` 0 or more.
+fn gib_bytes(value: &str, flag: &str, zero: bool) -> anyhow::Result<usize> {
+    let gib: f64 = value.parse().with_context(|| format!("{flag} takes GiB"))?;
+    ensure!(
+        gib > 0.0 || (zero && gib == 0.0),
+        "{flag} takes a {} number of GiB",
+        if zero { "non-negative" } else { "positive" }
+    );
+    #[expect(clippy::cast_sign_loss, reason = "gib is not negative")]
+    Ok((gib * f64::from(1u32 << 30)) as usize)
+}
+
+/// The rows of `--prefill-chunk`.
+fn chunk_rows(value: &str) -> anyhow::Result<usize> {
+    let rows = value.parse().context("--prefill-chunk takes rows")?;
+    ensure!(
+        PREFILL_CHUNK.contains(&rows),
+        "--prefill-chunk takes 1 to 2048"
+    );
+    Ok(rows)
 }
 
 /// The prefix cache's entries: `--prefix-cache-entries`, 1 to `streams`, or `streams`.

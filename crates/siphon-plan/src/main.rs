@@ -2,7 +2,7 @@
 //! safetensors headers before anything is loaded.
 //!
 //! ```text
-//! siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] [--context N] [--streams N] [--print]
+//! siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--print]
 //! ```
 //!
 //! It shows the plan of one configuration as a bar over the whole GPU and a table of its
@@ -28,13 +28,20 @@ use ratatui::{
 
 use siphon::memory;
 
-use crate::{app::App, device::Device};
+use crate::{
+    app::{App, Settings},
+    device::Device,
+};
 
-const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] \
-                     [--context N] [--streams N] [--print]
+const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] \
+                     [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--print]
 --drafter adds a DFlash drafter's plan beside the bundled draft's.
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's
 --memory does.
+--margin sets the free memory the plan leaves unclaimed, as siphon-serve's --margin does
+(0.5 GiB by default).
+--prefill-chunk plans prefill chunks of N rows, 1 to 2048, as siphon-serve's --prefill-chunk
+does (2048 by default).
 --free sets the free memory right after creating the CUDA context instead of asking
 nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
@@ -49,6 +56,8 @@ struct Args {
     model: PathBuf,
     drafter: Option<PathBuf>,
     memory: Option<usize>,
+    margin: usize,
+    prefill_chunk: usize,
     free: Option<usize>,
     context: Option<usize>,
     streams: usize,
@@ -58,8 +67,14 @@ struct Args {
 fn gib_arg(value: &str, flag: &str) -> anyhow::Result<usize> {
     let gib: f64 = value.parse().with_context(|| format!("{flag} takes GiB"))?;
     ensure!(gib > 0.0, "{flag} takes a positive number of GiB");
-    #[expect(clippy::cast_sign_loss, reason = "gib is positive")]
-    Ok((gib * f64::from(1u32 << 30)) as usize)
+    Ok(gib_bytes(gib))
+}
+
+/// `gib` GiB, which is not negative, in bytes.
+fn gib_bytes(gib: f64) -> usize {
+    #[expect(clippy::cast_sign_loss, reason = "gib is not negative")]
+    let bytes = (gib * f64::from(1u32 << 30)) as usize;
+    bytes
 }
 
 fn args() -> anyhow::Result<Args> {
@@ -67,6 +82,8 @@ fn args() -> anyhow::Result<Args> {
     let mut model = None;
     let mut drafter = None;
     let mut memory = None;
+    let mut margin = memory::DEFAULT_MARGIN;
+    let mut prefill_chunk = memory::DEFAULT_PREFILL_CHUNK;
     let mut free = None;
     let mut context = None;
     let mut streams = 1;
@@ -76,6 +93,19 @@ fn args() -> anyhow::Result<Args> {
         match arg.as_str() {
             "--drafter" => drafter = Some(PathBuf::from(value()?)),
             "--memory" => memory = Some(gib_arg(&value()?, "--memory")?),
+            "--margin" => {
+                let gib: f64 = value()?.parse().context("--margin takes GiB")?;
+                ensure!(gib >= 0.0, "--margin takes GiB, 0 or more");
+                margin = gib_bytes(gib);
+            }
+            "--prefill-chunk" => {
+                prefill_chunk = value()?.parse().context("--prefill-chunk takes rows")?;
+                ensure!(
+                    (1..=memory::MAX_PREFILL_CHUNK).contains(&prefill_chunk),
+                    "--prefill-chunk takes 1 to {}",
+                    memory::MAX_PREFILL_CHUNK
+                );
+            }
             "--free" => free = Some(gib_arg(&value()?, "--free")?),
             "--context" => context = Some(value()?.parse().context("--context takes positions")?),
             "--streams" => {
@@ -100,6 +130,8 @@ fn args() -> anyhow::Result<Args> {
         model: model.context(USAGE)?,
         drafter,
         memory,
+        margin,
+        prefill_chunk,
         free,
         context,
         streams,
@@ -114,9 +146,13 @@ fn main() -> anyhow::Result<()> {
         &args.model,
         args.drafter.as_deref(),
         device,
-        args.memory,
-        args.context,
-        args.streams,
+        &Settings {
+            limit: args.memory,
+            margin: args.margin,
+            prefill_chunk: args.prefill_chunk,
+            context: args.context,
+            streams: args.streams,
+        },
     )?;
     if args.print || !io::stdout().is_terminal() {
         return print_frame(&app);

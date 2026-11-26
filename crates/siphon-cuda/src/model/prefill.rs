@@ -42,9 +42,11 @@ use crate::{
 
 /// Most rows one chunk may hold.
 pub const MAX_PREFILL_CHUNK: usize = attention::MAX_PREFILL_ROWS;
+const _: () = assert!(MAX_PREFILL_CHUNK == siphon::memory::MAX_PREFILL_CHUNK);
 /// The fastest chunk size measured: each expert weight read serves the most rows. Time to
 /// first token for 32K tokens was 2.93 s at 512 rows, 2.55 s at 1024 and 2.39 s at 2048.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+const _: () = assert!(DEFAULT_PREFILL_CHUNK == siphon::memory::DEFAULT_PREFILL_CHUNK);
 /// The attention products [`Model::prefill`] runs over an FP8 cache unless
 /// [`Model::set_prefill_attention`] says otherwise.
 pub const DEFAULT_PREFILL_ATTENTION: PrefillAttention = PrefillAttention::Auto;

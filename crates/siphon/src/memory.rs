@@ -42,9 +42,13 @@ pub const RUNTIME_BYTES: usize = 128 << 20;
 /// under the plan without this at 1 stream and 11 to 43 MiB over it at 32.
 pub const STREAM_RUNTIME_BYTES: usize = 4 << 20;
 
-/// Free memory a plan leaves unclaimed, for other processes on the GPU and the
-/// allocator's growth past the plan.
-pub const SAFETY_MARGIN: usize = 512 << 20;
+/// Free memory a plan leaves unclaimed unless `--margin` says otherwise, for other
+/// processes on the GPU and the allocator's growth past the plan.
+pub const DEFAULT_MARGIN: usize = 512 << 20;
+
+/// Rows of a prefill chunk unless `--prefill-chunk` says otherwise, and the most it takes.
+pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+pub const MAX_PREFILL_CHUNK: usize = 2048;
 
 /// Rows of the largest verify pass.
 pub const VERIFY_ROWS: usize = 8;
@@ -188,11 +192,11 @@ impl Plan {
 }
 
 /// The bytes a plan may take: `free`, the free memory read right after creating the CUDA
-/// context, less [`SAFETY_MARGIN`], and with a `limit` on the process's memory at most the
-/// limit less [`CONTEXT_BYTES`].
+/// context, less `margin` (siphon-serve's `--margin`, [`DEFAULT_MARGIN`] by default), and
+/// with a `limit` on the process's memory at most the limit less [`CONTEXT_BYTES`].
 #[must_use]
-pub fn budget(free: usize, limit: Option<usize>) -> usize {
-    let free = free.saturating_sub(SAFETY_MARGIN);
+pub fn budget(free: usize, limit: Option<usize>, margin: usize) -> usize {
+    let free = free.saturating_sub(margin);
     limit.map_or(free, |l| free.min(l.saturating_sub(CONTEXT_BYTES)))
 }
 

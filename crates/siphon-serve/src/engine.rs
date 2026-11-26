@@ -221,6 +221,10 @@ pub struct Options {
     pub capacity: Option<usize>,
     /// Bytes of GPU memory the plan may use, the CUDA context included.
     pub memory: Option<usize>,
+    /// Free bytes the plan leaves unclaimed; `None` leaves `memory::DEFAULT_MARGIN`.
+    pub margin: Option<usize>,
+    /// Rows of each prefill chunk; `None` runs `DEFAULT_PREFILL_CHUNK`.
+    pub prefill_chunk: Option<usize>,
     pub fp8_weights: bool,
     pub fp8_kv: bool,
     /// Verify widths the adaptive policy chooses among.
@@ -317,7 +321,7 @@ mod cuda {
     use anyhow::Context as _;
     use siphon::{
         Checkpoint, TextConfig,
-        memory::{self, CONTEXT_BYTES, DraftChoice, PlanInputs, Planner, SAFETY_MARGIN, gib},
+        memory::{self, CONTEXT_BYTES, DEFAULT_MARGIN, DraftChoice, PlanInputs, Planner, gib},
     };
     use siphon_cuda::{
         Gpu, MemoryUse,
@@ -375,7 +379,8 @@ mod cuda {
         free: usize,
         warmup: usize,
     ) -> anyhow::Result<usize> {
-        let budget = memory::budget(free, options.memory);
+        let margin = options.margin.unwrap_or(DEFAULT_MARGIN);
+        let budget = memory::budget(free, options.memory, margin);
         let limit = options.memory.map_or_else(String::new, |l| {
             format!(
                 ", within --memory {} GiB less the context's {} GiB",
@@ -387,7 +392,7 @@ mod cuda {
             "budget {} GiB: {} GiB free less a {} GiB margin{limit}",
             gib(budget),
             gib(free),
-            gib(SAFETY_MARGIN)
+            gib(margin)
         );
         let capacity = match options.capacity {
             Some(capacity) => {
@@ -505,17 +510,9 @@ mod cuda {
         let gpu = Gpu::new(0)?;
         let (free, _) = gpu.context().mem_get_info()?;
         let checkpoint = Checkpoint::open(&options.model_dir)?;
-        let kv = if options.fp8_kv {
-            KvFormat::Fp8
-        } else {
-            KvFormat::Bf16
-        };
-        let weight_format = if options.fp8_weights {
-            WeightFormat::Fp8
-        } else {
-            WeightFormat::Bf16
-        };
+        let (weight_format, kv) = formats(options);
         let draft_options = DraftOptions::parse(&options.draft, None)?;
+        let chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK);
         let planner = Planner::new(&PlanInputs {
             config: &config,
             checkpoint: &checkpoint,
@@ -527,7 +524,7 @@ mod cuda {
                 .map_or(DraftChoice::Bundled(draft_options.approx()), |dir| {
                     DraftChoice::Dflash(dir, draft_options.approx())
                 }),
-            prefill_chunk: DEFAULT_PREFILL_CHUNK,
+            prefill_chunk: chunk,
             streams: options.streams,
             prefix_entries: options.prefix_entries,
             sms: gpu.sms()?,
@@ -547,11 +544,12 @@ mod cuda {
             .map_or(DraftSource::Bundled, DraftSource::Dflash);
         let draft = load_draft(&mut model, &checkpoint, source, capacity, &draft_options)?;
         let mut speculator = Speculator::with_draft(&model, draft, width)?;
+        speculator.set_prefill_chunk(chunk)?;
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
 
         // Price each width at the warmup prompt, which also captures the graphs.
         model.reset()?;
-        let first = speculator.prefill(&mut model, warmup, DEFAULT_PREFILL_CHUNK)?;
+        let first = speculator.prefill(&mut model, warmup, chunk)?;
         let saved = model.save_state()?;
         let policy = price(&mut model, &mut speculator, &saved, warmup, first)?;
         let priced: Vec<String> = options
@@ -604,9 +602,24 @@ mod cuda {
         // and a plan that undercounts fails here rather than on the first long prompt.
         // After pricing, so that they reuse the memory pricing freed, as a long prompt's
         // prefill would.
-        model.reserve_prefill(DEFAULT_PREFILL_CHUNK)?;
+        model.reserve_prefill(chunk)?;
         let check = MemoryCheck::new(gpu, planner.plan(capacity).total(), free)?;
         Ok((model, speculator, capacity, check))
+    }
+
+    /// The weight and KV cache formats `options` ask for.
+    fn formats(options: &Options) -> (WeightFormat, KvFormat) {
+        let weights = if options.fp8_weights {
+            WeightFormat::Fp8
+        } else {
+            WeightFormat::Bf16
+        };
+        let kv = if options.fp8_kv {
+            KvFormat::Fp8
+        } else {
+            KvFormat::Bf16
+        };
+        (weights, kv)
     }
 
     /// The model's form of a request's sampling, greedy under `--greedy`.
@@ -804,7 +817,7 @@ mod cuda {
                 // a batch of one rather than whole in slot 0.
                 if streams > 1
                     && speculator
-                        .prefix_lookup(&model, &job.prompt, DEFAULT_PREFILL_CHUNK, &[])
+                        .prefix_lookup(&model, &job.prompt, speculator.prefill_chunk(), &[])
                         .is_some_and(|hit| !hit.draft)
                 {
                     waiting.push_front(job);
@@ -866,8 +879,11 @@ mod cuda {
         let go_on = if request.next.is_some() {
             true
         } else {
-            let (first, cached) =
-                speculator.prefill_cached(model, &request.job.prompt, DEFAULT_PREFILL_CHUNK)?;
+            let (first, cached) = speculator.prefill_cached(
+                model,
+                &request.job.prompt,
+                speculator.prefill_chunk(),
+            )?;
             request.cached = cached;
             let _ = request.job.events.send(Event::Cached(cached));
             request.prefilled = request.job.prompt.len();
@@ -1020,7 +1036,7 @@ mod cuda {
                     continue;
                 }
                 let prompt = &request.job.prompt;
-                match speculator.claim_slot(model, prompt, DEFAULT_PREFILL_CHUNK, &busy) {
+                match speculator.claim_slot(model, prompt, speculator.prefill_chunk(), &busy) {
                     Ok((slot, cached)) => {
                         request.slot = slot;
                         request.prefilled = cached;
@@ -1088,22 +1104,18 @@ mod cuda {
             return;
         }
         let len = r.job.prompt.len();
-        let end = (r.prefilled + DEFAULT_PREFILL_CHUNK).min(len);
-        let boundary = len.saturating_sub(1) / DEFAULT_PREFILL_CHUNK * DEFAULT_PREFILL_CHUNK;
+        let chunk = speculator.prefill_chunk();
+        let end = (r.prefilled + chunk).min(len);
+        let boundary = len.saturating_sub(1) / chunk * chunk;
         model.set_sampling(r.sampling);
-        let first = match model.prefill_slot(
-            r.slot,
-            &r.job.prompt[r.prefilled..end],
-            DEFAULT_PREFILL_CHUNK,
-        ) {
+        let first = match model.prefill_slot(r.slot, &r.job.prompt[r.prefilled..end], chunk) {
             Ok(first) => first,
             Err(e) => return r.fail(&e),
         };
         r.prefilled = end;
         if end == boundary
             && end > r.cached
-            && let Err(e) =
-                speculator.save_prefix(model, r.slot, &r.job.prompt, DEFAULT_PREFILL_CHUNK, &busy)
+            && let Err(e) = speculator.save_prefix(model, r.slot, &r.job.prompt, chunk, &busy)
         {
             eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
         }

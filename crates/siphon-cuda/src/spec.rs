@@ -419,6 +419,8 @@ pub struct Speculator {
     round_hook: Option<RoundHook>,
     /// Whether a sampling request drafts coupled picks ([`Self::set_coupled_drafts`]).
     coupled: bool,
+    /// Rows of the prefill chunks [`Self::rebuild`] runs ([`Self::set_prefill_chunk`]).
+    prefill_chunk: usize,
 }
 
 /// What a verify round saw, for [`Speculator::set_round_hook`].
@@ -581,7 +583,27 @@ impl Speculator {
             draft_sequence: 0,
             round_hook: None,
             coupled: true,
+            prefill_chunk: crate::model::DEFAULT_PREFILL_CHUNK,
         })
+    }
+
+    /// The rows of the prefill chunks the caller runs, and that [`Self::rebuild`] runs:
+    /// 1 to [`crate::model::MAX_PREFILL_CHUNK`], [`crate::model::DEFAULT_PREFILL_CHUNK`]
+    /// until set. Prefix cache entries are found by the chunk they were saved with.
+    pub fn set_prefill_chunk(&mut self, rows: usize) -> anyhow::Result<()> {
+        ensure!(
+            (1..=crate::model::MAX_PREFILL_CHUNK).contains(&rows),
+            "a prefill chunk of {rows} rows, expected 1 to {}",
+            crate::model::MAX_PREFILL_CHUNK
+        );
+        self.prefill_chunk = rows;
+        Ok(())
+    }
+
+    /// The rows of [`Self::set_prefill_chunk`].
+    #[must_use]
+    pub fn prefill_chunk(&self) -> usize {
+        self.prefill_chunk
     }
 
     /// Calls `hook` after each verify round with the round's drafts and logits, or stops
@@ -870,7 +892,7 @@ impl Speculator {
             slot != from,
             "the draft is rebuilt in another slot than the sequence's"
         );
-        let chunk = crate::model::DEFAULT_PREFILL_CHUNK;
+        let chunk = self.prefill_chunk;
         // Before the slots swap places in `with_slot`.
         let entry = self.entry_starting(model, from, tokens, chunk);
         model.reset_slot(slot)?;
