@@ -38,6 +38,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cfloat>
+#include <climits>
 #include <cstdint>
 
 #include "pdl.cuh"
@@ -315,6 +317,228 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     }
 }
 
+// True if (a, ia) beats (b, ib) under argmax_f32's rule: larger value wins, ties go to the
+// smaller index, and NaN beats every number (first NaN wins).
+__device__ __forceinline__ bool argmax_better(float a, int ia, float b, int ib) {
+    const bool a_nan = isnan(a);
+    const bool b_nan = isnan(b);
+    if (a_nan || b_nan) {
+        return a_nan && (!b_nan || ia < ib);
+    }
+    return a > b || (a == b && ia < ib);
+}
+
+// Single-product LM head with a fused tile-argmax epilogue: runs the exact same MMA and
+// warp reduction as rows_product, rounds each logit to BF16 (matching head_logits so
+// argmax(softcap(bf16(x))) == argmax(bf16(x)) bit for bit), masks row < vocab, reduces
+// across the 8 g-lanes sharing each input row, and writes one (max_val, max_idx) partial
+// per (row, tile_block).
+template <bool kFp8, int K, int NT, int kT, bool kChunked = false>
+__device__ __forceinline__ void rows_product_argmax(
+    const uint8_t* weight, const float* scales, const __nv_bfloat16* x_in,
+    float* partial_vals, int* partial_idxs, int m, int vocab, int partial_stride, int pdl,
+    uint4* ring) {
+    constexpr int kBytes = kFp8 ? 1 : 2;
+    constexpr int kKPerStage = kStageBytes / kBytes;
+    constexpr int kStagesPerRow = K / kKPerStage;
+    static_assert(kStagesPerRow * kKPerStage == K, "whole stages per row");
+    static_assert(kT == 1 || kT == 2, "one tile or a pair");
+
+    const int tile_block = kChunked ? int(blockIdx.y) : int(blockIdx.x);
+    const int col_base = kChunked ? int(blockIdx.x) * (8 * NT) : 0;
+    const int splits = blockDim.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int g = lane / 4;
+    const int t = lane % 4;
+    const int r0 = tile_block * kT * kTileRows;
+    uint4* buf = ring + warp * kSlots * kT * kSlotVecs;
+    const int stages = (kStagesPerRow - warp + splits - 1) / splits;
+
+    auto issue = [&](int i) {
+        if (i < stages) {
+            const int stage = warp + i * splits;
+#pragma unroll
+            for (int u = 0; u < kT; ++u) {
+                uint4* slot = buf + (i % kSlots * kT + u) * kSlotVecs;
+#pragma unroll
+                for (int q = 0; q < kSlotVecs / 32; ++q) {
+                    const int idx = q * 32 + lane;
+                    const int r = idx / kChunks;
+                    const int c = idx % kChunks;
+                    const int row = min(r0 + u * kTileRows + r, vocab - 1);
+                    copy16(slot + slot_index(r, c),
+                           weight + size_t(row) * K * kBytes + stage * kStageBytes + c * 16);
+                }
+            }
+        }
+        commit();
+    };
+#pragma unroll
+    for (int i = 0; i < kSlots - 1; ++i) {
+        issue(i);
+    }
+    if (pdl) {
+        pdl_wait();
+    }
+    pdl_trigger();
+
+    const uint4* x[NT];
+    bool live[NT];
+    float acc[kT][NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+        const int col_row = col_base + g + 8 * n;
+        x[n] = reinterpret_cast<const uint4*>(x_in + size_t(col_row) * K);
+        live[n] = col_row < m;
+#pragma unroll
+        for (int u = 0; u < kT; ++u) {
+            acc[u][n][0] = acc[u][n][1] = acc[u][n][2] = acc[u][n][3] = 0.f;
+        }
+    }
+    constexpr int kXVecs = kChunks / 4 * (kFp8 ? 2 : 1);
+    for (int i = 0; i < stages; ++i) {
+        issue(i + kSlots - 1);
+        const int stage = warp + i * splits;
+        uint4 xv[NT][kXVecs];
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+#pragma unroll
+            for (int j = 0; j < kChunks / 4; ++j) {
+                const int c = 4 * j + t;
+#pragma unroll
+                for (int h = 0; h < kXVecs / (kChunks / 4); ++h) {
+                    const int xi = (stage * kKPerStage + c * (kFp8 ? 16 : 8)) / 8 + h;
+                    xv[n][j * (kXVecs / (kChunks / 4)) + h] =
+                        live[n] ? x[n][xi] : make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+        wait_copies<kSlots - 1>();
+        __syncwarp();
+#pragma unroll
+        for (int u = 0; u < kT; ++u) {
+            const uint4* slot = buf + (i % kSlots * kT + u) * kSlotVecs;
+#pragma unroll
+            for (int j = 0; j < kChunks / 4; ++j) {
+                const int c = 4 * j + t;
+                const uint4 a = slot[slot_index(g, c)];
+                const uint4 a8 = slot[slot_index(g + 8, c)];
+                if constexpr (kFp8) {
+                    const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+                    const uint32_t bw[4] = {a8.x, a8.y, a8.z, a8.w};
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const uint32_t a0 = e4m3x2_to_bf16x2(aw[q] & 0xffffu);
+                        const uint32_t a1 = e4m3x2_to_bf16x2(bw[q] & 0xffffu);
+                        const uint32_t a2 = e4m3x2_to_bf16x2(aw[q] >> 16);
+                        const uint32_t a3 = e4m3x2_to_bf16x2(bw[q] >> 16);
+#pragma unroll
+                        for (int n = 0; n < NT; ++n) {
+                            const uint4 x0 = xv[n][2 * j];
+                            const uint4 x1 = xv[n][2 * j + 1];
+                            const uint32_t xw[8] = {x0.x, x0.y, x0.z, x0.w,
+                                                    x1.x, x1.y, x1.z, x1.w};
+                            mma(acc[u][n], a0, a1, a2, a3, xw[2 * q], xw[2 * q + 1]);
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int n = 0; n < NT; ++n) {
+                        mma(acc[u][n], a.x, a8.x, a.y, a8.y, xv[n][j].x, xv[n][j].y);
+                        mma(acc[u][n], a.z, a8.z, a.w, a8.w, xv[n][j].z, xv[n][j].w);
+                    }
+                }
+            }
+        }
+        __syncwarp();
+    }
+
+    static_assert(NT * 32 * 16 <= kSlots * kSlotVecs * 16, "the partials fit a warp's ring");
+    if (splits > 1) {
+#pragma unroll
+        for (int u = 0; u < kT; ++u) {
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                reinterpret_cast<float4*>(buf + u * kSlots * kSlotVecs)[n * 32 + lane] =
+                    make_float4(acc[u][n][0], acc[u][n][1], acc[u][n][2], acc[u][n][3]);
+            }
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+        for (int w = 1; w < splits; ++w) {
+#pragma unroll
+            for (int u = 0; u < kT; ++u) {
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const float4 p = reinterpret_cast<const float4*>(
+                        ring + (w * kT + u) * kSlots * kSlotVecs)[n * 32 + lane];
+                    acc[u][n][0] += p.x;
+                    acc[u][n][1] += p.y;
+                    acc[u][n][2] += p.z;
+                    acc[u][n][3] += p.w;
+                }
+            }
+        }
+    }
+
+    float sc[kT][2];
+    if constexpr (kFp8) {
+#pragma unroll
+        for (int u = 0; u < kT; ++u) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int row = r0 + u * kTileRows + g + h * 8;
+                sc[u][h] = row < vocab ? scales[row] : 0.f;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+#pragma unroll
+        for (int e_col = 0; e_col < 2; ++e_col) {
+            const int col = col_base + 8 * n + 2 * t + e_col;
+            float best_v = -INFINITY;
+            int best_i = INT_MAX;
+            if (col < m) {
+#pragma unroll
+                for (int u = 0; u < kT; ++u) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int row = r0 + u * kTileRows + g + h * 8;
+                        if (row < vocab) {
+                            const float raw = kFp8 ? sc[u][h] * acc[u][n][2 * h + e_col]
+                                                   : acc[u][n][2 * h + e_col];
+                            const float v = __bfloat162float(__float2bfloat16_rn(raw));
+                            if (argmax_better(v, row, best_v, best_i)) {
+                                best_v = v;
+                                best_i = row;
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int offset = 4; offset <= 16; offset *= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best_v, offset);
+                const int oi = __shfl_xor_sync(0xffffffffu, best_i, offset);
+                if (argmax_better(ov, oi, best_v, best_i)) {
+                    best_v = ov;
+                    best_i = oi;
+                }
+            }
+            if (g == 0 && col < m) {
+                const size_t dst = size_t(col) * partial_stride + tile_block;
+                partial_vals[dst] = best_v;
+                partial_idxs[dst] = best_i;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 // Entry points by weight format, k and column tiles: `<name>` for 1 to 8 rows, and
@@ -339,9 +563,32 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     ROWS_ENTRY_NT(name##_4_chunk, fp8, K, 4, 1, true)                                      \
     ROWS_ENTRY_NT(name##_4_pair_chunk, fp8, K, 4, 2, true)
 
+// Fused tile-argmax entry points for the LM head (K = 2304).
+#define ROWS_ARGMAX_ENTRY_NT(name, fp8, K, NT, kT, chunked)                                    \
+    extern "C" __global__ void __launch_bounds__(kMaxWarps * 32) name(                         \
+        const uint8_t* weight, const float* scales, const __nv_bfloat16* x_in,                 \
+        float* partial_vals, int* partial_idxs, int m, int vocab, int partial_stride,          \
+        int pdl) {                                                                             \
+        extern __shared__ uint4 ring[];                                                        \
+        rows_product_argmax<fp8, K, NT, kT, chunked>(weight, scales, x_in, partial_vals,       \
+                                                     partial_idxs, m, vocab, partial_stride,   \
+                                                     pdl, ring);                               \
+    }
+#define ROWS_ARGMAX_ENTRY(name, fp8, K)                                                        \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax, fp8, K, 1, 1, false)                                   \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_2, fp8, K, 2, 1, false)                                 \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_3, fp8, K, 3, 1, false)                                 \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_4, fp8, K, 4, 1, false)                                 \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_3_pair, fp8, K, 3, 2, false)                            \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_4_pair, fp8, K, 4, 2, false)                            \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_4_chunk, fp8, K, 4, 1, true)                            \
+    ROWS_ARGMAX_ENTRY_NT(name##_argmax_4_pair_chunk, fp8, K, 4, 2, true)
+
 // The attention input projections and the LM head.
 ROWS_ENTRY(rows_bf16_k2304, false, 2304)
 ROWS_ENTRY(rows_fp8_k2304, true, 2304)
+ROWS_ARGMAX_ENTRY(rows_bf16_k2304, false, 2304)
+ROWS_ARGMAX_ENTRY(rows_fp8_k2304, true, 2304)
 // The output projection.
 ROWS_ENTRY(rows_bf16_k3072, false, 3072)
 ROWS_ENTRY(rows_fp8_k3072, true, 3072)

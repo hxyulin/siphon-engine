@@ -151,12 +151,48 @@ extern "C" __global__ void moe_combine_bf16(const __nv_bfloat16* experts, const 
 
 // out[l, c] = tanh(f32(logits[l, c]) / cap) * cap for the first out_width of in_width
 // columns, dropping the padded vocabulary entries as `Model.__call__` does.
+// Vectorized with 16-byte uint4 (8 BF16) loads and 2x float4 (or 4x float2 when out_width
+// leaves odd rows 8-byte aligned, as for out_width = 200058) stores, with PDL.
 extern "C" __global__ void logit_softcap_bf16_f32(const __nv_bfloat16* logits, float* out,
                                                   size_t n, uint32_t in_width,
                                                   uint32_t out_width, float cap) {
-    for (size_t i = grid_index(); i < n; i += grid_stride()) {
-        const size_t row = i / out_width;
-        const size_t col = i % out_width;
-        out[i] = softcap(__bfloat162float(logits[row * in_width + col]), cap);
+    pdl_trigger();
+    pdl_wait();
+    const size_t rows = n / out_width;
+    const size_t chunks_per_row = (size_t(out_width) + kVec - 1) / kVec;
+    const size_t total = rows * chunks_per_row;
+    for (size_t idx = grid_index(); idx < total; idx += grid_stride()) {
+        const size_t row = idx / chunks_per_row;
+        const uint32_t col = static_cast<uint32_t>((idx % chunks_per_row) * kVec);
+        const __nv_bfloat16* src = logits + row * in_width + col;
+        float* dst = out + row * out_width + col;
+        if (col + kVec <= out_width && (reinterpret_cast<uintptr_t>(src) & 15u) == 0) {
+            const uint4 packed = *reinterpret_cast<const uint4*>(src);
+            const auto* sv = reinterpret_cast<const __nv_bfloat16*>(&packed);
+            float y[kVec];
+#pragma unroll
+            for (int i = 0; i < kVec; ++i) {
+                y[i] = softcap(__bfloat162float(sv[i]), cap);
+            }
+            const uintptr_t daddr = reinterpret_cast<uintptr_t>(dst);
+            if ((daddr & 15u) == 0) {
+                reinterpret_cast<float4*>(dst)[0] = make_float4(y[0], y[1], y[2], y[3]);
+                reinterpret_cast<float4*>(dst)[1] = make_float4(y[4], y[5], y[6], y[7]);
+            } else if ((daddr & 7u) == 0) {
+                reinterpret_cast<float2*>(dst)[0] = make_float2(y[0], y[1]);
+                reinterpret_cast<float2*>(dst)[1] = make_float2(y[2], y[3]);
+                reinterpret_cast<float2*>(dst)[2] = make_float2(y[4], y[5]);
+                reinterpret_cast<float2*>(dst)[3] = make_float2(y[6], y[7]);
+            } else {
+#pragma unroll
+                for (int i = 0; i < kVec; ++i) {
+                    dst[i] = y[i];
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < kVec && col + i < out_width; ++i) {
+                dst[i] = softcap(__bfloat162float(src[i]), cap);
+            }
+        }
     }
 }

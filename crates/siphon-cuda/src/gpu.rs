@@ -296,6 +296,22 @@ impl KernelArgs {
         self
     }
 
+    /// Launches `func` without programmatic stream serialization.
+    ///
+    /// # Safety
+    ///
+    /// The arguments must match the kernel's parameters in number, order and type, and
+    /// every pointer must stay valid until the kernel finishes.
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        func: &CudaFunction,
+        cfg: LaunchConfig,
+    ) -> anyhow::Result<()> {
+        // SAFETY: forwarded to `launch_with_pdl` with `pdl = false`.
+        unsafe { self.launch_with_pdl(stream, func, cfg, false) }
+    }
+
     /// Launches `func` with programmatic stream serialization, so it may start before the
     /// previous kernel on `stream` finishes. The kernel must call `pdl_wait()` from
     /// `kernels/pdl.cuh` before it reads anything an earlier kernel writes. The `sm_89`
@@ -311,6 +327,23 @@ impl KernelArgs {
         stream: &CudaStream,
         func: &CudaFunction,
         cfg: LaunchConfig,
+    ) -> anyhow::Result<()> {
+        // SAFETY: forwarded to `launch_with_pdl` with `pdl = true`.
+        unsafe { self.launch_with_pdl(stream, func, cfg, true) }
+    }
+
+    /// Shared launcher for [`Self::launch`] and [`Self::launch_pdl`].
+    ///
+    /// # Safety
+    ///
+    /// Same preconditions as [`Self::launch_pdl`] when `pdl` is true, or [`Self::launch`]
+    /// otherwise.
+    unsafe fn launch_with_pdl(
+        &self,
+        stream: &CudaStream,
+        func: &CudaFunction,
+        cfg: LaunchConfig,
+        pdl: bool,
     ) -> anyhow::Result<()> {
         let mut params: Vec<*mut c_void> = self
             .0
@@ -335,7 +368,7 @@ impl KernelArgs {
             sharedMemBytes: cfg.shared_mem_bytes,
             hStream: stream.cu_stream(),
             attrs: &raw mut attr,
-            numAttrs: u32::from(!cfg!(sm89)),
+            numAttrs: u32::from(pdl && !cfg!(sm89)),
         };
         stream.context().bind_to_thread()?;
         // SAFETY: `params` points at one slot per kernel parameter, which outlive the call;

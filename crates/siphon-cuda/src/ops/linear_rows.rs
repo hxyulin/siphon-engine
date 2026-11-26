@@ -21,7 +21,7 @@ use half::bf16;
 
 use crate::{
     DeviceIn, DeviceOut,
-    gpu::{cubin, load_module},
+    gpu::{KernelArgs, cubin, load_module},
     ops::{
         linear::{Start, launch_by_value},
         linear_fp8::Fp8Matrix,
@@ -209,27 +209,57 @@ impl Entry {
 #[derive(Debug)]
 pub struct LinearRows {
     entries: Vec<Entry>,
+    argmax_entries: Vec<Entry>,
+}
+
+/// Validates `weight` against `width` and returns `(w_ptr, scale_ptr, weight_rows)`.
+fn resolve_weight(
+    stream: &CudaStream,
+    weight: &RowsWeight<'_>,
+    width: usize,
+) -> anyhow::Result<(u64, u64, usize)> {
+    match weight {
+        RowsWeight::Bf16(w) => {
+            ensure!(
+                w.len().is_multiple_of(width),
+                "weight has {} elements, not whole rows of {width}",
+                w.len()
+            );
+            Ok((w.device_ptr(stream).0, 0u64, w.len() / width))
+        }
+        RowsWeight::Fp8(w) => {
+            ensure!(w.k() == width, "weight has k = {}, expected {width}", w.k());
+            Ok((
+                w.values().device_ptr(stream).0,
+                w.scales().device_ptr(stream).0,
+                w.rows(),
+            ))
+        }
+        RowsWeight::Fp8Raw {
+            values,
+            scales,
+            rows,
+            k,
+        } => {
+            ensure!(*k == width, "weight has k = {k}, expected {width}");
+            ensure!(
+                values.len() >= *rows * width && scales.len() >= *rows,
+                "FP8 raw buffers too short for {rows} x {width}"
+            );
+            Ok((
+                values.device_ptr(stream).0,
+                scales.device_ptr(stream).0,
+                *rows,
+            ))
+        }
+    }
 }
 
 impl LinearRows {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "linear_rows", cubin!("linear_rows"))?;
         let smem = i32::try_from(MAX_WARPS * WARP_SMEM)?;
-        let mut entries = Vec::new();
-        for (fp8, k, name) in [
-            (false, 2304, "rows_bf16_k2304"),
-            (true, 2304, "rows_fp8_k2304"),
-            (false, 3072, "rows_bf16_k3072"),
-            (true, 3072, "rows_fp8_k3072"),
-            (false, 4096, "rows_bf16_k4096"),
-            (true, 4096, "rows_fp8_k4096"),
-            (false, 4608, "rows_bf16_k4608"),
-            (true, 4608, "rows_fp8_k4608"),
-            (false, 6912, "rows_bf16_k6912"),
-            (true, 6912, "rows_fp8_k6912"),
-            (false, 9216, "rows_bf16_k9216"),
-            (true, 9216, "rows_fp8_k9216"),
-        ] {
+        let load_entry = |fp8: bool, k: usize, name: &str| -> anyhow::Result<Entry> {
             let load = |name: String| -> anyhow::Result<CudaFunction> {
                 let function = module.load_function(&name)?;
                 function
@@ -254,16 +284,40 @@ impl LinearRows {
                 .collect::<anyhow::Result<_>>()?;
             let chunk = load(format!("{name}_{MAX_TILES}_chunk"))?;
             let chunk_pair = load(format!("{name}_{MAX_TILES}_pair_chunk"))?;
-            entries.push(Entry {
+            Ok(Entry {
                 fp8,
                 k,
                 functions,
                 pairs,
                 chunk,
                 chunk_pair,
-            });
+            })
+        };
+        let mut entries = Vec::new();
+        for (fp8, k, name) in [
+            (false, 2304, "rows_bf16_k2304"),
+            (true, 2304, "rows_fp8_k2304"),
+            (false, 3072, "rows_bf16_k3072"),
+            (true, 3072, "rows_fp8_k3072"),
+            (false, 4096, "rows_bf16_k4096"),
+            (true, 4096, "rows_fp8_k4096"),
+            (false, 4608, "rows_bf16_k4608"),
+            (true, 4608, "rows_fp8_k4608"),
+            (false, 6912, "rows_bf16_k6912"),
+            (true, 6912, "rows_fp8_k6912"),
+            (false, 9216, "rows_bf16_k9216"),
+            (true, 9216, "rows_fp8_k9216"),
+        ] {
+            entries.push(load_entry(fp8, k, name)?);
         }
-        Ok(Self { entries })
+        let argmax_entries = vec![
+            load_entry(false, 2304, "rows_bf16_k2304_argmax")?,
+            load_entry(true, 2304, "rows_fp8_k2304_argmax")?,
+        ];
+        Ok(Self {
+            entries,
+            argmax_entries,
+        })
     }
 
     /// Whether [`Self::run`] takes products with input length `k`.
@@ -408,5 +462,108 @@ impl LinearRows {
         // and columns below n, and before `pdl_wait` reads only weights. The stream orders
         // the kernel before any later use of the buffers.
         unsafe { launch_by_value(stream, function, config, &batch, start == Start::Early) }
+    }
+
+    /// Single-product LM head with a fused tile-argmax epilogue: computes `x @ weight^T`
+    /// (BF16-rounded per element, masked to `0..vocab`) and writes one `(max_val, max_idx)`
+    /// partial per `(row, tile)` into `partial_vals` and `partial_idxs`. Returns the number
+    /// of partials written per row (the row stride for `Misc::argmax_partials`).
+    ///
+    /// Matches `LinearRows::run -> logit_softcap_bf16_f32 -> argmax_f32` bit for bit (0-ULP)
+    /// for all logits in the strictly monotonic range of softcap, including tie-breaking and
+    /// NaN handling.
+    #[expect(clippy::too_many_arguments, reason = "weight, input, vocab and partials")]
+    pub fn run_argmax(
+        &self,
+        stream: &CudaStream,
+        weight: &RowsWeight<'_>,
+        x: &impl DeviceIn<bf16>,
+        vocab: usize,
+        partial_vals: &mut impl DeviceOut<f32>,
+        partial_idxs: &mut impl DeviceOut<i32>,
+        m: usize,
+        start: Start,
+    ) -> anyhow::Result<usize> {
+        let (x, mut partial_vals, mut partial_idxs) =
+            (x.view(), partial_vals.view_mut(), partial_idxs.view_mut());
+        ensure!(
+            (1..=MAX_ROWS).contains(&m),
+            "m is {m}, expected 1 to {MAX_ROWS}"
+        );
+        ensure!(vocab > 0, "vocab must be positive");
+        ensure!(
+            x.len().is_multiple_of(m),
+            "input has {} elements, not whole rows of {m}",
+            x.len()
+        );
+        let width = x.len() / m;
+        let fp8 = matches!(weight, RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. });
+        let entry = self
+            .argmax_entries
+            .iter()
+            .find(|e| e.fp8 == fp8 && e.k == width)
+            .with_context(|| format!("no fused argmax multi-row product for k = {width}"))?;
+
+        let (w_ptr, scale_ptr, weight_rows) = resolve_weight(stream, weight, width)?;
+        ensure!(
+            vocab <= weight_rows,
+            "vocab {vocab} exceeds weight rows {weight_rows}"
+        );
+        let x_ptr = x.device_ptr(stream).0;
+        ensure!(
+            (w_ptr | x_ptr).is_multiple_of(16),
+            "weight and input must be 16-byte aligned"
+        );
+
+        // Compute `splits` from `weight_rows` (padded vocab) so warp reduction order matches
+        // `LinearRows::run` bit for bit, while launching tiles only up to `vocab`.
+        let padded_tiles = weight_rows.div_ceil(TILE_ROWS);
+        let stages = width * if fp8 { 1 } else { 2 } / STAGE_BYTES;
+        let target = if fp8 {
+            TARGET_WARPS_FP8
+        } else {
+            TARGET_WARPS_BF16
+        };
+        let splits = target
+            .div_ceil(padded_tiles)
+            .clamp(1, MAX_WARPS.min(stages));
+        let vocab_tiles = vocab.div_ceil(TILE_ROWS);
+        let vocab_pairs = vocab_tiles.div_ceil(2);
+        let (function, (grid_x, grid_y), per_warp) =
+            entry.shape(m, splits, vocab_tiles, vocab_pairs);
+        let partial_stride = if m > CHUNK_ROWS { grid_y } else { grid_x };
+        ensure!(
+            partial_vals.len() >= m * partial_stride && partial_idxs.len() >= m * partial_stride,
+            "partial buffers ({}, {}) need at least {} elements ({m} x {partial_stride})",
+            partial_vals.len(),
+            partial_idxs.len(),
+            m * partial_stride
+        );
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(grid_x)?, u32::try_from(grid_y)?, 1),
+            block_dim: (u32::try_from(32 * splits)?, 1, 1),
+            shared_mem_bytes: u32::try_from(splits * per_warp)?,
+        };
+        let mut args = KernelArgs::default();
+        args.u64(w_ptr)
+            .u64(scale_ptr)
+            .u64(x_ptr)
+            .ptr_mut(&mut partial_vals, stream)
+            .ptr_mut(&mut partial_idxs, stream)
+            .i32(i32::try_from(m)?)
+            .i32(i32::try_from(vocab).context("vocab too large")?)
+            .i32(i32::try_from(partial_stride).context("partial_stride too large")?)
+            .i32(i32::from(start == Start::Early));
+        // SAFETY: arguments match `rows_{bf16,fp8}_k2304_argmax*(const u8*, const float*,
+        // const bf16*, float*, int*, int, int, int, int)`. Buffers are validated above, the
+        // kernel reads only `weight` before `pdl_wait`, and writes only `[0..m, 0..partial_stride)`.
+        unsafe {
+            if start == Start::Early {
+                args.launch_pdl(stream, function, config)?;
+            } else {
+                args.launch(stream, function, config)?;
+            }
+        }
+        Ok(partial_stride)
     }
 }

@@ -337,8 +337,8 @@ impl Model {
     /// The F32 logits after the softcap of the last verify's rows, `[rows, unpadded_vocab]`.
     pub fn verify_logits(&self) -> anyhow::Result<Vec<f32>> {
         let p = self.verify.as_ref().context("no verify has run")?;
-        let n = self.verify_rows * self.ctx.config.unpadded_vocab_size;
-        Ok(self.ctx.stream.clone_dtoh(&p.head_capped.slice(..n))?)
+        self.ctx
+            .compute_capped_logits(&p.final_hidden, self.verify_rows)
     }
 
     /// The feature taps of the last verify's rows, BF16 `[rows, taps, 2304]` in the order
@@ -351,12 +351,25 @@ impl Model {
     }
 
     fn ensure_verify(&mut self) -> anyhow::Result<()> {
-        if self.verify.is_some() {
+        if let Some(p) = self.verify.as_mut() {
+            if self.ctx.accept_margin > 0.0 {
+                p.ensure_capped_head(&self.ctx.stream, &self.ctx.config)?;
+            }
             return Ok(());
         }
         let stream = &self.ctx.stream;
-        let mut p =
-            PrefillScratch::new(stream, &self.ctx.config, self.max_blocks, VERIFY_ROWS, true)?;
+        let mut p = PrefillScratch::new(
+            stream,
+            &self.ctx.config,
+            self.max_blocks,
+            VERIFY_ROWS,
+            true,
+            self.sampler,
+            self.ctx.fp8_wide_head(),
+        )?;
+        if self.ctx.accept_margin > 0.0 {
+            p.ensure_capped_head(stream, &self.ctx.config)?;
+        }
         p.record_taps = true;
         p.tap_layout = self.tap_layout.clone();
         p.taps = Some(zeros(

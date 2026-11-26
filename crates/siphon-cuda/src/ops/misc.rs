@@ -20,6 +20,8 @@ const BLOCK: u32 = 256;
 const MAX_BLOCKS: usize = 1 << 16;
 /// Threads per block of the argmax kernel, one block per row.
 const ARGMAX_THREADS: u32 = 1024;
+/// Threads per block of `argmax_partials`, one block per row.
+const ARGMAX_PARTIALS_THREADS: u32 = 256;
 /// Hidden width and message-gate rank of the model.
 const HIDDEN: usize = 2304;
 const GATE_RANK: usize = 64;
@@ -263,6 +265,7 @@ pub struct Misc {
     cast_f32_to_bf16: CudaFunction,
     cast_bf16_to_f32: CudaFunction,
     argmax_f32: CudaFunction,
+    argmax_partials: CudaFunction,
     message_gate_out_2304: CudaFunction,
     message_gate_out_rows_2304: CudaFunction,
     message_gate_norm_rows_2304: CudaFunction,
@@ -325,6 +328,7 @@ impl Misc {
             cast_f32_to_bf16: module.load_function("cast_f32_to_bf16")?,
             cast_bf16_to_f32: module.load_function("cast_bf16_to_f32")?,
             argmax_f32: module.load_function("argmax_f32")?,
+            argmax_partials: module.load_function("argmax_partials")?,
             message_gate_out_2304: module.load_function("message_gate_out_2304")?,
             message_gate_out_rows_2304: module.load_function("message_gate_out_rows_2304")?,
             message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
@@ -414,7 +418,7 @@ impl Misc {
 
     /// Writes the index of the largest value in each row of `x` (shape `[rows, n]`) to `out`
     /// (shape `[rows]`). Ties go to the first index and NaN counts as the largest value, as in
-    /// `mx.argmax`.
+    /// `mx.argmax`. Vectorized and launched with PDL.
     pub fn argmax_f32(
         &self,
         stream: &CudaStream,
@@ -431,18 +435,63 @@ impl Misc {
         );
         let rows = x.len() / n;
         check_len("out", out.len(), rows)?;
+        if rows == 0 {
+            return Ok(());
+        }
         let n_arg = i32::try_from(n).context("n too large")?;
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
             block_dim: (ARGMAX_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.argmax_f32);
-        launch.arg(&x).arg(&mut out).arg(&n_arg);
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream).ptr_mut(&mut out, stream).i32(n_arg);
         // SAFETY: the arguments match `argmax_f32(const float*, int*, int)`. `x` holds `rows`
-        // rows of `n` and `out` holds `rows` elements, one per block.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // rows of `n`, `out` holds `rows` elements, one per block, and the kernel reads
+        // nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.argmax_f32, config) }
+    }
+
+    /// Second stage of the fused LM head greedy argmax: reduces `n` `(val, idx)` partials
+    /// per row (row stride `stride`) into `out` (`[rows]`), launched with PDL.
+    pub fn argmax_partials(
+        &self,
+        stream: &CudaStream,
+        vals: &impl DeviceIn<f32>,
+        idxs: &impl DeviceIn<i32>,
+        out: &mut impl DeviceOut<i32>,
+        n: usize,
+        stride: usize,
+    ) -> anyhow::Result<()> {
+        let (vals, idxs, mut out) = (vals.view(), idxs.view(), out.view_mut());
+        ensure!(n > 0, "n must be positive");
+        ensure!(stride >= n, "stride {stride} < n {n}");
+        let rows = out.len();
+        ensure!(rows > 0, "no rows");
+        ensure!(
+            vals.len() >= rows * stride && idxs.len() >= rows * stride,
+            "partials ({}, {}) need at least {} elements ({rows} x {stride})",
+            vals.len(),
+            idxs.len(),
+            rows * stride
+        );
+        let n_arg = i32::try_from(n).context("n too large")?;
+        let stride_arg = i32::try_from(stride).context("stride too large")?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
+            block_dim: (ARGMAX_PARTIALS_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&vals, stream)
+            .ptr(&idxs, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(n_arg)
+            .i32(stride_arg);
+        // SAFETY: the arguments match `argmax_partials(const float*, const int*, int*, int,
+        // int)`. `vals` and `idxs` hold at least `rows * stride` elements, `out` holds `rows`
+        // elements, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.argmax_partials, config) }
     }
 
     /// The end of `MessageGate` for one row from its BF16 down projection: the forget and

@@ -20,7 +20,7 @@ use half::bf16;
 
 use crate::{
     DeviceIn, DeviceOut,
-    gpu::{cubin, load_module},
+    gpu::{KernelArgs, cubin, load_module},
     ops::linear::{Prefetch, Start, launch_by_value},
 };
 
@@ -139,9 +139,11 @@ struct Entry {
 pub struct LinearFp8 {
     entries: Vec<Entry>,
     quantize: CudaFunction,
-    /// `gemm_fp8_128x128`, `gemm_fp8_64x64`, and `quantize_rows_mxfp8_dense`.
+    /// `gemm_fp8_128x128`, `gemm_fp8_64x64`, `gemm_fp8_128x128_argmax`, and
+    /// `quantize_rows_mxfp8_dense`.
     gemm: CudaFunction,
     gemm_small: CudaFunction,
+    gemm_argmax: CudaFunction,
     quantize_rows: CudaFunction,
     /// Multiprocessor count, for picking between the 128x128 and 64x64 tiles.
     sms: usize,
@@ -149,7 +151,7 @@ pub struct LinearFp8 {
 
 /// Rows and columns of `gemm_fp8_128x128` and `gemm_fp8_64x64`, their threads and dynamic
 /// shared memory (3 stages of x and W rows of 128 bytes and x row scales).
-const GEMM_TILE: usize = 128;
+pub const GEMM_TILE: usize = 128;
 const GEMM_THREADS: u32 = 256;
 const GEMM_SHARED: u32 = 3 * (2 * 128 * 128 + 128 * 4);
 const GEMM_SMALL_TILE: usize = 64;
@@ -240,6 +242,7 @@ impl LinearFp8 {
             quantize: module.load_function("quantize_e4m3_rows")?,
             gemm: load_gemm("gemm_fp8_128x128", GEMM_SHARED)?,
             gemm_small: load_gemm("gemm_fp8_64x64", GEMM_SMALL_SHARED)?,
+            gemm_argmax: load_gemm("gemm_fp8_128x128_argmax", GEMM_SHARED)?,
             quantize_rows: module.load_function("quantize_rows_mxfp8_dense")?,
             sms,
         })
@@ -349,6 +352,88 @@ impl LinearFp8 {
         // It stores only rows below m and columns below n of `out`, sized m x n above. k is a
         // multiple of 128, the stage width, so every 16-byte copy is aligned and in bounds.
         unsafe { launch_by_value(stream, function, config, &batch, false) }
+    }
+
+    /// Single-product FP8 tensor-core LM head with a fused 128 x 128 tile-argmax epilogue:
+    /// quantizes `x` (`[m, k]`) to MXFP8 in `scratch`, runs `gemm_fp8_128x128_argmax` over
+    /// the first `vocab` rows of `weight`, writes one `(max_val, max_idx)` partial per
+    /// `(row, n_tile)` into `partial_vals` / `partial_idxs`, and returns `tiles_n`
+    /// (`vocab.div_ceil(GEMM_TILE)`). Triggers PDL for the follow-on `argmax_partials`.
+    #[expect(clippy::too_many_arguments, reason = "weight, input, vocab, scratch and partials")]
+    pub fn gemm_argmax(
+        &self,
+        stream: &CudaStream,
+        weight: &Fp8Matrix,
+        x: &impl DeviceIn<bf16>,
+        vocab: usize,
+        scratch: &mut Fp8Rows,
+        partial_vals: &mut impl DeviceOut<f32>,
+        partial_idxs: &mut impl DeviceOut<i32>,
+        m: usize,
+    ) -> anyhow::Result<usize> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA,
+            "FP8 tensor-core LM head needs block-scaled MMA, which sm_89 lacks"
+        );
+        let (x, mut partial_vals, mut partial_idxs) =
+            (x.view(), partial_vals.view_mut(), partial_idxs.view_mut());
+        ensure!(m > 0, "no rows");
+        ensure!(
+            vocab > 0 && vocab <= weight.rows,
+            "vocab {vocab} out of range for weight rows {}",
+            weight.rows
+        );
+        let k = weight.k;
+        ensure!(
+            k.is_multiple_of(GEMM_K),
+            "the FP8 GEMM needs k a multiple of {GEMM_K}, not {k}"
+        );
+        ensure!(
+            x.len() == m * k,
+            "x has {} elements, expected {m} x {k}",
+            x.len()
+        );
+        ensure!(
+            scratch.values.len() >= m * k && scratch.scales.len() >= m * k / 32,
+            "the FP8 scratch holds {} values, the call needs {}",
+            scratch.values.len(),
+            m * k
+        );
+        let tiles_m = m.div_ceil(GEMM_TILE);
+        let tiles_n = vocab.div_ceil(GEMM_TILE);
+        ensure!(
+            partial_vals.len() >= m * tiles_n && partial_idxs.len() >= m * tiles_n,
+            "partial buffers ({}, {}) need at least {} elements ({m} x {tiles_n})",
+            partial_vals.len(),
+            partial_idxs.len(),
+            m * tiles_n
+        );
+        self.quantize_rows(stream, &x, m, k, scratch, 0)?;
+        let (w_ptr, _) = weight.data.device_ptr(stream);
+        let w_scale_ptr = w_ptr + u64::try_from(weight.padded_rows() * k)?;
+        let (x_vals_ptr, _) = scratch.values.device_ptr(stream);
+        let (x_scales_ptr, _) = scratch.scales.device_ptr(stream);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(tiles_m * tiles_n)?, 1, 1),
+            block_dim: (GEMM_THREADS, 1, 1),
+            shared_mem_bytes: GEMM_SHARED,
+        };
+        let mut args = KernelArgs::default();
+        args.u64(w_ptr)
+            .u64(w_scale_ptr)
+            .u64(x_vals_ptr)
+            .u64(x_scales_ptr)
+            .ptr_mut(&mut partial_vals, stream)
+            .ptr_mut(&mut partial_idxs, stream)
+            .i32(i32::try_from(m).context("too many rows")?)
+            .i32(i32::try_from(vocab).context("vocab too large")?)
+            .i32(i32::try_from(k)?);
+        // SAFETY: arguments match `gemm_fp8_128x128_argmax(const u8*, const float*, const u8*,
+        // const u8*, float*, int*, int, int, int)`. `scratch` holds m * k quantized values and
+        // m * k / 32 scales written above; `weight` holds at least `vocab` rows of k bytes and
+        // scales; `partial_vals` and `partial_idxs` hold at least m * tiles_n elements.
+        unsafe { args.launch(stream, &self.gemm_argmax, config) }?;
+        Ok(tiles_n)
     }
 
     /// Quantizes `x` (`[rows, k]`) into `scratch` at value offset `offset` (a multiple of

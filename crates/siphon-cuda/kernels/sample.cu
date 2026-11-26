@@ -25,6 +25,7 @@
 // on the reduction order. Speculation relies on this: a verify row and a batched row with
 // the same logits, seed and position pick the same token.
 
+#include <cuda_bf16.h>
 #include <cfloat>
 #include <climits>
 #include <cstdint>
@@ -32,6 +33,8 @@
 #include <cooperative_groups.h>
 
 #include "arch.cuh"
+#include "mlx_ops.cuh"
+#include "pdl.cuh"
 #include "race.cuh"
 
 namespace cg = cooperative_groups;
@@ -184,6 +187,59 @@ __device__ __forceinline__ void for_each(const float* x, int n, int t, F&& f) {
     const int tail = head + 4 * vectors + t;
     if (tail < n) {
         f(x[tail], tail);
+    }
+}
+
+// Calls f(v, i) over BF16 logits with 16-byte uint4 (8-wide) loads, four in flight per
+// thread. With kSoftcap and cap > 0, applies softcap_f32 inline (matching
+// logit_softcap_bf16_f32 bit for bit).
+template <int kThreads, bool kSoftcap, typename F>
+__device__ __forceinline__ void for_each_bf16(const __nv_bfloat16* x, int n, int t, float cap, F&& f) {
+    constexpr int kUnroll = 4;
+    const auto eval = [&](__nv_bfloat16 b) -> float {
+        const float v = __bfloat162float(b);
+        if constexpr (kSoftcap) {
+            return cap > 0.f ? softcap_f32(v, cap) : v;
+        } else {
+            return v;
+        }
+    };
+    const int head =
+        min(n, static_cast<int>(((16u - (reinterpret_cast<uintptr_t>(x) & 15u)) & 15u) / 2u));
+    if (t < head) {
+        f(eval(x[t]), t);
+    }
+    const uint4* v = reinterpret_cast<const uint4*>(x + head);
+    const int vectors = (n - head) / 8;
+    int i = t;
+    for (; i + (kUnroll - 1) * kThreads < vectors; i += kUnroll * kThreads) {
+        uint4 q[kUnroll];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            q[u] = v[i + u * kThreads];
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const int b = head + 8 * (i + u * kThreads);
+            const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&q[u]);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                f(eval(vals[k]), b + k);
+            }
+        }
+    }
+    for (; i < vectors; i += kThreads) {
+        const uint4 q = v[i];
+        const int b = head + 8 * i;
+        const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&q);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            f(eval(vals[k]), b + k);
+        }
+    }
+    const int tail = head + 8 * vectors + t;
+    if (tail < n) {
+        f(eval(x[tail]), tail);
     }
 }
 
@@ -344,11 +400,23 @@ struct Search {
 };
 
 // One block's share of a row: tokens offset .. offset + n - 1.
+template <typename Elem>
 struct Part {
-    const float* x;
+    const Elem* x;
     int n;
     int offset;
+    float cap;
 };
+
+template <int kThreads, bool kSoftcap, typename F>
+__device__ __forceinline__ void for_each_part(const Part<float>& part, int t, F&& f) {
+    for_each<kThreads>(part.x, part.n, t, f);
+}
+
+template <int kThreads, bool kSoftcap, typename F>
+__device__ __forceinline__ void for_each_part(const Part<__nv_bfloat16>& part, int t, F&& f) {
+    for_each_bf16<kThreads, kSoftcap>(part.x, part.n, t, part.cap, f);
+}
 
 // Sums every block's histogram of `bins` bins into each block's share of it, `merged`.
 // Starts with a cluster barrier, so that every block's histogram is complete and every
@@ -427,8 +495,9 @@ __device__ unsigned pick(Search& sh, int bins, bool descending, unsigned long lo
 
 // The k-th largest key of the row among those at or above `lowest`: a radix over all keys,
 // 11, 11 and 10 bits at a time. Only for a k past every token within kRange of the maximum.
-__device__ unsigned count_threshold(const Part& part, unsigned lowest, unsigned long long k, Search& sh,
-                                    ClusterGroup& cluster) {
+template <typename Elem>
+__device__ unsigned count_threshold(const Part<Elem>& part, unsigned lowest, unsigned long long k,
+                                    Search& sh, ClusterGroup& cluster) {
     unsigned prefix = 0;
     unsigned long long above = 0;
     for (int hi = 32; hi > 0;) {
@@ -437,7 +506,7 @@ __device__ unsigned count_threshold(const Part& part, unsigned lowest, unsigned 
         const int bins = 1 << width;
         sh.hist.clear(bins);
         __syncthreads();
-        for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+        for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) {
             const unsigned key = order_key(v);
             if (isnan(v) || key < lowest || (hi < 32 && (key >> hi) != (prefix >> hi))) {
                 return;
@@ -468,8 +537,10 @@ __device__ unsigned count_threshold(const Part& part, unsigned lowest, unsigned 
 // total, and a k past the tokens in range falls back to a radix over all keys. Each block
 // copies its tokens of the bin where the weight reaches the target to shared memory (when
 // they fit), and a radix over their keys, 11 bits at a time, finds the exact key.
-__device__ unsigned threshold(const Part& part, unsigned lowest, float top, float inv_t, bool by_mass,
-                              unsigned long long k, float share, Search& sh, ClusterGroup& cluster) {
+template <typename Elem>
+__device__ unsigned threshold(const Part<Elem>& part, unsigned lowest, float top, float inv_t,
+                              bool by_mass, unsigned long long k, float share, Search& sh,
+                              ClusterGroup& cluster) {
     sh.hist.clear(kBins);
     if (threadIdx.x == 0) {
         sh.count = 0;
@@ -488,7 +559,7 @@ __device__ unsigned threshold(const Part& part, unsigned lowest, float top, floa
         return min(static_cast<int>(d * (kBins / kRange)), kBins - 1);
     };
     const auto weight = [&](float v) { return by_mass ? mass(v, top, inv_t) : 1ull; };
-    for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+    for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) {
         const int bin = bin_of(v);
         if (bin >= 0) {
             const unsigned long long w = weight(v);
@@ -514,7 +585,7 @@ __device__ unsigned threshold(const Part& part, unsigned lowest, float top, floa
     // This block's tokens of the chosen bin, and the cluster's range of their keys.
     unsigned kmin = UINT_MAX;
     unsigned kmax = 0;
-    for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+    for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) {
         if (bin_of(v) != static_cast<int>(chosen)) {
             return;
         }
@@ -566,7 +637,7 @@ __device__ unsigned threshold(const Part& part, unsigned lowest, float top, floa
                 add(sh.keys[j], sh.weights[j]);
             }
         } else {
-            for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) {
+            for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) {
                 if (bin_of(v) == static_cast<int>(chosen)) {
                     const unsigned long long w = weight(v);
                     if (w != 0) {
@@ -586,14 +657,11 @@ __device__ unsigned threshold(const Part& part, unsigned lowest, float top, floa
     return kmin + prefix;
 }
 
-}  // namespace
-
-// The first stage, one cluster of kCluster blocks per row of logits [rows, n], each block
-// taking an eighth of the row: a greedy row writes its argmax to out; a sampling row writes
-// its thresholds to state for sample_race. Grid: rows * kCluster blocks.
-extern "C" __global__ void SIPHON_CLUSTER_DIMS(kCluster) __launch_bounds__(kPrepareThreads)
-sample_prepare(const float* logits, int n, const Params* params, State* state, int* out) {
-    __shared__ Search sh;
+template <typename Elem>
+__device__ __forceinline__ void sample_prepare_impl(const Elem* logits, int n, int stride,
+                                                    float cap, const Params* params, State* state,
+                                                    int* out, Search& sh) {
+    pdl_wait();
 #if SIPHON_SM89
     ClusterGroup cluster;
 #else
@@ -601,16 +669,17 @@ sample_prepare(const float* logits, int n, const Params* params, State* state, i
 #endif
     const int rank = static_cast<int>(cluster.block_rank());
     const int row = blockIdx.x / kCluster;
-    const float* x = logits + static_cast<size_t>(row) * n;
-    const int share = ((n + kCluster - 1) / kCluster + 3) & ~3;
+    const Elem* x = logits + static_cast<size_t>(row) * stride;
+    constexpr int kAlign = sizeof(Elem) == 2 ? 8 : 4;
+    const int share = ((n + kCluster - 1) / kCluster + (kAlign - 1)) & ~(kAlign - 1);
     const int offset = min(n, rank * share);
-    const Part part{x + offset, min(share, n - offset), offset};
+    const Part<Elem> part{x + offset, min(share, n - offset), offset, cap};
     const Params p = params[row];
 
     if (!(p.temperature > 0.f)) {
         float best = -INFINITY;
         int best_idx = INT_MAX;
-        for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int i) {
+        for_each_part<kPrepareThreads, false>(part, threadIdx.x, [&](float v, int i) {
             if (argmax_better(v, part.offset + i, best, best_idx)) {
                 best = v;
                 best_idx = part.offset + i;
@@ -656,6 +725,7 @@ sample_prepare(const float* logits, int n, const Params* params, State* state, i
         }
         // No block leaves while another may read its shared memory.
         cluster.sync();
+        pdl_trigger();
         return;
     }
 
@@ -665,7 +735,7 @@ sample_prepare(const float* logits, int n, const Params* params, State* state, i
     float max = 0.f;
     if (top_k || top_p || min_p) {
         float m = -INFINITY;
-        for_each<kPrepareThreads>(part.x, part.n, threadIdx.x, [&](float v, int) { m = fmaxf(m, v); });
+        for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) { m = fmaxf(m, v); });
         m = block_max(m, sh.fscratch);
         if (threadIdx.x == 0) {
             sh.max = m;
@@ -679,8 +749,8 @@ sample_prepare(const float* logits, int n, const Params* params, State* state, i
     const float inv_t = 1.f / p.temperature;
     unsigned lowest = 0;
     if (top_k) {
-        lowest = threshold(part, lowest, max, inv_t, false, static_cast<unsigned long long>(p.top_k), 1.f, sh,
-                           cluster);
+        lowest = threshold(part, lowest, max, inv_t, false, static_cast<unsigned long long>(p.top_k),
+                           1.f, sh, cluster);
     }
     if (top_p) {
         lowest = threshold(part, lowest, max, inv_t, true, 0, p.top_p, sh, cluster);
@@ -690,25 +760,26 @@ sample_prepare(const float* logits, int n, const Params* params, State* state, i
     }
     // No block leaves while another may read its shared memory.
     cluster.sync();
+    pdl_trigger();
 }
 
-// The second stage: the exponential race over each sampling row's kept tokens. Grid
-// (kRaceBlocks, rows) of 256 threads. Each block writes its best (score, index) to the
-// row's partials, and the row's last block to finish, found with counters[row], writes
-// the winner to out. counters must start at 0; the last block resets its row's.
-extern "C" __global__ void __launch_bounds__(kRaceThreads)
-sample_race(const float* logits, int n, const Params* params, const State* state, float* partial_scores,
-            int* partial_idxs, unsigned* counters, int* out) {
+template <typename Elem>
+__device__ __forceinline__ void sample_race_impl(const Elem* logits, int n, int stride, float cap,
+                                                 const Params* params, const State* state,
+                                                 float* partial_scores, int* partial_idxs,
+                                                 unsigned* counters, int* out) {
     __shared__ float warp_scores[kRaceThreads / 32];
     __shared__ int warp_idxs[kRaceThreads / 32];
     __shared__ bool last;
+    pdl_trigger();
+    pdl_wait();
     const int row = blockIdx.y;
     const State s = state[row];
     if (s.sample == 0) {
         return;
     }
     const Params p = params[row];
-    const float* x = logits + static_cast<size_t>(row) * n;
+    const Elem* x = logits + static_cast<size_t>(row) * stride;
     const float inv_t = 1.f / p.temperature;
     const bool min_p = p.min_p > 0.f;
     const unsigned long long key = draw_key(p);
@@ -734,13 +805,16 @@ sample_race(const float* logits, int n, const Params* params, const State* state
         }
         take(scaled + race_boost(key, i), i);
     };
-    for_each<kRaceBlocks * kRaceThreads>(x, n, blockIdx.x * kRaceThreads + threadIdx.x, consider);
+    const Part<Elem> part{x, n, 0, cap};
+    for_each_part<kRaceBlocks * kRaceThreads, true>(part, blockIdx.x * kRaceThreads + threadIdx.x,
+                                                    consider);
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
     const auto warp_reduce = [&] {
 #pragma unroll
         for (int offset = 16; offset >= 1; offset /= 2) {
-            take(__shfl_xor_sync(0xffffffffu, best, offset), __shfl_xor_sync(0xffffffffu, best_idx, offset));
+            take(__shfl_xor_sync(0xffffffffu, best, offset),
+                 __shfl_xor_sync(0xffffffffu, best_idx, offset));
         }
     };
     warp_reduce();
@@ -776,6 +850,47 @@ sample_race(const float* logits, int n, const Params* params, const State* state
             counters[row] = 0;
         }
     }
+}
+
+}  // namespace
+
+// The first stage, one cluster of kCluster blocks per row of logits [rows, n], each block
+// taking an eighth of the row: a greedy row writes its argmax to out; a sampling row writes
+// its thresholds to state for sample_race. Grid: rows * kCluster blocks.
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kCluster) __launch_bounds__(kPrepareThreads)
+sample_prepare(const float* logits, int n, const Params* params, State* state, int* out) {
+    __shared__ Search sh;
+    sample_prepare_impl<float>(logits, n, n, 0.f, params, state, out, sh);
+}
+
+// BF16 logits [rows, stride] (reading the first n columns with 8-wide uint4 loads) and
+// applying softcap(x, cap) inline on non-greedy rows.
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kCluster) __launch_bounds__(kPrepareThreads)
+sample_prepare_bf16(const __nv_bfloat16* logits, int n, int stride, float cap, const Params* params,
+                    State* state, int* out) {
+    __shared__ Search sh;
+    sample_prepare_impl<__nv_bfloat16>(logits, n, stride, cap, params, state, out, sh);
+}
+
+// The second stage: the exponential race over each sampling row's kept tokens. Grid
+// (kRaceBlocks, rows) of 256 threads. Each block writes its best (score, index) to the
+// row's partials, and the row's last block to finish, found with counters[row], writes
+// the winner to out. counters must start at 0; the last block resets its row's.
+extern "C" __global__ void __launch_bounds__(kRaceThreads)
+sample_race(const float* logits, int n, const Params* params, const State* state, float* partial_scores,
+            int* partial_idxs, unsigned* counters, int* out) {
+    sample_race_impl<float>(logits, n, n, 0.f, params, state, partial_scores, partial_idxs, counters,
+                            out);
+}
+
+// BF16 logits [rows, stride] (reading the first n columns with 8-wide uint4 loads) with
+// inline softcap(x, cap).
+extern "C" __global__ void __launch_bounds__(kRaceThreads)
+sample_race_bf16(const __nv_bfloat16* logits, int n, int stride, float cap, const Params* params,
+                 const State* state, float* partial_scores, int* partial_idxs, unsigned* counters,
+                 int* out) {
+    sample_race_impl<__nv_bfloat16>(logits, n, stride, cap, params, state, partial_scores,
+                                    partial_idxs, counters, out);
 }
 
 // -ln E_i of tokens 0..n of the draw with this seed and position, for tests of the host

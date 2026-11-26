@@ -1307,6 +1307,11 @@ impl Model {
             if p.sample.is_none() {
                 p.sample = Some(SampleBuffers::new(&stream, p.rows)?);
             }
+            if p.head_logits.is_none() {
+                p.head_logits = Some(zeros(&stream, p.rows * self.ctx.config.vocab_size)?);
+            }
+            p.head_partials = None;
+            p.head_fp8 = None;
         }
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_graphs.iter_mut().for_each(|g| *g = None);

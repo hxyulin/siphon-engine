@@ -721,8 +721,7 @@ impl Model {
     pub fn batch_logits(&self, rows: usize) -> anyhow::Result<Vec<f32>> {
         let p = self.batch.as_ref().context("no batched step has run")?;
         ensure!(rows <= p.rows, "a batch has at most {} rows", p.rows);
-        let n = rows * self.ctx.config.unpadded_vocab_size;
-        Ok(self.ctx.stream.clone_dtoh(&p.head_capped.slice(..n))?)
+        self.ctx.compute_capped_logits(&p.final_hidden, rows)
     }
 
     /// Makes the batched step's buffers for one row per slot, or for at least `m` rows,
@@ -736,7 +735,15 @@ impl Model {
         self.batch = None;
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
         let stream = &self.ctx.stream;
-        let mut p = PrefillScratch::new(stream, &self.ctx.config, self.max_blocks, rows, true)?;
+        let mut p = PrefillScratch::new(
+            stream,
+            &self.ctx.config,
+            self.max_blocks,
+            rows,
+            true,
+            self.sampler,
+            self.ctx.fp8_wide_head(),
+        )?;
         if self.batch_taps {
             p.record_taps = true;
             p.tap_layout = self.tap_layout.clone();
@@ -1031,8 +1038,8 @@ impl Model {
             .as_ref()
             .and_then(|b| b.verify.as_ref())
             .context("the batch verify state is missing")?;
-        let n = bv.last_seqs * bv.width * self.ctx.config.unpadded_vocab_size;
-        Ok(self.ctx.stream.clone_dtoh(&p.head_capped.slice(..n))?)
+        self.ctx
+            .compute_capped_logits(&p.final_hidden, bv.last_seqs * bv.width)
     }
 
     /// Reserves [`Model::verify_batch`] scratch and backup buffers for up to `max_seqs`
@@ -1051,12 +1058,28 @@ impl Model {
         if self.batch_verify.as_ref().is_some_and(|p| {
             p.rows >= max_rows && p.batch.as_ref().is_some_and(|b| b.max_seqs >= max_seqs)
         }) {
+            if self.ctx.accept_margin > 0.0
+                && let Some(p) = self.batch_verify.as_mut()
+            {
+                p.ensure_capped_head(&self.ctx.stream, &self.ctx.config)?;
+            }
             return Ok(());
         }
         self.batch_verify = None;
         self.batch_verify_graphs.clear();
         let stream = &self.ctx.stream;
-        let mut p = PrefillScratch::new(stream, &self.ctx.config, self.max_blocks, max_rows, true)?;
+        let mut p = PrefillScratch::new(
+            stream,
+            &self.ctx.config,
+            self.max_blocks,
+            max_rows,
+            true,
+            self.sampler,
+            self.ctx.fp8_wide_head(),
+        )?;
+        if self.ctx.accept_margin > 0.0 {
+            p.ensure_capped_head(stream, &self.ctx.config)?;
+        }
         p.record_taps = true;
         p.tap_layout = self.tap_layout.clone();
         p.taps = Some(zeros(

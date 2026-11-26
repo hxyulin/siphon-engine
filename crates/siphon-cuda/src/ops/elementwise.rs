@@ -299,6 +299,7 @@ impl Elementwise {
 
     /// `out = tanh(f32(logits) / softcap) * softcap` for BF16 `logits` of shape
     /// `[rows, 201024]`, keeping the first 200058 columns: `out` is `[rows, 200058]` F32.
+    /// Vectorized (8-wide BF16 loads -> 2x float4 / 4x float2 stores) and launched with PDL.
     pub fn logit_softcap(
         &self,
         stream: &CudaStream,
@@ -313,20 +314,22 @@ impl Elementwise {
             "out has {} elements, expected {rows} x {VOCAB}",
             out.len()
         );
+        if rows == 0 {
+            return Ok(());
+        }
         let n = out.len();
         let (in_width, out_width) = (PADDED_VOCAB as u32, VOCAB as u32);
-        let mut launch = stream.launch_builder(&self.logit_softcap_bf16_f32);
-        launch
-            .arg(&logits)
-            .arg(&mut out)
-            .arg(&n)
-            .arg(&in_width)
-            .arg(&out_width)
-            .arg(&softcap);
+        let total_chunks = rows * VOCAB.div_ceil(EMBEDDING_VEC);
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .ptr_mut(&mut out, stream)
+            .u64(u64::try_from(n)?)
+            .u32(in_width)
+            .u32(out_width)
+            .f32(softcap);
         // SAFETY: the arguments match `logit_softcap_bf16_f32(const bf16*, float*, size_t,
-        // uint32_t, uint32_t, float)`; `out` holds `n` elements and `logits` the same rows
-        // at the wider stride.
-        unsafe { launch.launch(grid_stride(n)) }?;
-        Ok(())
+        // uint32_t, uint32_t, float)`; `out` holds `n` elements, `logits` holds the same rows
+        // at the wider stride, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.logit_softcap_bf16_f32, grid_stride(total_chunks)) }
     }
 }

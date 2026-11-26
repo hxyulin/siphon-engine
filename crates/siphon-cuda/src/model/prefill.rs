@@ -28,8 +28,9 @@ use crate::{
         Products, attention,
         conv::VisitConvs,
         experts::{ExpertScratch, QuantizedRows},
-        linear_fp8::{Fp8Matrix, Fp8Rows},
-        linear_rows,
+        linear::Start,
+        linear_fp8::{self, Fp8Matrix, Fp8Rows},
+        linear_rows::{self, RowsWeight},
         misc::{GATE_SLOTS, GateRowsSlot, MessageMix},
         norm::{AttentionPostRows, KvConvWeights},
         routing::{
@@ -289,6 +290,39 @@ struct MoeRows {
     quantized: QuantizedRows,
 }
 
+/// Partial `(max_val, max_idx)` scratch for the fused greedy LM head (`verify_head`,
+/// `batch_head`, and greedy `prefill_packed`).
+pub(super) struct HeadArgmaxScratch {
+    pub(super) vals: CudaSlice<f32>,
+    pub(super) idxs: CudaSlice<i32>,
+}
+
+impl HeadArgmaxScratch {
+    pub(super) fn new(
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        vocab: usize,
+        fp8_wide: bool,
+    ) -> anyhow::Result<Self> {
+        let single_tiles = vocab.div_ceil(16);
+        let pair_tiles = single_tiles.div_ceil(2);
+        let wide_tiles = if fp8_wide {
+            vocab.div_ceil(linear_fp8::GEMM_TILE)
+        } else {
+            pair_tiles
+        };
+        // m <= 16 uses single_tiles (kT = 1); 17..=32 uses pair_tiles (kT = 2);
+        // m > 32 uses wide_tiles (128-wide FP8 GEMM on Blackwell, or pair_tiles fallback).
+        let cap = (rows.min(16) * single_tiles)
+            .max(rows.min(32) * pair_tiles)
+            .max(rows * wide_tiles);
+        Ok(Self {
+            vals: zeros(stream, cap.max(1))?,
+            idxs: zeros(stream, cap.max(1))?,
+        })
+    }
+}
+
 /// Every intermediate of a chunk of up to `rows` rows. Names follow [`Scratch`].
 pub(super) struct PrefillScratch {
     pub(super) rows: usize,
@@ -340,11 +374,64 @@ pub(super) struct PrefillScratch {
     mlp_input: CudaSlice<f32>,
     mlp_x: CudaSlice<bf16>,
     moe: MoeRows,
-    final_hidden: CudaSlice<bf16>,
-    head_logits: CudaSlice<bf16>,
-    pub(super) head_capped: CudaSlice<f32>,
-    /// Host copy of `head_capped`.
+    pub(super) final_hidden: CudaSlice<bf16>,
+    /// BF16 LM-head logits (`[rows, vocab_size]`): allocated for prefill chunks and for
+    /// sampled invariant chunks; omitted on greedy invariant chunks (which use
+    /// `head_partials` directly).
+    pub(super) head_logits: Option<CudaSlice<bf16>>,
+    /// F32 softcapped logits (`[HEAD_ROWS, unpadded_vocab]`): allocated for prefill
+    /// `PrefillLogits::All`/`Every` only; never allocated on invariant verify/batch chunks.
+    head_capped: Option<CudaSlice<f32>>,
+    /// Tile-argmax partial buffers for the fused greedy LM head.
+    pub(super) head_partials: Option<HeadArgmaxScratch>,
+    /// MXFP8 quantized `final_hidden` scratch for native FP8 LM head (`m > 32`).
+    pub(super) head_fp8: Option<Fp8Rows>,
+    /// Host copy of `head_capped` (non-invariant prefill only).
     head_host: Vec<f32>,
+}
+
+/// LM-head output and argmax scratch buffers for [`PrefillScratch::new`].
+type HeadBuffers = (
+    Option<CudaSlice<bf16>>,
+    Option<CudaSlice<f32>>,
+    Option<HeadArgmaxScratch>,
+    Option<Fp8Rows>,
+    Vec<f32>,
+);
+
+fn alloc_head_buffers(
+    stream: &Arc<CudaStream>,
+    cfg: &TextConfig,
+    rows: usize,
+    invariant: bool,
+    sampler: bool,
+    fp8_wide: bool,
+) -> anyhow::Result<HeadBuffers> {
+    if invariant {
+        let head_logits = sampler
+            .then(|| zeros(stream, rows * cfg.vocab_size))
+            .transpose()?;
+        let head_partials = (!sampler)
+            .then(|| HeadArgmaxScratch::new(stream, rows, cfg.unpadded_vocab_size, fp8_wide))
+            .transpose()?;
+        let head_fp8 = (!sampler && rows > 32 && fp8_wide)
+            .then(|| Fp8Rows::new(stream, rows * cfg.hidden_size))
+            .transpose()?;
+        Ok((head_logits, None, head_partials, head_fp8, Vec::new()))
+    } else {
+        Ok((
+            Some(zeros(stream, HEAD_ROWS * cfg.vocab_size)?),
+            Some(zeros(stream, HEAD_ROWS * cfg.unpadded_vocab_size)?),
+            Some(HeadArgmaxScratch::new(
+                stream,
+                HEAD_ROWS,
+                cfg.unpadded_vocab_size,
+                false,
+            )?),
+            None,
+            vec![0.0; HEAD_ROWS * cfg.unpadded_vocab_size],
+        ))
+    }
 }
 
 impl PrefillScratch {
@@ -366,6 +453,8 @@ impl PrefillScratch {
         max_blocks: usize,
         rows: usize,
         invariant: bool,
+        sampler: bool,
+        fp8_wide: bool,
     ) -> anyhow::Result<Self> {
         let hidden = cfg.hidden_size;
         let heads = cfg.num_attention_heads;
@@ -375,6 +464,8 @@ impl PrefillScratch {
         let top_k = cfg.num_experts_per_tok;
         let width = cfg.intermediate_size;
         let looped = cfg.loop_config.core_end - cfg.loop_config.core_start;
+        let (head_logits, head_capped, head_partials, head_fp8, head_host) =
+            alloc_head_buffers(stream, cfg, rows, invariant, sampler, fp8_wide)?;
         Ok(Self {
             rows,
             record_taps: false,
@@ -464,16 +555,28 @@ impl PrefillScratch {
                 )?,
             },
             final_hidden: zeros(stream, rows * hidden)?,
-            head_logits: zeros(
-                stream,
-                if invariant { rows.max(HEAD_ROWS) } else { HEAD_ROWS } * cfg.vocab_size,
-            )?,
-            head_capped: zeros(
-                stream,
-                if invariant { rows.max(HEAD_ROWS) } else { HEAD_ROWS } * cfg.unpadded_vocab_size,
-            )?,
-            head_host: vec![0.0; HEAD_ROWS * cfg.unpadded_vocab_size],
+            head_logits,
+            head_capped,
+            head_partials,
+            head_fp8,
+            head_host,
         })
+    }
+
+    /// Ensures `head_logits` and `head_capped` are allocated for opt-in margin acceptance
+    /// (`accept_margin > 0.0`). Unused on the default exact-acceptance path (0 bytes).
+    pub(super) fn ensure_capped_head(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        cfg: &TextConfig,
+    ) -> anyhow::Result<()> {
+        if self.head_logits.is_none() {
+            self.head_logits = Some(zeros(stream, self.rows * cfg.vocab_size)?);
+        }
+        if self.head_capped.is_none() {
+            self.head_capped = Some(zeros(stream, self.rows * cfg.unpadded_vocab_size)?);
+        }
+        Ok(())
     }
 }
 
@@ -593,6 +696,8 @@ impl Model {
                 &self.ctx.config,
                 self.max_blocks,
                 rows,
+                false,
+                false,
                 false,
             )?);
         }
@@ -1314,6 +1419,14 @@ impl Ctx {
         } else {
             HEAD_ROWS
         };
+        let head_logits = p
+            .head_logits
+            .as_mut()
+            .context("the head_logits buffer is missing")?;
+        let head_capped = p
+            .head_capped
+            .as_mut()
+            .context("the head_capped buffer is missing")?;
         for first in (0..m).step_by(step) {
             let n = step.min(m - first);
             let wanted = (first..first + n).filter(|&i| (start + i).is_multiple_of(every));
@@ -1325,7 +1438,7 @@ impl Ctx {
                     weight: self.weights.lm_head.slice(),
                     fp8,
                     x: p.final_hidden.slice(first * hidden..(first + n) * hidden),
-                    out: rows_mut(&mut p.head_logits, n, padded),
+                    out: rows_mut(head_logits, n, padded),
                 }],
                 n,
                 fp8.is_some(),
@@ -1333,14 +1446,14 @@ impl Ctx {
             )?;
             self.kernels.elementwise.logit_softcap(
                 &self.stream,
-                &rows(&p.head_logits, n, padded),
-                &mut rows_mut(&mut p.head_capped, n, vocab),
+                &rows(head_logits, n, padded),
+                &mut rows_mut(head_capped, n, vocab),
                 cfg.final_logit_softcapping,
             )?;
             if every == 1 {
                 let host = &mut p.head_host[..n * vocab];
                 self.stream
-                    .memcpy_dtoh(&rows(&p.head_capped, n, vocab), host)?;
+                    .memcpy_dtoh(&rows(head_capped, n, vocab), host)?;
                 for (i, row) in host.chunks_exact(vocab).enumerate() {
                     callback(start + first + i, row)?;
                 }
@@ -1349,7 +1462,7 @@ impl Ctx {
                     let row = i - first;
                     let host = &mut p.head_host[..vocab];
                     self.stream
-                        .memcpy_dtoh(&p.head_capped.slice(row * vocab..(row + 1) * vocab), host)?;
+                        .memcpy_dtoh(&head_capped.slice(row * vocab..(row + 1) * vocab), host)?;
                     callback(start + i, host)?;
                 }
             }
@@ -1357,54 +1470,174 @@ impl Ctx {
         Ok(())
     }
 
-    /// The end of a verify pass of `m` rows: every row's logits and token, the
-    /// acceptance, and the rollback of the conv states and ring slots of rejected rows.
+    /// Whether wide (`m > 32`) greedy LM heads can use the native FP8 tensor-core GEMM.
+    pub(super) fn fp8_wide_head(&self) -> bool {
+        self.weights.lm_head_fp8.is_some() && crate::BLOCK_SCALED_MMA
+    }
+
+    /// Fused greedy LM head: computes each row's argmax over `0..unpadded_vocab_size`
+    /// directly from `x` (`[m, hidden]`) into `out` (`[m]`) without writing `head_logits`
+    /// or `head_capped`.
+    ///
+    /// - `m <= 32` (or BF16 weights / `sm_89`): `LinearRows::run_argmax` (0-ULP bit-exact
+    ///   with `linear_rows -> logit_softcap_bf16_f32 -> argmax_f32`) + PDL `argmax_partials`.
+    /// - `m > 32` with FP8 weights on `sm_120a`: native FP8 tensor-core `LinearFp8::gemm_argmax`
+    ///   (128 x 128 tiles, ~12.5 KB/row partials) + PDL `argmax_partials`.
+    fn greedy_head_argmax(
+        &self,
+        x: &CudaView<'_, bf16>,
+        m: usize,
+        partials: &mut HeadArgmaxScratch,
+        head_fp8: Option<&mut Fp8Rows>,
+        out: &mut CudaViewMut<'_, i32>,
+    ) -> anyhow::Result<()> {
+        let vocab = self.config.unpadded_vocab_size;
+        let n_partials = if m > 32
+            && crate::BLOCK_SCALED_MMA
+            && let (Some(fp8), Some(scratch)) = (self.weights.lm_head_fp8.as_ref(), head_fp8)
+        {
+            self.kernels.linear_fp8.gemm_argmax(
+                &self.stream,
+                fp8,
+                x,
+                vocab,
+                scratch,
+                &mut partials.vals,
+                &mut partials.idxs,
+                m,
+            )?
+        } else {
+            let weight = if let Some(fp8) = self.weights.lm_head_fp8.as_ref() {
+                RowsWeight::Fp8(fp8)
+            } else {
+                RowsWeight::Bf16(self.weights.lm_head.slice().as_view())
+            };
+            self.kernels.linear_rows.run_argmax(
+                &self.stream,
+                &weight,
+                x,
+                vocab,
+                &mut partials.vals,
+                &mut partials.idxs,
+                m,
+                Start::Early,
+            )?
+        };
+        self.kernels.misc.argmax_partials(
+            &self.stream,
+            &partials.vals.slice(..m * n_partials),
+            &partials.idxs.slice(..m * n_partials),
+            out,
+            n_partials,
+            n_partials,
+        )
+    }
+
+    /// Computes softcapped F32 logits `[m, unpadded_vocab]` on demand from `final_hidden`
+    /// (`[m, hidden]`) using the invariant `linear_rows` head + `logit_softcap`, for tests
+    /// and diagnostics (`verify_logits`, `batch_logits`, `batch_verify_logits`).
+    pub(super) fn compute_capped_logits(
+        &self,
+        final_hidden: &CudaSlice<bf16>,
+        m: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        let cfg = &self.config;
+        let (hidden, vocab, padded) = (self.hidden(), cfg.unpadded_vocab_size, cfg.vocab_size);
+        let step = m.min(HEAD_ROWS);
+        let mut tmp_logits = zeros::<bf16>(&self.stream, step * padded)?;
+        let mut tmp_capped = zeros::<f32>(&self.stream, step * vocab)?;
+        let mut out = vec![0.0f32; m * vocab];
+        for first in (0..m).step_by(step) {
+            let n = step.min(m - first);
+            self.gemm_rows(
+                &mut [RowProduct {
+                    weight: self.weights.lm_head.slice(),
+                    fp8: self.weights.lm_head_fp8.as_ref(),
+                    x: final_hidden.slice(first * hidden..(first + n) * hidden),
+                    out: rows_mut(&mut tmp_logits, n, padded),
+                }],
+                n,
+                true,
+                None,
+            )?;
+            self.kernels.elementwise.logit_softcap(
+                &self.stream,
+                &rows(&tmp_logits, n, padded),
+                &mut rows_mut(&mut tmp_capped, n, vocab),
+                cfg.final_logit_softcapping,
+            )?;
+            self.stream.memcpy_dtoh(
+                &rows(&tmp_capped, n, vocab),
+                &mut out[first * vocab..(first + n) * vocab],
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// The end of a verify pass of `m` rows: every row's token (fused greedy argmax or
+    /// BF16 inline-softcap sampling), the acceptance, and the rollback of the conv states
+    /// and ring slots of rejected rows.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "handles fused greedy, BF16 inline-softcap sampling, and opt-in margin acceptance"
+    )]
     fn verify_head(&self, p: &mut PrefillScratch, m: usize) -> anyhow::Result<()> {
         let cfg = &self.config;
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
-        self.gemm_rows(
-            &mut [RowProduct {
-                weight: self.weights.lm_head.slice(),
-                fp8: self.weights.lm_head_fp8.as_ref(),
-                x: rows(&p.final_hidden, m, self.hidden()),
-                out: rows_mut(&mut p.head_logits, m, padded),
-            }],
-            m,
-            true,
-            None,
-        )?;
-        self.kernels.elementwise.logit_softcap(
-            &self.stream,
-            &rows(&p.head_logits, m, padded),
-            &mut rows_mut(&mut p.head_capped, m, vocab),
-            cfg.final_logit_softcapping,
-        )?;
         let v = p
             .verify
             .as_mut()
             .context("the verify buffers are missing")?;
         let spec = &self.kernels.spec;
-        match p.sample.as_mut() {
-            Some(sample) => self.kernels.sample.run(
-                &self.stream,
-                &rows(&p.head_capped, m, vocab),
-                vocab,
-                sample,
-                &mut v.argmax.slice_mut(..m),
-            )?,
-            None => self.kernels.misc.argmax_f32(
-                &self.stream,
-                &rows(&p.head_capped, m, vocab),
-                &mut v.argmax.slice_mut(..m),
-                vocab,
-            )?,
-        }
         if self.accept_margin > 0.0 {
+            let head_logits = p
+                .head_logits
+                .as_mut()
+                .context("the head_logits buffer is missing")?;
+            let head_capped = p
+                .head_capped
+                .as_mut()
+                .context("the head_capped buffer is missing")?;
+            self.gemm_rows(
+                &mut [RowProduct {
+                    weight: self.weights.lm_head.slice(),
+                    fp8: self.weights.lm_head_fp8.as_ref(),
+                    x: rows(&p.final_hidden, m, self.hidden()),
+                    out: rows_mut(head_logits, m, padded),
+                }],
+                m,
+                true,
+                None,
+            )?;
+            self.kernels.elementwise.logit_softcap(
+                &self.stream,
+                &rows(head_logits, m, padded),
+                &mut rows_mut(head_capped, m, vocab),
+                cfg.final_logit_softcapping,
+            )?;
+            match p.sample.as_mut() {
+                Some(sample) => self.kernels.sample.run(
+                    &self.stream,
+                    &rows(head_capped, m, vocab),
+                    vocab,
+                    sample,
+                    &mut v.argmax.slice_mut(..m),
+                )?,
+                None => self.kernels.misc.argmax_f32(
+                    &self.stream,
+                    &rows(head_capped, m, vocab),
+                    &mut v.argmax.slice_mut(..m),
+                    vocab,
+                )?,
+            }
             spec.accept_margin(
                 &self.stream,
                 &rows(&p.tokens, m, 1),
                 &v.argmax.slice(..m),
-                &rows(&p.head_capped, m, vocab),
+                &rows(head_capped, m, vocab),
                 vocab,
                 &v.keep,
                 m,
@@ -1413,6 +1646,44 @@ impl Ctx {
                 &mut v.anchor,
             )?;
         } else {
+            if let Some(sample) = p.sample.as_mut() {
+                let head_logits = p
+                    .head_logits
+                    .as_mut()
+                    .context("the head_logits buffer is missing")?;
+                self.gemm_rows(
+                    &mut [RowProduct {
+                        weight: self.weights.lm_head.slice(),
+                        fp8: self.weights.lm_head_fp8.as_ref(),
+                        x: rows(&p.final_hidden, m, self.hidden()),
+                        out: rows_mut(head_logits, m, padded),
+                    }],
+                    m,
+                    true,
+                    None,
+                )?;
+                self.kernels.sample.run_bf16(
+                    &self.stream,
+                    &rows(head_logits, m, padded),
+                    vocab,
+                    padded,
+                    cfg.final_logit_softcapping,
+                    sample,
+                    &mut v.argmax.slice_mut(..m),
+                )?;
+            } else {
+                let partials = p
+                    .head_partials
+                    .as_mut()
+                    .context("the head_partials buffer is missing")?;
+                self.greedy_head_argmax(
+                    &rows(&p.final_hidden, m, self.hidden()),
+                    m,
+                    partials,
+                    p.head_fp8.as_mut(),
+                    &mut v.argmax.slice_mut(..m),
+                )?;
+            }
             spec.accept_greedy(
                 &self.stream,
                 &rows(&p.tokens, m, 1),
@@ -1436,8 +1707,13 @@ impl Ctx {
         )
     }
 
-    /// The end of a batched step or batched verify of `m` rows: every row's logits and
-    /// token, plus per-sequence acceptance and rollback for a batched verify.
+    /// The end of a batched step or batched verify of `m` rows: every row's token (fused
+    /// greedy argmax or BF16 inline-softcap sampling), plus per-sequence acceptance and
+    /// rollback for a batched verify.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "handles fused greedy, BF16 inline-softcap sampling, and opt-in margin acceptance"
+    )]
     fn batch_head(
         &self,
         p: &mut PrefillScratch,
@@ -1446,38 +1722,86 @@ impl Ctx {
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
-        self.gemm_rows(
-            &mut [RowProduct {
-                weight: self.weights.lm_head.slice(),
-                fp8: self.weights.lm_head_fp8.as_ref(),
-                x: rows(&p.final_hidden, m, self.hidden()),
-                out: rows_mut(&mut p.head_logits, m, padded),
-            }],
-            m,
-            true,
-            Some(&mut p.gate.dense),
-        )?;
-        self.kernels.elementwise.logit_softcap(
-            &self.stream,
-            &rows(&p.head_logits, m, padded),
-            &mut rows_mut(&mut p.head_capped, m, vocab),
-            cfg.final_logit_softcapping,
-        )?;
         let b = p.batch.as_mut().context("the batch buffers are missing")?;
-        match p.sample.as_mut() {
-            Some(sample) => self.kernels.sample.run(
+        let use_margin = b.verify.is_some() && self.accept_margin > 0.0;
+        if use_margin {
+            let head_logits = p
+                .head_logits
+                .as_mut()
+                .context("the head_logits buffer is missing")?;
+            let head_capped = p
+                .head_capped
+                .as_mut()
+                .context("the head_capped buffer is missing")?;
+            self.gemm_rows(
+                &mut [RowProduct {
+                    weight: self.weights.lm_head.slice(),
+                    fp8: self.weights.lm_head_fp8.as_ref(),
+                    x: rows(&p.final_hidden, m, self.hidden()),
+                    out: rows_mut(head_logits, m, padded),
+                }],
+                m,
+                true,
+                Some(&mut p.gate.dense),
+            )?;
+            self.kernels.elementwise.logit_softcap(
                 &self.stream,
-                &rows(&p.head_capped, m, vocab),
+                &rows(head_logits, m, padded),
+                &mut rows_mut(head_capped, m, vocab),
+                cfg.final_logit_softcapping,
+            )?;
+            match p.sample.as_mut() {
+                Some(sample) => self.kernels.sample.run(
+                    &self.stream,
+                    &rows(head_capped, m, vocab),
+                    vocab,
+                    sample,
+                    &mut b.argmax.slice_mut(..m),
+                )?,
+                None => self.kernels.misc.argmax_f32(
+                    &self.stream,
+                    &rows(head_capped, m, vocab),
+                    &mut b.argmax.slice_mut(..m),
+                    vocab,
+                )?,
+            }
+        } else if let Some(sample) = p.sample.as_mut() {
+            let head_logits = p
+                .head_logits
+                .as_mut()
+                .context("the head_logits buffer is missing")?;
+            self.gemm_rows(
+                &mut [RowProduct {
+                    weight: self.weights.lm_head.slice(),
+                    fp8: self.weights.lm_head_fp8.as_ref(),
+                    x: rows(&p.final_hidden, m, self.hidden()),
+                    out: rows_mut(head_logits, m, padded),
+                }],
+                m,
+                true,
+                Some(&mut p.gate.dense),
+            )?;
+            self.kernels.sample.run_bf16(
+                &self.stream,
+                &rows(head_logits, m, padded),
                 vocab,
+                padded,
+                cfg.final_logit_softcapping,
                 sample,
                 &mut b.argmax.slice_mut(..m),
-            )?,
-            None => self.kernels.misc.argmax_f32(
-                &self.stream,
-                &rows(&p.head_capped, m, vocab),
+            )?;
+        } else {
+            let partials = p
+                .head_partials
+                .as_mut()
+                .context("the head_partials buffer is missing")?;
+            self.greedy_head_argmax(
+                &rows(&p.final_hidden, m, self.hidden()),
+                m,
+                partials,
+                p.head_fp8.as_mut(),
                 &mut b.argmax.slice_mut(..m),
-                vocab,
-            )?,
+            )?;
         }
         if let Some(bv) = b.verify.as_mut() {
             let width = bv.width;
@@ -1487,12 +1811,16 @@ impl Ctx {
             let keep = bv.keep.slice(..seqs);
             let mut results = bv.results.slice_mut(..seqs * RESULT_LEN);
             let mut anchors = bv.anchors.slice_mut(..seqs);
-            if self.accept_margin > 0.0 {
+            if use_margin {
+                let head_capped = p
+                    .head_capped
+                    .as_ref()
+                    .context("the head_capped buffer is missing")?;
                 spec.accept_margin_batch(
                     &self.stream,
                     &tokens,
                     &argmax,
-                    &rows(&p.head_capped, m, vocab),
+                    &rows(head_capped, m, vocab),
                     vocab,
                     &keep,
                     seqs,
@@ -2632,53 +2960,52 @@ impl Ctx {
         };
         for first in (0..finishing.len()).step_by(step) {
             let n = step.min(finishing.len() - first);
-            self.gemm_rows(
-                &mut [RowProduct {
-                    weight: self.weights.lm_head.slice(),
-                    fp8,
-                    x: p.out.slice(first * hidden..(first + n) * hidden),
-                    out: rows_mut(&mut p.head_logits, n, padded),
-                }],
-                n,
-                fp8.is_some(),
-                None,
-            )?;
-            self.kernels.elementwise.logit_softcap(
-                &self.stream,
-                &rows(&p.head_logits, n, padded),
-                &mut rows_mut(&mut p.head_capped, n, vocab),
-                cfg.final_logit_softcapping,
-            )?;
             let all_greedy = !sampler
                 || finishing[first..first + n]
                     .iter()
                     .all(|&si| meta[si].sampling.is_greedy());
             if all_greedy {
-                self.kernels.misc.argmax_f32(
-                    &self.stream,
-                    &rows(&p.head_capped, n, vocab),
+                let partials = p
+                    .head_partials
+                    .as_mut()
+                    .context("the head_partials buffer is missing")?;
+                self.greedy_head_argmax(
+                    &p.out.slice(first * hidden..(first + n) * hidden),
+                    n,
+                    partials,
+                    None,
                     &mut p.packed_argmax.slice_mut(first..first + n),
-                    vocab,
                 )?;
             } else {
+                let head_logits = p
+                    .head_logits
+                    .as_mut()
+                    .context("the head_logits buffer is missing")?;
+                self.gemm_rows(
+                    &mut [RowProduct {
+                        weight: self.weights.lm_head.slice(),
+                        fp8,
+                        x: p.out.slice(first * hidden..(first + n) * hidden),
+                        out: rows_mut(head_logits, n, padded),
+                    }],
+                    n,
+                    fp8.is_some(),
+                    None,
+                )?;
                 for (j, &si) in finishing[first..first + n].iter().enumerate() {
                     let s = &meta[si];
-                    let row_logits = p.head_capped.slice(j * vocab..(j + 1) * vocab);
+                    let row_logits = head_logits.slice(j * padded..(j + 1) * padded);
                     let mut dst = p.packed_argmax.slice_mut((first + j)..=(first + j));
-                    if s.sampling.is_greedy() {
-                        self.kernels
-                            .misc
-                            .argmax_f32(&self.stream, &row_logits, &mut dst, vocab)?;
-                    } else {
-                        sample_one.upload(&self.stream, &[(s.sampling, s.start + s.len)])?;
-                        self.kernels.sample.run(
-                            &self.stream,
-                            &row_logits,
-                            vocab,
-                            sample_one,
-                            &mut dst,
-                        )?;
-                    }
+                    sample_one.upload(&self.stream, &[(s.sampling, s.start + s.len)])?;
+                    self.kernels.sample.run_bf16(
+                        &self.stream,
+                        &row_logits,
+                        vocab,
+                        padded,
+                        cfg.final_logit_softcapping,
+                        sample_one,
+                        &mut dst,
+                    )?;
                 }
             }
         }

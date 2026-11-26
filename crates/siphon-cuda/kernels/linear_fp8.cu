@@ -24,6 +24,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cfloat>
+#include <climits>
 #include <cstdint>
 
 #include "mxfp8.cuh"
@@ -558,6 +560,216 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
     }
 }
 
+__device__ __forceinline__ bool argmax_better(float a, int ia, float b, int ib) {
+    const bool a_nan = isnan(a);
+    const bool b_nan = isnan(b);
+    if (a_nan || b_nan) {
+        return a_nan && (!b_nan || ia < ib);
+    }
+    return a > b || (a == b && ia < ib);
+}
+
+// Single-product FP8 tensor-core LM head with a fused 128 x 128 tile-argmax epilogue:
+// runs the exact same block-scaled FP8 MMA as gemm8::gemm, masks col < vocab, rounds each
+// logit to BF16, reduces across each 128-column tile into one (max_val, max_idx) partial
+// per (row, n_tile), and triggers PDL for the follow-on argmax_partials reduction.
+__device__ void gemm_argmax(const uint8_t* weight, const float* scales, const uint8_t* x,
+                            const uint8_t* x_scale, float* partial_vals, int* partial_idxs,
+                            int m, int vocab, int k, uint8_t* smem) {
+    static_assert(kBm * kWarpsN * (sizeof(float) + sizeof(int)) <= kSmemBytes,
+                  "tile argmax partials fit shared memory");
+    pdl_trigger();
+
+    const int block = int(blockIdx.x);
+    const int tiles_m = (m + kBm - 1) / kBm;
+    const int tiles_n = (vocab + kBn - 1) / kBn;
+    const int m0 = (block % tiles_m) * kBm;
+    const int n_tile = block / tiles_m;
+    const int n0 = n_tile * kBn;
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int wn = warp % kWarpsN;
+    const int wm = warp / kWarpsN;
+
+    const int chunk = tid % 8;
+    const uint8_t* a_src[4];
+    const uint8_t* b_src[4];
+    uint32_t dst[4];
+    uint32_t a_live = 0;
+    uint32_t b_live = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = tid / 8 + 32 * i;
+        dst[i] = offset(row, chunk);
+        const bool a_ok = m0 + row < m;
+        const bool b_ok = n0 + row < vocab;
+        a_live |= uint32_t(a_ok) << i;
+        b_live |= uint32_t(b_ok) << i;
+        a_src[i] = x + size_t(a_ok ? m0 + row : 0) * k + chunk * 16;
+        b_src[i] = weight + size_t(b_ok ? n0 + row : 0) * k + chunk * 16;
+    }
+    const bool scale_ok = tid < kBm && m0 + tid < m;
+    const uint8_t* scale_src = x_scale + size_t(scale_ok ? m0 + tid : 0) * (k / 32);
+
+    const uint32_t smem0 = smem_addr(smem);
+    auto load = [&](int stage, int step) {
+        const uint32_t base = smem0 + stage * kStage;
+        const int k0 = step * kBk;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            cp_async16(base + dst[i], a_src[i] + k0, a_live >> i & 1);
+            cp_async16(base + kStageA + dst[i], b_src[i] + k0, b_live >> i & 1);
+        }
+        if (tid < kBm) {
+            cp_async4(base + kStageA + kStageB + 4 * tid, scale_src + step * 4, scale_ok);
+        }
+    };
+
+    const int a_row = wm * kWarpRows + lane % 16;
+    const int b_row = wn * kWarpCols + lane % 8 + lane / 16 * 8;
+    const int scale_row = wm * kWarpRows + lane / 4 + 8 * (lane % 2);
+
+    float acc[kMi][kNi][4] = {};
+    const int steps = k / kBk;
+#pragma unroll
+    for (int st = 0; st < kStages - 1; ++st) {
+        if (st < steps) {
+            load(st, st);
+        }
+        cp_async_commit();
+    }
+
+    int stage = 0;
+    for (int step = 0; step < steps; ++step) {
+        cp_async_wait<kStages - 2>();
+        __syncthreads();
+        const int next = step + kStages - 1;
+        if (next < steps) {
+            load((stage + kStages - 1) % kStages, next);
+        }
+        cp_async_commit();
+
+        const uint32_t base = smem0 + stage * kStage;
+        const uint32_t* x_scales =
+            reinterpret_cast<const uint32_t*>(smem + stage * kStage + kStageA + kStageB);
+        uint32_t sa[kMi];
+#pragma unroll
+        for (int mi = 0; mi < kMi; ++mi) {
+            sa[mi] = x_scales[scale_row + 16 * mi];
+        }
+        auto k_step = [&]<int kK>() {
+            uint32_t bf[kNi][2];
+#pragma unroll
+            for (int nj = 0; nj < kNi; nj += 2) {
+                uint32_t r[4];
+                ldmatrix_x4(r, base + kStageA + offset(b_row + nj * 8, 2 * kK + lane / 8 % 2));
+                bf[nj][0] = r[0];
+                bf[nj][1] = r[1];
+                bf[nj + 1][0] = r[2];
+                bf[nj + 1][1] = r[3];
+            }
+#pragma unroll
+            for (int mi = 0; mi < kMi; ++mi) {
+                uint32_t af[4];
+                ldmatrix_x4(af, base + offset(a_row + mi * 16, 2 * kK + lane / 16));
+#pragma unroll
+                for (int ni = 0; ni < kNi; ++ni) {
+                    mma<kK>(acc[mi][ni], af, bf[ni][0], bf[ni][1], sa[mi]);
+                }
+            }
+        };
+        k_step.template operator()<0>();
+        k_step.template operator()<1>();
+        k_step.template operator()<2>();
+        k_step.template operator()<3>();
+        stage = stage + 1 == kStages ? 0 : stage + 1;
+    }
+
+    // Drain all async copies before reusing shared memory for the 4-warp tile merge.
+    cp_async_wait<0>();
+    __syncthreads();
+
+    float* sh_vals = reinterpret_cast<float*>(smem);
+    int* sh_idxs = reinterpret_cast<int*>(smem + kBm * kWarpsN * sizeof(float));
+
+    const int g = lane / 4, t = lane % 4;
+    float s0[kNi], s1[kNi];
+#pragma unroll
+    for (int ni = 0; ni < kNi; ++ni) {
+        const int col = n0 + wn * kWarpCols + ni * 8 + 2 * t;
+        s0[ni] = col < vocab ? scales[col] : 0.f;
+        s1[ni] = col + 1 < vocab ? scales[col + 1] : 0.f;
+    }
+
+#pragma unroll
+    for (int mi = 0; mi < kMi; ++mi) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int local_row = wm * kWarpRows + mi * 16 + g + 8 * h;
+            const int row = m0 + local_row;
+            float best_v = -INFINITY;
+            int best_i = INT_MAX;
+            if (row < m) {
+#pragma unroll
+                for (int ni = 0; ni < kNi; ++ni) {
+                    const int col = n0 + wn * kWarpCols + ni * 8 + 2 * t;
+                    if (col < vocab) {
+                        const float v0 =
+                            __bfloat162float(__float2bfloat16_rn(acc[mi][ni][2 * h] * s0[ni]));
+                        if (argmax_better(v0, col, best_v, best_i)) {
+                            best_v = v0;
+                            best_i = col;
+                        }
+                        if (col + 1 < vocab) {
+                            const float v1 = __bfloat162float(
+                                __float2bfloat16_rn(acc[mi][ni][2 * h + 1] * s1[ni]));
+                            if (argmax_better(v1, col + 1, best_v, best_i)) {
+                                best_v = v1;
+                                best_i = col + 1;
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int offset = 1; offset <= 2; offset *= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best_v, offset);
+                const int oi = __shfl_xor_sync(0xffffffffu, best_i, offset);
+                if (argmax_better(ov, oi, best_v, best_i)) {
+                    best_v = ov;
+                    best_i = oi;
+                }
+            }
+            if (t == 0) {
+                sh_vals[local_row * kWarpsN + wn] = best_v;
+                sh_idxs[local_row * kWarpsN + wn] = best_i;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < kBm) {
+        const int row = m0 + tid;
+        if (row < m) {
+            float best_v = sh_vals[tid * kWarpsN + 0];
+            int best_i = sh_idxs[tid * kWarpsN + 0];
+#pragma unroll
+            for (int w = 1; w < kWarpsN; ++w) {
+                const float ov = sh_vals[tid * kWarpsN + w];
+                const int oi = sh_idxs[tid * kWarpsN + w];
+                if (argmax_better(ov, oi, best_v, best_i)) {
+                    best_v = ov;
+                    best_i = oi;
+                }
+            }
+            const size_t dst = size_t(row) * tiles_n + n_tile;
+            partial_vals[dst] = best_v;
+            partial_idxs[dst] = best_i;
+        }
+    }
+}
+
 }  // namespace gemm8
 
 // The FP8 GEMM entry points. Grid: one block per tile of every product; k must be a
@@ -575,6 +787,17 @@ extern "C" __global__ void __launch_bounds__(128, 2)
     gemm_fp8_64x64(const __grid_constant__ gemm8::Batch batch) {
     extern __shared__ __align__(16) uint8_t gemm8_smem[];
     gemm8::gemm<64, 64, 2, 2, 3>(batch, gemm8_smem);
+}
+
+// Fused FP8 GEMM + tile-argmax entry point for the LM head (m > 32). Grid: ceil(m / 128) *
+// ceil(vocab / 128) blocks; dynamic shared memory gemm8::kSmemBytes.
+extern "C" __global__ void __launch_bounds__(gemm8::kThreads, 1)
+    gemm_fp8_128x128_argmax(const uint8_t* weight, const float* scales, const uint8_t* x,
+                            const uint8_t* x_scale, float* partial_vals, int* partial_idxs,
+                            int m, int vocab, int k) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm_argmax(weight, scales, x, x_scale, partial_vals, partial_idxs, m, vocab, k,
+                       gemm8_smem);
 }
 
 // Quantizes `rows` BF16 rows of k values (`x`) to MXFP8 for gemm_fp8: E4M3 `values`

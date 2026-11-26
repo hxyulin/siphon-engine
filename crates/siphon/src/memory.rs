@@ -394,8 +394,7 @@ impl Planner {
         let (verify, draft_bytes, draft_kv_per_position) = match &draft {
             None => (0, 0, 0),
             Some((d, approx)) => {
-                let verify = rows_scratch(c, VERIFY_ROWS, inputs.sms)
-                    + invariant_scratch(c, VERIFY_ROWS)
+                let verify = invariant_rows_scratch(c, VERIFY_ROWS, inputs.sms)
                     + VERIFY_ROWS * taps * hidden * 2
                     + visits.len() * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
                     // The speculator's prompt tail, twice, and its run of plain steps.
@@ -457,8 +456,7 @@ impl Planner {
             let draft_kv_bytes = if approx.fp8_kv { 1 } else { 2 };
             let extra_draft_rings =
                 (streams - 1) * d.layers * d.ring_slots * 2 * kv_dims * draft_kv_bytes;
-            let verify_bufs = rows_scratch(c, spec_rows, inputs.sms)
-                + invariant_scratch(c, spec_rows)
+            let verify_bufs = invariant_rows_scratch(c, spec_rows, inputs.sms)
                 + spec_rows * taps * hidden * 2
                 + visits.len() * spec_seqs * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
                 + sliding_visits * spec_seqs * VERIFY_ROWS * 2 * ring_row_bytes;
@@ -469,8 +467,7 @@ impl Planner {
             0
         };
         let batch = if streams > 1 {
-            rows_scratch(c, streams, inputs.sms)
-                + invariant_scratch(c, streams)
+            invariant_rows_scratch(c, streams, inputs.sms)
                 + visits.len() * streams * 6 * 8
                 + streams * 8
                 + streams * taps * hidden * 2
@@ -693,9 +690,8 @@ fn max_blocks(c: &TextConfig) -> usize {
         + starts(l.core_end..c.num_hidden_layers)
 }
 
-/// `PrefillScratch::new` for `rows` rows: the buffers of a prefill chunk or a verify pass,
-/// without the taps and the verify pass's own state.
-fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
+/// Core per-chunk buffers of `PrefillScratch::new` without the LM head outputs.
+fn rows_scratch_core(c: &TextConfig, rows: usize, sms: usize) -> usize {
     let hidden = c.hidden_size;
     let heads = c.num_attention_heads;
     let q_dims = heads * c.head_dim;
@@ -734,10 +730,21 @@ fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
         + 16 * pairs.min(pairs / 64 + experts) // tiles
         + quantized + quantized / 16 + 4 * pairs
         + 4 * (rows * (heads / c.num_key_value_heads)).div_ceil(128) * c.num_key_value_heads;
-    let fixed = 4 * 2 * sms * PREFILL_SLOT
-        + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2)
-        + HEAD_ROWS * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
+    let fixed = 4 * 2 * sms * PREFILL_SLOT + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2);
     per_rows + fixed
+}
+
+/// `PrefillScratch::new` for a non-invariant prefill chunk of `rows` rows, including
+/// `HEAD_ROWS` of BF16 `head_logits` and F32 `head_capped` for `PrefillLogits::All`/`Every`.
+fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
+    rows_scratch_core(c, rows, sms) + HEAD_ROWS * (c.vocab_size * 2 + c.unpadded_vocab_size * 4)
+}
+
+/// `PrefillScratch::new` for an invariant chunk (`verify`, `batch`, `batch_verify`):
+/// never allocates F32 `head_capped` (sampling reads BF16 `head_logits` with inline
+/// softcap; greedy runs fused tile-argmax into tiny partial buffers).
+fn invariant_rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
+    rows_scratch_core(c, rows, sms) + invariant_scratch(c, rows)
 }
 
 /// The MXFP8 inputs of a prefill chunk's FP8 dense products (`GateRows::dense`): three
@@ -748,19 +755,21 @@ fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
     values + values / 32
 }
 
-/// What `PrefillScratch::new` adds for an invariant chunk, the verify pass: every looped
-/// layer's message weights and normalized messages, an output for each of the 3 gates
-/// one launch runs (`misc::GATE_SLOTS`), and any LM-head/sync headroom past [`HEAD_ROWS`].
+/// What `PrefillScratch::new` adds for an invariant chunk (verify / batch / batch_verify):
+/// every looped layer's message weights and normalized messages, an output for each of the
+/// 3 gates one launch runs (`misc::GATE_SLOTS`), BF16 `head_logits` (worst case when
+/// sampling is enabled; greedy uses even smaller tile-argmax partials), and wide-row sync
+/// headroom.
 fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     let hidden = c.hidden_size;
     let looped = c.loop_config.core_end - c.loop_config.core_start;
-    // The multi-row attention's partials and counters past the 8 rows `rows_scratch`
+    // The multi-row attention's partials and counters past the 8 rows `rows_scratch_core`
     // counts, for a batched step's rows.
     let attention = rows.saturating_sub(VERIFY_ROWS)
         * (ROWS_ATTENTION_ROWS / VERIFY_ROWS * (c.head_dim + 2) * 4
             + 2 * c.num_key_value_heads * 4);
-    let extra_head =
-        rows.saturating_sub(HEAD_ROWS) * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
+    // BF16 `head_logits` when sampling is enabled (0 bytes of F32 `head_capped`!).
+    let head_logits = rows * c.vocab_size * 2;
     // Above 32 rows, `ExpertsRows::sync_len` adds grouped routing metadata (`ExpertRowsMeta`).
     let extra_sync = if rows > 32 {
         let base = 1 + rows * (c.num_experts_per_tok + 1);
@@ -779,7 +788,7 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     };
     rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2 + 2 * hidden * 4)
         + attention
-        + extra_head
+        + head_logits
         + extra_sync
         + dense
 }
@@ -1245,5 +1254,26 @@ mod tests {
         // About 0.3 MB per row: the relative bias, the expert activations and the blocks.
         let per_row = (large - small) / 2040;
         assert!((250_000..400_000).contains(&per_row), "{per_row}");
+    }
+
+    #[test]
+    fn invariant_scratch_omits_f32_head_capped() {
+        let c = config();
+        // Verify (8 rows) + batch (32 rows) + batch_verify (256 rows) no longer allocate
+        // F32 head_capped (which previously took (32 + 32 + 256) * unpadded_vocab * 4 ~ 256 MB).
+        let old_head = |rows: usize| {
+            rows.max(HEAD_ROWS) * (c.vocab_size * 2 + c.unpadded_vocab_size * 4)
+        };
+        let new_head = |rows: usize| rows * c.vocab_size * 2;
+        let saved: usize = [8usize, 32, 256]
+            .into_iter()
+            .map(|r| old_head(r) - new_head(r))
+            .sum();
+        assert!(saved > 250_000_000, "expected >250 MB saved, got {saved}");
+        // Verify invariant_rows_scratch reflects this exact difference vs rows_scratch_core.
+        assert_eq!(
+            invariant_rows_scratch(&c, 256, 170) - rows_scratch_core(&c, 256, 170),
+            invariant_scratch(&c, 256)
+        );
     }
 }

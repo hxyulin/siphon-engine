@@ -7,8 +7,9 @@ use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
 };
+use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 
 /// Threads of `sample_prepare`'s blocks, and its blocks per row, one cluster:
 /// `kPrepareThreads` and `kCluster` in the kernel. Ada has no clusters, so the `sm_89`
@@ -159,7 +160,9 @@ impl SampleBuffers {
 #[derive(Debug)]
 pub struct Sample {
     prepare: CudaFunction,
+    prepare_bf16: CudaFunction,
     race: CudaFunction,
+    race_bf16: CudaFunction,
     noise: CudaFunction,
 }
 
@@ -168,7 +171,9 @@ impl Sample {
         let module = load_module(ctx, "sample", cubin!("sample"))?;
         Ok(Self {
             prepare: module.load_function("sample_prepare")?,
+            prepare_bf16: module.load_function("sample_prepare_bf16")?,
             race: module.load_function("sample_race")?,
+            race_bf16: module.load_function("sample_race_bf16")?,
             noise: module.load_function("sample_noise")?,
         })
     }
@@ -240,36 +245,120 @@ impl Sample {
             block_dim: (PREPARE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.prepare);
-        launch
-            .arg(&logits)
-            .arg(&n)
-            .arg(&buffers.params)
-            .arg(&mut buffers.state)
-            .arg(&mut out);
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n)
+            .ptr(&buffers.params, stream)
+            .ptr_mut(&mut buffers.state, stream)
+            .ptr_mut(&mut out, stream);
         // SAFETY: the arguments match `sample_prepare(const float*, int, const Params*,
         // State*, int*)`: `logits` holds `rows` rows of `n`, the buffers hold `rows` rows of
-        // 8 and 4 words, and `out` holds `rows` elements, one per cluster of 8 blocks.
-        unsafe { launch.launch(config) }?;
+        // 8 and 4 words, `out` holds `rows` elements, and the kernel waits at `pdl_wait`
+        // before any global load.
+        unsafe { args.launch_pdl(stream, &self.prepare, config) }?;
         let config = LaunchConfig {
             grid_dim: (u32::try_from(RACE_BLOCKS)?, grid_rows, 1),
             block_dim: (RACE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.race);
-        launch
-            .arg(&logits)
-            .arg(&n)
-            .arg(&buffers.params)
-            .arg(&buffers.state)
-            .arg(&mut buffers.scores)
-            .arg(&mut buffers.idxs)
-            .arg(&mut buffers.counters)
-            .arg(&mut out);
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n)
+            .ptr(&buffers.params, stream)
+            .ptr(&buffers.state, stream)
+            .ptr_mut(&mut buffers.scores, stream)
+            .ptr_mut(&mut buffers.idxs, stream)
+            .ptr_mut(&mut buffers.counters, stream)
+            .ptr_mut(&mut out, stream);
         // SAFETY: the arguments match `sample_race(const float*, int, const Params*, const
-        // State*, float*, int*, unsigned*, int*)`; the partials hold `RACE_BLOCKS` per row
-        // and the counters one per row, all zero between launches.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // State*, float*, int*, unsigned*, int*)`; the partials hold `RACE_BLOCKS` per row,
+        // the counters one per row (all zero between launches), and the kernel reads nothing
+        // before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.race, config) }
+    }
+
+    /// Writes each row's token of BF16 `logits` (`[rows, stride]`, reading the first `n`
+    /// columns with 8-wide `uint4` loads and applying `softcap` inline on non-greedy rows)
+    /// to `out` (`[rows]`) with the settings in `buffers`. Eliminates the separate
+    /// `logit_softcap` pass and F32 `head_capped` buffer.
+    #[expect(clippy::too_many_arguments, reason = "logits, shape, softcap, buffers and output")]
+    pub fn run_bf16(
+        &self,
+        stream: &CudaStream,
+        logits: &impl DeviceIn<bf16>,
+        n: usize,
+        stride: usize,
+        softcap: f32,
+        buffers: &mut SampleBuffers,
+        out: &mut impl DeviceOut<i32>,
+    ) -> anyhow::Result<()> {
+        let (logits, mut out) = (logits.view(), out.view_mut());
+        ensure!(n > 0, "n must be positive");
+        ensure!(stride >= n, "stride {stride} < n {n}");
+        ensure!(
+            logits.len().is_multiple_of(stride),
+            "logits have {} elements, not a multiple of stride {stride}",
+            logits.len()
+        );
+        ensure!(
+            n <= MAX_TOKENS,
+            "rows of {n} tokens, the kernels take at most {MAX_TOKENS}"
+        );
+        ensure!(
+            softcap.is_finite() && softcap >= 0.0,
+            "softcap must be finite and non-negative, not {softcap}"
+        );
+        let rows = logits.len() / stride;
+        ensure!(
+            (1..=buffers.rows).contains(&rows),
+            "{rows} rows, the buffers hold {}",
+            buffers.rows
+        );
+        ensure!(
+            out.len() == rows,
+            "out has {} elements, not {rows}",
+            out.len()
+        );
+        let n_arg = i32::try_from(n).context("n too large")?;
+        let stride_arg = i32::try_from(stride).context("stride too large")?;
+        let grid_rows = u32::try_from(rows)?;
+        let config = LaunchConfig {
+            grid_dim: (grid_rows * PREPARE_CLUSTER, 1, 1),
+            block_dim: (PREPARE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n_arg)
+            .i32(stride_arg)
+            .f32(softcap)
+            .ptr(&buffers.params, stream)
+            .ptr_mut(&mut buffers.state, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: the arguments match `sample_prepare_bf16(const bf16*, int, int, float,
+        // const Params*, State*, int*)`; `logits` holds `rows` rows of `stride >= n`, the
+        // buffers hold `rows` entries, and the kernel waits at `pdl_wait` before any load.
+        unsafe { args.launch_pdl(stream, &self.prepare_bf16, config) }?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(RACE_BLOCKS)?, grid_rows, 1),
+            block_dim: (RACE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n_arg)
+            .i32(stride_arg)
+            .f32(softcap)
+            .ptr(&buffers.params, stream)
+            .ptr(&buffers.state, stream)
+            .ptr_mut(&mut buffers.scores, stream)
+            .ptr_mut(&mut buffers.idxs, stream)
+            .ptr_mut(&mut buffers.counters, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: the arguments match `sample_race_bf16(const bf16*, int, int, float, const
+        // Params*, const State*, float*, int*, unsigned*, int*)`; the partials hold
+        // `RACE_BLOCKS` per row, counters are zero between launches, and the kernel reads
+        // nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.race_bf16, config) }
     }
 }

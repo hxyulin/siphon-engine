@@ -27,6 +27,7 @@ namespace {
 
 constexpr int kArgmaxThreads = 1024;
 constexpr int kArgmaxWideThreads = 256;
+constexpr int kArgmaxPartialsThreads = 256;
 
 __device__ __forceinline__ size_t grid_index() {
     return size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -113,34 +114,51 @@ extern "C" __global__ void cast_bf16_to_f32(const uint16_t* x, float* out, size_
 }
 
 // out[r] = index of the largest of the n values in row r of x. One block per row.
-// The comparison orders every (value, index) pair, so the reduction order does
-// not change the result.
+// Vectorized with 16-byte float4 loads (peeling any unaligned head/tail) and PDL-enabled.
+// The comparison orders every (value, index) pair, so the reduction order does not change
+// the result.
 extern "C" __global__ void __launch_bounds__(kArgmaxThreads)
 argmax_f32(const float* x, int* out, int n) {
     __shared__ float warp_vals[kArgmaxThreads / 32];
     __shared__ int warp_idxs[kArgmaxThreads / 32];
+    pdl_trigger();
+    pdl_wait();
     const float* row = x + size_t(blockIdx.x) * n;
 
     // Threads without an element hold (-inf, INT_MAX), which loses to every element.
     float best = -INFINITY;
     int best_idx = INT_MAX;
-    for (int i = threadIdx.x; i < n; i += kArgmaxThreads) {
-        const float v = row[i];
-        if (argmax_better(v, i, best, best_idx)) {
+    const auto take = [&](float v, int idx) {
+        if (argmax_better(v, idx, best, best_idx)) {
             best = v;
-            best_idx = i;
+            best_idx = idx;
         }
+    };
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(row);
+    const int head = min(n, static_cast<int>(((16u - (addr & 15u)) & 15u) / 4u));
+    if (threadIdx.x < head) {
+        take(row[threadIdx.x], threadIdx.x);
+    }
+    const float4* vecs = reinterpret_cast<const float4*>(row + head);
+    const int nvecs = (n - head) / 4;
+    for (int v = threadIdx.x; v < nvecs; v += kArgmaxThreads) {
+        const float4 q = vecs[v];
+        const int base = head + 4 * v;
+        take(q.x, base);
+        take(q.y, base + 1);
+        take(q.z, base + 2);
+        take(q.w, base + 3);
+    }
+    const int tail = head + 4 * nvecs + threadIdx.x;
+    if (tail < n) {
+        take(row[tail], tail);
     }
 
     const auto warp_reduce = [&] {
 #pragma unroll
         for (int offset = 16; offset >= 1; offset /= 2) {
-            const float v = __shfl_xor_sync(0xffffffffu, best, offset);
-            const int idx = __shfl_xor_sync(0xffffffffu, best_idx, offset);
-            if (argmax_better(v, idx, best, best_idx)) {
-                best = v;
-                best_idx = idx;
-            }
+            take(__shfl_xor_sync(0xffffffffu, best, offset),
+                 __shfl_xor_sync(0xffffffffu, best_idx, offset));
         }
     };
 
@@ -155,6 +173,80 @@ argmax_f32(const float* x, int* out, int n) {
     if (warp == 0) {
         best = warp_vals[lane];
         best_idx = warp_idxs[lane];
+        warp_reduce();
+        if (lane == 0) {
+            out[blockIdx.x] = best_idx;
+        }
+    }
+}
+
+// Second stage of the fused LM head greedy argmax: reduces `n` (val, idx) partials per row
+// (with row stride `stride`) into out[row]. One block per row, vectorized float4 + int4
+// loads, PDL-enabled.
+extern "C" __global__ void __launch_bounds__(kArgmaxPartialsThreads)
+argmax_partials(const float* vals, const int* idxs, int* out, int n, int stride) {
+    __shared__ float warp_vals[kArgmaxPartialsThreads / 32];
+    __shared__ int warp_idxs[kArgmaxPartialsThreads / 32];
+    pdl_trigger();
+    pdl_wait();
+    const float* vrow = vals + size_t(blockIdx.x) * stride;
+    const int* irow = idxs + size_t(blockIdx.x) * stride;
+
+    float best = -INFINITY;
+    int best_idx = INT_MAX;
+    const auto take = [&](float v, int idx) {
+        if (argmax_better(v, idx, best, best_idx)) {
+            best = v;
+            best_idx = idx;
+        }
+    };
+    const uintptr_t va = reinterpret_cast<uintptr_t>(vrow);
+    const uintptr_t ia = reinterpret_cast<uintptr_t>(irow);
+    if ((va & 3u) == 0 && (va & 15u) == (ia & 15u)) {
+        const int head = min(n, static_cast<int>(((16u - (va & 15u)) & 15u) / 4u));
+        if (threadIdx.x < head) {
+            take(vrow[threadIdx.x], irow[threadIdx.x]);
+        }
+        const float4* vv = reinterpret_cast<const float4*>(vrow + head);
+        const int4* iv = reinterpret_cast<const int4*>(irow + head);
+        const int nvecs = (n - head) / 4;
+        for (int v = threadIdx.x; v < nvecs; v += kArgmaxPartialsThreads) {
+            const float4 fq = vv[v];
+            const int4 iq = iv[v];
+            take(fq.x, iq.x);
+            take(fq.y, iq.y);
+            take(fq.z, iq.z);
+            take(fq.w, iq.w);
+        }
+        const int tail = head + 4 * nvecs + threadIdx.x;
+        if (tail < n) {
+            take(vrow[tail], irow[tail]);
+        }
+    } else {
+        for (int i = threadIdx.x; i < n; i += kArgmaxPartialsThreads) {
+            take(vrow[i], irow[i]);
+        }
+    }
+
+    const auto warp_reduce = [&] {
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            take(__shfl_xor_sync(0xffffffffu, best, offset),
+                 __shfl_xor_sync(0xffffffffu, best_idx, offset));
+        }
+    };
+
+    warp_reduce();
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    if (lane == 0) {
+        warp_vals[warp] = best;
+        warp_idxs[warp] = best_idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < kArgmaxPartialsThreads / 32 ? warp_vals[lane] : -INFINITY;
+        best_idx = lane < kArgmaxPartialsThreads / 32 ? warp_idxs[lane] : INT_MAX;
         warp_reduce();
         if (lane == 0) {
             out[blockIdx.x] = best_idx;
