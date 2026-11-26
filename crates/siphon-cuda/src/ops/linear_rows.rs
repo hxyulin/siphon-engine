@@ -109,6 +109,7 @@ struct Segment {
     out: u64,
     n: i32,
     tile_end: i32,
+    pair_end: i32,
 }
 
 /// Kernel parameter, as `Batch` in the kernel.
@@ -122,12 +123,41 @@ struct Batch {
 }
 
 /// One weight format and `k`: its entry point for each count of column tiles, 1 to
-/// [`MAX_TILES`].
+/// [`MAX_TILES`], and the tile-pair entry points for 3 and 4 column tiles.
 #[derive(Debug)]
 struct Entry {
     fp8: bool,
     k: usize,
     functions: Vec<CudaFunction>,
+    pairs: Vec<CudaFunction>,
+}
+
+/// Fewest column tiles that run blocks of two weight tiles. Each block reads its inputs
+/// once for both tiles, which halves the input bytes per weight byte: at 3 and 4 column
+/// tiles those are 3 and 4 times the FP8 weight bytes and come from L2.
+const PAIR_FROM_TILES: usize = 3;
+
+impl Entry {
+    /// The entry point, blocks and shared memory per warp for `column_tiles` column tiles:
+    /// tile pairs from [`PAIR_FROM_TILES`] when twice the shared memory fits. Pairs change
+    /// which block runs a tile, not its instructions, so no result changes.
+    fn shape(
+        &self,
+        column_tiles: usize,
+        splits: usize,
+        tiles: usize,
+        pairs: usize,
+    ) -> (&CudaFunction, usize, usize) {
+        if column_tiles >= PAIR_FROM_TILES && 2 * splits <= MAX_WARPS {
+            (
+                &self.pairs[column_tiles - PAIR_FROM_TILES],
+                pairs,
+                2 * WARP_SMEM,
+            )
+        } else {
+            (&self.functions[column_tiles - 1], tiles, WARP_SMEM)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,24 +178,34 @@ impl LinearRows {
             (false, 4608, "rows_bf16_k4608"),
             (true, 4608, "rows_fp8_k4608"),
         ] {
+            let load = |name: String| -> anyhow::Result<CudaFunction> {
+                let function = module.load_function(&name)?;
+                function
+                    .set_attribute(
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem,
+                    )
+                    .with_context(|| format!("raising the shared memory of {name}"))?;
+                Ok(function)
+            };
             let functions = (1..=MAX_TILES)
                 .map(|tiles| {
-                    let name = if tiles == 1 {
+                    load(if tiles == 1 {
                         name.to_owned()
                     } else {
                         format!("{name}_{tiles}")
-                    };
-                    let function = module.load_function(&name)?;
-                    function
-                        .set_attribute(
-                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            smem,
-                        )
-                        .with_context(|| format!("raising the shared memory of {name}"))?;
-                    Ok(function)
+                    })
                 })
                 .collect::<anyhow::Result<_>>()?;
-            entries.push(Entry { fp8, k, functions });
+            let pairs = (PAIR_FROM_TILES..=MAX_TILES)
+                .map(|tiles| load(format!("{name}_{tiles}_pair")))
+                .collect::<anyhow::Result<_>>()?;
+            entries.push(Entry {
+                fp8,
+                k,
+                functions,
+                pairs,
+            });
         }
         Ok(Self { entries })
     }
@@ -218,6 +258,7 @@ impl LinearRows {
             ..Batch::default()
         };
         let mut tiles = 0usize;
+        let mut pairs = 0usize;
         for (i, p) in products.iter_mut().enumerate() {
             ensure!(p.is_fp8() == fp8, "product {i} has another weight format");
             ensure!(
@@ -261,6 +302,7 @@ impl LinearRows {
                 "product {i}: weight and input must be 16-byte aligned"
             );
             tiles += out_rows.div_ceil(TILE_ROWS);
+            pairs += out_rows.div_ceil(TILE_ROWS).div_ceil(2);
             batch.seg[i] = Segment {
                 w,
                 scale,
@@ -268,6 +310,7 @@ impl LinearRows {
                 out,
                 n: i32::try_from(out_rows).context("too many output rows")?,
                 tile_end: i32::try_from(tiles).context("too many tiles")?,
+                pair_end: i32::try_from(pairs).context("too many tiles")?,
             };
         }
         // The split depends on the shapes only, never on m, so each row's sum order is the
@@ -279,10 +322,12 @@ impl LinearRows {
             TARGET_WARPS_BF16
         };
         let splits = target.div_ceil(tiles).clamp(1, MAX_WARPS.min(stages));
+        let (function, blocks, per_warp) =
+            entry.shape(m.div_ceil(TILE_COLUMNS), splits, tiles, pairs);
         let config = LaunchConfig {
-            grid_dim: (u32::try_from(tiles)?, 1, 1),
+            grid_dim: (u32::try_from(blocks)?, 1, 1),
             block_dim: (u32::try_from(32 * splits)?, 1, 1),
-            shared_mem_bytes: u32::try_from(splits * WARP_SMEM)?,
+            shared_mem_bytes: u32::try_from(splits * per_warp)?,
         };
         // SAFETY: `batch` has the kernel's `Batch` layout. The checks above size each weight
         // as [n, k] (an FP8 weight's values and scales come from its matrix), each input as
@@ -290,14 +335,6 @@ impl LinearRows {
         // the last tile), input rows below m and columns below k, writes only rows below m
         // and columns below n, and before `pdl_wait` reads only weights. The stream orders
         // the kernel before any later use of the buffers.
-        unsafe {
-            launch_by_value(
-                stream,
-                &entry.functions[m.div_ceil(TILE_COLUMNS) - 1],
-                config,
-                &batch,
-                start == Start::Early,
-            )
-        }
+        unsafe { launch_by_value(stream, function, config, &batch, start == Start::Early) }
     }
 }

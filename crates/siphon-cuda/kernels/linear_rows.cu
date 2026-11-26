@@ -67,6 +67,9 @@ struct Segment {
     int n;
     // Tiles of this segment and every segment before it.
     int tile_end;
+    // Tile pairs of this segment and every segment before it: a segment's tiles in pairs,
+    // the last alone when the segment has an odd count.
+    int pair_end;
 };
 
 struct Batch {
@@ -121,17 +124,22 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t pair) {
 // hit distinct banks.
 __device__ __forceinline__ int slot_index(int r, int c) { return r * kChunks + (c ^ ((r & 1) << 2)); }
 
-template <bool kFp8, int K, int NT>
+// kT tiles per block: 1, or 2 consecutive tiles of one segment, whose warps share their
+// input loads. Each tile runs the same instructions on its own accumulators either way, so
+// kT changes no result; it halves the input bytes each weight byte needs, which at 3 and 4
+// column tiles are 3 and 4 times the FP8 weight bytes and come from L2.
+template <bool kFp8, int K, int NT, int kT>
 __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     constexpr int kBytes = kFp8 ? 1 : 2;
     constexpr int kKPerStage = kStageBytes / kBytes;
     constexpr int kStagesPerRow = K / kKPerStage;
     static_assert(kStagesPerRow * kKPerStage == K, "whole stages per row");
+    static_assert(kT == 1 || kT == 2, "one tile or a pair");
 
     int s = 0;
-    int tile_begin = 0;
-    while (s + 1 < b.count && int(blockIdx.x) >= b.seg[s].tile_end) {
-        tile_begin = b.seg[s].tile_end;
+    int begin = 0;
+    while (s + 1 < b.count && int(blockIdx.x) >= (kT == 1 ? b.seg[s].tile_end : b.seg[s].pair_end)) {
+        begin = kT == 1 ? b.seg[s].tile_end : b.seg[s].pair_end;
         ++s;
     }
     const Segment& seg = b.seg[s];
@@ -140,8 +148,10 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     const int warp = threadIdx.x / 32;
     const int g = lane / 4;
     const int t = lane % 4;
-    const int r0 = (int(blockIdx.x) - tile_begin) * kTileRows;
-    uint4* buf = ring + warp * kSlots * kSlotVecs;
+    // Weight row of the block's first tile; tile u starts kTileRows u rows later, and a
+    // second tile past the segment's rows computes clamped rows it never stores.
+    const int r0 = (int(blockIdx.x) - begin) * kT * kTileRows;
+    uint4* buf = ring + warp * kSlots * kT * kSlotVecs;
     // The launcher keeps splits at most kStagesPerRow, so every warp has a stage.
     const int stages = (kStagesPerRow - warp + splits - 1) / splits;
 
@@ -150,15 +160,18 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     auto issue = [&](int i) {
         if (i < stages) {
             const int stage = warp + i * splits;
-            uint4* slot = buf + i % kSlots * kSlotVecs;
 #pragma unroll
-            for (int q = 0; q < kSlotVecs / 32; ++q) {
-                const int idx = q * 32 + lane;
-                const int r = idx / kChunks;
-                const int c = idx % kChunks;
-                const int row = min(r0 + r, seg.n - 1);
-                copy16(slot + slot_index(r, c),
-                       seg.w + size_t(row) * K * kBytes + stage * kStageBytes + c * 16);
+            for (int u = 0; u < kT; ++u) {
+                uint4* slot = buf + (i % kSlots * kT + u) * kSlotVecs;
+#pragma unroll
+                for (int q = 0; q < kSlotVecs / 32; ++q) {
+                    const int idx = q * 32 + lane;
+                    const int r = idx / kChunks;
+                    const int c = idx % kChunks;
+                    const int row = min(r0 + u * kTileRows + r, seg.n - 1);
+                    copy16(slot + slot_index(r, c),
+                           seg.w + size_t(row) * K * kBytes + stage * kStageBytes + c * 16);
+                }
             }
         }
         commit();
@@ -176,12 +189,15 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     // Plain loads: x may come from a kernel that ran just before this one.
     const uint4* x[NT];
     bool live[NT];
-    float acc[NT][4];
+    float acc[kT][NT][4];
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
         x[n] = reinterpret_cast<const uint4*>(seg.x + size_t(g + 8 * n) * K);
         live[n] = g + 8 * n < b.m;
-        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f;
+#pragma unroll
+        for (int u = 0; u < kT; ++u) {
+            acc[u][n][0] = acc[u][n][1] = acc[u][n][2] = acc[u][n][3] = 0.f;
+        }
     }
     // Input vectors per lane per stage and tile: one per BF16 chunk, two per FP8 chunk.
     constexpr int kXVecs = kChunks / 4 * (kFp8 ? 2 : 1);
@@ -204,36 +220,39 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
         }
         wait_copies<kSlots - 1>();
         __syncwarp();
-        const uint4* slot = buf + i % kSlots * kSlotVecs;
 #pragma unroll
-        for (int j = 0; j < kChunks / 4; ++j) {
-            const int c = 4 * j + t;
-            const uint4 a = slot[slot_index(g, c)];
-            const uint4 a8 = slot[slot_index(g + 8, c)];
-            if constexpr (kFp8) {
-                // 16 E4M3 weights per row and 16 inputs: four products of k = 16.
-                const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
-                const uint32_t bw[4] = {a8.x, a8.y, a8.z, a8.w};
+        for (int u = 0; u < kT; ++u) {
+            const uint4* slot = buf + (i % kSlots * kT + u) * kSlotVecs;
 #pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const uint32_t a0 = e4m3x2_to_bf16x2(aw[q] & 0xffffu);
-                    const uint32_t a1 = e4m3x2_to_bf16x2(bw[q] & 0xffffu);
-                    const uint32_t a2 = e4m3x2_to_bf16x2(aw[q] >> 16);
-                    const uint32_t a3 = e4m3x2_to_bf16x2(bw[q] >> 16);
+            for (int j = 0; j < kChunks / 4; ++j) {
+                const int c = 4 * j + t;
+                const uint4 a = slot[slot_index(g, c)];
+                const uint4 a8 = slot[slot_index(g + 8, c)];
+                if constexpr (kFp8) {
+                    // 16 E4M3 weights per row and 16 inputs: four products of k = 16.
+                    const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+                    const uint32_t bw[4] = {a8.x, a8.y, a8.z, a8.w};
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const uint32_t a0 = e4m3x2_to_bf16x2(aw[q] & 0xffffu);
+                        const uint32_t a1 = e4m3x2_to_bf16x2(bw[q] & 0xffffu);
+                        const uint32_t a2 = e4m3x2_to_bf16x2(aw[q] >> 16);
+                        const uint32_t a3 = e4m3x2_to_bf16x2(bw[q] >> 16);
+#pragma unroll
+                        for (int n = 0; n < NT; ++n) {
+                            const uint4 x0 = xv[n][2 * j];
+                            const uint4 x1 = xv[n][2 * j + 1];
+                            const uint32_t xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+                            mma(acc[u][n], a0, a1, a2, a3, xw[2 * q], xw[2 * q + 1]);
+                        }
+                    }
+                } else {
+                    // 8 BF16 weights per row and 8 inputs: two products of k = 16.
 #pragma unroll
                     for (int n = 0; n < NT; ++n) {
-                        const uint4 x0 = xv[n][2 * j];
-                        const uint4 x1 = xv[n][2 * j + 1];
-                        const uint32_t xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-                        mma(acc[n], a0, a1, a2, a3, xw[2 * q], xw[2 * q + 1]);
+                        mma(acc[u][n], a.x, a8.x, a.y, a8.y, xv[n][j].x, xv[n][j].y);
+                        mma(acc[u][n], a.z, a8.z, a.w, a8.w, xv[n][j].z, xv[n][j].w);
                     }
-                }
-            } else {
-                // 8 BF16 weights per row and 8 inputs: two products of k = 16.
-#pragma unroll
-                for (int n = 0; n < NT; ++n) {
-                    mma(acc[n], a.x, a8.x, a.y, a8.y, xv[n][j].x, xv[n][j].y);
-                    mma(acc[n], a.z, a8.z, a.w, a8.w, xv[n][j].z, xv[n][j].w);
                 }
             }
         }
@@ -245,9 +264,12 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     static_assert(NT * 32 * 16 <= kSlots * kSlotVecs * 16, "the partials fit a warp's ring");
     if (splits > 1) {
 #pragma unroll
-        for (int n = 0; n < NT; ++n) {
-            reinterpret_cast<float4*>(buf)[n * 32 + lane] =
-                make_float4(acc[n][0], acc[n][1], acc[n][2], acc[n][3]);
+        for (int u = 0; u < kT; ++u) {
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                reinterpret_cast<float4*>(buf + u * kSlots * kSlotVecs)[n * 32 + lane] =
+                    make_float4(acc[u][n][0], acc[u][n][1], acc[u][n][2], acc[u][n][3]);
+            }
         }
         __syncthreads();
         if (warp != 0) {
@@ -255,26 +277,33 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
         }
         for (int w = 1; w < splits; ++w) {
 #pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                const float4 p = reinterpret_cast<const float4*>(ring + w * kSlots * kSlotVecs)[n * 32 + lane];
-                acc[n][0] += p.x;
-                acc[n][1] += p.y;
-                acc[n][2] += p.z;
-                acc[n][3] += p.w;
+            for (int u = 0; u < kT; ++u) {
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const float4 p = reinterpret_cast<const float4*>(
+                        ring + (w * kT + u) * kSlots * kSlotVecs)[n * 32 + lane];
+                    acc[u][n][0] += p.x;
+                    acc[u][n][1] += p.y;
+                    acc[u][n][2] += p.z;
+                    acc[u][n][3] += p.w;
+                }
             }
         }
     }
-    // acc[n][0], acc[n][1]: weight row g, input rows 8 n + 2t and 8 n + 2t + 1; acc[n][2],
-    // acc[n][3]: weight row g + 8.
+    // acc[u][n][0], acc[u][n][1]: weight row g of tile u, input rows 8 n + 2t and
+    // 8 n + 2t + 1; acc[u][n][2], acc[u][n][3]: weight row g + 8.
 #pragma unroll
-    for (int n = 0; n < NT; ++n) {
+    for (int u = 0; u < kT; ++u) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int col = 8 * n + 2 * t + (e & 1);
-            const int row = r0 + g + (e >> 1) * 8;
-            if (col < b.m && row < seg.n) {
-                const float v = kFp8 ? seg.scale[row] * acc[n][e] : acc[n][e];
-                seg.out[size_t(col) * seg.n + row] = __float2bfloat16_rn(v);
+        for (int n = 0; n < NT; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int col = 8 * n + 2 * t + (e & 1);
+                const int row = r0 + u * kTileRows + g + (e >> 1) * 8;
+                if (col < b.m && row < seg.n) {
+                    const float v = kFp8 ? seg.scale[row] * acc[u][n][e] : acc[u][n][e];
+                    seg.out[size_t(col) * seg.n + row] = __float2bfloat16_rn(v);
+                }
             }
         }
     }
@@ -285,17 +314,21 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
 // Entry points by weight format, k and column tiles: `<name>` for 1 to 8 rows, and
 // `<name>_<NT>` for NT tiles of 8 rows, up to 8 NT rows. Blocks of 1 to kMaxWarps warps,
 // one tile of 16 weight rows each, with splits x kSlots x 4 KiB of dynamic shared memory.
-#define ROWS_ENTRY_NT(name, fp8, K, NT)                                                    \
+// `<name>_<NT>_pair`, for 3 and 4 column tiles, gives each block a pair of tiles (see
+// rows_product) with twice the shared memory.
+#define ROWS_ENTRY_NT(name, fp8, K, NT, kT)                                                \
     extern "C" __global__ void __launch_bounds__(kMaxWarps * 32)                           \
         name(const __grid_constant__ Batch batch) {                                        \
         extern __shared__ uint4 ring[];                                                    \
-        rows_product<fp8, K, NT>(batch, ring);                                             \
+        rows_product<fp8, K, NT, kT>(batch, ring);                                         \
     }
 #define ROWS_ENTRY(name, fp8, K)                                                           \
-    ROWS_ENTRY_NT(name, fp8, K, 1)                                                         \
-    ROWS_ENTRY_NT(name##_2, fp8, K, 2)                                                     \
-    ROWS_ENTRY_NT(name##_3, fp8, K, 3)                                                     \
-    ROWS_ENTRY_NT(name##_4, fp8, K, 4)
+    ROWS_ENTRY_NT(name, fp8, K, 1, 1)                                                      \
+    ROWS_ENTRY_NT(name##_2, fp8, K, 2, 1)                                                  \
+    ROWS_ENTRY_NT(name##_3, fp8, K, 3, 1)                                                  \
+    ROWS_ENTRY_NT(name##_4, fp8, K, 4, 1)                                                  \
+    ROWS_ENTRY_NT(name##_3_pair, fp8, K, 3, 2)                                             \
+    ROWS_ENTRY_NT(name##_4_pair, fp8, K, 4, 2)
 
 // The attention input projections and the LM head.
 ROWS_ENTRY(rows_bf16_k2304, false, 2304)
