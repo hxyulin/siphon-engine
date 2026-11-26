@@ -5,7 +5,8 @@
 //!        [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
 //!        [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8]
 //!        [--prefill-dense bf16|fp8] [--kv-quant none|nvfp4|q4_0] [--kv-rotate]
-//!        [--kv-quant-visits V,V,...]
+//!        [--kv-quant-visits V,V,...] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0]
+//!        [--moe-min-k 1..=8]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -51,8 +52,8 @@ mod linux {
         Gpu,
         kv_options::KvOptions,
         model::{
-            Accept, DEFAULT_PREFILL_ATTENTION, MAX_PREFILL_CHUNK, Model, PrefillAttention,
-            PrefillLogits, VerifyTokens,
+            Accept, DEFAULT_PREFILL_ATTENTION, MAX_PREFILL_CHUNK, Model, MoePruning,
+            PrefillAttention, PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         weights::{OutputProjection, WeightFormat, Weights},
@@ -92,8 +93,10 @@ mod linux {
         prefill_attention: PrefillAttention,
         prefill_dense: Products,
         kv_options: KvOptions,
+        moe_pruning: MoePruning,
     }
 
+    #[expect(clippy::too_many_lines, reason = "one branch per flag")]
     fn args() -> anyhow::Result<Args> {
         let mut positional = Vec::new();
         let mut passes = None;
@@ -107,6 +110,9 @@ mod linux {
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         let mut prefill_dense = Products::Bf16;
         let mut kv_options = KvOptions::default();
+        let mut moe_top_k = None;
+        let mut moe_min_k = None;
+        let mut moe_prune = None;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if kv_options.parse(&arg, &mut it)? {
@@ -138,6 +144,12 @@ mod linux {
                     .next()
                     .context("--prefill-dense needs bf16 or fp8")?
                     .parse()?;
+            } else if arg == "--moe-top-k" {
+                moe_top_k = Some(it.next().context("--moe-top-k needs 1..=8")?.parse()?);
+            } else if arg == "--moe-min-k" {
+                moe_min_k = Some(it.next().context("--moe-min-k needs 1..=8")?.parse()?);
+            } else if arg == "--moe-prune" {
+                moe_prune = Some(it.next().context("--moe-prune needs 0.0..=1.0")?.parse()?);
             } else if arg == "--prefill" {
                 let chunk: usize = it.next().context("--prefill needs a chunk size")?.parse()?;
                 ensure!(
@@ -161,12 +173,21 @@ mod linux {
              [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] \
              [--verify WIDTH] [--dump FILE] \
              [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
-             [--prefill-dense bf16|fp8] [kv options]",
+             [--prefill-dense bf16|fp8] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] \
+             [--moe-min-k 1..=8] [kv options]",
         )?;
         ensure!(
             prefill.is_none() || verify.is_none(),
             "--prefill and --verify exclude each other"
         );
+        let default_pruning = MoePruning::default();
+        let top_k = moe_top_k.unwrap_or(default_pruning.top_k);
+        let moe_pruning = MoePruning {
+            top_k,
+            min_k: moe_min_k.unwrap_or_else(|| default_pruning.min_k.min(top_k)),
+            threshold: moe_prune.unwrap_or(default_pruning.threshold),
+        };
+        moe_pruning.validate()?;
         Ok(Args {
             model,
             capture,
@@ -181,6 +202,7 @@ mod linux {
             prefill_attention,
             prefill_dense,
             kv_options,
+            moe_pruning,
         })
     }
 
@@ -416,6 +438,7 @@ mod linux {
             args.weights,
         )?;
         args.kv_options.apply(&mut model)?;
+        model.set_moe_pruning(args.moe_pruning)?;
         model.set_expert_activations(args.expert_activations)?;
         model.set_prefill_attention(args.prefill_attention)?;
         model.set_prefill_dense(args.prefill_dense)?;
@@ -523,8 +546,13 @@ mod linux {
             ),
             (None, None) => "token by token".to_owned(),
         };
+        let pruning = if args.moe_pruning.is_active() {
+            format!("; moe pruning ({})", args.moe_pruning)
+        } else {
+            String::new()
+        };
         println!(
-            "{n} tokens; MLX capture mode: {}; engine: {engine_mode}; {}",
+            "{n} tokens; MLX capture mode: {}; engine: {engine_mode}; {}{pruning}",
             capture.mode, args.kv_options
         );
         println!(

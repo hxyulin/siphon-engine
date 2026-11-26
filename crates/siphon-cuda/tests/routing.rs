@@ -25,8 +25,9 @@ use siphon_cuda::{
         misc::{MessageMix, Misc},
         norm::Norm,
         routing::{
-            DepthRows, DepthStep, EXPERTS, FUSED_MAX_CANDIDATES, NormDest, Partial, RouterMatmul,
-            RouterRowsScratch, Routing, RowsPartial, STEP_ROUTER_ROWS, StepPartial, TOP_K,
+            DepthRows, DepthStep, EXPERTS, FUSED_MAX_CANDIDATES, MoePruning, NormDest, Partial,
+            RouterMatmul, RouterRowsScratch, Routing, RowsPartial, STEP_ROUTER_ROWS, StepPartial,
+            TOP_K,
         },
     },
 };
@@ -1548,5 +1549,316 @@ fn depth_attention_rows_conv_residual_batch_matches_unfused() -> anyhow::Result<
             );
         }
     }
+    Ok(())
+}
+
+/// Validates [`MoePruning`] parameter bounds and checks dynamic top-k / probability-threshold
+/// expert pruning across every top-8 router kernel:
+/// - default pruning (`top_k = 8, threshold = 0.0`) is bit-exact against stock routing;
+/// - hard `top_k < 8` emits `-1` / `0.0` in pruned slots and renormalizes kept weights;
+/// - threshold pruning respects `min_k` and `top_k` and matches bit-for-bit between
+///   `moe_router_step_pruned` and `moe_router_step_rows_pruned`.
+#[test]
+#[expect(clippy::too_many_lines, reason = "covers all five router entry points")]
+fn moe_pruning_matches_reference_across_routers() -> anyhow::Result<()> {
+    assert!(MoePruning::default().validate().is_ok());
+    assert!(!MoePruning::default().is_active());
+    for bad in [
+        MoePruning {
+            top_k: 0,
+            threshold: 0.0,
+            min_k: 0,
+        },
+        MoePruning {
+            top_k: 9,
+            threshold: 0.0,
+            min_k: 4,
+        },
+        MoePruning {
+            top_k: 4,
+            threshold: 0.0,
+            min_k: 0,
+        },
+        MoePruning {
+            top_k: 4,
+            threshold: 0.0,
+            min_k: 5,
+        },
+        MoePruning {
+            top_k: 8,
+            threshold: -0.01,
+            min_k: 4,
+        },
+        MoePruning {
+            top_k: 8,
+            threshold: 1.01,
+            min_k: 4,
+        },
+        MoePruning {
+            top_k: 8,
+            threshold: f32::NAN,
+            min_k: 4,
+        },
+    ] {
+        assert!(bad.validate().is_err(), "expected {bad:?} to be rejected");
+    }
+
+    let fixture = Fixture::load("routing")?;
+    let (bias, _) = fixture.f32("router.bias")?;
+    let (logits16, _) = fixture.f32("router16.logits")?;
+    let (hidden16, _) = fixture.bf16("router16.hidden")?;
+    let rows = logits16.len() / EXPERTS;
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+
+    let logits_dev = stream.clone_htod(&logits16)?;
+    let bias_dev = stream.clone_htod(&bias)?;
+    let mut stock_idx = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+    let mut stock_w = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+    routing.expert_routing(
+        stream,
+        &logits_dev,
+        &bias_dev,
+        &mut stock_idx,
+        &mut stock_w,
+        ROUTE_SCALE,
+    )?;
+    let stock_idx_h = stream.clone_dtoh(&stock_idx)?;
+    let stock_w_h = stream.clone_dtoh(&stock_w)?;
+
+    // Default MoePruning must match stock bit-for-bit.
+    let mut def_idx = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+    let mut def_w = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+    routing.expert_routing_pruned(
+        stream,
+        &logits_dev,
+        &bias_dev,
+        &mut def_idx,
+        &mut def_w,
+        ROUTE_SCALE,
+        MoePruning::default(),
+    )?;
+    assert_eq!(stream.clone_dtoh(&def_idx)?, stock_idx_h);
+    assert_f32_within_ulps(
+        "default pruning weights",
+        &stream.clone_dtoh(&def_w)?,
+        &stock_w_h,
+        0,
+    );
+
+    // Hard top_k = 4 on fixture logits.
+    let hard4 = MoePruning {
+        top_k: 4,
+        threshold: 0.0,
+        min_k: 4,
+    };
+    assert!(hard4.is_active());
+    let mut p_idx = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+    let mut p_w = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+    routing.expert_routing_pruned(
+        stream,
+        &logits_dev,
+        &bias_dev,
+        &mut p_idx,
+        &mut p_w,
+        ROUTE_SCALE,
+        hard4,
+    )?;
+    let p_idx_h = stream.clone_dtoh(&p_idx)?;
+    let p_w_h = stream.clone_dtoh(&p_w)?;
+    for r in 0..rows {
+        let base = r * TOP_K;
+        assert_eq!(&p_idx_h[base..base + 4], &stock_idx_h[base..base + 4]);
+        assert_eq!(&p_idx_h[base + 4..base + TOP_K], &[-1, -1, -1, -1]);
+        for k in 4..TOP_K {
+            assert_eq!(p_w_h[base + k].to_bits(), 0.0f32.to_bits());
+        }
+        let kept_sum: f32 = p_w_h[base..base + 4].iter().sum();
+        assert!(
+            (kept_sum - ROUTE_SCALE).abs() < 1e-5,
+            "row {r}: kept weights sum to {kept_sum}, expected {ROUTE_SCALE}"
+        );
+    }
+
+    // Synthetic logits with wide score gaps for unambiguous threshold pruning:
+    // top 3 scores ~0.953, next 5 scores ~0.047 -> shares ~0.308 vs ~0.015.
+    let mut synth_logits = vec![-10.0f32; EXPERTS];
+    synth_logits[..3].fill(3.0);
+    synth_logits[3..8].fill(-3.0);
+    let zero_bias = vec![0.0f32; EXPERTS];
+    let synth_dev = stream.clone_htod(&synth_logits)?;
+    let zero_bias_dev = stream.clone_htod(&zero_bias)?;
+    let mut s_idx = stream.alloc_zeros::<i32>(TOP_K)?;
+    let mut s_w = stream.alloc_zeros::<f32>(TOP_K)?;
+    routing.expert_routing_pruned(
+        stream,
+        &synth_dev,
+        &zero_bias_dev,
+        &mut s_idx,
+        &mut s_w,
+        ROUTE_SCALE,
+        MoePruning {
+            top_k: 6,
+            threshold: 0.10,
+            min_k: 2,
+        },
+    )?;
+    let s_idx_h = stream.clone_dtoh(&s_idx)?;
+    let s_w_h = stream.clone_dtoh(&s_w)?;
+    assert_eq!(s_idx_h, vec![0, 1, 2, -1, -1, -1, -1, -1]);
+    for &w in &s_w_h[..3] {
+        assert!((w - ROUTE_SCALE / 3.0).abs() < 1e-5);
+    }
+    for &w in &s_w_h[3..TOP_K] {
+        assert_eq!(w.to_bits(), 0.0f32.to_bits());
+    }
+
+    // Threshold + top_k across moe_router_step_pruned, moe_router_step_rows_pruned,
+    // moe_router_rows_pruned, and moe_router_pruned.
+    let dyn_prune = MoePruning {
+        top_k: 6,
+        threshold: 0.12,
+        min_k: 2,
+    };
+    let weight_dev = stream.clone_htod(&router_weight())?;
+    let hidden_dev = stream.clone_htod(&hidden16)?;
+    let single_row_dev = stream.clone_htod(&hidden16[..HIDDEN])?;
+
+    let mut step_logits = stream.alloc_zeros::<f32>(EXPERTS)?;
+    let mut step_idx = stream.alloc_zeros::<i32>(TOP_K)?;
+    let mut step_w = stream.alloc_zeros::<f32>(TOP_K)?;
+    routing.moe_router_step_pruned(
+        stream,
+        &single_row_dev,
+        &weight_dev,
+        &bias_dev,
+        &mut step_logits,
+        &mut step_idx,
+        &mut step_w,
+        ROUTE_SCALE,
+        dyn_prune,
+    )?;
+
+    let mut step_rows_logits = stream.alloc_zeros::<f32>(rows * EXPERTS)?;
+    let mut step_rows_idx = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+    let mut step_rows_w = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+    routing.moe_router_step_rows_pruned(
+        stream,
+        &hidden_dev,
+        &weight_dev,
+        &bias_dev,
+        &mut step_rows_logits,
+        &mut step_rows_idx,
+        &mut step_rows_w,
+        ROUTE_SCALE,
+        rows,
+        dyn_prune,
+    )?;
+
+    let mut rows_logits = stream.alloc_zeros::<f32>(rows * EXPERTS)?;
+    let mut rows_idx = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+    let mut rows_w = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+    let mut scratch = RouterRowsScratch::new(stream, rows)?;
+    routing.moe_router_rows_pruned(
+        stream,
+        &hidden_dev,
+        &weight_dev,
+        &bias_dev,
+        &mut rows_logits,
+        &mut rows_idx,
+        &mut rows_w,
+        &mut scratch,
+        ROUTE_SCALE,
+        rows,
+        dyn_prune,
+    )?;
+
+    let step_idx_h = stream.clone_dtoh(&step_idx)?;
+    let step_w_h = stream.clone_dtoh(&step_w)?;
+    let step_rows_idx_h = stream.clone_dtoh(&step_rows_idx)?;
+    let step_rows_w_h = stream.clone_dtoh(&step_rows_w)?;
+    let rows_idx_h = stream.clone_dtoh(&rows_idx)?;
+    let rows_w_h = stream.clone_dtoh(&rows_w)?;
+
+    assert_eq!(&step_rows_idx_h[..TOP_K], &step_idx_h[..]);
+    assert_f32_within_ulps(
+        "step_rows[0] vs step",
+        &step_rows_w_h[..TOP_K],
+        &step_w_h,
+        0,
+    );
+
+    for (label, idx_h, w_h) in [
+        ("moe_router_step_rows", &step_rows_idx_h, &step_rows_w_h),
+        ("moe_router_rows", &rows_idx_h, &rows_w_h),
+    ] {
+        for r in 0..rows {
+            let base = r * TOP_K;
+            let kept = (0..TOP_K).filter(|&k| idx_h[base + k] >= 0).count();
+            assert!(
+                (dyn_prune.min_k..=dyn_prune.top_k).contains(&kept),
+                "{label} row {r}: kept {kept} outside {}..={}",
+                dyn_prune.min_k,
+                dyn_prune.top_k
+            );
+            for k in 0..dyn_prune.min_k {
+                assert!(idx_h[base + k] >= 0 && w_h[base + k] > 0.0);
+            }
+            for k in dyn_prune.top_k..TOP_K {
+                assert_eq!(idx_h[base + k], -1);
+                assert_eq!(w_h[base + k].to_bits(), 0.0f32.to_bits());
+            }
+            let mut sum = 0.0f32;
+            for k in 0..TOP_K {
+                if idx_h[base + k] < 0 {
+                    assert_eq!(w_h[base + k].to_bits(), 0.0f32.to_bits());
+                } else {
+                    assert!(w_h[base + k] > 0.0);
+                    sum += w_h[base + k];
+                }
+            }
+            assert!(
+                (sum - ROUTE_SCALE).abs() < 1e-5,
+                "{label} row {r}: sum {sum} != {ROUTE_SCALE}"
+            );
+        }
+    }
+
+    // Single-row fused norm + router (`moe_router_pruned`).
+    let x_f32 = stream.clone_htod(&pseudo_random(HIDDEN, 777, 1.0))?;
+    let norm_w = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 778, 0.5, 1.0))?;
+    let mut x_out = stream.alloc_zeros::<bf16>(HIDDEN)?;
+    let mut r_logits = stream.alloc_zeros::<f32>(EXPERTS)?;
+    let mut r_idx = stream.alloc_zeros::<i32>(TOP_K)?;
+    let mut r_w = stream.alloc_zeros::<f32>(TOP_K)?;
+    let mut counter = stream.alloc_zeros::<u32>(1)?;
+    routing.moe_router_pruned(
+        stream,
+        &x_f32,
+        &norm_w,
+        EPS,
+        &weight_dev,
+        &bias_dev,
+        &mut x_out,
+        &mut r_logits,
+        &mut r_idx,
+        &mut r_w,
+        &mut counter,
+        ROUTE_SCALE,
+        dyn_prune,
+    )?;
+    let r_idx_h = stream.clone_dtoh(&r_idx)?;
+    let r_w_h = stream.clone_dtoh(&r_w)?;
+    for k in 0..dyn_prune.min_k {
+        assert!(r_idx_h[k] >= 0 && r_w_h[k] > 0.0);
+    }
+    for k in dyn_prune.top_k..TOP_K {
+        assert_eq!(r_idx_h[k], -1);
+        assert_eq!(r_w_h[k].to_bits(), 0.0f32.to_bits());
+    }
+    let sum: f32 = r_w_h.iter().sum();
+    assert!((sum - ROUTE_SCALE).abs() < 1e-5);
     Ok(())
 }

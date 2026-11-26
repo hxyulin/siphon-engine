@@ -349,6 +349,13 @@ pub struct Options {
     pub vision: Option<VisionOptions>,
     /// The KV options of `siphon_cuda::kv_options` as given on the command line.
     pub kv_args: Vec<String>,
+    /// Maximum MoE experts per token (`1..=8`, `--moe-top-k`).
+    pub moe_top_k: usize,
+    /// Minimum MoE experts kept per token under threshold pruning (`1..=moe_top_k`,
+    /// `--moe-min-k`).
+    pub moe_min_k: usize,
+    /// Probability share threshold for MoE expert pruning (`0.0..=1.0`, `--moe-prune`).
+    pub moe_prune: f32,
 }
 
 /// `--vision`'s tower, which runs in BF16: its FP8 products drift 3 to 5 times further
@@ -506,7 +513,7 @@ mod cuda {
         kv_options::KvOptions,
         model::{
             BATCH_VERIFY_MAX_ROWS, DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS, Model,
-            PackedPrefill, Sampling as ModelSampling,
+            MoePruning, PackedPrefill, Sampling as ModelSampling,
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
@@ -876,6 +883,15 @@ mod cuda {
             Some(pool),
         )?;
         kv_options.apply(&mut model)?;
+        let moe_pruning = MoePruning {
+            top_k: options.moe_top_k,
+            threshold: options.moe_prune,
+            min_k: options.moe_min_k,
+        };
+        model.set_moe_pruning(moe_pruning)?;
+        if moe_pruning.is_active() {
+            eprintln!("moe pruning: {moe_pruning}");
+        }
         model.set_prefill_attention(options.prefill_attention.parse()?)?;
         model.set_prefill_dense(options.prefill_dense.parse()?)?;
         model.set_expert_activations(options.expert_activations.parse()?)?;
@@ -1104,6 +1120,9 @@ mod cuda {
             "prefill_attention": options.prefill_attention,
             "prefill_dense": options.prefill_dense,
             "expert_activations": options.expert_activations,
+            "moe_top_k": options.moe_top_k,
+            "moe_min_k": options.moe_min_k,
+            "moe_prune": options.moe_prune,
             "kernels": siphon_cuda::KERNELS_HASH,
         }))
     }

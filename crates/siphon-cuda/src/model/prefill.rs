@@ -2359,7 +2359,7 @@ impl Ctx {
         let top_k = cfg.num_experts_per_tok;
         if t.invariant {
             // Each row as a step routes it, and each distinct expert streams once.
-            self.kernels.routing.moe_router_step_rows(
+            self.kernels.routing.moe_router_step_rows_pruned(
                 &self.stream,
                 &rows(x, m, hidden),
                 &w.router,
@@ -2369,6 +2369,7 @@ impl Ctx {
                 &mut rows_mut(&mut t.weights, m, top_k),
                 cfg.route_scale,
                 m,
+                self.moe_pruning,
             )?;
             let (w13, w2) = self.expert_weights(w);
             return self.kernels.experts_rows.expert_mlp_rows(
@@ -2384,7 +2385,7 @@ impl Ctx {
                 cfg.mlp_up_softcap,
             );
         }
-        self.kernels.routing.moe_router_rows(
+        self.kernels.routing.moe_router_rows_pruned(
             &self.stream,
             &rows(x, m, hidden),
             &w.router,
@@ -2395,6 +2396,7 @@ impl Ctx {
             &mut t.router,
             cfg.route_scale,
             m,
+            self.moe_pruning,
         )?;
         let (w13, w2) = self.expert_weights(w);
         self.group_rows(&rows(&t.indices, m, top_k), &mut t.experts, m)?;

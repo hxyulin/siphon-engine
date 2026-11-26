@@ -171,7 +171,10 @@ extern "C" __global__ void moe_conv_residual_2304(const __nv_bfloat16* experts, 
     float total = 0.f;
 #pragma unroll
     for (int k = 0; k < kTopK; ++k) {
-        total = __fadd_rn(total, __fmul_rn(__bfloat162float(experts[size_t(k) * kHidden + c]), weights[k]));
+        const float wk = weights[k];
+        if (wk != 0.f) {
+            total = __fadd_rn(total, __fmul_rn(__bfloat162float(experts[size_t(k) * kHidden + c]), wk));
+        }
     }
     const float x = round_bf16(total);
     const float y = __bfloat162float(conv_step::short_conv(x, weight, state, c, kHidden));
@@ -267,12 +270,14 @@ moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
             float total[kMoeConvCols] = {};
 #pragma unroll
             for (int x = 0; x < kTopK; ++x) {
-                float v[kMoeConvCols];
-                load_bf16x4(e + size_t(x) * kHidden, v);
                 const float wx = w[x];
+                if (wx != 0.f) {
+                    float v[kMoeConvCols];
+                    load_bf16x4(e + size_t(x) * kHidden, v);
 #pragma unroll
-                for (int j = 0; j < kMoeConvCols; ++j) {
-                    total[j] = __fadd_rn(total[j], __fmul_rn(v[j], wx));
+                    for (int j = 0; j < kMoeConvCols; ++j) {
+                        total[j] = __fadd_rn(total[j], __fmul_rn(v[j], wx));
+                    }
                 }
             }
 #pragma unroll
@@ -365,8 +370,8 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
     float w[kTopK];
 #pragma unroll
     for (int x = 0; x < kTopK; ++x) {
-        e[x] = __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]);
         w[x] = weights[size_t(r) * kTopK + x];
+        e[x] = w[x] != 0.f ? __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]) : 0.f;
     }
     const float res = residual[size_t(r) * kHidden + c];
     // Rows 0 .. 2 load the old states' rows of their number.
@@ -381,7 +386,9 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
     float total = 0.f;
 #pragma unroll
     for (int x = 0; x < kTopK; ++x) {
-        total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        if (w[x] != 0.f) {
+            total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        }
     }
     const float mine = round_bf16(total);
     comb[r + kOld][lane] = mine;
@@ -504,8 +511,8 @@ moe_conv_residual_batch_2304(const __nv_bfloat16* experts, const float* weights,
     float w[kTopK];
 #pragma unroll
     for (int x = 0; x < kTopK; ++x) {
-        e[x] = __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]);
         w[x] = weights[size_t(r) * kTopK + x];
+        e[x] = w[x] != 0.f ? __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]) : 0.f;
     }
     const size_t at = size_t(r) * kHidden + c;
     const float res = residual[at];
@@ -529,7 +536,9 @@ moe_conv_residual_batch_2304(const __nv_bfloat16* experts, const float* weights,
     float total = 0.f;
 #pragma unroll
     for (int x = 0; x < kTopK; ++x) {
-        total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        if (w[x] != 0.f) {
+            total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        }
     }
     const float mine = round_bf16(total);
     comb[kOld] = mine;
@@ -595,8 +604,8 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     float w[kTopK];
 #pragma unroll
     for (int x = 0; x < kTopK; ++x) {
-        e[x] = __bfloat162float(seq_experts[(size_t(r) * kTopK + x) * kHidden + c]);
         w[x] = seq_weights[size_t(r) * kTopK + x];
+        e[x] = w[x] != 0.f ? __bfloat162float(seq_experts[(size_t(r) * kTopK + x) * kHidden + c]) : 0.f;
     }
     const float res = seq_residual[size_t(r) * kHidden + c];
     if (r < kOld) {
@@ -610,7 +619,9 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     float total = 0.f;
 #pragma unroll
     for (int x = 0; x < kTopK; ++x) {
-        total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        if (w[x] != 0.f) {
+            total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        }
     }
     const float mine = round_bf16(total);
     comb[r + kOld][lane] = mine;

@@ -46,7 +46,8 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
                      [--decode-floor 20] [--greedy] [--vision] \
-                     [--max-image-pixels 2073600] [--max-images 16]
+                     [--max-image-pixels 2073600] [--max-images 16] \
+                     [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] [--moe-min-k 1..=8]
 --context sets the positions of the KV cache pool: the prompts and generated tokens of every
 running request together. One request may take all of them, up to the model's limit of
 1,048,576. Without it the server takes the most that fit in GPU memory. Either way it plans
@@ -118,6 +119,10 @@ position, at about FP8's divergence.
 --kv-quant nvfp4|q4_0 [--kv-rotate] [--kv-quant-visits V,...]
 rounds the global keys and values through a 4-bit format with a BF16 cache (--kv bf16), to
 measure the quality of a 4-bit cache; it saves no memory.
+--moe-top-k 1..=8 [--moe-prune 0.0..1.0] [--moe-min-k 1..=8]
+opt-in dynamic MoE expert pruning: caps active experts per token at --moe-top-k (default 8)
+and drops ranked slots at or above --moe-min-k (default min(4, top-k)) whose share of the
+top-8 score sum is below --moe-prune (default 0.0, disabled).
 --greedy decodes every request greedily, whatever its sampling fields ask. Without it, a
 request samples with its temperature, top_k, top_p, min_p and seed, and the fields it leaves
 out come from the checkpoint's generation_config.json (temperature 1 for Inkling 2 Mini).
@@ -178,6 +183,9 @@ fn args() -> anyhow::Result<Args> {
     let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
     let mut max_images = vision::DEFAULT_MAX_IMAGES;
     let mut kv_args = Vec::new();
+    let mut moe_top_k = None;
+    let mut moe_min_k = None;
+    let mut moe_prune = 0.0f32;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -283,6 +291,15 @@ fn args() -> anyhow::Result<Args> {
                 kv_args.extend([arg, v]);
             }
             "--kv-rotate" => kv_args.push(arg),
+            "--moe-top-k" => {
+                moe_top_k = Some(value()?.parse().context("--moe-top-k takes 1 to 8")?);
+            }
+            "--moe-min-k" => {
+                moe_min_k = Some(value()?.parse().context("--moe-min-k takes 1 to 8")?);
+            }
+            "--moe-prune" => {
+                moe_prune = value()?.parse().context("--moe-prune takes 0.0 to 1.0")?;
+            }
             "--widths" => {
                 widths = value()?
                     .split(',')
@@ -302,6 +319,17 @@ fn args() -> anyhow::Result<Args> {
         }
     }
     let model_dir = model_dir.context(USAGE)?;
+    let moe_top_k = moe_top_k.unwrap_or(8);
+    ensure!((1..=8).contains(&moe_top_k), "--moe-top-k takes 1 to 8");
+    let moe_min_k = moe_min_k.unwrap_or_else(|| 4usize.min(moe_top_k));
+    ensure!(
+        (1..=moe_top_k).contains(&moe_min_k),
+        "--moe-min-k takes 1 to --moe-top-k ({moe_top_k})"
+    );
+    ensure!(
+        moe_prune.is_finite() && (0.0..=1.0).contains(&moe_prune),
+        "--moe-prune takes a value in 0.0..=1.0"
+    );
     let address = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("{host}:{port} is not an address"))?;
@@ -340,6 +368,9 @@ fn args() -> anyhow::Result<Args> {
                 max_pixels: max_image_pixels,
             }),
             kv_args,
+            moe_top_k,
+            moe_min_k,
+            moe_prune,
         },
         max_images,
         model_dir,

@@ -584,6 +584,99 @@ fn expert_mlp_end_matches_moe_conv_residual() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pruned slots (`index = -1, weight = 0.0`), including when the finisher slot 7 is
+/// pruned, must not deadlock or propagate `0 * NaN` in either fused `expert_mlp` (`MoeEnd`),
+/// `moe_conv_residual`, or `moe_combine`.
+#[test]
+fn expert_mlp_pruned_slots_skip_nan_and_finish_cleanly() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let conv = Conv::load(s.gpu.context())?;
+    let elementwise = Elementwise::load(s.gpu.context())?;
+    let stream = s.stream();
+    let experts = 10;
+    let ids = [3, 1, 4, -1, 5, -1, -1, -1];
+    let routing_host = [2.0f32, 2.5, 1.5, 0.0, 2.0, 0.0, 0.0, 0.0];
+    for fp4 in [true, false] {
+        let w13 = Synthetic::with_experts(&s, experts, fp4, 2 * INTERMEDIATE, HIDDEN, 71)?;
+        let w2 = Synthetic::with_experts(&s, experts, fp4, HIDDEN, INTERMEDIATE, 73)?;
+        let conv_weight =
+            stream.clone_htod(&common::pseudo_random_bf16(4 * HIDDEN, 17, 0.5, 0.0))?;
+        let weights = (&w13.gpu.weights(), &w2.gpu.weights(), &conv_weight);
+        let start = common::pseudo_random(3 * HIDDEN, 19, 2.0);
+        let mut state_want = stream.clone_htod(&start)?;
+        let mut state_got = stream.clone_htod(&start)?;
+        let mut sync_want = stream.alloc_zeros::<u32>(1 + SLOTS)?;
+        let mut sync_got = stream.alloc_zeros::<u32>(1 + SLOTS + HIDDEN / 16)?;
+        let row = MoeRow {
+            x: stream.clone_htod(&common::pseudo_random_bf16(HIDDEN, 80, 1.0, 0.0))?,
+            indices: stream.clone_htod(&ids)?,
+            routing: stream.clone_htod(&routing_host)?,
+            residual: stream.clone_htod(&common::pseudo_random(HIDDEN, 82, 4.0))?,
+        };
+        let want = moe_end(
+            &s,
+            &conv,
+            weights,
+            &row,
+            (&mut state_want, &mut sync_want),
+            false,
+        )?;
+        let got = moe_end(
+            &s,
+            &conv,
+            weights,
+            &row,
+            (&mut state_got, &mut sync_got),
+            true,
+        )?;
+        for (name, got_v, want_v) in ["act", "out", "hidden"]
+            .into_iter()
+            .zip(&got)
+            .zip(&want)
+            .map(|((n, g), w)| (n, g, w))
+        {
+            assert_eq!(got_v, want_v, "fp4 {fp4}: {name}");
+        }
+        assert!(
+            got[2].iter().all(|&b| bf16::from_bits(b).is_finite()),
+            "fp4 {fp4}: pruned hidden output contains NaN/Inf"
+        );
+        let state_got_h = stream.clone_dtoh(&state_got)?;
+        let state_want_h = stream.clone_dtoh(&state_want)?;
+        assert_eq!(
+            state_got_h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            state_want_h.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "fp4 {fp4}: conv state"
+        );
+        assert!(
+            state_got_h.iter().all(|v| v.is_finite()),
+            "fp4 {fp4}: conv state contains NaN/Inf"
+        );
+        assert!(
+            stream.clone_dtoh(&sync_got)?.iter().all(|&v| v == 0),
+            "fp4 {fp4}: sync not reset"
+        );
+
+        // Also check standalone `moe_combine` ignores 0-weighted NaN slots.
+        let out_dev = stream.clone_htod(
+            &got[1]
+                .iter()
+                .map(|&b| bf16::from_bits(b))
+                .collect::<Vec<_>>(),
+        )?;
+        let mut combined = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        elementwise.moe_combine(stream, &out_dev, &row.routing, &mut combined)?;
+        assert!(
+            stream
+                .clone_dtoh(&combined)?
+                .iter()
+                .all(|v| v.is_finite()),
+            "fp4 {fp4}: moe_combine contains NaN/Inf"
+        );
+    }
+    Ok(())
+}
+
 // `expert_matmul`, the expert-grouped product for prefill.
 //
 // It computes the same exact products as `expert_matvec` but adds them in another order, so

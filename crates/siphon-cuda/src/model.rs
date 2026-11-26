@@ -27,7 +27,7 @@ pub use prefill::{
 pub use prefix::{DeviceSpan, GlobalKv, LocalState};
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
-pub use crate::ops::sample::Sampling;
+pub use crate::ops::{routing::MoePruning, sample::Sampling};
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
@@ -456,6 +456,8 @@ struct Ctx {
     prefill_dense: Products,
     /// The 4-bit rounding of the global caches' writes, for the visits with `round` set.
     kv_rounding: KvRounding,
+    /// Opt-in MoE dynamic top-k and probability-threshold expert pruning.
+    moe_pruning: MoePruning,
 }
 
 impl std::fmt::Debug for Model {
@@ -663,6 +665,7 @@ impl Model {
                 } else {
                     KvRounding::default()
                 },
+                moe_pruning: MoePruning::default(),
             },
             passes,
             rounded_below: 0,
@@ -960,6 +963,28 @@ impl Model {
         );
         if self.ctx.prefill_dense != products {
             self.ctx.prefill_dense = products;
+            self.batch_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch_verify_graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// Current MoE expert pruning configuration.
+    #[must_use]
+    pub fn moe_pruning(&self) -> MoePruning {
+        self.ctx.moe_pruning
+    }
+
+    /// Sets MoE dynamic top-k and probability-threshold expert pruning. Drops captured
+    /// decode, verify and batched graphs when the setting changes, since they hold the
+    /// old router arguments.
+    pub fn set_moe_pruning(&mut self, pruning: MoePruning) -> anyhow::Result<()> {
+        pruning.validate()?;
+        if pruning != self.ctx.moe_pruning {
+            self.ctx.moe_pruning = pruning;
+            self.graph = None;
+            self.tap_graph = None;
+            self.verify_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_verify_graphs.clear();
         }
@@ -2313,7 +2338,7 @@ impl Ctx {
         end: Option<(&mut CudaSlice<f32>, &CudaSlice<f32>, &mut CudaSlice<bf16>)>,
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
-        self.kernels.routing.moe_router_step(
+        self.kernels.routing.moe_router_step_pruned(
             &self.stream,
             x,
             &w.router,
@@ -2322,6 +2347,7 @@ impl Ctx {
             &mut t.indices,
             &mut t.weights,
             cfg.route_scale,
+            self.moe_pruning,
         )?;
 
         let (w13, w2) = self.expert_weights(w);

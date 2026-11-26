@@ -138,7 +138,8 @@ router_logits_2304(const __nv_bfloat16* hidden, const float* weight, float* logi
 // holds experts l, l + 32, l + 64 and l + 96. Experts come out in selection
 // order: highest biased score first, ties to the lower index.
 extern "C" __global__ void expert_routing_128_top8(const float* logits, const float* bias, int32_t* indices,
-                                                   float* weights, int rows, float route_scale) {
+                                                   float* weights, int rows, float route_scale,
+                                                   int max_k, int min_k, float prune_threshold) {
     constexpr int kPerLane = kExperts / 32;
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int lane = threadIdx.x % 32;
@@ -195,14 +196,41 @@ extern "C" __global__ void expert_routing_128_top8(const float* logits, const fl
     }
 
     if (lane == 0) {
-        float total = 0.f;
+        if (max_k == kTopK && prune_threshold <= 0.f) {
+            float total = 0.f;
 #pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            total = w[k] + total;
-        }
+            for (int k = 0; k < kTopK; ++k) {
+                total = w[k] + total;
+            }
 #pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            weights[size_t(row) * kTopK + k] = w[k] / (total + kScoreEps) * route_scale;
+            for (int k = 0; k < kTopK; ++k) {
+                weights[size_t(row) * kTopK + k] = w[k] / (total + kScoreEps) * route_scale;
+            }
+        } else {
+            float total_all = 0.f;
+#pragma unroll
+            for (int k = 0; k < kTopK; ++k) {
+                total_all = w[k] + total_all;
+            }
+            const float denom_all = total_all + kScoreEps;
+            float kept_total = 0.f;
+            bool kept[kTopK];
+#pragma unroll
+            for (int k = 0; k < kTopK; ++k) {
+                kept[k] = k < max_k && (k < min_k || (w[k] / denom_all) >= prune_threshold);
+                if (kept[k]) {
+                    kept_total = w[k] + kept_total;
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < kTopK; ++k) {
+                if (kept[k]) {
+                    weights[size_t(row) * kTopK + k] = w[k] / (kept_total + kScoreEps) * route_scale;
+                } else {
+                    indices[size_t(row) * kTopK + k] = -1;
+                    weights[size_t(row) * kTopK + k] = 0.f;
+                }
+            }
         }
     }
 }
@@ -648,10 +676,53 @@ constexpr int kGemvChunks = (kHidden + kLogitsThreads * 4 - 1) / (kLogitsThreads
 
 namespace {
 
+// Finalizes slot `t` (0..kTopK) after top-8 selection into `indices` and `top`:
+// - Default (`max_k == 8 && prune_threshold <= 0.f`): runs the exact unpruned loop.
+// - Otherwise: keeps slot `k` iff `k < max_k && (k < min_k || top[k] / (sum_all + eps) >= prune_threshold)`,
+//   sets pruned slots to `indices[t] = -1, weights[t] = 0.f`, and renormalizes kept slots.
+__device__ __forceinline__ void finalize_top8(const float (&top)[kTopK], int32_t* indices,
+                                              float* weights, int t, float route_scale,
+                                              int max_k, int min_k, float prune_threshold) {
+    if (max_k == kTopK && prune_threshold <= 0.f) {
+        float total = 0.f;
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            total = top[k] + total;
+        }
+        weights[t] = top[t] / (total + kScoreEps) * route_scale;
+    } else {
+        float total_all = 0.f;
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            total_all = top[k] + total_all;
+        }
+        const float denom_all = total_all + kScoreEps;
+        float kept_total = 0.f;
+        bool keep_t = false;
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            const bool keep = k < max_k && (k < min_k || (top[k] / denom_all) >= prune_threshold);
+            if (keep) {
+                kept_total = top[k] + kept_total;
+            }
+            if (k == t) {
+                keep_t = keep;
+            }
+        }
+        if (keep_t) {
+            weights[t] = top[t] / (kept_total + kScoreEps) * route_scale;
+        } else {
+            indices[t] = -1;
+            weights[t] = 0.f;
+        }
+    }
+}
+
 // The top-8 routing of expert_routing_128_top8 for one row of 128 logits, with the
 // sigmoid through CUDA's expf. Every thread of the block must call it.
 __device__ __forceinline__ void route_top8(const float* logits, const float* __restrict__ bias, int32_t* indices,
-                                           float* weights, float route_scale) {
+                                           float* weights, float route_scale,
+                                           int max_k, int min_k, float prune_threshold) {
     // Each expert's rank among the biased scores, ties to the lower index, picks the top 8
     // without sequential rounds.
     __shared__ float biased[kExperts];
@@ -681,12 +752,7 @@ __device__ __forceinline__ void route_top8(const float* logits, const float* __r
     }
     __syncthreads();
     if (threadIdx.x < kTopK) {
-        float total = 0.f;
-#pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            total = top[k] + total;
-        }
-        weights[threadIdx.x] = top[threadIdx.x] / (total + kScoreEps) * route_scale;
+        finalize_top8(top, indices, weights, threadIdx.x, route_scale, max_k, min_k, prune_threshold);
     }
 }
 
@@ -706,7 +772,7 @@ __device__ __forceinline__ void
 moe_router_row(const float* x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
                const float* __restrict__ router, const float* __restrict__ bias,
                __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
-               unsigned* counter, float route_scale) {
+               unsigned* counter, float route_scale, int max_k, int min_k, float prune_threshold) {
     __shared__ float vw[kNormVirtualWarps];
     __shared__ float xs[kHidden];
     __shared__ float warp_dots[kExpertsPerBlock][kLogitsThreads / 32];
@@ -800,7 +866,7 @@ moe_router_row(const float* x, const __nv_bfloat16* __restrict__ norm_weight, fl
     }
     __threadfence();
 
-    route_top8(logits, bias, indices, weights, route_scale);
+    route_top8(logits, bias, indices, weights, route_scale, max_k, min_k, prune_threshold);
     if (threadIdx.x == 0) {
         *counter = 0;
     }
@@ -812,8 +878,9 @@ extern "C" __global__ void __launch_bounds__(kRouterThreads)
 moe_router_2304(const float* x, const __nv_bfloat16* __restrict__ norm_weight, float eps,
                 const float* __restrict__ router, const float* __restrict__ bias,
                 __nv_bfloat16* x_out, float* logits, int32_t* indices, float* weights,
-                unsigned* counter, float route_scale) {
-    moe_router_row(x, norm_weight, eps, router, bias, x_out, logits, indices, weights, counter, route_scale);
+                unsigned* counter, float route_scale, int max_k, int min_k, float prune_threshold) {
+    moe_router_row(x, norm_weight, eps, router, bias, x_out, logits, indices, weights, counter, route_scale,
+                   max_k, min_k, prune_threshold);
 }
 
 // ---------------------------------------------------------------------------
@@ -935,7 +1002,8 @@ moe_router_logits_rows_2304(const __nv_bfloat16* x, const float* __restrict__ ro
 // then moe_router_2304's top-8 routing into indices and weights ([rows, 8]). 128 threads.
 extern "C" __global__ void __launch_bounds__(kExperts)
 moe_router_route_rows_2304(const float* partials, int splits, const float* __restrict__ bias,
-                           float* logits, int32_t* indices, float* weights, int rows, float route_scale) {
+                           float* logits, int32_t* indices, float* weights, int rows, float route_scale,
+                           int max_k, int min_k, float prune_threshold) {
     const size_t row = blockIdx.x;
     const int e = threadIdx.x;
     pdl_trigger();
@@ -946,7 +1014,8 @@ moe_router_route_rows_2304(const float* partials, int splits, const float* __res
     }
     logits[row * kExperts + e] = total;
     // route_top8 reads each logit back in the thread that wrote it.
-    route_top8(logits + row * kExperts, bias, indices + row * kTopK, weights + row * kTopK, route_scale);
+    route_top8(logits + row * kExperts, bias, indices + row * kTopK, weights + row * kTopK, route_scale,
+               max_k, min_k, prune_threshold);
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,7 +1595,8 @@ __device__ sm89::Mailboxes<4 * kClusterRouterBlocks, 8192> router_mail;
 // over half the experts each, as route_top8 does.
 extern "C" __global__ void SIPHON_CLUSTER_DIMS(kClusterRouterBlocks) __launch_bounds__(kClusterRouterThreads)
 moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, const float* __restrict__ bias,
-                     float* logits, int32_t* indices, float* weights, float route_scale) {
+                     float* logits, int32_t* indices, float* weights, float route_scale,
+                     int max_k, int min_k, float prune_threshold) {
     __shared__ __align__(16) float all[kExperts];
     __shared__ __align__(16) float mine[kClusterRouterWarps];
     __shared__ __align__(8) uint64_t arrived;
@@ -1631,12 +1701,7 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
     }
     __syncthreads();
     if (t < kTopK) {
-        float total = 0.f;
-#pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            total = top[k] + total;
-        }
-        weights[t] = top[t] / (total + kScoreEps) * route_scale;
+        finalize_top8(top, indices, weights, t, route_scale, max_k, min_k, prune_threshold);
     }
 }
 
@@ -1658,7 +1723,7 @@ static_assert(kRowsRouterThreads >= 2 * kExperts, "two threads per expert rank i
 extern "C" __global__ void SIPHON_CLUSTER_DIMS(kClusterRouterBlocks) __launch_bounds__(kRowsRouterThreads)
 moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restrict__ router,
                           const float* __restrict__ bias, float* logits, int32_t* indices,
-                          float* weights, float route_scale) {
+                          float* weights, float route_scale, int max_k, int min_k, float prune_threshold) {
     constexpr int kPairs = kStepRouterRows * kClusterRouterWarps;
     __shared__ __align__(16) float all[kExperts];
     __shared__ __align__(16) float mine[kStepRouterRows][kClusterRouterWarps];
@@ -1815,12 +1880,8 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
     }
     __syncthreads();
     if (t < kTopK) {
-        float total = 0.f;
-#pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            total = top[k] + total;
-        }
-        weights[r * kTopK + t] = top[t] / (total + kScoreEps) * route_scale;
+        finalize_top8(top, indices + r * kTopK, weights + r * kTopK, t, route_scale, max_k, min_k,
+                      prune_threshold);
     }
 }
 

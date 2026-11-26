@@ -281,7 +281,10 @@ __device__ __forceinline__ void moe_conv(const MoeConv& m, const MoeConvInputs& 
     float total = 0.f;
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
-        total = __fadd_rn(total, __fmul_rn(__bfloat162float(__ldcg(down + size_t(k) * n + c)), in.weights[k]));
+        const float wk = in.weights[k];
+        if (wk != 0.f) {
+            total = __fadd_rn(total, __fmul_rn(__bfloat162float(__ldcg(down + size_t(k) * n + c)), wk));
+        }
     }
     const float x = conv_step::round_bf16(total);
     const auto* taps = reinterpret_cast<const __nv_bfloat16*>(&in.taps);
@@ -315,7 +318,13 @@ __device__ __forceinline__ void expert_matvec(const __nv_bfloat16* x, const int3
     pdl_trigger();
     const int expert = indices[pair];
     const bool known = expert >= 0 && expert < experts;
-    WarpRows<kFp4, kK> rows(weight, scales, expert, known, n, row0);
+    if (!known) {
+        if (lane < G::kRows) {
+            out[size_t(pair) * n + row0 + lane] = __float2bfloat16(kNan);
+        }
+        return;
+    }
+    WarpRows<kFp4, kK> rows(weight, scales, expert, true, n, row0);
 #pragma unroll
     for (int i = 0; i < kChunks; ++i) {
         rows.load(i, lane);
@@ -323,7 +332,7 @@ __device__ __forceinline__ void expert_matvec(const __nv_bfloat16* x, const int3
     const unsigned input = inputs_per_row == 1 ? pair / 8 : pair;
     float result = rows.dot(x + size_t(input) * kK, lane);
     if (lane < G::kRows) {
-        result = known ? result * output_scale(kFp4, global_scale, expert) : kNan;
+        result *= output_scale(kFp4, global_scale, expert);
         out[size_t(pair) * n + row0 + lane] = __float2bfloat16(result);
     }
 }
@@ -368,22 +377,25 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             const int row0 = task % kTiles13 * G13::kBlockRows + warp * G13::kRows;
             const int expert = indices[pair];
             const bool known = expert >= 0 && expert < experts;
-            WarpRows<kFp4, kK13> rows(w13, s13, expert, known, kN13, row0);
+            if (!known) {
+                if (lane < G13::kRows && lane % 2 == 0) {
+                    act[size_t(pair) * kK2 + (row0 + lane) / 2] = __float2bfloat16(kNan);
+                }
+                continue;
+            }
+            WarpRows<kFp4, kK13> rows(w13, s13, expert, true, kN13, row0);
 #pragma unroll
             for (int i = 0; i < kChunks; ++i) {
                 rows.load(i, lane);
             }
             float result = rows.dot(x + size_t(pair / 8) * kK13, lane);
-            if (known) {
-                result *= output_scale(kFp4, g13, expert);
-            }
+            result *= output_scale(kFp4, g13, expert);
             const float up = __shfl_down_sync(0xffffffffu, result, 1);
             if (lane < G13::kRows && lane % 2 == 0) {
                 const float gate_bf16 = __bfloat162float(__float2bfloat16(result));
                 const float up_bf16 = __bfloat162float(__float2bfloat16(up));
                 act[size_t(pair) * kK2 + (row0 + lane) / 2] =
-                    known ? softcapped_swiglu(gate_bf16, up_bf16, gate_softcap, up_softcap)
-                          : __float2bfloat16(kNan);
+                    softcapped_swiglu(gate_bf16, up_bf16, gate_softcap, up_softcap);
             }
             __syncthreads();
             if (threadIdx.x == 0) {
@@ -395,26 +407,30 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             const int row0 = (task - tasks13) % tiles2 * G2::kBlockRows + warp * G2::kRows;
             const int expert = indices[pair];
             const bool known = expert >= 0 && expert < experts;
-            if (threadIdx.x == 0) {
-                while (load_relaxed(&sync[1 + pair]) < kTiles13) {
-                    __nanosleep(64);
+            if (known) {
+                if (threadIdx.x == 0) {
+                    while (load_relaxed(&sync[1 + pair]) < kTiles13) {
+                        __nanosleep(64);
+                    }
+                    // With the barrier below, orders the block's activation loads after the
+                    // count, and so after the stores the count covers.
+                    __threadfence();
                 }
-                // With the barrier below, orders the block's activation loads after the
-                // count, and so after the stores the count covers.
-                __threadfence();
-            }
-            __syncthreads();
-            // Loading weights before the wait was slower: 27.0 us instead of 24.6 per NVFP4
-            // layer visit with all nine chunks.
-            WarpRows<kFp4, kK2> rows(w2, s2, expert, known, n2, row0);
+                __syncthreads();
+                // Loading weights before the wait was slower: 27.0 us instead of 24.6 per NVFP4
+                // layer visit with all nine chunks.
+                WarpRows<kFp4, kK2> rows(w2, s2, expert, true, n2, row0);
 #pragma unroll
-            for (int i = 0; i < kChunks; ++i) {
-                rows.load(i, lane);
-            }
-            float result = rows.dot(act + size_t(pair) * kK2, lane);
-            if (lane < G2::kRows) {
-                result = known ? result * output_scale(kFp4, g2, expert) : kNan;
-                out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(result);
+                for (int i = 0; i < kChunks; ++i) {
+                    rows.load(i, lane);
+                }
+                float result = rows.dot(act + size_t(pair) * kK2, lane);
+                if (lane < G2::kRows) {
+                    result *= output_scale(kFp4, g2, expert);
+                    out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(result);
+                }
+            } else if (lane < G2::kRows) {
+                out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(kNan);
             }
             if (conv.hidden != nullptr) {
                 // The last pair's task of each row tile finishes the tile's channels once

@@ -140,7 +140,10 @@ extern "C" __global__ void moe_combine_bf16(const __nv_bfloat16* experts, const 
         float total = 0.f;
 #pragma unroll
         for (int k = 0; k < kTopK; ++k) {
-            total = fadd(total, fmul(__bfloat162float(e[k * kHidden]), w[k]));
+            const float wk = w[k];
+            if (wk != 0.f) {
+                total = fadd(total, fmul(__bfloat162float(e[k * kHidden]), wk));
+            }
         }
         out[i] = to_bf16(total);
     }

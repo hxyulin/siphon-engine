@@ -18,6 +18,84 @@ const HIDDEN: usize = 2304;
 pub const EXPERTS: usize = 128;
 /// Experts chosen per token.
 pub const TOP_K: usize = 8;
+/// Default floor on kept experts when probability-threshold pruning is active.
+pub const DEFAULT_MIN_K: usize = 4;
+
+/// Opt-in MoE dynamic top-k and probability-threshold expert pruning.
+///
+/// The default (`top_k = 8`, `threshold = 0.0`, `min_k = 4`) keeps every slot and runs
+/// the exact stock top-8 normalization loop. When active, a ranked slot `k` (`0..8`,
+/// highest biased score first) is kept iff `k < top_k` and either `k < min_k` or its
+/// normalized share of the top-8 score sum is at least `threshold`. Pruned slots receive
+/// index `-1` and weight `0.0`, and kept slots are renormalized to sum to `route_scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoePruning {
+    /// Maximum experts kept per token (`1..=8`).
+    pub top_k: usize,
+    /// Minimum normalized weight share (`0.0..=1.0`) required to keep a slot at or above
+    /// `min_k`. `0.0` disables threshold pruning.
+    pub threshold: f32,
+    /// Minimum experts always kept per token (`1..=top_k`), regardless of `threshold`.
+    pub min_k: usize,
+}
+
+impl Default for MoePruning {
+    fn default() -> Self {
+        Self {
+            top_k: TOP_K,
+            threshold: 0.0,
+            min_k: DEFAULT_MIN_K,
+        }
+    }
+}
+
+impl MoePruning {
+    /// Checks that `1 <= min_k <= top_k <= 8` and `0.0 <= threshold <= 1.0`.
+    pub fn validate(self) -> anyhow::Result<()> {
+        ensure!(
+            (1..=TOP_K).contains(&self.top_k),
+            "moe top_k must be in 1..={TOP_K}, got {}",
+            self.top_k
+        );
+        ensure!(
+            (1..=self.top_k).contains(&self.min_k),
+            "moe min_k must be in 1..={}, got {}",
+            self.top_k,
+            self.min_k
+        );
+        ensure!(
+            self.threshold.is_finite() && (0.0..=1.0).contains(&self.threshold),
+            "moe prune threshold must be in 0.0..=1.0, got {}",
+            self.threshold
+        );
+        Ok(())
+    }
+
+    /// Whether pruning alters routing from stock top-8.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        self.top_k < TOP_K || self.threshold > 0.0
+    }
+
+    fn kernel_args(self) -> anyhow::Result<(i32, i32, f32)> {
+        self.validate()?;
+        Ok((
+            i32::try_from(self.top_k)?,
+            i32::try_from(self.min_k)?,
+            self.threshold,
+        ))
+    }
+}
+
+impl std::fmt::Display for MoePruning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "top_k={}, min_k={}, threshold={:.4}",
+            self.top_k, self.min_k, self.threshold
+        )
+    }
+}
 /// Rows of one cluster of [`Routing::moe_router_step_rows`], `kStepRouterRows` in the
 /// kernel.
 const STEP_ROUTER_GROUP: usize = 8;
@@ -354,6 +432,31 @@ impl Routing {
         weights: &mut CudaSlice<f32>,
         route_scale: f32,
     ) -> anyhow::Result<()> {
+        self.expert_routing_pruned(
+            stream,
+            logits,
+            bias,
+            indices,
+            weights,
+            route_scale,
+            MoePruning::default(),
+        )
+    }
+
+    /// [`Self::expert_routing`] with optional dynamic top-k and probability-threshold
+    /// pruning.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn expert_routing_pruned(
+        &self,
+        stream: &CudaStream,
+        logits: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        indices: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        route_scale: f32,
+        pruning: MoePruning,
+    ) -> anyhow::Result<()> {
+        let (max_k, min_k, threshold) = pruning.kernel_args()?;
         ensure!(
             bias.len() == EXPERTS,
             "bias has {} elements, expected {EXPERTS}",
@@ -385,10 +488,13 @@ impl Routing {
             .arg(indices)
             .arg(weights)
             .arg(&rows)
-            .arg(&route_scale);
+            .arg(&route_scale)
+            .arg(&max_k)
+            .arg(&min_k)
+            .arg(&threshold);
         // SAFETY: the arguments match `expert_routing_128_top8(const float*, const float*,
-        // int32_t*, float*, int, float)`, the kernel skips warps past `rows`, and the checks
-        // above keep every row inside the buffers.
+        // int32_t*, float*, int, float, int, int, float)`, the kernel skips warps past
+        // `rows`, and the checks above keep every row inside the buffers.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -578,6 +684,42 @@ impl Routing {
         counter: &mut CudaSlice<u32>,
         route_scale: f32,
     ) -> anyhow::Result<()> {
+        self.moe_router_pruned(
+            stream,
+            x,
+            norm_weight,
+            eps,
+            router,
+            bias,
+            x_out,
+            logits,
+            indices,
+            weights,
+            counter,
+            route_scale,
+            MoePruning::default(),
+        )
+    }
+
+    /// [`Self::moe_router`] with optional dynamic top-k and probability-threshold pruning.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router_pruned(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<f32>,
+        norm_weight: &CudaSlice<bf16>,
+        eps: f32,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        x_out: &mut CudaSlice<bf16>,
+        logits: &mut CudaSlice<f32>,
+        indices: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        counter: &mut CudaSlice<u32>,
+        route_scale: f32,
+        pruning: MoePruning,
+    ) -> anyhow::Result<()> {
+        let (max_k, min_k, threshold) = pruning.kernel_args()?;
         let x = x.view();
         ensure!(
             x.len() == HIDDEN,
@@ -618,11 +760,14 @@ impl Routing {
             .ptr_mut(indices, stream)
             .ptr_mut(weights, stream)
             .ptr_mut(counter, stream)
-            .f32(route_scale);
+            .f32(route_scale)
+            .i32(max_k)
+            .i32(min_k)
+            .f32(threshold);
         // SAFETY: the arguments match `moe_router_2304(const float*, const bf16*, float,
-        // const float*, const float*, bf16*, float*, int32_t*, float*, unsigned*, float)`,
-        // every buffer has the length the kernel reads or writes, and it reads only weights
-        // before `pdl_wait`.
+        // const float*, const float*, bf16*, float*, int32_t*, float*, unsigned*, float,
+        // int, int, float)`, every buffer has the length the kernel reads or writes, and it
+        // reads only weights before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_2304, config) }
     }
 
@@ -866,6 +1011,35 @@ impl Routing {
         weights: &mut CudaSlice<f32>,
         route_scale: f32,
     ) -> anyhow::Result<()> {
+        self.moe_router_step_pruned(
+            stream,
+            x,
+            router,
+            bias,
+            logits,
+            indices,
+            weights,
+            route_scale,
+            MoePruning::default(),
+        )
+    }
+
+    /// [`Self::moe_router_step`] with optional dynamic top-k and probability-threshold
+    /// pruning.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router_step_pruned(
+        &self,
+        stream: &CudaStream,
+        x: &CudaSlice<bf16>,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        logits: &mut CudaSlice<f32>,
+        indices: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        route_scale: f32,
+        pruning: MoePruning,
+    ) -> anyhow::Result<()> {
+        let (max_k, min_k, threshold) = pruning.kernel_args()?;
         ensure!(
             x.len() == HIDDEN,
             "x has {} elements, expected {HIDDEN}",
@@ -896,11 +1070,15 @@ impl Routing {
             .ptr_mut(logits, stream)
             .ptr_mut(indices, stream)
             .ptr_mut(weights, stream)
-            .f32(route_scale);
+            .f32(route_scale)
+            .i32(max_k)
+            .i32(min_k)
+            .f32(threshold);
         // SAFETY: the arguments match `moe_router_step_2304(const bf16*, const float*, const
-        // float*, float*, int32_t*, float*, float)`, every buffer has the length the kernel
-        // reads or writes, the grid is the kernel's one cluster of 16 blocks of one warp per
-        // expert, and the kernel reads only the router and the bias before `pdl_wait`.
+        // float*, float*, int32_t*, float*, float, int, int, float)`, every buffer has the
+        // length the kernel reads or writes, the grid is the kernel's one cluster of 16
+        // blocks of one warp per expert, and the kernel reads only the router and the bias
+        // before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_step_2304, config) }
     }
 
@@ -921,6 +1099,37 @@ impl Routing {
         route_scale: f32,
         rows: usize,
     ) -> anyhow::Result<()> {
+        self.moe_router_step_rows_pruned(
+            stream,
+            x,
+            router,
+            bias,
+            logits,
+            indices,
+            weights,
+            route_scale,
+            rows,
+            MoePruning::default(),
+        )
+    }
+
+    /// [`Self::moe_router_step_rows`] with optional dynamic top-k and probability-threshold
+    /// pruning.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn moe_router_step_rows_pruned(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        logits: &mut impl DeviceOut<f32>,
+        indices: &mut impl DeviceOut<i32>,
+        weights: &mut impl DeviceOut<f32>,
+        route_scale: f32,
+        rows: usize,
+        pruning: MoePruning,
+    ) -> anyhow::Result<()> {
+        let (max_k, min_k, threshold) = pruning.kernel_args()?;
         let x = x.view();
         let (mut logits, mut indices, mut weights) =
             (logits.view_mut(), indices.view_mut(), weights.view_mut());
@@ -960,12 +1169,15 @@ impl Routing {
             .ptr_mut(&mut logits, stream)
             .ptr_mut(&mut indices, stream)
             .ptr_mut(&mut weights, stream)
-            .f32(route_scale);
+            .f32(route_scale)
+            .i32(max_k)
+            .i32(min_k)
+            .f32(threshold);
         // SAFETY: the arguments match `moe_router_step_rows_2304(const bf16*, int, const
-        // float*, const float*, float*, int32_t*, float*, float)`, every buffer has the
-        // length the kernel reads or writes for `rows` rows, the grid is one of the
-        // kernel's clusters of 16 blocks of 288 threads per 8 rows, and the kernel reads
-        // only the router and the bias before `pdl_wait`.
+        // float*, const float*, float*, int32_t*, float*, float, int, int, float)`, every
+        // buffer has the length the kernel reads or writes for `rows` rows, the grid is one
+        // of the kernel's clusters of 16 blocks of 288 threads per 8 rows, and the kernel
+        // reads only the router and the bias before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_step_rows_2304, config) }
     }
 
@@ -989,6 +1201,39 @@ impl Routing {
         route_scale: f32,
         rows: usize,
     ) -> anyhow::Result<()> {
+        self.moe_router_rows_pruned(
+            stream,
+            x,
+            router,
+            bias,
+            logits,
+            indices,
+            weights,
+            scratch,
+            route_scale,
+            rows,
+            MoePruning::default(),
+        )
+    }
+
+    /// [`Self::moe_router_rows`] with optional dynamic top-k and probability-threshold
+    /// pruning.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signatures")]
+    pub fn moe_router_rows_pruned(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        logits: &mut impl DeviceOut<f32>,
+        indices: &mut impl DeviceOut<i32>,
+        weights: &mut impl DeviceOut<f32>,
+        scratch: &mut RouterRowsScratch,
+        route_scale: f32,
+        rows: usize,
+        pruning: MoePruning,
+    ) -> anyhow::Result<()> {
+        let (max_k, min_k, threshold) = pruning.kernel_args()?;
         let x = x.view();
         let (mut logits, mut indices, mut weights) =
             (logits.view_mut(), indices.view_mut(), weights.view_mut());
@@ -1045,16 +1290,19 @@ impl Routing {
             .ptr_mut(&mut indices, stream)
             .ptr_mut(&mut weights, stream)
             .i32(rows_i32)
-            .f32(route_scale);
+            .f32(route_scale)
+            .i32(max_k)
+            .i32(min_k)
+            .f32(threshold);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows).context("too many rows")?, 1, 1),
             block_dim: (u32::try_from(EXPERTS)?, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `moe_router_route_rows_2304(const float*, int, const
-        // float*, float*, int*, float*, int, float)`, every buffer holds `rows` rows as
-        // checked above, the grid has one block of 128 threads per row, and the kernel reads
-        // nothing before `pdl_wait`.
+        // float*, float*, int*, float*, int, float, int, int, float)`, every buffer holds
+        // `rows` rows as checked above, the grid has one block of 128 threads per row, and
+        // the kernel reads nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_route_rows_2304, config) }
     }
 }

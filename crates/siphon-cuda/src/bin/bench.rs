@@ -103,7 +103,7 @@ mod linux {
         kv_options::KvOptions,
         model::{
             Accept, BATCH_ROWS, DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK,
-            MAX_PREFILL_CHUNK, Model, PrefillAttention, PrefillLogits, VerifyTokens,
+            MAX_PREFILL_CHUNK, Model, MoePruning, PrefillAttention, PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
@@ -128,7 +128,8 @@ mod linux {
                          [--expert-activations bf16|quantized|fp8] \
                          [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]\n       \
                          every mode also takes [--kv-quant none|nvfp4|q4_0] [--kv-rotate] \
-                         [--kv-quant-visits V,V,...]";
+                         [--kv-quant-visits V,V,...] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] \
+                         [--moe-min-k 1..=8]";
 
     #[expect(clippy::struct_excessive_bools, reason = "command-line flags")]
     struct Args {
@@ -174,6 +175,7 @@ mod linux {
         /// Whether the draft follows row 0 of the batched steps.
         follow: bool,
         kv_options: KvOptions,
+        moe_pruning: MoePruning,
     }
 
     fn token_counts(arg: &str, value: &str) -> anyhow::Result<Vec<usize>> {
@@ -217,6 +219,9 @@ mod linux {
         let mut batch = None;
         let mut follow = false;
         let mut kv_options = KvOptions::default();
+        let mut moe_top_k = None;
+        let mut moe_min_k = None;
+        let mut moe_prune = None;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
             if kv_options.parse(&arg, &mut it)? {
@@ -260,6 +265,9 @@ mod linux {
                 "--seeds" => seeds = value()?.parse()?,
                 "--batch" => batch = Some(token_counts(&arg, &value()?)?),
                 "--follow" => follow = true,
+                "--moe-top-k" => moe_top_k = Some(value()?.parse()?),
+                "--moe-min-k" => moe_min_k = Some(value()?.parse()?),
+                "--moe-prune" => moe_prune = Some(value()?.parse()?),
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -281,6 +289,14 @@ mod linux {
             prefill.as_ref().is_none_or(|p| p.iter().all(|&n| n > 0)),
             "--prefill lengths must be positive"
         );
+        let default_pruning = MoePruning::default();
+        let top_k = moe_top_k.unwrap_or(default_pruning.top_k);
+        let moe_pruning = MoePruning {
+            top_k,
+            min_k: moe_min_k.unwrap_or_else(|| default_pruning.min_k.min(top_k)),
+            threshold: moe_prune.unwrap_or(default_pruning.threshold),
+        };
+        moe_pruning.validate()?;
         Ok(Args {
             model: model.context(USAGE)?,
             contexts,
@@ -312,6 +328,7 @@ mod linux {
             batch,
             follow,
             kv_options,
+            moe_pruning,
         })
     }
 
@@ -450,10 +467,19 @@ mod linux {
             args.weights,
         )?;
         args.kv_options.apply(&mut model)?;
+        model.set_moe_pruning(args.moe_pruning)?;
         model.set_expert_activations(args.expert_activations)?;
         model.set_prefill_attention(args.prefill_attention)?;
         model.set_prefill_dense(args.prefill_dense)?;
         Ok(model)
+    }
+
+    fn pruning_suffix(pruning: MoePruning) -> String {
+        if pruning.is_active() {
+            format!(", moe pruning ({pruning})")
+        } else {
+            String::new()
+        }
     }
 
     fn bench_prefill(args: &Args, lengths: &[usize]) -> anyhow::Result<()> {
@@ -509,7 +535,8 @@ mod linux {
             println!(
                 "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"processes_before_load\":[{}],\
                  \"passes\":{passes},\"kv\":{},\"expert_activations\":{},\
-                 \"prefill_attention\":{},\"prefill_dense\":{},\"chunk\":{},\"rows\":[{}]}}",
+                 \"prefill_attention\":{},\"prefill_dense\":{},\"chunk\":{},\
+                 \"moe_top_k\":{},\"moe_min_k\":{},\"moe_prune\":{},\"rows\":[{}]}}",
                 quote(&before.timestamp),
                 quote(&before.name),
                 quote(&before.driver),
@@ -519,6 +546,9 @@ mod linux {
                 quote(&args.prefill_attention.to_string()),
                 quote(&args.prefill_dense.to_string()),
                 args.chunk,
+                args.moe_pruning.top_k,
+                args.moe_pruning.min_k,
+                args.moe_pruning.threshold,
                 rows.join(","),
             );
         } else {
@@ -537,13 +567,13 @@ mod linux {
                 },
             );
             println!(
-                "passes {passes}, {} global KV cache, prefill chunks of {}\n",
-                args.kv, args.chunk
+                "passes {passes}, {} global KV cache, prefill chunks of {}{}\n\n\
+                 | prompt tokens | time to first token ms | prefill tok/s | SM MHz | mem MHz |\n\
+                 |---:|---:|---:|---:|---:|",
+                args.kv,
+                args.chunk,
+                pruning_suffix(args.moe_pruning),
             );
-            println!(
-                "| prompt tokens | time to first token ms | prefill tok/s | SM MHz | mem MHz |"
-            );
-            println!("|---:|---:|---:|---:|---:|");
             for r in &rows {
                 println!(
                     "| {} | {:.1} | {:.1} | {} | {} |",
@@ -617,6 +647,7 @@ mod linux {
             args.weights,
         )?;
         args.kv_options.apply(&mut model)?;
+        model.set_moe_pruning(args.moe_pruning)?;
         let weight_bytes = match args.weights {
             WeightFormat::Bf16 => WEIGHT_BYTES_PER_TOKEN,
             WeightFormat::Fp8 => WEIGHT_BYTES_PER_TOKEN - FP8_SAVED_BYTES_PER_TOKEN,
@@ -725,6 +756,7 @@ mod linux {
         )?;
         args.kv_options.apply(&mut model)?;
         model.set_prefill_dense(args.prefill_dense)?;
+        model.set_moe_pruning(args.moe_pruning)?;
         model.add_slots(largest - 1)?;
         let mut speculator = if args.follow {
             let options = DraftOptions::fast()
@@ -856,8 +888,12 @@ mod linux {
         let _ = writeln!(
             s,
             "passes {passes}, {} global KV cache, {} dense weights, {} warmup steps, {} timed \
-             steps\n",
-            args.kv, args.weights, args.warmup, args.steps
+             steps{}\n",
+            args.kv,
+            args.weights,
+            args.warmup,
+            args.steps,
+            pruning_suffix(args.moe_pruning),
         );
         let _ = writeln!(
             s,
@@ -911,7 +947,8 @@ mod linux {
         format!(
             "{{\"timestamp\":{},\"gpu\":{},\"driver\":{},\"max_sm_mhz\":{},\"max_mem_mhz\":{},\
              \"temperature_c_before_load\":{},\"power_w_before_load\":{},\"processes_before_load\":[{}],\
-             \"passes\":{passes},\"kv\":{},\"weights\":{},\"warmup\":{},\"steps\":{},\"rows\":[{}]}}",
+             \"passes\":{passes},\"kv\":{},\"weights\":{},\"warmup\":{},\"steps\":{},\
+             \"moe_top_k\":{},\"moe_min_k\":{},\"moe_prune\":{},\"rows\":[{}]}}",
             quote(&gpu.timestamp),
             quote(&gpu.name),
             quote(&gpu.driver),
@@ -924,6 +961,9 @@ mod linux {
             quote(&args.weights.to_string()),
             args.warmup,
             args.steps,
+            args.moe_pruning.top_k,
+            args.moe_pruning.min_k,
+            args.moe_pruning.threshold,
             rows.join(","),
         )
     }
@@ -1024,6 +1064,7 @@ mod linux {
             )?;
             args.kv_options.apply(&mut model)?;
             model.set_prefill_dense(args.prefill_dense)?;
+            model.set_moe_pruning(args.moe_pruning)?;
             println!(
                 "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
                  before load: {}",
