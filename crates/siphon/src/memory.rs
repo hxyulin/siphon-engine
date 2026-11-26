@@ -824,7 +824,8 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     let extra_sync = if rows > 32 {
         let base = 1 + rows * (c.num_experts_per_tok + 1);
         let pairs = rows * c.num_experts_per_tok;
-        let wide = 1 + pairs.min(c.n_routed_experts) + rows + 904 / 4 + pairs.div_ceil(2);
+        let groups = pairs.min(c.n_routed_experts) + rows;
+        let wide = (2 + groups).next_multiple_of(2) + 2056 / 4 + pairs.div_ceil(2);
         wide.saturating_sub(base) * 4
     } else {
         0

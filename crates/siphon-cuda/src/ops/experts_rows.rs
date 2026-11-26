@@ -31,7 +31,9 @@ pub const MAX_ROWS: usize = 256;
 /// Most rows the single-kernel shared-memory path takes (`kMaxRows` in the kernel).
 const INLINE_MAX_ROWS: usize = 32;
 /// `u32` words of `ExpertRowsMeta`'s fixed header (`offsetof(ExpertRowsMeta, pair_list) / 4`).
-const META_HEADER_U32: usize = 904 / 4;
+const META_HEADER_U32: usize = 2056 / 4;
+/// Pairs per chunk for the BF16 wide path.
+const WIDE_BF16_CHUNK_CAP: i32 = 32;
 /// Experts each row routes to.
 const SLOTS: usize = 8;
 /// Routed experts.
@@ -74,10 +76,10 @@ impl ExpertsRows {
     pub const fn sync_len(max_rows: usize) -> usize {
         let pairs = max_rows * SLOTS;
         let groups = if pairs < EXPERTS { pairs } else { EXPERTS } + max_rows;
-        let counters = 1 + groups;
         if max_rows <= INLINE_MAX_ROWS {
-            counters
+            1 + groups
         } else {
+            let counters = (2 + groups).next_multiple_of(2);
             counters + META_HEADER_U32 + pairs.div_ceil(2)
         }
     }
@@ -232,11 +234,12 @@ impl ExpertsRows {
         ensure!(n13 == n2, "w13 has {n13} experts and w2 {n2}");
 
         if m > INLINE_MAX_ROWS {
-            let sync_end = i32::try_from(1 + groups)?;
+            let sync_end = i32::try_from((2 + groups).next_multiple_of(2))?;
             let mut gargs = KernelArgs::default();
             gargs
                 .ptr(&indices, stream)
                 .i32(i32::try_from(m)?)
+                .i32(WIDE_BF16_CHUNK_CAP)
                 .ptr_mut(&mut sync, stream)
                 .i32(sync_end);
             let gcfg = LaunchConfig {
@@ -244,9 +247,10 @@ impl ExpertsRows {
                 block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
                 shared_mem_bytes: 0,
             };
-            // SAFETY: `expert_group_rows(const int*, int, unsigned*, int)` writes `ExpertRowsMeta`
-            // into `sync + sync_end`, which has at least `META_HEADER_U32 + ceil(8*m / 2)` words
-            // as checked above, and reads `indices` only after `pdl_wait`.
+            // SAFETY: `expert_group_rows(const int*, int, int, unsigned*, int)` writes
+            // `ExpertRowsMeta` into `sync + sync_end` (8-byte aligned), which has at least
+            // `META_HEADER_U32 + ceil(8*m / 2)` words as checked above, and reads `indices`
+            // only after `pdl_wait`.
             unsafe { gargs.launch_pdl(stream, &self.group, gcfg) }?;
 
             let mut args = KernelArgs::default();

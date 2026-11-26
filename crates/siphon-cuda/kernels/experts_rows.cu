@@ -142,6 +142,20 @@ __device__ __forceinline__ uint32_t load_relaxed(const uint32_t* p) {
     return v;
 }
 
+__device__ __forceinline__ uint32_t load_acquire(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void fence_acq_rel_gpu() {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+__device__ __forceinline__ void atomic_inc_release(uint32_t* p) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p) : "memory");
+}
+
 __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t a2,
                                     uint32_t a3, uint32_t b0, uint32_t b1) {
     asm volatile(
@@ -337,12 +351,13 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
 // Multi-group form of `tile_product` for `expert_mlp_rows_wide`: processes `ng` (1..=4)
 // column groups of 8 pairs (up to 32 pairs) against a single DRAM load and dequantization
 // of the 16-row weight tile. Each group runs the exact same mma.sync instructions in the
-// same k order as `tile_product`, keeping every output bit-identical.
-template <bool kFp4, int K, int kRing>
+// same k order as `tile_product`, keeping every output bit-identical. `ready()` runs after
+// the first weight copies are issued and before anything reads `x_ptrs`.
+template <bool kFp4, int K, int kRing, typename Ready>
 __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_t* s, int row0,
                                                   const __nv_bfloat16* const x_ptrs[4], int ng,
                                                   uint4* ring, int lane, uint64_t policy,
-                                                  float acc[4][4]) {
+                                                  float acc[4][4], Ready ready) {
     using G = Geometry<kFp4, K>;
     constexpr int kJ = G::kChunks / 4;
     constexpr int kXVecs = G::kValues / 8;
@@ -372,6 +387,7 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
     for (int q = 0; q < kRing - 1; ++q) {
         issue(q);
     }
+    ready();
     for (int i = 0; i < G::kStages; ++i) {
         issue(i + kRing - 1);
         uint4 xv0[kJ][kXVecs];
@@ -450,30 +466,34 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
                         xw[2 * q + 1]);
                 }
             }
+            if (ng > 1) {
 #pragma unroll
-            for (int u = 1; u < 4; ++u) {
-                if (u < ng) {
-                    const __nv_bfloat16* const xu = x_ptrs[u];
-                    uint32_t xw[G::kValues / 2];
+                for (int u = 1; u < 4; ++u) {
+                    if (u < ng) {
+                        const __nv_bfloat16* const xu = x_ptrs[u];
+                        uint32_t xw[G::kValues / 2];
 #pragma unroll
-                    for (int h = 0; h < kXVecs; ++h) {
-                        const uint4 v = xu != nullptr ? reinterpret_cast<const uint4*>(xu + k)[h]
-                                                      : make_uint4(0, 0, 0, 0);
-                        xw[4 * h] = v.x;
-                        xw[4 * h + 1] = v.y;
-                        xw[4 * h + 2] = v.z;
-                        xw[4 * h + 3] = v.w;
-                    }
+                        for (int h = 0; h < kXVecs; ++h) {
+                            const uint4 v = xu != nullptr ? reinterpret_cast<const uint4*>(xu + k)[h]
+                                                          : make_uint4(0, 0, 0, 0);
+                            xw[4 * h] = v.x;
+                            xw[4 * h + 1] = v.y;
+                            xw[4 * h + 2] = v.z;
+                            xw[4 * h + 3] = v.w;
+                        }
 #pragma unroll
-                    for (int q = 0; q < G::kValues / 4; ++q) {
-                        mma(acc[u], a[2 * q], b[2 * q], a[2 * q + 1], b[2 * q + 1], xw[2 * q],
-                            xw[2 * q + 1]);
+                        for (int q = 0; q < G::kValues / 4; ++q) {
+                            mma(acc[u], a[2 * q], b[2 * q], a[2 * q + 1], b[2 * q + 1], xw[2 * q],
+                                xw[2 * q + 1]);
+                        }
                     }
                 }
             }
         }
         __syncwarp();
     }
+    wait_copies<0>();
+    __syncwarp();
 }
 
 template <bool kFp4, int kRing>
@@ -735,16 +755,32 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
 // Grouped routing metadata written once by `expert_group_rows` for calls with m > 32
 // (up to kWideMaxRows = 256 rows, 2048 pairs), stored in global memory right after the
 // sync counters and read from L2 by every block of `expert_mlp_rows_wide`.
+//
+// Experts are bucket-sorted in descending pair-count order (Longest-Processing-Time-first)
+// while keeping all chunks of one expert adjacent, so heavy experts start first with full
+// L2 weight reuse across sibling chunks and cold 1..8-pair experts drain the tail smoothly.
+constexpr int kMaxWideChunks = 256;
+
+struct ExpertChunk {
+    uint16_t expert;
+    uint16_t pstart;
+    uint16_t count;
+    uint16_t pad;
+};
+static_assert(sizeof(ExpertChunk) == 8, "ExpertChunk is 8 bytes");
+
 struct ExpertRowsMeta {
-    int32_t distinct;
-    uint8_t expert_id[kExperts];
-    uint16_t expert_count[kExperts];
-    uint16_t pstart[kExperts + 1];
-    uint16_t vstart[kExperts + 1];
+    int32_t num_chunks;
+    int32_t pad;
+    ExpertChunk chunks[kMaxWideChunks];
     uint16_t pair_list[kWideMaxPairs];
 };
-static_assert(offsetof(ExpertRowsMeta, pair_list) == 904, "meta header layout");
+static_assert(offsetof(ExpertRowsMeta, chunks) == 8, "chunks offset");
+static_assert(offsetof(ExpertRowsMeta, pair_list) == 8 + kMaxWideChunks * 8, "meta header layout");
 
+// Persistent dynamic-queue BF16-dequant wide MLP (bit-exact with `expert_mlp_rows`).
+// Uses sync[0] as the dynamic warp work-queue counter, sync[1] as the finished-block counter,
+// and sync[2 + chunk] as each 32-pair chunk's w13 tile completion counter.
 template <bool kFp4, int kRing>
 __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int m,
                                                      const uint8_t* w13, const uint8_t* s13,
@@ -756,11 +792,7 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
                                                      uint4* ring_all) {
     using G13 = Geometry<kFp4, kK13>;
     using G2 = Geometry<kFp4, kK2>;
-    __shared__ uint8_t expert_id[kExperts];
-    __shared__ uint16_t expert_count[kExperts];
-    __shared__ uint16_t pstart[kExperts + 1];
-    __shared__ uint16_t vstart[kExperts + 1];
-    __shared__ int distinct;
+    __shared__ int num_chunks_s;
     __shared__ bool last_block;
 
     const int tid = threadIdx.x;
@@ -774,46 +806,34 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
     pdl_wait();
     pdl_trigger();
     const auto* meta = reinterpret_cast<const ExpertRowsMeta*>(sync + sync_end);
-    expert_id[tid] = meta->expert_id[tid];
-    expert_count[tid] = meta->expert_count[tid];
-    pstart[tid + 1] = meta->pstart[tid + 1];
-    vstart[tid + 1] = meta->vstart[tid + 1];
     if (tid == 0) {
-        distinct = meta->distinct;
-        pstart[0] = 0;
-        vstart[0] = 0;
+        num_chunks_s = meta->num_chunks;
     }
     __syncthreads();
 
-    const int d = distinct;
-    const int groups_total = int(vstart[d]);
+    const int num_chunks = num_chunks_s;
     const uint64_t policy = evict_first_policy();
     uint4* ring = ring_all + warp * kRing * kSlotVecs;
-    const int tasks13 = groups_total * kTiles;
+    const int tasks13 = num_chunks * kTiles;
     const int tasks = 2 * tasks13;
-    const int warps = gridDim.x * kWarps;
-    for (int task = blockIdx.x * kWarps + warp; task < tasks; task += warps) {
+
+    for (;;) {
+        int task;
+        if (lane == 0) {
+            task = int(atomicAdd(&sync[0], 1u));
+        }
+        task = __shfl_sync(0xffffffffu, task, 0);
+        if (task >= tasks) {
+            break;
+        }
         const bool up_proj = task < tasks13;
         const int flat = up_proj ? task : task - tasks13;
-        int lo = 0;
-        int hi = d - 1;
-        while (lo < hi) {
-            const int mid = (lo + hi + 1) / 2;
-            if (int(vstart[mid]) * kTiles <= flat) {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        const int ordinal = lo;
-        const int chunks = int(vstart[lo + 1]) - int(vstart[lo]);
-        const int local = flat - int(vstart[lo]) * kTiles;
-        const int row0 = local / chunks * 16;
-        const int chunk = int(vstart[lo]) + local % chunks;
-        const int e = int(expert_id[ordinal]);
-        const int col0 = 32 * (chunk - int(vstart[ordinal]));
-        const uint16_t* const pairs_of = &meta->pair_list[int(pstart[ordinal]) + col0];
-        const int count = min(int(expert_count[ordinal]) - col0, 32);
+        const int chunk = flat / kTiles;
+        const int row0 = (flat % kTiles) * 16;
+        const ExpertChunk ch = meta->chunks[chunk];
+        const int e = int(ch.expert);
+        const uint16_t* const pairs_of = &meta->pair_list[ch.pstart];
+        const int count = int(ch.count);
         const int ng = (count + 7) / 8;
         const __nv_bfloat16* x_ptrs[4];
 #pragma unroll
@@ -831,10 +851,11 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
                            {0.f, 0.f, 0.f, 0.f},
                            {0.f, 0.f, 0.f, 0.f}};
         if (up_proj) {
-            tile_product_wide<kFp4, kK13, kRing>(w13 + size_t(e) * kN13 * G13::kRowBytes,
-                                                 s13 + size_t(e) * kN13 * G13::kRowScales, row0,
-                                                 x_ptrs, ng, ring, lane, policy, acc);
+            tile_product_wide<kFp4, kK13, kRing>(
+                w13 + size_t(e) * kN13 * G13::kRowBytes, s13 + size_t(e) * kN13 * G13::kRowScales,
+                row0, x_ptrs, ng, ring, lane, policy, acc, [] {});
             const float scale = kFp4 ? __fdiv_rn(g13[e], kNvfp4ScaleEnc) : 1.f;
+            __nv_bfloat16* act_smem = reinterpret_cast<__nv_bfloat16*>(ring);
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 if (u < ng) {
@@ -845,32 +866,39 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
                         const float up = __shfl_down_sync(0xffffffffu, gate, 4);
                         const int column = col_off + 2 * t + (i & 1);
                         if (g % 2 == 0 && column < count) {
-                            const int row = row0 + g + (i >> 1) * 8;
-                            const int pair = int(pairs_of[column]);
-                            act[size_t(pair) * kK2 + row / 2] = softcapped_swiglu(
+                            act_smem[column * 8 + (g >> 1) + (i >> 1) * 4] = softcapped_swiglu(
                                 __bfloat162float(__float2bfloat16(gate)),
                                 __bfloat162float(__float2bfloat16(up)), gate_softcap, up_softcap);
                         }
                     }
                 }
             }
-            __threadfence();
+            __syncwarp();
+            if (lane < count) {
+                const int pair = int(pairs_of[lane]);
+                *reinterpret_cast<uint4*>(act + size_t(pair) * kK2 + row0 / 2) =
+                    *reinterpret_cast<const uint4*>(act_smem + lane * 8);
+            }
+            fence_acq_rel_gpu();
             __syncwarp();
             if (lane == 0) {
-                atomicAdd(&sync[1 + chunk], 1u);
+                atomic_inc_release(&sync[2 + chunk]);
             }
         } else {
-            if (lane == 0) {
-                while (load_relaxed(&sync[1 + chunk]) < kTiles) {
-                    __nanosleep(64);
-                }
-                __threadfence();
-            }
-            __syncwarp();
             const uint8_t* w2e = w2 + size_t(e) * kN2 * G2::kRowBytes;
-            tile_product_wide<kFp4, kK2, kRing>(w2e, s2 + size_t(e) * kN2 * G2::kRowScales, row0,
-                                                x_ptrs, ng, ring, lane, policy, acc);
+            tile_product_wide<kFp4, kK2, kRing>(
+                w2e, s2 + size_t(e) * kN2 * G2::kRowScales, row0, x_ptrs, ng, ring, lane, policy,
+                acc, [&] {
+                    if (lane == 0) {
+                        while (load_acquire(&sync[2 + chunk]) < kTiles) {
+                            __nanosleep(64);
+                        }
+                    }
+                    __syncwarp();
+                });
             const float scale = kFp4 ? __fdiv_rn(g2[e], kNvfp4ScaleEnc) : 1.f;
+            __nv_bfloat16* out_smem = reinterpret_cast<__nv_bfloat16*>(ring);
+            constexpr int kWideOutStride = 24;
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 if (u < ng) {
@@ -879,23 +907,31 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
                     for (int i = 0; i < 4; ++i) {
                         const int column = col_off + 2 * t + (i & 1);
                         if (column < count) {
-                            const int row = row0 + g + (i >> 1) * 8;
-                            const int pair = int(pairs_of[column]);
-                            out[size_t(pair) * kN2 + row] = __float2bfloat16(acc[u][i] * scale);
+                            out_smem[column * kWideOutStride + g + (i >> 1) * 8] =
+                                __float2bfloat16(acc[u][i] * scale);
                         }
                     }
                 }
             }
+            __syncwarp();
+            if (lane < count) {
+                const int pair = int(pairs_of[lane]);
+                __nv_bfloat16* dst = out + size_t(pair) * kN2 + row0;
+                const __nv_bfloat16* src = out_smem + lane * kWideOutStride;
+                *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+                *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(src + 8);
+            }
+            __syncwarp();
         }
     }
     __syncthreads();
     if (tid == 0) {
-        last_block = atomicAdd(&sync[0], 1u) == gridDim.x - 1;
+        last_block = atomicAdd(&sync[1], 1u) == gridDim.x - 1;
     }
     __syncthreads();
     if (last_block) {
-        for (int i = tid; i < groups_total; i += kWarps * 32) {
-            sync[1 + i] = 0;
+        for (int i = tid; i < num_chunks; i += kWarps * 32) {
+            sync[2 + i] = 0;
         }
         const int meta_words = int(offsetof(ExpertRowsMeta, pair_list) / 4) + (pairs + 1) / 2;
         uint32_t* meta_u32 = sync + sync_end;
@@ -905,6 +941,7 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
         __syncthreads();
         if (tid == 0) {
             sync[0] = 0;
+            sync[1] = 0;
         }
     }
 }
@@ -912,17 +949,22 @@ __device__ __forceinline__ void expert_mlp_rows_wide(const __nv_bfloat16* x, int
 }  // namespace
 
 // Groups `m * 8` (row, slot) pairs by expert in ascending pair order into `meta`
-// (`sync + sync_end`), for `expert_mlp_rows_wide`. One block of kWarps * 32 = 128 threads.
+// (`sync + sync_end`), bucket-sorting active experts in descending pair-count order (LPT)
+// and splitting each expert's pairs into chunks of at most `chunk_cap` (32) pairs.
+// One block of kWarps * 32 = 128 threads. Reads `indices` once into registers and uses
+// double-buffered per-warp counts to cut block barriers by >3x.
 extern "C" __global__ void __launch_bounds__(kWarps * 32)
-    expert_group_rows(const int32_t* indices, int m, uint32_t* sync, int sync_end) {
-    __shared__ uint16_t counts[kExperts];
-    __shared__ uint8_t warp_count[kWarps][kExperts];
-    __shared__ uint16_t ordinal_of[kExperts];
-    __shared__ uint16_t write_pos[kExperts];
+    expert_group_rows(const int32_t* indices, int m, int chunk_cap, uint32_t* sync, int sync_end) {
+    static_assert(kWideMaxPairs <= 16 * 128, "register cache holds every pair");
+    __shared__ uint32_t counts_u32[kExperts];
+    __shared__ uint8_t warp_count[2][kWarps][kExperts];
+    __shared__ uint8_t warp_rb_cnt[kWarps][16];
+    __shared__ uint16_t bucket_base[16];
     __shared__ uint8_t expert_id[kExperts];
     __shared__ uint16_t expert_count[kExperts];
     __shared__ uint16_t pstart[kExperts + 1];
-    __shared__ uint16_t vstart[kExperts + 1];
+    __shared__ uint16_t cstart[kExperts + 1];
+    __shared__ uint16_t write_pos[kExperts];
     __shared__ int warp_sums[2][kWarps];
     __shared__ int distinct;
 
@@ -930,118 +972,156 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32)
     const int lane = tid % 32;
     const int warp = tid / 32;
     const int pairs = m * 8;
-    const int chunks = (pairs + 127) / 128;
+    const int loops = (pairs + 127) / 128;
     const unsigned below = (1u << lane) - 1;
 
     pdl_wait();
-    counts[tid] = 0;
-    for (int c = 0; c < chunks; ++c) {
-        warp_count[0][tid] = 0;
-        warp_count[1][tid] = 0;
-        warp_count[2][tid] = 0;
-        warp_count[3][tid] = 0;
-        __syncthreads();
-        const int p = c * 128 + tid;
-        const int e = p < pairs ? indices[p] : -1;
-        const unsigned same = __match_any_sync(0xffffffffu, e);
-        if (e >= 0 && (same & below) == 0) {
-            warp_count[warp][e] = uint8_t(__popc(same));
-        }
-        __syncthreads();
-        counts[tid] = uint16_t(counts[tid] + warp_count[0][tid] + warp_count[1][tid] +
-                               warp_count[2][tid] + warp_count[3][tid]);
-        __syncthreads();
-    }
-
-    const int active = counts[tid] > 0 ? 1 : 0;
-    int inc = active;
+    pdl_trigger();
+    counts_u32[tid] = 0;
+    write_pos[tid] = 0;
 #pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        const int v = __shfl_up_sync(0xffffffffu, inc, o);
-        inc += lane >= o ? v : 0;
-    }
-    if (lane == 31) {
-        warp_sums[0][warp] = inc;
+    for (int buf = 0; buf < 2; ++buf) {
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            warp_count[buf][w][tid] = 0;
+        }
     }
     __syncthreads();
-    int warp_off = 0;
-    for (int w = 0; w < warp; ++w) {
-        warp_off += warp_sums[0][w];
+
+    uint8_t my_e[16];
+    uint8_t my_off[16];
+    for (int c = 0; c < loops; ++c) {
+        const int p = c * 128 + tid;
+        const int e = p < pairs ? indices[p] : -1;
+        my_e[c] = e >= 0 ? uint8_t(e) : uint8_t(255);
+        const unsigned same = __match_any_sync(0xffffffffu, e);
+        my_off[c] = uint8_t(__popc(same & below));
+        if (e >= 0 && (same & below) == 0) {
+            atomicAdd(&counts_u32[e], uint32_t(__popc(same)));
+        }
     }
-    const int ord = warp_off + inc - active;
-    if (active) {
+    __syncthreads();
+
+    // 16-bucket descending LPT sort of active experts: rb = 0 is heaviest (>= 121 pairs),
+    // rb = 15 is lightest (1..8 pairs). Ties preserve ascending expert id order.
+    const int cnt_e = int(counts_u32[tid]);
+    const int my_rb = cnt_e > 0 ? (15 - min((cnt_e - 1) / 8, 15)) : -1;
+    int in_warp_rank = 0;
+#pragma unroll
+    for (int rb = 0; rb < 16; ++rb) {
+        const bool match = (cnt_e > 0) && (my_rb == rb);
+        const unsigned mask = __ballot_sync(0xffffffffu, match);
+        if (lane == 0) {
+            warp_rb_cnt[warp][rb] = uint8_t(__popc(mask));
+        }
+        if (match) {
+            in_warp_rank = __popc(mask & below);
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int val = lane < 16 ? (int(warp_rb_cnt[0][lane]) + int(warp_rb_cnt[1][lane]) +
+                                     int(warp_rb_cnt[2][lane]) + int(warp_rb_cnt[3][lane]))
+                                  : 0;
+        int inc = val;
+#pragma unroll
+        for (int o = 1; o < 16; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, inc, o);
+            inc += lane >= o ? v : 0;
+        }
+        if (lane < 16) {
+            bucket_base[lane] = uint16_t(inc - val);
+        }
+        if (lane == 15) {
+            distinct = inc;
+        }
+    }
+    __syncthreads();
+    if (cnt_e > 0) {
+        int ord = int(bucket_base[my_rb]) + in_warp_rank;
+        for (int w = 0; w < warp; ++w) {
+            ord += int(warp_rb_cnt[w][my_rb]);
+        }
         expert_id[ord] = uint8_t(tid);
-        expert_count[ord] = counts[tid];
-        ordinal_of[tid] = uint16_t(ord);
-    }
-    if (tid == kExperts - 1) {
-        distinct = warp_off + inc;
+        expert_count[ord] = uint16_t(cnt_e);
     }
     __syncthreads();
 
     const int d = distinct;
     int cnt = tid < d ? int(expert_count[tid]) : 0;
-    int grps = (cnt + 31) / 32;
+    int nch = cnt > 0 ? (cnt + chunk_cap - 1) / chunk_cap : 0;
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
-        const int vg = __shfl_up_sync(0xffffffffu, grps, o);
+        const int vg = __shfl_up_sync(0xffffffffu, nch, o);
         const int vc = __shfl_up_sync(0xffffffffu, cnt, o);
-        grps += lane >= o ? vg : 0;
+        nch += lane >= o ? vg : 0;
         cnt += lane >= o ? vc : 0;
     }
     if (lane == 31) {
-        warp_sums[0][warp] = grps;
+        warp_sums[0][warp] = nch;
         warp_sums[1][warp] = cnt;
     }
     __syncthreads();
     for (int w = 0; w < warp; ++w) {
-        grps += warp_sums[0][w];
+        nch += warp_sums[0][w];
         cnt += warp_sums[1][w];
     }
-    vstart[tid + 1] = uint16_t(grps);
+    cstart[tid + 1] = uint16_t(nch);
     pstart[tid + 1] = uint16_t(cnt);
-    auto* meta = reinterpret_cast<ExpertRowsMeta*>(sync + sync_end);
     if (tid == 0) {
-        vstart[0] = 0;
+        cstart[0] = 0;
         pstart[0] = 0;
-        meta->distinct = d;
-        meta->vstart[0] = 0;
-        meta->pstart[0] = 0;
     }
-    __syncthreads();
-    if (active) {
-        write_pos[tid] = pstart[ordinal_of[tid]];
-    }
-    meta->expert_id[tid] = tid < d ? expert_id[tid] : 0;
-    meta->expert_count[tid] = tid < d ? expert_count[tid] : 0;
-    meta->pstart[tid + 1] = pstart[tid + 1];
-    meta->vstart[tid + 1] = vstart[tid + 1];
     __syncthreads();
 
-    for (int c = 0; c < chunks; ++c) {
-        warp_count[0][tid] = 0;
-        warp_count[1][tid] = 0;
-        warp_count[2][tid] = 0;
-        warp_count[3][tid] = 0;
-        __syncthreads();
-        const int p = c * 128 + tid;
-        const int e = p < pairs ? indices[p] : -1;
+    auto* meta = reinterpret_cast<ExpertRowsMeta*>(sync + sync_end);
+    if (tid == 0) {
+        meta->num_chunks = int32_t(cstart[d]);
+        meta->pad = 0;
+    }
+    if (tid < d) {
+        const int e = int(expert_id[tid]);
+        const int cnt_o = int(expert_count[tid]);
+        const int ps = int(pstart[tid]);
+        const int cs = int(cstart[tid]);
+        const int ce = int(cstart[tid + 1]);
+        write_pos[e] = uint16_t(ps);
+        for (int k = 0; k < ce - cs; ++k) {
+            ExpertChunk ch;
+            ch.expert = uint16_t(e);
+            ch.pstart = uint16_t(ps + k * chunk_cap);
+            ch.count = uint16_t(min(chunk_cap, cnt_o - k * chunk_cap));
+            ch.pad = 0;
+            meta->chunks[cs + k] = ch;
+        }
+    }
+    __syncthreads();
+
+    for (int c = 0; c < loops; ++c) {
+        const int cur = c & 1;
+        const int prev = cur ^ 1;
+        const int e = my_e[c] < kExperts ? int(my_e[c]) : -1;
         const unsigned same = __match_any_sync(0xffffffffu, e);
         if (e >= 0 && (same & below) == 0) {
-            warp_count[warp][e] = uint8_t(__popc(same));
+            warp_count[cur][warp][e] = uint8_t(__popc(same));
         }
         __syncthreads();
         if (e >= 0) {
-            int off = __popc(same & below);
+            int off = int(my_off[c]);
             for (int w = 0; w < warp; ++w) {
-                off += warp_count[w][e];
+                off += warp_count[cur][w][e];
             }
-            meta->pair_list[write_pos[e] + off] = uint16_t(p);
+            meta->pair_list[write_pos[e] + off] = uint16_t(c * 128 + tid);
+        }
+        const uint16_t delta =
+            uint16_t(warp_count[cur][0][tid] + warp_count[cur][1][tid] + warp_count[cur][2][tid] +
+                     warp_count[cur][3][tid]);
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            warp_count[prev][w][tid] = 0;
         }
         __syncthreads();
-        write_pos[tid] = uint16_t(write_pos[tid] + warp_count[0][tid] + warp_count[1][tid] +
-                                  warp_count[2][tid] + warp_count[3][tid]);
-        __syncthreads();
+        write_pos[tid] = uint16_t(write_pos[tid] + delta);
     }
 }
 
