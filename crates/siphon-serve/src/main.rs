@@ -43,7 +43,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--draft-shortlist N] [--draft-context-rows N] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
-                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
+                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8|fp4] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
                      [--decode-floor 20] [--greedy] [--vision] \
                      [--accept-margin 0.0] [--group-by-confidence] \
@@ -97,9 +97,10 @@ another checkpoint, drafter, format, draft or build of the kernels is discarded.
 On SIGTERM or Ctrl-C the server drains: it answers new requests with 503 and Retry-After,
 /health turns 503, and it finishes the running and queued requests. After --drain-timeout
 seconds it ends what is left with an error. Then it saves --cache-dir and exits.
---prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
+--prefill-attention picks prefill's global attention products over an FP8 or NVFP4 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
-first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
+first token by up to a fifth; bf16 keeps every prompt as before, fp8 runs FP8 throughout, and
+fp4 runs native Blackwell NVFP4 Q K^T + FP8 P V over NVFP4 caches (and FP8 over FP8 caches).
 --prefill-dense picks dense products in prefill and large batched passes (>= 48 rows): bf16
 (the default) keeps BF16/row-invariant products, and fp8 runs MXFP8 tensor-core GEMMs with
 --weights fp8.

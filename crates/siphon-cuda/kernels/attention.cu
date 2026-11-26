@@ -353,6 +353,20 @@ struct Fp4Format {
     static constexpr int kChunkStride = 16;
 };
 
+// `Fp4Format` for the prefill attention that multiplies Q K^T on Blackwell's
+// native NVFP4 tensor cores (`kind::mxf4nvf4`, m16n8k64) and P V on block-scaled
+// FP8 tensor cores (`kind::mxf8f6f4`, m16n8k32) (`prefill_attention_fp4_mma`).
+struct Fp4MmaFormat : Fp4Format {};
+
+template <class F>
+struct IsFp4Mma {
+    static constexpr bool value = false;
+};
+template <>
+struct IsFp4Mma<Fp4MmaFormat> {
+    static constexpr bool value = true;
+};
+
 // Streaming L2 eviction policy: KV cache slabs read once per step should evict first so
 // they do not displace reusable weights and activations from L2.
 __device__ __forceinline__ uint64_t l2_evict_first() {
@@ -1591,13 +1605,27 @@ decode_step_fp4(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __
 //   the cache's E4M3 bytes, read with ldmatrix from the staged tile.
 // - O += P V: the softmax weights carry a factor of 2^8 instead of 2^15, so
 //   that the largest is 256, and round to E4M3. The values are the cache's
-//   bytes, transposed in shared memory to [dim][key] for the B operand. Within
-//   each block of 32 keys, MMA k position 4t + j (and 16 + 4t + j) holds key
-//   8 (j / 2) + 2t + j % 2 (and 16 more), the keys a lane holds in the S
-//   fragments, so the weights pack into A registers without shuffles; the
+//   bytes, transposed in shared memory to [dim][key] for the B operand into two
+//   ping-pong stages so warp skewing overlaps tensor-core products with SFU
+//   softmax. Within each block of 32 keys, MMA k position 4t + j (and 16 + 4t +
+//   j) holds key 8 (j / 2) + 2t + j % 2 (and 16 more), the keys a lane holds in
+//   the S fragments, so the weights pack into A registers without shuffles; the
 //   transpose stores the values in the same order.
 // The softmax and its denominator stay F32. Only the rounding of the queries
 // and the weights to E4M3 differs from `prefill_attention_fp8`.
+//
+// `prefill_attention_fp4_mma` (opt-in) accelerates NVFP4 global caches on
+// Blackwell (`sm_120a`):
+// - S = Q K^T: runs directly on native NVFP4 tensor cores (`kind::mxf4nvf4`,
+//   scale_vec::4X, m16n8k64, F32 accumulators) with ZERO key dequantization.
+//   The keys stay in their cache layout (64 bytes of E2M1 + 8 UE4M3 scales per
+//   row, swizzled for conflict-free ldmatrix). Queries are quantized once per
+//   segment in registers to per-16 E2M1 + UE4M3 scales under a per-row F32
+//   outer scale folded into the softmax score scale.
+// - O += P V: decodes and transposes the staged NVFP4 values directly into
+//   two ping-pong [128, 64] E4M3 tiles and multiplies with `mma_fp8` (m16n8k32)
+//   using warp skewing, preserving full E4M3 precision for softmax weights P
+//   while balancing tensor-core and SFU throughput.
 
 namespace {
 
@@ -1630,6 +1658,13 @@ __device__ __forceinline__ int v8_offset(int row, int unit) {
     return row * kHeadDim + ((unit ^ ((row >> 1 & 3) | (row >> 2 & 4))) << 4);
 }
 
+// Byte offset of 16-byte unit `unit` (0..3) of key `row` (0..63) in a staged
+// [64, 64] NVFP4 tile: XOR with (row >> 1) & 3 so that the 8 rows an ldmatrix
+// reads fall in distinct banks (matches `q_offset` in expert_matmul.cu).
+__device__ __forceinline__ int k4_offset(int row, int unit) {
+    return row * kFp4HeadBytes + ((unit ^ ((row >> 1) & 3)) << 4);
+}
+
 // Byte offset of 16-byte unit `unit` (4 per row) of dim `row` in the
 // transposed [128, 64] value tile.
 __device__ __forceinline__ int vt_offset(int row, int unit) {
@@ -1640,6 +1675,35 @@ __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t select
     uint32_t d;
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(selector));
     return d;
+}
+
+// Two F16 values packed in a uint32_t (low half first) rounded to two E4M3 bytes
+// (first in the low byte), nearest even, saturated to +-448.
+__device__ __forceinline__ uint32_t f16x2_to_e4m3x2(uint32_t h) {
+    const __half2_raw raw = {static_cast<unsigned short>(h & 0xffffu), static_cast<unsigned short>(h >> 16)};
+    return uint32_t(__nv_cvt_halfraw2_to_fp8x2(raw, __NV_SATFINITE, __NV_E4M3));
+}
+
+__device__ __forceinline__ uint32_t f16x4_to_e4m3x4(uint32_t h0, uint32_t h1) {
+    return f16x2_to_e4m3x2(h0) | (f16x2_to_e4m3x2(h1) << 16);
+}
+
+// c += a b, block-scaled NVFP4 with F32 accumulators: lanes t = 0 and 1 of each
+// quad pass the A scales (4 UE4M3 bytes, one per 16 values) of rows g and g + 8;
+// lane `kThreadB` of each quad passes the B scales of column g.
+template <int kThreadB>
+__device__ __forceinline__ void mma_fp4(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
+                                        uint32_t scale_a, uint32_t scale_b) {
+#if SIPHON_SM89
+    __trap();
+#else
+    asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1."
+        "e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, "
+        "{%11, %12}, {%13}, {%14, %15};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a), "h"(uint16_t(0)),
+          "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(0)), "h"(uint16_t(kThreadB)));
+#endif
 }
 
 // c += a b, block-scaled FP8 with F32 accumulators: the A scales of rows g and
@@ -1748,19 +1812,22 @@ template <class F, int kWarps>
 struct alignas(16) PrefillShared {
     static constexpr bool kFp8 = sizeof(typename F::Elem) == 1;
     static constexpr bool kMma8 = IsFp8Mma<F>::value;
+    static constexpr bool kMma4 = IsFp4Mma<F>::value;
+    static constexpr bool kMmaLow = kMma8 || kMma4;
     static constexpr int kRows = 16 * kWarps;
-    // BF16 key and value tiles, [64, 128] swizzled: two stages, or for E4M3 one
-    // tile that each staged tile is decoded into (stubs for the FP8 MMA
-    // variant).
-    // The FP8 MMA variant keeps its transposed [128, 64] E4M3 value tile in k.
-    static constexpr int kStages = kFp8 ? 1 : 2;
-    static constexpr int kKTile = kMma8 ? kPrefillKeys * kHeadDim / 2 : kPrefillKeys * kHeadDim;
-    static constexpr int kVTile = kMma8 ? 16 : kPrefillKeys * kHeadDim;
+    // BF16 key and value tiles, [64, 128] swizzled: two stages; for Fp8Format /
+    // Fp4Format one tile that each staged tile is decoded into; for Fp8MmaFormat
+    // and Fp4MmaFormat, `k` holds two ping-pong stages of the transposed [128, 64]
+    // E4M3 value tile so warp skewing overlaps tensor-core MMA with SFU softmax.
+    static constexpr int kStages = (kFp8 && !kMmaLow) ? 1 : 2;
+    static constexpr int kKTile = kMmaLow ? kPrefillKeys * kHeadDim / 2 : kPrefillKeys * kHeadDim;
+    static constexpr int kVTile = kMmaLow ? 16 : kPrefillKeys * kHeadDim;
     __nv_bfloat16 k[kStages][kKTile];
     __nv_bfloat16 v[kStages][kVTile];
-    // E4M3 staging tiles, [64, 128], unswizzled, or for the FP8 MMA variant
-    // swizzled (a stub for BF16).
-    static constexpr int kStaged = kFp8 ? kPrefillKeys * kHeadDim : 16;
+    // Raw cache staging tiles: [64, 128] for E4M3, [64, 64+8] for NVFP4 (stub
+    // for BF16).
+    static constexpr int kStaged =
+        F::kFp4 ? kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) : (kFp8 ? kPrefillKeys * kHeadDim : 16);
     uint8_t k8[2][kStaged];
     uint8_t v8[2][kStaged];
     // Bias values of each M row for the tile's distances: 9 aligned chunks
@@ -1822,8 +1889,10 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
     constexpr int kRows = Shared::kRows;
     constexpr bool kFp8 = Shared::kFp8;
     constexpr bool kMma8 = Shared::kMma8;
-    constexpr float kPLog2 = kMma8 ? kPScaleLog2Fp8 : kPScaleLog2;
-    constexpr float kP = kMma8 ? kPScaleFp8 : kPScale;
+    constexpr bool kMma4 = Shared::kMma4;
+    constexpr bool kMmaLow = Shared::kMmaLow;
+    constexpr float kPLog2 = kMmaLow ? kPScaleLog2Fp8 : kPScaleLog2;
+    constexpr float kP = kMmaLow ? kPScaleFp8 : kPScale;
     // Floats of one partial slot: [kWarps, 16 n-tiles, 32 lanes] float4 of
     // output fragments, then the max and the sum of each M row.
     constexpr int kSlot = kRows * (kHeadDim + 2);
@@ -1976,14 +2045,17 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                         kd = pack_group(k_in + offset, ks);
                         vd = pack_group(v_in + offset, vs);
                     }
-                    *reinterpret_cast<uint2*>(&sm.k8[stage][row * kFp4HeadBytes + group * 8]) = kd;
-                    *reinterpret_cast<uint2*>(&sm.v8[stage][row * kFp4HeadBytes + group * 8]) = vd;
+                    const int dst_off =
+                        kMma4 ? k4_offset(row, group / 2) + (group % 2) * 8
+                              : row * kFp4HeadBytes + group * 8;
+                    *reinterpret_cast<uint2*>(&sm.k8[stage][dst_off]) = kd;
+                    *reinterpret_cast<uint2*>(&sm.v8[stage][dst_off]) = vd;
                     sm.k8[stage][kScalesAt + row * kFp4HeadScales + group] = ks;
                     sm.v8[stage][kScalesAt + row * kFp4HeadScales + group] = vs;
                 }
             } else {
-                // 4 chunks of 32 E2M1 values per row, unswizzled, then the row's 8 scales after
-                // the tile's data.
+                // 4 chunks of 32 E2M1 values per row (swizzled for `kMma4`'s ldmatrix,
+                // unswizzled for F16 decode), then the row's 8 scales after the tile's data.
                 constexpr int kChunks = kFp4HeadBytes / 16;
                 const int chunk = threadIdx.x % kChunks;
 #pragma unroll
@@ -1993,8 +2065,9 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                     source = source >= wrap ? source - wrap : source;
                     const unsigned slot = valid ? source : 0;
                     const size_t offset = fp4_data(slot, g.kv_head) + chunk * 16;
-                    copy_async16(&sm.k8[stage][row * kFp4HeadBytes + chunk * 16], k_cache + offset, valid);
-                    copy_async16(&sm.v8[stage][row * kFp4HeadBytes + chunk * 16], v_cache + offset, valid);
+                    const int dst_off = kMma4 ? k4_offset(row, chunk) : row * kFp4HeadBytes + chunk * 16;
+                    copy_async16(&sm.k8[stage][dst_off], k_cache + offset, valid);
+                    copy_async16(&sm.v8[stage][dst_off], v_cache + offset, valid);
                     if (chunk == 0) {
                         const size_t scales = fp4_scales(slot, g.kv_head);
                         copy_async8(&sm.k8[stage][kScalesAt + row * kFp4HeadScales], k_cache + scales, valid);
@@ -2082,9 +2155,77 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
     // holds E4M3 fragments instead: register j of k-step s holds row (j & 1),
     // dims 32s + 4(lane % 4) + 16(j >> 1) and the next 3, and qs[s] the UE8M0
     // scale of row g (lane t = 0) or g + 8 (lane t = 1) for those 32 dims.
-    uint32_t qa[kMma8 ? 1 : kHeadDim / 16][4];
+    // The FP4 MMA variant holds E2M1 fragments: register j of k-step ks holds
+    // row (j & 1), dims 64*ks + 8*(lane % 4) + 32*(j >> 1) and the next 7,
+    // qs4[ks] the 4 packed UE4M3 scales of row g (t = 0) or g + 8 (t = 1), and
+    // q_outer[i] the per-row outer scale folded into `row_score_scale`.
+    uint32_t qa[kMmaLow ? 1 : kHeadDim / 16][4];
     uint32_t qa8[kMma8 ? kHeadDim / 32 : 1][4];
     uint32_t qs[kMma8 ? kHeadDim / 32 : 1];
+    uint32_t qa4[kMma4 ? kHeadDim / 64 : 1][4];
+    uint32_t qs4[kMma4 ? kHeadDim / 64 : 1];
+    float q_outer[2] = {1.f, 1.f};
+    auto load_q4 = [&](const PrefillSegment& g) {
+        uint32_t scale_packed[2][kHeadDim / 64];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const unsigned mg = g.block_m * kRows + warp * 16 + lane / 4 + 8 * i;
+            const bool valid = mg < total_m;
+            const size_t head = size_t(valid ? mg / kGroup : 0) * kHeads + g.kv_head * kGroup + mg % kGroup;
+            const __nv_bfloat16* row = q + head * kHeadDim + (lane % 4) * 8;
+            float x[2][2][8];
+            float gmax[2][2];
+            float row_amax = 0.f;
+#pragma unroll
+            for (int ks = 0; ks < kHeadDim / 64; ++ks) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 raw =
+                        valid ? *reinterpret_cast<const uint4*>(row + 64 * ks + 32 * h) : make_uint4(0, 0, 0, 0);
+                    unpack_bf16x8(raw, x[ks][h]);
+                    float am = 0.f;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        am = fmaxf(am, fabsf(x[ks][h][j]));
+                    }
+                    // Lanes (t=0,1) hold group 0/2 (16 dims); lanes (t=2,3) hold group 1/3.
+                    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+                    gmax[ks][h] = am;
+                    row_amax = fmaxf(row_amax, am);
+                }
+            }
+            row_amax = fmaxf(row_amax, __shfl_xor_sync(0xffffffffu, row_amax, 2));
+            // Per-row outer scale maps the row's largest group scale (amax / 6) to 256,
+            // below E4M3's 448, keeping small groups in E4M3's normal range.
+            const float enc = row_amax > 0.f ? fminf(__fdiv_rn(1536.f, row_amax), 1e35f) : 0.f;
+            q_outer[i] = enc > 0.f ? __fdiv_rn(1.f, enc) : 0.f;
+#pragma unroll
+            for (int ks = 0; ks < kHeadDim / 64; ++ks) {
+                uint8_t sc[2];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    sc[h] = fp4_scale_of(gmax[ks][h] * enc);
+                    const float sv = e4m3_value(sc[h]);
+                    const float inv = sv == 0.f ? 0.f : __fdiv_rn(enc, sv);
+                    float scaled[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        scaled[j] = x[ks][h][j] * inv;
+                    }
+                    qa4[ks][2 * h + i] = pack_e2m1x8(scaled);
+                }
+                const uint32_t s0 = sc[0];
+                const uint32_t s1 = __shfl_xor_sync(0xffffffffu, s0, 2);
+                const uint32_t s2 = sc[1];
+                const uint32_t s3 = __shfl_xor_sync(0xffffffffu, s2, 2);
+                scale_packed[i][ks] = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
+            }
+        }
+#pragma unroll
+        for (int ks = 0; ks < kHeadDim / 64; ++ks) {
+            qs4[ks] = (lane & 1) ? scale_packed[1][ks] : scale_packed[0][ks];
+        }
+    };
     auto load_q8 = [&](const PrefillSegment& g) {
         uint32_t scale[2][kHeadDim / 32];
 #pragma unroll
@@ -2126,7 +2267,9 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         }
     };
     auto load_q = [&](const PrefillSegment& g) {
-        if constexpr (kMma8) {
+        if constexpr (kMma4) {
+            load_q4(g);
+        } else if constexpr (kMma8) {
             load_q8(g);
         } else {
 #pragma unroll
@@ -2174,31 +2317,34 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
     };
 
     // O += P V on FP8 for one tile, P as E4M3 A fragments: k-step kk covers
-    // keys 32kk..32kk+31 in the order of the transposed values.
-    auto pv8 = [&](float (&o)[kHeadDim / 8][4], const uint32_t (&pa)[kPrefillKeys / 32][4]) {
+    // keys 32kk..32kk+31 in the order of the transposed values in `vt`.
+    auto pv8 = [&](float (&o)[kHeadDim / 8][4], const uint32_t (&pa)[kPrefillKeys / 32][4], const uint8_t* vt) {
 #pragma unroll
         for (int kk = 0; kk < kPrefillKeys / 32; ++kk) {
 #pragma unroll
             for (int dp = 0; dp < kHeadDim / 16; ++dp) {
                 uint32_t b[4];
                 const int dim = dp * 16 + (lane & 7) + 8 * (lane >> 4);
-                ldmatrix_x4(b, reinterpret_cast<const uint8_t*>(sm.k[0]) + vt_offset(dim, 2 * kk + ((lane >> 3) & 1)));
+                ldmatrix_x4(b, vt + vt_offset(dim, 2 * kk + ((lane >> 3) & 1)));
                 mma_fp8(o[2 * dp], pa[kk], b[0], b[1], 0x7f7f7f7fu);
                 mma_fp8(o[2 * dp + 1], pa[kk], b[2], b[3], 0x7f7f7f7fu);
             }
         }
     };
 
-    // BF16 blocks run the two halves of their warps half a tile apart: warps
-    // 4-7 ("late" warps) compute each tile's P V at the start of the next tile.
-    // Each scheduler holds warp w and w + 4, so one warp's scores and softmax
-    // run while the other's products keep the tensor cores busy. The late
-    // warps still read the previous tile's values then, so only the keys of
-    // tile t + 1 are copied at the start of tile t; the late warps copy its
-    // values once all of them are done with tile t - 1's.
-    constexpr bool kSkew = !kFp8;
+    // BF16, FP8-MMA and FP4-MMA blocks run the two halves of their warps half a
+    // tile apart: warps 4-7 ("late" warps) compute each tile's P V at the start
+    // of the next tile. Each scheduler holds warp w and w + 4, so one warp's
+    // scores and softmax run while the other's products keep the tensor cores
+    // busy. BF16 late warps read `sm.v[1 - stage]` directly, so they sync on
+    // barrier 1 before refilling it; FP8-MMA and FP4-MMA keep two transposed
+    // value stages in `sm.k[0..1]`, so `load(next, 1 - stage)` never conflicts.
+    constexpr bool kSkewBf16 = !kFp8;
+    constexpr bool kSkewLow = kMmaLow;
+    constexpr bool kSkew = kSkewBf16 || kSkewLow;
     const bool late = kSkew && warp >= kWarps / 2;
-    uint32_t pending[kPrefillKeys / 16][4];
+    uint32_t pending[kMmaLow ? 1 : kPrefillKeys / 16][4];
+    uint32_t pending8[kMmaLow ? kPrefillKeys / 32 : 1][4];
     bool has_pending = false;
 
     // The first segment's first tile, bias and queries. Each later segment's
@@ -2247,6 +2393,12 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
             }
         }
         float o[kHeadDim / 8][4] = {};
+        // Capture this segment's score scale before `load_q(next_seg)` updates `q_outer`
+        // on the segment's last tile.
+        const float row_score_scale[2] = {
+            kMma4 ? score_scale * q_outer[0] : score_scale,
+            kMma4 ? score_scale * q_outer[1] : score_scale,
+        };
 
         for (unsigned t = seg.t_begin; t < seg.t_end; ++t) {
             const PrefillTile tile = tile_at(seg, t);
@@ -2257,7 +2409,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
             const bool more = !last_tile || has_next;
             const PrefillSegment& next_owner = last_tile ? next_seg : seg;
             const PrefillTile next = tile_at(next_owner, last_tile ? next_seg.t_begin : t + 1);
-            if constexpr (kSkew) {
+            if constexpr (kSkewBf16) {
                 if (more) {
                     copy_bf16(next_owner, next, sm.k[1 - stage],
                               next.input ? k_in : reinterpret_cast<const __nv_bfloat16*>(k_cache), threadIdx.x,
@@ -2282,14 +2434,15 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 load(next_owner, next, 1 - stage);
             }
             if constexpr (kMma8) {
-                // Transposes the staged values to [dim][key], keys in the MMA
-                // order: lane (t, kk, h, dim quad parity) = (lane % 4, lane / 8
-                // % 2, lane / 4 % 2, lane / 16) gathers stored positions 32kk +
-                // 16h + 4t + j (keys 32kk + 16h + 8 (j / 2) + 2t + j % 2) of 4
-                // dims and writes one word per dim.
+                // Transposes the staged values to [dim][key] in stage `stage`, keys in the
+                // MMA order: lane (t, kk, h, dim quad parity) = (lane % 4, lane / 8 % 2,
+                // lane / 4 % 2, lane / 16) gathers stored positions 32kk + 16h + 4t + j
+                // (keys 32kk + 16h + 8 (j / 2) + 2t + j % 2) of 4 dims and writes one word
+                // per dim.
                 const int t = lane % 4;
                 const int base_key = 32 * (lane / 8 % 2) + 16 * (lane / 4 % 2) + 2 * t;
                 const int position = 32 * (lane / 8 % 2) + 16 * (lane / 4 % 2) + 4 * t;
+                uint8_t* vt_dst = reinterpret_cast<uint8_t*>(sm.k[stage]);
 #pragma unroll
                 for (int it = 0; it < 2; ++it) {
                     const int quad = 2 * (warp + kWarps * it) + lane / 16;
@@ -2308,8 +2461,50 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
 #pragma unroll
                     for (int d = 0; d < 4; ++d) {
                         const int dim = 4 * quad + d;
-                        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(sm.k[0]) + vt_offset(dim, position / 16) +
-                                                     position % 16) = out4[d];
+                        *reinterpret_cast<uint32_t*>(vt_dst + vt_offset(dim, position / 16) + position % 16) = out4[d];
+                    }
+                }
+                __syncthreads();
+            } else if constexpr (kMma4) {
+                // Decodes and transposes the staged NVFP4 values directly into [dim][key]
+                // E4M3 in stage `stage`, matching `pv8`'s key order. Each quad of 4 dims
+                // lies inside one 16-dim NVFP4 scale group (`quad / 4`) and occupies 2 bytes.
+                constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+                const int t = lane % 4;
+                const int base_key = 32 * (lane / 8 % 2) + 16 * (lane / 4 % 2) + 2 * t;
+                const int position = 32 * (lane / 8 % 2) + 16 * (lane / 4 % 2) + 4 * t;
+                const uint8_t* v4 = sm.v8[stage];
+                uint8_t* vt_dst = reinterpret_cast<uint8_t*>(sm.k[stage]);
+#pragma unroll
+                for (int it = 0; it < 2; ++it) {
+                    const int quad = 2 * (warp + kWarps * it) + lane / 16;
+                    const int unit = quad / 8;
+                    const int sub = 2 * (quad % 8);
+                    const int group = quad / 4;
+                    uint32_t w[4];
+#pragma unroll
+                    for (int p = 0; p < 2; ++p) {
+                        const int key0 = base_key + 8 * p;
+                        const int key1 = key0 + 1;
+                        const uint16_t r0 = *reinterpret_cast<const uint16_t*>(&v4[k4_offset(key0, unit) + sub]);
+                        const uint16_t r1 = *reinterpret_cast<const uint16_t*>(&v4[k4_offset(key1, unit) + sub]);
+                        uint32_t h[4];
+                        e2m1x8_to_f16x8(uint32_t(r0) | (uint32_t(r1) << 16), h);
+                        const __half2 sc0 = e4m3_half2(v4[kScalesAt + key0 * kFp4HeadScales + group]);
+                        const __half2 sc1 = e4m3_half2(v4[kScalesAt + key1 * kFp4HeadScales + group]);
+                        w[2 * p] = f16x4_to_e4m3x4(hmul2_bits(h[0], sc0), hmul2_bits(h[1], sc0));
+                        w[2 * p + 1] = f16x4_to_e4m3x4(hmul2_bits(h[2], sc1), hmul2_bits(h[3], sc1));
+                    }
+                    const uint32_t t0 = prmt(w[0], w[1], 0x5140u);
+                    const uint32_t t1 = prmt(w[2], w[3], 0x5140u);
+                    const uint32_t t2 = prmt(w[0], w[1], 0x7362u);
+                    const uint32_t t3 = prmt(w[2], w[3], 0x7362u);
+                    const uint32_t out4[4] = {prmt(t0, t1, 0x5410u), prmt(t0, t1, 0x7632u), prmt(t2, t3, 0x5410u),
+                                              prmt(t2, t3, 0x7632u)};
+#pragma unroll
+                    for (int d = 0; d < 4; ++d) {
+                        const int dim = 4 * quad + d;
+                        *reinterpret_cast<uint32_t*>(vt_dst + vt_offset(dim, position / 16) + position % 16) = out4[d];
                     }
                 }
                 __syncthreads();
@@ -2358,12 +2553,49 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 }
                 __syncthreads();
             }
+            if constexpr (kSkewLow) {
+                // Late warps finish the previous tile's P V from `sm.k[1 - stage]` while
+                // early warps start this tile's Q K^T and softmax.
+                if (late && has_pending) {
+                    pv8(o, pending8, reinterpret_cast<const uint8_t*>(sm.k[1 - stage]));
+                    has_pending = false;
+                }
+            }
             const __nv_bfloat16* keys = sm.k[kFp8 ? 0 : stage];
             const __nv_bfloat16* values = sm.v[kFp8 ? 0 : stage];
 
             // S = Q K^T: n-tile n holds keys 8n..8n+7.
             float s[kPrefillKeys / 8][4] = {};
-            if constexpr (kMma8) {
+            if constexpr (kMma4) {
+                const uint8_t* keys4 = sm.k8[stage];
+                constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+                const int g = lane / 4;
+                const int t = lane % 4;
+                // Lane (g, t=0) loads ks=0 scales (bytes 0..3) of key 8n + g;
+                // lane (g, t=1) loads ks=1 scales (bytes 4..7). Conflict-free.
+                uint32_t sb[kPrefillKeys / 8];
+#pragma unroll
+                for (int n = 0; n < kPrefillKeys / 8; ++n) {
+                    sb[n] = *reinterpret_cast<const uint32_t*>(keys4 + kScalesAt + (8 * n + g) * kFp4HeadScales +
+                                                               4 * (t & 1));
+                }
+#pragma unroll
+                for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                    uint32_t b[4];
+                    const int key = np * 16 + (lane & 7) + 8 * (lane >> 4);
+                    ldmatrix_x4(b, keys4 + k4_offset(key, (lane >> 3) & 1));
+                    mma_fp4<0>(s[2 * np], qa4[0], b[0], b[1], qs4[0], sb[2 * np]);
+                    mma_fp4<0>(s[2 * np + 1], qa4[0], b[2], b[3], qs4[0], sb[2 * np + 1]);
+                }
+#pragma unroll
+                for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                    uint32_t b[4];
+                    const int key = np * 16 + (lane & 7) + 8 * (lane >> 4);
+                    ldmatrix_x4(b, keys4 + k4_offset(key, 2 + ((lane >> 3) & 1)));
+                    mma_fp4<1>(s[2 * np], qa4[1], b[0], b[1], qs4[1], sb[2 * np]);
+                    mma_fp4<1>(s[2 * np + 1], qa4[1], b[2], b[3], qs4[1], sb[2 * np + 1]);
+                }
+            } else if constexpr (kMma8) {
                 const uint8_t* keys8 = sm.k8[stage];
 #pragma unroll
                 for (int ks = 0; ks < kHeadDim / 32; ++ks) {
@@ -2376,19 +2608,20 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                         mma_fp8(s[2 * np + 1], qa8[ks], b[2], b[3], qs[ks]);
                     }
                 }
-            }
+            } else {
 #pragma unroll
-            for (int ks = 0; ks < (kMma8 ? 0 : kHeadDim / 16); ++ks) {
+                for (int ks = 0; ks < kHeadDim / 16; ++ks) {
 #pragma unroll
-                for (int np = 0; np < kPrefillKeys / 16; ++np) {
-                    uint32_t b[4];
-                    ldmatrix_x4(b, keys + swizzle(np * 16 + (lane >> 4) * 8 + (lane & 7), 2 * ks + ((lane >> 3) & 1)));
-                    if constexpr (F::kFp4) {
-                        mma_f16(s[2 * np], qa[ks], b[0], b[1]);
-                        mma_f16(s[2 * np + 1], qa[ks], b[2], b[3]);
-                    } else {
-                        mma_bf16(s[2 * np], qa[ks], b[0], b[1]);
-                        mma_bf16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                    for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                        uint32_t b[4];
+                        ldmatrix_x4(b, keys + swizzle(np * 16 + (lane >> 4) * 8 + (lane & 7), 2 * ks + ((lane >> 3) & 1)));
+                        if constexpr (F::kFp4) {
+                            mma_f16(s[2 * np], qa[ks], b[0], b[1]);
+                            mma_f16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                        } else {
+                            mma_bf16(s[2 * np], qa[ks], b[0], b[1]);
+                            mma_bf16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                        }
                     }
                 }
             }
@@ -2412,7 +2645,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 for (int n = 0; n < kPrefillKeys / 8; ++n) {
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        s[n][e] *= score_scale;
+                        s[n][e] *= row_score_scale[e / 2];
                     }
                 }
             } else if (tile.full && tile.near) {
@@ -2421,7 +2654,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
                         const float b = __bfloat162float(bias_base[e / 2][-(n * 8 + e % 2)]);
-                        s[n][e] = fmaf(b, kLog2e, s[n][e] * score_scale);
+                        s[n][e] = fmaf(b, kLog2e, s[n][e] * row_score_scale[e / 2]);
                     }
                 }
             } else {
@@ -2434,7 +2667,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                         const unsigned p = tile.p0 + j;
                         const unsigned distance = position[i] - p;
                         const bool visible = p < tile.end && p <= position[i] && (window == 0 || distance < window);
-                        float x = s[n][e] * score_scale;
+                        float x = s[n][e] * row_score_scale[i];
                         if (tile.biased && distance < extent) {
                             x = fmaf(__bfloat162float(bias_base[i][-(n * 8 + e % 2)]), kLog2e, x);
                         }
@@ -2488,7 +2721,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 o[n][3] *= factor[1];
             }
 
-            if constexpr (kMma8) {
+            if constexpr (kMmaLow) {
                 // A register j of k-step kk: row j % 2, n-tiles 4kk + 2 (j / 2)
                 // and 4kk + 2 (j / 2) + 1.
                 uint32_t pa8[kPrefillKeys / 32][4];
@@ -2501,7 +2734,18 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                         pa8[kk][j] = pack_e4m3x4(s[n][e], s[n][e + 1], s[n + 1][e], s[n + 1][e + 1]);
                     }
                 }
-                pv8(o, pa8);
+                if (late) {
+#pragma unroll
+                    for (int kk = 0; kk < kPrefillKeys / 32; ++kk) {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            pending8[kk][j] = pa8[kk][j];
+                        }
+                    }
+                    has_pending = true;
+                } else {
+                    pv8(o, pa8, reinterpret_cast<const uint8_t*>(sm.k[stage]));
+                }
             } else {
                 uint32_t pa[kPrefillKeys / 16][4];
 #pragma unroll
@@ -2529,7 +2773,11 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         // The late warps' last tile, whose values sit in the stage before the
         // next segment's.
         if (has_pending) {
-            pv(o, pending, sm.v[1 - stage]);
+            if constexpr (kSkewLow) {
+                pv8(o, pending8, reinterpret_cast<const uint8_t*>(sm.k[1 - stage]));
+            } else {
+                pv(o, pending, sm.v[1 - stage]);
+            }
             has_pending = false;
         }
 
@@ -2770,12 +3018,28 @@ prefill_attention_fp8_mma(const __nv_bfloat16* q, const __nv_bfloat16* k_in, con
                                                    scale);
 }
 
+// `prefill_attention_fp4` with Q K^T on native Blackwell NVFP4 tensor cores
+// (`kind::mxf4nvf4`, m16n8k64) and P V on block-scaled FP8 tensor cores
+// (`kind::mxf8f6f4`, m16n8k32). Every key comes from the NVFP4 cache.
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_fp4_mma(const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
+                          const uint8_t* k_cache, const uint8_t* v_cache, const __nv_bfloat16* bias,
+                          const __nv_bfloat16* sinks, float* partials, unsigned* counters, __nv_bfloat16* out,
+                          const unsigned* start, unsigned rows, unsigned slots, unsigned window, unsigned extent,
+                          unsigned input_keys, float scale) {
+    prefill_attention<Fp4MmaFormat, kPrefillWarps>(q, k_in, v_in, k_cache, v_cache, bias, sinks, partials,
+                                                   counters, out, start, rows, slots, window, extent, input_keys,
+                                                   scale);
+}
+
 // The launcher passes PREFILL_SHARED_BYTES of dynamic shared memory.
 static_assert(sizeof(PrefillShared<Bf16Format, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp8Format, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp8MmaFormat, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp4Format, kPrefillWarps>) <= 84240);
+static_assert(sizeof(PrefillShared<Fp4MmaFormat, kPrefillWarps>) <= 84240);
 static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <= PrefillShared<Fp4Format, kPrefillWarps>::kStaged);
+static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <= PrefillShared<Fp4MmaFormat, kPrefillWarps>::kStaged);
 
 // ---------------------------------------------------------------------------
 // Ragged packed multi-slice prefill KV append & flash attention: runs across

@@ -935,13 +935,15 @@ impl Model {
         Ok(())
     }
 
-    /// Makes [`Model::prefill`] run attention over an FP8 cache as `attention` says
+    /// Makes [`Model::prefill`] run attention over an FP8 or NVFP4 cache as `attention` says
     /// ([`DEFAULT_PREFILL_ATTENTION`] until set). Decode and BF16 caches are unaffected.
-    /// [`PrefillAttention::Fp8`] needs [`crate::BLOCK_SCALED_MMA`].
+    /// [`PrefillAttention::Fp8`] and [`PrefillAttention::Fp4`] need
+    /// [`crate::BLOCK_SCALED_MMA`].
     pub fn set_prefill_attention(&mut self, attention: PrefillAttention) -> anyhow::Result<()> {
         ensure!(
-            crate::BLOCK_SCALED_MMA || attention != PrefillAttention::Fp8,
-            "FP8 prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
+            crate::BLOCK_SCALED_MMA
+                || !matches!(attention, PrefillAttention::Fp8 | PrefillAttention::Fp4),
+            "{attention} prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
         );
         self.ctx.prefill_attention = attention;
         Ok(())
@@ -956,6 +958,10 @@ impl Model {
     /// single-sequence verify are unaffected. Drops the captured batched graphs when
     /// changed.
     pub fn set_prefill_dense(&mut self, products: Products) -> anyhow::Result<()> {
+        ensure!(
+            products != Products::Fp4,
+            "dense prefill products are bf16 or fp8, not fp4"
+        );
         ensure!(
             crate::BLOCK_SCALED_MMA || products == Products::Bf16,
             "FP8 dense products need the block-scaled MMA, which this sm_89 build lacks"

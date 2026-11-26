@@ -139,7 +139,7 @@ mod linux {
             } else if arg == "--prefill-attention" {
                 prefill_attention = it
                     .next()
-                    .context("--prefill-attention needs auto, bf16 or fp8")?
+                    .context("--prefill-attention needs auto, bf16, fp8 or fp4")?
                     .parse()?;
             } else if arg == "--prefill-dense" {
                 prefill_dense = it
@@ -183,7 +183,7 @@ mod linux {
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
              [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] \
              [--verify WIDTH] [--accept-margin MARGIN] [--dump FILE] \
-             [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
+             [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8|fp4] \
              [--prefill-dense bf16|fp8] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] \
              [--moe-min-k 1..=8] [kv options]",
         )?;

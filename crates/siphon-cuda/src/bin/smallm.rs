@@ -140,7 +140,7 @@ mod linux {
         let mut it = env::args().skip(2);
         let usage = "usage: smallm verify <model-dir> <capture> --width M [--passes N] \
                      [--weights bf16|fp8] [--output-projection bf16|fp8] [--kv bf16|fp8] \
-                     [--hash 1] [--prefill-attention auto|bf16|fp8]";
+                     [--hash 1] [--prefill-attention auto|bf16|fp8|fp4]";
         let model_dir = PathBuf::from(it.next().context(usage)?);
         let capture = PathBuf::from(it.next().context(usage)?);
         let (mut width, mut passes, mut weights, mut kv, mut hash) =

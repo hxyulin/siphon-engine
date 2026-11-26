@@ -106,13 +106,16 @@ impl QuantDest<'_> {
 }
 
 /// How prefill multiplies its attention and dense products: in BF16 (F16 for attention's
-/// weighted values), or on the block-scaled FP8 tensor cores with the activations quantized
-/// to E4M3. FP8 lowers precision on purpose; decode never uses it.
+/// weighted values), on the block-scaled FP8 tensor cores with activations quantized to E4M3,
+/// or on Blackwell's native NVFP4 tensor cores for NVFP4 KV cache prefill attention
+/// (`prefill_attention_fp4_mma`: NVFP4 `Q K^T` with FP8 `P V`). Lower-precision modes are
+/// opt-in for prefill; decode never uses them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Products {
     #[default]
     Bf16,
     Fp8,
+    Fp4,
 }
 
 impl FromStr for Products {
@@ -122,7 +125,8 @@ impl FromStr for Products {
         match s {
             "bf16" => Ok(Self::Bf16),
             "fp8" => Ok(Self::Fp8),
-            _ => anyhow::bail!("unknown product format {s:?}; expected bf16 or fp8"),
+            "fp4" => Ok(Self::Fp4),
+            _ => anyhow::bail!("unknown product format {s:?}; expected bf16, fp8 or fp4"),
         }
     }
 }
@@ -132,6 +136,7 @@ impl fmt::Display for Products {
         f.write_str(match self {
             Self::Bf16 => "bf16",
             Self::Fp8 => "fp8",
+            Self::Fp4 => "fp4",
         })
     }
 }

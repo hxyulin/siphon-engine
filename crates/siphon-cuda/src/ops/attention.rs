@@ -736,6 +736,8 @@ pub struct Attention {
     kv_append_rows_packed_fp8: CudaFunction,
     kv_append_rows_packed_fp4: CudaFunction,
     prefill_fp4: CudaFunction,
+    /// `prefill_attention_fp4_mma`, for [`Products::Fp4`] on an NVFP4 cache.
+    prefill_fp4_mma: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
     /// `prefill_attention_fp8_mma`, for [`Products::Fp8`].
@@ -887,7 +889,14 @@ impl Attention {
         let prefill_fp8 = module.load_function("prefill_attention_fp8")?;
         let prefill_fp8_mma = module.load_function("prefill_attention_fp8_mma")?;
         let prefill_fp4 = module.load_function("prefill_attention_fp4")?;
-        for function in [&prefill, &prefill_fp8, &prefill_fp8_mma, &prefill_fp4] {
+        let prefill_fp4_mma = module.load_function("prefill_attention_fp4_mma")?;
+        for function in [
+            &prefill,
+            &prefill_fp8,
+            &prefill_fp8_mma,
+            &prefill_fp4,
+            &prefill_fp4_mma,
+        ] {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 PREFILL_SHARED_BYTES.cast_signed(),
@@ -932,6 +941,7 @@ impl Attention {
             kv_append_rows_packed_fp8: module.load_function("kv_append_rows_packed_fp8")?,
             kv_append_rows_packed_fp4: module.load_function("kv_append_rows_packed_fp4")?,
             prefill_fp4,
+            prefill_fp4_mma,
             prefill,
             prefill_fp8,
             prefill_fp8_mma,
@@ -1864,8 +1874,11 @@ impl Attention {
     /// A single row runs [`Attention::append`] and [`Attention::decode_attention`].
     ///
     /// With [`Products::Fp8`], an FP8 cache's products run on the FP8 tensor cores
-    /// (`prefill_attention_fp8_mma`): the queries and the softmax weights round to E4M3. A
-    /// BF16 cache ignores it.
+    /// (`prefill_attention_fp8_mma`): the queries and the softmax weights round to E4M3.
+    /// With [`Products::Fp4`], an NVFP4 cache runs `Q K^T` directly on Blackwell's native
+    /// NVFP4 tensor cores (`prefill_attention_fp4_mma`, `m16n8k64`) and `P V` on FP8 tensor
+    /// cores (`m16n8k32`), while an FP8 cache uses `prefill_attention_fp8_mma`. A BF16 cache
+    /// ignores both.
     ///
     /// `rows` is 1 to `scratch`'s row count. The caller checks [`KvCache::holds`] for
     /// position `start + rows - 1`, and `extent` must be a multiple of 8.
@@ -1932,6 +1945,15 @@ impl Attention {
                 ),
             "sliding caches are BF16, FP8 or NVFP4"
         );
+        ensure!(
+            crate::BLOCK_SCALED_MMA
+                || !matches!(
+                    (&*cache.data, products),
+                    (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4)
+                        | (KvData::Nvfp4 { .. }, Products::Fp4)
+                ),
+            "{products} prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
+        );
         if input_keys == 0 {
             self.append_rows(stream, cache, &start, rows, &k, &v)?;
         }
@@ -1939,8 +1961,9 @@ impl Attention {
         let function = match (&*cache.data, products) {
             (KvData::Bf16 { .. }, _) => &self.prefill,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
-            (KvData::Fp8 { .. }, Products::Fp8) => &self.prefill_fp8_mma,
-            (KvData::Nvfp4 { .. }, _) => &self.prefill_fp4,
+            (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4) => &self.prefill_fp8_mma,
+            (KvData::Nvfp4 { .. }, Products::Bf16 | Products::Fp8) => &self.prefill_fp4,
+            (KvData::Nvfp4 { .. }, Products::Fp4) => &self.prefill_fp4_mma,
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&q).arg(&k).arg(&v);
@@ -1972,8 +1995,8 @@ impl Attention {
         // const bf16* v_in, const bf16* k_cache, const bf16* v_cache, const bf16* bias, const
         // bf16* sinks, float* partials, unsigned* counters, bf16* out, const unsigned* start,
         // unsigned rows, unsigned slots, unsigned window, unsigned extent, unsigned
-        // input_keys, float scale)`, or `prefill_attention_fp8`, `prefill_attention_fp8_mma`
-        // and `prefill_attention_fp4` with `uint8_t*` caches. The
+        // input_keys, float scale)`, or `prefill_attention_fp8`, `prefill_attention_fp8_mma`,
+        // `prefill_attention_fp4` and `prefill_attention_fp4_mma` with `uint8_t*` caches. The
         // checks above size `q`, `k`, `v`, `bias`, `sinks` and `out` for `rows` rows. The
         // kernel reads input rows below `rows`, cache slots below `slots` and bias columns
         // below `extent`. Its `scratch.blocks`
@@ -2119,7 +2142,7 @@ impl Attention {
         let function = match (&*cache.data, products) {
             (KvData::Bf16 { .. }, _) => &self.prefill_packed,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_packed_fp8,
-            (KvData::Fp8 { .. }, Products::Fp8) => &self.prefill_packed_fp8_mma,
+            (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4) => &self.prefill_packed_fp8_mma,
             (KvData::Nvfp4 { .. }, _) => &self.prefill_packed_fp4,
         };
         let mut launch = stream.launch_builder(function);

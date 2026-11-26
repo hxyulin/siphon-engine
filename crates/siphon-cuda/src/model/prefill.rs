@@ -65,9 +65,11 @@ pub const DEFAULT_PREFILL_ATTENTION: PrefillAttention = PrefillAttention::Auto;
 /// 92,160 tokens.
 pub const FP8_ATTENTION_KEYS: usize = 16_384;
 
-/// Which products [`Model::prefill`]'s global attention runs over an FP8 cache. FP8 passes
-/// the quality gate (see `docs/engine.md`) and halves global attention's time, but changes
-/// the cache prefill leaves, and with it greedy decode.
+/// Which products [`Model::prefill`]'s global attention runs over an FP8 or NVFP4 cache.
+/// FP8 passes the quality gate (see `docs/engine.md`) and halves global attention's time,
+/// but changes the cache prefill leaves, and with it greedy decode. FP4 (opt-in) runs
+/// `Q K^T` on Blackwell's native NVFP4 tensor cores (`m16n8k64`) and `P V` on FP8 tensor
+/// cores (`m16n8k32`) over an NVFP4 cache, and uses FP8 tensor cores over an FP8 cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillAttention {
     /// BF16 for chunks whose last row reads up to [`FP8_ATTENTION_KEYS`] keys, FP8 after,
@@ -76,6 +78,7 @@ pub enum PrefillAttention {
     Auto,
     Bf16,
     Fp8,
+    Fp4,
 }
 
 impl PrefillAttention {
@@ -85,6 +88,7 @@ impl PrefillAttention {
             Self::Auto if end > FP8_ATTENTION_KEYS && crate::BLOCK_SCALED_MMA => Products::Fp8,
             Self::Auto | Self::Bf16 => Products::Bf16,
             Self::Fp8 => Products::Fp8,
+            Self::Fp4 => Products::Fp4,
         }
     }
 }
@@ -97,7 +101,8 @@ impl FromStr for PrefillAttention {
             "auto" => Ok(Self::Auto),
             "bf16" => Ok(Self::Bf16),
             "fp8" => Ok(Self::Fp8),
-            _ => anyhow::bail!("unknown prefill attention {s:?}; expected auto, bf16 or fp8"),
+            "fp4" => Ok(Self::Fp4),
+            _ => anyhow::bail!("unknown prefill attention {s:?}; expected auto, bf16, fp8 or fp4"),
         }
     }
 }
@@ -108,6 +113,7 @@ impl fmt::Display for PrefillAttention {
             Self::Auto => "auto",
             Self::Bf16 => "bf16",
             Self::Fp8 => "fp8",
+            Self::Fp4 => "fp4",
         })
     }
 }
@@ -1057,7 +1063,7 @@ impl Model {
             let blocks_m = prefill_blocks(s.len);
             let dst = match ctx.prefill_attention.products(s.start + s.len) {
                 Products::Bf16 => &mut bf16_descs,
-                Products::Fp8 => &mut fp8_descs,
+                Products::Fp8 | Products::Fp4 => &mut fp8_descs,
             };
             for bm in 0..blocks_m {
                 dst.push(u32::try_from((bm << 8) | si)?);

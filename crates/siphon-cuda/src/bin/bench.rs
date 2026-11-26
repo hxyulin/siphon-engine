@@ -4,7 +4,7 @@
 //!        [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] [--json]
 //!        bench <model-dir> --prefill 512,4096,32768 [--chunk N] [--passes N]
 //!        [--kv bf16|fp8] [--weights bf16|fp8] [--expert-activations bf16|quantized|fp8]
-//!        [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]
+//!        [--prefill-attention auto|bf16|fp8|fp4] [--prefill-dense bf16|fp8] [--json]
 //!
 //! With `--prefill`, each prompt length runs once through `Model::prefill` in chunks of
 //! `--chunk` rows from an empty cache, after one warmup chunk, and the time to the first
@@ -127,7 +127,7 @@ mod linux {
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--expert-activations bf16|quantized|fp8] \
-                         [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]\n       \
+                         [--prefill-attention auto|bf16|fp8|fp4] [--prefill-dense bf16|fp8] [--json]\n       \
                          every mode also takes [--kv-quant none|nvfp4|q4_0] [--kv-rotate] \
                          [--kv-quant-visits V,V,...] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] \
                          [--moe-min-k 1..=8]";

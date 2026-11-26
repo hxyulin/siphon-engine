@@ -168,6 +168,11 @@ const PREFILL_FP8_ERROR: f64 = 1.0 / 14.0;
 /// Absolute error of the FP8 product prefill attention: weights below 2^-17 of a row's
 /// largest flush to zero in E4M3, and the values are at most about 8.
 const PREFILL_FP8_V_ERROR: f64 = 8.0 / 131_072.0;
+/// Error of the FP4 product prefill attention (`prefill_attention_fp4_mma`) per unit of
+/// magnitude, against a reference with the same NVFP4 queries ([`nvfp4_queries`]) and
+/// stored NVFP4 values: softmax weights round to E4M3 (`<= 2^-4`) and decoded NVFP4 values
+/// also round to E4M3 (`<= 2^-4`) for `pv8`, so combined relative error is at most ~1/7.
+const PREFILL_FP4_ERROR: f64 = 1.0 / 6.0;
 
 /// How far one comparison came from its tolerance.
 #[derive(Clone, Copy, Debug, Default)]
@@ -315,6 +320,89 @@ fn mxfp8_queries(q: &[bf16]) -> Vec<bf16> {
                 .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() / scale)) * scale))
         })
         .collect()
+}
+
+/// Rounds `y` to the nearest E2M1 value, ties to even, saturated to `+-6.0`, matching
+/// `cvt.rn.satfinite.e2m1x2.f32`.
+fn e2m1_round(y: f32) -> f32 {
+    let a = y.abs();
+    let mag: f32 = if a <= 0.25 {
+        0.0
+    } else if a < 0.75 {
+        0.5
+    } else if a <= 1.25 {
+        1.0
+    } else if a < 1.75 {
+        1.5
+    } else if a <= 2.5 {
+        2.0
+    } else if a < 3.5 {
+        3.0
+    } else if a <= 5.0 {
+        4.0
+    } else {
+        6.0
+    };
+    mag.copysign(y)
+}
+
+/// Values as an NVFP4 KV cache (`kv_append_rows_fp4`) stores them: per 16 elements, an
+/// E4M3 scale `E4M3(amax / 6)` and E2M1 values rounded to nearest even.
+fn nvfp4_stored(values: &[bf16]) -> Vec<f32> {
+    values
+        .chunks(16)
+        .flat_map(|group| {
+            let amax = group.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
+            let scale = e4m3_value(e4m3_from_f32(amax / 6.0));
+            group.iter().map(move |x| {
+                if scale == 0.0 {
+                    0.0
+                } else {
+                    e2m1_round(x.to_f32() / scale) * scale
+                }
+            })
+        })
+        .collect()
+}
+
+/// The queries `[heads, 128]` as `prefill_attention_fp4_mma` quantizes them: a per-head
+/// F32 outer scale `amax / 1536`, per-16 UE4M3 scales `E4M3(group_amax * enc / 6)`, and
+/// E2M1 values rounded to nearest even.
+fn nvfp4_queries(q: &[bf16]) -> Vec<bf16> {
+    q.chunks(HEAD_DIM)
+        .flat_map(|head| {
+            let row_amax = head.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
+            let enc = if row_amax > 0.0 {
+                (1536.0 / row_amax).min(1e35)
+            } else {
+                0.0
+            };
+            let outer = if enc > 0.0 { 1.0 / enc } else { 0.0 };
+            head.chunks(16).flat_map(move |group| {
+                let gmax = group.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
+                let sv = e4m3_value(e4m3_from_f32(gmax * enc / 6.0));
+                let inv = if sv == 0.0 { 0.0 } else { enc / sv };
+                group
+                    .iter()
+                    .map(move |x| bf16::from_f32(e2m1_round(x.to_f32() * inv) * sv * outer))
+            })
+        })
+        .collect()
+}
+
+/// Cosine similarity and max absolute difference between two BF16 slices.
+fn cosine_and_max_abs(a: &[bf16], b: &[bf16]) -> (f64, f64) {
+    let (mut dot, mut na, mut nb, mut max_abs) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (xf, yf) = (x.to_f64(), y.to_f64());
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+        max_abs = max_abs.max((xf - yf).abs());
+    }
+    let denom = (na * nb).sqrt();
+    let cosine = if denom > 0.0 { dot / denom } else { 1.0 };
+    (cosine, max_abs)
 }
 
 /// Prints how far `got` is from `want`, the reference on the unquantized cache: the RMS error
@@ -1081,6 +1169,13 @@ fn assert_same_cache(stream: &Arc<CudaStream>, a: &KvCache, b: &KvCache) -> anyh
                 keys: keys_b,
                 values: values_b,
             },
+        )
+        | (
+            KvData::Nvfp4 { keys, values },
+            KvData::Nvfp4 {
+                keys: keys_b,
+                values: values_b,
+            },
         ) => {
             stream.clone_dtoh(keys)? == stream.clone_dtoh(keys_b)?
                 && stream.clone_dtoh(values)? == stream.clone_dtoh(values_b)?
@@ -1450,6 +1545,324 @@ fn long_fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
         8,
         Products::Fp8,
     )
+}
+
+/// Checks `prefill_attention_fp4_mma` (`Products::Fp4` on an NVFP4 global cache) against:
+/// 1. The F64 host reference on its own NVFP4-quantized queries and stored NVFP4 KV cache,
+/// 2. The exact F16 `prefill_attention_fp4` (`Products::Bf16`) on the same NVFP4 KV cache,
+/// 3. The unquantized BF16 `prefill_attention_bf16` reference.
+///
+/// Verifies byte-identical NVFP4 cache contents, strict F64 error bounds, and cosine /
+/// max-abs parity tolerances.
+#[expect(
+    clippy::too_many_lines,
+    reason = "runs three caches in lockstep over the chunks"
+)]
+fn check_prefill_fp4_mma(capacity: usize, chunks: &[Chunk], seed: u64) -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let mut fp4_mma_cache = KvCache::global_with_format(stream, capacity, KvFormat::Nvfp4)?;
+    let mut fp4_ref_cache = KvCache::global_with_format(stream, capacity, KvFormat::Nvfp4)?;
+    let mut bf16_ref_cache = KvCache::global_with_format(stream, capacity, KvFormat::Bf16)?;
+
+    let tokens: usize = chunks.iter().map(|c| c.rows).sum();
+    let mut rng = Rng(seed);
+    let topics: Vec<Vec<f32>> = (0..4)
+        .map(|_| (0..HEAD_DIM).map(|_| 1.5 * rng.normal()).collect())
+        .collect();
+    let k = rng.heads(tokens * KV_HEADS, &topics);
+    let v = rng.normals(tokens * ROW, 1.0);
+    let stored_k = nvfp4_stored(&k);
+    let stored_v = nvfp4_stored(&v);
+    let k_dev = stream.clone_htod(&k)?;
+    let v_dev = stream.clone_htod(&v)?;
+
+    let mut scratch = PrefillScratch::new(stream, MAX_PREFILL_ROWS)?;
+    let mut start_dev = stream.alloc_zeros::<u32>(1)?;
+    let head_len = HEADS * HEAD_DIM;
+    let bias_len = HEADS * EXTENT;
+
+    let mut start = 0;
+    for chunk in chunks {
+        let m = chunk.rows;
+        let checks = chunk.checks.clone().unwrap_or_else(|| (0..m).collect());
+        let (q, bias, sinks) = if checks.is_empty() {
+            (
+                rng.heads(m * HEADS, &topics),
+                vec![bf16::ZERO; m * bias_len],
+                vec![bf16::ZERO; m * HEADS],
+            )
+        } else {
+            (
+                rng.heads(m * HEADS, &topics),
+                rng.normals(m * bias_len, 1.5),
+                rng.normals(m * HEADS, 2.0),
+            )
+        };
+        let q_dev = stream.clone_htod(&q)?;
+        let bias_dev = stream.clone_htod(&bias)?;
+        let sinks_dev = stream.clone_htod(&sinks)?;
+        let mut out_mma = stream.alloc_zeros::<bf16>(m * head_len)?;
+        let mut out_fp4 = stream.alloc_zeros::<bf16>(m * head_len)?;
+        let mut out_bf16 = stream.alloc_zeros::<bf16>(m * head_len)?;
+        stream.memcpy_htod(&[u32::try_from(start)?], &mut start_dev)?;
+        let rows = start * ROW..(start + m) * ROW;
+
+        attention.prefill_attention(
+            stream,
+            &q_dev,
+            &k_dev.slice(rows.clone()),
+            &v_dev.slice(rows.clone()),
+            &mut fp4_mma_cache,
+            &start_dev,
+            m,
+            &bias_dev,
+            &sinks_dev,
+            &mut scratch,
+            &mut out_mma,
+            Products::Fp4,
+        )?;
+        attention.prefill_attention(
+            stream,
+            &q_dev,
+            &k_dev.slice(rows.clone()),
+            &v_dev.slice(rows.clone()),
+            &mut fp4_ref_cache,
+            &start_dev,
+            m,
+            &bias_dev,
+            &sinks_dev,
+            &mut scratch,
+            &mut out_fp4,
+            Products::Bf16,
+        )?;
+        attention.prefill_attention(
+            stream,
+            &q_dev,
+            &k_dev.slice(rows.clone()),
+            &v_dev.slice(rows),
+            &mut bf16_ref_cache,
+            &start_dev,
+            m,
+            &bias_dev,
+            &sinks_dev,
+            &mut scratch,
+            &mut out_bf16,
+            Products::Bf16,
+        )?;
+
+        if !checks.is_empty() {
+            let got_mma = stream.clone_dtoh(&out_mma)?;
+            let got_fp4 = stream.clone_dtoh(&out_fp4)?;
+            let got_bf16 = stream.clone_dtoh(&out_bf16)?;
+            let mut vs_reference = Closeness::default();
+            let mut min_cos_fp4 = 1.0f64;
+            let mut max_abs_fp4 = 0.0f64;
+            let mut min_cos_bf16 = 1.0f64;
+            let mut min_cos_ref_bf16 = 1.0f64;
+            let mut max_abs_bf16 = 0.0f64;
+            for &i in &checks {
+                let position = start + i;
+                let span = i * head_len..(i + 1) * head_len;
+                let query = Query {
+                    q: nvfp4_queries(&q[span.clone()]),
+                    bias: bias[i * bias_len..(i + 1) * bias_len].to_vec(),
+                    sinks: sinks[i * HEADS..(i + 1) * HEADS].to_vec(),
+                };
+                let history = ..(position + 1) * ROW;
+                let (want, magnitude) = reference(
+                    &query,
+                    &stored_k[history],
+                    &stored_v[history],
+                    None,
+                    position,
+                );
+                let row_mma = &got_mma[span.clone()];
+                let row_fp4 = &got_fp4[span.clone()];
+                let row_bf16 = &got_bf16[span];
+                vs_reference = vs_reference.merge(check_within(
+                    &format!("nvfp4_mma prefill {position} vs F64"),
+                    row_mma,
+                    &want,
+                    &magnitude,
+                    Tolerance {
+                        absolute: PREFILL_FP8_V_ERROR,
+                        ..Tolerance::reference(F32_ERROR + PREFILL_FP4_ERROR)
+                    },
+                ));
+                let (cos_fp4, abs_fp4) = cosine_and_max_abs(row_mma, row_fp4);
+                let (cos_bf16, abs_bf16) = cosine_and_max_abs(row_mma, row_bf16);
+                let (cos_ref_bf16, _) = cosine_and_max_abs(row_fp4, row_bf16);
+                min_cos_fp4 = min_cos_fp4.min(cos_fp4);
+                max_abs_fp4 = max_abs_fp4.max(abs_fp4);
+                min_cos_bf16 = min_cos_bf16.min(cos_bf16);
+                min_cos_ref_bf16 = min_cos_ref_bf16.min(cos_ref_bf16);
+                max_abs_bf16 = max_abs_bf16.max(abs_bf16);
+                assert!(
+                    cos_fp4 >= 0.985,
+                    "nvfp4_mma pos {position} vs nvfp4_f16: cosine {cos_fp4:.5} < 0.985 \
+                     (max_abs {abs_fp4:.4})"
+                );
+                assert!(
+                    cos_bf16 >= cos_ref_bf16 - 0.025,
+                    "nvfp4_mma pos {position} vs bf16: cosine {cos_bf16:.5} dropped more than \
+                     0.025 below nvfp4_f16 vs bf16 ({cos_ref_bf16:.5}, max_abs {abs_bf16:.4})"
+                );
+            }
+            eprintln!(
+                "nvfp4_mma chunk {start}+{m}: {} rows vs F64 worst {:.0}% tol; \
+                 vs nvfp4_f16 min_cos={min_cos_fp4:.5} max_abs={max_abs_fp4:.4}; \
+                 vs bf16 min_cos={min_cos_bf16:.5} (nvfp4_f16={min_cos_ref_bf16:.5}) \
+                 max_abs={max_abs_bf16:.4}",
+                checks.len(),
+                100.0 * vs_reference.worst,
+            );
+        }
+        start += m;
+    }
+    assert_same_cache(stream, &fp4_mma_cache, &fp4_ref_cache)
+}
+
+#[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
+fn fp4_product_prefill_attention_matches_reference() -> anyhow::Result<()> {
+    let chunks = [
+        Chunk::full(77),
+        Chunk::full(1),
+        Chunk::full(2),
+        Chunk::sampled(1024, spread(1024)),
+        Chunk::sampled(512, spread(512)),
+        Chunk::sampled(2048, spread(2048)),
+    ];
+    check_prefill_fp4_mma(4096, &chunks, 12)
+}
+
+#[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
+fn long_fp4_product_prefill_attention_matches_reference() -> anyhow::Result<()> {
+    check_prefill_fp4_mma(40_960, &long_chunks(), 13)
+}
+
+/// Throughput benchmark comparing `prefill_attention` variants (BF16, FP8, FP8-MMA,
+/// NVFP4-F16, NVFP4-MMA) across sequence lengths `L = 2048, 4096, 8192` (with 2048-row
+/// chunks ending at `L`, plus sliding window). Run with `--ignored --nocapture` on an
+/// idle Blackwell GPU.
+#[test]
+#[ignore = "timing, not a check"]
+#[expect(clippy::too_many_lines, reason = "benchmark sweep table")]
+fn prefill_attention_fp4_timing() -> anyhow::Result<()> {
+    use cudarc::driver::sys::CUevent_flags;
+
+    const CALLS: usize = 5;
+    const BATCHES: usize = 8;
+    const CHUNK: usize = 2048;
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let attention = Attention::load(gpu.context())?;
+    let mut scratch = PrefillScratch::new(stream, MAX_PREFILL_ROWS)?;
+    let mut start_dev = stream.alloc_zeros::<u32>(1)?;
+    let mut rng = Rng(14);
+    let table = stream.clone_htod(&rng.normals(REL_DIM * EXTENT, 0.4))?;
+    let q = stream.clone_htod(&rng.normals(CHUNK * HEADS * HEAD_DIM, 1.0))?;
+    let k = stream.clone_htod(&rng.normals(CHUNK * ROW, 1.0))?;
+    let v = stream.clone_htod(&rng.normals(CHUNK * ROW, 1.0))?;
+    let rel = stream.clone_htod(&rng.normals(CHUNK * HEADS * REL_DIM, 1.0))?;
+    let mut bias = stream.alloc_zeros::<bf16>(CHUNK * HEADS * EXTENT)?;
+    attention.relative_bias_rows(stream, &rel, &table, &mut bias)?;
+    let sinks = stream.clone_htod(&rng.normals(CHUNK * HEADS, 1.0))?;
+    let mut out = stream.alloc_zeros::<bf16>(CHUNK * HEADS * HEAD_DIM)?;
+
+    let begin = gpu
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    let end = gpu
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+
+    eprintln!("| variant | L | rows | start | us/call | TFLOP/s | KV GB/s |");
+    eprintln!("| --- | --- | --- | --- | --- | --- | --- |");
+
+    let variants: &[(&str, Option<KvFormat>, Products)] = &[
+        ("global bf16", Some(KvFormat::Bf16), Products::Bf16),
+        ("global fp8", Some(KvFormat::Fp8), Products::Bf16),
+        ("global fp8_mma", Some(KvFormat::Fp8), Products::Fp8),
+        ("global nvfp4", Some(KvFormat::Nvfp4), Products::Bf16),
+        ("global nvfp4_mma", Some(KvFormat::Nvfp4), Products::Fp4),
+        ("sliding bf16", None, Products::Bf16),
+        ("sliding fp8_mma", None, Products::Fp8),
+    ];
+
+    for seq_len in [2048usize, 4096, 8192] {
+        let start = seq_len - CHUNK;
+        stream.memcpy_htod(&[u32::try_from(start)?], &mut start_dev)?;
+        for &(name, format, products) in variants {
+            if !siphon_cuda::BLOCK_SCALED_MMA && products != Products::Bf16 {
+                continue;
+            }
+            let mut cache = match (format, products) {
+                (None, Products::Fp8) => {
+                    KvCache::sliding_ring_with_format(stream, WINDOW, WINDOW, KvFormat::Fp8)?
+                }
+                (None, _) => KvCache::sliding(stream, WINDOW)?,
+                (Some(fmt), _) => KvCache::global_with_format(stream, seq_len, fmt)?,
+            };
+            let mut run = || {
+                attention.prefill_attention(
+                    stream,
+                    &q,
+                    &k,
+                    &v,
+                    &mut cache,
+                    &start_dev,
+                    CHUNK,
+                    &bias,
+                    &sinks,
+                    &mut scratch,
+                    &mut out,
+                    products,
+                )
+            };
+            run()?;
+            let mut best = f64::INFINITY;
+            for _ in 0..BATCHES {
+                begin.record(stream)?;
+                for _ in 0..CALLS {
+                    run()?;
+                }
+                end.record(stream)?;
+                best = best.min(f64::from(begin.elapsed_ms(&end)?) * 1e-3 / CALLS as f64);
+            }
+            let seen = |i: usize| {
+                if format.is_none() {
+                    (start + i + 1).min(WINDOW)
+                } else {
+                    start + i + 1
+                }
+            };
+            let pairs: usize = (0..CHUNK).map(seen).sum();
+            let flops = (pairs * HEADS * HEAD_DIM * 4) as f64;
+            let distinct = if format.is_none() {
+                seq_len.min(WINDOW + CHUNK - 1)
+            } else {
+                seq_len
+            };
+            let row_bytes = match (format, products) {
+                (None, Products::Fp8) => KvFormat::Fp8.row_bytes(ROW),
+                (None, _) => 2 * ROW,
+                (Some(fmt), _) => fmt.row_bytes(ROW),
+            };
+            let bytes = (distinct * 2 * row_bytes) as f64;
+            eprintln!(
+                "| {name} | {seq_len} | {CHUNK} | {start} | {:.1} | {:.1} | {:.0} |",
+                best * 1e6,
+                flops / best * 1e-12,
+                bytes / best * 1e-9,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Time per prefill call (append included) for the cases in the report. Run with
