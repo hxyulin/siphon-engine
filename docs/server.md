@@ -24,7 +24,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--memory GiB` | free memory | Caps the GPU memory the plan may use, the CUDA context included. |
 | `--weights fp8\|bf16` | `fp8` | Dense weights: FP8 copies or the checkpoint's BF16. |
 | `--kv fp8\|bf16` | `fp8` | Global KV cache format. |
-| `--streams N` | `1` | Requests that run at once, 1 to 8, each with its own KV cache. |
+| `--streams N` | `1` | Requests that run at once, 1 to 32, each with its own KV cache. |
 | `--queue N` | `8` | Requests that wait beyond the running ones. |
 | `--widths` | `1,2,...,8` | Verify widths speculation picks from. |
 | `--drafter DIR` | bundled DSpark | Runs Inco AI's DFlash 2 drafter or a 2DSD DFlash export instead. |
@@ -152,7 +152,9 @@ Each choice of a request with `n` choices counts as a request in the request cou
 
 ## Concurrent requests
 
-With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit.
+With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit. `siphon-plan --streams N` shows that context: with FP8 weights and caches, 77,824 positions for 8 streams on a 32 GB card, and 283,648 for 16 or 131,072 for 32 on an RTX PRO 6000 Blackwell Max-Q.
+
+More streams serve more in total and less per stream. On an RTX PRO 6000 Blackwell Max-Q, 32 streams at 10,674 tokens of context ran 1,138 tok/s in all against 661 for 8 ([batching.md](batching.md#16-and-32-streams-on-an-rtx-pro-6000-blackwell-max-q)). With `--streams 32 --context 16384`, 32 concurrent requests of 512 tokens came back at 1,198 tok/s in all.
 
 A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of 2,048 tokens between the batch's steps. Either way each request gets the same tokens it would get alone, greedy or sampled with a seed. [batching.md](batching.md) has the design.
 

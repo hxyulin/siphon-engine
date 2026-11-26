@@ -1,10 +1,10 @@
 # Batching several sequences
 
-Siphon serves one sequence at a time. This note describes how it runs up to 8 sequences together with plain decode, reusing the verify pass's multi-row kernels, and how the server schedules them. [engine.md](engine.md) describes the verify pass this builds on.
+Siphon serves one sequence at a time. This note describes how it runs up to 32 sequences together with plain decode, reusing the verify pass's multi-row kernels, and how the server schedules them. [engine.md](engine.md) describes the verify pass this builds on.
 
 ## Goal and exactness
 
-A batched step runs one row for each of up to 8 sequences. Every sequence must get exactly the tokens it would get if it were served alone.
+A batched step runs one row for each of up to 32 sequences. Every sequence must get exactly the tokens it would get if it were served alone.
 
 The verify pass already gives each row the same logits, bit for bit, as a verify of that row alone at its position, whatever the other rows hold. A batched step reuses those kernels and gives each row its own caches and position, so a batched row equals a one-row verify of its sequence. A sequence decoded in a batch therefore emits `greedy_by_verify`'s tokens: the tokens of greedy decoding through one-row verifies. Speculation without `--fallback` emits the same tokens. So a request gets the same output whether it runs alone with speculation, in a batch, or switches between the two mid-generation.
 
@@ -30,9 +30,11 @@ The model keeps sequence slots. Slot 0 is the model's existing state, which `Mod
 
 ## Memory: fixed slots
 
-The planner gives every slot the same capacity: `--streams N` slots of `capacity` positions each. It counts N sets of global caches, rings and conv states, one batch scratch (the verify pass's multi-row buffers for 8 rows and their taps), and the draft and verify buffers once. Without `--context`, the server takes the largest capacity at which N slots fit.
+The planner gives every slot the same capacity: `--streams N` slots of `capacity` positions each. It counts N sets of global caches, rings and conv states, one batch scratch (the verify pass's multi-row buffers for N rows and their taps), 4 MiB per stream past the first for its batch size's CUDA graph and the allocator's rounding, and the draft and verify buffers once. Without `--context`, the server takes the largest capacity at which N slots fit.
 
-On a 32 GB card with FP8 weights and caches and the bundled draft, about 11 GiB remain after the fixed parts. Eight slots get 77,824 positions each, four 163,840.
+On a 32 GB card with FP8 weights and caches and the bundled draft, about 11 GiB remain after the fixed parts. Eight slots get 77,824 positions each, four 163,840. On an RTX PRO 6000 Blackwell Max-Q, with 94.46 GiB free after the CUDA context, `siphon-plan --streams N` gives 584,704 positions each to 8 slots, 283,648 to 16 and 131,072 to 32. At 32 streams the rings, conv states and prefix cache entries take 10.5 GiB of the 93.7 GiB plan.
+
+`siphon-serve --streams 32 --context 16384` checks the plan against its memory pool after a request of each stream: 38,288 MiB at peak against 38,369 MiB planned, and 28,772 against 28,827 at 16 streams.
 
 A shared paged pool would let one long request and several short ones share the memory, but every attention kernel would have to read pages through a block table, including decode's and prefill's. That is a large change to kernels that three other efforts are tuning. Fixed slots need no change to the cache layout. A request whose prompt and limit exceed the slot capacity gets a 400 error, as it does today.
 
@@ -52,7 +54,7 @@ Most kernels are row-independent and run unchanged: the embedding and norms, dep
 Each batched row then computes exactly the one-row verify's arithmetic:
 
 - `attention_post_rows` treats every batched row as row 0 of its own chunk.
-- The attention entry point calls the same device function with one row, so each instance has the one-row verify's 34 blocks per KV head and its 3 combining blocks. A combining block waits on a counter for the other blocks of its instance. At most 2 blocks per instance wait, 128 in a batch of 8 rows, while the GPU holds at least 340 of these blocks at once, so the blocks they wait for always get an SM.
+- The attention entry point calls the same device function with one row, so each instance has the one-row verify's 34 blocks per KV head and its 3 combining blocks. A combining block waits on a counter for the other blocks of its instance, at most 2 per KV head. The GPU starts blocks in index order with the row last, so only the instance being started can have waiting blocks whose blocks have no SM yet: at most 16, while the GPU holds hundreds of these blocks at once. Every other waiting block waits for blocks that are running.
 - The post-attention conv kernel uses the same operations as the fused one, and depth attention's F32 mode reads back the same values the fused mode keeps in registers.
 
 The kernel changes stay small for merging with the attention work:
@@ -61,11 +63,33 @@ The kernel changes stay small for merging with the attention work:
 - `attention_post_rows_bf16` gains two pointer arguments.
 - Everything else is new kernels. `depth_attention_rows` is not touched.
 
+## More than 8 rows
+
+The verify pass takes at most 8 rows, and its kernels were built for that. A batched step of up to 32 rows widens them, each so that a row runs the instructions it runs in a one-row verify:
+
+| Kernel | Up to 8 rows | Up to 32 rows |
+| --- | --- | --- |
+| Dense products (`linear_rows`) | One `m16n8k16` column tile: the rows are the 8 columns | Up to 4 column tiles, each multiplying the same weight fragments by its own 8 rows. The weights still stream once. |
+| Experts (`experts_rows`) | An expert's pairs are the columns of one tile | An expert's pairs split into groups of 8, each group a task of its own. Tasks run by expert, then weight tile, then group, so the groups of one tile run on neighbouring warps and its weights come from DRAM about once. |
+| Router (`moe_router_step_rows`) | One cluster of 16 blocks | One cluster per 8 rows, side by side |
+| Message gates (`message_gate_rows`) | One cluster of 16 blocks per gate | One cluster per gate and 8 rows |
+| Attention, convs, post-attention | One instance or grid row per row | Unchanged; the scratch holds a row's partials and counters for each row |
+
+The tensor cores compute each column of a product separately, so a row's sums are the same in any column of any tile. Above 8 rows a prefill chunk shifts the conv states and computes the relative bias in separate kernels on slot 0's states; a batched step keeps the per-row kernels at every size. The verify pass's logits stay the same bit for bit: `smallm verify --hash 1` gives the base build's hashes at widths 1, 3 and 8 with FP8 and BF16 weights.
+
+Three other ways were measured or ruled out:
+
+- Several 8-row sub-steps per step: each reads every weight again, so 16 rows would take two 8-row steps and serve at most the 8-stream total. Not built.
+- Up to 32 pairs per expert task in 4 column tiles, which kept the expert kernel to one task per expert tile: the kernel needed 255 registers and spilled, so it fit half the blocks per SM. At 32 rows a step took 26.1 ms against 22.2 ms with groups of 8, and groups of 16 pairs in 2 tiles took 22.5 ms.
+- The prefill path's GEMMs: their tiles and FP8 input quantization depend on the chunk, so a batched row would not equal a one-row verify, and a request could not move between speculation and batching without changing its tokens.
+
+Grouping up to 256 pairs at first used a table of 128 experts by 32 pairs in shared memory. That left room for only two blocks of the expert kernel per SM instead of three, and a one-row verify took 3.93 instead of 3.78 ms. A list of the pairs with an offset per expert keeps three.
+
 Pointer tables: for each visit, `table[visit][row]` holds the row's key cache, value cache and four conv states. The host rewrites it only when the batch's membership changes. Positions and tokens go to the device before each step, 64 bytes.
 
 ## CUDA graphs
 
-Each batch size B from 1 to 8 gets its own graph, captured on first use, as the verify widths do. The graph reads the tokens, the positions and the pointer tables from device buffers, so it replays for any assignment of slots to rows. Membership changes rewrite the tables and pick the graph of the new size.
+Each batch size B from 1 to 32 gets its own graph, captured on first use, as the verify widths do. The graph reads the tokens, the positions and the pointer tables from device buffers, so it replays for any assignment of slots to rows. Membership changes rewrite the tables and pick the graph of the new size.
 
 ## New requests join
 
@@ -135,3 +159,31 @@ The measurements came out lower: 408, 576 and 797 tok/s. The experts explain mos
 One stream in a batch matches a one-row verify. Plain decode runs 366 tok/s and speculation 490 to 800 tok/s for one sequence. With option 1, a speculating request drops to about 200 tok/s when a second arrives, so two streams together get about what one speculating stream gets alone. From three or four streams on, batching serves more in total. A lone sequence in a batch runs about 23% slower than plain decode, the price of keeping the verify's numerics, which is why it returns to speculation.
 
 The two separate conv kernels cost about 0.15 ms per step. Folding the post-attention conv into depth attention would save most of that, once the depth-attention work settles.
+
+### 16 and 32 streams on an RTX PRO 6000 Blackwell Max-Q
+
+The same benchmark up to 32 rows (`bench --batch 1,2,4,8,16,24,32`), FP8 weights and cache, on an RTX PRO 6000 Blackwell Max-Q (188 SMs, 275 W), with the other compute process on the GPU paused. Row r feeds the capture from offset (r mod 8) / 8 + (r div 8) / 32 of its length, so rows 0 to 7 feed what they fed before. The median step of 100, ms, with tok/s in all and per stream:
+
+| Context | 1 stream | 2 | 4 | 8 | 16 | 24 | 32 |
+| ---: | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 3.82: 262 | 5.18: 386, 193 | 7.29: 549, 137 | 10.23: 782, 98 | 14.78: 1082, 68 | 18.30: 1312, 55 | 21.17: 1512, 47 |
+| 10,674 | 4.18: 239 | 5.74: 348, 174 | 8.26: 484, 121 | 12.11: 661, 83 | 18.37: 871, 54 | 23.56: 1019, 42 | 28.12: 1138, 36 |
+| 32,768 | 4.44: 225 | 6.24: 320, 160 | 9.08: 440, 110 | 13.79: 580, 73 | 21.61: 740, 46 | 28.39: 845, 35 | 34.84: 918, 29 |
+
+32 streams serve 1.93 times the 8-stream total at context 0, 1.72 times at 10,674 and 1.58 times at 32,768. The build before this change, run alternately in the same hold, took 10.24, 11.99 and 13.68 ms at 8 rows and 3.82, 4.16 and 4.41 ms at one row, within 1% of these.
+
+A kernel trace at context 0, each kernel counted from the previous one's end, us per step:
+
+| Operation | 8 rows | 16 rows | 24 rows | 32 rows |
+| --- | ---: | ---: | ---: | ---: |
+| Experts | 6,291 | 9,416 | 11,402 | 12,944 |
+| Dense products and LM head | 810 | 1,172 | 1,430 | 1,950 |
+| Attention | 603 | 1,117 | 1,565 | 1,998 |
+| L2 prefetch | 549 | 493 | 529 | 463 |
+| Message gates | 353 | 397 | 373 | 549 |
+| Depth attention | 331 | 367 | 371 | 392 |
+| Step span | 9,698 | 13,878 | 16,876 | 19,714 |
+
+At the card's 1,645 GB/s, the expert kernel's time is what streaming about 48 distinct experts per visit takes at 8 rows, and about 99 at 32, of 4.5 MB each. Attention at context 0 grows with its 272 blocks per row, most of which find no keys.
+
+Over HTTP, `siphon-serve --streams 32 --context 16384` answered 32 concurrent chat requests of 512 tokens each in 13.6 s, 1,198 and 1,207 tok/s in all over two rounds, prompts and their prefill included.

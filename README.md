@@ -98,7 +98,7 @@ Neither mode is clearly more accurate. On 23 quickbench items at a3fc890, 4 atte
 
 ### Concurrent requests
 
-`siphon-serve --streams N` runs up to 8 requests at once, each in its own KV cache. A request alone speculates. When others arrive, all of them decode in batched steps of one row each, and a request left alone speculates again. Tok/s in all, with tok/s per stream in brackets:
+`siphon-serve --streams N` runs up to 32 requests at once, each in its own KV cache. A request alone speculates. When others arrive, all of them decode in batched steps of one row each, and a request left alone speculates again. Tok/s in all, with tok/s per stream in brackets:
 
 | Context of each stream | 1 stream | 2 streams | 4 streams | 8 streams |
 | ---: | ---: | ---: | ---: | ---: |
@@ -107,6 +107,16 @@ Neither mode is clearly more accurate. On 23 quickbench items at a3fc890, 4 atte
 | 32,768 | 264 | 376 (188) | 519 (130) | **696** (87) |
 
 A batch of one takes 3.14 ms per step against 2.71 ms for plain decode, because the batch keeps the verify pass's numerics. A request that speculates alone runs at 508 to 875 tok/s greedy and 345 to 711 tok/s at temperature 1, so batching serves more in total from about three streams on. The batched steps here decode greedily. Over HTTP with `--streams 8`, temperature 1 served 734 tok/s in all against 780 greedy (see [Sampling](#sampling)).
+
+A 32 GB card fits 8 streams of 77,824 positions. An RTX PRO 6000 Blackwell Max-Q (95 GiB, 1,645 GB/s, 275 W) fits 16 streams of 283,648 positions or 32 of 131,072, and serves more with each step up to 32. The same batched-step benchmark there:
+
+| Context of each stream | 1 stream | 8 streams | 16 streams | 32 streams |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 262 | 782 (98) | 1,082 (68) | **1,512** (47) |
+| 10,674 | 239 | 661 (83) | 871 (54) | **1,138** (36) |
+| 32,768 | 225 | 580 (73) | 740 (46) | **918** (29) |
+
+Every request still gets the tokens it gets alone: each row of a batched step of up to 32 rows equals a one-row verify bit for bit ([batching.md](docs/batching.md#more-than-8-rows)).
 
 ### Prefill and the prefix cache
 
@@ -141,7 +151,7 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 ## Features
 
 - **Server.** OpenAI chat completions and completions, with streaming, reasoning (`reasoning_content`), tool calls, `tool_choice`, stop strings, `reasoning_effort`, sampling and several choices per request (`n`) from one prefill. vLLM and TabbyAPI tokenizer routes, and vLLM's `return_token_ids`, `ignore_eos` and `continue_final_message`.
-- **Scheduling.** Continuous batching of up to 8 requests. Speculation for a request that runs alone, and a prefix cache with an entry per stream, for batched and lone requests.
+- **Scheduling.** Continuous batching of up to 32 requests. Speculation for a request that runs alone, and a prefix cache with an entry per stream, for batched and lone requests.
 - **Sampling.** Temperature, top-k, top-p and min-p on the GPU, applied in vLLM's order, with the checkpoint's `generation_config.json` for the fields a request leaves out (temperature 1). Each draw depends only on the logits, the request's seed and the token's position. `temperature: 0` or `--greedy` decodes greedily.
 - **Speculation.** The bundled DSpark draft by default, or Inco AI's DFlash 2 drafter or a 2DSD DFlash export with `--drafter DIR`. `--fallback` runs plain steps where the draft cannot predict the text. It speeds up free prose, but the output can then differ between runs.
 - **Formats.** FP8 dense weights (`--weights fp8`) and an FP8 global KV cache (`--kv fp8`) by default, BF16 for both on request. Prefill can opt in to quantized expert activations and FP8 dense products, which are faster and fail the quality gate on some texts.
