@@ -73,6 +73,7 @@ impl App {
         device: Device,
         limit: Option<usize>,
         context: Option<usize>,
+        streams: usize,
     ) -> anyhow::Result<Self> {
         let config = TextConfig::load(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir)?;
@@ -105,8 +106,8 @@ impl App {
                                 Draft::None => DraftChoice::None,
                             },
                             prefill_chunk: PREFILL_CHUNK,
-                            streams: 1,
-                            prefix_entries: 1,
+                            streams,
+                            prefix_entries: streams,
                             sms: device.sms,
                         })
                         .with_context(|| format!("planning with the {} draft", draft.name()))?;

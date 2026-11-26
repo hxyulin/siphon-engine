@@ -2,7 +2,7 @@
 //! safetensors headers before anything is loaded.
 //!
 //! ```text
-//! siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] [--context N] [--print]
+//! siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] [--context N] [--streams N] [--print]
 //! ```
 //!
 //! It shows the plan of one configuration as a bar over the whole GPU and a table of its
@@ -29,13 +29,15 @@ use ratatui::{
 use crate::{app::App, device::Device};
 
 const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] \
-                     [--context N] [--print]
+                     [--context N] [--streams N] [--print]
 --drafter adds a DFlash drafter's plan beside the bundled draft's.
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's
 --memory does.
 --free sets the free memory right after creating the CUDA context instead of asking
 nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
+--streams plans N sequence slots of the context each, with a prefix cache entry per slot, as
+siphon-serve --streams does (default 1).
 --print prints one frame as text and exits.";
 
 /// Columns of a printed frame.
@@ -47,6 +49,7 @@ struct Args {
     memory: Option<usize>,
     free: Option<usize>,
     context: Option<usize>,
+    streams: usize,
     print: bool,
 }
 
@@ -64,6 +67,7 @@ fn args() -> anyhow::Result<Args> {
     let mut memory = None;
     let mut free = None;
     let mut context = None;
+    let mut streams = 1;
     let mut print = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -72,6 +76,7 @@ fn args() -> anyhow::Result<Args> {
             "--memory" => memory = Some(gib_arg(&value()?, "--memory")?),
             "--free" => free = Some(gib_arg(&value()?, "--free")?),
             "--context" => context = Some(value()?.parse().context("--context takes positions")?),
+            "--streams" => streams = value()?.parse().context("--streams takes a count")?,
             "--print" => print = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -88,6 +93,7 @@ fn args() -> anyhow::Result<Args> {
         memory,
         free,
         context,
+        streams,
         print,
     })
 }
@@ -101,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         device,
         args.memory,
         args.context,
+        args.streams,
     )?;
     if args.print || !io::stdout().is_terminal() {
         return print_frame(&app);
