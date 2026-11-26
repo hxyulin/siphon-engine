@@ -754,7 +754,7 @@ The global caches are 16 KiB per position with the FP8 cache, and at long contex
 
 `--kv nvfp4` (`KvFormat::Nvfp4`) stores the global keys and values as NVFP4: E2M1 values with one E4M3 scale per 16 elements, the scale `amax / 6` rounded to nearest and each value `x / scale` rounded to nearest even and saturated at 6. A slot holds 576 bytes per buffer: the 8 heads' values, 64 bytes each, then their 8 scales each. The scales need no global factor: keys are L2-clipped and values RMS-normed, so a group's `amax / 6` stays far inside E4M3's range.
 
-Rounding a group a second time gives the same bytes, since its largest element is then exactly 6 times the scale. So the verify pass, batched steps and prefill round their rows to NVFP4 values in BF16 first (`kv_round_bf16`), and the appends (`kv_append_rows_fp4`, the combine of `attention_rows_fp4`) store them without further change: every reader, including a row reading its own key, sees the same value. The fused decode step rounds its new row across the 4 lanes of each group. The attention kernels read the 4-bit bytes and scales straight into shared memory with `cp.async` and decode them with the hardware converter (`cvt.rn.f16x2.e2m1x2`) times the scale, which is exact in F16 and BF16; no full-size copy exists:
+Rounding a group a second time gives the same bytes, since its largest element is then exactly 6 times the scale. So the verify pass, batched steps and prefill round their rows to NVFP4 values in BF16 first (`kv_round_bf16`), and the appends (`kv_append_rows_fp4`, the combine of `attention_rows_fp4`) store them without further change: every reader, including a row reading its own key, sees the same value. The fused decode step rounds its new row across the 4 lanes of each group. The attention kernels read the 4-bit bytes and scales straight into shared memory with `cp.async` and decode them with the hardware converter (`cvt.rn.f16x2.e2m1x2`, a byte permute on the [RTX 4090](#nvfp4-and-mixed-caches-on-the-rtx-4090)) times the scale, which is exact in F16 and BF16; no full-size copy exists:
 
 - decode (`decode_step_fp4`): tiles of 64 keys, each warp decoding its 32 dims of a key in the score phase and each lane its 4 dims in the value phase;
 - verify and batched steps (`attention_rows_fp4_*`, `attention_batch_fp4`): the E4M3 kernels' fragment layout, with each lane decoding 32 dims of a key for S and one group of 16 dims of 4 keys for P V;
@@ -1116,7 +1116,7 @@ Ada lacks five things the `sm_120a` kernels use. `kernels/arch.cuh` defines `SIP
 - **Thread-block clusters.** The router (`moe_router_step_2304`, `moe_router_step_rows_2304`), the message gates (`message_gate_step*`, `message_gate_rows*`) and the split-k GEMM run each cluster as plain blocks that meet in global memory (`kernels/cluster_sm89.cuh`). Each block has a mailbox that mirrors its shared memory by address. A send writes the values at the target's address in the receiver's mailbox and adds their bytes to the word at the address of the receiver's mbarrier. The receiver waits for the bytes it expects, copies them to shared memory and clears the word for the next launch. Cluster barriers become a sense-reversing barrier on two counters per cluster. Every sum keeps its values and order. The blocks of a cluster wait for each other. That cannot deadlock while a cluster has at most 16 blocks and the GPU starts blocks in index order: the earliest unfinished cluster then always has every block running. `sample_prepare` runs each row in one block instead of a cluster of 8. Its histograms count in integers and its maxima compare exactly, so its thresholds stay the same.
 - **Bulk prefetches into L2.** `cp.async.bulk.prefetch` becomes one `prefetch.global.L2` per 128-byte line. The paced decode prefetch runs at 0.8 TB/s instead of 1.5.
 - **The block-scaled MMA.** The kernels of FP8 prefill attention, quantized and FP8 expert activations and FP8 dense products trap there, and the `Model` setters refuse them. `--prefill-attention auto` stays on BF16 at every length. `siphon_cuda::BLOCK_SCALED_MMA` is false, and the 9 kernel tests of those paths are skipped.
-- **An E2M1 converter.** CUDA's `__nv_cvt_fp4x2_to_halfraw2` falls back to an E2M3 conversion in software on Ada, which took the decode step's NVFP4 expert MLP to 131 us per call, 27% of the DRAM bandwidth, while the MXFP8 one ran at 87%. The F16 forms of the eight E2M1 magnitudes differ only in their high byte, so one `prmt` looks up both values of a byte (`e2m1x2_to_f16x2_sm89`). It matches CUDA's conversion on all 256 bytes.
+- **An E2M1 converter.** CUDA's `__nv_cvt_fp4x2_to_halfraw2` falls back to an E2M3 conversion in software on Ada, which took the decode step's NVFP4 expert MLP to 131 us per call, 27% of the DRAM bandwidth, while the MXFP8 one ran at 87%. The F16 forms of the eight E2M1 magnitudes differ only in their high byte, so one `prmt` looks up both values of a byte (`e2m1x2_to_f16x2_sm89`). It matches CUDA's conversion on all 256 bytes. The NVFP4 KV cache uses it too, with an encoder of its own ([below](#nvfp4-and-mixed-caches-on-the-rtx-4090)).
 
 The memory plan has the same parts. The cluster stand-ins add 10.3 MB of module globals, inside `RUNTIME_BYTES`. The CUDA context takes 392 MiB with driver 595, against the 507 MiB of `CONTEXT_BYTES`, so `siphon-plan` without `--free` underestimates the free memory by 115 MiB there.
 
@@ -1241,6 +1241,30 @@ The fidelity track, mean KL and mean \|log-prob difference\| against MLX:
 | `regex-readme`, 32,768 | 166 | 304, 3.66 | 341, 4.48 |
 
 A DFlash 2 round's draft took 1.08 to 1.10 ms, against 0.76 to 0.94 ms for the bundled draft. As on the RTX 5090, DFlash 2 is faster on `regex-readme` and on quickbench's chat, code and story prompts, ties on the agent request, and is slower on `anyhow`, `half` and the 33,164-token prompt.
+
+### NVFP4 and mixed caches on the RTX 4090
+
+The [NVFP4 cache](#nvfp4-cache)'s kernels convert with `cvt.rn.satfinite.e2m1x2.f32` and `cvt.rn.f16x2.e2m1x2`, which Ada lacks. The `sm_89` build decodes with `e2m1x2_to_f16x2_sm89`, as the expert kernels do. It encodes each value by counting the rounding thresholds its magnitude reaches (0.25, 0.75, 1.25, 1.75, 2.5, 3.5 and 5, ties to the even code), keeps the sign and maps NaN to 6, as the converter does. On an RTX 5090 that encoder gave the converter's byte for all 2^32 F32 bit patterns. The `sm_120a` build's `attention.cu` cubin stays the same bytes.
+
+On the RTX 4090 the kernel tests pass, but for the 9 that need the block-scaled MMA. `batch_matches_alone_nvfp4`, `batch_matches_alone_16_nvfp4`, `batch_matches_alone_mixed`, `prefix_cache_entries_nvfp4`, `prefix_cache_entries_mixed` and `nvfp4_prefill_matches_stepping` pass.
+
+The planner's longest context with 1 stream, FP8 weights and the default 0.25 GiB margin, 23.13 GiB free after the CUDA context:
+
+| Cache | Bundled draft | Bundled draft, chunks of 1024 | DFlash 2 | No draft | RTX 5090, bundled draft |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP8 | 222,208 | 244,736 | 239,616 | 316,416 | 648,192 |
+| Mixed | 313,344 | 346,112 | 356,352 | 472,064 | 915,456 |
+| NVFP4 | 363,520 | 401,408 | 425,984 | 563,200 | 1,048,576 |
+
+Speed with FP8 weights and the FP8 copy of the output projection (now `--output-projection fp8`), `bench` as in the RTX 5090 table above: decode is the median step over 200 after 20, and prefill the time to the first token of random ids in chunks of 2,048. Two rounds of the decode runs in one hold agreed within 0.1%:
+
+| Cache | Decode 32K | 128K | RTX 5090 32K | 128K | Prefill 32K | 128K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP8 | 166.3 tok/s | 128.7 | 309.6 | 236.0 | 3.66 s | 19.06 s |
+| NVFP4 | 177.3 | 139.5 | 322.3 | 267.6 | 3.70 s | 19.48 s |
+| Mixed | 174.0 | 136.4 | 320.1 | 260.0 | 3.70 s | 19.42 s |
+
+NVFP4 decode is 6.6% faster than FP8 at 32K and 8.4% at 128K, against 4% and 13% on the RTX 5090. At 128K it saves 0.60 ms per step where the 0.94 GB it does not read would take 0.93 ms at the RTX 4090's 1.008 TB/s. In an nsys trace at 128K, `decode_step_fp4` took 247 us per call, 0.61 TB/s over its 151 MB of cache, and `decode_step_fp8` took 322 us, 0.83 TB/s over 268 MB. Prefill loses only 1% at 32K and 2% at 128K, since the FP8 cache's prefill has no FP8 tensor-core attention on Ada either.
 
 ## References
 
