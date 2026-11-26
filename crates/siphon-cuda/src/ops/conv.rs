@@ -15,7 +15,10 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::spec::{BATCH_ROWS, BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, VERIFY_ROWS, VISIT_CHANNELS},
+    ops::spec::{
+        BATCH_ROWS, BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, PACKED_SLICE_WORDS, PackedRows,
+        VERIFY_ROWS, VISIT_CHANNELS,
+    },
 };
 
 /// Taps per channel.
@@ -29,7 +32,10 @@ const DYNAMIC_HEADS: usize = 8;
 /// Threads per block; each thread owns one channel.
 const BLOCK: u32 = 256;
 /// Rows per block of `moe_conv_residual_rows_2304`, and its threads and columns per block.
-const MOE_CONV_ROWS: usize = 8;
+pub const MOE_CONV_ROWS: usize = 8;
+/// Maximum 8-row tiles across `BATCH_ROWS` packed slices totaling at most `MAX_PREFILL_CHUNK`
+/// rows (`2048 / 8 + 64 = 320`).
+pub const MOE_PACKED_MAX_TILES: usize = 320;
 const MOE_CONV_THREADS: u32 = 192;
 const MOE_CONV_BLOCK_COLS: usize = 768;
 /// Channels per block of `moe_conv_residual_step_rows_2304`, `kStepBlockCols` in the
@@ -72,6 +78,9 @@ pub struct Conv {
     moe_conv_residual_batch_2304: CudaFunction,
     moe_conv_residual_batch_verify_2304: CudaFunction,
     shift_state_rows: CudaFunction,
+    short_conv_residual_rows_packed_2304: CudaFunction,
+    moe_conv_residual_rows_packed_2304: CudaFunction,
+    shift_visit_states_packed_2304: CudaFunction,
 }
 
 /// The other conv streams of a visit, which [`Conv::moe_conv_residual_step_rows`] shifts
@@ -125,6 +134,12 @@ impl Conv {
             moe_conv_residual_batch_verify_2304: module
                 .load_function("moe_conv_residual_batch_verify_2304")?,
             shift_state_rows: module.load_function("shift_state_rows")?,
+            short_conv_residual_rows_packed_2304: module
+                .load_function("short_conv_residual_rows_packed_2304")?,
+            moe_conv_residual_rows_packed_2304: module
+                .load_function("moe_conv_residual_rows_packed_2304")?,
+            shift_visit_states_packed_2304: module
+                .load_function("shift_visit_states_packed_2304")?,
         })
     }
 
@@ -681,6 +696,184 @@ impl Conv {
         // holds `rows` rows of `dims` and `state` three, and the kernel skips threads past
         // `dims`.
         unsafe { args.launch_pdl(stream, &self.shift_state_rows, channel_config(dims)?) }
+    }
+
+    /// Ragged packed multi-slice form of [`Conv::short_conv_residual_rows`]: runs across all
+    /// `rows` packed rows of `packed.num_slices` slices in one launch. Each row reads its
+    /// slice's post-attention conv state (word 4 of `packed.states`) without modifying it;
+    /// [`Conv::shift_visit_states_packed`] updates all conv states at the end of the visit.
+    /// Every output equals per-slice [`Conv::short_conv_residual_rows`] bit for bit.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn short_conv_residual_rows_packed(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        weight: &CudaSlice<bf16>,
+        packed: &PackedRows<'_>,
+        hidden: Option<&CudaView<'_, bf16>>,
+        residual: &mut impl DeviceOut<f32>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (x, mut residual) = (x.view(), residual.view_mut());
+        ensure!(rows > 0, "no rows");
+        ensure!(packed.num_slices > 0, "no packed slices");
+        check_len("weight", weight.len(), HIDDEN * KERNEL)?;
+        check_len("x", x.len(), rows * HIDDEN)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        ensure!(
+            !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
+            "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
+            packed.states.len()
+        );
+        if let Some(h) = hidden {
+            check_len("hidden", h.len(), rows * HIDDEN)?;
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(weight, stream)
+            .ptr(&packed.states, stream)
+            .ptr(&packed.slices, stream)
+            .i32(i32::try_from(packed.num_slices)?)
+            .opt(hidden, stream)
+            .ptr_mut(&mut residual, stream);
+        // SAFETY: the arguments match `short_conv_residual_rows_packed_2304(const bf16*,
+        // const bf16*, const unsigned long long*, const PackedSlice*, int, const bf16*,
+        // float*)`. Every buffer holds `rows` rows as checked above, `slices` covers `0..rows`,
+        // each slice's word 4 in `states` is a live `[3, 2304]` F32 conv state, and before
+        // `pdl_wait` the kernel reads only `weight`.
+        unsafe {
+            args.launch_pdl(
+                stream,
+                &self.short_conv_residual_rows_packed_2304,
+                hidden_rows_config(rows)?,
+            )
+        }
+    }
+
+    /// Ragged packed multi-slice form of [`Conv::moe_conv_residual_rows`]: runs across all
+    /// `tiles.len()` 8-row tiles covering `packed.num_slices` slices in one launch without
+    /// crossing slice boundaries. Reads each slice's post-MLP conv state (word 5 of
+    /// `packed.states`) and writes the combines of each slice's last `min(len, 3)` rows into
+    /// `combined` for [`Conv::shift_visit_states_packed`]. Every output equals per-slice
+    /// [`Conv::moe_conv_residual_rows`] bit for bit.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn moe_conv_residual_rows_packed(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        packed: &PackedRows<'_>,
+        tiles: &CudaView<'_, u32>,
+        residual: &impl DeviceIn<f32>,
+        combined: &mut impl DeviceOut<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
+        let (mut combined, mut out) = (combined.view_mut(), out.view_mut());
+        ensure!(rows > 0, "no rows");
+        ensure!(packed.num_slices > 0 && !tiles.is_empty(), "no packed slices or tiles");
+        check_len("weight", weight.len(), HIDDEN * KERNEL)?;
+        check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
+        check_len("weights", weights.len(), rows * TOP_K)?;
+        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        ensure!(
+            !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
+            "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
+            packed.states.len()
+        );
+        for (name, len) in [
+            ("residual", residual.len()),
+            ("combined", combined.len()),
+            ("out", out.len()),
+        ] {
+            check_len(name, len, rows * HIDDEN)?;
+        }
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(HIDDEN / MOE_CONV_BLOCK_COLS)?,
+                u32::try_from(tiles.len()).context("too many tiles")?,
+                1,
+            ),
+            block_dim: (MOE_CONV_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&experts, stream)
+            .ptr(&weights, stream)
+            .ptr(weight, stream)
+            .ptr(&packed.states, stream)
+            .ptr(&packed.slices, stream)
+            .ptr(tiles, stream)
+            .ptr(&residual, stream)
+            .ptr_mut(&mut combined, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: the arguments match `moe_conv_residual_rows_packed_2304(const bf16*,
+        // const float*, const bf16*, const unsigned long long*, const PackedSlice*,
+        // const uint32_t*, const float*, bf16*, bf16*)`. Every buffer holds `rows` rows as
+        // checked above, each `tiles` entry names a valid `(local_tile, slice_idx)` pair,
+        // each slice's word 5 in `states` is a live `[3, 2304]` F32 conv state, and before
+        // `pdl_wait` the kernel reads only `weight`.
+        unsafe {
+            args.launch_pdl(stream, &self.moe_conv_residual_rows_packed_2304, config)
+        }
+    }
+
+    /// Shifts up to all four conv streams (`k_raw`, `v_raw`, `proj`, `combined`) of a visit
+    /// into every packed slice's conv states (words 2..5 of `packed.states`) in one launch.
+    /// Any `None` stream is skipped. Exact bit-for-bit match with per-slice
+    /// [`Conv::shift_state`].
+    pub fn shift_visit_states_packed(
+        &self,
+        stream: &CudaStream,
+        [k_raw, v_raw, proj, combined]: [Option<CudaView<'_, bf16>>; 4],
+        packed: &PackedRows<'_>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(rows > 0, "no rows");
+        ensure!(packed.num_slices > 0, "no packed slices");
+        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        ensure!(
+            !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
+            "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
+            packed.states.len()
+        );
+        if let Some(x) = &k_raw {
+            check_len("k_raw", x.len(), rows * DYNAMIC_DIMS)?;
+        }
+        if let Some(x) = &v_raw {
+            check_len("v_raw", x.len(), rows * DYNAMIC_DIMS)?;
+        }
+        if let Some(x) = &proj {
+            check_len("proj", x.len(), rows * HIDDEN)?;
+        }
+        if let Some(x) = &combined {
+            check_len("combined", x.len(), rows * HIDDEN)?;
+        }
+        let config = LaunchConfig {
+            grid_dim: (
+                (HIDDEN as u32).div_ceil(BLOCK),
+                u32::try_from(packed.num_slices)?,
+                1,
+            ),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.opt(k_raw.as_ref(), stream)
+            .opt(v_raw.as_ref(), stream)
+            .opt(proj.as_ref(), stream)
+            .opt(combined.as_ref(), stream)
+            .ptr(&packed.states, stream)
+            .ptr(&packed.slices, stream);
+        // SAFETY: the arguments match `shift_visit_states_packed_2304(const bf16*, const bf16*,
+        // const bf16*, const bf16*, const unsigned long long*, const PackedSlice*)`. Each
+        // non-null stream holds `rows` rows as checked above, every slice's conv states in
+        // `states` (words 2..5) are live and distinct across slices, and the kernel reads
+        // nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.shift_visit_states_packed_2304, config) }
     }
 }
 

@@ -78,6 +78,12 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     **{f"attention_batch_nosplit_{f}_{nt}": {"states", "positions"}
        for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
     "attention_post_rows_bf16": {"states", "positions"},
+    # Ragged packed prefill: host uploads the per-visit state pointer table, slice metadata,
+    # and MoE tile descriptors before the pass; no kernel writes them.
+    "attention_post_rows_packed_bf16": {"states", "slices"},
+    "short_conv_residual_rows_packed_2304": {"states", "slices"},
+    "moe_conv_residual_rows_packed_2304": {"states", "slices", "tiles"},
+    "shift_visit_states_packed_2304": {"states", "slices"},
 }
 
 # Tables of device addresses, per kernel, that the host writes before a pass: a load whose

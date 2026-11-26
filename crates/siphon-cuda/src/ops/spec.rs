@@ -41,6 +41,20 @@ pub struct BatchRows<'a> {
     pub rows_per_seq: usize,
 }
 
+/// Words per entry of the packed slice table (`PackedSlice` in `packed.cuh`):
+/// `[row_start, row_len, kv_start, state_idx]`.
+pub const PACKED_SLICE_WORDS: usize = 4;
+
+/// Per-visit state pointers and slice metadata for a ragged packed prefill pass:
+/// `states` holds `[num_states, BATCH_STATE_WORDS]` device addresses (same layout as
+/// [`BatchRows::states`]), and `slices` holds `[num_slices, PACKED_SLICE_WORDS]`
+/// (`[row_start, row_len, kv_start, state_idx]`).
+pub struct PackedRows<'a> {
+    pub states: CudaView<'a, u64>,
+    pub slices: CudaView<'a, u32>,
+    pub num_slices: usize,
+}
+
 /// The hidden states a draft reads for each row: the partial block entering each visit of
 /// `visits`, in order, then the final normed hidden state if `final_hidden` is set.
 #[derive(Clone, Debug, PartialEq, Eq)]

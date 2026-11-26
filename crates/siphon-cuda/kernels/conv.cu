@@ -126,6 +126,7 @@ extern "C" __global__ void dynamic_short_conv_bf16(const __nv_bfloat16* __restri
 }
 
 #include "conv_step.cuh"
+#include "packed.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -698,5 +699,190 @@ extern "C" __global__ void shift_state_rows(const __nv_bfloat16* x, float* state
         // Index k + rows of the old state followed by x.
         const int i = k + rows;
         state[size_t(k) * dims + c] = i < kRows ? old[i] : __bfloat162float(x[size_t(i - kRows) * dims + c]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ragged packed multi-slice forms for Model::prefill_packed. Each kernel runs
+// once across all S variable-length slices using `slices[S]` and the per-visit
+// state pointer table `states[S, 6]` (matching `attention_batch` / `conv_residual_batch`).
+// Every row and final conv state rounds bit-for-bit identically to the per-slice kernels.
+// ---------------------------------------------------------------------------
+
+// Ragged packed form of `short_conv_residual_rows_2304`: row r = blockIdx.y finds its
+// slice in `slices[0..num_slices)`, convolves strictly within that slice's rows and its
+// post-attention conv state (word 4 of `states`), adds `hidden[r]` if non-null, and writes
+// `residual[r]`. The conv state is only read; `shift_visit_states_packed_2304` updates it
+// at the end of the visit. Grid: (2304 / 256, m), 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+short_conv_residual_rows_packed_2304(const __nv_bfloat16* x,
+                                     const __nv_bfloat16* __restrict__ weight,
+                                     const unsigned long long* states,
+                                     const PackedSlice* slices,
+                                     int num_slices,
+                                     const __nv_bfloat16* hidden,
+                                     float* __restrict__ residual) {
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    float taps[kKernel];
+    load_bf16x4(weight + size_t(c) * kKernel, taps);
+    pdl_trigger();
+    pdl_wait();
+    const int si = find_packed_slice(slices, num_slices, uint32_t(r));
+    const PackedSlice sl = slices[si];
+    const int first = int(sl.row_start);
+    const int local = r - first;
+    const float* state = batch_state(states, int(sl.state_idx), 4);
+    float win[kKernel];
+    conv_step::load_window(x + size_t(first) * kHidden, state, c, kHidden, local, win);
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(win[k]), taps[k]));
+    }
+    const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), win[kKernel - 1]), kShortDivisor));
+    const size_t at = size_t(r) * kHidden + c;
+    residual[at] = hidden != nullptr ? __fadd_rn(__bfloat162float(hidden[at]), y) : y;
+}
+
+// Ragged packed form of `moe_conv_residual_rows_2304`: `tiles[blockIdx.y]` packs
+// `(local_tile << 8) | slice_idx`, so each CTA processes up to `kMoeConvRows` (8) rows of
+// one slice and 768 columns (4 per thread) without crossing slice boundaries. Reads that
+// slice's post-MLP conv state (word 5 of `states`) and writes the combines of each slice's
+// last `min(row_len, 3)` rows to `combined` for `shift_visit_states_packed_2304`.
+// Grid: (3, total_tiles), 192 threads.
+extern "C" __global__ void __launch_bounds__(kMoeConvThreads)
+moe_conv_residual_rows_packed_2304(const __nv_bfloat16* experts, const float* weights,
+                                   const __nv_bfloat16* __restrict__ weight,
+                                   const unsigned long long* states,
+                                   const PackedSlice* slices, const uint32_t* tiles,
+                                   const float* residual, __nv_bfloat16* __restrict__ combined,
+                                   __nv_bfloat16* __restrict__ out) {
+    const int c0 = blockIdx.x * kMoeConvBlockCols + threadIdx.x * kMoeConvCols;
+    float taps[kMoeConvCols][kKernel];
+#pragma unroll
+    for (int j = 0; j < kMoeConvCols; ++j) {
+        load_bf16x4(weight + size_t(c0 + j) * kKernel, taps[j]);
+    }
+    pdl_trigger();
+    pdl_wait();
+    const uint32_t desc = tiles[blockIdx.y];
+    const int si = int(desc & 0xffu);
+    const int tile = int(desc >> 8);
+    const PackedSlice sl = slices[si];
+    const size_t first = size_t(sl.row_start);
+    const int rows = int(sl.row_len);
+    const float* state = batch_state(states, int(sl.state_idx), 5);
+    const __nv_bfloat16* seq_experts = experts + first * kTopK * kHidden;
+    const float* seq_weights = weights + first * kTopK;
+    const float* seq_residual = residual + first * kHidden;
+    __nv_bfloat16* seq_combined = combined + first * kHidden;
+    __nv_bfloat16* seq_out = out + first * kHidden;
+
+    const int r0 = tile * kMoeConvRows;
+    const int r_end = min(r0 + kMoeConvRows, rows);
+    constexpr int kWindowRows = kMoeConvRows + kKernel - 1;
+    float comb[kWindowRows][kMoeConvCols];
+#pragma unroll
+    for (int i = 0; i < kWindowRows; ++i) {
+        const int r = r0 - (kKernel - 1) + i;
+        if (r < 0) {
+            const float4 v = *reinterpret_cast<const float4*>(state + size_t(kKernel - 1 + r) * kHidden + c0);
+            comb[i][0] = v.x;
+            comb[i][1] = v.y;
+            comb[i][2] = v.z;
+            comb[i][3] = v.w;
+        } else if (r < r_end) {
+            const __nv_bfloat16* e = seq_experts + size_t(r) * kTopK * kHidden + c0;
+            const float* w = seq_weights + size_t(r) * kTopK;
+            float total[kMoeConvCols] = {};
+#pragma unroll
+            for (int x = 0; x < kTopK; ++x) {
+                float v[kMoeConvCols];
+                load_bf16x4(e + size_t(x) * kHidden, v);
+                const float wx = w[x];
+#pragma unroll
+                for (int j = 0; j < kMoeConvCols; ++j) {
+                    total[j] = __fadd_rn(total[j], __fmul_rn(v[j], wx));
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kMoeConvCols; ++j) {
+                comb[i][j] = round_bf16(total[j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = kKernel - 1; i < kWindowRows; ++i) {
+        const int r = r0 - (kKernel - 1) + i;
+        if (r >= r_end) {
+            break;
+        }
+        const float4 res = *reinterpret_cast<const float4*>(seq_residual + size_t(r) * kHidden + c0);
+        const float rv[kMoeConvCols] = {res.x, res.y, res.z, res.w};
+        __nv_bfloat16 o[kMoeConvCols];
+        __nv_bfloat16 cb[kMoeConvCols];
+#pragma unroll
+        for (int j = 0; j < kMoeConvCols; ++j) {
+            cb[j] = __float2bfloat16(comb[i][j]);
+            float acc = 0.f;
+#pragma unroll
+            for (int k = 0; k < kKernel; ++k) {
+                acc = __fadd_rn(acc, __fmul_rn(round_bf16(comb[i - (kKernel - 1) + k][j]), taps[j][k]));
+            }
+            const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), comb[i][j]), kShortDivisor));
+            o[j] = __float2bfloat16(__fadd_rn(rv[j], y));
+        }
+        *reinterpret_cast<uint2*>(seq_out + size_t(r) * kHidden + c0) = *reinterpret_cast<const uint2*>(o);
+        if (r >= rows - (kKernel - 1)) {
+            *reinterpret_cast<uint2*>(seq_combined + size_t(r) * kHidden + c0) = *reinterpret_cast<const uint2*>(cb);
+        }
+    }
+}
+
+// Shifts up to all four conv streams (k_raw, v_raw, proj, combined) of a visit into each
+// slice's conv states (words 2..5 of `states`) in one launch across all S slices. Any null
+// stream pointer is skipped. Grid: (2304 / 256, num_slices), 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+shift_visit_states_packed_2304(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
+                               const __nv_bfloat16* proj, const __nv_bfloat16* combined,
+                               const unsigned long long* states, const PackedSlice* slices) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kHidden) {
+        return;
+    }
+    const PackedSlice sl = slices[blockIdx.y];
+    const size_t first = size_t(sl.row_start);
+    const int rows = int(sl.row_len);
+    const int state_idx = int(sl.state_idx);
+    constexpr int kOld = conv_step::kKernel - 1;
+    auto shift_one = [&](const __nv_bfloat16* x, float* state, int dims) {
+        float old[kOld];
+#pragma unroll
+        for (int k = 0; k < kOld; ++k) {
+            old[k] = state[size_t(k) * dims + c];
+        }
+#pragma unroll
+        for (int k = 0; k < kOld; ++k) {
+            const int i = k + rows;
+            state[size_t(k) * dims + c] =
+                i < kOld ? old[i] : __bfloat162float(x[(first + size_t(i - kOld)) * dims + c]);
+        }
+    };
+    if (c < kKvDims) {
+        if (k_raw != nullptr) {
+            shift_one(k_raw, batch_state(states, state_idx, 2), kKvDims);
+        }
+        if (v_raw != nullptr) {
+            shift_one(v_raw, batch_state(states, state_idx, 3), kKvDims);
+        }
+    }
+    if (proj != nullptr) {
+        shift_one(proj, batch_state(states, state_idx, 4), kHidden);
+    }
+    if (combined != nullptr) {
+        shift_one(combined, batch_state(states, state_idx, 5), kHidden);
     }
 }

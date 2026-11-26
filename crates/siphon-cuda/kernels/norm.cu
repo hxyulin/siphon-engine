@@ -20,6 +20,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "packed.cuh"
 #include "pdl.cuh"
 #include "quant_epilogue.cuh"
 
@@ -829,6 +830,194 @@ attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
             out = __fdiv_rn(__fadd_rn(acc, win[conv_step::kKernel - 1][i]), conv_step::kDynamicDivisor);
         } else {
             // short_conv_window in conv_step.cuh.
+#pragma unroll
+            for (int kk = 0; kk < conv_step::kKernel; ++kk) {
+                acc = __fadd_rn(acc, __fmul_rn(conv_step::round_bf16(win[kk][i]), taps[i][kk]));
+            }
+            out = __fdiv_rn(__fadd_rn(conv_step::round_bf16(acc), win[conv_step::kKernel - 1][i]),
+                            conv_step::kShortDivisor);
+        }
+        y[i] = __bfloat162float(__float2bfloat16(out));
+    }
+    const size_t at = size_t(row) * kKvDims + c0;
+    if (is_k) {
+        const float factor = l2_clip_factor(l2_sum_128(y), qk_threshold);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            y[i] = __fmul_rn(y[i], factor);
+        }
+        store_bf16x4(k + at, y);
+    } else {
+        const float scale = inv_rms_f32(warp_sum(fma_sum_squares(y)), kHeadDim, eps);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            y[i] *= scale;
+        }
+        store_bf16x4(v + at, y);
+    }
+}
+
+// Ragged packed multi-slice form of `attention_post_rows_bf16`: runs across all `m`
+// packed rows (`gridDim.y = m`) belonging to `num_slices` variable-length slices in one
+// launch. Each row finds its slice in `slices` (sorted by `row_start`), computes its
+// causal K/V conv window strictly within its own slice (reaching into that slice's K/V
+// conv state in `states[sl.state_idx * 6 + {2,3}]` before `sl.row_start`), and applies
+// FullAttention log scaling at position `sl.kv_start + (row - sl.row_start)`.
+// Every value rounds bit-for-bit identically to per-slice `attention_post_rows_bf16`.
+extern "C" __global__ void __launch_bounds__(kPostThreads)
+attention_post_rows_packed_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
+                                const __nv_bfloat16* __restrict__ k_weight,
+                                const __nv_bfloat16* __restrict__ v_weight,
+                                const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
+                                const float* __restrict__ k_static, const float* __restrict__ v_static,
+                                const __nv_bfloat16* q_raw, const __nv_bfloat16* __restrict__ q_scale,
+                                const __nv_bfloat16* r_raw, const __nv_bfloat16* __restrict__ r_scale,
+                                __nv_bfloat16* k, __nv_bfloat16* v, __nv_bfloat16* q, __nv_bfloat16* r,
+                                int log_scale, float alpha, float n_floor, float qk_threshold,
+                                float rel_threshold, float eps, const __nv_bfloat16* __restrict__ table,
+                                __nv_bfloat16* bias, int extent, const unsigned long long* states,
+                                const PackedSlice* slices, int num_slices) {
+    const int row = blockIdx.y;
+    const int b = blockIdx.x;
+    if (b >= kQBlock0) {
+        pdl_trigger();
+        pdl_wait();
+        float tau = 1.f;
+        if (log_scale) {
+            const int si = find_packed_slice(slices, num_slices, uint32_t(row));
+            const PackedSlice sl = slices[si];
+            tau = log_scale_tau(sl.kv_start + uint32_t(row) - sl.row_start, alpha, n_floor);
+        }
+        const auto scaled = [&](float x) {
+            return log_scale ? __bfloat162float(__float2bfloat16(__fmul_rn(x, tau))) : x;
+        };
+        if (b > kRBlock) {
+            __shared__ __align__(16) float rel_s[kBiasHeads][kRelDim];
+            const int h0 = (b - kRBlock - 1) * kBiasHeads;
+            if (threadIdx.x < kBiasHeads) {
+                float rel[kRelDim];
+                rel_head(r_raw, r_scale, row, h0 + threadIdx.x, rel_threshold, scaled, rel);
+#pragma unroll
+                for (int i = 0; i < kRelDim; ++i) {
+                    rel_s[threadIdx.x][i] = rel[i];
+                }
+            }
+            __syncthreads();
+            for (int c = kVec * threadIdx.x; c < extent; c += kVec * kPostThreads) {
+                float t[kVec][kRelDim];
+#pragma unroll
+                for (int kk = 0; kk < kRelDim; ++kk) {
+                    float vals[kVec];
+                    load_bf16x4(table + size_t(kk) * extent + c, vals);
+#pragma unroll
+                    for (int j = 0; j < kVec; ++j) {
+                        t[j][kk] = vals[j];
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < kBiasHeads; ++h) {
+                    float rv[kRelDim];
+#pragma unroll
+                    for (int kk = 0; kk < kRelDim; ++kk) {
+                        rv[kk] = rel_s[h][kk];
+                    }
+                    float out[kVec];
+#pragma unroll
+                    for (int j = 0; j < kVec; ++j) {
+                        out[j] = relative_bias_dot(rv, t[j]);
+                    }
+                    store_bf16x4(bias + (size_t(row) * kQHeads + h0 + h) * extent + c, out);
+                }
+            }
+            return;
+        }
+        if (b < kRBlock) {
+            const int head = (b - kQBlock0) * kHeadsPerBlock + threadIdx.x / 32;
+            const size_t c0 = size_t(row) * kQHeads * kHeadDim + head * kHeadDim + threadIdx.x % 32 * kVec;
+            float x[kVec];
+            float sc[kVec];
+            load_bf16x4(q_raw + c0, x);
+            load_bf16x4(q_scale + head * kHeadDim + threadIdx.x % 32 * kVec, sc);
+#pragma unroll
+            for (int i = 0; i < kVec; ++i) {
+                x[i] = __fmul_rn(x[i], sc[i]);
+            }
+            const float factor = l2_clip_factor(l2_sum_128(x), qk_threshold);
+#pragma unroll
+            for (int i = 0; i < kVec; ++i) {
+                x[i] = scaled(__bfloat162float(__float2bfloat16(__fmul_rn(x[i], factor))));
+            }
+            store_bf16x4(q + c0, x);
+            return;
+        }
+        const int head = threadIdx.x;
+        if (head >= kQHeads) {
+            return;
+        }
+        float rel[kRelDim];
+        rel_head(r_raw, r_scale, row, head, rel_threshold, scaled, rel);
+#pragma unroll
+        for (int i = 0; i < kRelDim; i += kVec) {
+            const float part[kVec] = {rel[i], rel[i + 1], rel[i + 2], rel[i + 3]};
+            store_bf16x4(r + (size_t(row) * kQHeads + head) * kRelDim + i, part);
+        }
+        return;
+    }
+    const bool is_k = b < kVBlock0;
+    const int head = (is_k ? b - kKBlock0 : b - kVBlock0) * kHeadsPerBlock + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int c0 = head * kHeadDim + lane * kVec;
+    const __nv_bfloat16* x = is_k ? k_raw : v_raw;
+    const __nv_bfloat16* dynamic = is_k ? k_dynamic : v_dynamic;
+    const bool dyn = dynamic != nullptr;
+    float taps[kVec][conv_step::kKernel];
+    float stat[conv_step::kKernel][kVec];
+    if (dyn) {
+        const float* sw = is_k ? k_static : v_static;
+#pragma unroll
+        for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+            load_f32x4(sw + lag * kKvDims + c0, stat[lag]);
+        }
+    } else {
+        const __nv_bfloat16* w = is_k ? k_weight : v_weight;
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            load_bf16x4(w + size_t(c0 + i) * conv_step::kKernel, taps[i]);
+        }
+    }
+    pdl_trigger();
+    pdl_wait();
+    const int si = find_packed_slice(slices, num_slices, uint32_t(row));
+    const PackedSlice sl = slices[si];
+    const int first = int(sl.row_start);
+    const float* state = reinterpret_cast<const float*>(states[size_t(sl.state_idx) * 6 + (is_k ? 2 : 3)]);
+    float win[conv_step::kKernel][kVec];
+#pragma unroll
+    for (int kk = 0; kk < conv_step::kKernel; ++kk) {
+        const int t = row - first - (conv_step::kKernel - 1) + kk;
+        if (t >= 0) {
+            load_bf16x4(x + size_t(first + t) * kKvDims + c0, win[kk]);
+        } else {
+            load_f32x4(state + size_t(conv_step::kKernel - 1 + t) * kKvDims + c0, win[kk]);
+        }
+    }
+    float dw[conv_step::kKernel];
+    if (dyn) {
+        load_bf16x4(dynamic + size_t(row) * kKvHeads * conv_step::kKernel + head * conv_step::kKernel, dw);
+    }
+    float y[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        float acc = 0.f;
+        float out;
+        if (dyn) {
+#pragma unroll
+            for (int lag = 0; lag < conv_step::kKernel; ++lag) {
+                const float w = __fadd_rn(stat[lag][i], dw[lag]);
+                acc = __fadd_rn(acc, __fmul_rn(win[conv_step::kKernel - 1 - lag][i], w));
+            }
+            out = __fdiv_rn(__fadd_rn(acc, win[conv_step::kKernel - 1][i]), conv_step::kDynamicDivisor);
+        } else {
 #pragma unroll
             for (int kk = 0; kk < conv_step::kKernel; ++kk) {
                 acc = __fadd_rn(acc, __fmul_rn(conv_step::round_bf16(win[kk][i]), taps[i][kk]));

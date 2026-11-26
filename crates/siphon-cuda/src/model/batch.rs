@@ -270,7 +270,7 @@ fn slot_visits(m: &mut Model, slot: usize) -> &mut Vec<VisitState> {
 }
 
 /// A visit's line of a state table: its caches' and conv states' device addresses.
-fn state_words(stream: &CudaStream, v: &VisitState) -> [u64; BATCH_STATE_WORDS] {
+pub(super) fn state_words(stream: &CudaStream, v: &VisitState) -> [u64; BATCH_STATE_WORDS] {
     let (keys, values) = match v.kv.data() {
         KvData::Bf16 { keys, values } => (keys.device_ptr(stream).0, values.device_ptr(stream).0),
         KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {

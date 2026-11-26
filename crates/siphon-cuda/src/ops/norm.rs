@@ -13,7 +13,7 @@ use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
     ops::{
         QuantDest,
-        spec::{BATCH_STATE_WORDS, BatchRows},
+        spec::{BATCH_STATE_WORDS, BatchRows, PACKED_SLICE_WORDS, PackedRows},
     },
 };
 
@@ -113,6 +113,32 @@ pub struct AttentionPostRows<'a> {
     pub batch: Option<&'a BatchRows<'a>>,
 }
 
+/// Inputs and outputs of [`Norm::attention_post_rows_packed`] for a ragged packed prefill:
+/// all `rows` packed rows across `packed.num_slices` variable-length slices in one launch.
+pub struct AttentionPostRowsPacked<'a> {
+    pub k_raw: CudaView<'a, bf16>,
+    pub v_raw: CudaView<'a, bf16>,
+    pub conv: KvConvWeights<'a>,
+    pub q_raw: CudaView<'a, bf16>,
+    pub q_scale: &'a CudaSlice<bf16>,
+    pub r_raw: CudaView<'a, bf16>,
+    pub r_scale: &'a CudaSlice<bf16>,
+    pub k: CudaViewMut<'a, bf16>,
+    pub v: CudaViewMut<'a, bf16>,
+    pub q: CudaViewMut<'a, bf16>,
+    pub r: CudaViewMut<'a, bf16>,
+    /// For full attention, `(alpha, n_floor)` of the query log scaling; per-slice starting
+    /// positions come from `packed.slices`.
+    pub log_scale: Option<(f32, f32)>,
+    pub qk_threshold: f32,
+    pub rel_threshold: f32,
+    pub eps: f32,
+    /// Optional fused relative bias table `[16, extent]` and output `[rows, 24, extent]`.
+    pub bias: Option<(&'a CudaSlice<bf16>, CudaViewMut<'a, bf16>)>,
+    /// Per-visit state pointer table and slice metadata for all packed slices.
+    pub packed: &'a PackedRows<'a>,
+}
+
 #[derive(Debug)]
 pub struct Norm {
     rms_norm_bf16_2304: CudaFunction,
@@ -126,6 +152,7 @@ pub struct Norm {
     l2_clip_bf16_16: CudaFunction,
     attention_post_bf16: CudaFunction,
     attention_post_rows_bf16: CudaFunction,
+    attention_post_rows_packed_bf16: CudaFunction,
 }
 
 /// The extent of a relative bias table `[16, extent]`, after checking that the bias holds
@@ -198,6 +225,8 @@ impl Norm {
             l2_clip_bf16_16: module.load_function("l2_clip_bf16_16")?,
             attention_post_bf16: module.load_function("attention_post_bf16")?,
             attention_post_rows_bf16: module.load_function("attention_post_rows_bf16")?,
+            attention_post_rows_packed_bf16: module
+                .load_function("attention_post_rows_packed_bf16")?,
         })
     }
 
@@ -687,5 +716,109 @@ impl Norm {
         // without dynamic taps, `start` only with log scaling), writes no state, and reads
         // nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.attention_post_rows_bf16, config) }
+    }
+
+    /// Ragged packed multi-slice form of [`Norm::attention_post_rows`]: processes all
+    /// `rows` packed rows across `a.packed.num_slices` slices in one launch. Each slice's
+    /// K/V conv reads only within its own row range and its own K/V conv state (words 2 and
+    /// 3 of `a.packed.states`), and FullAttention log scaling uses each slice's own
+    /// `kv_start`. Every output equals per-slice [`Norm::attention_post_rows`] bit for bit.
+    pub fn attention_post_rows_packed(
+        &self,
+        stream: &CudaStream,
+        a: AttentionPostRowsPacked<'_>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let kv = KV_HEADS * HEAD_DIM;
+        let check = |name: &str, len: usize, want: usize| {
+            ensure!(len == want, "{name} has {len} elements, expected {want}");
+            Ok(())
+        };
+        ensure!(rows > 0 && a.packed.num_slices > 0, "no rows or packed slices");
+        check("slices", a.packed.slices.len(), a.packed.num_slices * PACKED_SLICE_WORDS)?;
+        ensure!(
+            !a.packed.states.is_empty() && a.packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
+            "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
+            a.packed.states.len()
+        );
+        for (name, len, want) in [
+            ("k_raw", a.k_raw.len(), rows * kv),
+            ("v_raw", a.v_raw.len(), rows * kv),
+            ("k", a.k.len(), rows * kv),
+            ("v", a.v.len(), rows * kv),
+            ("q_raw", a.q_raw.len(), rows * Q_HEADS * HEAD_DIM),
+            ("q", a.q.len(), rows * Q_HEADS * HEAD_DIM),
+            ("q_scale", a.q_scale.len(), Q_HEADS * HEAD_DIM),
+            ("r_raw", a.r_raw.len(), rows * Q_HEADS * REL_DIM),
+            ("r", a.r.len(), rows * Q_HEADS * REL_DIM),
+            ("r_scale", a.r_scale.len(), Q_HEADS * REL_DIM),
+        ] {
+            check(name, len, want)?;
+        }
+        let extent = bias_extent(a.bias.as_ref(), rows)?;
+        let config = LaunchConfig {
+            grid_dim: (
+                POST_BLOCKS + if a.bias.is_some() { BIAS_BLOCKS } else { 0 },
+                u32::try_from(rows).context("too many rows")?,
+                1,
+            ),
+            block_dim: (POST_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&a.k_raw, stream).ptr(&a.v_raw, stream);
+        match &a.conv {
+            KvConvWeights::Static { k, v } => {
+                check("k conv weight", k.len(), kv * CONV_TAPS)?;
+                check("v conv weight", v.len(), kv * CONV_TAPS)?;
+                args.ptr(*k, stream).ptr(*v, stream).u64(0).u64(0).u64(0).u64(0);
+            }
+            KvConvWeights::Dynamic {
+                k_dynamic,
+                v_dynamic,
+                k_static,
+                v_static,
+            } => {
+                check("k_dynamic", k_dynamic.len(), rows * KV_HEADS * CONV_TAPS)?;
+                check("v_dynamic", v_dynamic.len(), rows * KV_HEADS * CONV_TAPS)?;
+                check("k_static", k_static.len(), CONV_TAPS * kv)?;
+                check("v_static", v_static.len(), CONV_TAPS * kv)?;
+                args.u64(0)
+                    .u64(0)
+                    .ptr(k_dynamic, stream)
+                    .ptr(v_dynamic, stream)
+                    .ptr(*k_static, stream)
+                    .ptr(*v_static, stream);
+            }
+        }
+        let (log_scale, alpha, n_floor) = a.log_scale.map_or((0, 0.0, 1.0), |(al, fl)| (1, al, fl));
+        let (mut k_out, mut v_out, mut q_out, mut r_out) = (a.k, a.v, a.q, a.r);
+        let (table, mut bias) = a.bias.unzip();
+        args.ptr(&a.q_raw, stream)
+            .ptr(a.q_scale, stream)
+            .ptr(&a.r_raw, stream)
+            .ptr(a.r_scale, stream)
+            .ptr_mut(&mut k_out, stream)
+            .ptr_mut(&mut v_out, stream)
+            .ptr_mut(&mut q_out, stream)
+            .ptr_mut(&mut r_out, stream)
+            .i32(log_scale)
+            .f32(alpha)
+            .f32(n_floor)
+            .f32(a.qk_threshold)
+            .f32(a.rel_threshold)
+            .f32(a.eps)
+            .opt(table, stream)
+            .opt_mut(bias.as_mut(), stream)
+            .i32(i32::try_from(extent)?)
+            .ptr(&a.packed.states, stream)
+            .ptr(&a.packed.slices, stream)
+            .i32(i32::try_from(a.packed.num_slices)?);
+        // SAFETY: the arguments match `attention_post_rows_packed_bf16`'s signature. Every
+        // per-row buffer holds `rows` rows as checked above, `slices` holds `num_slices`
+        // sorted `PackedSlice` entries covering `0..rows`, each entry's `state_idx` indexes a
+        // live `[3, 1024]` K/V conv state pair in `states` (words 2 and 3), the kernel writes
+        // no conv state, and before `pdl_wait` it reads only read-only weights.
+        unsafe { args.launch_pdl(stream, &self.attention_post_rows_packed_bf16, config) }
     }
 }

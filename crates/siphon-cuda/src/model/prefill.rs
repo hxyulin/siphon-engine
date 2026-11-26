@@ -20,27 +20,29 @@ use siphon::TextConfig;
 
 use super::{
     Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Sampling, Scratch, Upcoming, VisitState, Window,
-    batch::BatchBuffers, verify::VerifyBuffers, visit_plan, zeros,
+    batch::{BatchBuffers, state_words},
+    verify::VerifyBuffers,
+    visit_plan, zeros,
 };
 use crate::{
-    DeviceIn,
     ops::{
-        Products, QuantDest, QuantFormat, attention,
-        conv::VisitConvs,
+        Products, QuantDest, QuantFormat,
+        attention::{self, KV_HEADS, PREFILL_PACKED_MAX_BLOCKS, prefill_blocks},
+        conv::{MOE_CONV_ROWS, MOE_PACKED_MAX_TILES, VisitConvs},
         experts::{self, ExpertActivations, ExpertScratch, QuantizedRows},
         linear::Start,
         linear_fp8::{self, Fp8GemmQuantized, Fp8Matrix, Fp8Rows},
         linear_rows::{self, RowsWeight},
         misc::{GATE_SLOTS, GateNormQuant, GateRowsSlot, MessageMix},
-        norm::{AttentionPostRows, KvConvWeights},
+        norm::{AttentionPostRows, AttentionPostRowsPacked, KvConvWeights},
         routing::{
             DepthRows, DepthRowsQuant, FUSED_MAX_CANDIDATES, NormDest, QuantNormDest,
             RouterRowsScratch, RowsBatch, RowsPartial,
         },
         sample::SampleBuffers,
         spec::{
-            BATCH_ROWS, BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, RESULT_LEN, TapLayout,
-            VERIFY_ROWS, VISIT_CHANNELS,
+            BATCH_ROWS, BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, PACKED_SLICE_WORDS,
+            PackedRows, RESULT_LEN, TapLayout, VERIFY_ROWS, VISIT_CHANNELS,
         },
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
@@ -174,6 +176,49 @@ struct PackedSliceMeta<'a> {
     images: &'a [ImageRows],
     need_first_token: bool,
     sampling: Sampling,
+}
+
+/// Device tables for ragged multi-slice [`Model::prefill_packed`], allocated on first
+/// packed call and reused across calls.
+struct PackedBuffers {
+    /// Number of visits `tables` is sized for.
+    visits: usize,
+    /// Per-visit state pointer table, `[visits, BATCH_ROWS, BATCH_STATE_WORDS]`.
+    tables: CudaSlice<u64>,
+    /// Slice metadata table, `[BATCH_ROWS, PACKED_SLICE_WORDS]`:
+    /// `[row_start, row_len, kv_start, state_idx]`.
+    slices: CudaSlice<u32>,
+    /// Global `(local_block_m << 8) | slice_idx` descriptors for `prefill_attention_packed`.
+    attn_blocks: CudaSlice<u32>,
+    /// Global `(local_tile << 8) | slice_idx` descriptors for `moe_conv_residual_rows_packed`.
+    moe_tiles: CudaSlice<u32>,
+    /// Atomic segment counters for `prefill_attention_packed`, returned to zero after each call.
+    attn_counters: CudaSlice<u32>,
+}
+
+impl PackedBuffers {
+    fn new(stream: &Arc<CudaStream>, visits: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            visits,
+            tables: zeros(stream, visits * BATCH_ROWS * BATCH_STATE_WORDS)?,
+            slices: zeros(stream, BATCH_ROWS * PACKED_SLICE_WORDS)?,
+            attn_blocks: zeros(stream, PREFILL_PACKED_MAX_BLOCKS)?,
+            moe_tiles: zeros(stream, MOE_PACKED_MAX_TILES)?,
+            attn_counters: zeros(stream, PREFILL_PACKED_MAX_BLOCKS * KV_HEADS)?,
+        })
+    }
+}
+
+/// Host-side counts for the uploaded [`PackedBuffers`] tables of one packed pass.
+#[derive(Clone, Copy)]
+struct PackedPlan {
+    num_slices: usize,
+    /// Entries in `attn_blocks[..bf16_blocks]` using [`Products::Bf16`].
+    bf16_blocks: usize,
+    /// Entries in `attn_blocks[bf16_blocks..bf16_blocks + fp8_blocks]` using [`Products::Fp8`].
+    fp8_blocks: usize,
+    /// Total 8-row MoE tiles in `moe_tiles[..moe_tiles]`.
+    moe_tiles: usize,
 }
 
 /// Which logits [`Model::prefill`] produces.
@@ -345,8 +390,8 @@ pub(super) struct PrefillScratch {
     pub(super) tokens: CudaSlice<i32>,
     /// The position of the chunk's first row.
     pub(super) start: CudaSlice<u32>,
-    /// Starting positions of each slice in [`Model::prefill_packed`], `[BATCH_ROWS]`.
-    packed_starts: CudaSlice<u32>,
+    /// Device metadata tables for [`Model::prefill_packed`], allocated lazily on first use.
+    packed: Option<PackedBuffers>,
     /// First-token argmax/sample outputs of [`Model::prefill_packed`], `[BATCH_ROWS]`.
     packed_argmax: CudaSlice<i32>,
     embedded: CudaSlice<bf16>,
@@ -477,7 +522,7 @@ impl PrefillScratch {
             sample: None,
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
-            packed_starts: zeros(stream, BATCH_ROWS)?,
+            packed: None,
             packed_argmax: zeros(stream, BATCH_ROWS)?,
             embedded: zeros(stream, rows * hidden)?,
             hidden: zeros(stream, rows * hidden)?,
@@ -879,7 +924,6 @@ impl Model {
         let hidden = self.ctx.hidden();
         let mut total_rows = 0usize;
         let mut meta = Vec::with_capacity(slices.len());
-        let mut starts_u32 = Vec::with_capacity(slices.len());
         let mut ids = Vec::new();
         for (i, s) in slices.iter().enumerate() {
             ensure!(!s.tokens.is_empty(), "packed slice {i} is empty");
@@ -904,7 +948,6 @@ impl Model {
                     run.rows.len()
                 );
             }
-            starts_u32.push(u32::try_from(start)?);
             meta.push(PackedSliceMeta {
                 slot: s.slot,
                 offset: total_rows,
@@ -941,9 +984,6 @@ impl Model {
         self.ctx
             .stream
             .memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, total_rows, 1))?;
-        self.ctx
-            .stream
-            .memcpy_htod(&starts_u32, &mut p.packed_starts.slice_mut(..slices.len()))?;
         let Self {
             ctx,
             passes,
@@ -972,12 +1012,105 @@ impl Model {
             .into_iter()
             .map(|v| v.context("missing visit states for packed slot"))
             .collect::<anyhow::Result<_>>()?;
+        let num_visits = slice_visits[0].len();
+        let num_slices = meta.len();
+        for (si, sv) in slice_visits.iter().enumerate() {
+            ensure!(
+                sv.len() == num_visits,
+                "packed slice {si} has {} visits, expected {num_visits}",
+                sv.len()
+            );
+        }
+        for v in 0..num_visits {
+            let proto = &slice_visits[0][v];
+            for (si, sv) in slice_visits.iter().enumerate().skip(1) {
+                let other = &sv[v];
+                ensure!(
+                    other.kv.format() == proto.kv.format()
+                        && other.kv.slots() == proto.kv.slots()
+                        && other.kv.window() == proto.kv.window()
+                        && other.round == proto.round,
+                    "packed slice {si} visit {v} cache metadata differs from slice 0"
+                );
+            }
+        }
+        if p.packed.as_ref().is_none_or(|b| b.visits < num_visits) {
+            p.packed = Some(PackedBuffers::new(&ctx.stream, num_visits)?);
+        }
+        let mut host_tables = Vec::with_capacity(num_visits * num_slices * BATCH_STATE_WORDS);
+        for v in 0..num_visits {
+            for sv in &slice_visits {
+                host_tables.extend_from_slice(&state_words(&ctx.stream, &sv[v]));
+            }
+        }
+        let mut host_slices = Vec::with_capacity(num_slices * PACKED_SLICE_WORDS);
+        let mut bf16_descs = Vec::new();
+        let mut fp8_descs = Vec::new();
+        let mut host_moe_tiles = Vec::new();
+        for (si, s) in meta.iter().enumerate() {
+            host_slices.extend_from_slice(&[
+                u32::try_from(s.offset)?,
+                u32::try_from(s.len)?,
+                u32::try_from(s.start)?,
+                u32::try_from(si)?,
+            ]);
+            let blocks_m = prefill_blocks(s.len);
+            let dst = match ctx.prefill_attention.products(s.start + s.len) {
+                Products::Bf16 => &mut bf16_descs,
+                Products::Fp8 => &mut fp8_descs,
+            };
+            for bm in 0..blocks_m {
+                dst.push(u32::try_from((bm << 8) | si)?);
+            }
+            let tiles = s.len.div_ceil(MOE_CONV_ROWS);
+            for tile in 0..tiles {
+                host_moe_tiles.push(u32::try_from((tile << 8) | si)?);
+            }
+        }
+        let bf16_blocks = bf16_descs.len();
+        let fp8_blocks = fp8_descs.len();
+        let mut host_attn_blocks = bf16_descs;
+        host_attn_blocks.extend_from_slice(&fp8_descs);
+        ensure!(
+            host_attn_blocks.len() <= PREFILL_PACKED_MAX_BLOCKS,
+            "packed prefill has {} attention blocks, exceeding {PREFILL_PACKED_MAX_BLOCKS}",
+            host_attn_blocks.len()
+        );
+        ensure!(
+            host_moe_tiles.len() <= MOE_PACKED_MAX_TILES,
+            "packed prefill has {} MoE tiles, exceeding {MOE_PACKED_MAX_TILES}",
+            host_moe_tiles.len()
+        );
+        let packed_buf = p.packed.as_mut().context("the packed buffers are missing")?;
+        ctx.stream.memcpy_htod(
+            &host_tables,
+            &mut packed_buf.tables.slice_mut(..host_tables.len()),
+        )?;
+        ctx.stream.memcpy_htod(
+            &host_slices,
+            &mut packed_buf.slices.slice_mut(..host_slices.len()),
+        )?;
+        ctx.stream.memcpy_htod(
+            &host_attn_blocks,
+            &mut packed_buf.attn_blocks.slice_mut(..host_attn_blocks.len()),
+        )?;
+        ctx.stream.memcpy_htod(
+            &host_moe_tiles,
+            &mut packed_buf.moe_tiles.slice_mut(..host_moe_tiles.len()),
+        )?;
+        let plan = PackedPlan {
+            num_slices,
+            bf16_blocks,
+            fp8_blocks,
+            moe_tiles: host_moe_tiles.len(),
+        };
         ctx.prefill_packed_enqueue(
             p,
             &mut slice_visits,
             *passes,
             *max_blocks,
             &meta,
+            plan,
             total_rows,
             sample_one,
             *sampler,
@@ -3097,6 +3230,7 @@ impl Ctx {
         passes: usize,
         max_blocks: usize,
         meta: &[PackedSliceMeta<'_>],
+        plan: PackedPlan,
         m: usize,
         sample_one: &mut SampleBuffers,
         sampler: bool,
@@ -3139,7 +3273,17 @@ impl Ctx {
         };
         let mut visit_index = 0usize;
         for layer in 0..core_start {
-            self.visit_packed_rows(p, slice_visits, visit_index, layer, &mut blocks, false, meta, m)?;
+            self.visit_packed_rows(
+                p,
+                slice_visits,
+                visit_index,
+                layer,
+                &mut blocks,
+                false,
+                meta,
+                plan,
+                m,
+            )?;
             visit_index += 1;
         }
         self.stream.memcpy_dtod(
@@ -3210,13 +3354,24 @@ impl Ctx {
                     &mut blocks,
                     pass > 0,
                     meta,
+                    plan,
                     m,
                 )?;
                 visit_index += 1;
             }
         }
         for layer in core_end..cfg.num_hidden_layers {
-            self.visit_packed_rows(p, slice_visits, visit_index, layer, &mut blocks, false, meta, m)?;
+            self.visit_packed_rows(
+                p,
+                slice_visits,
+                visit_index,
+                layer,
+                &mut blocks,
+                false,
+                meta,
+                plan,
+                m,
+            )?;
             visit_index += 1;
         }
         let finishing: Vec<usize> = meta
@@ -3336,7 +3491,7 @@ impl Ctx {
 
     /// One decoder-layer visit for a packed multi-prompt prefill pass.
     #[expect(clippy::too_many_arguments, reason = "packed visit state")]
-    #[expect(clippy::too_many_lines, reason = "mirrors visit_rows with per-slice conv/attention")]
+    #[expect(clippy::too_many_lines, reason = "mirrors visit_rows with ragged packed kernels")]
     fn visit_packed_rows(
         &self,
         p: &mut PrefillScratch,
@@ -3346,6 +3501,7 @@ impl Ctx {
         blocks: &mut Blocks,
         messages: bool,
         meta: &[PackedSliceMeta<'_>],
+        plan: PackedPlan,
         m: usize,
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
@@ -3492,64 +3648,52 @@ impl Ctx {
             self.gemm_rows(&mut products, m, false, Some(&mut p.gate.dense))?;
         }
 
-        // 2. Per-slice attention_post_rows + K/V conv state shift.
-        for (si, slice) in meta.iter().enumerate() {
-            let (off, len) = (slice.offset, slice.len);
-            let state = &mut slice_visits[si][index];
+        // 2. Ragged packed attention_post_rows across all `m` rows in 1 launch
+        //    (all 4 conv states shift in 1 launch at the end of the visit).
+        let state_off = index * plan.num_slices * BATCH_STATE_WORDS;
+        let state_end = state_off + plan.num_slices * BATCH_STATE_WORDS;
+        let slice_words = plan.num_slices * PACKED_SLICE_WORDS;
+        {
+            let packed_buf = p.packed.as_ref().context("the packed buffers are missing")?;
+            let packed_rows = PackedRows {
+                states: packed_buf.tables.slice(state_off..state_end),
+                slices: packed_buf.slices.slice(..slice_words),
+                num_slices: plan.num_slices,
+            };
             let conv = match &attn_w.kv_conv {
                 KvConv::Static { k, v } => KvConvWeights::Static { k, v },
                 KvConv::Dynamic {
                     k_static, v_static, ..
                 } => KvConvWeights::Dynamic {
-                    k_dynamic: attn.k_dynamic.slice(off * taps_w..(off + len) * taps_w),
-                    v_dynamic: attn.v_dynamic.slice(off * taps_w..(off + len) * taps_w),
+                    k_dynamic: rows(&attn.k_dynamic, m, taps_w),
+                    v_dynamic: rows(&attn.v_dynamic, m, taps_w),
                     k_static,
                     v_static,
                 },
             };
-            self.kernels.norm.attention_post_rows(
+            self.kernels.norm.attention_post_rows_packed(
                 &self.stream,
-                AttentionPostRows {
-                    k_raw: attn.k_raw.slice(off * kv_dims..(off + len) * kv_dims),
-                    v_raw: attn.v_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                AttentionPostRowsPacked {
+                    k_raw: rows(&attn.k_raw, m, kv_dims),
+                    v_raw: rows(&attn.v_raw, m, kv_dims),
                     conv,
-                    k_state: &state.conv[0],
-                    v_state: &state.conv[1],
-                    q_raw: attn.q_raw.slice(off * q_dims..(off + len) * q_dims),
+                    q_raw: rows(&attn.q_raw, m, q_dims),
                     q_scale: &attn_w.q_clip_scale,
-                    r_raw: attn.r_raw.slice(off * rel_dims..(off + len) * rel_dims),
+                    r_raw: rows(&attn.r_raw, m, rel_dims),
                     r_scale: &attn_w.rel_clip_scale,
-                    k: attn.k.slice_mut(off * kv_dims..(off + len) * kv_dims),
-                    v: attn.v.slice_mut(off * kv_dims..(off + len) * kv_dims),
-                    q: attn.q.slice_mut(off * q_dims..(off + len) * q_dims),
-                    r: attn.r.slice_mut(off * rel_dims..(off + len) * rel_dims),
-                    log_scale: (!sliding).then_some((
-                        p.packed_starts.slice(si..=si),
-                        cfg.log_scaling_alpha,
-                        cfg.log_scaling_n_floor as f32,
-                    )),
+                    k: rows_mut(&mut attn.k, m, kv_dims),
+                    v: rows_mut(&mut attn.v, m, kv_dims),
+                    q: rows_mut(&mut attn.q, m, q_dims),
+                    r: rows_mut(&mut attn.r, m, rel_dims),
+                    log_scale: (!sliding)
+                        .then_some((cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32)),
                     qk_threshold: cfg.qk_l2_clip_threshold,
                     rel_threshold: cfg.rel_l2_clip_threshold,
                     eps: self.eps(),
                     bias: None,
-                    batch: None,
+                    packed: &packed_rows,
                 },
-                len,
-            )?;
-            let [k_state, v_state, ..] = &mut state.conv;
-            self.kernels.conv.shift_state(
-                &self.stream,
-                &attn.k_raw.slice(off * kv_dims..(off + len) * kv_dims),
-                k_state,
-                kv_dims,
-                len,
-            )?;
-            self.kernels.conv.shift_state(
-                &self.stream,
-                &attn.v_raw.slice(off * kv_dims..(off + len) * kv_dims),
-                v_state,
-                kv_dims,
-                len,
+                m,
             )?;
         }
 
@@ -3570,24 +3714,119 @@ impl Ctx {
             )?;
         }
 
-        // 4. Per-slice flash prefill attention against each slot's KV cache.
-        for (si, slice) in meta.iter().enumerate() {
-            let (off, len) = (slice.offset, slice.len);
-            let state = &mut slice_visits[si][index];
-            self.kernels.attention.prefill_attention(
-                &self.stream,
-                &attn.q.slice(off * q_dims..(off + len) * q_dims),
-                &attn.k.slice(off * kv_dims..(off + len) * kv_dims),
-                &attn.v.slice(off * kv_dims..(off + len) * kv_dims),
-                &mut state.kv,
-                &p.packed_starts.slice(si..=si),
-                len,
-                &attn.bias.slice(off * bias_w..(off + len) * bias_w),
-                &attn.sinks.slice(off * heads..(off + len) * heads),
-                &mut attn.partials,
-                &mut attn.out.slice_mut(off * q_dims..(off + len) * q_dims),
-                self.prefill_attention.products(slice.start + len),
-            )?;
+        // 4. Ragged packed flash prefill attention + KV append across all S slices.
+        {
+            let packed_buf = p.packed.as_mut().context("the packed buffers are missing")?;
+            let total_blocks = plan.bf16_blocks + plan.fp8_blocks;
+            if plan.num_slices == 1
+                && meta[0].len == 1
+                && slice_visits[0][index].kv.format() != attention::KvFormat::Nvfp4
+            {
+                // Single 1-token slice: match `prefill_slot` bit-for-bit via decode attention.
+                self.kernels.attention.prefill_attention(
+                    &self.stream,
+                    &rows(&attn.q, m, q_dims),
+                    &rows(&attn.k, m, kv_dims),
+                    &rows(&attn.v, m, kv_dims),
+                    &mut slice_visits[0][index].kv,
+                    &packed_buf.slices.slice(2..=2),
+                    1,
+                    &rows(&attn.bias, m, bias_w),
+                    &rows(&attn.sinks, m, heads),
+                    &mut attn.partials,
+                    &mut rows_mut(&mut attn.out, m, q_dims),
+                    self.prefill_attention.products(meta[0].start + 1),
+                )?;
+            } else {
+                let packed_rows = PackedRows {
+                    states: packed_buf.tables.slice(state_off..state_end),
+                    slices: packed_buf.slices.slice(..slice_words),
+                    num_slices: plan.num_slices,
+                };
+                let proto_kv = &slice_visits[0][index].kv;
+                if proto_kv.format() == attention::KvFormat::Fp8
+                    && plan.bf16_blocks > 0
+                    && plan.fp8_blocks > 0
+                {
+                    // Mixed Auto FP8 batch (some slices <= 16K, some > 16K): append once and
+                    // run each product group in one packed launch.
+                    let sliding_kv = proto_kv.window().is_some();
+                    if !sliding_kv {
+                        self.kernels.attention.append_rows_packed(
+                            &self.stream,
+                            proto_kv,
+                            &packed_rows,
+                            m,
+                            &rows(&attn.k, m, kv_dims),
+                            &rows(&attn.v, m, kv_dims),
+                        )?;
+                    }
+                    self.kernels.attention.prefill_attention_packed_kernel(
+                        &self.stream,
+                        &rows(&attn.q, m, q_dims),
+                        &rows(&attn.k, m, kv_dims),
+                        &rows(&attn.v, m, kv_dims),
+                        proto_kv,
+                        &packed_rows,
+                        &packed_buf.attn_blocks.slice(..plan.bf16_blocks),
+                        m,
+                        &rows(&attn.bias, m, bias_w),
+                        &rows(&attn.sinks, m, heads),
+                        &mut attn.partials,
+                        &mut packed_buf.attn_counters,
+                        &mut rows_mut(&mut attn.out, m, q_dims),
+                        Products::Bf16,
+                    )?;
+                    self.kernels.attention.prefill_attention_packed_kernel(
+                        &self.stream,
+                        &rows(&attn.q, m, q_dims),
+                        &rows(&attn.k, m, kv_dims),
+                        &rows(&attn.v, m, kv_dims),
+                        proto_kv,
+                        &packed_rows,
+                        &packed_buf.attn_blocks.slice(plan.bf16_blocks..total_blocks),
+                        m,
+                        &rows(&attn.bias, m, bias_w),
+                        &rows(&attn.sinks, m, heads),
+                        &mut attn.partials,
+                        &mut packed_buf.attn_counters,
+                        &mut rows_mut(&mut attn.out, m, q_dims),
+                        Products::Fp8,
+                    )?;
+                    if sliding_kv {
+                        self.kernels.attention.append_rows_packed(
+                            &self.stream,
+                            proto_kv,
+                            &packed_rows,
+                            m,
+                            &rows(&attn.k, m, kv_dims),
+                            &rows(&attn.v, m, kv_dims),
+                        )?;
+                    }
+                } else {
+                    let products = if plan.fp8_blocks > 0 && plan.bf16_blocks == 0 {
+                        Products::Fp8
+                    } else {
+                        Products::Bf16
+                    };
+                    self.kernels.attention.prefill_attention_packed(
+                        &self.stream,
+                        &rows(&attn.q, m, q_dims),
+                        &rows(&attn.k, m, kv_dims),
+                        &rows(&attn.v, m, kv_dims),
+                        proto_kv,
+                        &packed_rows,
+                        &packed_buf.attn_blocks.slice(..total_blocks),
+                        m,
+                        &rows(&attn.bias, m, bias_w),
+                        &rows(&attn.sinks, m, heads),
+                        &mut attn.partials,
+                        &mut packed_buf.attn_counters,
+                        &mut rows_mut(&mut attn.out, m, q_dims),
+                        products,
+                    )?;
+                }
+            }
         }
 
         // 5. Attention gate + output projection once across all `m` rows.
@@ -3609,21 +3848,24 @@ impl Ctx {
             None,
         )?;
 
-        // 6. Per-slice post-attention conv + residual add (shifts conv[2] per slice),
+        // 6. Ragged packed post-attention conv + residual add across all `m` rows in 1 launch,
         //    then one depth_attention_rows over all `m` rows.
-        for (si, slice) in meta.iter().enumerate() {
-            let (off, len) = (slice.offset, slice.len);
-            let state = &mut slice_visits[si][index];
-            let hidden_slice =
-                (!block_start).then(|| p.hidden.slice(off * hidden..(off + len) * hidden));
-            self.kernels.conv.short_conv_residual_rows(
+        {
+            let packed_buf = p.packed.as_ref().context("the packed buffers are missing")?;
+            let packed_rows = PackedRows {
+                states: packed_buf.tables.slice(state_off..state_end),
+                slices: packed_buf.slices.slice(..slice_words),
+                num_slices: plan.num_slices,
+            };
+            let hidden_view = (!block_start).then(|| rows(&p.hidden, m, hidden));
+            self.kernels.conv.short_conv_residual_rows_packed(
                 &self.stream,
-                &p.attention.proj.slice(off * hidden..(off + len) * hidden),
+                &rows(&p.attention.proj, m, hidden),
                 &layer_w.post_attention_conv,
-                &mut state.conv[2],
-                hidden_slice.as_ref().map(|v| v as &dyn DeviceIn<bf16>),
-                &mut p.residual.slice_mut(off * hidden..(off + len) * hidden),
-                len,
+                &packed_rows,
+                hidden_view.as_ref(),
+                &mut rows_mut(&mut p.residual, m, hidden),
+                m,
             )?;
         }
         let w13_quant =
@@ -3747,20 +3989,37 @@ impl Ctx {
         // 7. MoE router + grouping + expert GEMMs once across all `m` rows.
         self.moe_block_rows(layer_w, &mut p.moe, &p.mlp_x, w13_quant.is_some(), m)?;
 
-        // 8. Per-slice post-MLP conv + residual add (shifts conv[3] per slice).
-        for (si, slice) in meta.iter().enumerate() {
-            let (off, len) = (slice.offset, slice.len);
-            let state = &mut slice_visits[si][index];
-            self.kernels.conv.moe_conv_residual_rows(
+        // 8. Ragged packed post-MLP conv + residual add across all S slices in 1 launch,
+        //    then shift all 4 conv states (k, v, post-attn, post-MLP) for all S slices in 1 launch.
+        {
+            let packed_buf = p.packed.as_ref().context("the packed buffers are missing")?;
+            let packed_rows = PackedRows {
+                states: packed_buf.tables.slice(state_off..state_end),
+                slices: packed_buf.slices.slice(..slice_words),
+                num_slices: plan.num_slices,
+            };
+            self.kernels.conv.moe_conv_residual_rows_packed(
                 &self.stream,
-                &p.moe.down.slice(off * 8 * hidden..(off + len) * 8 * hidden),
-                &p.moe.weights.slice(off * 8..(off + len) * 8),
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
                 &layer_w.post_mlp_conv,
-                &mut state.conv[3],
-                &p.residual.slice(off * hidden..(off + len) * hidden),
-                &mut p.moe.combined.slice_mut(off * hidden..(off + len) * hidden),
-                &mut p.out.slice_mut(off * hidden..(off + len) * hidden),
-                len,
+                &packed_rows,
+                &packed_buf.moe_tiles.slice(..plan.moe_tiles),
+                &rows(&p.residual, m, hidden),
+                &mut rows_mut(&mut p.moe.combined, m, hidden),
+                &mut rows_mut(&mut p.out, m, hidden),
+                m,
+            )?;
+            self.kernels.conv.shift_visit_states_packed(
+                &self.stream,
+                [
+                    Some(rows(&p.attention.k_raw, m, kv_dims)),
+                    Some(rows(&p.attention.v_raw, m, kv_dims)),
+                    Some(rows(&p.attention.proj, m, hidden)),
+                    Some(rows(&p.moe.combined, m, hidden)),
+                ],
+                &packed_rows,
+                m,
             )?;
         }
         std::mem::swap(&mut p.hidden, &mut p.out);

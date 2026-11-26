@@ -38,7 +38,7 @@ use crate::{
     ops::{
         Products,
         norm::KvConvWeights,
-        spec::{BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows},
+        spec::{BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, PACKED_SLICE_WORDS, PackedRows},
     },
     vmm::{PagePool, Pooled},
 };
@@ -82,6 +82,12 @@ const PREFILL_BLOCK: u32 = 256;
 /// Dynamic shared memory of a prefill block, checked against the kernel's layout by
 /// `static_assert`s in `attention.cu`. One block fits on an SM.
 const PREFILL_SHARED_BYTES: u32 = 84_240;
+/// Maximum global `block_m` blocks across up to `BATCH_ROWS` packed slices totaling at most
+/// `MAX_PREFILL_ROWS` rows (`kPrefillPackedMaxBlocks` in `attention.cu`).
+pub const PREFILL_PACKED_MAX_BLOCKS: usize = 128;
+/// Dynamic shared memory of a packed prefill block, checked against `PrefillPackedShared`'s
+/// `static_assert`s in `attention.cu`.
+const PREFILL_PACKED_SHARED_BYTES: u32 = 84_864;
 /// F32 values of one prefill partial slot: 128 rows of 128 outputs, a max and a sum.
 const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
 const _: () = assert!(PREFILL_SLOT == siphon::memory::PREFILL_SLOT);
@@ -665,7 +671,8 @@ fn splits(slots: usize, min_slots: usize) -> u32 {
 }
 
 /// Prefill blocks per KV head for a chunk of `rows`.
-fn prefill_blocks(rows: usize) -> usize {
+#[must_use]
+pub fn prefill_blocks(rows: usize) -> usize {
     (rows * (HEADS / KV_HEADS)).div_ceil(PREFILL_BLOCK_ROWS)
 }
 
@@ -725,11 +732,18 @@ pub struct Attention {
     decode_step_fp8: CudaFunction,
     decode_step_fp4: CudaFunction,
     kv_append_rows_fp4: CudaFunction,
+    kv_append_rows_packed: CudaFunction,
+    kv_append_rows_packed_fp8: CudaFunction,
+    kv_append_rows_packed_fp4: CudaFunction,
     prefill_fp4: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
     /// `prefill_attention_fp8_mma`, for [`Products::Fp8`].
     prefill_fp8_mma: CudaFunction,
+    prefill_packed_fp4: CudaFunction,
+    prefill_packed: CudaFunction,
+    prefill_packed_fp8: CudaFunction,
+    prefill_packed_fp8_mma: CudaFunction,
     /// `attention_rows_bf16_<NT>`, `attention_rows_fp8_<NT>` and `attention_rows_fp4_<NT>`
     /// for NT = 1 to 3.
     rows: Vec<[CudaFunction; 3]>,
@@ -855,6 +869,10 @@ fn extent(name: &str, len: usize, rows: usize) -> anyhow::Result<u32> {
 }
 
 impl Attention {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "loads all attention, packed-prefill, and adaptive split-K kernel entry points"
+    )]
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "attention", cubin!("attention"))?;
         let rows_function = |name: &str, smem: u32| -> anyhow::Result<CudaFunction> {
@@ -882,6 +900,21 @@ impl Attention {
             Ok("1" | "true" | "TRUE" | "yes" | "YES") => BatchSplitMode::Exact,
             _ => BatchSplitMode::Auto,
         };
+        let prefill_packed = module.load_function("prefill_attention_packed_bf16")?;
+        let prefill_packed_fp8 = module.load_function("prefill_attention_packed_fp8")?;
+        let prefill_packed_fp8_mma = module.load_function("prefill_attention_packed_fp8_mma")?;
+        let prefill_packed_fp4 = module.load_function("prefill_attention_packed_fp4")?;
+        for function in [
+            &prefill_packed,
+            &prefill_packed_fp8,
+            &prefill_packed_fp8_mma,
+            &prefill_packed_fp4,
+        ] {
+            function.set_attribute(
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                PREFILL_PACKED_SHARED_BYTES.cast_signed(),
+            )?;
+        }
         Ok(Self {
             relative_bias: module.load_function("relative_bias_bf16")?,
             relative_bias_rows: module.load_function("relative_bias_rows_bf16")?,
@@ -895,10 +928,17 @@ impl Attention {
             decode_step_fp8: module.load_function("decode_step_fp8")?,
             decode_step_fp4: module.load_function("decode_step_fp4")?,
             kv_append_rows_fp4: module.load_function("kv_append_rows_fp4")?,
+            kv_append_rows_packed: module.load_function("kv_append_rows_packed_bf16")?,
+            kv_append_rows_packed_fp8: module.load_function("kv_append_rows_packed_fp8")?,
+            kv_append_rows_packed_fp4: module.load_function("kv_append_rows_packed_fp4")?,
             prefill_fp4,
             prefill,
             prefill_fp8,
             prefill_fp8_mma,
+            prefill_packed_fp4,
+            prefill_packed,
+            prefill_packed_fp8,
+            prefill_packed_fp8_mma,
             rows: (1..=ROWS_QUERY_TILES)
                 .map(|nt| {
                     Ok([
@@ -1945,6 +1985,223 @@ impl Attention {
 
         if input_keys == 1 {
             self.append_rows(stream, cache, &start, rows, &k, &v)?;
+        }
+        Ok(())
+    }
+
+    /// Appends all `rows` packed tokens across `packed.num_slices` slices into each slice's
+    /// own KV cache (words 0 and 1 of `packed.states`) in one launch. Every slice must share
+    /// the cache `format` and `slots` of `cache`.
+    pub fn append_rows_packed(
+        &self,
+        stream: &CudaStream,
+        cache: &KvCache,
+        packed: &PackedRows<'_>,
+        rows: usize,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+    ) -> anyhow::Result<()> {
+        let (k, v) = (k.view(), v.view());
+        ensure!(rows > 0, "no rows");
+        ensure!(packed.num_slices > 0, "no packed slices");
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        ensure!(
+            !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
+            "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
+            packed.states.len()
+        );
+        let slots = u32::try_from(cache.slots)?;
+        let num_slices = i32::try_from(packed.num_slices)?;
+        let threads = if cache.format() == KvFormat::Nvfp4 {
+            KV_ROW / 16
+        } else {
+            KV_ROW / 8
+        };
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows)?, 1, 1),
+            block_dim: (threads as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let function = match *cache.data {
+            KvData::Bf16 { .. } => &self.kv_append_rows_packed,
+            KvData::Fp8 { .. } => &self.kv_append_rows_packed_fp8,
+            KvData::Nvfp4 { .. } => &self.kv_append_rows_packed_fp4,
+        };
+        let mut launch = stream.launch_builder(function);
+        launch
+            .arg(&k)
+            .arg(&v)
+            .arg(&packed.states)
+            .arg(&packed.slices)
+            .arg(&num_slices)
+            .arg(&slots);
+        // SAFETY: the arguments match `kv_append_rows_packed_{bf16,fp8,fp4}(const bf16*,
+        // const bf16*, const unsigned long long*, const PackedSlice*, int, unsigned)`. Each
+        // row finds its slice in `slices`, appends into that slice's live, distinct KV caches
+        // (words 0 and 1 of `states`) of `slots` slots and `cache.format()`, and skips
+        // overwritten rows when `row_len > slots`.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Launches ONLY the ragged packed flash prefill attention kernel (without KV append)
+    /// for the global query blocks listed in `block_descs`. Use
+    /// [`Attention::prefill_attention_packed`] for the standard append + attention pair, or
+    /// call [`Attention::append_rows_packed`] once and this method twice when a packed FP8
+    /// `Auto` batch mixes slices below and above `FP8_ATTENTION_KEYS`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn prefill_attention_packed_kernel(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        cache: &KvCache,
+        packed: &PackedRows<'_>,
+        block_descs: &CudaView<'_, u32>,
+        rows: usize,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
+        scratch: &mut PrefillScratch,
+        counters: &mut CudaSlice<u32>,
+        out: &mut impl DeviceOut<bf16>,
+        products: Products,
+    ) -> anyhow::Result<()> {
+        let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
+        let mut out = out.view_mut();
+        ensure!(
+            (1..=scratch.max_rows).contains(&rows),
+            "prefill scratch takes 1 to {} rows, not {rows}",
+            scratch.max_rows
+        );
+        ensure!(packed.num_slices > 0, "no packed slices");
+        let total_blocks_m = block_descs.len();
+        ensure!(
+            (1..=PREFILL_PACKED_MAX_BLOCKS).contains(&total_blocks_m),
+            "packed prefill takes 1 to {PREFILL_PACKED_MAX_BLOCKS} query blocks, not {total_blocks_m}"
+        );
+        check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        check_len("sinks", sinks.len(), rows * HEADS)?;
+        check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        ensure!(
+            !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
+            "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
+            packed.states.len()
+        );
+        ensure!(
+            counters.len() >= total_blocks_m * KV_HEADS,
+            "packed counters has {} elements, need at least {}",
+            counters.len(),
+            total_blocks_m * KV_HEADS
+        );
+        let extent = extent("bias", bias.len(), rows * HEADS)?;
+        ensure!(
+            extent.is_multiple_of(8),
+            "prefill needs a bias extent that is a multiple of 8, not {extent}"
+        );
+        let slots = u32::try_from(cache.slots)?;
+        let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
+        let total_blocks_u32 = u32::try_from(total_blocks_m)?;
+        let input_keys = u32::from(cache.window.is_some());
+        ensure!(
+            input_keys == 0
+                || matches!(
+                    cache.format(),
+                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4
+                ),
+            "sliding caches are BF16, FP8 or NVFP4"
+        );
+        let function = match (&*cache.data, products) {
+            (KvData::Bf16 { .. }, _) => &self.prefill_packed,
+            (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_packed_fp8,
+            (KvData::Fp8 { .. }, Products::Fp8) => &self.prefill_packed_fp8_mma,
+            (KvData::Nvfp4 { .. }, _) => &self.prefill_packed_fp4,
+        };
+        let mut launch = stream.launch_builder(function);
+        launch
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&packed.states)
+            .arg(&packed.slices)
+            .arg(block_descs)
+            .arg(&bias)
+            .arg(&sinks)
+            .arg(&mut scratch.partials)
+            .arg(counters)
+            .arg(&mut out)
+            .arg(&total_blocks_u32)
+            .arg(&slots)
+            .arg(&window)
+            .arg(&extent)
+            .arg(&input_keys)
+            .arg(&SCALE);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(scratch.blocks)?, 1, 1),
+            block_dim: (PREFILL_BLOCK, 1, 1),
+            shared_mem_bytes: PREFILL_PACKED_SHARED_BYTES,
+        };
+        // SAFETY: the arguments match `prefill_attention_packed_{bf16,fp8,fp8_mma,fp4}`.
+        // Every per-row buffer holds `rows` rows as checked above, `block_descs` names
+        // `total_blocks_m <= 128` valid `(local_block_m, slice_idx)` pairs into `slices`,
+        // each slice's KV caches (words 0 and 1 of `states`) match `cache.format()` and
+        // `slots` and hold all positions up to `kv_start + row_len - 1`, `scratch.partials`
+        // holds two slots per SM, `counters` holds at least `total_blocks_m * 8` zeroed
+        // counters (returned to zero), and `PREFILL_PACKED_SHARED_BYTES` matches the
+        // `static_assert`s in `attention.cu`.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Ragged packed multi-slice form of [`Attention::prefill_attention`]: appends all `rows`
+    /// tokens across `packed.num_slices` slices into their own KV caches and computes their
+    /// attention in one persistent grid launch across all S slices (2 launches total: 1 KV
+    /// append + 1 flash attention, independent of `S`).
+    #[expect(clippy::too_many_arguments, reason = "mirrors prefill_attention")]
+    pub fn prefill_attention_packed(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        cache: &KvCache,
+        packed: &PackedRows<'_>,
+        block_descs: &CudaView<'_, u32>,
+        rows: usize,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
+        scratch: &mut PrefillScratch,
+        counters: &mut CudaSlice<u32>,
+        out: &mut impl DeviceOut<bf16>,
+        products: Products,
+    ) -> anyhow::Result<()> {
+        let sliding = cache.window.is_some();
+        if !sliding {
+            self.append_rows_packed(stream, cache, packed, rows, k, v)?;
+        }
+        self.prefill_attention_packed_kernel(
+            stream,
+            q,
+            k,
+            v,
+            cache,
+            packed,
+            block_descs,
+            rows,
+            bias,
+            sinks,
+            scratch,
+            counters,
+            out,
+            products,
+        )?;
+        if sliding {
+            self.append_rows_packed(stream, cache, packed, rows, k, v)?;
         }
         Ok(())
     }

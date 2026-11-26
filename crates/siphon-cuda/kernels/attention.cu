@@ -45,6 +45,7 @@
 #include <cstdint>
 
 #include "conv_step.cuh"
+#include "packed.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -2775,6 +2776,980 @@ static_assert(sizeof(PrefillShared<Fp8Format, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp8MmaFormat, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp4Format, kPrefillWarps>) <= 84240);
 static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <= PrefillShared<Fp4Format, kPrefillWarps>::kStaged);
+
+// ---------------------------------------------------------------------------
+// Ragged packed multi-slice prefill KV append & flash attention: runs across
+// all S variable-length slices (1 <= S <= 64, sum(row_len) <= 2048) in one
+// persistent grid launch so short slices saturate every SM concurrently.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Upper bound on sum_s ceil(row_len[s] * 3 / 128) across S <= 64 slices totaling <= 2048
+// rows: at most 64 + 47 = 111 blocks, rounded up to 128.
+constexpr int kPrefillPackedMaxBlocks = 128;
+
+template <class F, int kWarps>
+struct alignas(16) PrefillPackedShared {
+    static constexpr bool kFp8 = sizeof(typename F::Elem) == 1;
+    static constexpr bool kMma8 = IsFp8Mma<F>::value;
+    static constexpr int kRows = 16 * kWarps;
+    static constexpr int kStages = kFp8 ? 1 : 2;
+    static constexpr int kKTile = kMma8 ? kPrefillKeys * kHeadDim / 2 : kPrefillKeys * kHeadDim;
+    static constexpr int kVTile = kMma8 ? 16 : kPrefillKeys * kHeadDim;
+    __nv_bfloat16 k[kStages][kKTile];
+    __nv_bfloat16 v[kStages][kVTile];
+    static constexpr int kStaged = kFp8 ? kPrefillKeys * kHeadDim : 16;
+    uint8_t k8[2][kStaged];
+    uint8_t v8[2][kStaged];
+    __nv_bfloat16 bias[kRows * kBiasStride];
+    unsigned tiles[kPrefillPackedMaxBlocks + 1];
+    uint16_t block_desc[kPrefillPackedMaxBlocks];
+    bool last;
+};
+
+struct PrefillPackedSegment {
+    PrefillRange range;
+    unsigned begin;
+    unsigned unit_begin;
+    unsigned t_begin;
+    unsigned t_end;
+    unsigned row_start;
+    unsigned rows;
+    unsigned start;
+    unsigned state_idx;
+    int gblock;
+    int block_m;
+    int kv_head;
+};
+
+template <class F, int kWarps>
+__device__ __forceinline__ void prefill_attention_packed(
+    const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
+    const unsigned long long* states, const PackedSlice* slices, const uint32_t* block_descs,
+    const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partials, unsigned* counters,
+    __nv_bfloat16* out, unsigned total_blocks_m, unsigned slots, unsigned window, unsigned extent,
+    unsigned input_keys, float scale) {
+    using Shared = PrefillPackedShared<F, kWarps>;
+    constexpr int kThreads = kWarps * 32;
+    constexpr int kRows = Shared::kRows;
+    constexpr bool kFp8 = Shared::kFp8;
+    constexpr bool kMma8 = Shared::kMma8;
+    constexpr float kPLog2 = kMma8 ? kPScaleLog2Fp8 : kPScaleLog2;
+    constexpr float kP = kMma8 ? kPScaleFp8 : kPScale;
+    constexpr int kSlot = kRows * (kHeadDim + 2);
+    extern __shared__ __align__(16) unsigned char prefill_packed_smem[];
+    Shared& sm = *reinterpret_cast<Shared*>(prefill_packed_smem);
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    auto range_of = [&](const PackedSlice& sl, int block_m) {
+        PrefillRange r;
+        const unsigned total_m = sl.row_len * kGroup;
+        const unsigned cache_end = input_keys ? sl.kv_start : sl.kv_start + sl.row_len;
+        const unsigned m0 = unsigned(block_m) * kRows;
+        r.r_lo = m0 / kGroup;
+        r.r_hi = (min(m0 + kRows, total_m) - 1) / kGroup;
+        r.hi = sl.kv_start + r.r_hi + 1;
+        r.lo = window != 0 && sl.kv_start + r.r_lo + 1 > window
+                   ? sl.kv_start + r.r_lo + 1 - window
+                   : 0;
+        r.a_end = min(r.hi, cache_end);
+        r.a_tiles = r.a_end > r.lo ? (r.a_end - r.lo + kPrefillKeys - 1) / kPrefillKeys : 0;
+        r.b_lo = max(r.lo, cache_end);
+        const unsigned b_tiles = r.hi > r.b_lo ? (r.hi - r.b_lo + kPrefillKeys - 1) / kPrefillKeys : 0;
+        r.tiles = r.a_tiles + b_tiles;
+        return r;
+    };
+
+    // Warp 0 scans the tile counts across all `total_blocks_m <= 128` global blocks
+    // (4 blocks per lane), storing prefix sums in `sm.tiles` and descriptors in `sm.block_desc`.
+    if (warp == 0) {
+        unsigned c[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int gb = 4 * lane + k;
+            if (gb < int(total_blocks_m)) {
+                const uint32_t desc = block_descs[gb];
+                sm.block_desc[gb] = uint16_t(desc);
+                const int si = int(desc & 0xffu);
+                const int bm = int(desc >> 8);
+                c[k] = range_of(slices[si], bm).tiles * kKvHeads;
+            }
+        }
+        const unsigned sum4 = c[0] + c[1] + c[2] + c[3];
+        unsigned inclusive = sum4;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            const unsigned v = __shfl_up_sync(0xffffffffu, inclusive, offset);
+            inclusive += lane >= offset ? v : 0;
+        }
+        const unsigned exclusive = inclusive - sum4;
+        const unsigned p[4] = {
+            exclusive,
+            exclusive + c[0],
+            exclusive + c[0] + c[1],
+            exclusive + c[0] + c[1] + c[2],
+        };
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int gb = 4 * lane + k;
+            if (gb <= int(total_blocks_m)) {
+                sm.tiles[gb] = p[k];
+            }
+        }
+        if (lane == 31 && total_blocks_m == kPrefillPackedMaxBlocks) {
+            sm.tiles[kPrefillPackedMaxBlocks] = inclusive;
+        }
+    }
+    __syncthreads();
+
+    const unsigned total = sm.tiles[total_blocks_m];
+    const unsigned grid = min(gridDim.x, total);
+    if (blockIdx.x >= grid) {
+        return;
+    }
+    auto begin_of = [&](unsigned b) { return unsigned((unsigned long long)b * total / grid); };
+    auto block_of = [&](unsigned x) { return unsigned(((unsigned long long)(x + 1) * grid - 1) / total); };
+    const unsigned my_begin = begin_of(blockIdx.x);
+    const unsigned my_end = begin_of(blockIdx.x + 1);
+    const float score_scale = scale * kLog2e;
+
+    int gblock = 0;
+    auto segment_at = [&](unsigned x) {
+        PrefillPackedSegment g;
+        while (sm.tiles[gblock + 1] <= x) {
+            ++gblock;
+        }
+        const uint16_t desc = sm.block_desc[gblock];
+        const int si = int(desc & 0xffu);
+        const int bm = int(desc >> 8);
+        const PackedSlice sl = slices[si];
+        g.gblock = gblock;
+        g.block_m = bm;
+        g.row_start = sl.row_start;
+        g.rows = sl.row_len;
+        g.start = sl.kv_start;
+        g.state_idx = sl.state_idx;
+        g.range = range_of(sl, bm);
+        g.kv_head = int((x - sm.tiles[gblock]) / g.range.tiles);
+        g.unit_begin = sm.tiles[gblock] + g.kv_head * g.range.tiles;
+        g.begin = x;
+        g.t_begin = x - g.unit_begin;
+        g.t_end = min(my_end, g.unit_begin + g.range.tiles) - g.unit_begin;
+        return g;
+    };
+
+    auto tile_at = [&](const PrefillPackedSegment& g, unsigned t) {
+        const PrefillRange& range = g.range;
+        PrefillTile tile;
+        tile.input = t >= range.a_tiles;
+        tile.p0 = tile.input ? range.b_lo + (t - range.a_tiles) * kPrefillKeys : range.lo + t * kPrefillKeys;
+        tile.end = tile.input ? range.hi : range.a_end;
+        const unsigned last = tile.p0 + kPrefillKeys - 1;
+        tile.full = last < tile.end && last <= g.start + range.r_lo &&
+                    (window == 0 || g.start + range.r_hi - tile.p0 < window);
+        tile.biased = int(g.start + range.r_lo) - int(last) < int(extent);
+        tile.near = g.start + range.r_hi - tile.p0 < extent;
+        return tile;
+    };
+
+    auto k_cache_of = [&](const PrefillPackedSegment& g) {
+        return reinterpret_cast<const typename F::Elem*>(states[size_t(g.state_idx) * 6 + 0]);
+    };
+    auto v_cache_of = [&](const PrefillPackedSegment& g) {
+        return reinterpret_cast<const typename F::Elem*>(states[size_t(g.state_idx) * 6 + 1]);
+    };
+    auto k_in_of = [&](const PrefillPackedSegment& g) { return k_in + size_t(g.row_start) * kKvRow; };
+    auto v_in_of = [&](const PrefillPackedSegment& g) { return v_in + size_t(g.row_start) * kKvRow; };
+
+    auto copy_bf16 = [&](const PrefillPackedSegment& g, const PrefillTile& tile, __nv_bfloat16* dst,
+                         const __nv_bfloat16* src, int thread, int threads) {
+        const unsigned first = tile.input ? tile.p0 - g.start : tile.p0 % slots;
+        const unsigned wrap = tile.input ? 0xffffffffu : slots;
+        constexpr int kChunks = kHeadDim / 8;
+        const int chunk = thread % kChunks;
+#pragma unroll 4
+        for (int row = thread / kChunks; row < kPrefillKeys; row += threads / kChunks) {
+            const bool valid = tile.p0 + row < tile.end;
+            unsigned source = first + row;
+            source = source >= wrap ? source - wrap : source;
+            const size_t offset = size_t(valid ? source : 0) * kKvRow + g.kv_head * kHeadDim + chunk * 8;
+            copy_async16(&dst[swizzle(row, chunk)], src + offset, valid);
+        }
+    };
+
+    auto load = [&](const PrefillPackedSegment& g, const PrefillTile& tile, int stage) {
+        const unsigned first = tile.input ? tile.p0 - g.start : tile.p0 % slots;
+        const unsigned wrap = tile.input ? 0xffffffffu : slots;
+        const typename F::Elem* kc = k_cache_of(g);
+        const typename F::Elem* vc = v_cache_of(g);
+        if constexpr (F::kFp4) {
+            constexpr int kChunks = kFp4HeadBytes / 16;
+            const int chunk = threadIdx.x % kChunks;
+#pragma unroll
+            for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
+                const bool valid = tile.p0 + row < tile.end;
+                unsigned source = first + row;
+                source = source >= wrap ? source - wrap : source;
+                const unsigned slot = valid ? source : 0;
+                const size_t offset = fp4_data(slot, g.kv_head) + chunk * 16;
+                copy_async16(&sm.k8[stage][row * kFp4HeadBytes + chunk * 16], kc + offset, valid);
+                copy_async16(&sm.v8[stage][row * kFp4HeadBytes + chunk * 16], vc + offset, valid);
+                if (chunk == 0) {
+                    const size_t scales = fp4_scales(slot, g.kv_head);
+                    constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+                    copy_async8(&sm.k8[stage][kScalesAt + row * kFp4HeadScales], kc + scales, valid);
+                    copy_async8(&sm.v8[stage][kScalesAt + row * kFp4HeadScales], vc + scales, valid);
+                }
+            }
+        } else if constexpr (kFp8) {
+            constexpr int kChunks = kHeadDim / 16;
+            const int chunk = threadIdx.x % kChunks;
+            const __nv_bfloat16* kin = k_in_of(g);
+            const __nv_bfloat16* vin = v_in_of(g);
+#pragma unroll
+            for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
+                const bool valid = tile.p0 + row < tile.end;
+                unsigned source = first + row;
+                source = source >= wrap ? source - wrap : source;
+                if (tile.input) {
+                    uint4 kk = make_uint4(0, 0, 0, 0);
+                    uint4 vv = make_uint4(0, 0, 0, 0);
+                    if (valid) {
+                        const size_t offset = size_t(source) * kKvRow + g.kv_head * kHeadDim + chunk * 16;
+                        auto pack16 = [](const __nv_bfloat16* src) {
+                            float a[8], b[8];
+                            unpack_bf16x8(*reinterpret_cast<const uint4*>(src), a);
+                            unpack_bf16x8(*reinterpret_cast<const uint4*>(src + 8), b);
+                            return make_uint4(pack_e4m3x4(a[0], a[1], a[2], a[3]),
+                                              pack_e4m3x4(a[4], a[5], a[6], a[7]),
+                                              pack_e4m3x4(b[0], b[1], b[2], b[3]),
+                                              pack_e4m3x4(b[4], b[5], b[6], b[7]));
+                        };
+                        kk = pack16(kin + offset);
+                        vv = pack16(vin + offset);
+                    }
+                    if constexpr (kMma8) {
+                        *reinterpret_cast<uint4*>(&sm.k8[stage][k8_offset(row, chunk)]) = kk;
+                        *reinterpret_cast<uint4*>(&sm.v8[stage][v8_offset(row, chunk)]) = vv;
+                    } else {
+                        *reinterpret_cast<uint4*>(&sm.k8[stage][row * kHeadDim + chunk * 16]) = kk;
+                        *reinterpret_cast<uint4*>(&sm.v8[stage][row * kHeadDim + chunk * 16]) = vv;
+                    }
+                } else {
+                    const size_t offset = size_t(valid ? source : 0) * kKvRow + g.kv_head * kHeadDim + chunk * 16;
+                    if constexpr (kMma8) {
+                        copy_async16(&sm.k8[stage][k8_offset(row, chunk)], kc + offset, valid);
+                        copy_async16(&sm.v8[stage][v8_offset(row, chunk)], vc + offset, valid);
+                    } else {
+                        copy_async16(&sm.k8[stage][row * kHeadDim + chunk * 16], kc + offset, valid);
+                        copy_async16(&sm.v8[stage][row * kHeadDim + chunk * 16], vc + offset, valid);
+                    }
+                }
+            }
+        } else {
+            copy_bf16(g, tile, sm.k[stage], tile.input ? k_in_of(g) : reinterpret_cast<const __nv_bfloat16*>(kc),
+                      threadIdx.x, kThreads);
+            copy_bf16(g, tile, sm.v[stage], tile.input ? v_in_of(g) : reinterpret_cast<const __nv_bfloat16*>(vc),
+                      threadIdx.x, kThreads);
+        }
+        copy_async_commit();
+    };
+
+    auto load_bias = [&](const PrefillPackedSegment& g, const PrefillTile& tile) {
+        const unsigned total_m = g.rows * kGroup;
+        const unsigned m0 = g.block_m * kRows;
+        const int top = int(tile.p0) + kPrefillKeys - 1;
+#pragma unroll
+        for (int i = lane; i < 16 * kBiasChunks; i += 32) {
+            const int row = warp * 16 + i / kBiasChunks;
+            const int c = i % kBiasChunks;
+            const unsigned mg = m0 + row;
+            const unsigned r = mg / kGroup;
+            const int chunk = ((int(g.start + r) - top) >> 3) + c;
+            const bool valid = mg < total_m && chunk >= 0 && (chunk + 1) * 8 <= int(extent);
+            const __nv_bfloat16* src =
+                bias + (size_t(g.row_start + r) * kHeads + g.kv_head * kGroup + mg % kGroup) * extent + chunk * 8;
+            copy_async16(&sm.bias[row * kBiasStride + c * 8], valid ? src : bias, valid);
+        }
+        copy_async_commit();
+    };
+
+    uint32_t qa[kMma8 ? 1 : kHeadDim / 16][4];
+    uint32_t qa8[kMma8 ? kHeadDim / 32 : 1][4];
+    uint32_t qs[kMma8 ? kHeadDim / 32 : 1];
+    auto load_q8 = [&](const PrefillPackedSegment& g) {
+        const unsigned total_m = g.rows * kGroup;
+        uint32_t scale[2][kHeadDim / 32];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const unsigned mg = g.block_m * kRows + warp * 16 + lane / 4 + 8 * i;
+            const bool valid = mg < total_m;
+            const size_t head =
+                size_t(g.row_start + (valid ? mg / kGroup : 0)) * kHeads + g.kv_head * kGroup + mg % kGroup;
+            const __nv_bfloat16* row = q + head * kHeadDim + (lane % 4) * 4;
+#pragma unroll
+            for (int s = 0; s < kHeadDim / 32; ++s) {
+                float x[8];
+                float lo4[4];
+                float hi4[4];
+                unpack_bf16x4(valid ? *reinterpret_cast<const uint2*>(row + 32 * s) : make_uint2(0, 0), lo4);
+                unpack_bf16x4(valid ? *reinterpret_cast<const uint2*>(row + 32 * s + 16) : make_uint2(0, 0), hi4);
+                float amax = 0.f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    x[j] = lo4[j];
+                    x[4 + j] = hi4[j];
+                    amax = fmaxf(amax, fmaxf(fabsf(lo4[j]), fabsf(hi4[j])));
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                const float raw = __fmul_rn(amax, 1.f / 448.f);
+                const int exponent = max(((__float_as_int(raw) + 0x007fffff) & 0x7f800000) >> 23, 1);
+                const float inverse = __int_as_float((254 - exponent) << 23);
+                scale[i][s] = unsigned(exponent);
+                qa8[s][i] = pack_e4m3x4(x[0] * inverse, x[1] * inverse, x[2] * inverse, x[3] * inverse);
+                qa8[s][2 + i] = pack_e4m3x4(x[4] * inverse, x[5] * inverse, x[6] * inverse, x[7] * inverse);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kHeadDim / 32; ++s) {
+            qs[s] = lane & 1 ? scale[1][s] : scale[0][s];
+        }
+    };
+    auto load_q = [&](const PrefillPackedSegment& g) {
+        if constexpr (kMma8) {
+            load_q8(g);
+        } else {
+            const unsigned total_m = g.rows * kGroup;
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const unsigned mg = g.block_m * kRows + warp * 16 + lane / 4 + 8 * i;
+                const bool valid = mg < total_m;
+                const size_t head =
+                    size_t(g.row_start + (valid ? mg / kGroup : 0)) * kHeads + g.kv_head * kGroup + mg % kGroup;
+                const __nv_bfloat16* row = q + head * kHeadDim + (lane % 4) * 2;
+#pragma unroll
+                for (int s = 0; s < kHeadDim / 16; ++s) {
+                    uint32_t lo = valid ? *reinterpret_cast<const uint32_t*>(row + 16 * s) : 0;
+                    uint32_t hi = valid ? *reinterpret_cast<const uint32_t*>(row + 16 * s + 8) : 0;
+                    if constexpr (F::kFp4) {
+                        lo = bf16x2_to_f16x2(lo);
+                        hi = bf16x2_to_f16x2(hi);
+                    }
+                    qa[s][i] = lo;
+                    qa[s][2 + i] = hi;
+                }
+            }
+        }
+    };
+
+    auto pv = [&](float (&o)[kHeadDim / 8][4], const uint32_t (&pa)[kPrefillKeys / 16][4],
+                  const __nv_bfloat16* values) {
+#pragma unroll
+        for (int kk = 0; kk < kPrefillKeys / 16; ++kk) {
+#pragma unroll
+            for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+                uint32_t b[4];
+                ldmatrix_x4_trans(b, values + swizzle(kk * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), 2 * dp + (lane >> 4)));
+                if constexpr (!kFp8) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        b[i] = bf16x2_to_f16x2(b[i]);
+                    }
+                }
+                mma_f16(o[2 * dp], pa[kk], b[0], b[1]);
+                mma_f16(o[2 * dp + 1], pa[kk], b[2], b[3]);
+            }
+        }
+    };
+
+    auto pv8 = [&](float (&o)[kHeadDim / 8][4], const uint32_t (&pa)[kPrefillKeys / 32][4]) {
+#pragma unroll
+        for (int kk = 0; kk < kPrefillKeys / 32; ++kk) {
+#pragma unroll
+            for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+                uint32_t b[4];
+                const int dim = dp * 16 + (lane & 7) + 8 * (lane >> 4);
+                ldmatrix_x4(b, reinterpret_cast<const uint8_t*>(sm.k[0]) + vt_offset(dim, 2 * kk + ((lane >> 3) & 1)));
+                mma_fp8(o[2 * dp], pa[kk], b[0], b[1], 0x7f7f7f7fu);
+                mma_fp8(o[2 * dp + 1], pa[kk], b[2], b[3], 0x7f7f7f7fu);
+            }
+        }
+    };
+
+    constexpr bool kSkew = !kFp8;
+    const bool late = kSkew && warp >= kWarps / 2;
+    uint32_t pending[kPrefillKeys / 16][4];
+    bool has_pending = false;
+
+    PrefillPackedSegment seg = segment_at(my_begin);
+    int stage = 0;
+    {
+        const PrefillTile first = tile_at(seg, seg.t_begin);
+        load(seg, first, 0);
+        if (first.biased) {
+            load_bias(seg, first);
+        }
+        load_q(seg);
+    }
+
+    for (;;) {
+        const bool has_next = seg.unit_begin + seg.t_end < my_end;
+        const PrefillPackedSegment next_seg = segment_at(has_next ? seg.unit_begin + seg.t_end : seg.begin);
+        const unsigned total_m = seg.rows * kGroup;
+        const unsigned m0 = seg.block_m * kRows;
+        const int kv_head = seg.kv_head;
+
+        int local[2];
+        bool valid_row[2];
+        unsigned position[2];
+        size_t row_head[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            local[i] = warp * 16 + lane / 4 + 8 * i;
+            const unsigned mg = m0 + local[i];
+            valid_row[i] = mg < total_m;
+            const unsigned r = valid_row[i] ? mg / kGroup : 0;
+            position[i] = seg.start + r;
+            row_head[i] = size_t(seg.row_start + r) * kHeads + kv_head * kGroup + mg % kGroup;
+        }
+
+        float m[2];
+        float l[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            m[i] = -FLT_MAX;
+            l[i] = 0.f;
+            if (seg.t_begin == 0) {
+                m[i] = valid_row[i] ? __bfloat162float(sinks[row_head[i]]) * kLog2e : 0.f;
+                l[i] = lane % 4 == 0 ? kP : 0.f;
+            }
+        }
+        float o[kHeadDim / 8][4] = {};
+
+        for (unsigned t = seg.t_begin; t < seg.t_end; ++t) {
+            const PrefillTile tile = tile_at(seg, t);
+            copy_async_wait_all();
+            __syncthreads();
+            const bool last_tile = t + 1 == seg.t_end;
+            const bool more = !last_tile || has_next;
+            const PrefillPackedSegment& next_owner = last_tile ? next_seg : seg;
+            const PrefillTile next = tile_at(next_owner, last_tile ? next_seg.t_begin : t + 1);
+            if constexpr (kSkew) {
+                if (more) {
+                    copy_bf16(next_owner, next, sm.k[1 - stage],
+                              next.input ? k_in_of(next_owner)
+                                         : reinterpret_cast<const __nv_bfloat16*>(k_cache_of(next_owner)),
+                              threadIdx.x, kThreads);
+                    copy_async_commit();
+                }
+                if (late) {
+                    if (has_pending) {
+                        pv(o, pending, sm.v[1 - stage]);
+                        has_pending = false;
+                    }
+                    asm volatile("bar.sync 1, %0;" ::"r"(kThreads / 2) : "memory");
+                    if (more) {
+                        copy_bf16(next_owner, next, sm.v[1 - stage],
+                                  next.input ? v_in_of(next_owner)
+                                             : reinterpret_cast<const __nv_bfloat16*>(v_cache_of(next_owner)),
+                                  threadIdx.x - kThreads / 2, kThreads / 2);
+                        copy_async_commit();
+                    }
+                }
+            } else if (more) {
+                load(next_owner, next, 1 - stage);
+            }
+            if constexpr (kMma8) {
+                const int tt = lane % 4;
+                const int base_key = 32 * (lane / 8 % 2) + 16 * (lane / 4 % 2) + 2 * tt;
+                const int pos = 32 * (lane / 8 % 2) + 16 * (lane / 4 % 2) + 4 * tt;
+#pragma unroll
+                for (int it = 0; it < 2; ++it) {
+                    const int quad = 2 * (warp + kWarps * it) + lane / 16;
+                    uint32_t w[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int key = base_key + 8 * (j / 2) + j % 2;
+                        w[j] = *reinterpret_cast<const uint32_t*>(&sm.v8[stage][v8_offset(key, quad / 4) + 4 * (quad % 4)]);
+                    }
+                    const uint32_t t0 = prmt(w[0], w[1], 0x5140u);
+                    const uint32_t t1 = prmt(w[2], w[3], 0x5140u);
+                    const uint32_t t2 = prmt(w[0], w[1], 0x7362u);
+                    const uint32_t t3 = prmt(w[2], w[3], 0x7362u);
+                    const uint32_t out4[4] = {prmt(t0, t1, 0x5410u), prmt(t0, t1, 0x7632u), prmt(t2, t3, 0x5410u),
+                                              prmt(t2, t3, 0x7632u)};
+#pragma unroll
+                    for (int d = 0; d < 4; ++d) {
+                        const int dim = 4 * quad + d;
+                        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(sm.k[0]) + vt_offset(dim, pos / 16) +
+                                                     pos % 16) = out4[d];
+                    }
+                }
+                __syncthreads();
+            } else if constexpr (F::kFp4) {
+                constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+                for (int i = threadIdx.x; i < kPrefillKeys * kFp4HeadScales; i += kThreads) {
+                    const int row = i / kFp4HeadScales;
+                    const int group = i % kFp4HeadScales;
+#pragma unroll
+                    for (int kv = 0; kv < 2; ++kv) {
+                        const uint8_t* staged = kv == 0 ? sm.k8[stage] : sm.v8[stage];
+                        const uint2 raw = *reinterpret_cast<const uint2*>(&staged[row * kFp4HeadBytes + group * 8]);
+                        const __half2 sc = e4m3_half2(staged[kScalesAt + row * kFp4HeadScales + group]);
+                        uint32_t h[8];
+                        uint32_t lo[4];
+                        uint32_t hi[4];
+                        e2m1x8_to_f16x8(raw.x, lo);
+                        e2m1x8_to_f16x8(raw.y, hi);
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) {
+                            h[w] = hmul2_bits(lo[w], sc);
+                            h[4 + w] = hmul2_bits(hi[w], sc);
+                        }
+                        __nv_bfloat16* dst = kv == 0 ? sm.k[0] : sm.v[0];
+                        *reinterpret_cast<uint4*>(&dst[swizzle(row, 2 * group)]) = make_uint4(h[0], h[1], h[2], h[3]);
+                        *reinterpret_cast<uint4*>(&dst[swizzle(row, 2 * group + 1)]) =
+                            make_uint4(h[4], h[5], h[6], h[7]);
+                    }
+                }
+                __syncthreads();
+            } else if constexpr (kFp8) {
+                for (int i = threadIdx.x; i < kPrefillKeys * 8; i += kThreads) {
+                    const int row = i / 8;
+                    const int chunk = i % 8;
+                    uint4 lo4;
+                    uint4 hi4;
+                    e4m3x16_to_bf16(*reinterpret_cast<const uint4*>(&sm.k8[stage][row * kHeadDim + chunk * 16]), lo4,
+                                    hi4);
+                    *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * chunk)]) = lo4;
+                    *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * chunk + 1)]) = hi4;
+                    e4m3x16_to_f16(*reinterpret_cast<const uint4*>(&sm.v8[stage][row * kHeadDim + chunk * 16]), lo4,
+                                   hi4);
+                    *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * chunk)]) = lo4;
+                    *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * chunk + 1)]) = hi4;
+                }
+                __syncthreads();
+            }
+            const __nv_bfloat16* keys = sm.k[kFp8 ? 0 : stage];
+            const __nv_bfloat16* values = sm.v[kFp8 ? 0 : stage];
+
+            float s[kPrefillKeys / 8][4] = {};
+            if constexpr (kMma8) {
+                const uint8_t* keys8 = sm.k8[stage];
+#pragma unroll
+                for (int ks = 0; ks < kHeadDim / 32; ++ks) {
+#pragma unroll
+                    for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                        uint32_t b[4];
+                        const int key = np * 16 + (lane & 7) + 8 * (lane >> 4);
+                        ldmatrix_x4(b, keys8 + k8_offset(key, 2 * ks + ((lane >> 3) & 1)));
+                        mma_fp8(s[2 * np], qa8[ks], b[0], b[1], qs[ks]);
+                        mma_fp8(s[2 * np + 1], qa8[ks], b[2], b[3], qs[ks]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int ks = 0; ks < (kMma8 ? 0 : kHeadDim / 16); ++ks) {
+#pragma unroll
+                for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                    uint32_t b[4];
+                    ldmatrix_x4(b, keys + swizzle(np * 16 + (lane >> 4) * 8 + (lane & 7), 2 * ks + ((lane >> 3) & 1)));
+                    if constexpr (F::kFp4) {
+                        mma_f16(s[2 * np], qa[ks], b[0], b[1]);
+                        mma_f16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                    } else {
+                        mma_bf16(s[2 * np], qa[ks], b[0], b[1]);
+                        mma_bf16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                    }
+                }
+            }
+            if (last_tile && has_next) {
+                load_q(next_seg);
+            }
+
+            const __nv_bfloat16* bias_base[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int first = int(position[i]) - int(tile.p0 + kPrefillKeys - 1);
+                bias_base[i] = sm.bias + local[i] * kBiasStride + (first & 7) + kPrefillKeys - 1 - (lane % 4) * 2;
+            }
+            if (tile.full && !tile.biased) {
+#pragma unroll
+                for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        s[n][e] *= score_scale;
+                    }
+                }
+            } else if (tile.full && tile.near) {
+#pragma unroll
+                for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float b = __bfloat162float(bias_base[e / 2][-(n * 8 + e % 2)]);
+                        s[n][e] = fmaf(b, kLog2e, s[n][e] * score_scale);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const int i = e / 2;
+                        const int j = n * 8 + (lane % 4) * 2 + e % 2;
+                        const unsigned p = tile.p0 + j;
+                        const unsigned distance = position[i] - p;
+                        const bool visible = p < tile.end && p <= position[i] && (window == 0 || distance < window);
+                        float x = s[n][e] * score_scale;
+                        if (tile.biased && distance < extent) {
+                            x = fmaf(__bfloat162float(bias_base[i][-(n * 8 + e % 2)]), kLog2e, x);
+                        }
+                        s[n][e] = visible ? x : -INFINITY;
+                    }
+                }
+            }
+
+            if (more && next.biased) {
+                __syncwarp();
+                load_bias(next_owner, next);
+            }
+
+            float factor[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                float mx = m[i];
+#pragma unroll
+                for (int n = 0; n < kPrefillKeys / 8; ++n) {
+                    mx = fmaxf(mx, fmaxf(s[n][2 * i], s[n][2 * i + 1]));
+                }
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+                factor[i] = exp2_ftz(m[i] - mx);
+                m[i] = mx;
+            }
+            const float offset[2] = {m[0] - kPLog2, m[1] - kPLog2};
+            float sum[2] = {0.f, 0.f};
+#pragma unroll
+            for (int n = 0; n < kPrefillKeys / 8; ++n) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    s[n][e] = exp2_ftz(s[n][e] - offset[e / 2]);
+                    sum[e / 2] += s[n][e];
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                l[i] = fmaf(l[i], factor[i], sum[i]);
+            }
+#pragma unroll
+            for (int n = 0; n < kHeadDim / 8; ++n) {
+                o[n][0] *= factor[0];
+                o[n][1] *= factor[0];
+                o[n][2] *= factor[1];
+                o[n][3] *= factor[1];
+            }
+
+            if constexpr (kMma8) {
+                uint32_t pa8[kPrefillKeys / 32][4];
+#pragma unroll
+                for (int kk = 0; kk < kPrefillKeys / 32; ++kk) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int n = 4 * kk + 2 * (j / 2);
+                        const int e = 2 * (j % 2);
+                        pa8[kk][j] = pack_e4m3x4(s[n][e], s[n][e + 1], s[n + 1][e], s[n + 1][e + 1]);
+                    }
+                }
+                pv8(o, pa8);
+            } else {
+                uint32_t pa[kPrefillKeys / 16][4];
+#pragma unroll
+                for (int kk = 0; kk < kPrefillKeys / 16; ++kk) {
+                    pa[kk][0] = pack_f16x2(s[2 * kk][0], s[2 * kk][1]);
+                    pa[kk][1] = pack_f16x2(s[2 * kk][2], s[2 * kk][3]);
+                    pa[kk][2] = pack_f16x2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+                    pa[kk][3] = pack_f16x2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+                }
+                if (late) {
+#pragma unroll
+                    for (int kk = 0; kk < kPrefillKeys / 16; ++kk) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            pending[kk][i] = pa[kk][i];
+                        }
+                    }
+                    has_pending = true;
+                } else {
+                    pv(o, pa, values);
+                }
+            }
+            stage ^= 1;
+        }
+        if (has_pending) {
+            pv(o, pending, sm.v[1 - stage]);
+            has_pending = false;
+        }
+
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+            l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        }
+
+        if (seg.t_begin != 0 || seg.t_end != seg.range.tiles) {
+            float* slot = partials + size_t(2 * blockIdx.x + (seg.begin != my_begin)) * kSlot;
+            float4* slot_o = reinterpret_cast<float4*>(slot) + warp * (kHeadDim / 8) * 32 + lane;
+#pragma unroll
+            for (int n = 0; n < kHeadDim / 8; ++n) {
+                __stcg(slot_o + n * 32, make_float4(o[n][0], o[n][1], o[n][2], o[n][3]));
+            }
+            if (lane % 4 == 0) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    __stcg(slot + kRows * kHeadDim + local[i], m[i]);
+                    __stcg(slot + kRows * kHeadDim + kRows + local[i], l[i]);
+                }
+            }
+            __syncthreads();
+            unsigned* counter = &counters[seg.gblock * kKvHeads + kv_head];
+            const unsigned first_block = block_of(seg.unit_begin);
+            const unsigned last_block = block_of(seg.unit_begin + seg.range.tiles - 1);
+            if (threadIdx.x == 0) {
+                __threadfence();
+                sm.last = atomicAdd(counter, 1u) == last_block - first_block;
+                __threadfence();
+            }
+            __syncthreads();
+            const bool combine = sm.last;
+            if (combine) {
+                {
+                    const float* first =
+                        partials + size_t(2 * first_block + (seg.unit_begin > begin_of(first_block))) * kSlot;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        m[i] = __ldcg(first + kRows * kHeadDim + local[i]);
+                        l[i] = __ldcg(first + kRows * kHeadDim + kRows + local[i]);
+                    }
+                    const float4* first_o = reinterpret_cast<const float4*>(first) + warp * (kHeadDim / 8) * 32 + lane;
+#pragma unroll
+                    for (int n = 0; n < kHeadDim / 8; ++n) {
+                        const float4 p = __ldcg(first_o + n * 32);
+                        o[n][0] = p.x;
+                        o[n][1] = p.y;
+                        o[n][2] = p.z;
+                        o[n][3] = p.w;
+                    }
+                }
+                for (unsigned b = first_block + 1; b <= last_block; ++b) {
+                    const float* other = partials + size_t(2 * b + (seg.unit_begin > begin_of(b))) * kSlot;
+                    float own[2];
+                    float theirs[2];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const float mo = __ldcg(other + kRows * kHeadDim + local[i]);
+                        const float lo = __ldcg(other + kRows * kHeadDim + kRows + local[i]);
+                        const float mx = fmaxf(m[i], mo);
+                        own[i] = exp2_ftz(m[i] - mx);
+                        theirs[i] = exp2_ftz(mo - mx);
+                        m[i] = mx;
+                        l[i] = fmaf(l[i], own[i], lo * theirs[i]);
+                    }
+                    const float4* other_o =
+                        reinterpret_cast<const float4*>(other) + warp * (kHeadDim / 8) * 32 + lane;
+#pragma unroll
+                    for (int n = 0; n < kHeadDim / 8; ++n) {
+                        const float4 p = __ldcg(other_o + n * 32);
+                        o[n][0] = fmaf(o[n][0], own[0], p.x * theirs[0]);
+                        o[n][1] = fmaf(o[n][1], own[0], p.y * theirs[0]);
+                        o[n][2] = fmaf(o[n][2], own[1], p.z * theirs[1]);
+                        o[n][3] = fmaf(o[n][3], own[1], p.w * theirs[1]);
+                    }
+                }
+                if (threadIdx.x == 0) {
+                    *counter = 0;
+                }
+            }
+            __syncthreads();
+            if (!combine) {
+                if (!has_next) {
+                    break;
+                }
+                seg = next_seg;
+                continue;
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            if (!valid_row[i]) {
+                continue;
+            }
+            const float inv = 1.f / l[i];
+            __nv_bfloat16* dst = out + row_head[i] * kHeadDim + (lane % 4) * 2;
+#pragma unroll
+            for (int n = 0; n < kHeadDim / 8; ++n) {
+                *reinterpret_cast<__nv_bfloat162*>(dst + 8 * n) =
+                    __floats2bfloat162_rn(o[n][2 * i] * inv, o[n][2 * i + 1] * inv);
+            }
+        }
+        if (!has_next) {
+            break;
+        }
+        seg = next_seg;
+    }
+}
+
+}  // namespace
+
+// Ragged packed multi-slice KV append across all `m = gridDim.x` rows: each row appends
+// into its own slice's KV cache (words 0 and 1 of `states`) at `(kv_start + local) % slots`,
+// skipping overwritten rows when a slice's length exceeds `slots`.
+extern "C" __global__ void __launch_bounds__(128)
+kv_append_rows_packed_bf16(const __nv_bfloat16* k, const __nv_bfloat16* v,
+                           const unsigned long long* states, const PackedSlice* slices,
+                           int num_slices, unsigned slots) {
+    const uint32_t row = blockIdx.x;
+    const int si = find_packed_slice(slices, num_slices, row);
+    const PackedSlice sl = slices[si];
+    const uint32_t local = row - sl.row_start;
+    if (local + slots < sl.row_len) {
+        return;
+    }
+    __nv_bfloat16* k_cache = reinterpret_cast<__nv_bfloat16*>(states[size_t(sl.state_idx) * 6 + 0]);
+    __nv_bfloat16* v_cache = reinterpret_cast<__nv_bfloat16*>(states[size_t(sl.state_idx) * 6 + 1]);
+    const size_t i = threadIdx.x * 8;
+    const size_t src = size_t(row) * kKvRow + i;
+    const size_t dst = size_t((sl.kv_start + local) % slots) * kKvRow + i;
+    *reinterpret_cast<uint4*>(k_cache + dst) = *reinterpret_cast<const uint4*>(k + src);
+    *reinterpret_cast<uint4*>(v_cache + dst) = *reinterpret_cast<const uint4*>(v + src);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+kv_append_rows_packed_fp8(const __nv_bfloat16* k, const __nv_bfloat16* v,
+                          const unsigned long long* states, const PackedSlice* slices,
+                          int num_slices, unsigned slots) {
+    const uint32_t row = blockIdx.x;
+    const int si = find_packed_slice(slices, num_slices, row);
+    const PackedSlice sl = slices[si];
+    const uint32_t local = row - sl.row_start;
+    if (local + slots < sl.row_len) {
+        return;
+    }
+    uint8_t* k_cache = reinterpret_cast<uint8_t*>(states[size_t(sl.state_idx) * 6 + 0]);
+    uint8_t* v_cache = reinterpret_cast<uint8_t*>(states[size_t(sl.state_idx) * 6 + 1]);
+    const size_t i = threadIdx.x * 8;
+    const size_t src = size_t(row) * kKvRow + i;
+    const size_t dst = size_t((sl.kv_start + local) % slots) * kKvRow + i;
+    float x[8];
+    unpack_bf16x8(*reinterpret_cast<const uint4*>(k + src), x);
+    *reinterpret_cast<uint2*>(k_cache + dst) =
+        make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
+    unpack_bf16x8(*reinterpret_cast<const uint4*>(v + src), x);
+    *reinterpret_cast<uint2*>(v_cache + dst) =
+        make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
+}
+
+extern "C" __global__ void __launch_bounds__(64)
+kv_append_rows_packed_fp4(const __nv_bfloat16* k, const __nv_bfloat16* v,
+                          const unsigned long long* states, const PackedSlice* slices,
+                          int num_slices, unsigned slots) {
+    const uint32_t row = blockIdx.x;
+    const int si = find_packed_slice(slices, num_slices, row);
+    const PackedSlice sl = slices[si];
+    const uint32_t local = row - sl.row_start;
+    if (local + slots < sl.row_len) {
+        return;
+    }
+    uint8_t* k_cache = reinterpret_cast<uint8_t*>(states[size_t(sl.state_idx) * 6 + 0]);
+    uint8_t* v_cache = reinterpret_cast<uint8_t*>(states[size_t(sl.state_idx) * 6 + 1]);
+    const int head = threadIdx.x / kFp4HeadScales;
+    const int group = threadIdx.x % kFp4HeadScales;
+    const size_t src = size_t(row) * kKvRow + threadIdx.x * 16;
+    const unsigned slot = (sl.kv_start + local) % slots;
+#pragma unroll
+    for (int kv = 0; kv < 2; ++kv) {
+        const __nv_bfloat16* x = kv == 0 ? k : v;
+        float lo[8];
+        float hi[8];
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(x + src), lo);
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(x + src + 8), hi);
+        float vals[16];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            vals[i] = lo[i];
+            vals[8 + i] = hi[i];
+        }
+        uint8_t scale;
+        const uint2 data = fp4_group(vals, scale);
+        uint8_t* cache = kv == 0 ? k_cache : v_cache;
+        *reinterpret_cast<uint2*>(cache + fp4_data(slot, head) + group * 8) = data;
+        cache[fp4_scales(slot, head) + group] = scale;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_packed_fp4(const __nv_bfloat16* q, const __nv_bfloat16* k_in,
+                             const __nv_bfloat16* v_in, const unsigned long long* states,
+                             const PackedSlice* slices, const uint32_t* block_descs,
+                             const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                             float* partials, unsigned* counters, __nv_bfloat16* out,
+                             unsigned total_blocks_m, unsigned slots, unsigned window,
+                             unsigned extent, unsigned input_keys, float scale) {
+    prefill_attention_packed<Fp4Format, kPrefillWarps>(
+        q, k_in, v_in, states, slices, block_descs, bias, sinks, partials, counters, out,
+        total_blocks_m, slots, window, extent, input_keys, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_packed_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_in,
+                              const __nv_bfloat16* v_in, const unsigned long long* states,
+                              const PackedSlice* slices, const uint32_t* block_descs,
+                              const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                              float* partials, unsigned* counters, __nv_bfloat16* out,
+                              unsigned total_blocks_m, unsigned slots, unsigned window,
+                              unsigned extent, unsigned input_keys, float scale) {
+    prefill_attention_packed<Bf16Format, kPrefillWarps>(
+        q, k_in, v_in, states, slices, block_descs, bias, sinks, partials, counters, out,
+        total_blocks_m, slots, window, extent, input_keys, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_packed_fp8(const __nv_bfloat16* q, const __nv_bfloat16* k_in,
+                             const __nv_bfloat16* v_in, const unsigned long long* states,
+                             const PackedSlice* slices, const uint32_t* block_descs,
+                             const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                             float* partials, unsigned* counters, __nv_bfloat16* out,
+                             unsigned total_blocks_m, unsigned slots, unsigned window,
+                             unsigned extent, unsigned input_keys, float scale) {
+    prefill_attention_packed<Fp8Format, kPrefillWarps>(
+        q, k_in, v_in, states, slices, block_descs, bias, sinks, partials, counters, out,
+        total_blocks_m, slots, window, extent, input_keys, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_packed_fp8_mma(const __nv_bfloat16* q, const __nv_bfloat16* k_in,
+                                 const __nv_bfloat16* v_in, const unsigned long long* states,
+                                 const PackedSlice* slices, const uint32_t* block_descs,
+                                 const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                                 float* partials, unsigned* counters, __nv_bfloat16* out,
+                                 unsigned total_blocks_m, unsigned slots, unsigned window,
+                                 unsigned extent, unsigned input_keys, float scale) {
+    prefill_attention_packed<Fp8MmaFormat, kPrefillWarps>(
+        q, k_in, v_in, states, slices, block_descs, bias, sinks, partials, counters, out,
+        total_blocks_m, slots, window, extent, input_keys, scale);
+}
+
+// The launcher passes PREFILL_PACKED_SHARED_BYTES of dynamic shared memory.
+static_assert(sizeof(PrefillPackedShared<Bf16Format, kPrefillWarps>) <= 84864);
+static_assert(sizeof(PrefillPackedShared<Fp8Format, kPrefillWarps>) <= 84864);
+static_assert(sizeof(PrefillPackedShared<Fp8MmaFormat, kPrefillWarps>) <= 84864);
+static_assert(sizeof(PrefillPackedShared<Fp4Format, kPrefillWarps>) <= 84864);
+static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <=
+              PrefillPackedShared<Fp4Format, kPrefillWarps>::kStaged);
 
 
 // ---------------------------------------------------------------------------
