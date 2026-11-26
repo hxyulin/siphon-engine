@@ -820,3 +820,146 @@ fn batch_dflash2_matches_alone() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Times `Model::verify_batch` vs `Draft::batch_commit_and_draft` across `(B, W)` shapes
+/// on real book prompts so we can inspect verify/draft breakdown and kernel hotspots.
+#[test]
+#[ignore = "needs the checkpoint, SIPHON_DFLASH (DFlash 2), and a GPU"]
+#[expect(clippy::too_many_lines, reason = "multi-shape timing table")]
+fn batch_dflash2_profile() -> anyhow::Result<()> {
+    let Some(dflash_dir) = env::var_os("SIPHON_DFLASH") else {
+        println!("SIPHON_DFLASH is not set; skipped");
+        return Ok(());
+    };
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let mut draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Dflash(std::path::Path::new(&dflash_dir)),
+        2048,
+        &DraftOptions::fast(),
+    )?;
+    let stream = std::sync::Arc::clone(model.stream());
+    let linear = siphon_cuda::ops::linear::Linear::load(stream.context())?;
+    let max_b = 32usize;
+    model.add_slots(max_b - 1)?;
+    model.reserve_batch_verify(max_b)?;
+    draft.ensure_batch_dflash2(&stream, max_b, max_b - 1)?;
+    let prompt_base: Vec<u32> = (0..256u32).map(|j| 200 + (j * 7) % 500).collect();
+    let mut anchors_all = Vec::with_capacity(max_b);
+    for slot in 0..max_b {
+        model.reset_slot(slot)?;
+        draft.reset_slot(slot);
+        let p: Vec<u32> = prompt_base
+            .iter()
+            .enumerate()
+            .map(|(j, &t)| t + u32::try_from((slot * 37 + j) % 13).unwrap_or(0))
+            .collect();
+        let mut commit = |start: usize, taps: cudarc::driver::CudaView<'_, half::bf16>| {
+            draft.commit_slot(&stream, &linear, slot, &taps, start)
+        };
+        let first = model.prefill_slot_with_taps(slot, &p, 256, &mut commit)?;
+        anchors_all.push(first);
+    }
+    let shapes = [
+        (1, 8),
+        (8, 8),
+        (8, 4),
+        (16, 8),
+        (16, 6),
+        (16, 4),
+        (32, 8),
+        (32, 6),
+        (32, 5),
+        (32, 4),
+        (32, 3),
+        (32, 2),
+    ];
+    let only_32_8 = env::var_os("PROFILE_32_8_ONLY").is_some();
+    for &(b, w) in &shapes {
+        if only_32_8 && (b, w) != (32, 8) {
+            continue;
+        }
+        let slots: Vec<usize> = (0..b).collect();
+        let samplings = vec![Sampling::GREEDY; b];
+        let accept = vec![Accept::Greedy; b];
+        let mut anchors = anchors_all[..b].to_vec();
+        // Reset committed & model pos via quick re-anchor isn't needed; just advance 15 rounds.
+        draft.batch_draft_initial(
+            &stream,
+            model.draft_shared(),
+            &slots,
+            &anchors,
+            &samplings,
+            w - 1,
+        )?;
+        let mut verify_ms = Vec::new();
+        let mut draft_ms = Vec::new();
+        let mut tot_ms = Vec::new();
+        let mut emitted_sum = 0usize;
+        let iters = if only_32_8 { 12 } else { 10 };
+        for iter in 0..iters {
+            let starts: Vec<usize> = slots
+                .iter()
+                .map(|&s| model.slot_position(s))
+                .collect::<anyhow::Result<_>>()?;
+            let tokens = draft.batch_verify_tokens(b, w)?;
+            let ev0 = stream.record_event(Some(
+                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+            ))?;
+            let pending = model.start_verify_batch(
+                &slots,
+                BatchVerifyTokens::Device { tokens, width: w },
+                &accept,
+                &samplings,
+            )?;
+            let ev1 = stream.record_event(Some(
+                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+            ))?;
+            draft.batch_commit_and_draft(
+                &stream,
+                model.draft_shared(),
+                &slots,
+                &starts,
+                &model.batch_verify_taps()?,
+                &model.batch_verify_results()?,
+                &model.batch_verify_anchors()?,
+                &samplings,
+                w,
+                w - 1,
+            )?;
+            let ev2 = stream.record_event(Some(
+                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+            ))?;
+            let verdicts = model.finish_verify_batch(pending)?;
+            for (i, v) in verdicts.iter().enumerate() {
+                draft.set_slot_committed(slots[i], starts[i] + v.accepted + 1)?;
+                anchors[i] = v.next();
+                if iter >= 3 {
+                    emitted_sum += v.emitted().len();
+                }
+            }
+            if iter >= 3 {
+                verify_ms.push(f64::from(ev0.elapsed_ms(&ev1)?));
+                draft_ms.push(f64::from(ev1.elapsed_ms(&ev2)?));
+                tot_ms.push(f64::from(ev0.elapsed_ms(&ev2)?));
+            }
+        }
+        verify_ms.sort_by(f64::total_cmp);
+        draft_ms.sort_by(f64::total_cmp);
+        tot_ms.sort_by(f64::total_cmp);
+        let mid = tot_ms.len() / 2;
+        let tok_r = emitted_sum as f64 / ((iters - 3) * b) as f64;
+        println!(
+            "B={b:2} W={w} (M={:3}): verify={:6.2} ms  draft={:5.2} ms  total={:6.2} ms  ms/row={:.3}  (tok/r={tok_r:.2})",
+            b * w,
+            verify_ms[mid],
+            draft_ms[mid],
+            tot_ms[mid],
+            tot_ms[mid] / (b * w) as f64,
+        );
+    }
+    Ok(())
+}

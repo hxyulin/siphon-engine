@@ -195,6 +195,23 @@ impl Calibration {
             }
         }
     }
+
+    /// Records one sequence's verify of `width` rows with confidences `conf` that kept
+    /// `kept` drafts, with bounded history so long-running batched servers adapt quickly.
+    fn record_bounded(&mut self, conf: &[f32], width: usize, kept: usize) {
+        let reached = (kept + 1).min(width.saturating_sub(1)).min(conf.len());
+        for (j, &c) in conf[..reached].iter().enumerate() {
+            let b = Self::bin(c);
+            self.verified[b] += 1.0;
+            if j < kept {
+                self.kept[b] += 1.0;
+            }
+            if self.verified[b] > 200.0 {
+                self.verified[b] *= 0.5;
+                self.kept[b] *= 0.5;
+            }
+        }
+    }
 }
 
 /// What the round loop runs next.
@@ -473,8 +490,24 @@ pub struct Speculator {
     coupled: bool,
     /// Rows of the prefill chunks [`Self::rebuild`] runs ([`Self::set_prefill_chunk`]).
     prefill_chunk: usize,
-    /// Pre-drafted batched DFlash 2 verify tokens cached per micro-batch `(slots, width)`.
-    batch_drafted: Vec<(Vec<usize>, usize, CudaSlice<i32>)>,
+    /// Pre-drafted batched DFlash 2 verify tokens cached per micro-batch.
+    batch_drafted: Vec<BatchDrafted>,
+    /// Running per-confidence-bin acceptance calibration for batched DFlash 2 width choice.
+    batch_calibration: Calibration,
+}
+
+/// Pre-drafted tokens and confidences for one active micro-batch of batched DFlash 2.
+struct BatchDrafted {
+    slots: Vec<usize>,
+    width: usize,
+    tokens: CudaSlice<i32>,
+    confidences: Vec<f32>,
+}
+
+/// Relative round time model for batched DFlash 2 (`seqs` sequences x `width` verify rows),
+/// fitted to measured Blackwell `verify_batch + batch_commit_and_draft` timings.
+fn batch_round_cost_ms(seqs: usize, width: usize) -> f64 {
+    5.4 + 0.165 * (seqs * width) as f64 + 0.10 * seqs as f64
 }
 
 /// What a verify round saw, for [`Speculator::set_round_hook`].
@@ -666,6 +699,7 @@ impl Speculator {
             coupled: true,
             prefill_chunk: crate::model::DEFAULT_PREFILL_CHUNK,
             batch_drafted: Vec::new(),
+            batch_calibration: Calibration::default(),
         })
     }
 
@@ -789,16 +823,72 @@ impl Speculator {
         }
     }
 
-    /// Runs one batched DFlash 2 speculation round for `slots` (`1..=32`) of `width` rows per
-    /// sequence (`2..=8`, `seqs * width <= 256`), pipelining `Model::start_verify_batch` with
+    /// Chooses the verify width in `[2, 4, 6, 8]` (at most `max_width`) that maximizes
+    /// expected tokens per millisecond for a batch of `seqs` sequences given their calibrated
+    /// per-position draft confidences `[seqs, STEPS]`.
+    fn choose_batch_width(&self, seqs: usize, confidences: &[f32], max_width: usize) -> usize {
+        let mut best_w = 2usize.min(max_width);
+        let mut best_rate = f64::NEG_INFINITY;
+        for &w in &[2usize, 4, 6, 8] {
+            if w > max_width {
+                continue;
+            }
+            let mut total_tok = 0.0f64;
+            for s in 0..seqs {
+                let row = &confidences[s * STEPS..(s + 1) * STEPS];
+                let cal = self.batch_calibration.apply(row);
+                let mut surv = 1.0f64;
+                let mut tok = 1.0f64;
+                for &c in &cal[..w - 1] {
+                    surv *= f64::from(c.clamp(0.0, 1.0));
+                    tok += surv;
+                }
+                total_tok += tok;
+            }
+            let mean_tok = total_tok / seqs as f64;
+            let rate = mean_tok / batch_round_cost_ms(seqs, w);
+            if rate > best_rate {
+                best_rate = rate;
+                best_w = w;
+            }
+        }
+        best_w
+    }
+
+    /// Packs `[seqs, VERIFY_ROWS]` drafted verify tokens on the already-synchronized stream
+    /// into `[seqs, width]` in `dst`.
+    fn pack_batch_verify_tokens(
+        stream: &Arc<CudaStream>,
+        src: &CudaView<'_, i32>,
+        seqs: usize,
+        width: usize,
+        dst: &mut CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        if width == VERIFY_ROWS {
+            stream.memcpy_dtod(src, &mut dst.slice_mut(..seqs * VERIFY_ROWS))?;
+        } else {
+            let raw = stream.clone_dtoh(src)?;
+            let mut packed = Vec::with_capacity(seqs * width);
+            for s in 0..seqs {
+                packed.extend_from_slice(&raw[s * VERIFY_ROWS..s * VERIFY_ROWS + width]);
+            }
+            stream.memcpy_htod(&packed, &mut dst.slice_mut(..seqs * width))?;
+        }
+        Ok(())
+    }
+
+    /// Runs one batched DFlash 2 speculation round for `slots` (`1..=32`) of up to `max_width`
+    /// rows per sequence (`2..=8`, `seqs * max_width <= 256`), adapting the verify width from
+    /// calibrated per-position confidences and pipelining `Model::start_verify_batch` with
     /// `Draft::batch_commit_and_draft` under a single host synchronization.
+    #[expect(clippy::too_many_lines, reason = "pipelined adaptive batch verify + draft")]
     pub fn speculate_batch_round(
         &mut self,
         model: &mut Model,
         slots: &[usize],
         anchors: &[u32],
         samplings: &[Sampling],
-        width: usize,
+        max_width: usize,
     ) -> anyhow::Result<Vec<Verdict>> {
         let seqs = slots.len();
         ensure!(
@@ -806,8 +896,8 @@ impl Speculator {
             "batched speculation takes 1 to {MAX_BATCH_SEQS} sequences, not {seqs}"
         );
         ensure!(
-            (2..=VERIFY_ROWS).contains(&width) && seqs * width <= BATCH_VERIFY_MAX_ROWS,
-            "invalid batched verify shape {seqs} x {width}"
+            (2..=VERIFY_ROWS).contains(&max_width) && seqs * max_width <= BATCH_VERIFY_MAX_ROWS,
+            "invalid batched verify shape {seqs} x {max_width}"
         );
         ensure!(
             anchors.len() == seqs && samplings.len() == seqs,
@@ -823,20 +913,15 @@ impl Speculator {
         } else {
             vec![Sampling::GREEDY; seqs]
         };
-        let steps = width - 1;
         let cached_idx = self
             .batch_drafted
             .iter()
-            .position(|(s, w, _)| s.as_slice() == slots && *w == width);
+            .position(|e| e.slots.as_slice() == slots && e.width <= max_width);
         let accept = vec![Accept::Greedy; seqs];
-        let pending = if let Some(idx) = cached_idx {
-            let tokens = self.batch_drafted[idx].2.slice(..seqs * width);
-            model.start_verify_batch(
-                slots,
-                BatchVerifyTokens::Device { tokens, width },
-                &accept,
-                samplings,
-            )?
+        let (verify_w, used_conf, slot_idx) = if let Some(idx) = cached_idx {
+            let w = self.batch_drafted[idx].width;
+            let conf = self.batch_drafted[idx].confidences.clone();
+            (w, conf, idx)
         } else {
             self.draft.batch_draft_initial(
                 &stream,
@@ -844,17 +929,37 @@ impl Speculator {
                 slots,
                 anchors,
                 &draft_samplings,
-                steps,
+                STEPS,
             )?;
-            let tokens = self.draft.batch_verify_tokens(seqs, width)?;
+            let init_conf = self.draft.batch_confidences(&stream, seqs, STEPS)?;
+            let w = self.choose_batch_width(seqs, &init_conf, max_width);
+            let mut buf = stream.alloc_zeros::<i32>(seqs * VERIFY_ROWS)?;
+            let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+            Self::pack_batch_verify_tokens(&stream, &src, seqs, w, &mut buf)?;
+            if self.batch_drafted.len() >= 4 {
+                self.batch_drafted.remove(0);
+            }
+            self.batch_drafted.push(BatchDrafted {
+                slots: slots.to_vec(),
+                width: w,
+                tokens: buf,
+                confidences: init_conf.clone(),
+            });
+            (w, init_conf, self.batch_drafted.len() - 1)
+        };
+        let pending = {
+            let tokens = self.batch_drafted[slot_idx].tokens.slice(..seqs * verify_w);
             model.start_verify_batch(
                 slots,
-                BatchVerifyTokens::Device { tokens, width },
+                BatchVerifyTokens::Device {
+                    tokens,
+                    width: verify_w,
+                },
                 &accept,
                 samplings,
             )?
         };
-        // Immediately pipeline commit + next-round draft on the GPU before syncing.
+        // Immediately pipeline commit + next-round draft (always 7 drafts) on the GPU before syncing.
         self.draft.batch_commit_and_draft(
             &stream,
             model.draft_shared(),
@@ -864,29 +969,37 @@ impl Speculator {
             &model.batch_verify_results()?,
             &model.batch_verify_anchors()?,
             &draft_samplings,
-            width,
-            steps,
+            verify_w,
+            STEPS,
         )?;
-        // Save the freshly drafted verify tokens (<= 1 KiB) for this micro-batch.
-        let next_tokens = self.draft.batch_verify_tokens(seqs, width)?;
-        if let Some(idx) = cached_idx {
-            stream.memcpy_dtod(
-                &next_tokens,
-                &mut self.batch_drafted[idx].2.slice_mut(..seqs * width),
-            )?;
-        } else {
-            if self.batch_drafted.len() >= 4 {
-                self.batch_drafted.remove(0);
-            }
-            let mut buf = stream.alloc_zeros::<i32>(seqs * width)?;
-            stream.memcpy_dtod(&next_tokens, &mut buf)?;
-            self.batch_drafted.push((slots.to_vec(), width, buf));
-        }
         // Single host synchronization for the whole round.
         let verdicts = model.finish_verify_batch(pending)?;
-        for (&slot, (&start, v)) in slots.iter().zip(starts.iter().zip(&verdicts)) {
+        for (s, (&slot, (&start, v))) in slots
+            .iter()
+            .zip(starts.iter().zip(&verdicts))
+            .enumerate()
+        {
             self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+            self.batch_calibration.record_bounded(
+                &used_conf[s * STEPS..(s + 1) * STEPS],
+                verify_w,
+                v.accepted,
+            );
         }
+        // Stream is already synchronized: read next round's confidences (~3 us), pick next
+        // verify width, and pack its verify tokens (~2 us).
+        let next_conf = self.draft.batch_confidences(&stream, seqs, STEPS)?;
+        let next_w = self.choose_batch_width(seqs, &next_conf, max_width);
+        let next_tokens = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+        Self::pack_batch_verify_tokens(
+            &stream,
+            &next_tokens,
+            seqs,
+            next_w,
+            &mut self.batch_drafted[slot_idx].tokens,
+        )?;
+        self.batch_drafted[slot_idx].width = next_w;
+        self.batch_drafted[slot_idx].confidences = next_conf;
         let emitted_ids: Vec<i32> = verdicts
             .iter()
             .flat_map(Verdict::emitted)
