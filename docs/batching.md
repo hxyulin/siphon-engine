@@ -249,3 +249,137 @@ A kernel trace at context 0, each kernel counted from the previous one's end, us
 At the card's 1,645 GB/s, the expert kernel's time is what streaming about 48 distinct experts per visit takes at 8 rows, and about 99 at 32, of 4.5 MB each. Attention at context 0 grows with its 272 blocks per row, most of which find no keys.
 
 Over HTTP, `siphon-serve --streams 32 --context 16384` answered 32 concurrent chat requests of 512 tokens each in 13.6 s, 1,198 and 1,207 tok/s in all over two rounds, prompts and their prefill included.
+
+## Against vLLM and SGLang on an RTX PRO 6000 Workstation Edition
+
+Measured on an RTX PRO 6000 Blackwell Workstation Edition (188 SMs, 96 GB, 1.79 TB/s, held to 450 W, driver 620.70), every engine under the GPU lock with no other compute process on the GPU. The Max-Q numbers above do not carry over: at 32 streams and context 0 this card runs 1,910 tok/s against the Max-Q's 1,512.
+
+### What each engine runs
+
+| | Siphon | vLLM | SGLang |
+| --- | --- | --- | --- |
+| Build | this branch | 0.34.1rc1.dev191+ge4ac319d2 (nightly wheel), torch 2.14.0+cu132, FlashInfer 0.7.4 | 0.5.6.post3.dev15594+gffc106df9 (pull request 51926), torch 2.14.1+cu132 |
+| Experts, layers 0 to 19 | NVFP4 weights, BF16 activations | NVFP4 × NVFP4: activations quantized per token by the four-over-six rule, Triton `tl.dot_scaled` | NVFP4 × NVFP4 through FlashInfer's SM120 CUTLASS grouped GEMMs |
+| Experts, layers 20 to 23 | MXFP8 weights, BF16 activations | MXFP8 × MXFP8 | MXFP8 × MXFP8 |
+| Dense projections and LM head | FP8 E4M3 copies, one scale per row | BF16, cuBLASLt | BF16 |
+| Global KV cache | FP8 E4M3 | FP8 E4M3 | MXFP8 |
+| Sliding KV | BF16 ring | FP8 E4M3 | MXFP8 |
+| Speculation | bundled draft, for a request alone | DSpark, 7 drafts | DSpark, block of 8 |
+| Batched rows | equal one-row verifies bit for bit | no such property | no such property |
+
+vLLM ran with `--kv-cache-dtype fp8 --max-num-seqs 32 --max-model-len 40960`. SGLang's FA4 attention on SM120 rejects an E4M3 cache (query BF16, key E4M3), so it ran with `--kv-cache-dtype mxfp8`, and with `--disable-prefill-cuda-graph`, since capturing its 58 prefill graph shapes took 9 minutes for the first. Siphon ran `siphon-serve --streams 32 --context 40960`.
+
+The checkpoint's quantization config asks for NVFP4 activations on the NVFP4 experts and MXFP8 activations on the MXFP8 ones. Siphon keeps BF16 activations because NVFP4 activations double KL against the F32 captures ([engine.md](engine.md)); its prefill can run the checkpoint's formats with `--expert-activations quantized`.
+
+### Serving throughput
+
+One client drives every engine over the OpenAI API: greedy, `ignore_eos`, 512 tokens per request, all requests sent at once, each with its own prompt. Two prompt sets: chat requests (HumanEval+ tasks and GPQA diamond questions, alternating), and completions of 256-token excerpts of 10 Project Gutenberg books. The decode rate of a stream is its tokens after the first over the time from its first token to its last; the table gives the sum over streams, which leaves out admission. Ranges are two runs.
+
+Chat, decode rate summed over streams:
+
+| Engine | 1 stream | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: |
+| Siphon | 471 to 602 | 868 to 884 | 1,227 to 1,236 | 1,690 to 1,713 |
+| vLLM | 177 | 736 to 744 | 1,169 to 1,181 | 1,781 to 1,815 |
+| vLLM, DSpark | 263 to 406 | 1,465 to 1,522 | 2,485 to 2,563 | 4,019 to 4,121 |
+| SGLang | 163 | 712 to 722 | 1,122 to 1,133 | 1,723 to 1,757 |
+| SGLang, DSpark | 277 to 378 | 1,407 to 1,437 | 2,390 to 2,428 | 3,752 to 3,935 |
+
+Book completions, the same measure:
+
+| Engine | 1 stream | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: |
+| Siphon | 573 to 629 | 894 to 920 | 1,289 to 1,327 | 1,813 to 1,846 |
+| vLLM | 175 | 756 to 771 | 1,222 to 1,258 | 1,914 to 1,966 |
+| vLLM, DSpark | 310 to 319 | 1,573 to 1,648 | 2,538 to 2,923 | 4,483 to 4,513 |
+| SGLang | 162 | 719 to 743 | 1,181 to 1,202 | 1,876 to 1,935 |
+| SGLang, DSpark | 311 to 360 | 1,403 to 1,646 | 2,644 to 2,658 | 4,113 to 4,220 |
+
+Tokens over the wall time of the whole run, chat, where SGLang with DSpark had no stalls: Siphon 457 to 581, 838 to 854, 1,166 to 1,176 and 1,564 to 1,587 tok/s at 1, 8, 16 and 32 streams; SGLang with DSpark 255 to 338, 1,068 to 1,099, 1,745 to 1,900 and 2,520 to 2,713. vLLM stalled about 6 s at the start of most runs at 8 streams and more, with and without DSpark, even after warm-up runs at every width, so its wall-time rates are lower than its decode rates suggest.
+
+Three things set the gaps:
+
+- Plain decode is even. On the same workload at 32 streams, a Siphon step of 32 rows takes 16.48 ms between step starts and a vLLM step 16.70 ms (kernel traces, median steps). At 8 streams Siphon's step is 8.99 ms, and vLLM's decode rate puts its step near 10.4 ms.
+- Admission costs Siphon 7 to 9% at 32 streams. It prefills each new request alone, between batched steps, since prefill must keep the chunk boundaries a request has when served alone: the 32 prompts of 256 tokens reach their first token after 0.60 to 0.68 s on average, against 0.21 to 0.31 s in vLLM, which prefills them in one pass. Each of those prefills reads most of the expert weights for 256 rows.
+- Speculation across streams is the large gap. vLLM and SGLang verify every stream's drafts in one pass of up to 256 rows. A 32-row step already reads about 75 of the 128 experts per visit (the expert kernel's time at the harness's 87% of the floor) and 256 rows read nearly all of them, so the extra rows cost far less than their count. DSpark more than doubles the decode rate: 2.2 to 2.4 times Siphon's on chat at 32 streams. Siphon speculates only for a request alone, where it runs about 1.6 times as fast as either engine on chat and 1.8 times on book text, by the middle of the ranges. See [What option 2 would gain](#speculation) for the costs on the Siphon side; at 16 to 32 streams they would need passes of more than 32 rows and a draft that runs every sequence in one pass.
+
+### Prefill
+
+One request at a time, time to the first token, tok/s:
+
+| Engine | 8,192 tokens | 32,768 tokens |
+| --- | ---: | ---: |
+| Siphon over HTTP, book text | 14,895 to 14,960 | 14,321 to 14,330 |
+| Siphon `bench --prefill` | 16,332 | 15,574 |
+| Siphon `bench --prefill`, checkpoint formats | 28,053 | 25,329 |
+| vLLM | 20,421 to 20,472 | 17,634 to 17,654 |
+| SGLang | 18,082 to 18,104 | 16,246 to 16,290 |
+
+The checkpoint-formats row is `--expert-activations quantized --prefill-dense fp8 --prefill-attention fp8`, the activation formats the other two engines run. With them `bench` prefills 37% faster than vLLM at 8,192 tokens and 43% at 32,768. `bench --prefill` feeds arbitrary token ids, whose routing reads fewer bytes than real text: in the default formats it runs 9% above the HTTP figure, so real text in the checkpoint's formats would still prefill about 25% faster than vLLM. The default trades that speed for BF16 expert activations.
+
+### Floors and library kernels at batched-decode shapes
+
+Up to 32 rows every product is bound by memory: at 32 rows the experts' arithmetic is 196 GFLOP per step, under 1 ms at the BF16 tensor-core rate, and the dense products and LM head 112 GFLOP. The floor below is the bytes a call must read once from DRAM at 1.79 TB/s. GPU performance counters are not available in this container, so bytes come from the shapes and, for the experts, from the routing the harness draws.
+
+Experts. A harness calls each kernel on the same random NVFP4 weights of 128 experts, in 8 copies so every call reads its weights from DRAM, with each row routed to 8 distinct experts at random. The experts per call were 50.2, 81.8 and 110.0 at 8, 16 and 32 rows. Microseconds per call, with the share of the floor:
+
+| Kernel | 8 rows | 16 rows | 32 rows |
+| --- | ---: | ---: | ---: |
+| Siphon `expert_mlp_rows` (BF16 activations) | 145.7 (86%) | 234.3 (87%) | 315.8 (87%) |
+| FlashInfer SM12x, NVFP4 × BF16 | 146.1 (86%) | 242.9 (84%) | 315.2 (87%) |
+| FlashInfer SM12x, NVFP4 × NVFP4 | 154.2 (82%) | 240.8 (85%) | 317.8 (87%) |
+| vLLM Marlin MoE, NVFP4 × BF16 | 155.8 (81%) | 243.3 (84%) | 323.4 (85%) |
+| FlashInfer b12x, NVFP4 × BF16 | 159.9 (79%) | 248.6 (82%) | 335.8 (82%) |
+| FlashInfer cuTile, NVFP4 × NVFP4 | 177.4 (71%) | 262.1 (78%) | 349.3 (79%) |
+| FlashInfer cuTile, NVFP4 × BF16 | 194.1 (65%) | 294.9 (69%) | 387.2 (71%) |
+
+No library kernel beats Siphon's, and the best two tie it. The engines' own expert kernels, from kernel traces of each server at 32 streams on the book workload, per step: Siphon 10.3 ms (206 us per NVFP4 visit, 312 us per MXFP8 visit), vLLM 10.5 ms (its Triton GEMMs 10.0 ms, routing and activation quantization 0.5 ms), SGLang 11.5 ms (FlashInfer's CUTLASS NVFP4 grouped GEMMs 10.6 ms, quantization and routing 0.9 ms).
+
+Attention, us per call:
+
+| Attention | Floor | Siphon | FlashInfer batch decode |
+| --- | --- | ---: | ---: |
+| Global, FP8 cache, 32,768 keys, 8 / 16 / 32 rows | 300 / 600 / 1,200 | 336 / 666 / 1,328 | 336 / 667 / 1,319 |
+| Sliding, BF16 ring of 1,024, 32 rows | 75 | 104 | 86 |
+
+FlashInfer's kernel has no relative bias, sinks or log scaling, so it bounds what plain decode attention costs. At 8 and 16 rows its sliding test fit in L2, so only the 32-row case compares.
+
+Dense products, us per call. Siphon's run inside the step, where the L2 prefetch has already brought the weights in; cuBLASLt's were timed with the weights in L2 ("warm") and in DRAM ("cold"):
+
+| Product | Floor, FP8 / BF16 | Siphon FP8, 8 / 16 / 32 rows | cuBLASLt BF16 warm | cuBLASLt BF16 cold | cuBLASLt FP8 |
+| --- | --- | --- | --- | --- | --- |
+| Input projection, 2304 to 8600 | 11.1 / 22.1 | 7.5 / 10.1 / 18.1 | 8.2 / 8.0 / 10.2 | 26.8 / 25.6 / 28.3 | needs n divisible by 16 |
+| Output projection, 3072 to 2304 | 4.0 / 7.9 | 3.9 / 6.0 / 8.8 | 5.3 / 4.9 / 5.2 | 11.3 / 11.6 / 11.5 | 13.1 to 14.2 |
+| LM head, 2304 to 201,024 | 259 / 518 | 271 / 279 / 324 | | 568 / 571 / 594 | 410 / 366 / 340 |
+
+cuBLASLt beats Siphon's input and output projections at 32 rows when the weights sit in L2. Its BF16 weights would double the prefetch's DRAM bytes, so adopting it would move that time elsewhere; the tile pairs below took part of the gap instead.
+
+### Changes
+
+Two changes, each leaving every result bit for bit as before (`smallm verify --hash 1` at widths 1 and 8, and `tests/batch.rs` at 5, 16 and 32 sequences):
+
+- The batched attention launches only the split blocks a cache's slots can reach and one recent block. A 1,024-slot sliding ring fills at most 16 of the 32 split blocks, and with one row per instance the second recent block has no row, so half the blocks only waited and left.
+- At 17 to 32 rows each block of the dense products takes two weight tiles and reads its inputs once for both. At 3 and 4 column tiles the inputs are 3 and 4 times the FP8 weight bytes, from L2.
+
+`bench --batch` before and after, alternating in one locked hold, ms per step, two runs each:
+
+| Context | Rows | Before | Attention | Attention and tile pairs |
+| ---: | ---: | --- | --- | --- |
+| 0 | 16 | 11.85, 11.87 | 11.75, 11.76 | 11.75, 11.78 |
+| 0 | 32 | 16.33, 16.37 | 16.05, 16.10 | 15.97, 15.97 |
+| 10,674 | 16 | 15.23, 15.24 | 15.12, 15.13 | 15.15, 15.16 |
+| 10,674 | 32 | 23.20, 23.21 | 22.75, 22.76 | 22.65, 22.68 |
+| 32,768 | 16 | 18.42, 18.42 | 18.30, 18.31 | 18.32, 18.34 |
+| 32,768 | 32 | 29.72, 29.75 | 29.27, 29.28 | 29.19, 29.22 |
+
+At 8 rows the three builds are within 0.05 ms. At 32 rows the two changes take 1.8 to 2.3% off a step.
+
+Over HTTP, `siphon-serve --streams 32` before and after, alternating, one run each per round: at 32 streams chat went from 1,586 and 1,594 tok/s in all to 1,604 and 1,612, and book completions from 1,657 and 1,667 to 1,679 and 1,688, 1.1 to 1.3%. At 8 streams the two builds were within 0.7%. Prefill, which the changes do not touch, takes part of each run.
+
+Tried and dropped: letting each launched attention block run 2 or 4 split blocks in turn, which keeps every partial. With 4 sliding splits per block a 32-row step took 0.1 to 0.2 ms less at context 0 and the same or more at 10,674 and 32,768; grouping the global attention's splits made it slower.
+
+### What remains
+
+- Speculation across streams (option 2 above), at 2.2 to 2.4 times the decode rate on chat at 32 streams. It needs passes of more than 32 rows, which the dense products, expert grouping, router, attention combiners and visit-end kernels cap today, a draft that drafts every sequence in one pass, and a width policy across sequences.
+- Admission: prefilling several waiting requests together would read the weights once for all of them, but would change their caches from what each gets prefilled alone.
+- Prefill: with BF16 expert activations the default prefills at 58 to 61% of the speed of the checkpoint's own formats. No library kernel was needed to beat vLLM's and SGLang's prefill; the format choice decides it.
