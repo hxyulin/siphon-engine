@@ -219,6 +219,12 @@ fn fp8(format: &str) -> anyhow::Result<bool> {
 }
 
 fn main() -> ExitCode {
+    // Load every kernel's code when its module loads, at startup, rather than at its first
+    // launch, which may come in a request after the memory check. Unless the user chose.
+    if env::var_os("CUDA_MODULE_LOADING").is_none() {
+        // SAFETY: no other thread exists yet to read the environment.
+        unsafe { env::set_var("CUDA_MODULE_LOADING", "EAGER") };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
