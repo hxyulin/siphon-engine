@@ -3,16 +3,17 @@
 //!
 //! The times come from when the job's events reached the HTTP layer ([`Times`]): the
 //! queue runs from the job's submission, after the request was parsed and tokenized, to
-//! the engine's `Started`; the prompt from `Started` to the first tokens; generation from
-//! the first tokens to the end. A request with several choices counts from its earliest
-//! start and first tokens to its last end, and sums the choices' tokens and rounds.
+//! the engine's `Started`; the prompt from `Started` to the first tokens, less the vision
+//! tower's encodes, which the engine times on the GPU; generation from the first tokens to
+//! the end. A request with several choices counts from its earliest start and first tokens
+//! to its last end, and sums the choices' tokens, rounds and encodes.
 
 use std::time::Instant;
 
 use axum::http::HeaderValue;
 use serde_json::{Value, json};
 
-use crate::metrics::Times;
+use crate::{metrics::Times, vision::ImageStats};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Timings {
@@ -27,6 +28,9 @@ pub struct Timings {
     /// Speculation rounds, and the tokens they delivered.
     pub rounds: u64,
     pub round_tokens: u64,
+    /// What the vision tower did, for a prompt with images. `prompt_ms` leaves out its
+    /// encodes.
+    pub images: Option<ImageStats>,
 }
 
 impl Timings {
@@ -50,16 +54,32 @@ impl Timings {
             .min(first);
         let ms =
             |from: Instant, to: Instant| to.saturating_duration_since(from).as_secs_f64() * 1e3;
+        // Choices share their prompt: each reports the same images from the cache.
+        let images = times
+            .iter()
+            .filter_map(|t| t.images)
+            .reduce(|a, b| ImageStats {
+                encoded: a.encoded + b.encoded,
+                ms: a.ms + b.ms,
+                cached: a.cached.max(b.cached),
+            });
+        let image_ms = images.map_or(0.0, |i| i.ms);
         Self {
             cache_n: cached,
             prompt_n: prompt_tokens.saturating_sub(cached),
             predicted_n,
             queue_ms: ms(submitted, started),
-            prompt_ms: ms(started, first),
+            prompt_ms: (ms(started, first) - image_ms).max(0.0),
             predicted_ms: ms(first, ended),
             rounds: times.iter().map(|t| t.rounds).sum(),
             round_tokens: times.iter().map(|t| t.round_tokens).sum(),
+            images,
         }
+    }
+
+    /// Milliseconds the vision tower encoded for.
+    fn image_ms(&self) -> f64 {
+        self.images.map_or(0.0, |i| i.ms)
     }
 
     /// The `timings` object.
@@ -75,8 +95,13 @@ impl Timings {
             "predicted_per_token_ms": round(per(self.predicted_ms, self.predicted_n as f64)),
             "predicted_per_second": round(per(self.predicted_n as f64 * 1e3, self.predicted_ms)),
             "queue_ms": round(self.queue_ms),
-            "ttft_ms": round(self.queue_ms + self.prompt_ms),
+            "ttft_ms": round(self.queue_ms + self.image_ms() + self.prompt_ms),
         });
+        if let Some(images) = self.images {
+            timings["image_n"] = json!(images.encoded);
+            timings["image_cache_n"] = json!(images.cached);
+            timings["image_ms"] = json!(round(images.ms));
+        }
         if self.rounds > 0 {
             timings["draft_rounds"] = json!(self.rounds);
             timings["tokens_per_round"] =
@@ -85,10 +110,15 @@ impl Timings {
         timings
     }
 
-    /// A `Server-Timing` header with the queue, prefill and decode times in milliseconds.
+    /// A `Server-Timing` header with the queue, image encode, prefill and decode times in
+    /// milliseconds; the image encode only for a prompt with images.
     pub fn server_timing(&self) -> HeaderValue {
+        let image = match self.images {
+            Some(images) => format!(", image;dur={:.3}", images.ms),
+            None => String::new(),
+        };
         let value = format!(
-            "queue;dur={:.3}, prefill;dur={:.3}, decode;dur={:.3}",
+            "queue;dur={:.3}{image}, prefill;dur={:.3}, decode;dur={:.3}",
             self.queue_ms, self.prompt_ms, self.predicted_ms
         );
         HeaderValue::from_str(&value).expect("the header is ASCII")
@@ -174,5 +204,28 @@ mod tests {
         assert_eq!(json["predicted_per_token_ms"], 0.0);
         assert_eq!(json["prompt_ms"], 4.0);
         assert!(json.get("draft_rounds").is_none());
+        assert!(json.get("image_ms").is_none());
+
+        // Images: the encodes leave the prompt time, and their own fields report them.
+        let encoded = |encoded: usize, ms: f64| Times {
+            images: Some(ImageStats {
+                encoded,
+                ms,
+                cached: 1,
+            }),
+            ..job
+        };
+        let timings = Timings::new(&[encoded(2, 120.0), encoded(0, 0.0)], 30_000, 20_000, 200);
+        let json = timings.json();
+        assert_eq!(
+            (&json["image_n"], &json["image_cache_n"], &json["image_ms"]),
+            (&json!(2), &json!(1), &json!(120.0))
+        );
+        assert_eq!(json["prompt_ms"], 380.0);
+        assert_eq!(json["ttft_ms"], 520.0);
+        assert_eq!(
+            timings.server_timing(),
+            "queue;dur=20.000, image;dur=120.000, prefill;dur=380.000, decode;dur=1000.000"
+        );
     }
 }

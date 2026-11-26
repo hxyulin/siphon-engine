@@ -227,7 +227,7 @@ pub(crate) async fn run<R: Reply>(
             results.next().await
         };
         match event {
-            Event::Started | Event::Round => continue,
+            Event::Started | Event::Round | Event::Images(_) => continue,
             Event::Cached(n) => {
                 prompt.cached = n;
                 continue;

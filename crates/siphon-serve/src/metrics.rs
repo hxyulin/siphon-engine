@@ -14,6 +14,8 @@ use std::{
     time::Instant,
 };
 
+use crate::vision::ImageStats;
+
 /// vLLM's bucket edges for time to first token, in seconds.
 const TTFT_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
@@ -279,6 +281,8 @@ pub struct Times {
     /// Speculation rounds, and the tokens they delivered.
     pub rounds: u64,
     pub round_tokens: u64,
+    /// What the vision tower did for a prompt with images.
+    pub images: Option<ImageStats>,
     /// Whether the next tokens come from a speculation round.
     pub(crate) round: bool,
 }
@@ -293,6 +297,7 @@ impl Times {
             ended: None,
             rounds: 0,
             round_tokens: 0,
+            images: None,
             round: false,
         }
     }
@@ -343,6 +348,11 @@ impl Tracker {
     /// Prompt tokens whose state came from the prefix cache.
     pub fn cached(&mut self, tokens: usize) {
         self.cached = tokens as u64;
+    }
+
+    /// What the vision tower did for the prompt.
+    pub fn images(&mut self, stats: ImageStats) {
+        self.times.images = Some(stats);
     }
 
     /// `n` tokens arrived.

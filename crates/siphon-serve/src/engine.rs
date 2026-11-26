@@ -45,7 +45,7 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::vision::Images;
+use crate::vision::{ImageStats, Images};
 
 /// What a request asks the engine for.
 #[cfg_attr(
@@ -269,6 +269,13 @@ pub enum Event {
     /// `--fallback`.
     Round,
     Tokens(Vec<u32>),
+    /// The vision tower's work on the prompt's images, after the prefill of a prompt with
+    /// any, before the first tokens.
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        expect(dead_code, reason = "only the Linux engine runs jobs")
+    )]
+    Images(ImageStats),
     Done(Finish),
     Failed(String),
 }
@@ -474,7 +481,7 @@ mod cuda {
     use std::sync::Arc;
 
     use anyhow::Context as _;
-    use cudarc::driver::CudaSlice;
+    use cudarc::driver::{CudaEvent, CudaSlice, sys::CUevent_flags};
     use half::bf16;
     use siphon::{
         Checkpoint, TextConfig,
@@ -502,7 +509,7 @@ mod cuda {
     };
 
     use super::{Control, Engine, Event, Finish, Job, Options};
-    use crate::vision::PromptImage;
+    use crate::vision::{ImageStats, PromptImage};
 
     /// The vision tower, with `--vision`.
     type Tower = Option<VisionTower>;
@@ -511,14 +518,41 @@ mod cuda {
     /// among the prompt's images, and its rows.
     type Kept = Option<(usize, Arc<CudaSlice<bf16>>)>;
 
+    /// The GPU events around each image the tower encoded for one request's prefill.
+    #[derive(Debug, Default)]
+    struct Encodes(Vec<(CudaEvent, CudaEvent)>);
+
+    impl Encodes {
+        /// The tower's work for a prompt with `images`, of which `cached` tokens came from
+        /// the prefix cache. Waits for the last encode.
+        fn stats(&self, images: &[PromptImage], cached: usize) -> ImageStats {
+            let ms = self
+                .0
+                .iter()
+                .map(|(start, end)| start.elapsed_ms(end).map_or(0.0, f64::from))
+                // From 0: `sum` of no floats is -0.
+                .fold(0.0, |all, ms| all + ms);
+            ImageStats {
+                encoded: self.0.len(),
+                ms,
+                cached: images
+                    .iter()
+                    .filter(|image| image.positions().end <= cached)
+                    .count(),
+            }
+        }
+    }
+
     /// The rows of the `images` whose placeholders overlap prompt positions `start..end`,
     /// encoded by the tower as prefill reaches them. An image that runs past `end` stays in
-    /// `kept` for the next chunk, so that each image is encoded once per prefill.
+    /// `kept` for the next chunk, so that each image is encoded once per prefill. Each
+    /// encode's events go to `timers`.
     fn image_rows(
         tower: &mut Tower,
         hidden: usize,
         images: &[PromptImage],
         kept: &mut Kept,
+        timers: &mut Encodes,
         (start, end): (usize, usize),
     ) -> anyhow::Result<Vec<ImageRows>> {
         let mut rows = Vec::new();
@@ -531,7 +565,10 @@ mod cuda {
                 Some((k, encoded)) if k == i => encoded,
                 _ => {
                     let tower = tower.as_mut().context("this server has no vision tower")?;
+                    let timed = Some(CUevent_flags::CU_EVENT_DEFAULT);
+                    let begin = tower.stream().record_event(timed)?;
                     let encoded = tower.encode(&image.image)?;
+                    timers.0.push((begin, tower.stream().record_event(timed)?));
                     anyhow::ensure!(
                         encoded.len() == positions.len() * hidden,
                         "the vision tower gave {} values for an image of {} tokens",
@@ -1143,6 +1180,8 @@ mod cuda {
         batched: usize,
         /// The image a batched prefill chunk encoded for the next one.
         kept: Kept,
+        /// The tower's encodes for its prefill.
+        encodes: Encodes,
         /// When the request last started to run: admitted, or back from the host tier.
         since: Instant,
         /// Its id in the host tier while swapped out (`park`).
@@ -1179,6 +1218,7 @@ mod cuda {
                 speculated: 0,
                 batched: 0,
                 kept: None,
+                encodes: Encodes::default(),
                 since: Instant::now(),
                 parked: None,
                 parks: 0,
@@ -1258,9 +1298,17 @@ mod cuda {
         fn finish(&self, detail: &str) {
             let decode_s = self.started.elapsed().as_secs_f64() - self.prefill_s;
             let events = &self.job.events;
+            let mut prefill_ms = self.prefill_s * 1e3;
             let images = match self.job.images.len() {
                 0 => String::new(),
-                n => format!(", {n} images"),
+                n => {
+                    let stats = self.encodes.stats(&self.job.images, self.cached);
+                    prefill_ms = (prefill_ms - stats.ms).max(0.0);
+                    format!(
+                        ", {n} images: {} encoded in {:.0} ms, {} from the cache",
+                        stats.encoded, stats.ms, stats.cached
+                    )
+                }
             };
             let parks = if self.parks > 0 {
                 format!(
@@ -1276,7 +1324,7 @@ mod cuda {
                 self.job.label,
                 self.job.prompt.len(),
                 self.cached,
-                self.prefill_s * 1e3,
+                prefill_ms,
                 if self.shared { " (copied)" } else { "" },
                 self.output.len(),
                 decode_s,
@@ -1290,6 +1338,14 @@ mod cuda {
                 },
             );
             let _ = events.send(Event::Done(self.finish));
+        }
+
+        /// Tells its client what the tower did, once its prompt's prefill has ended.
+        fn send_images(&self) {
+            if !self.job.images.is_empty() {
+                let stats = self.encodes.stats(&self.job.images, self.cached);
+                let _ = self.job.events.send(Event::Images(stats));
+            }
         }
 
         fn fail(&mut self, e: &anyhow::Error) {
@@ -1854,9 +1910,10 @@ mod cuda {
             let hidden = model.config().hidden_size;
             let chunk = speculator.prefill_chunk();
             let job = &request.job;
+            let encodes = &mut request.encodes;
             let mut kept = None;
             let mut source = |start: usize, end: usize| {
-                image_rows(tower, hidden, &job.images, &mut kept, (start, end))
+                image_rows(tower, hidden, &job.images, &mut kept, encodes, (start, end))
             };
             let prompt = Prompt {
                 tokens: &job.prompt,
@@ -1873,6 +1930,7 @@ mod cuda {
             let _ = request.job.events.send(Event::Cached(cached));
             request.prefilled = request.job.prompt.len();
             request.prefill_s = request.started.elapsed().as_secs_f64();
+            request.send_images();
             request.next = Some(first);
             request.take(&[first], stop).is_continue()
         };
@@ -1996,8 +2054,11 @@ mod cuda {
             let hidden = model.config().hidden_size;
             let images = &r.job.images;
             let mut kept = None;
+            // The draft's rebuild is not the request's prefill, so its encodes are not
+            // reported.
+            let mut encodes = Encodes::default();
             let mut source = |start: usize, end: usize| {
-                image_rows(tower, hidden, images, &mut kept, (start, end))
+                image_rows(tower, hidden, images, &mut kept, &mut encodes, (start, end))
             };
             let prompt = Prompt {
                 tokens: &tokens,
@@ -2245,9 +2306,10 @@ mod cuda {
             // The tower runs here, inside the chunk, so the decode floor counts it as
             // prefill.
             let hidden = model.config().hidden_size;
-            let (images, kept) = (&r.job.images, &mut r.kept);
-            let mut source =
-                |start: usize, end: usize| image_rows(tower, hidden, images, kept, (start, end));
+            let (images, kept, encodes) = (&r.job.images, &mut r.kept, &mut r.encodes);
+            let mut source = |start: usize, end: usize| {
+                image_rows(tower, hidden, images, kept, encodes, (start, end))
+            };
             model.prefill_slot_with_images(r.slot, tokens, chunk, &mut source)
         };
         let first = match prefilled {
@@ -2275,6 +2337,7 @@ mod cuda {
         if end == len {
             r.kept = None;
             r.prefill_s = r.started.elapsed().as_secs_f64();
+            r.send_images();
             r.next = Some(first);
             r.done = r.take(&[first], stop).is_break();
             share_prefill(model, active, i, stop);

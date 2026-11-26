@@ -267,6 +267,12 @@ impl VisionTower {
         Ok(tower)
     }
 
+    /// The stream the tower runs on.
+    #[must_use]
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     #[must_use]
     pub fn format(&self) -> VisionFormat {
         self.format

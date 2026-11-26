@@ -723,6 +723,7 @@ impl Results {
         match &event {
             Event::Started => self.tracker.started(),
             Event::Cached(n) => self.tracker.cached(*n),
+            Event::Images(stats) => self.tracker.images(*stats),
             Event::Round => self.tracker.round(),
             Event::Tokens(ids) => self.tracker.tokens(ids.len()),
             Event::Done(finish) => self.tracker.finish(reason(*finish)),
@@ -964,7 +965,7 @@ async fn whole(
         let (i, event) = fanout.next().await;
         let output = &mut outputs[i];
         let finish = match event {
-            Event::Started | Event::Round => continue,
+            Event::Started | Event::Round | Event::Images(_) => continue,
             Event::Cached(n) => {
                 if i == 0 {
                     reply.cached_tokens = n;
@@ -1451,7 +1452,7 @@ async fn stream(
         let (i, event) = fanout.next().await;
         let output = &mut outputs[i];
         let (delta, finish) = match event {
-            Event::Started | Event::Round => continue,
+            Event::Started | Event::Round | Event::Images(_) => continue,
             Event::Cached(cached) => {
                 if i == 0 {
                     chunks.reply.cached_tokens = cached;

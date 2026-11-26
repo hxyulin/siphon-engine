@@ -20,6 +20,7 @@ use crate::{
     metrics::Metrics,
     openai::{self, App},
     request::SamplingDefaults,
+    vision::ImageStats,
 };
 
 /// A server whose engine answers every job with `script`'s events, and the labels of the
@@ -703,4 +704,58 @@ async fn responses_stream_function_arguments_piece_by_piece() {
             assert_eq!(items[i]["name"], CALLS[i].0);
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn image_encodes_leave_the_prompt_time() {
+    let stats = ImageStats {
+        encoded: 1,
+        ms: 50.0,
+        cached: 2,
+    };
+    let server = Server::with_engine(4096, move |vocab, job| {
+        let _ = job.events.send(Event::Started);
+        let _ = job.events.send(Event::Cached(2));
+        thread::sleep(std::time::Duration::from_millis(80));
+        let _ = job.events.send(Event::Images(stats));
+        for event in text_reply(vocab, "A cat.", 2).into_iter().skip(2) {
+            let _ = job.events.send(event);
+        }
+    });
+    let response = server
+        .call(post("/v1/chat/completions", &chat_body(false), &[]))
+        .await;
+    let header = response.headers()["server-timing"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        header.contains(", image;dur=50.000, prefill;dur="),
+        "{header}"
+    );
+    let timings = json_body(response).await["timings"].clone();
+    assert_eq!(timings["image_n"], 1, "{timings}");
+    assert_eq!(timings["image_cache_n"], 2, "{timings}");
+    assert_eq!(timings["image_ms"], 50.0, "{timings}");
+    // The prompt took at least the 80 ms sleep, of which 50 ms were encodes.
+    let prompt_ms = timings["prompt_ms"].as_f64().unwrap();
+    assert!((30.0..80.0).contains(&prompt_ms), "{timings}");
+    let ttft = timings["ttft_ms"].as_f64().unwrap();
+    let queue = timings["queue_ms"].as_f64().unwrap();
+    assert!((ttft - queue - prompt_ms - 50.0).abs() < 1e-2, "{timings}");
+
+    // A prompt without images has none of the fields.
+    let server = Server::new(4096, |vocab, _| text_reply(vocab, "Hi.", 0));
+    let body = json_body(
+        server
+            .call(post("/v1/messages", &messages_body(false), &[]))
+            .await,
+    )
+    .await;
+    assert!(
+        body["timings"].get("image_ms").is_none(),
+        "{}",
+        body["timings"]
+    );
 }

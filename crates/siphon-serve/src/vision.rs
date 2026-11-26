@@ -263,6 +263,16 @@ impl<'a> Collector<'a> {
 /// A prompt's images, shared by the jobs of its choices.
 pub type Images = Arc<[PromptImage]>;
 
+/// What the vision tower did for one job's prompt.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImageStats {
+    /// Images the tower encoded, and the milliseconds of GPU time the encodes took.
+    pub encoded: usize,
+    pub ms: f64,
+    /// Images inside the prompt's prefix cache hit, which the tower did not encode.
+    pub cached: usize,
+}
+
 /// The bytes of an image content part: OpenAI's `image_url` and `input_image` with a
 /// `data:` URL, or Anthropic's `image` with a `base64` source.
 pub fn image_bytes(part: &Value) -> Result<Vec<u8>, InvalidRequest> {
