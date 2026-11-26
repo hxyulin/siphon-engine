@@ -1100,6 +1100,48 @@ The NVFP4 `fp8` kernel issues twice the MMAs of an exact single-pass one and kee
 
 The output projection stays BF16. Alone on `regex-readme`, its FP8 product raised the worst range's |log-prob difference| from 0.035 to 0.043; all the input projections together raised it to 0.038, and the message gates not at all. With it, the dense products failed the gate there (0.050).
 
+## RTX 4090 (sm_89)
+
+`SIPHON_CUDA_ARCH=sm_89` builds the kernels for Ada, the RTX 4090, and sets the `sm89` cfg for the Rust code:
+
+```sh
+SIPHON_CUDA_ARCH=sm_89 cargo build --release
+```
+
+`Gpu::new` accepts only a device of the build's compute capability, so the `sm_89` build refuses an RTX 5090 and the default build refuses an RTX 4090. The `sm_89` build was tested with nvcc 13.2 and driver 595 (`CUDA_HOME=/usr/local/cuda`). The default `sm_120a` build compiles to the same SASS as before, kernel for kernel.
+
+Ada lacks five things the `sm_120a` kernels use. `kernels/arch.cuh` defines `SIPHON_SM89`, which selects the replacements:
+
+- **Programmatic dependent launch.** `pdl_wait` and `pdl_trigger` do nothing, and the launchers leave out the launch attribute, so each kernel starts after the previous one ends.
+- **Thread-block clusters.** The router (`moe_router_step_2304`, `moe_router_step_rows_2304`), the message gates (`message_gate_step*`, `message_gate_rows*`) and the split-k GEMM run each cluster as plain blocks that meet in global memory (`kernels/cluster_sm89.cuh`). Each block has a mailbox that mirrors its shared memory by address. A send writes the values at the target's address in the receiver's mailbox and adds their bytes to the word at the address of the receiver's mbarrier. The receiver waits for the bytes it expects, copies them to shared memory and clears the word for the next launch. Cluster barriers become a sense-reversing barrier on two counters per cluster. Every sum keeps its values and order. The blocks of a cluster wait for each other. That cannot deadlock while a cluster has at most 16 blocks and the GPU starts blocks in index order: the earliest unfinished cluster then always has every block running. `sample_prepare` runs each row in one block instead of a cluster of 8. Its histograms count in integers and its maxima compare exactly, so its thresholds stay the same.
+- **Bulk prefetches into L2.** `cp.async.bulk.prefetch` becomes one `prefetch.global.L2` per 128-byte line. The paced decode prefetch runs at 0.8 TB/s instead of 1.5.
+- **The block-scaled MMA.** The kernels of FP8 prefill attention, quantized and FP8 expert activations and FP8 dense products trap there, and the `Model` setters refuse them. `--prefill-attention auto` stays on BF16 at every length. `siphon_cuda::BLOCK_SCALED_MMA` is false, and the 9 kernel tests of those paths are skipped.
+- **An E2M1 converter.** CUDA's `__nv_cvt_fp4x2_to_halfraw2` falls back to an E2M3 conversion in software on Ada, which took the decode step's NVFP4 expert MLP to 131 us per call, 27% of the DRAM bandwidth, while the MXFP8 one ran at 87%. The F16 forms of the eight E2M1 magnitudes differ only in their high byte, so one `prmt` looks up both values of a byte (`e2m1x2_to_f16x2_sm89`). It matches CUDA's conversion on all 256 bytes.
+
+The memory plan has the same parts. The cluster stand-ins add 10.3 MB of module globals, inside `RUNTIME_BYTES`. The CUDA context takes 392 MiB with driver 595, against the 507 MiB of `CONTEXT_BYTES`, so `siphon-plan` without `--free` underestimates the free memory by 115 MiB there.
+
+### Results on the RTX 4090
+
+The kernel tests pass, but for the 9 skipped ones. Logits differ from the `sm_120a` build's: `tanhf`, `expf`, `sqrtf`, `rsqrtf`, `logf` and `exp2f` give the same bits on both GPUs, but BF16 and F16 `mma.sync` with F32 accumulators round their sums differently on Ada. So `smallm verify --hash 1` over `anyhow-chunked` has its own values there:
+
+| Weights and cache | Width 1 | Width 3 | Width 8 |
+| --- | --- | --- | --- |
+| FP8 | `85c88c08dbe6b415` | `044d7bcabd13d3f3` | `118d8e3e8c5637e0` |
+| FP8, `--output-projection fp8` | `2a0d5034f3af2068` | `37d27a7a9cabc0aa` | `94f10cdd3dceb7c5` |
+| BF16 | `655ad0def7fe068c` | `95960bc6a6b86a70` | `97f25d91b288b3d5` |
+
+The runs below read the FP8 copy of the output projection, now `--output-projection fp8` ([The output projection](#the-output-projection)). The quality gate with FP8 weights and cache, against MLX's chunked captures of `anyhow`, `half` and `regex-readme`, on the RTX 4090 and on an RTX 5090 with the same checkpoint:
+
+| Mode | GPU | Mean KL | Worst range's \|log-prob difference\| | Verdict |
+| --- | --- | --- | --- | --- |
+| Prefill, chunks of 2048 | RTX 4090 | 2.0e-3, 1.2e-3, 1.2e-3 | 0.031, 0.033, 0.034 | pass |
+| | RTX 5090 | 2.1e-3, 1.0e-3, 1.5e-3 | 0.030, 0.032, 0.036 | pass |
+| Verify, 8 rows | RTX 4090 | 2.8e-3, 1.2e-3, 2.1e-3 | 0.035, 0.041, 0.044 | pass |
+| | RTX 5090 | 2.6e-3, 1.1e-3, 3.0e-3 | 0.034, 0.038, 0.044 | pass |
+| Stepping | both | 2.7e-3, 1.1e-3, 1.9e-3 | 0.034, 0.041, 0.0451 | fails `regex-readme`: limit 0.045 |
+
+Stepping runs the GEMVs, not `mma.sync`, and gives the same numbers on both GPUs, so its failure on `regex-readme` comes from the FP8 path itself, not from Ada.
+
 ## References
 
 Targets the official checkpoint at revision [`b85c3cfa`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/b85c3cfa615fc413cc9af3379f491b963f3b586a), with its NVFP4/MXFP8 experts, BF16 dense weights and bundled DSpark draft.

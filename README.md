@@ -181,6 +181,8 @@ target/release/bench <model-dir> --prompt <capture> --spec auto --weights fp8 --
 target/release/bench <model-dir> --batch 1,2,4,8 --prompt <capture> --contexts 0 --weights fp8 --kv fp8
 ```
 
+For an RTX 4090, build with `SIPHON_CUDA_ARCH=sm_89`. That build has no FP8 prefill attention, quantized or FP8 expert activations or FP8 dense products, since Ada lacks the block-scaled MMA. Its logits differ from the RTX 5090's by tensor-core rounding, and it scores the same on the quality gate. [engine.md](docs/engine.md#rtx-4090-sm_89) lists what else differs and how fast it runs.
+
 On macOS, `siphon-cuda` compiles to an empty crate, so the tests run but the server cannot serve. `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command there.
 
 ## Project layout
