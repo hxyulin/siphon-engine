@@ -1,6 +1,6 @@
 # siphon-serve
 
-`siphon-serve` is an OpenAI-compatible HTTP server for Inkling 2 Mini. This page lists its options, routes and request fields. [engine.md](engine.md) covers how the engine works.
+`siphon-serve` is an OpenAI-compatible HTTP server for Inkling 2 Mini. This page lists its options, routes and request fields. [engine.md](engine.md) covers how the engine works, and [clients.md](clients.md) sets up coding agents against the server.
 
 ```sh
 SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
@@ -161,28 +161,7 @@ Errors take OpenAI's shape. A full queue answers 503, as on the chat route. A fa
 
 ### Codex
 
-Point the Codex CLI at the server with a custom provider in `config.toml` (`~/.codex/config.toml`, or `$CODEX_HOME/config.toml`):
-
-```toml
-model = "inkling-2-mini"            # the server's --name
-model_provider = "siphon"
-model_context_window = 131072       # the server's --context, or max_model_len from /v1/models
-
-[model_providers.siphon]
-name = "Siphon"
-base_url = "http://<host>:8000/v1"
-wire_api = "responses"
-env_key = "SIPHON_API_KEY"          # the variable Codex reads the key from
-```
-
-```sh
-export SIPHON_API_KEY=<key>          # any text when the server runs without SIPHON_API_KEY
-codex
-```
-
-Codex sends plain HTTP requests with server-sent events to a custom provider, since `supports_websockets` is off by default. Codex warns that it has no metadata for the model and uses defaults: function tools such as `exec_command` and `write_stdin`, and no `apply_patch` grammar tool. Set `model_context_window` so that Codex compacts the conversation before the prompt overflows; a prompt that still overflows gets a 400 with the code `context_length_exceeded`, which Codex reads to compact. `model_reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high` or `xhigh`) reaches the server as `reasoning.effort`. Codex sends no `max_output_tokens`, so with `--streams 1` its turns miss the prefix cache for now (see [Known gaps](#known-gaps)).
-
-Codex shows the thinking as each reasoning item's summary. Leave `show_raw_agent_reasoning` off: the summary already holds the whole text, and with the setting on, Codex's TUI shows it twice.
+[clients.md](clients.md#codex) has the Codex setup, with Pi, OpenCode and DeepSeek Harness.
 
 ## Images
 
