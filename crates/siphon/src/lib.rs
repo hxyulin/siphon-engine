@@ -5,6 +5,7 @@ mod config;
 mod format;
 pub mod memory;
 pub mod race;
+pub mod vision;
 
 pub use checkpoint::{Checkpoint, TensorEntry};
 pub use config::{LoopConfig, TextConfig};
