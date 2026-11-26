@@ -35,6 +35,9 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--no-prefix-cache` | cache on | Turns off the prefix cache and gives its memory, about 0.17 GiB per entry, to the KV cache. |
 | `--prefix-cache-entries N` | `--streams` | Prompts the prefix cache keeps, 1 to `--streams`. |
 | `--prefix-cache-ttl SECONDS` | `600` | Drops a prefix cache entry unused for that long. |
+| `--host-cache GiB` | `0`, off | Keeps prefix cache entries in that much page-locked host memory too, global KV cache included, so a conversation whose stream another request took restores over PCIe instead of prefilling again. Needs the default `--prefill-chunk` of 2048. |
+| `--cache-dir DIR` | none | Saves the host cache to DIR when the server stops and loads it at startup. Needs `--host-cache`. See [Restarts](#restarts). |
+| `--drain-timeout SECONDS` | `600` | How long a drain on SIGTERM waits for the running and queued requests before it ends them. |
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
 | `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
 
@@ -170,11 +173,28 @@ Each entry belongs to a stream's KV cache, so a request that hits one runs in th
 
 A request that runs alone speculates. When its entry was saved by a batched request, it lacks the draft's state: the request then prefills from the entry and decodes batched, and rebuilds the draft's state, a prefill of its whole prompt, only when its `max_tokens` leaves more than 1/16 of the position to generate (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context.
 
+With `--host-cache GiB`, every entry is also copied to page-locked host memory with its whole KV cache, and a request whose entry left the GPU restores it from there into the stream it takes, then prefills only the rest, with the same tokens and logits. A conversation that a subagent or another session pushed off the GPU then comes back in 0.135 s instead of 2.1 s at 32K tokens, and in 0.81 s instead of 39 s at 330K, on an RTX PRO 6000 Blackwell Workstation Edition. The memory is allocated at startup (9.7 s for 12 GiB). An entry takes 18 KiB per token with FP8 caches and the bundled draft (16 KiB with DFlash 2, 34 KiB with BF16 caches) plus about 0.2 GiB, conversations that share a start share its memory, and the least recently used entries go when it is full. The log reports each save and restore. On a two-socket host, run the server on the GPU's socket (`taskset` or `numactl`), or restores run at about half speed. [engine.md](engine.md#host-tier) has the design and the measurements.
+
+## Restarts
+
+On SIGTERM or Ctrl-C the server drains instead of stopping:
+
+1. It logs the running and queued requests, refuses new ones with 503 and `Retry-After: 1`, and `/health` answers 503 `draining`, so the proxy in front sends new requests and their retries to the process that replaces this one. The Anthropic route answers 503 too, not its usual 529 for a full queue.
+2. It finishes the running and queued requests, for up to `--drain-timeout` seconds.
+3. It ends the requests still left with an error at their next step, and logs how many it finished and how many it cut.
+4. With `--cache-dir`, it copies the conversations the streams hold into the host cache, writes every host cache entry to DIR, and exits.
+
+At startup the server loads DIR's entries into the host cache, so the first turn of each saved conversation restores from host memory in place of a full prefill, with the same tokens and logits as a cold prefill. DIR holds one file per entry and a `manifest.json`. The manifest records what changes the saved bytes or their meaning: a hash of the checkpoint's `config.json` and of its weight files' names and sizes, the same for `--drafter`, the KV cache and weight formats, `--draft`, `--prefill-attention`, a hash of the kernels this build compiled, the chunk layout and the file format version. A directory whose manifest differs in any of them is discarded with a log line, so a build with other kernels starts empty. Each file is written under a temporary name and renamed, and the manifest is removed before a save and written after it, so a crash midway leaves nothing that loads.
+
+On an RTX PRO 6000 Blackwell Workstation Edition with `--host-cache 12`, two conversations of 330K tokens filled 11.66 GiB of the host cache. SIGTERM to exit took 14.1 s, 8.8 s of it saving the files (1.42 GB/s, with `fsync`). The next server loaded them in 4.4 s, read from disk after the files were dropped from the page cache, after the 9.7 s that page-locking the pool takes. Its first turn of each conversation read 329,728 tokens from the cache and took 1.13 s and 0.65 s instead of 37 s, and the 64-token reply equaled the one before the restart. With `--drain-timeout 2`, a request in its reply was cut: its client got a 500 with the reason, and the server saved and exited.
+
+`tests/drain.rs` checks a deploy end to end with the real binary: a running request finishes all of its 1,500 tokens after SIGTERM, while `/health` and a new request get 503 with `Retry-After`, the server saves and exits with status 0, and the next server loads the entry and gives the same request the same reply from 2,048 cached tokens. `host_cache_round_trips` in `crates/siphon-cuda/tests/prefix.rs` checks that entries read back from disk restore with the first token's logits, tokens and draft acceptance of a cold prefill, with the bundled draft and DFlash 2, that a manifest of another identity is discarded with its files, and that a directory without a manifest loads nothing.
+
 ## Known gaps
 
 Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of 41,281 tokens (largest 153,426) and a median reply of 151 tokens. The prefix cache served 90% of the tokens of prompts over 4,096.
 
-- **Another request in a slot loses its conversation.** An entry keeps only the slot's rings and conv states. The global KV cache stays in the slot, so any other sequence there overwrites it. With `--streams 1`, short side requests caused 6 full prefills of 77,421 to 150,445 tokens, at 5.7 to 12.5 s each. The side requests included the agent's own 539-token request and 21-token tests. A host-memory tier for entries would restore those prompts in well under a second.
+- **Another request in a slot loses its conversation without `--host-cache`.** A device entry keeps only the slot's rings and conv states. The global KV cache stays in the slot, so any other sequence there overwrites it. With `--streams 1`, short side requests caused 6 full prefills of 77,421 to 150,445 tokens, at 5.7 to 12.5 s each. The side requests included the agent's own 539-token request and 21-token tests. The host tier, `--host-cache`, now restores such prompts in well under a second.
 - **A prefill stalls every other stream.** Prefill runs whole, between decode steps. In a test on an RTX PRO 6000 Blackwell with two streams of 1,048,576 positions, the running request delivered 2.2 tok/s while the second request's 325 s prefill ran. Chunked prefill with decode steps between the chunks would bound the stall.
 - **Job lines carry no request ID.** A `job:` log line cannot be matched to a proxy's request log except by time.
 - **Decode slows past 100,000 tokens.** Agent turns decoded at a median 534 tok/s with prompts of 32,000 to 100,000 tokens, and 417 tok/s above 100,000. Speculation kept a median of 3.09 tokens per round.

@@ -14,12 +14,19 @@
 //! An entry is live while its slot holds the same sequence ([`Model::slot_sequence`]) and
 //! it was used within the time to live. Anything that starts another sequence in the slot
 //! (a reset, a [`Model::move_slot`] into it) so drops the entry without the cache's help.
+//!
+//! With a host tier ([`Speculator::enable_host_cache`], [`super::host`]), every saved entry
+//! is also copied to host memory, global caches included, and a prompt whose entry died
+//! on the device restores from there into the slot it takes.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
 
-use super::Speculator;
+use super::{
+    Speculator,
+    host::{DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS, HostCache},
+};
 use crate::{
     draft::DraftRings,
     model::{LocalState, Model},
@@ -32,6 +39,17 @@ pub(super) struct PrefixCache {
     ttl: Duration,
     /// Whether the draft has global layers ([`crate::draft::Draft::has_global_layers`]).
     draft_global: bool,
+    /// The host tier, with [`Speculator::enable_host_cache`].
+    host: Option<HostCache>,
+}
+
+/// Where a prompt's longest cached prefix lies.
+#[derive(Clone, Copy, Debug)]
+enum Source {
+    /// A device entry.
+    Device(usize),
+    /// A host entry, and its tokens.
+    Host(usize, usize),
 }
 
 /// One prompt's state at its last chunk boundary.
@@ -52,11 +70,11 @@ struct Entry {
     draft_sequence: Option<u64>,
 }
 
-/// The longest live entry a prompt starts with, from [`Speculator::prefix_lookup`].
+/// The longest entry a prompt starts with, from [`Speculator::prefix_lookup`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefixHit {
-    /// The slot that holds the entry.
-    pub slot: usize,
+    /// The slot that holds the entry, `None` for an entry in host memory.
+    pub slot: Option<usize>,
     /// Prompt tokens whose state the entry holds.
     pub tokens: usize,
     /// Whether the entry also holds the draft's state, so that the prompt can speculate
@@ -104,6 +122,37 @@ impl PrefixCache {
             })
             .max_by_key(|(_, e)| e.tokens.len())
             .map(|(i, _)| i)
+    }
+
+    /// The longest entry outside `busy` slots that `prompt` starts with and goes past: the
+    /// live device entry of [`Self::lookup`], or a host entry if one is longer. With
+    /// `draft`, only entries with the draft's state count.
+    fn pick(
+        &self,
+        model: &Model,
+        prompt: &[u32],
+        chunk: usize,
+        busy: &[usize],
+        draft: Option<u64>,
+        now: Instant,
+    ) -> Option<Source> {
+        let device = self.lookup(model, prompt, chunk, busy, draft, now);
+        let device_len = device.map_or(0, |i| self.entries[i].tokens.len());
+        let host = self
+            .host
+            .as_ref()
+            .filter(|_| chunk == HOST_CHUNK_POSITIONS)
+            .and_then(|h| {
+                let j = h.lookup(prompt, draft.is_some())?;
+                (h.len(j) > device_len).then(|| Source::Host(j, h.len(j)))
+            });
+        host.or(device.map(Source::Device))
+    }
+
+    /// Makes the model's stream wait for the host tier's copies before it overwrites what
+    /// they read.
+    fn fence(&self) -> anyhow::Result<()> {
+        self.host.as_ref().map_or(Ok(()), HostCache::fence)
     }
 
     /// The live entry of slot `slot`.
@@ -186,8 +235,81 @@ impl Speculator {
             entries,
             ttl,
             draft_global: self.draft.has_global_layers(),
+            host: None,
         });
         Ok(bytes)
+    }
+
+    /// Adds a host tier of `bytes` of page-locked host memory to the prefix cache
+    /// ([`Self::enable_prefix_cache`]), which every saved entry is copied to. Returns the
+    /// chunks the memory holds and the bytes of each.
+    pub fn enable_host_cache(
+        &mut self,
+        model: &Model,
+        bytes: usize,
+    ) -> anyhow::Result<(usize, usize)> {
+        let cache = self
+            .prefix
+            .as_mut()
+            .context("the host cache needs the prefix cache")?;
+        let host = HostCache::new(model, &self.draft, bytes)?;
+        let chunks = host.chunks();
+        cache.host = Some(host);
+        Ok(chunks)
+    }
+
+    /// Copies every live device entry to the host tier, so that the conversations the
+    /// slots hold are there too, then writes every host entry to files in `dir` with a
+    /// manifest that records `identity` ([`HostCache::save_dir`]).
+    pub fn save_host_cache(
+        &mut self,
+        model: &Model,
+        dir: &std::path::Path,
+        identity: &serde_json::Value,
+    ) -> anyhow::Result<DiskSaved> {
+        let now = Instant::now();
+        let cache = self.prefix.as_ref().context("the prefix cache is off")?;
+        let live: Vec<(usize, bool)> = (0..cache.entries.len())
+            .filter(|&i| cache.live(&cache.entries[i], model, now))
+            .map(|i| (i, cache.has_draft(&cache.entries[i], self.draft_sequence)))
+            .collect();
+        for (i, draft) in live {
+            self.save_host(model, i, draft);
+        }
+        let host = self
+            .prefix
+            .as_ref()
+            .and_then(|c| c.host.as_ref())
+            .context("the host cache is off")?;
+        host.save_dir(dir, identity)
+    }
+
+    /// Reads the host entries that [`Self::save_host_cache`] wrote to `dir`, if its
+    /// manifest matches `identity` and this host tier's layout, and otherwise removes them.
+    pub fn load_host_cache(
+        &mut self,
+        dir: &std::path::Path,
+        identity: &serde_json::Value,
+    ) -> anyhow::Result<DiskLoaded> {
+        self.prefix
+            .as_mut()
+            .and_then(|c| c.host.as_mut())
+            .context("the host cache is off")?
+            .load_dir(dir, identity)
+    }
+
+    /// Makes the model's stream wait for the host tier's copies before it overwrites what
+    /// they read: a slot's caches or the draft's.
+    pub(super) fn fence_host(&self) -> anyhow::Result<()> {
+        self.prefix.as_ref().map_or(Ok(()), PrefixCache::fence)
+    }
+
+    /// Lines about the host tier's saves and restores since the last call, for a log.
+    pub fn host_notes(&mut self) -> Vec<String> {
+        self.prefix
+            .as_mut()
+            .and_then(|c| c.host.as_mut())
+            .map_or_else(Vec::new, HostCache::notes)
     }
 
     /// Drops entries after `ttl` unused from now on.
@@ -208,13 +330,21 @@ impl Speculator {
         busy: &[usize],
     ) -> Option<PrefixHit> {
         let cache = self.prefix.as_ref()?;
-        let i = cache.lookup(model, prompt, chunk, busy, None, Instant::now())?;
-        let e = &cache.entries[i];
-        Some(PrefixHit {
-            slot: e.slot?,
-            tokens: e.tokens.len(),
-            draft: cache.has_draft(e, self.draft_sequence),
-        })
+        match cache.pick(model, prompt, chunk, busy, None, Instant::now())? {
+            Source::Device(i) => {
+                let e = &cache.entries[i];
+                Some(PrefixHit {
+                    slot: Some(e.slot?),
+                    tokens: e.tokens.len(),
+                    draft: cache.has_draft(e, self.draft_sequence),
+                })
+            }
+            Source::Host(j, tokens) => Some(PrefixHit {
+                slot: None,
+                tokens,
+                draft: cache.host.as_ref()?.has_draft(j),
+            }),
+        }
     }
 
     /// [`Self::prefill`] of `prompt` into slot 0 through the prefix cache
@@ -226,10 +356,12 @@ impl Speculator {
     /// moves to slot 0 ([`Self::move_to_slot0`]), and its copies return slot 0 and the
     /// draft to the entry's boundary; then only the rest is prefilled, in the same chunks
     /// as a whole prompt from position 0, so the results equal [`Self::prefill`]'s bit for
-    /// bit. Without such an entry, the entry of slot 0 moves to a free slot and slot 0
-    /// prefills from position 0. Either way slot 0's entry then takes `prompt`'s state at
-    /// its own last multiple of `chunk` below its end. Without a cache this prefills the
-    /// whole prompt.
+    /// bit. A longer host entry with the draft's state ([`Self::enable_host_cache`]) is
+    /// copied into slot 0 and the draft instead, after slot 0's entry moves aside, and slot
+    /// 0's entry takes it at once. Without either, the entry of slot 0 moves to a free slot
+    /// and slot 0 prefills from position 0. Either way slot 0's entry then takes `prompt`'s
+    /// state at its own last multiple of `chunk` below its end. Without a cache this
+    /// prefills the whole prompt.
     pub fn prefill_cached(
         &mut self,
         model: &mut Model,
@@ -242,38 +374,66 @@ impl Speculator {
             model.reset()?;
             return Ok((self.prefill(model, prompt, chunk)?, 0));
         };
-        let hit = cache.lookup(model, prompt, chunk, &[], Some(self.draft_sequence), now);
-        let start = if let Some(i) = hit {
-            let e = &cache.entries[i];
-            let (slot, len) = (e.slot.context("a live entry has a slot")?, e.tokens.len());
-            self.move_to_slot0(model, slot)?;
-            len
-        } else {
-            self.vacate_slot0(model, &[])?;
-            0
+        cache.fence()?;
+        let source = cache.pick(model, prompt, chunk, &[], Some(self.draft_sequence), now);
+        let (mut hit, start) = match source {
+            Some(Source::Device(i)) => {
+                let e = &cache.entries[i];
+                let (slot, len) = (e.slot.context("a live entry has a slot")?, e.tokens.len());
+                self.move_to_slot0(model, slot)?;
+                (Some(i), len)
+            }
+            Some(Source::Host(_, len)) => {
+                self.vacate_slot0(model, &[])?;
+                (None, len)
+            }
+            None => {
+                self.vacate_slot0(model, &[])?;
+                (None, 0)
+            }
         };
         self.start_prompt(model, prompt)?;
         let stream = std::sync::Arc::clone(model.stream());
         let cache = self.prefix.as_mut().context("the cache is on")?;
-        if let Some(i) = hit {
-            let e = &mut cache.entries[i];
-            model.restore_local_state(0, &e.model)?;
-            self.draft.restore_rings(&stream, &e.draft)?;
-            e.used = now;
-        } else {
-            model.reset()?;
-            // The draft's global caches now take another sequence.
-            self.draft_sequence += 1;
+        match source {
+            Some(Source::Device(i)) => {
+                let e = &mut cache.entries[i];
+                model.restore_local_state(0, &e.model)?;
+                self.draft.restore_rings(&stream, &e.draft)?;
+                e.used = now;
+            }
+            Some(Source::Host(j, len)) => {
+                model.reset()?;
+                // The draft's global caches now take another sequence.
+                self.draft_sequence += 1;
+                let host = cache.host.as_mut().context("a host hit has a host cache")?;
+                let started = host.start_restore()?;
+                let bytes =
+                    host.restore_slot(model, j, 0)? + host.restore_draft(&mut self.draft, j)?;
+                let seconds = host.finish_restore(started)?;
+                host.note(restored(len, 0, bytes, seconds, "with the draft's state"));
+            }
+            None => {
+                model.reset()?;
+                // The draft's global caches now take another sequence.
+                self.draft_sequence += 1;
+            }
         }
         // The last chunk boundary below the end, so at least one row remains for the
         // logits. `start` is such a boundary of a shorter prompt, so it is at most this.
         let boundary = (prompt.len() - 1) / chunk * chunk;
-        if boundary > start {
+        let from_host = matches!(source, Some(Source::Host(..)));
+        if boundary > start || from_host {
             // Prefill splits a chunk only at the end of its tokens, so the chunks match a
             // prefill of the whole prompt.
-            self.prefill_rows(model, &prompt[start..boundary], chunk)?;
+            if boundary > start {
+                self.prefill_rows(model, &prompt[start..boundary], chunk)?;
+            }
+            // A state restored from the host goes into a device entry too, so that the
+            // next turn finds it there.
             let cache = self.prefix.as_ref().context("the cache is on")?;
-            if let Some(i) = hit.or_else(|| cache.free_entry(model, &[], now)) {
+            hit = hit.or_else(|| cache.free_entry(model, &[], now));
+            if let Some(i) = hit {
                 self.save_entry(model, i, 0, &prompt[..boundary], chunk)?;
                 self.save_entry_rings(model, i)?;
             }
@@ -285,7 +445,9 @@ impl Speculator {
     /// Picks a slot outside `busy` for a request that runs batched, and readies it: the
     /// slot of the longest live entry that `prompt` starts with, returned to that entry's
     /// boundary, else a slot without a live entry, else the slot of the least recently used
-    /// entry, reset. Returns the slot and the prompt tokens whose state it holds, from
+    /// entry, reset. A longer host entry is copied into that reset slot, without the
+    /// draft's state but for a draft of rings alone, and kept in a device entry outside
+    /// `busy` slots too. Returns the slot and the prompt tokens whose state it holds, from
     /// which the request prefills the rest in chunks of `chunk` ([`Model::prefill_slot`]),
     /// as a prefill from position 0 would. Without a cache, takes the first slot outside
     /// `busy`, slot 0 last.
@@ -297,27 +459,61 @@ impl Speculator {
         busy: &[usize],
     ) -> anyhow::Result<(usize, usize)> {
         let now = Instant::now();
-        let slot = if let Some(cache) = self.prefix.as_mut() {
-            if let Some(i) = cache.lookup(model, prompt, chunk, busy, None, now) {
-                let e = &mut cache.entries[i];
-                let slot = e.slot.context("a live entry has a slot")?;
-                model.restore_local_state(slot, &e.model)?;
-                e.used = now;
-                return Ok((slot, e.tokens.len()));
-            }
-            let slot = cache
-                .victim_slot(model, busy, now)
-                .context("every slot runs a request")?;
-            cache.drop_slot(slot);
-            slot
-        } else {
-            (1..model.slots())
+        let Some(cache) = self.prefix.as_mut() else {
+            let slot = (1..model.slots())
                 .chain([0])
                 .find(|s| !busy.contains(s))
-                .context("every slot runs a request")?
+                .context("every slot runs a request")?;
+            model.reset_slot(slot)?;
+            return Ok((slot, 0));
         };
+        cache.fence()?;
+        let source = cache.pick(model, prompt, chunk, busy, None, now);
+        if let Some(Source::Device(i)) = source {
+            let e = &mut cache.entries[i];
+            let slot = e.slot.context("a live entry has a slot")?;
+            model.restore_local_state(slot, &e.model)?;
+            e.used = now;
+            return Ok((slot, e.tokens.len()));
+        }
+        let slot = cache
+            .victim_slot(model, busy, now)
+            .context("every slot runs a request")?;
+        cache.drop_slot(slot);
         model.reset_slot(slot)?;
-        Ok((slot, 0))
+        let Some(Source::Host(j, len)) = source else {
+            return Ok((slot, 0));
+        };
+        let host = cache.host.as_mut().context("a host hit has a host cache")?;
+        let started = host.start_restore()?;
+        let bytes = host.restore_slot(model, j, slot)?;
+        let seconds = host.finish_restore(started)?;
+        let rings = !cache.draft_global && host.has_rings(j);
+        host.note(restored(
+            len,
+            slot,
+            bytes,
+            seconds,
+            if rings {
+                "with the draft's rings"
+            } else {
+                "without the draft's state"
+            },
+        ));
+        // Into a device entry too, so that the next turn finds it there. A draft of rings
+        // alone takes any entry's rings, so they come along.
+        if let Some(i) = cache.free_entry(model, busy, now) {
+            self.save_entry(model, i, slot, &prompt[..len], chunk)?;
+            if rings {
+                let sequence = self.draft_sequence;
+                let cache = self.prefix.as_mut().context("the cache is on")?;
+                let host = cache.host.as_ref().context("a host hit has a host cache")?;
+                let e = &mut cache.entries[i];
+                host.restore_rings(j, &mut e.draft)?;
+                e.draft_sequence = Some(sequence);
+            }
+        }
+        Ok((slot, len))
     }
 
     /// After a batched request in slot `slot` has prefilled `prompt` up to its last
@@ -336,6 +532,7 @@ impl Speculator {
         let Some(cache) = self.prefix.as_ref() else {
             return Ok(());
         };
+        cache.fence()?;
         let boundary = prompt.len().saturating_sub(1) / chunk * chunk;
         if boundary == 0 {
             return Ok(());
@@ -350,6 +547,7 @@ impl Speculator {
             .or_else(|| cache.free_entry(model, busy, now));
         if let Some(i) = entry {
             self.save_entry(model, i, slot, &prompt[..boundary], chunk)?;
+            self.save_host(model, i, false);
         }
         Ok(())
     }
@@ -361,6 +559,7 @@ impl Speculator {
         let Some(cache) = self.prefix.as_mut() else {
             return (0..model.slots()).find(|s| !busy.contains(s));
         };
+        cache.fence().ok()?;
         let slot = cache.victim_slot(model, busy, Instant::now())?;
         cache.drop_slot(slot);
         Some(slot)
@@ -372,6 +571,9 @@ impl Speculator {
     pub fn move_to_slot0(&mut self, model: &mut Model, from: usize) -> anyhow::Result<()> {
         if from == 0 {
             return Ok(());
+        }
+        if let Some(cache) = self.prefix.as_ref() {
+            cache.fence()?;
         }
         self.vacate_slot0(model, &[from])?;
         let now = Instant::now();
@@ -399,6 +601,7 @@ impl Speculator {
         let Some(i) = cache.of_slot(model, 0, now) else {
             return Ok(());
         };
+        cache.fence()?;
         let mut busy = busy.to_vec();
         busy.push(0);
         let Some(to) = cache.victim_slot(model, &busy, now) else {
@@ -466,7 +669,63 @@ impl Speculator {
         let e = &mut cache.entries[i];
         self.draft.save_rings(model.stream(), &mut e.draft)?;
         e.draft_sequence = Some(sequence);
+        self.save_host(model, i, true);
         Ok(())
+    }
+
+    /// Copies entry `i`, just saved, to the host tier, with the draft's rings and global
+    /// caches if `draft`. A failure only costs the host copy, so it goes to the log.
+    ///
+    /// Inside a rebuild ([`Self::rebuild`]), the rebuild's slot stands in for slot 0, the
+    /// entry's, and the copies read its global caches. Below the boundary they hold the
+    /// values of the entry's: the same tokens, prefilled in the same chunks from position 0.
+    fn save_host(&mut self, model: &Model, i: usize, draft: bool) {
+        let Some(PrefixCache {
+            entries,
+            host: Some(host),
+            ..
+        }) = self.prefix.as_mut()
+        else {
+            return;
+        };
+        let e = &entries[i];
+        if e.chunk != HOST_CHUNK_POSITIONS {
+            return;
+        }
+        let saved = e.slot.context("a saved entry has a slot").and_then(|slot| {
+            host.save(
+                model,
+                &self.draft,
+                slot,
+                &e.tokens,
+                &e.model,
+                draft.then_some(&e.draft),
+            )
+        });
+        let line = match saved {
+            Ok(Some(s)) if s.bytes == 0 => return,
+            Ok(Some(s)) => format!(
+                "host cache: saving {} tokens{}: {} MiB, {} chunks copied, {} shared; {} of {} \
+                 chunks in use by {} entries",
+                e.tokens.len(),
+                if draft { " with the draft's state" } else { "" },
+                s.bytes >> 20,
+                s.copied,
+                s.shared,
+                host.used_chunks(),
+                host.chunks().0,
+                host.entries()
+            ),
+            Ok(None) => format!(
+                "host cache: {} tokens do not fit the host cache",
+                e.tokens.len()
+            ),
+            Err(err) => format!(
+                "host cache: saving {} tokens failed: {err:#}",
+                e.tokens.len()
+            ),
+        };
+        host.note(line);
     }
 
     /// The live entry of slot `slot` whose tokens `tokens` starts with and goes past.
@@ -490,4 +749,15 @@ impl Speculator {
             .as_ref()
             .map_or(0, |c| c.entries[i].tokens.len())
     }
+}
+
+/// A log line for a restore from the host tier.
+fn restored(tokens: usize, slot: usize, bytes: usize, seconds: f64, what: &str) -> String {
+    format!(
+        "host cache: restored {tokens} tokens into slot {slot} {what}: {} MiB in {:.1} ms, \
+         {:.1} GB/s",
+        bytes >> 20,
+        seconds * 1e3,
+        bytes as f64 / seconds.max(1e-9) / 1e9
+    )
 }

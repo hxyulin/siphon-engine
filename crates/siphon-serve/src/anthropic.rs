@@ -69,8 +69,14 @@ pub struct Error(pub ApiError);
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let (status, kind) = error_kind(self.0.status);
-        (status, Json(error_body(kind, &self.0.message))).into_response()
+        let (status, kind) = if self.0.retry_after.is_some() {
+            // A draining server: a 503 that the proxy retries elsewhere, not 529.
+            (self.0.status, "overloaded_error")
+        } else {
+            error_kind(self.0.status)
+        };
+        self.0
+            .with_retry_after((status, Json(error_body(kind, &self.0.message))).into_response())
     }
 }
 

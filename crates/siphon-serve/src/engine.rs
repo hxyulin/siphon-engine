@@ -37,8 +37,8 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{SyncSender, TrySendError},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
     },
 };
 
@@ -62,6 +62,8 @@ pub struct Job {
     group: u64,
     /// The job's place in the engine's [`Load`], from [`Engine::submit`].
     ticket: Option<Ticket>,
+    /// The engine's drain state, from [`Engine::submit`].
+    control: Option<Arc<Control>>,
 }
 
 impl Job {
@@ -80,7 +82,19 @@ impl Job {
             events,
             group: 0,
             ticket: None,
+            control: None,
         }
+    }
+
+    /// Whether a drain gave up on the job ([`Engine::cancel`]).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only the Linux engine runs jobs")
+    )]
+    fn cancelled(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|c| c.cancel.load(Ordering::Relaxed))
     }
 
     /// Counts the job as running rather than waiting.
@@ -122,6 +136,18 @@ impl Load {
         }
         fits
     }
+}
+
+/// What a drain tells the engine thread, set from the HTTP side.
+#[derive(Debug, Default)]
+struct Control {
+    /// New jobs are refused ([`Engine::drain`]).
+    draining: AtomicBool,
+    /// The jobs left end now, with an error ([`Engine::cancel`]).
+    cancel: AtomicBool,
+    /// Where the engine thread reports once it has stopped ([`Engine::stop`]); it stops
+    /// when this is set and no job is left.
+    stopped: Mutex<Option<mpsc::Sender<String>>>,
 }
 
 /// One job's count in a [`Load`]: waiting until [`Ticket::start`], then running until
@@ -243,6 +269,10 @@ pub struct Options {
     pub prefix_entries: usize,
     /// How long an unused prefix cache entry lives.
     pub prefix_ttl: std::time::Duration,
+    /// Bytes of page-locked host memory for the prefix cache's host tier, 0 for none.
+    pub host_cache: usize,
+    /// Where the host tier's entries are saved after a drain and loaded at startup.
+    pub cache_dir: Option<PathBuf>,
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
@@ -259,11 +289,14 @@ pub struct Engine {
     load: Arc<Load>,
     queue: usize,
     streams: usize,
+    control: Arc<Control>,
 }
 
 /// Why the engine did not take a job.
 pub enum Refused {
     Busy,
+    /// The server drains before it stops ([`Engine::drain`]).
+    Draining,
     Stopped,
 }
 
@@ -283,6 +316,9 @@ impl Engine {
     /// stopped.
     pub fn submit(&self, mut jobs: Vec<Job>) -> Result<(), Refused> {
         static GROUPS: AtomicU64 = AtomicU64::new(0);
+        if self.draining() {
+            return Err(Refused::Draining);
+        }
         if !self.load.reserve(jobs.len(), self.queue, self.streams) {
             return Err(Refused::Busy);
         }
@@ -292,11 +328,48 @@ impl Engine {
             // Each ticket gives back its reservation when its job is dropped, so a refused
             // send below gives them all back.
             job.ticket = Some(Ticket::new(&self.load));
+            job.control = Some(Arc::clone(&self.control));
         }
         self.jobs.try_send(jobs).map_err(|e| match e {
             TrySendError::Full(_) => Refused::Busy,
             TrySendError::Disconnected(_) => Refused::Stopped,
         })
+    }
+
+    /// Refuses new jobs from now on; the running and waiting ones go on.
+    pub fn drain(&self) {
+        self.control.draining.store(true, Ordering::Relaxed);
+    }
+
+    pub fn draining(&self) -> bool {
+        self.control.draining.load(Ordering::Relaxed)
+    }
+
+    /// Jobs running and jobs waiting.
+    pub fn counts(&self) -> (usize, usize) {
+        let counts = self.load.counts();
+        (counts.running, counts.waiting)
+    }
+
+    /// Ends every job left, running or waiting, with an error at its next step.
+    pub fn cancel(&self) {
+        self.control.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Stops the engine thread once no job is left, after it saves the prefix cache's host
+    /// tier to `--cache-dir`, and returns its report. Blocks until then.
+    pub fn stop(&self) -> String {
+        let (sender, receiver) = mpsc::channel();
+        *self
+            .control
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sender);
+        // Wakes the thread if it waits for jobs.
+        let _ = self.jobs.try_send(Vec::new());
+        receiver
+            .recv()
+            .unwrap_or_else(|_| "the engine thread had already stopped".to_owned())
     }
 }
 
@@ -328,11 +401,17 @@ mod cuda {
         draft::DraftOptions,
         model::{DEFAULT_PREFILL_CHUNK, Model, Sampling as ModelSampling},
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
-        spec::{DraftSource, Drafts, Speculator, Width, WidthPolicy, load_draft, price},
+        spec::{
+            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Speculator, Width, WidthPolicy,
+            load_draft, price,
+        },
         weights::{WeightFormat, Weights},
     };
 
-    use super::{Engine, Event, Finish, Job, Options};
+    use super::{Control, Engine, Event, Finish, Job, Options};
+
+    /// Why a job that a drain gave up on failed.
+    const CANCELLED: &str = "the server stopped before the request finished";
 
     /// Positions past the last generated token that a round may write: a full verify.
     const MARGIN: usize = VERIFY_ROWS + 1;
@@ -348,12 +427,22 @@ mod cuda {
         let (ready, loaded) = sync_channel(1);
         let (queue_len, streams) = (options.queue, options.streams);
         let options = options.clone();
+        let control = std::sync::Arc::new(Control::default());
+        let engine_control = std::sync::Arc::clone(&control);
         thread::Builder::new()
             .name("engine".to_owned())
             .spawn(move || match load(&options, &warmup) {
                 Ok((model, speculator, capacity, check)) => {
                     let _ = ready.send(Ok(capacity));
-                    run(model, speculator, check, &queue, &stop, &options);
+                    run(
+                        model,
+                        speculator,
+                        check,
+                        &queue,
+                        &stop,
+                        &options,
+                        &engine_control,
+                    );
                 }
                 Err(e) => {
                     let _ = ready.send(Err(e));
@@ -368,6 +457,7 @@ mod cuda {
             load: std::sync::Arc::default(),
             queue: queue_len,
             streams,
+            control,
         })
     }
 
@@ -598,6 +688,7 @@ mod cuda {
                 options.prefix_ttl.as_secs()
             );
         }
+        enable_host_cache(options, &model, &mut speculator)?;
         // The full chunk's buffers now, so that the check below sees every planned buffer
         // and a plan that undercounts fails here rather than on the first long prompt.
         // After pricing, so that they reuse the memory pricing freed, as a long prompt's
@@ -620,6 +711,129 @@ mod cuda {
             KvFormat::Bf16
         };
         (weights, kv)
+    }
+
+    /// Adds the prefix cache's host tier of `--host-cache` bytes, if any, and logs how long
+    /// page-locking its memory took.
+    fn enable_host_cache(
+        options: &Options,
+        model: &Model,
+        speculator: &mut Speculator,
+    ) -> anyhow::Result<()> {
+        if options.host_cache == 0 {
+            anyhow::ensure!(
+                options.cache_dir.is_none(),
+                "--cache-dir needs --host-cache"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            options.prefix_entries > 0,
+            "--host-cache needs the prefix cache"
+        );
+        anyhow::ensure!(
+            speculator.prefill_chunk() == HOST_CHUNK_POSITIONS,
+            "--host-cache needs --prefill-chunk {HOST_CHUNK_POSITIONS}, the host cache's chunk"
+        );
+        let started = Instant::now();
+        let (chunks, chunk_bytes) = speculator.enable_host_cache(model, options.host_cache)?;
+        eprintln!(
+            "host cache: {:.2} GiB of page-locked host memory in {:.2} s, {chunks} chunks of \
+             {} MiB ({HOST_CHUNK_POSITIONS} positions each)",
+            (chunks * chunk_bytes) as f64 / f64::from(1u32 << 30),
+            started.elapsed().as_secs_f64(),
+            chunk_bytes >> 20
+        );
+        let Some(dir) = &options.cache_dir else {
+            return Ok(());
+        };
+        let line = match speculator.load_host_cache(dir, &cache_identity(options)?)? {
+            DiskLoaded::Missing => format!("no saved host cache in {}", dir.display()),
+            DiskLoaded::Discarded(why) => {
+                format!("discarded the saved host cache in {}: {why}", dir.display())
+            }
+            DiskLoaded::Loaded {
+                entries,
+                skipped,
+                bytes,
+                seconds,
+            } => format!(
+                "loaded {entries} entries ({:.2} GiB) from {} in {seconds:.1} s ({:.2} GB/s), \
+                 skipped {skipped}",
+                bytes as f64 / f64::from(1u32 << 30),
+                dir.display(),
+                bytes as f64 / seconds.max(1e-9) / 1e9
+            ),
+        };
+        eprintln!("host cache: {line}");
+        log_host(speculator);
+        Ok(())
+    }
+
+    /// What changes the bytes of the host tier's saved entries or their meaning, for the
+    /// manifest in `--cache-dir`: the checkpoint and the drafter (their configs and the
+    /// names and sizes of their weight files), the formats, the draft's approximations,
+    /// prefill's attention products and the kernels.
+    fn cache_identity(options: &Options) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "checkpoint": weights_hash(&options.model_dir)?,
+            "drafter": options.drafter.as_deref().map(weights_hash).transpose()?,
+            "kv": if options.fp8_kv { "fp8" } else { "bf16" },
+            "weights": if options.fp8_weights { "fp8" } else { "bf16" },
+            "draft": options.draft,
+            "prefill_attention": options.prefill_attention,
+            "kernels": siphon_cuda::KERNELS_HASH,
+        }))
+    }
+
+    /// FNV-1a over `dir`'s config.json and the names and sizes of its safetensors files.
+    fn weights_hash(dir: &std::path::Path) -> anyhow::Result<String> {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut add = |bytes: &[u8]| {
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let config = dir.join("config.json");
+        add(&std::fs::read(&config).with_context(|| format!("reading {}", config.display()))?);
+        let mut files: Vec<(String, u64)> = std::fs::read_dir(dir)?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+            .map(|e| {
+                Ok((
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata()?.len(),
+                ))
+            })
+            .collect::<std::io::Result<_>>()?;
+        files.sort();
+        for (name, size) in files {
+            add(name.as_bytes());
+            add(&size.to_le_bytes());
+        }
+        Ok(format!("{hash:016x}"))
+    }
+
+    /// Saves the host tier to `--cache-dir`, if both are on, before the engine thread
+    /// stops, and returns a line for the log.
+    fn shut_down(model: &Model, speculator: &mut Speculator, options: &Options) -> String {
+        let Some(dir) = options.cache_dir.as_deref() else {
+            return "engine stopped".to_owned();
+        };
+        let saved = cache_identity(options)
+            .and_then(|identity| speculator.save_host_cache(model, dir, &identity));
+        log_host(speculator);
+        match saved {
+            Ok(s) => format!(
+                "host cache: saved {} entries ({:.2} GiB) to {} in {:.1} s ({:.2} GB/s)",
+                s.entries,
+                s.bytes as f64 / f64::from(1u32 << 30),
+                dir.display(),
+                s.seconds,
+                s.bytes as f64 / s.seconds.max(1e-9) / 1e9
+            ),
+            Err(e) => format!("host cache: saving to {} failed: {e:#}", dir.display()),
+        }
     }
 
     /// The model's form of a request's sampling, greedy under `--greedy`.
@@ -696,6 +910,8 @@ mod cuda {
             };
             if let Some(e) = error {
                 request.fail(&e);
+            } else if request.job.cancelled() {
+                request.fail(&anyhow::anyhow!(CANCELLED));
             }
             request
         }
@@ -703,6 +919,10 @@ mod cuda {
         /// Sends the tokens of `ids` that fit, up to a stop token; breaks when the job is
         /// over or its client has left.
         fn take(&mut self, ids: &[u32], stop: &[u32]) -> ControlFlow<()> {
+            if self.job.cancelled() {
+                self.fail(&anyhow::anyhow!(CANCELLED));
+                return ControlFlow::Break(());
+            }
             let room = self.job.max_tokens - self.output.len();
             let end = if self.job.ignore_eos {
                 None
@@ -771,6 +991,7 @@ mod cuda {
         queue: &Receiver<Vec<Job>>,
         stop: &[u32],
         options: &Options,
+        control: &Control,
     ) {
         let (streams, greedy) = (options.streams, options.greedy);
         let mut waiting = VecDeque::new();
@@ -781,6 +1002,15 @@ mod cuda {
                 request
             } else {
                 if waiting.is_empty() {
+                    let stopping = control
+                        .stopped
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(report) = stopping {
+                        let _ = report.send(shut_down(&model, &mut speculator, options));
+                        return;
+                    }
                     match queue.recv() {
                         Ok(jobs) => waiting.extend(jobs),
                         Err(_) => return,
@@ -884,6 +1114,7 @@ mod cuda {
                 &request.job.prompt,
                 speculator.prefill_chunk(),
             )?;
+            log_host(speculator);
             request.cached = cached;
             let _ = request.job.events.send(Event::Cached(cached));
             request.prefilled = request.job.prompt.len();
@@ -941,6 +1172,13 @@ mod cuda {
         Ok(false)
     }
 
+    /// Prints what the prefix cache's host tier did since the last call.
+    fn log_host(speculator: &mut Speculator) {
+        for line in speculator.host_notes() {
+            eprintln!("{line}");
+        }
+    }
+
     /// Prompt and generated tokens per remaining token above which a lone request that
     /// ran without the draft gets the draft's state rebuilt, by prefilling its tokens
     /// again, to speculate. A one-row batched step takes about 3.7 ms and speculation about
@@ -985,6 +1223,7 @@ mod cuda {
                 .idle_slot(model, &[0])
                 .context("no free slot to rebuild the draft in")?;
             speculator.rebuild(model, free, 0, &tokens)?;
+            log_host(speculator);
             r.followed = true;
             format!("rebuilt the draft in slot {free}")
         };
@@ -1036,7 +1275,10 @@ mod cuda {
                     continue;
                 }
                 let prompt = &request.job.prompt;
-                match speculator.claim_slot(model, prompt, speculator.prefill_chunk(), &busy) {
+                let claimed =
+                    speculator.claim_slot(model, prompt, speculator.prefill_chunk(), &busy);
+                log_host(speculator);
+                match claimed {
                     Ok((slot, cached)) => {
                         request.slot = slot;
                         request.prefilled = cached;
@@ -1103,6 +1345,9 @@ mod cuda {
             r.done = true;
             return;
         }
+        if r.job.cancelled() {
+            return r.fail(&anyhow::anyhow!(CANCELLED));
+        }
         let len = r.job.prompt.len();
         let chunk = speculator.prefill_chunk();
         let end = (r.prefilled + chunk).min(len);
@@ -1119,6 +1364,7 @@ mod cuda {
         {
             eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
         }
+        log_host(speculator);
         if end == len {
             r.prefill_s = r.started.elapsed().as_secs_f64();
             r.next = Some(first);

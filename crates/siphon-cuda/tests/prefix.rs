@@ -364,7 +364,7 @@ fn serve_alone(
     let (first, logits, cached, path) = if hit.is_some_and(|h| !h.draft) {
         let (slot, cached) = spec.claim_slot(model, prompt, CHUNK, &[])?;
         ensure!(
-            Some(slot) == hit.map(|h| h.slot),
+            hit.is_some_and(|h| h.slot.is_none_or(|s| s == slot)),
             "the batch took another slot"
         );
         let first = prefill_batched(model, spec, slot, prompt, cached, &[slot])?;
@@ -373,11 +373,17 @@ fn serve_alone(
         let free = spec.idle_slot(model, &[0]).context("no idle slot")?;
         spec.rebuild(model, free, 0, prompt)?;
         spec.resume(model, first)?;
-        (first, logits, cached, "batch of one, rebuild")
+        let path = if hit.is_some_and(|h| h.slot.is_none()) {
+            "from host memory as a batch of one, rebuild"
+        } else {
+            "batch of one, rebuild"
+        };
+        (first, logits, cached, path)
     } else {
-        let path = match hit {
-            Some(h) if h.slot != 0 => "moved to slot 0 with the draft's rings",
-            Some(_) => "in slot 0 with the draft's rings",
+        let path = match hit.map(|h| h.slot) {
+            Some(None) => "from host memory with the draft's state",
+            Some(Some(0)) => "in slot 0 with the draft's rings",
+            Some(Some(_)) => "moved to slot 0 with the draft's rings",
             None => "from position 0",
         };
         let (first, cached) = spec.prefill_cached(model, prompt, CHUNK)?;
@@ -535,8 +541,8 @@ fn prefix_cache_entries(drafter: Option<&std::path::Path>) -> anyhow::Result<()>
     // F runs while every other slot is busy, so it takes A's slot; A then misses.
     let a_slot = spec
         .prefix_lookup(&model, &conversations[0][2], CHUNK, &[])
-        .context("A3 has an entry")?
-        .slot;
+        .and_then(|h| h.slot)
+        .context("A3 has an entry")?;
     let busy: Vec<usize> = (0..4).filter(|&s| s != a_slot).collect();
     let (slot, cached) = spec.claim_slot(&mut model, &f, CHUNK, &busy)?;
     ensure!(slot == a_slot, "F took slot {slot}, not A's slot {a_slot}");
@@ -556,10 +562,11 @@ fn prefix_cache_entries(drafter: Option<&std::path::Path>) -> anyhow::Result<()>
     )?;
 
     // A reset of the slot drops its entry too.
-    let hit = spec
+    let slot = spec
         .prefix_lookup(&model, &conversations[0][2], CHUNK, &[])
+        .and_then(|h| h.slot)
         .context("A3 has an entry")?;
-    model.reset_slot(hit.slot)?;
+    model.reset_slot(slot)?;
     let (got, cached, path) = serve_alone(&mut model, &mut spec, &conversations[0][2])?;
     same(
         &format!("A3 alone after its slot was reset ({path})"),
@@ -569,6 +576,257 @@ fn prefix_cache_entries(drafter: Option<&std::path::Path>) -> anyhow::Result<()>
         0,
     )?;
     Ok(())
+}
+
+/// Bytes of host memory the host cache tests page-lock.
+const HOST_BYTES: usize = 2 << 30;
+/// The paths of [`serve_alone`] from no entry and from a host entry with the draft's state.
+const MISS: &str = "from position 0";
+const HOST: &str = "from host memory with the draft's state";
+
+/// The prefix cache's host tier (`Speculator::enable_host_cache`): with one device entry
+/// for two slots, every conversation loses its device entry to the next one, and must come
+/// back from host memory equal to a prefill from position 0: alone with the draft's state,
+/// batched without it, extended past its boundary, sharing chunks with a conversation of
+/// the same start, and through a batch of one whose rebuild then gives the host entry the
+/// draft's state. Most remainders after the restored boundary are shorter than the
+/// 1,024-slot window, where a stale ring would show.
+#[expect(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "one scenario, step by step, over the turns of named conversations"
+)]
+fn host_cache_matches_prefill(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let (_gpu, mut model, mut spec) = load(drafter, 2)?;
+    let capture = capture_tokens()?;
+    ensure!(
+        capture.len() >= 9000,
+        "the capture has {} tokens",
+        capture.len()
+    );
+    let a = &capture[..4500];
+    let a1 = &capture[..4900];
+    let a2 = &capture[..7000];
+    let a3 = &capture[..8500];
+    let a4 = &capture[..8700];
+    let b = &capture[1000..5600];
+    let b1 = &capture[1000..6000];
+    let c = &capture[3000..7600];
+    let c1 = &capture[3000..8000];
+    // `g` shares `a`'s first 4,300 tokens, so two chunks of its global caches.
+    let g: Vec<u32> = capture[..4300]
+        .iter()
+        .chain(&capture[6000..8000])
+        .copied()
+        .collect();
+    let g1: Vec<u32> = g.iter().chain(&capture[8000..8300]).copied().collect();
+
+    let mut alone = Vec::new();
+    for prompt in [a1, a2, a4, b1, &g1] {
+        alone.push(run(&mut model, &mut spec, prompt, false)?.0);
+    }
+    let [want_a1, want_a2, want_a4, want_b1, want_g1] =
+        alone.try_into().map_err(|_| anyhow::anyhow!("five runs"))?;
+    let mut batch = Vec::new();
+    for prompt in [a3, b1, c1] {
+        batch.push(batched_from_zero(&mut model, prompt)?);
+    }
+    let [batch_a3, batch_b1, batch_c1] = batch
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("three runs"))?;
+
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    let (chunks, chunk_bytes) = spec.enable_host_cache(&model, HOST_BYTES)?;
+    println!(
+        "host cache: {chunks} chunks of {} MiB, one device entry",
+        chunk_bytes >> 20
+    );
+    let notes = |spec: &mut Speculator| {
+        for line in spec.host_notes() {
+            println!("  {line}");
+        }
+    };
+    let alone_turn = |name: &str,
+                      model: &mut Model,
+                      spec: &mut Speculator,
+                      prompt: &[u32],
+                      want: Option<&Run>,
+                      cached: usize,
+                      path: &str|
+     -> anyhow::Result<()> {
+        let (got, from_cache, took) = serve_alone(model, spec, prompt)?;
+        notes(spec);
+        let name = format!("{name} alone ({took})");
+        ensure!(took == path, "{name}: expected the path {path}");
+        if let Some(want) = want {
+            same(&name, &got, want, from_cache, cached)?;
+        } else {
+            println!("{name}: {from_cache} cached");
+            ensure!(
+                from_cache == cached,
+                "{name}: {from_cache} cached, expected {cached}"
+            );
+        }
+        Ok(())
+    };
+    alone_turn("A", &mut model, &mut spec, a, None, 0, MISS)?;
+    // B takes the one device entry, so A lives only in host memory.
+    alone_turn("B", &mut model, &mut spec, b, None, 0, MISS)?;
+    // 804 tokens past the restored boundary.
+    alone_turn("A1", &mut model, &mut spec, a1, Some(&want_a1), 4096, HOST)?;
+    alone_turn("B1", &mut model, &mut spec, b1, Some(&want_b1), 4096, HOST)?;
+    // A2 prefills a chunk past A's boundary and saves a new entry, which shares A's two
+    // chunks and replaces A's entry.
+    alone_turn("A2", &mut model, &mut spec, a2, Some(&want_a2), 4096, HOST)?;
+    // G shares A2's first two chunks.
+    alone_turn("G", &mut model, &mut spec, &g, None, 0, MISS)?;
+    alone_turn("C", &mut model, &mut spec, c, None, 0, MISS)?;
+    alone_turn("G1", &mut model, &mut spec, &g1, Some(&want_g1), 6144, HOST)?;
+    alone_turn(
+        "A2 again",
+        &mut model,
+        &mut spec,
+        a2,
+        Some(&want_a2),
+        6144,
+        HOST,
+    )?;
+
+    // Batched requests restore without the draft's state; B1 and C1 each prefill fewer
+    // tokens than a window past their boundary.
+    let runs = serve_batch(&mut model, &mut spec, &[b1, c1])?;
+    notes(&mut spec);
+    same("B1 batched", &runs[0].0, &batch_b1, runs[0].2, 4096)?;
+    same("C1 batched", &runs[1].0, &batch_c1, runs[1].2, 4096)?;
+    // A3 restores A2 and saves its own entry from the batch, without the draft's state.
+    let runs = serve_batch(&mut model, &mut spec, &[a3])?;
+    notes(&mut spec);
+    same("A3 batched", &runs[0].0, &batch_a3, runs[0].2, 6144)?;
+    // B1 takes the device entry; A4 then finds A3's host entry without the draft's state,
+    // runs as a batch of one, and its rebuild gives the host entry the draft's state.
+    alone_turn("B1", &mut model, &mut spec, b1, Some(&want_b1), 4096, HOST)?;
+    alone_turn(
+        "A4",
+        &mut model,
+        &mut spec,
+        a4,
+        Some(&want_a4),
+        8192,
+        "from host memory as a batch of one, rebuild",
+    )?;
+    alone_turn("B1", &mut model, &mut spec, b1, Some(&want_b1), 4096, HOST)?;
+    alone_turn(
+        "A4 again",
+        &mut model,
+        &mut spec,
+        a4,
+        Some(&want_a4),
+        8192,
+        HOST,
+    )?;
+    Ok(())
+}
+
+/// The host tier through disk (`Speculator::save_host_cache`, `load_host_cache`): entries
+/// saved to files and read back into a new host tier, with every slot reset, restore as a
+/// prefill from position 0 would, with 804 and 904 tokens past their boundaries. A
+/// manifest of another identity is discarded with its files, and a directory without a
+/// manifest, as a save that stopped midway leaves it, loads nothing.
+fn host_cache_round_trips(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
+    use siphon_cuda::spec::DiskLoaded;
+
+    let (_gpu, mut model, mut spec) = load(drafter, 2)?;
+    let capture = capture_tokens()?;
+    let (a, a1) = (&capture[..4500], &capture[..4900]);
+    let (b, b1) = (&capture[1000..5600], &capture[1000..6000]);
+    let want_a = run(&mut model, &mut spec, a1, false)?.0;
+    let want_b = run(&mut model, &mut spec, b1, false)?.0;
+    let dir = env::temp_dir().join(format!("siphon-host-cache-test-{}", std::process::id()));
+    let identity = serde_json::json!({"test": "host cache round trip"});
+
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    spec.enable_host_cache(&model, HOST_BYTES)?;
+    serve_alone(&mut model, &mut spec, a)?;
+    serve_alone(&mut model, &mut spec, b)?;
+    let saved = spec.save_host_cache(&model, &dir, &identity)?;
+    println!("saved {saved:?}");
+    ensure!(saved.entries == 2, "saved {} entries, not 2", saved.entries);
+
+    // A new process in all but name: a new cache, and no slot holds anything.
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    spec.enable_host_cache(&model, HOST_BYTES)?;
+    for slot in 0..model.slots() {
+        model.reset_slot(slot)?;
+    }
+    let loaded = spec.load_host_cache(&dir, &identity)?;
+    println!("loaded {loaded:?}");
+    ensure!(
+        matches!(
+            loaded,
+            DiskLoaded::Loaded {
+                entries: 2,
+                skipped: 0,
+                ..
+            }
+        ),
+        "loaded {loaded:?}"
+    );
+    for (name, prompt, want) in [("A1", a1, &want_a), ("B1", b1, &want_b)] {
+        let (got, cached, path) = serve_alone(&mut model, &mut spec, prompt)?;
+        ensure!(path == HOST, "{name} took the path {path}");
+        same(&format!("{name} after a restart"), &got, want, cached, 4096)?;
+    }
+
+    // Another identity: the directory goes.
+    spec.save_host_cache(&model, &dir, &identity)?;
+    let other = serde_json::json!({"test": "another checkpoint"});
+    let loaded = spec.load_host_cache(&dir, &other)?;
+    println!("with another identity: {loaded:?}");
+    ensure!(matches!(loaded, DiskLoaded::Discarded(_)), "{loaded:?}");
+    let left = fs::read_dir(&dir)?.count();
+    ensure!(left == 0, "{left} files left after the discard");
+    let loaded = spec.load_host_cache(&dir, &identity)?;
+    ensure!(matches!(loaded, DiskLoaded::Missing), "{loaded:?}");
+
+    // A save that stopped before its manifest loads nothing.
+    spec.save_host_cache(&model, &dir, &identity)?;
+    fs::remove_file(dir.join("manifest.json"))?;
+    let loaded = spec.load_host_cache(&dir, &identity)?;
+    ensure!(matches!(loaded, DiskLoaded::Missing), "{loaded:?}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_round_trips_bundled() -> anyhow::Result<()> {
+    host_cache_round_trips(None)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_round_trips_dflash2() -> anyhow::Result<()> {
+    let Some(dir) = env::var_os("SIPHON_DFLASH2") else {
+        println!("SIPHON_DFLASH2 is not set; skipped");
+        return Ok(());
+    };
+    host_cache_round_trips(Some(std::path::Path::new(&dir)))
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_matches_prefill_bundled() -> anyhow::Result<()> {
+    host_cache_matches_prefill(None)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_matches_prefill_dflash2() -> anyhow::Result<()> {
+    let Some(dir) = env::var_os("SIPHON_DFLASH2") else {
+        println!("SIPHON_DFLASH2 is not set; skipped");
+        return Ok(());
+    };
+    host_cache_matches_prefill(Some(std::path::Path::new(&dir)))
 }
 
 #[test]

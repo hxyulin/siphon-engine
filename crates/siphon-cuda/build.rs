@@ -1,4 +1,5 @@
-//! Compiles every `kernels/*.cu` file to a cubin in `OUT_DIR`.
+//! Compiles every `kernels/*.cu` file to a cubin in `OUT_DIR`, and hashes the cubins into
+//! `SIPHON_KERNELS_HASH`, which the prefix cache's saved files record.
 //!
 //! Only runs when targeting Linux. Finds `nvcc` through `NVCC`, then `CUDA_HOME`,
 //! then `PATH`. `SIPHON_CUDA_ARCH` overrides the default `sm_120a` target.
@@ -13,6 +14,7 @@ fn main() {
     let arch = env::var("SIPHON_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".to_owned());
     println!("cargo::rustc-env=SIPHON_CUDA_ARCH={arch}");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!("cargo::rustc-env=SIPHON_KERNELS_HASH=none");
         return;
     }
 
@@ -30,6 +32,13 @@ fn main() {
         .collect();
     sources.sort();
 
+    // FNV-1a over every cubin's name and bytes.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fnv = |bytes: &[u8]| {
+        for &b in bytes {
+            hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
     for source in sources {
         let stem = source
             .file_stem()
@@ -48,5 +57,8 @@ fn main() {
                 panic!("running {}: {err}; set NVCC or CUDA_HOME", nvcc.display())
             });
         assert!(status.success(), "nvcc failed on {}", source.display());
+        fnv(stem.as_encoded_bytes());
+        fnv(&fs::read(&cubin).expect("nvcc wrote the cubin"));
     }
+    println!("cargo::rustc-env=SIPHON_KERNELS_HASH={hash:016x}");
 }

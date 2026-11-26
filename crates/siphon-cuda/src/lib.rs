@@ -13,3 +13,7 @@ pub mod spec;
 pub mod weights;
 
 pub use gpu::{DeviceIn, DeviceOut, Gpu, MemoryUse};
+
+/// A hash of the kernels this build compiled, which changes whenever any kernel's code
+/// does. The prefix cache's files on disk record it.
+pub const KERNELS_HASH: &str = env!("SIPHON_KERNELS_HASH");

@@ -39,7 +39,7 @@ pub use crate::ops::spec::BATCH_ROWS;
 /// A sequence slot besides slot 0: its caches and position.
 #[derive(Debug)]
 pub(super) struct Slot {
-    visits: Vec<VisitState>,
+    pub(super) visits: Vec<VisitState>,
     position: usize,
     /// The slot's [`Model::slot_sequence`], swapped with slot 0's while the slot stands in
     /// for it ([`Model::with_slot`]).
@@ -161,7 +161,7 @@ impl Model {
         if slot == 0 {
             return Ok(self.sequence);
         }
-        Ok(self.slot(slot)?.sequence)
+        Ok(self.slot_state(slot)?.sequence)
     }
 
     /// Position of the next token of slot `slot`.
@@ -169,10 +169,10 @@ impl Model {
         if slot == 0 {
             return Ok(self.position);
         }
-        Ok(self.slot(slot)?.position)
+        Ok(self.slot_state(slot)?.position)
     }
 
-    fn slot(&self, slot: usize) -> anyhow::Result<&Slot> {
+    pub(super) fn slot_state(&self, slot: usize) -> anyhow::Result<&Slot> {
         slot.checked_sub(1)
             .and_then(|i| self.slots.get(i))
             .with_context(|| format!("no slot {slot}; the model has {}", self.slots()))
@@ -189,7 +189,7 @@ impl Model {
         if slot == 0 {
             return f(self);
         }
-        self.slot(slot)?;
+        self.slot_state(slot)?;
         let swap = |m: &mut Self| {
             let s = &mut m.slots[slot - 1];
             std::mem::swap(&mut m.visits, &mut s.visits);

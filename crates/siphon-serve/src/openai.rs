@@ -125,7 +125,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .layer(DefaultBodyLimit::max(body_limit))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize))
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         .route("/metrics", get(metrics_route))
         .route(
             "/version",
@@ -134,19 +134,56 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+/// `ok`, or a 503 once the server drains, so that the proxy in front stops sending
+/// requests here.
+async fn health(State(app): State<Arc<App>>) -> Response {
+    if app.engine.draining() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+    }
+    "ok".into_response()
+}
+
 /// An OpenAI-style error response.
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
     pub(crate) message: String,
+    /// Seconds for a `Retry-After` header.
+    pub(crate) retry_after: Option<u32>,
 }
+
+/// Seconds a client waits before it retries a request that a draining server refused. The
+/// proxy in front sends the retry to the server that replaces this one.
+const DRAIN_RETRY_AFTER: u32 = 1;
 
 impl ApiError {
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    /// A 503 with `Retry-After` for a request that arrives while the server drains.
+    pub(crate) fn draining() -> Self {
+        Self {
+            retry_after: Some(DRAIN_RETRY_AFTER),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the server is shutting down, retry",
+            )
+        }
+    }
+
+    /// `response` with this error's `Retry-After` header, if it has one.
+    pub(crate) fn with_retry_after(&self, mut response: Response) -> Response {
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(seconds));
+        }
+        response
     }
 
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
@@ -180,7 +217,7 @@ impl IntoResponse for ApiError {
         };
         let body =
             json!({"error": {"message": self.message, "type": kind, "param": null, "code": code}});
-        (self.status, Json(body)).into_response()
+        self.with_retry_after((self.status, Json(body)).into_response())
     }
 }
 
@@ -531,6 +568,7 @@ pub(crate) fn submit_choices(
             StatusCode::SERVICE_UNAVAILABLE,
             "the request queue is full, retry later",
         ),
+        Refused::Draining => ApiError::draining(),
         Refused::Stopped => ApiError::internal("the engine has stopped"),
     })?;
     // The prompt counts once in the metrics, with the first choice.

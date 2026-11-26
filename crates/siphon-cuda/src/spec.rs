@@ -45,8 +45,10 @@ use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView, sys::CUevent_fl
 use half::bf16;
 use siphon::Checkpoint;
 
+mod host;
 mod prefix;
 
+pub use host::{DISK_FORMAT, DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS};
 use prefix::PrefixCache;
 pub use prefix::PrefixHit;
 
@@ -680,6 +682,7 @@ impl Speculator {
         chunk: usize,
         entry: Option<usize>,
     ) -> anyhow::Result<u32> {
+        self.fence_host()?;
         // The draft's global caches now take another sequence.
         self.draft_sequence += 1;
         self.start_prompt(model, prompt)?;
@@ -895,6 +898,7 @@ impl Speculator {
         let chunk = self.prefill_chunk;
         // Before the slots swap places in `with_slot`.
         let entry = self.entry_starting(model, from, tokens, chunk);
+        self.fence_host()?;
         model.reset_slot(slot)?;
         model.with_slot(slot, |m| self.prefill_saving(m, tokens, chunk, entry))?;
         self.batched = Some(Batched {

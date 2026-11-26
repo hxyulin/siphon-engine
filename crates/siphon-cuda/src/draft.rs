@@ -34,6 +34,7 @@ use siphon::TextConfig;
 
 use crate::{
     DeviceIn,
+    model::{DeviceSpan, GlobalKv},
     ops::spec::TapLayout,
     ops::{
         draft::{
@@ -275,6 +276,22 @@ pub struct DraftRings {
 }
 
 impl DraftRings {
+    /// Each ring layer's keys and values, in the order of [`Draft::ring_spans`]. Copies
+    /// into these buffers change the rings, whose committed position
+    /// [`Self::set_committed`] then gives.
+    pub(crate) fn spans(&self, stream: &CudaStream) -> Vec<DeviceSpan> {
+        self.caches
+            .iter()
+            .flatten()
+            .flat_map(|c| [DeviceSpan::of(&c.k, stream), DeviceSpan::of(&c.v, stream)])
+            .collect()
+    }
+
+    /// Makes `committed` the committed position of copies that [`Self::spans`] filled.
+    pub(crate) fn set_committed(&mut self, committed: usize) {
+        self.committed = committed;
+    }
+
     /// Device bytes the copies take.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -1052,6 +1069,52 @@ impl Draft {
     #[must_use]
     pub fn has_global_layers(&self) -> bool {
         self.caches.iter().any(|c| c.slots >= self.capacity)
+    }
+
+    /// The sliding rings' keys and values, in the order of [`DraftRings::spans`].
+    pub(crate) fn ring_spans(&self, stream: &CudaStream) -> Vec<DeviceSpan> {
+        self.caches
+            .iter()
+            .filter(|c| c.slots < self.capacity)
+            .flat_map(|c| [DeviceSpan::of(&c.k, stream), DeviceSpan::of(&c.v, stream)])
+            .collect()
+    }
+
+    /// The global layers' caches, none for a draft of rings alone such as DFlash 2.
+    pub(crate) fn global_kv(&self, stream: &CudaStream) -> GlobalKv {
+        let globals: Vec<&KvCache> = self
+            .caches
+            .iter()
+            .filter(|c| c.slots >= self.capacity)
+            .collect();
+        GlobalKv {
+            caches: globals
+                .iter()
+                .flat_map(|c| {
+                    [
+                        DeviceSpan::of(&c.k, stream).ptr,
+                        DeviceSpan::of(&c.v, stream).ptr,
+                    ]
+                })
+                .collect(),
+            position_bytes: globals
+                .first()
+                .map_or(0, |c| KV_WIDTH * if c.fp8 { 1 } else { 2 }),
+            capacity: self.capacity,
+        }
+    }
+
+    /// Takes every position below `committed` as committed, once the global layers hold
+    /// them and the sliding rings hold the state at `committed`, copied from elsewhere
+    /// (the prefix cache's host tier). A commit must come before the next round, as after
+    /// [`Self::restore_rings`].
+    pub(crate) fn set_loaded(&mut self, committed: usize) -> anyhow::Result<()> {
+        ensure!(
+            committed <= self.capacity,
+            "the draft's cache cannot hold position {committed}"
+        );
+        self.committed = committed;
+        Ok(())
     }
 
     /// Allocates a [`DraftRings`] for the sliding rings, holding nothing yet.

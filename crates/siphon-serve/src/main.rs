@@ -28,7 +28,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
-                     [--prefill-attention auto|bf16|fp8] [--greedy]
+                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] [--greedy]
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
@@ -52,6 +52,19 @@ their last multiple of --prefill-chunk tokens, one per stream, and a request who
 one of them prefills only the rest. Each entry costs about 0.17 GiB, 0.2 GiB with DFlash 2,
 whatever the context. --prefix-cache-entries keeps fewer entries than --streams, to leave
 more memory for the context. --prefix-cache-ttl drops an entry unused for that many seconds.
+--host-cache keeps entries in that many GiB of page-locked host memory too (0, the default,
+for none), global KV cache included, so a conversation whose stream another request took
+restores over PCIe instead of prefilling again. The memory is allocated at startup. An
+entry takes 16 KiB per token with the FP8 KV cache (32 KiB with BF16), plus the bundled
+draft's 2 KiB, plus 0.2 GiB; conversations that share a prefix share its memory, and the
+least recently used entries go when it is full.
+--cache-dir saves the host cache's entries to DIR when the server stops, with the
+conversations the streams hold, and loads them back at startup, so that the first turn after
+a restart restores instead of prefilling. It needs --host-cache. A directory saved with
+another checkpoint, drafter, format, draft or build of the kernels is discarded.
+On SIGTERM or Ctrl-C the server drains: it answers new requests with 503 and Retry-After,
+/health turns 503, and it finishes the running and queued requests. After --drain-timeout
+seconds it ends what is left with an error. Then it saves --cache-dir and exits.
 --prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
@@ -73,8 +86,11 @@ struct Args {
     address: SocketAddr,
     name: String,
     engine: engine::Options,
+    /// How long a drain waits for the running and queued requests.
+    drain_timeout: std::time::Duration,
 }
 
+#[expect(clippy::too_many_lines, reason = "one match arm per flag")]
 fn args() -> anyhow::Result<Args> {
     let mut model_dir = None;
     let mut host = "127.0.0.1".to_owned();
@@ -95,6 +111,9 @@ fn args() -> anyhow::Result<Args> {
     let mut prefix_cache = true;
     let mut prefix_entries = None;
     let mut prefix_ttl = 600;
+    let mut host_cache = 0;
+    let mut cache_dir = None;
+    let mut drain_timeout = 600;
     let mut prefill_attention = "auto".to_owned();
     let mut greedy = false;
     let mut it = env::args().skip(1);
@@ -124,6 +143,9 @@ fn args() -> anyhow::Result<Args> {
             "--no-prefix-cache" => prefix_cache = false,
             "--prefix-cache-entries" => prefix_entries = Some(value()?.parse()?),
             "--prefix-cache-ttl" => prefix_ttl = value()?.parse()?,
+            "--host-cache" => host_cache = gib_bytes(&value()?, "--host-cache", true)?,
+            "--cache-dir" => cache_dir = Some(PathBuf::from(value()?)),
+            "--drain-timeout" => drain_timeout = value()?.parse()?,
             "--prefill-attention" => prefill_attention = value()?,
             "--greedy" => greedy = true,
             "--widths" => {
@@ -169,12 +191,15 @@ fn args() -> anyhow::Result<Args> {
                 0
             },
             prefix_ttl: std::time::Duration::from_secs(prefix_ttl),
+            host_cache,
+            cache_dir,
             prefill_attention,
             greedy,
         },
         model_dir,
         address,
         name,
+        drain_timeout: std::time::Duration::from_secs(drain_timeout),
     })
 }
 
@@ -208,6 +233,69 @@ fn entries(entries: Option<usize>, streams: usize) -> anyhow::Result<usize> {
         "--prefix-cache-entries takes 1 to --streams, {streams}"
     );
     Ok(entries)
+}
+
+/// Waits for SIGTERM or Ctrl-C.
+async fn stop_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = ctrl_c.await;
+}
+
+/// Drains the engine before the server stops: refuses new requests, waits up to `timeout`
+/// for the running and queued ones, cancels what is left, then stops the engine, which
+/// saves the host cache to `--cache-dir`. Logs each step.
+async fn drain(engine: engine::Engine, timeout: std::time::Duration) {
+    engine.drain();
+    let started = std::time::Instant::now();
+    let (running, waiting) = engine.counts();
+    eprintln!(
+        "draining: refusing new requests, finishing {running} running and {waiting} queued \
+         within {} s",
+        timeout.as_secs()
+    );
+    let busy = |e: &engine::Engine| {
+        let (r, w) = e.counts();
+        r + w > 0
+    };
+    while busy(&engine) && started.elapsed() < timeout {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (left_running, left_waiting) = engine.counts();
+    if left_running + left_waiting > 0 {
+        engine.cancel();
+        eprintln!(
+            "drain: cut {left_running} running and {left_waiting} queued requests after {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        while busy(&engine) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    eprintln!(
+        "drain: finished {} requests in {:.1} s",
+        (running + waiting).saturating_sub(left_running + left_waiting),
+        started.elapsed().as_secs_f64()
+    );
+    match tokio::task::spawn_blocking(move || engine.stop()).await {
+        Ok(report) => eprintln!("{report}"),
+        Err(e) => eprintln!("stopping the engine failed: {e}"),
+    }
 }
 
 fn fp8(format: &str) -> anyhow::Result<bool> {
@@ -271,9 +359,11 @@ fn run() -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding {}", args.address))?;
         eprintln!("serving {} on http://{}", app.name, args.address);
+        let engine = app.engine.clone();
         axum::serve(listener, openai::router(app))
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
+            .with_graceful_shutdown(async move {
+                stop_signal().await;
+                drain(engine, args.drain_timeout).await;
             })
             .await
             .context("serving")
