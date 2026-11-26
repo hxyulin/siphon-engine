@@ -14,6 +14,7 @@ pub mod norm;
 pub mod routing;
 pub mod sample;
 pub mod spec;
+pub mod vision;
 
 use std::{fmt, str::FromStr};
 

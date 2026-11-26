@@ -10,6 +10,7 @@ mod gpu;
 pub mod model;
 pub mod ops;
 pub mod spec;
+pub mod vision;
 pub mod weights;
 
 pub use gpu::{DeviceIn, DeviceOut, Gpu, MemoryUse};

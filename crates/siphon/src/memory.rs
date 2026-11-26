@@ -16,7 +16,7 @@ use std::{fmt, path::Path};
 use anyhow::{Context as _, ensure};
 use safetensors::Dtype;
 
-use crate::{Checkpoint, KvFormat, TextConfig, WeightFormat};
+use crate::{Checkpoint, KvFormat, TextConfig, VisionFormat, WeightFormat};
 
 /// Device memory the CUDA context takes, rounded up: 507 MiB on an RTX 5090 with driver
 /// 620, measured as `nvidia-smi`'s free memory before `siphon-serve` started less the free
@@ -733,6 +733,56 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
         bytes += 2 * COMMIT_ROWS * hidden * 2;
     }
     bytes
+}
+
+/// The vision tower's width, layers, MLP width, values per patch, position-table rows,
+/// projector width and output width, which `siphon_cuda::vision` checks at load.
+pub const VISION_DIM: usize = 1024;
+pub const VISION_LAYERS: usize = 23;
+pub const VISION_MLP: usize = 4096;
+pub const VISION_PATCH_VALUES: usize = 1200;
+pub const VISION_POSITIONS: usize = 32 * 32;
+pub const VISION_PROJECTION: usize = 4096;
+pub const VISION_OUT: usize = 2304;
+
+/// Device bytes of the vision tower with its linear layers in `format`: the weights, plus
+/// the buffers of one image of up to `max_patches` 20-pixel patches and its output
+/// embeddings. The buffers live from the first encode (or `VisionTower::reserve`) until
+/// `VisionTower::release`; the output lives as long as the caller keeps it.
+#[must_use]
+pub fn vision_bytes(format: VisionFormat, max_patches: usize) -> usize {
+    vision_weight_bytes(format) + vision_buffer_bytes(format, max_patches)
+}
+
+/// Device bytes of the vision tower's weights in `format`.
+#[must_use]
+pub fn vision_weight_bytes(format: VisionFormat) -> usize {
+    let (d, mlp) = (VISION_DIM, VISION_MLP);
+    let matrix = |rows: usize, k: usize| match format {
+        VisionFormat::Bf16 => 2 * rows * k,
+    };
+    let layer = 4 * matrix(d, d) + matrix(mlp, d) + matrix(d, mlp) + 2 * (11 * d + mlp);
+    let embeddings = 2 * (d * VISION_PATCH_VALUES + VISION_POSITIONS * d + 4 * d);
+    let projector = matrix(VISION_PROJECTION, 4 * d) + matrix(VISION_OUT, VISION_PROJECTION);
+    embeddings + VISION_LAYERS * layer + projector
+}
+
+/// Device bytes of the vision tower's buffers for images of up to `max_patches` patches,
+/// the output embeddings of one image included.
+#[must_use]
+pub fn vision_buffer_bytes(format: VisionFormat, max_patches: usize) -> usize {
+    if max_patches == 0 {
+        return 0;
+    }
+    let rows = max_patches + 1;
+    let d = VISION_DIM;
+    // The F32 residual stream, the BF16 product inputs and outputs, and the wide scratch
+    // that holds q, k and v, the MLP's hidden rows and, first, the patches.
+    let rows_bytes = match format {
+        VisionFormat::Bf16 => rows * d * (4 + 2) + rows * VISION_MLP * 2,
+    };
+    let output = max_patches / 4 * VISION_OUT * 2;
+    rows_bytes + output
 }
 
 #[cfg(test)]

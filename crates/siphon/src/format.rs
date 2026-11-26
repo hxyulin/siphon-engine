@@ -78,3 +78,31 @@ impl fmt::Display for KvFormat {
         })
     }
 }
+
+/// The format of the vision tower's linear layers. Only BF16: FP8 weights with MXFP8
+/// activations changed the model's answers (see docs/vision.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VisionFormat {
+    /// The checkpoint's BF16 weights.
+    #[default]
+    Bf16,
+}
+
+impl FromStr for VisionFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "bf16" => Ok(Self::Bf16),
+            _ => bail!("unknown vision format {s:?}; expected bf16"),
+        }
+    }
+}
+
+impl fmt::Display for VisionFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bf16 => "bf16",
+        })
+    }
+}

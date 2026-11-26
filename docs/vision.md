@@ -169,6 +169,92 @@ What the drift does to the text model: mlx-vlm's text model run twice over the s
 
 The next token after the prompt is the same in every case. An engine's image features compared the same way should give KLs of this size or smaller.
 
+## GPU encoder
+
+`siphon_cuda::vision::VisionTower` runs the encoder, the merge and the projector on the GPU. `VisionTower::load(&gpu, &checkpoint, VisionFormat::Bf16)` uploads `model.visual.*`; BF16 is the only format (see [FP8, tried and removed](#fp8-tried-and-removed)). `encode(&PreparedImage)` enqueues one image on the model's stream and returns its embeddings, BF16 `[tokens, 2304]`, ready to overwrite the placeholder rows.
+
+Each step and what runs it (kernels in `crates/siphon-cuda/kernels/vision.cu`):
+
+| Step | Kernel |
+| --- | --- |
+| Patches to BF16, patch embedding | `vision_f32_to_bf16`, the BF16 tensor-core GEMM (`Linear::gemm_bf16`) |
+| Position resampling, class token, `ln_pre` | `vision_embed` |
+| `ln_1`, `ln_2`, residual adds with layer scale | `vision_residual_norm`, one launch per norm, with the previous product's bias and residual add fused in |
+| q, k, v and out projections, `c_fc`, `c_proj`, `proj_in`, `proj_out` | the BF16 GEMM, q, k and v in one launch |
+| q and k biases, 2-D RoPE, the 1/8 scale | `vision_qkv_rope` |
+| Bidirectional attention | `vision_attention`: flash style, 64 query rows of one head per block, key tiles of 64 through shared memory, `mma.sync` m16n8k16 |
+| `c_fc` bias and GELU, the projector's GELU | `vision_gelu` |
+
+The residual stream stays in F32 between layers, where the references round it to BF16. Every product reads and writes BF16 with F32 sums, and attention rounds its probabilities to BF16 before multiplying with the values. Attention memory is linear in the sequence: it reads q, k and v from the `[rows, 1024]` buffers and keeps the running softmax in registers. The merge needs no copy: after the last layer, `vision_residual_norm` writes the F32 rows back to BF16, and rows 1 onward are already the projector's `[tokens, 4096]` input.
+
+### Memory
+
+`siphon::memory::vision_bytes(format, max_patches)` gives the tower's device bytes: the weights (`vision_weight_bytes`) plus the buffers for images of up to `max_patches` patches and one output (`vision_buffer_bytes`). The buffers are 14,336 bytes per encoder row (F32 residual, BF16 product rows, and a `[rows, 4096]` scratch that holds the patches first, then q, k and v, then the MLP's hidden rows), plus 1,152 bytes of output per patch. Both functions equal the allocations measured on an RTX 5090 to the byte.
+
+| | BF16 | FP8 (removed) |
+| --- | ---: | ---: |
+| Weights | 0.593 GiB | 0.300 GiB |
+| Buffers, 1920 x 1080 (5,184 patches) | 0.075 GiB | 0.095 GiB |
+| Buffers, 2048 x 2048 (10,816 patches) | 0.156 GiB | 0.199 GiB |
+
+The buffers are allocated by the first `encode` or by `VisionTower::reserve(max_patches)`, grow when a larger image comes, and stay until `VisionTower::release`. The output is a new allocation per call that lives as long as the caller keeps it.
+
+### Accuracy
+
+Relative RMS error of the projected embeddings against Transformers in F32, and the lowest cosine similarity of one row, on the six fixture images. `tests/vision.rs` (`tower_matches_transformers`) prints these:
+
+| Image | BF16 | BF16, lowest row | mlx-vlm BF16 | mlx-vlm, lowest row | FP8 (removed) | FP8, lowest row |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tiny` | 1.2% | 0.9999 | 1.9% | 0.9998 | 9.6% | 0.995 |
+| `alpha` | 2.6% | 0.995 | 3.9% | 0.992 | 15.2% | 0.918 |
+| `tall` | 2.5% | 0.993 | 4.5% | 0.971 | 13.8% | 0.798 |
+| `square` | 3.3% | 0.986 | 4.5% | 0.986 | 15.1% | 0.856 |
+| `screenshot` | 4.9% | 0.889 | 6.3% | 0.633 | 19.0% | 0.477 |
+| `huge` | 2.9% | 0.942 | 3.9% | 0.932 | 14.7% | 0.609 |
+
+The BF16 tower is closer to F32 than mlx-vlm in BF16 on every image, which the F32 residual stream explains.
+
+### Effect on the text model
+
+`reference/vision_text.py` feeds each image's embeddings through mlx-vlm's text model with the capture's chat prompt and compares the result with the run that used Transformers' F32 projection. The F32 run generates 160 greedy tokens. Every other run is teacher-forced over the same tokens for the KL, taken over the 172 rows after the image's last placeholder (the rest of the prompt and the generated rows), and also generates its own 160 greedy tokens. "Greedy" counts the first 24 tokens that equal the F32 run's. The first generated token agreed with F32 for every image and encoder.
+
+```sh
+cargo run --release -p siphon-cuda --bin vision -- <model-dir> --dump <capture-dir> <siphon-dir>
+uv run --script reference/vision_text.py <model-dir> <capture-dir> <siphon-dir> results.json --tokens 160
+```
+
+| Image | mlx-vlm BF16: mean KL, max KL, greedy | Siphon BF16 | Siphon FP8 (removed) |
+| --- | --- | --- | --- |
+| `tiny` | 6.9e-3, 0.91, 24 | 6.9e-3, 0.92, 24 | 1.6e-2, 1.11, 24 |
+| `alpha` | 4.3e-3, 0.23, 24 | 7.4e-3, 0.58, 24 | 8.8e-3, 0.14, 24 |
+| `tall` | 3.0e-3, 0.06, 24 | 3.4e-3, 0.10, 24 | 9.6e-3, 0.41, 24 |
+| `square` | 3.7e-3, 0.06, 22 | 8.8e-3, 0.75, 24 | 2.0e-2, 1.84, 22 |
+| `screenshot` | 1.2e-2, 0.65, 24 | 2.1e-2, 1.26, 24 | 1.1e-2, 0.15, 24 |
+| `huge` | 2.4e-2, 1.48, 19 | 2.1e-2, 0.68, 24 | 4.3e-2, 2.80, 19 |
+
+Siphon's BF16 tower keeps all 24 greedy tokens on every image, and its replies describe the same content as the F32 run's: the 15 labeled bands, the six circles and the banner text, the editor showing `crates/siphon/src/config.rs` and its `TextConfig` struct, the README with colored blocks. Its KL is the same size as mlx-vlm's BF16, higher on four images and lower on two, although its embeddings are closer to F32: single rows near a decision flip either way. FP8's KL is about twice the BF16 tower's on five images. It leaves the greedy path within 24 tokens on `square` and `huge`, and on `alpha` its reply drops the black vertical strip that every other run mentions and calls the gray dotted circle black and white.
+
+### Speed
+
+`cargo run --release -p siphon-cuda --bin vision -- <model-dir>` times synthetic images padded to multiples of 40 pixels, the median of 20 encodes after a warm-up, measured from enqueue to stream synchronize, on an RTX 5090 with no other compute process:
+
+| Image | Patches | Tokens | BF16 | FP8 (removed) |
+| --- | ---: | ---: | ---: | ---: |
+| 512 x 512 | 676 | 169 | 4.27 ms | 2.97 ms |
+| 1024 x 1024 | 2,704 | 676 | 15.12 ms | 10.05 ms |
+| 1920 x 1080 | 5,184 | 1,296 | 30.86 ms | 22.52 ms |
+| 2048 x 2048 | 10,816 | 2,704 | 90.74 ms | 74.23 ms |
+
+At 1920 x 1080 the encoder does about 3.0 TFLOP of products and 2.5 TFLOP of attention, so BF16 runs at about 180 TFLOP/s. At 2048 x 2048 attention grows to 11 TFLOP of the 17, and the time grows 2.9 times for 2.1 times the patches.
+
+### FP8, tried and removed
+
+An FP8 format quantized every linear layer but the patch embedding to E4M3 with one F32 scale per row and multiplied it on sm_120's block-scaled FP8 tensor cores (`LinearFp8::gemm`), with each product's input quantized to MXFP8 (E4M3 with one power-of-two scale per 32 values). It halved the weights to 0.300 GiB and took 22.5 instead of 30.9 ms at 1920 x 1080, but its embeddings landed 10 to 19% (relative RMS) from F32, three to five times mlx-vlm's BF16, and it changed the model's answers: the `FP8 (removed)` columns above. It was removed. FP8 weights with BF16 activations would need a new GEMM and were not tried.
+
+### Other GPUs
+
+`vision.cu` uses only `mma.sync`, `ldmatrix` and `cp.async`, which sm_80 and later have, so it builds for sm_89. One dependency does not: `Linear::load` requires thread-block clusters, which the BF16 GEMM uses to split k when its tiles cannot fill the GPU. The tower runs on sm_89 once that GEMM runs without clusters.
+
 ## Open questions
 
 - **Alpha.** The image processor composites transparency onto a checkerboard, but both references' file loaders drop alpha first. Which one the model saw in training is not stated. The engine follows the processor.
