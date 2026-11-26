@@ -94,6 +94,9 @@ const _: () = assert!(ROWS_MAX * HEADS * ROWS_PARTS == siphon::memory::ROWS_ATTE
 /// Blocks per KV head of `attention_rows_*`: the 32 split blocks and two for the rows' 8
 /// nearest keys, 4 rows each.
 const ROWS_BLOCKS: u32 = 34;
+/// Split blocks per KV head of `attention_rows_*`, and the slots of each split.
+const ROWS_SPLIT_BLOCKS: u32 = 32;
+const ROWS_SPLIT_SLOTS: u32 = 64;
 /// Most 8-column tiles of query rows: 3 heads x 8 rows.
 const ROWS_QUERY_TILES: usize = 3;
 /// Threads per block of `attention_rows_*`.
@@ -1051,8 +1054,13 @@ impl Attention {
             .u32(window)
             .u32(extent)
             .f32(SCALE);
+        // Only the split blocks whose first split can hold a live slot, and the recent block
+        // of row 0: a 1,024-slot ring needs 16 of the 32 split blocks. The rest would write
+        // empty partials, so this changes no result.
+        let split_blocks = slots.div_ceil(ROWS_SPLIT_SLOTS).clamp(1, ROWS_SPLIT_BLOCKS);
+        args.i32(split_blocks.cast_signed());
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS, u32::try_from(rows)?),
+            grid_dim: (KV_HEADS as u32, split_blocks + 1, u32::try_from(rows)?),
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
@@ -1060,13 +1068,14 @@ impl Attention {
         // const bf16* v_new, const unsigned long long* states, const bf16* bias, const bf16*
         // sinks, float* partial_out, float* partial_max, float* partial_sum, unsigned*
         // counters, bf16* out, const bf16* gate, const unsigned* positions, unsigned slots,
-        // unsigned window, unsigned extent, float scale)`, or `attention_batch_fp8`. Grid z
-        // index r runs attention_rows' one-row kernel for row r on the caches of words 0 and
-        // 1 of its state table, which the caller keeps live caches of `like`'s format and
-        // slots that hold the row's position; the row takes the scratch's partials of query
-        // rows 24 r .. 24 r + 23 and counters 16 r .. 16 r + 15, within the scratch's rows.
-        // Before `pdl_wait` it reads only the table, the positions and the caches, which the
-        // host writes before the step and no kernel of the step writes before this one.
+        // unsigned window, unsigned extent, float scale, int split_blocks)`, or
+        // `attention_batch_fp8` or `attention_batch_fp4`. split_blocks covers every slot of the
+        // caches. Grid z index r runs attention_rows' one-row kernel for row r on the caches of
+        // words 0 and 1 of its state table, which the caller keeps live caches of `like`'s
+        // format and slots that hold the row's position; the row takes the scratch's partials
+        // of query rows 24 r .. 24 r + 23 and counters 16 r .. 16 r + 15, within the scratch's
+        // rows. Before `pdl_wait` it reads only the table, the positions and the caches, which
+        // the host writes before the step and no kernel of the step writes before this one.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
