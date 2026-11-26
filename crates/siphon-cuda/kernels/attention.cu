@@ -2845,12 +2845,12 @@ struct RowsMerge {
 static_assert(sizeof(RowsMerge) <= sizeof(RowsShared<Bf16Format>));
 
 // What a combining block keeps in shared memory: its arrival order among the KV head's
-// blocks, and the rescale factor of every partial and the combined sum of each of its
-// query rows.
+// blocks, and the rescale factor of every partial and the combined sum of up to kRowsWarps
+// query rows at once.
 constexpr int kRowsCombineQueries = 1;
 struct RowsCombine {
-    float factor[kRowsCombineQueries][kRowsParts];
-    float total[kRowsCombineQueries];
+    float factor[kRowsWarps][kRowsParts];
+    float total[kRowsWarps];
     unsigned arrival;
 };
 
@@ -3195,154 +3195,46 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
     const int lane = threadIdx.x % 32;
     const int queries = kGroup * rows;
     const int d = threadIdx.x;
-    if constexpr (kSingleCombiner) {
-        // Single-block combine for batched multi-row verify: one query row per iteration,
-        // same arithmetic as below, no spin-wait on sibling blocks.
-        for (int qi = 0; qi < queries; ++qi) {
-            const size_t query = size_t(qi / kGroup) * kHeads + kv_head * kGroup + qi % kGroup;
-            float parts[kRowsParts];
-#pragma unroll
-            for (int b = 0; b < kRowsParts; ++b) {
-                parts[b] = b < used || b == kRowsBlocks
-                               ? __ldcg(&partial_out[(query * kRowsParts + b) * kHeadDim + d])
-                               : 0.f;
-            }
-            if (warp == 0) {
-                const float block_max = lane < used ? __ldcg(&partial_max[query * kRowsParts + lane]) : -FLT_MAX;
-                const float block_sum = lane < used ? __ldcg(&partial_sum[query * kRowsParts + lane]) : 0.f;
-                const float recent_max = __ldcg(&partial_max[query * kRowsParts + kRowsBlocks]);
-                const float recent_sum = __ldcg(&partial_sum[query * kRowsParts + kRowsBlocks]);
-                const float largest = fmaxf(warp_max(block_max), recent_max);
-                const float factor = exp2_ftz((block_max - largest) * kLog2e);
-                const float recent_factor = exp2_ftz((recent_max - largest) * kLog2e);
-                sm.factor[0][lane] = factor;
-                float total = 0.f;
-#pragma unroll
-                for (int b = 0; b < kRowsBlocks; ++b) {
-                    total = fmaf(__shfl_sync(0xffffffffu, factor, b), __shfl_sync(0xffffffffu, block_sum, b), total);
-                }
-                total = fmaf(recent_factor, recent_sum, total);
-                if (lane == 0) {
-                    sm.factor[0][kRowsBlocks] = recent_factor;
-                    sm.total[0] = total;
-                }
-            }
-            __syncthreads();
-            float value = 0.f;
-#pragma unroll
-            for (int b = 0; b < kRowsParts; ++b) {
-                value = fmaf(sm.factor[0][b], parts[b], value);
-            }
-            const float total = sm.total[0];
-            const __nv_bfloat16 attn = __float2bfloat16(value / total);
-            const size_t at = query * kHeadDim + d;
-            out[at] = gate != nullptr
-                          ? to_bf16_ftz(fmul(__bfloat162float(attn), mlx_sigmoid(__bfloat162float(gate[at]))))
-                          : attn;
-            if (k_cache != nullptr && qi % kGroup == 0) {
-                const size_t row = qi / kGroup;
-                const size_t channel = size_t(kv_head) * kHeadDim + d;
-                if constexpr (F::kFp4) {
-                    if (d % 16 == 0) {
-                        const unsigned slot = (start + unsigned(row)) % slots;
-#pragma unroll
-                        for (int kv = 0; kv < 2; ++kv) {
-                            const __nv_bfloat16* x = (kv == 0 ? k_new : v_new) + row * kKvRow + channel;
-                            float vals[16];
-#pragma unroll
-                            for (int i = 0; i < 16; ++i) {
-                                vals[i] = __bfloat162float(x[i]);
-                            }
-                            uint8_t sc;
-                            const uint2 data = fp4_group(vals, sc);
-                            typename F::Elem* cache = kv == 0 ? k_cache : v_cache;
-                            *reinterpret_cast<uint2*>(cache + fp4_data(slot, kv_head) + d / 2) = data;
-                            cache[fp4_scales(slot, kv_head) + d / 16] = sc;
-                        }
-                    }
-                } else {
-                    const size_t dst = size_t((start + unsigned(row)) % slots) * kKvRow + channel;
-                    F::store1(k_cache + dst, k_new[row * kKvRow + channel]);
-                    F::store1(v_cache + dst, v_new[row * kKvRow + channel]);
-                }
-            }
-            if (qi + 1 < queries) {
-                __syncthreads();
-            }
-        }
-        return;
-    }
-    // This block's query rows j are qi = combiner + j * combiners.
-    const auto query_of = [&](int j) {
-        const int qi = combiner + j * combiners;
-        return size_t(qi / kGroup) * kHeads + kv_head * kGroup + qi % kGroup;
-    };
-    const auto owns = [&](int j) { return combiner + j * combiners < queries; };
-    // Thread t takes dim t of each query row. Its partial outputs load first, before the
-    // maxes and sums they wait for.
-    float parts[kRowsCombineQueries][kRowsParts];
-#pragma unroll
-    for (int j = 0; j < kRowsCombineQueries; ++j) {
-        if (owns(j)) {
-            const size_t query = query_of(j);
-#pragma unroll
-            for (int b = 0; b < kRowsParts; ++b) {
-                parts[j][b] = b < used || b == kRowsBlocks
-                                  ? __ldcg(&partial_out[(query * kRowsParts + b) * kHeadDim + d])
-                                  : 0.f;
-            }
-        }
-    }
-
-    // Warp j takes query row j; lane b holds block b's max and sum.
-    if (warp < kRowsCombineQueries && owns(warp)) {
-        const size_t query = query_of(warp);
-        const float block_max = lane < used ? __ldcg(&partial_max[query * kRowsParts + lane]) : -FLT_MAX;
-        const float block_sum = lane < used ? __ldcg(&partial_sum[query * kRowsParts + lane]) : 0.f;
+    const auto compute_factors = [&](int slot, size_t query) {
+        const float m = lane < used ? __ldcg(&partial_max[query * kRowsParts + lane]) : -FLT_MAX;
+        const float s = lane < used ? __ldcg(&partial_sum[query * kRowsParts + lane]) : 0.f;
         const float recent_max = __ldcg(&partial_max[query * kRowsParts + kRowsBlocks]);
         const float recent_sum = __ldcg(&partial_sum[query * kRowsParts + kRowsBlocks]);
-        const float largest = fmaxf(warp_max(block_max), recent_max);
-        const float factor = exp2_ftz((block_max - largest) * kLog2e);
+        const float largest = fmaxf(warp_max(m), recent_max);
+        const float factor = exp2_ftz((m - largest) * kLog2e);
         const float recent_factor = exp2_ftz((recent_max - largest) * kLog2e);
-        sm.factor[warp][lane] = factor;
+        sm.factor[slot][lane] = factor;
         float total = 0.f;
 #pragma unroll
         for (int b = 0; b < kRowsBlocks; ++b) {
-            total = fmaf(__shfl_sync(0xffffffffu, factor, b), __shfl_sync(0xffffffffu, block_sum, b), total);
+            total = fmaf(__shfl_sync(0xffffffffu, factor, b), __shfl_sync(0xffffffffu, s, b), total);
         }
         total = fmaf(recent_factor, recent_sum, total);
         if (lane == 0) {
-            sm.factor[warp][kRowsBlocks] = recent_factor;
-            sm.total[warp] = total;
+            sm.factor[slot][kRowsBlocks] = recent_factor;
+            sm.total[slot] = total;
         }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int j = 0; j < kRowsCombineQueries; ++j) {
-        if (!owns(j)) {
-            continue;
-        }
+    };
+    const auto emit_query = [&](int slot, int qi, size_t query) {
         float value = 0.f;
-#pragma unroll
-        for (int b = 0; b < kRowsParts; ++b) {
-            value = fmaf(sm.factor[j][b], parts[j][b], value);
+        for (int b = 0; b < used; ++b) {
+            value = fmaf(sm.factor[slot][b], __ldcg(&partial_out[(query * kRowsParts + b) * kHeadDim + d]), value);
         }
-        const float total = sm.total[j];
+        value = fmaf(sm.factor[slot][kRowsBlocks],
+                     __ldcg(&partial_out[(query * kRowsParts + kRowsBlocks) * kHeadDim + d]), value);
+        const float total = sm.total[slot];
         const __nv_bfloat16 attn = __float2bfloat16(value / total);
-        const size_t query = query_of(j);
         const size_t at = query * kHeadDim + d;
         out[at] = gate != nullptr
                       ? to_bf16_ftz(fmul(__bfloat162float(attn), mlx_sigmoid(__bfloat162float(gate[at]))))
                       : attn;
-        const int qi = combiner + j * combiners;
         if (k_cache != nullptr && qi % kGroup == 0) {
             const size_t row = qi / kGroup;
             const size_t channel = size_t(kv_head) * kHeadDim + d;
             if constexpr (F::kFp4) {
                 // Thread 16 i rounds group i of the head, as kv_append_rows_fp4 does.
                 if (d % 16 == 0) {
-                    const unsigned slot = (start + unsigned(row)) % slots;
+                    const unsigned slot_idx = (start + unsigned(row)) % slots;
 #pragma unroll
                     for (int kv = 0; kv < 2; ++kv) {
                         const __nv_bfloat16* x = (kv == 0 ? k_new : v_new) + row * kKvRow + channel;
@@ -3354,8 +3246,8 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
                         uint8_t sc;
                         const uint2 data = fp4_group(vals, sc);
                         typename F::Elem* cache = kv == 0 ? k_cache : v_cache;
-                        *reinterpret_cast<uint2*>(cache + fp4_data(slot, kv_head) + d / 2) = data;
-                        cache[fp4_scales(slot, kv_head) + d / 16] = sc;
+                        *reinterpret_cast<uint2*>(cache + fp4_data(slot_idx, kv_head) + d / 2) = data;
+                        cache[fp4_scales(slot_idx, kv_head) + d / 16] = sc;
                     }
                 }
             } else {
@@ -3364,6 +3256,46 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
                 F::store1(v_cache + dst, v_new[row * kKvRow + channel]);
             }
         }
+    };
+    if constexpr (kSingleCombiner) {
+        // Single-block combine for batched multi-row verify: 4 query rows per iteration
+        // (one warp per query row for factor reduction), cutting barriers 4x with bit-exact
+        // summation order.
+        for (int qi0 = 0; qi0 < queries; qi0 += kRowsWarps) {
+            const int qi_w = qi0 + warp;
+            if (qi_w < queries) {
+                const size_t query = size_t(qi_w / kGroup) * kHeads + kv_head * kGroup + qi_w % kGroup;
+                compute_factors(warp, query);
+            }
+            __syncthreads();
+            const int batch_q = min(kRowsWarps, queries - qi0);
+            for (int j = 0; j < batch_q; ++j) {
+                const int qi = qi0 + j;
+                const size_t query = size_t(qi / kGroup) * kHeads + kv_head * kGroup + qi % kGroup;
+                emit_query(j, qi, query);
+            }
+            if (qi0 + kRowsWarps < queries) {
+                __syncthreads();
+            }
+        }
+        return;
+    }
+    // This block's query rows j are qi = combiner + j * combiners.
+    const auto query_of = [&](int j) {
+        const int qi = combiner + j * combiners;
+        return size_t(qi / kGroup) * kHeads + kv_head * kGroup + qi % kGroup;
+    };
+    const auto owns = [&](int j) { return combiner + j * combiners < queries; };
+    if (warp < kRowsCombineQueries && owns(warp)) {
+        compute_factors(warp, query_of(warp));
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < kRowsCombineQueries; ++j) {
+        if (!owns(j)) {
+            continue;
+        }
+        emit_query(j, combiner + j * combiners, query_of(j));
     }
 }
 
