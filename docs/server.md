@@ -8,7 +8,7 @@ SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
 
 ## Startup
 
-Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. Without `--context`, it takes the longest context that fits the free memory less `--margin` (0.25 GiB by default), up to the model's 1,048,576 positions. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
+Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. The global KV caches of every stream share one pool of pages ([Concurrent requests](#concurrent-requests)). Without `--context`, the pool takes the free memory less `--margin` (0.25 GiB by default) and what the weights and buffers need, up to the model's 1,048,576 positions. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
 
 It then loads the model, prices each verify width on a short prompt, and serves. After warmup it compares the memory the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the module images and CUDA graphs from the change in free memory. After each job it checks the pool's peak again and warns if the peak went past the plan.
 
@@ -20,14 +20,14 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | --- | --- | --- |
 | `--host`, `--port` | `127.0.0.1`, `8000` | Address to listen on. |
 | `--name` | `inkling-2-mini` | Model id in responses and `/v1/models`. |
-| `--context N` | most that fits | KV cache positions per stream: prompt plus generated tokens. |
+| `--context N` | most that fits | KV cache positions of the pool that every running request shares: prompts plus generated tokens. One request may take all of them. |
 | `--memory GiB` | free memory | Caps the GPU memory the plan may use, the CUDA context included. |
 | `--margin GiB` | `0.25` | Free memory the plan leaves unclaimed. |
 | `--prefill-chunk N` | `2048` | Rows of each prefill chunk, 1 to 2048. 1024 frees 0.4 GiB for the context and costs 6 to 7% of prefill speed. |
 | `--weights fp8\|bf16` | `fp8` | Dense weights: FP8 copies or the checkpoint's BF16. |
 | `--output-projection bf16\|fp8` | `bf16` | The attention output projection decode reads with FP8 weights. `fp8` saves 4 to 6% of a plain step and moves the logits further from the model. |
 | `--kv fp8\|bf16\|nvfp4\|mixed` | `fp8` | Global KV cache format: 16, 32, 9 or 10.75 KiB per position. See [engine.md](engine.md#kv-cache-reduction). |
-| `--streams N` | `1` | Requests that run at once, 1 to 32, each with its own KV cache. |
+| `--streams N` | `1` | Requests that run at once at most, 1 to 32, as many as the pool holds. |
 | `--queue N` | `8` | Requests that wait beyond the running ones. |
 | `--decode-floor R` | `20` | Tokens per second each decoding request gets at least while another prefills. 0 runs one batched step per prefill chunk. |
 | `--widths` | `1,2,...,8` | Verify widths speculation picks from. |
@@ -116,7 +116,7 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS=<context>
 
 Claude Code sends background requests, such as titles and summaries, to its Haiku model, so that name must point at this server too. It assumes a context of 1,048,576 tokens for a model it does not know. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the server's `--context`, or to the `max_model_len` that `/v1/models` lists, so that it compacts the conversation before the prompt overflows.
 
-With `--streams 1`, the [prefix cache](#prefix-cache) holds one prompt. A background request that does not start with the conversation's tokens then replaces it with its own prompt, and the next turn of the main conversation prefills its whole prompt again. With `--streams 2` or more, the background request's prompt takes another entry, and the conversation keeps its own.
+With `--streams 1`, a background request waits for the conversation's reply, and the [prefix cache](#prefix-cache) holds one prompt: the background request then replaces it with its own, and the next turn of the main conversation prefills its whole prompt again. With `--streams 4`, the background request starts beside the conversation's reply, in the same pool of KV cache pages, and takes another entry, so the conversation keeps its own.
 
 ## Images
 
@@ -193,7 +193,9 @@ Each choice of a request with `n` choices counts as a request in the request cou
 
 ## Concurrent requests
 
-With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit. `siphon-plan --streams N` shows that context: with FP8 weights and caches, 71,680 positions for 8 streams on a 32 GB card, and 284,672 for 16 or 132,096 for 32 on an RTX PRO 6000 Blackwell Max-Q.
+With `--streams N`, up to N requests run at once and up to `--queue` more wait. Their global KV caches and sliding rings share one pool of 2 MiB pages, which each takes as its sequence grows and keeps after it ends until the pool needs them, so one long conversation and several short requests run together, and one request alone may fill the pool. `--streams` costs little past the first: on a 32 GB card with FP8 weights and caches, with 30.45 GiB free and the default margin, the largest single request takes 653,312 positions with `--streams 1`, 645,120 with 4 and 641,024 with 8. Before the pool, `--streams 1` took 657,408 and 4 streams 161,792 each. [batching.md](batching.md#memory-one-pool-of-pages) has the design.
+
+A request starts when the pool has room for its prompt and 2,048 positions more. The shortest prompts start first, unless a request has waited 20 s. When the running requests outgrow the pool, prompts that the prefix cache keeps for idle streams go first. With `--host-cache`, requests that still do not fit then take turns: one is swapped out to host memory, the others run, and it comes back, each running at least nine times as long as its swap takes. A request with images that is swapped out mid-prefill encodes the image its next chunk needs again when it returns. Without `--host-cache`, a request starts only when the pool holds every position it may reach.
 
 More streams serve more in total and less per stream. On an RTX PRO 6000 Blackwell Max-Q, 32 streams at 10,674 tokens of context ran 1,138 tok/s in all against 661 for 8 ([batching.md](batching.md#16-and-32-streams-on-an-rtx-pro-6000-blackwell-max-q)). With `--streams 32 --context 16384`, 32 concurrent requests of 512 tokens came back at 1,198 tok/s in all.
 
@@ -203,9 +205,9 @@ A request that arrives at an idle server speculates. When another arrives, the f
 
 Chat clients and agents resend the whole conversation each turn. The server keeps the state of recent prompts, one per stream unless `--prefix-cache-entries` says fewer, each at its last multiple of `--prefill-chunk` tokens (2,048 by default). A request whose prompt starts with one of them prefills only the rest, batched or alone, and gets the same tokens and logits as without the cache. The usage object reports the reused tokens as `prompt_tokens_details.cached_tokens`.
 
-Each entry belongs to a stream's KV cache, so a request that hits one runs in that stream. A new prompt takes a stream without an entry, else the one whose entry was used least recently, and an entry unused for `--prefix-cache-ttl` seconds is dropped. So up to `--streams` conversations, such as an agent and its parallel subagents, each keep their own history cached between turns. Prompts that share only a beginning, such as two conversations with the same system prompt, do not share an entry.
+Each entry belongs to a stream's KV cache, so a request that hits one runs in that stream. A new prompt takes a stream without an entry, else the one whose entry was used least recently, and an entry unused for `--prefix-cache-ttl` seconds is dropped. An entry keeps its stream's pages until the pool needs them for a running request. So up to `--streams` conversations, such as an agent and its parallel subagents, each keep their own history cached between turns. Prompts that share only a beginning, such as two conversations with the same system prompt, do not share an entry.
 
-A request that runs alone speculates. When its entry was saved by a batched request, it lacks the draft's state: the request then prefills from the entry and decodes batched, and rebuilds the draft's state, a prefill of its whole prompt, only when its `max_tokens` leaves more than 1/16 of the position to generate (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context.
+A request that runs alone speculates. When its entry was saved by a batched request, it lacks the draft's state: the request then prefills from the entry and decodes batched, and rebuilds the draft's state, a prefill of its whole prompt, only when its `max_tokens` leaves more than 1/16 of the position to generate (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context, of which the 160 MiB of copies of the rings come from the pool while the entry lives.
 
 With `--host-cache GiB`, every entry is also copied to page-locked host memory with its whole KV cache, and a request whose entry left the GPU restores it from there into the stream it takes, then prefills only the rest, with the same tokens and logits. A conversation that a subagent or another session pushed off the GPU then comes back in 0.135 s instead of 2.1 s at 32K tokens, and in 0.81 s instead of 39 s at 330K, on an RTX PRO 6000 Blackwell Workstation Edition. The memory is allocated at startup (9.7 s for 12 GiB). An entry takes 18 KiB per token with FP8 caches and the bundled draft (16 KiB with DFlash 2, 34 KiB with BF16 caches) plus about 0.2 GiB, conversations that share a start share its memory, and the least recently used entries go when it is full. The log reports each save and restore. On a two-socket host, run the server on the GPU's socket (`taskset` or `numactl`), or restores run at about half speed. [engine.md](engine.md#host-tier) has the design and the measurements.
 

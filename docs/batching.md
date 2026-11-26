@@ -28,15 +28,62 @@ plus its position and the next token to feed. The draft's state (its caches, rin
 
 The model keeps sequence slots. Slot 0 is the model's existing state, which `Model::step`, `prefill` and the verify pass use as before. Slots 1 to N-1 each own the same set of caches in separate allocations. Kernels reach a slot's caches through device tables of pointers, so nothing assumes the slots are contiguous.
 
-## Memory: fixed slots
+## Memory: one pool of pages
 
-The planner gives every slot the same capacity: `--streams N` slots of `capacity` positions each. It counts N sets of global caches, rings and conv states, one batch scratch (the verify pass's multi-row buffers for N rows and their taps), 4 MiB per stream past the first for its batch size's CUDA graph and the allocator's rounding, and the draft and verify buffers once. Without `--context`, the server takes the largest capacity at which N slots fit.
+Every slot reserves virtual addresses for the whole context of its global KV caches and of its sliding rings, with `cuMemAddressReserve`, which takes no memory. Physical memory comes from one pool of pages made once with `cuMemCreate` (`siphon_cuda::vmm`). A page is the allocation granularity, 2 MiB on the RTX 5090 and the RTX PRO 6000 Blackwell, which holds 2,048 positions of one FP8 global cache's keys or values, the default prefill chunk and the prefix cache's unit. A slot maps pages (`cuMemMap`, `cuMemSetAccess`, then zeroes them on the stream) as its sequence grows, a chunk of 2,048 positions at a time. It keeps them after its request ends and when it takes another sequence, which then maps none, until the pool needs them. The addresses never move, so the attention kernels, the batched step's pointer tables and every CUDA graph run unchanged on whatever pages back them.
 
-On a 32 GB card with FP8 weights and caches and the bundled draft, about 11 GiB remain after the fixed parts. With a prefix cache entry per slot, eight slots get 71,680 positions each, four 161,792. On an RTX PRO 6000 Blackwell Max-Q, with 94.46 GiB free after the CUDA context, `siphon-plan --streams N` gives 587,776 positions each to 8 slots, 284,672 to 16 and 132,096 to 32. At 32 streams the rings, conv states and prefix cache entries take 10.5 GiB of the 94.0 GiB plan.
+The model maps what each step, prefill chunk, verify pass and batched step writes before it runs (`Model::map_slot`), so a caller cannot touch an unmapped position. A slot's rings take their 80 pages when it first holds a sequence. The draft's global caches, one set for the sequence that speculates, map from the same pool. Moving a sequence into slot 0 to speculate maps its pages there instead of copying them (`Model::transfer_slot`). The cache counts and each cache's bytes per position come from the model and the KV format, and each key and value buffer maps its own pages. An NVFP4 buffer takes 576 bytes per position with its scales, so 2,048 positions fill 1.13 MiB and a page holds about 3,640 positions; `--kv mixed` maps its two FP8 caches and six NVFP4 caches each at its own rate.
 
-`siphon-serve --streams 32 --context 16384` checks the plan against its memory pool after a request of each stream: 38,288 MiB at peak against 38,369 MiB planned, and 28,772 against 28,827 at 16 streams.
+| Measured on an RTX PRO 6000 Blackwell Workstation Edition | |
+| --- | --- |
+| Granularity, minimum and recommended | 2 MiB |
+| Creating a page | 28 µs |
+| Mapping, granting access to and zeroing a chunk of the 16 FP8 caches (16 pages) | 1.73 ms |
+| Unmapping a chunk | 0.80 ms, without waiting for queued work |
+| Copies through mapped pages | 1,420 GB/s both ways |
 
-A shared paged pool would let one long request and several short ones share the memory, but every attention kernel would have to read pages through a block table, including decode's and prefill's. That is a large change to kernels that three other efforts are tuning. Fixed slots need no change to the cache layout. A request whose prompt and limit exceed the slot capacity gets a 400 error, as it does today.
+A decoding sequence maps a chunk every 2,048 tokens, 1.7 ms against about 8 s of steps. `bench` decodes as fast with pooled caches as with allocated ones: 2.788 against 2.789 ms per step at 0 positions, 3.272 against 3.276 at 32,768, 4.283 against 4.291 at 131,072 and 5.959 against 5.968 at 300,000, within 0.15% (two alternating runs each in one hold). `smallm verify --hash 1` gives the same logits hashes at widths 1, 3 and 8 for the build before this change, this build with allocated caches and this build pooled.
+
+The planner counts the weights, the fixed buffers and each slot's conv states, then gives the rest to the pool. `--context` is the positions the pool holds over every running request together, and one request may take all of them, up to the model's 1,048,576. The pool also holds one request's rings and its prefix cache entry's copies of them. `--streams` is the most requests that run at once; past the first, each costs its conv states, batch rows, graph and prefix cache entry's conv copies, about 20 MiB. The pool's page tables and copies take 64 MiB more (`POOL_RUNTIME_BYTES`). With FP8 weights and caches, 30.45 GiB free on a 32 GB card and the default 0.25 GiB margin, `siphon-plan` gives one request 653,312 positions with `--streams 1`, 645,120 with 4, 641,024 with 8, 632,832 with 16 and 614,400 with 32. With a fixed cache per stream, `--streams 1` gave 657,408 and 4 streams 161,792 each. `--vision` adds the tower and its buffers outside the pool ([server.md](server.md#images)): 612,352 positions with `--streams 1`. With `--kv mixed` the pool holds 920,576 positions with `--streams 1` and 911,360 with 4, against 927,744 and 4 streams of 237,568 with fixed caches; `--kv nvfp4` reaches the model's 1,048,576 at `--streams 1` either way.
+
+The server's scheduler (`crates/siphon-serve/src/engine.rs`) goes by pages:
+
+- It starts every waiting request that fits: a free slot, and room for its prompt, one chunk more, its rings and its entry's copies, beside what the running requests still prefill. Without a host tier it counts every position the request may reach instead, so that a running request never lacks room.
+- Requests that waited past 20 s go first in arrival order, then requests that were swapped out, then the rest from the shortest prompt. Prefill takes one chunk per turn of the request with the fewest prompt tokens left, so a short request arriving during a long prefill starts at once.
+- When a request does not fit, idle slots give back the pages their prefix cache entries do not need (past the entry and their rings), then the copies of entries no longer live, then the least recently used entries with their pages (their host tier copies stay), then the draft's pages if it follows nobody.
+- When the running requests still need more pages than the pool has, they take turns through the host tier: one is swapped out (`Speculator::park`), the others run, and it comes back (`Speculator::unpark`) when it fits or when another has had its turn. A request still prefilling goes first, since its client sees no tokens yet, then the one that has run longest since it started. A request runs at least nine times as long as swapping it out and back takes, so swapping costs at most 10% of the time, and at least 1 s.
+
+A swapped-out sequence keeps its global caches below its position and its rings and conv states at that position in the host tier, in chunks of 2,048 positions. The whole chunks of its prompt are shared, counted by references, with the host entry that agrees with it longest, as host entries share chunks; the rest is copied. Returning copies it into any free slot, so its next tokens are the ones it would have decoded without leaving. `parked_sequences_return_exactly` in `tests/prefix.rs` swaps one sequence out after 20 batched steps, lets another take its pages, returns it to another slot and checks 10 more steps of both against sequences that never moved, token and logits; it also swaps one out mid-prefill. `transfer_moves_a_sequence_exactly` moves a sequence through three slots and checks every byte.
+
+### Measured on an RTX 5090
+
+`siphon-serve` with FP8 weights and caches and the bundled draft, on an idle RTX 5090, under the GPU lock. A conversation of 300,010 tokens is in the prefix cache and decodes a reply of 4,000 tokens; once it streams, a request of 2,010 tokens arrives, then after it one of 40,010 tokens, each for 256 tokens. Today's main with `--streams 1` against the pool with `--streams 4 --host-cache 12`:
+
+| | `--streams 1` | Pool, `--streams 4` |
+| --- | ---: | ---: |
+| 2K request: time to first token | 7.50 s | 0.14 s |
+| 2K request: tok/s | 486 | 130 |
+| Long request meanwhile | 490 tok/s | 122 tok/s |
+| 40K request: time to first token | 2.84 s | 3.35 s |
+| 40K request: tok/s | 447 | 124 |
+| Long request meanwhile | 0 (finished) | 64.5 tok/s |
+| Long request after both | | 393 tok/s, speculating again |
+| Next turn of the long conversation: time to first token | 31.9 s | 0.90 s |
+
+With `--streams 1` the 2K request waits for the reply to finish, then takes the only slot and its prefix cache entry, so the conversation's next turn prefills all 304,220 tokens again. In the pool the side requests start beside the reply, the reply drops to batched plain decode while they run (122 tok/s with the 2K one, 64.5 tok/s while the 40K one prefills at the decode floor), and it returns to speculation after them. The conversation keeps its pages and entry: its next turn prefills 5,212 tokens.
+
+The largest single request: on 30.86 GiB free, with the default 0.25 GiB margin, the plan gives 680,960 positions to `--streams 1` on main, and 675,840 to the pool with `--streams 1`, 669,696 with 4 and 655,360 with 16. Both served a prompt of 630,010 tokens, planned with the earlier 0.5 GiB margin and FP8 output projections: 93.04 s of prefill on main, 93.41 s pooled at `--streams 4`.
+
+Beside the 300,010-token conversation (2,544 pages with its rings and entry copies, 298 more for the draft, of 5,724 at `--streams 16`), 32,778-token requests of 256 tokens each take 432 pages, so six run beside it at once: sent together, all six ran without a swap, their prompts prefilling one after another at the decode floor (first tokens after 2.75 to 17.6 s) while the conversation decoded at 32.4 tok/s. Seven sent at once all ran too, but swapped two requests that were still prefilling out and back; eight swapped nine times, the long conversation once for 0.54 s. The memory check peaked at 30,972 MiB against 31,084 MiB planned with six.
+
+### Round robin
+
+On an RTX PRO 6000 Blackwell Workstation Edition with the pool capped at `--context 524288`, close to an RTX 5090's, `--host-cache 24`:
+
+- Two conversations of 300,010 tokens, both in the prefix cache, each decoding 3,000 tokens, do not fit together. They took turns of about 4.7 s, the quantum for 300,000 positions, and each was swapped out 5 times: 61.8 and 66.4 tok/s, 120 tok/s together, with stalls of up to 5.10 s while the other ran. A swap out copied 187 to 196 MiB, one or two chunks of generated tokens and the rings, and shared the 146 chunks of the prompt with the host entry; it took 1 to 2 ms to queue. A swap back copied 4,859 MiB in 211 ms (24.1 GB/s) into the slot the other conversation had left, whose pages it kept. When the swapped-out slot gave its pages back to the pool first, the same copy took 443 ms, half of it mapping 2,400 pages, and the two ran 106 tok/s together.
+- A conversation of 480,010 tokens decoding, and four requests of 8,202 tokens arriving at once, while the pool is full. They started after 0.78 to 3.82 s; the conversation ran at 37 tok/s meanwhile, swapped out once for 1.96 s, and the short requests were swapped out 2 times each for 1.8 to 5.7 s.
+
+A lone request decodes in one-row batched steps while another is swapped out, 128 tok/s over its turns at 300,000 positions, rather than speculating, which ran 393 tok/s at that length on the RTX 5090 above: the draft follows one sequence, and a swap drops its state, which only a prefill of the whole sequence could rebuild.
 
 ## A batched step
 
