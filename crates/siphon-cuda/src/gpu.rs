@@ -1,6 +1,6 @@
 use std::{ffi::c_void, mem::ManuallyDrop, ptr, sync::Arc};
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use cudarc::{
     driver::{
         CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
@@ -8,6 +8,9 @@ use cudarc::{
     },
     nvrtc::Ptx,
 };
+
+/// The target the kernels are compiled for, `SIPHON_CUDA_ARCH` at build time.
+const KERNEL_ARCH: &str = env!("SIPHON_CUDA_ARCH");
 
 /// One CUDA device and the stream every op launches on.
 ///
@@ -24,11 +27,27 @@ impl Gpu {
     pub fn new(ordinal: usize) -> anyhow::Result<Self> {
         let ctx =
             CudaContext::new(ordinal).with_context(|| format!("opening CUDA device {ordinal}"))?;
+        let (major, minor) = ctx.compute_capability()?;
+        let device = format!("sm_{major}{minor}");
+        ensure!(
+            KERNEL_ARCH.trim_end_matches('a') == device,
+            "the kernels are built for {KERNEL_ARCH}, which the RTX 5090 and RTX PRO 6000 \
+             Blackwell run, but CUDA device {ordinal}, {}, is {device}",
+            ctx.name()?
+        );
         // SAFETY: nothing has been allocated in this context yet, and every buffer and launch
         // afterwards goes through the one stream below, which orders all work itself.
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         Ok(Self { ctx, stream })
+    }
+
+    /// The device's streaming multiprocessors.
+    pub fn sms(&self) -> anyhow::Result<usize> {
+        let sms = self
+            .ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+        Ok(usize::try_from(sms)?)
     }
 
     #[must_use]

@@ -530,6 +530,7 @@ mod cuda {
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             streams: options.streams,
             prefix_entries: options.prefix_entries,
+            sms: gpu.sms()?,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;

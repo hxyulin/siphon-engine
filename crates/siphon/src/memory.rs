@@ -73,8 +73,6 @@ pub const COMMIT_ROWS: usize = 512;
 pub const HEAD_ROWS: usize = 32;
 /// The FP8 copies of the target pad their rows to a multiple of this.
 pub const FP8_ROW_PAD: usize = 32;
-/// Blocks of the prefill attention's split partials: the RTX 5090's SM count.
-pub const SMS: usize = 170;
 /// Floats of one prefill attention partial slot: 128 rows of 128 values, a maximum and a sum.
 pub const PREFILL_SLOT: usize = 128 * (128 + 2);
 /// Partial rows of the multi-row attention: 8 rows of 24 heads, 33 partials each.
@@ -125,6 +123,9 @@ pub struct PlanInputs<'a> {
     /// Entries of the speculator's prefix cache, 0 for none: each copies one slot's
     /// sliding rings and conv states and the draft's rings.
     pub prefix_entries: usize,
+    /// Streaming multiprocessors of the device. The prefill attention keeps two slots of
+    /// split partials per SM.
+    pub sms: usize,
 }
 
 /// Device bytes of one configuration at one capacity, by what holds them.
@@ -290,14 +291,14 @@ impl Planner {
         let prefill = if inputs.prefill_chunk == 0 {
             0
         } else {
-            rows_scratch(c, inputs.prefill_chunk)
+            rows_scratch(c, inputs.prefill_chunk, inputs.sms)
                 + inputs.prefill_chunk * taps * hidden * 2
                 + dense_scratch(c, inputs.prefill_chunk)
         };
         let (verify, draft_bytes, draft_kv_per_position) = match &draft {
             None => (0, 0, 0),
             Some((d, approx)) => {
-                let verify = rows_scratch(c, VERIFY_ROWS)
+                let verify = rows_scratch(c, VERIFY_ROWS, inputs.sms)
                     + invariant_scratch(c, VERIFY_ROWS)
                     + VERIFY_ROWS * taps * hidden * 2
                     + visits.len() * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
@@ -325,7 +326,7 @@ impl Planner {
         // The batched step's chunk buffers, its state tables, positions and tokens, and its
         // rows' taps for the draft.
         let batch = if streams > 1 {
-            rows_scratch(c, VERIFY_ROWS)
+            rows_scratch(c, VERIFY_ROWS, inputs.sms)
                 + invariant_scratch(c, VERIFY_ROWS)
                 + visits.len() * VERIFY_ROWS * 6 * 8
                 + VERIFY_ROWS * 8
@@ -500,7 +501,7 @@ fn max_blocks(c: &TextConfig) -> usize {
 
 /// `PrefillScratch::new` for `rows` rows: the buffers of a prefill chunk or a verify pass,
 /// without the taps and the verify pass's own state.
-fn rows_scratch(c: &TextConfig, rows: usize) -> usize {
+fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
     let hidden = c.hidden_size;
     let heads = c.num_attention_heads;
     let q_dims = heads * c.head_dim;
@@ -539,7 +540,7 @@ fn rows_scratch(c: &TextConfig, rows: usize) -> usize {
         + 16 * pairs.min(pairs / 64 + experts) // tiles
         + quantized + quantized / 16 + 4 * pairs
         + 4 * (rows * (heads / c.num_key_value_heads)).div_ceil(128) * c.num_key_value_heads;
-    let fixed = 4 * 2 * SMS * PREFILL_SLOT
+    let fixed = 4 * 2 * sms * PREFILL_SLOT
         + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2)
         + HEAD_ROWS * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
     per_rows + fixed
@@ -846,8 +847,8 @@ mod tests {
     #[test]
     fn prefill_scratch_grows_with_the_chunk() {
         let c = config();
-        let small = rows_scratch(&c, 8);
-        let large = rows_scratch(&c, 2048);
+        let small = rows_scratch(&c, 8, 170);
+        let large = rows_scratch(&c, 2048, 170);
         // About 0.3 MB per row: the relative bias, the expert activations and the blocks.
         let per_row = (large - small) / 2040;
         assert!((250_000..400_000).contains(&per_row), "{per_row}");

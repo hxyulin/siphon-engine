@@ -10,6 +10,8 @@ fn main() {
     for var in ["NVCC", "CUDA_HOME", "SIPHON_CUDA_ARCH"] {
         println!("cargo::rerun-if-env-changed={var}");
     }
+    let arch = env::var("SIPHON_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".to_owned());
+    println!("cargo::rustc-env=SIPHON_CUDA_ARCH={arch}");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
@@ -19,7 +21,6 @@ fn main() {
         (None, Some(home)) => PathBuf::from(home).join("bin/nvcc"),
         (None, None) => PathBuf::from("nvcc"),
     };
-    let arch = env::var("SIPHON_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".to_owned());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
 
     let mut sources: Vec<PathBuf> = fs::read_dir("kernels")

@@ -567,6 +567,7 @@ mod linux {
             prefill_chunk: 0,
             streams: 1,
             prefix_entries: 0,
+            sms: gpu.sms()?,
         })?;
         let contexts = args
             .contexts

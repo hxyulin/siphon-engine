@@ -10,6 +10,20 @@ use siphon::memory::CONTEXT_BYTES;
 const RTX_5090_TOTAL: usize = 32_607 << 20;
 const RTX_5090_IDLE_HELD: usize = (459 + 454) << 20;
 
+/// Streaming multiprocessors by device name, which nvidia-smi does not report.
+const SMS: [(&str, usize); 2] = [("RTX 5090", 170), ("RTX PRO 6000 Blackwell", 188)];
+
+/// The SM count of the device `name`, or the largest known for another device, since the
+/// plan's buffers grow with it.
+fn sms(name: &str) -> usize {
+    SMS.iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map_or(
+            SMS.iter().map(|&(_, sms)| sms).max().unwrap_or(0),
+            |&(_, sms)| sms,
+        )
+}
+
 /// Where [`Device`]'s numbers come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -30,6 +44,8 @@ pub struct Device {
     /// Bytes free once the CUDA context exists: what a plan must fit, as
     /// `siphon_cuda`'s `cuMemGetInfo` after creating the context reads it.
     pub free: usize,
+    /// Streaming multiprocessors.
+    pub sms: usize,
     pub source: Source,
 }
 
@@ -42,6 +58,7 @@ impl Device {
             total: RTX_5090_TOTAL,
             others: RTX_5090_IDLE_HELD,
             free: RTX_5090_TOTAL - RTX_5090_IDLE_HELD - CONTEXT_BYTES,
+            sms: sms("RTX 5090"),
             source: Source::Assumed,
         });
         match free {
@@ -70,7 +87,11 @@ fn query() -> Option<Device> {
     }
     let text = String::from_utf8(out.stdout).ok()?;
     let mut fields = text.lines().next()?.split(", ");
-    let name = fields.next()?.trim().trim_start_matches("NVIDIA GeForce ");
+    let name = fields
+        .next()?
+        .trim()
+        .trim_start_matches("NVIDIA ")
+        .trim_start_matches("GeForce ");
     let mib = |s: Option<&str>| s?.trim().parse::<usize>().ok().map(|m| m << 20);
     let total = mib(fields.next())?;
     let reserved = mib(fields.next())?;
@@ -78,6 +99,7 @@ fn query() -> Option<Device> {
     let free = mib(fields.next())?;
     Some(Device {
         name: name.to_owned(),
+        sms: sms(name),
         total,
         others: reserved + used,
         // CONTEXT_BYTES was measured as nvidia-smi's free memory less the free memory the
