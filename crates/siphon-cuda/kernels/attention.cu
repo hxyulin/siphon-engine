@@ -324,11 +324,25 @@ struct Fp4Format {
     static constexpr int kChunkStride = 16;
 };
 
+// Streaming L2 eviction policy: KV cache slabs read once per step should evict first so
+// they do not displace reusable weights and activations from L2.
+__device__ __forceinline__ uint64_t l2_evict_first() {
+    uint64_t policy;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+}
+
 // Copies 8 bytes from global to shared memory without blocking, or writes 8 zero bytes
 // when `valid` is false.
 __device__ __forceinline__ void copy_async8(void* dst, const void* src, bool valid) {
     const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(shared), "l"(src), "r"(valid ? 8 : 0));
+}
+
+__device__ __forceinline__ void copy_async8_evict(void* dst, const void* src, bool valid, uint64_t policy) {
+    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 8, %2, %3;" ::"r"(shared), "l"(src),
+                 "r"(valid ? 8 : 0), "l"(policy));
 }
 
 // atomicAdd with acquire and release semantics at GPU scope.
@@ -343,6 +357,12 @@ __device__ __forceinline__ unsigned atomic_add_acq_rel(unsigned* p, unsigned v) 
 __device__ __forceinline__ void copy_async16(void* dst, const void* src, bool valid) {
     const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(shared), "l"(src), "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void copy_async16_evict(void* dst, const void* src, bool valid, uint64_t policy) {
+    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;" ::"r"(shared), "l"(src),
+                 "r"(valid ? 16 : 0), "l"(policy));
 }
 
 __device__ __forceinline__ void copy_async_commit() {
@@ -2830,6 +2850,7 @@ __device__ __forceinline__ int rows_offset(int row, int chunk) {
 template <class F>
 __device__ __forceinline__ void rows_copy_chunk(typename F::Elem* dst, const typename F::Elem* cache, int kv_head,
                                                 unsigned first, unsigned end, int lane) {
+    const uint64_t policy = l2_evict_first();
     if constexpr (F::kFp4) {
         // 4 data chunks per row, two per lane, and lanes 0 .. 15 copy row lane's scales.
         constexpr int kChunks = kFp4HeadBytes / 16;
@@ -2840,14 +2861,14 @@ __device__ __forceinline__ void rows_copy_chunk(typename F::Elem* dst, const typ
             const int chunk = i % kChunks;
             const unsigned slot = first + row;
             const bool valid = slot < end;
-            copy_async16(reinterpret_cast<char*>(dst) + rows_offset<F>(row, chunk),
-                         cache + fp4_data(valid ? slot : 0, kv_head) + chunk * 16, valid);
+            copy_async16_evict(reinterpret_cast<char*>(dst) + rows_offset<F>(row, chunk),
+                               cache + fp4_data(valid ? slot : 0, kv_head) + chunk * 16, valid, policy);
         }
         if (lane < kRowsChunk) {
             const unsigned slot = first + lane;
             const bool valid = slot < end;
-            copy_async8(reinterpret_cast<char*>(dst) + kRowsFp4Scales + lane * kFp4HeadScales,
-                        cache + fp4_scales(valid ? slot : 0, kv_head), valid);
+            copy_async8_evict(reinterpret_cast<char*>(dst) + kRowsFp4Scales + lane * kFp4HeadScales,
+                              cache + fp4_scales(valid ? slot : 0, kv_head), valid, policy);
         }
         return;
     }
@@ -2861,7 +2882,7 @@ __device__ __forceinline__ void rows_copy_chunk(typename F::Elem* dst, const typ
         const unsigned slot = first + row;
         const bool valid = slot < end;
         const size_t offset = size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * kElems;
-        copy_async16(reinterpret_cast<char*>(dst) + rows_offset<F>(row, chunk), cache + offset, valid);
+        copy_async16_evict(reinterpret_cast<char*>(dst) + rows_offset<F>(row, chunk), cache + offset, valid, policy);
     }
 }
 
