@@ -409,7 +409,7 @@ impl Speculator {
         let now = Instant::now();
         let Some(cache) = self.prefix.as_ref() else {
             model.reset()?;
-            return Ok((self.prefill_saving(model, prompt, chunk, None)?, 0));
+            return Ok((self.prefill_whole(model, prompt, chunk)?, 0));
         };
         let Prompt {
             tokens,
@@ -719,9 +719,8 @@ impl Speculator {
     /// Copies entry `i`, just saved, to the host tier, with the draft's rings and global
     /// caches if `draft`. A failure only costs the host copy, so it goes to the log.
     ///
-    /// Inside a rebuild ([`Self::rebuild`]), the rebuild's slot stands in for slot 0, the
-    /// entry's, and the copies read its global caches. Below the boundary they hold the
-    /// values of the entry's: the same tokens, prefilled in the same chunks from position 0.
+    /// After a rebuild step ([`Self::rebuild_step`]), the copies read the entry's slot and
+    /// the draft's global caches, which the rebuild filled from the entry's tokens.
     fn save_host(&mut self, model: &Model, i: usize, draft: bool) {
         let Some(PrefixCache {
             entries,
@@ -964,26 +963,81 @@ impl Speculator {
         self.draft.pages_to(end)
     }
 
-    /// The live entry of slot `slot` whose tokens `tokens` starts with and goes past.
-    pub(super) fn entry_starting(
+    /// The boundary of the shortest live prefix cache entry of prefill chunks of `chunk`
+    /// whose tokens `key` starts with and that goes past position `done`.
+    pub(super) fn entry_after(
         &self,
         model: &Model,
-        slot: usize,
-        tokens: &[u32],
+        key: &[u32],
+        done: usize,
         chunk: usize,
     ) -> Option<usize> {
         let cache = self.prefix.as_ref()?;
-        let i = cache.of_slot(model, slot, Instant::now())?;
-        let e = &cache.entries[i];
-        (e.chunk == chunk && tokens.len() > e.tokens.len() && tokens.starts_with(&e.tokens))
-            .then_some(i)
+        let now = Instant::now();
+        cache
+            .entries
+            .iter()
+            .filter(|e| {
+                cache.live(e, model, now)
+                    && e.chunk == chunk
+                    && e.tokens.len() > done
+                    && key.starts_with(&e.tokens)
+            })
+            .map(|e| e.tokens.len())
+            .min()
     }
 
-    /// Tokens of entry `i`.
-    pub(super) fn entry_len(&self, i: usize) -> usize {
-        self.prefix
-            .as_ref()
-            .map_or(0, |c| c.entries[i].tokens.len())
+    /// The live entries of prefill chunks of [`Self::prefill_chunk`] whose tokens are
+    /// `key` and that lack the draft's state.
+    pub(super) fn entries_without_draft(&self, model: &Model, key: &[u32]) -> Vec<usize> {
+        let Some(cache) = self.prefix.as_ref() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        (0..cache.entries.len())
+            .filter(|&i| {
+                let e = &cache.entries[i];
+                cache.live(e, model, now)
+                    && e.chunk == self.prefill_chunk
+                    && e.tokens == key
+                    && !cache.has_draft(e, self.draft_sequence)
+            })
+            .collect()
+    }
+
+    /// The slot and key of the live prefix cache entry with the most tokens, when it lacks
+    /// the draft's state and holds text alone, ids below `vocab`: the entry that a rebuild
+    /// on an idle server gives the draft's state ([`Self::start_rebuild`]).
+    #[must_use]
+    pub fn entry_to_rebuild(&self, model: &Model, vocab: usize) -> Option<(usize, Vec<u32>)> {
+        let cache = self.prefix.as_ref()?;
+        let now = Instant::now();
+        let e = cache
+            .entries
+            .iter()
+            .filter(|e| cache.live(e, model, now) && e.chunk == self.prefill_chunk)
+            .max_by_key(|e| e.tokens.len())?;
+        let text = e
+            .tokens
+            .iter()
+            .all(|&t| usize::try_from(t).is_ok_and(|t| t < vocab));
+        if !text || cache.has_draft(e, self.draft_sequence) {
+            return None;
+        }
+        Some((e.slot?, e.tokens.clone()))
+    }
+
+    /// A slot outside `busy` without a live entry, for a rebuild that may not drop one.
+    #[must_use]
+    pub fn empty_slot(&self, model: &Model, busy: &[usize]) -> Option<usize> {
+        let now = Instant::now();
+        (0..model.slots()).rev().find(|s| {
+            !busy.contains(s)
+                && self
+                    .prefix
+                    .as_ref()
+                    .is_none_or(|c| c.of_slot(model, *s, now).is_none())
+        })
     }
 }
 

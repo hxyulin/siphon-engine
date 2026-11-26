@@ -473,7 +473,7 @@ mod cuda {
     use std::{
         collections::VecDeque,
         ops::ControlFlow,
-        sync::mpsc::{Receiver, sync_channel},
+        sync::mpsc::{Receiver, TryRecvError, sync_channel},
         thread,
         time::Instant,
     };
@@ -500,8 +500,8 @@ mod cuda {
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
-            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Prompt, Speculator, Width,
-            WidthPolicy, load_draft, price,
+            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Prompt, Rebuild, Speculator,
+            Width, WidthPolicy, load_draft, price,
         },
         vision::{VisionFormat, VisionTower},
         vmm::{PagePool, granularity},
@@ -1178,6 +1178,9 @@ mod cuda {
         /// Tokens emitted by speculation and by batched steps.
         speculated: usize,
         batched: usize,
+        /// Batched steps it ran as the only row, which pay for a draft rebuild
+        /// (`rebuild_turn`).
+        rent: usize,
         /// The image a batched prefill chunk encoded for the next one.
         kept: Kept,
         /// The tower's encodes for its prefill.
@@ -1217,6 +1220,7 @@ mod cuda {
                 stay_batched: false,
                 speculated: 0,
                 batched: 0,
+                rent: 0,
                 kept: None,
                 encodes: Encodes::default(),
                 since: Instant::now(),
@@ -1398,6 +1402,8 @@ mod cuda {
         let mut waiting = VecDeque::new();
         // A request that a batch left alone, to continue with speculation.
         let mut resumed = None;
+        // A draft rebuild in progress, and when it started (`idle_rebuild`, `rebuild_turn`).
+        let mut rebuild = None;
         loop {
             let mut request = if let Some(request) = resumed.take() {
                 request
@@ -1412,10 +1418,25 @@ mod cuda {
                         let _ = report.send(shut_down(&model, &mut speculator, options));
                         return;
                     }
-                    match queue.recv() {
-                        Ok(jobs) => waiting.extend(jobs),
-                        Err(_) => return,
-                    }
+                    // Idle: once no job came for `IDLE_DELAY`, a step of a draft rebuild,
+                    // then a look at the queue.
+                    let jobs = if streams == 1 {
+                        queue.recv().ok()
+                    } else if rebuild.is_none()
+                        && let Ok(jobs) = queue.recv_timeout(IDLE_DELAY)
+                    {
+                        Some(jobs)
+                    } else if idle_rebuild(&mut model, &mut speculator, &mut rebuild) {
+                        match queue.try_recv() {
+                            Ok(jobs) => Some(jobs),
+                            Err(TryRecvError::Empty) => continue,
+                            Err(TryRecvError::Disconnected) => None,
+                        }
+                    } else {
+                        queue.recv().ok()
+                    };
+                    let Some(jobs) = jobs else { return };
+                    waiting.extend(jobs);
                 }
                 let Some(job) = waiting.pop_front() else {
                     continue;
@@ -1439,6 +1460,7 @@ mod cuda {
                             queue,
                             stop,
                             &sched,
+                            &mut rebuild,
                         );
                         check.after_job();
                         continue;
@@ -1459,6 +1481,7 @@ mod cuda {
                         queue,
                         stop,
                         &sched,
+                        &mut rebuild,
                     );
                     check.after_job();
                     continue;
@@ -1485,9 +1508,16 @@ mod cuda {
                 }
                 let keep: Vec<usize> = hit_slot.into_iter().collect();
                 let draft_hit = hit.is_some_and(|h| h.draft && h.slot.is_some());
-                make_room(&mut model, &mut speculator, need, &keep, !draft_hit);
+                let reclaim = if draft_hit {
+                    Reclaim::Entries
+                } else {
+                    Reclaim::Draft
+                };
+                make_room(&mut model, &mut speculator, need, &keep, reclaim);
                 request
             };
+            // Speculation takes the draft from any rebuild.
+            rebuild = None;
             let interrupt = (streams > 1).then_some((queue, &mut waiting));
             let ran = alone(
                 &mut model,
@@ -1511,6 +1541,7 @@ mod cuda {
                         queue,
                         stop,
                         &sched,
+                        &mut rebuild,
                     );
                 }
                 Ok(false) => {}
@@ -1528,17 +1559,26 @@ mod cuda {
         }
     }
 
-    /// Frees pages of the KV pool until `need` are free, from slots outside `keep`: first
-    /// the pages that idle slots keep past their prefix cache entries and their rings, and
-    /// the copies of entries no longer live, then whole entries with their pages, least
-    /// recently used first, then, with `draft`, the draft's pages if it follows no request.
-    /// Returns whether `need` pages are free.
+    /// What `make_room` may free, each level with what the levels before it free.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Reclaim {
+        /// The pages that idle slots keep past their prefix cache entries and their rings,
+        /// and the copies of entries no longer live.
+        Pages,
+        /// Whole entries with their pages, least recently used first.
+        Entries,
+        /// The draft's pages, if it follows no request.
+        Draft,
+    }
+
+    /// Frees pages of the KV pool until `need` are free, from slots outside `keep`, as far
+    /// as `reclaim` goes. Returns whether `need` pages are free.
     fn make_room(
         model: &mut Model,
         speculator: &mut Speculator,
         need: usize,
         keep: &[usize],
-        draft: bool,
+        reclaim: Reclaim,
     ) -> bool {
         let free = |m: &Model| m.kv_pool().map_or(usize::MAX, PagePool::free_pages);
         if free(model) >= need {
@@ -1556,6 +1596,9 @@ mod cuda {
                 return true;
             }
         }
+        if reclaim < Reclaim::Entries {
+            return false;
+        }
         for (slot, pages) in speculator.evictable_slots(model, keep) {
             match speculator.evict_slot(model, slot) {
                 Ok(()) => eprintln!(
@@ -1568,7 +1611,7 @@ mod cuda {
                 return true;
             }
         }
-        if !draft {
+        if reclaim < Reclaim::Draft {
             return false;
         }
         match speculator.trim_draft(model) {
@@ -1663,7 +1706,7 @@ mod cuda {
         loop {
             let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
             let pages = need(model, active);
-            if make_room(model, speculator, pages, &busy, true) {
+            if make_room(model, speculator, pages, &busy, Reclaim::Draft) {
                 return true;
             }
             let Some(v) = victim(model, active, spare, force) else {
@@ -1841,7 +1884,7 @@ mod cuda {
         };
         let mut keep = busy;
         keep.extend(slot);
-        make_room(model, speculator, mine + others, &keep, true)
+        make_room(model, speculator, mine + others, &keep, Reclaim::Draft)
     }
 
     /// Starts `pick`: a waiting job in the slot the prefix cache gives it, or a swapped-out
@@ -1973,7 +2016,7 @@ mod cuda {
                 };
                 for to in [(end + HEADROOM).min(final_position).max(end), end] {
                     let pages = need(model, speculator, to);
-                    if make_room(model, speculator, pages, &[0], false) {
+                    if make_room(model, speculator, pages, &[0], Reclaim::Entries) {
                         held = to;
                         return true;
                     }
@@ -2034,98 +2077,253 @@ mod cuda {
         }
     }
 
-    /// Prompt and generated tokens per remaining token above which a lone request that
-    /// ran without the draft gets the draft's state rebuilt, by prefilling its tokens
-    /// again, to speculate. A one-row batched step takes about 3.7 ms and speculation about
-    /// 2 ms per token, so each remaining token saves about 1.7 ms, while the rebuild
-    /// prefills about 20,000 tokens per second: it pays off once the remaining tokens
-    /// exceed about 1/34 of the position. Requiring 1/16 leaves room for requests that
-    /// stop well before their limit.
-    const REBUILD_RATIO: usize = 16;
+    /// Positions that a draft rebuild prefills in the time of one batched step of a lone
+    /// request, about: an RTX 5090 prefills about 20,000 positions per second and runs a
+    /// one-row batched step in about 3.6 ms, 72 positions; an RTX 4090 prefilled 72,000
+    /// positions in 9.4 s and stepped in 7.1 ms, 55 positions.
+    const RENT_RATIO: usize = 64;
 
-    /// Moves a lone request from a batch back to speculation in slot 0: commits the taps
-    /// the draft kept while following it, or moves it to slot 0 and rebuilds the draft's
-    /// state from its tokens in an idle slot, which also gives the request's prefix cache
-    /// entry the draft's state. Returns false when it stays batched: it never ran with the
-    /// draft and too few tokens remain to rebuild.
+    /// A draft rebuild in progress, and when it started.
+    type Rebuilding = Option<(Rebuild, Instant)>;
+
+    /// How long the server waits idle before it starts a draft rebuild (`idle_rebuild`):
+    /// agents often send their next request right after a reply, which would otherwise
+    /// wait for the rebuild's step in flight.
+    const IDLE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Moves a lone request from a batch back to speculation in slot 0, when the draft
+    /// follows it: commits the taps the draft kept while following it. Returns false when
+    /// the draft does not follow it.
     fn speculate_again(
         model: &mut Model,
         speculator: &mut Speculator,
-        tower: &mut Tower,
         r: &mut Request,
     ) -> anyhow::Result<bool> {
+        if !r.followed {
+            return Ok(false);
+        }
         let started = Instant::now();
         let from = r.slot;
         let position = model.slot_position(r.slot)?;
         let next = r.next.context("the request has no next token")?;
-        let how = if r.followed {
-            "the draft kept its taps".to_owned()
-        } else {
-            let remaining = r.job.max_tokens - r.output.len();
-            if remaining * REBUILD_RATIO < position {
-                return Ok(false);
-            }
-            let fed = &r.output[..r.output.len() - 1];
-            let tokens: Vec<u32> = r.job.prompt.iter().chain(fed).copied().collect();
-            let key: Vec<u32> = r.job.key().iter().chain(fed).copied().collect();
-            anyhow::ensure!(
-                tokens.len() == position,
-                "{} tokens fed, the slot is at {position}",
-                tokens.len()
-            );
-            // The rebuild prefills every position again in another slot, and the draft
-            // commits them: without room for both, the request stays batched. Moving the
-            // request into slot 0 first copies it while the pool has room for the copy.
-            let moved = if r.slot == 0 {
-                0
-            } else {
-                model.pages_for(position)
-            };
-            let need =
-                model.pages_for(position) + moved + speculator.draft_pages_to(position + MARGIN);
-            if !make_room(model, speculator, need, &[r.slot], true) {
-                eprintln!("no room in the KV pool to rebuild the draft at position {position}");
-                return Ok(false);
-            }
-            // Into slot 0 first, so that the rebuild may take the slot it leaves.
-            speculator.move_to_slot0(model, r.slot)?;
-            r.slot = 0;
-            let free = speculator
-                .idle_slot(model, &[0])
-                .context("no free slot to rebuild the draft in")?;
-            let hidden = model.config().hidden_size;
-            let images = &r.job.images;
-            let mut kept = None;
-            // The draft's rebuild is not the request's prefill, so its encodes are not
-            // reported.
-            let mut encodes = Encodes::default();
-            let mut source = |start: usize, end: usize| {
-                image_rows(tower, hidden, images, &mut kept, &mut encodes, (start, end))
-            };
-            let prompt = Prompt {
-                tokens: &tokens,
-                key: &key,
-                images: if images.is_empty() {
-                    None
-                } else {
-                    Some(&mut source)
-                },
-            };
-            speculator.rebuild(model, free, 0, prompt)?;
-            log_host(speculator);
-            r.followed = true;
-            format!("rebuilt the draft in slot {free}")
-        };
         speculator.move_to_slot0(model, r.slot)?;
         r.slot = 0;
         speculator.resume(model, next)?;
         model.stream().synchronize()?;
         eprintln!(
-            "speculating again at position {position} from slot {from}: {how}, {:.1} ms",
+            "speculating again at position {position} from slot {from}, {:.1} ms",
             started.elapsed().as_secs_f64() * 1e3
         );
         r.followed = false;
         Ok(true)
+    }
+
+    /// Runs the next step of `rebuild` for a sequence whose positions took `prompt`, after
+    /// making room for it beside slots `keep` as far as `reclaim` goes, short of the
+    /// draft's pages. Drops
+    /// the rebuild when there is no room or the step fails. Returns whether the draft now
+    /// holds every position of `prompt`, `None` when no step ran.
+    fn step_rebuild(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        rebuild: &mut Rebuilding,
+        prompt: Prompt<'_>,
+        keep: &[usize],
+        reclaim: Reclaim,
+    ) -> Option<bool> {
+        let (r, _) = rebuild.as_mut()?;
+        let mut keep = keep.to_vec();
+        keep.push(r.slot());
+        let need = speculator.rebuild_pages(model, r, prompt.key);
+        if !make_room(
+            model,
+            speculator,
+            need,
+            &keep,
+            reclaim.min(Reclaim::Entries),
+        ) {
+            eprintln!("no room in the KV pool to rebuild the draft");
+            *rebuild = None;
+            return None;
+        }
+        let (r, _) = rebuild.as_mut()?;
+        let stepped = speculator.rebuild_step(model, r, prompt);
+        log_host(speculator);
+        match stepped {
+            Ok(done) => Some(done),
+            Err(e) => {
+                eprintln!("rebuilding the draft failed: {e:#}");
+                *rebuild = None;
+                None
+            }
+        }
+    }
+
+    /// Drops `rebuild` unless it can go on for a sequence whose positions took `key`.
+    fn keep_rebuild(speculator: &Speculator, model: &Model, rebuild: &mut Rebuilding, key: &[u32]) {
+        if rebuild
+            .as_ref()
+            .is_some_and(|(r, _)| !speculator.rebuild_live(model, r) || !key.starts_with(r.key()))
+        {
+            *rebuild = None;
+        }
+    }
+
+    /// On an idle server, runs a step of a rebuild that gives the draft's state to the
+    /// longest prefix cache entry, when it lacks it (`Speculator::entry_to_rebuild`), in a
+    /// slot without an entry: its conversation's next turn then speculates from the cache
+    /// rather than decoding batched. A rebuild that a request interrupts goes on while
+    /// that request, or the next idle time, continues the same tokens. Returns whether a
+    /// step ran.
+    fn idle_rebuild(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        rebuild: &mut Rebuilding,
+    ) -> bool {
+        let vocab = model.config().vocab_size;
+        let Some((slot, key)) = speculator.entry_to_rebuild(model, vocab) else {
+            *rebuild = None;
+            return false;
+        };
+        keep_rebuild(speculator, model, rebuild, &key);
+        if rebuild.is_none() {
+            let Some(scratch) = speculator.empty_slot(model, &[slot]) else {
+                return false;
+            };
+            match speculator.start_rebuild(model, scratch) {
+                Ok(r) => *rebuild = Some((r, Instant::now())),
+                Err(e) => {
+                    eprintln!("starting a draft rebuild failed: {e:#}");
+                    return false;
+                }
+            }
+            eprintln!(
+                "idle: rebuilding the draft's state for the cached prompt of {} tokens in slot \
+                 {slot}, in slot {scratch}",
+                key.len()
+            );
+        }
+        let prompt = Prompt::text(&key);
+        match step_rebuild(model, speculator, rebuild, prompt, &[slot], Reclaim::Pages) {
+            Some(true) => {
+                if let Some((_, started)) = rebuild.take() {
+                    eprintln!(
+                        "idle: the cached prompt of {} tokens has the draft's state, {:.2} s",
+                        key.len(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                true
+            }
+            Some(false) => true,
+            None => false,
+        }
+    }
+
+    /// Runs a step of a draft rebuild for the lone request of `active`, which decodes
+    /// batched without the draft's state, so that it returns to speculation once the
+    /// draft holds its every position (`followed`, then `speculate_again`). Its reply may
+    /// end at any point, whatever its token limit, so it rents before it buys: the rebuild
+    /// starts, or goes on, once the request's batched steps as the only row could have
+    /// prefilled the positions the rebuild still lacks ([`RENT_RATIO`]), which costs it at
+    /// most about twice the time of the better choice. The steps then run between batched
+    /// steps as prefill chunks do (`floor_steps`), and a request that arrives meanwhile
+    /// waits for one step at most. The rebuild also gives the request's prefix cache
+    /// entry the draft's state. Returns whether a step ran.
+    fn rebuild_turn(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        tower: &mut Tower,
+        active: &mut [Request],
+        rebuild: &mut Rebuilding,
+    ) -> bool {
+        let [r] = active else {
+            return false;
+        };
+        if r.next.is_none() || r.done || r.followed || r.stay_batched {
+            return false;
+        }
+        let generated = &r.output[..r.output.len() - 1];
+        let key: Vec<u32> = r.job.key().iter().chain(generated).copied().collect();
+        keep_rebuild(speculator, model, rebuild, &key);
+        let done = rebuild.as_ref().map_or(0, |(rb, _)| rb.key().len());
+        if r.rent * RENT_RATIO < key.len() - done {
+            return false;
+        }
+        if rebuild.is_none() {
+            if speculator.following() {
+                return false;
+            }
+            let Some(scratch) = speculator.idle_slot(model, &[r.slot]) else {
+                return false;
+            };
+            match speculator.start_rebuild(model, scratch) {
+                Ok(rb) => *rebuild = Some((rb, Instant::now())),
+                Err(e) => {
+                    eprintln!("starting a draft rebuild failed: {e:#}");
+                    return false;
+                }
+            }
+            eprintln!(
+                "rebuilding the draft at position {} of a request in slot {} after {} batched \
+                 steps, in slot {scratch}",
+                key.len(),
+                r.slot,
+                r.rent
+            );
+        }
+        let tokens: Vec<u32> = r.job.prompt.iter().chain(generated).copied().collect();
+        let hidden = model.config().hidden_size;
+        let images = &r.job.images;
+        let mut kept = None;
+        // The draft's rebuild is not the request's prefill, so its encodes are not
+        // reported.
+        let mut encodes = Encodes::default();
+        let mut source = |start: usize, end: usize| {
+            image_rows(tower, hidden, images, &mut kept, &mut encodes, (start, end))
+        };
+        let prompt = Prompt {
+            tokens: &tokens,
+            key: &key,
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(&mut source)
+            },
+        };
+        match step_rebuild(
+            model,
+            speculator,
+            rebuild,
+            prompt,
+            &[r.slot],
+            Reclaim::Entries,
+        ) {
+            Some(true) => {
+                let Some((rb, started)) = rebuild.take() else {
+                    return true;
+                };
+                match speculator.follow_rebuilt(model, rb, &tokens) {
+                    Ok(()) => {
+                        eprintln!(
+                            "rebuilt the draft at position {} in {:.2} s",
+                            tokens.len(),
+                            started.elapsed().as_secs_f64()
+                        );
+                        r.followed = true;
+                    }
+                    Err(e) => eprintln!("following a rebuilt request failed: {e:#}"),
+                }
+                true
+            }
+            Some(false) => true,
+            // Without room or after a failure, the request stays batched rather than try
+            // again after every step.
+            None => {
+                r.stay_batched = true;
+                false
+            }
+        }
     }
 
     /// Runs `active` and the jobs that arrive while any runs, up to `streams` at once, each
@@ -2148,6 +2346,7 @@ mod cuda {
         queue: &Receiver<Vec<Job>>,
         stop: &[u32],
         sched: &Sched,
+        rebuild: &mut Rebuilding,
     ) -> Option<Request> {
         // Requests swapped out to the host tier, to return when they fit.
         let mut parked: Vec<Request> = Vec::new();
@@ -2176,16 +2375,18 @@ mod cuda {
             }
             let chunked = prefill_chunk(model, speculator, tower, &mut active, &mut parked, stop);
             retire(model, speculator, &mut active);
-            // Right after its prefill, a lone request speculates before any batched step,
-            // as it would have from the start.
+            let alone = waiting.is_empty() && parked.is_empty();
+            let chunked =
+                chunked || (alone && rebuild_turn(model, speculator, tower, &mut active, rebuild));
+            // A lone request that the draft follows speculates before any batched step: right
+            // after its prefill, as it would have from the start, or once its rebuild ends.
             if let [r] = active.as_mut_slice()
                 && r.next.is_some()
                 && !r.done
                 && !r.stay_batched
-                && waiting.is_empty()
-                && parked.is_empty()
+                && alone
             {
-                match speculate_again(model, speculator, tower, r) {
+                match speculate_again(model, speculator, r) {
                     Ok(true) => return active.pop(),
                     Ok(false) => {}
                     Err(e) => {
@@ -2365,7 +2566,7 @@ mod cuda {
         let slot = r.slot;
         // The entry copies the slot's rings into pages of the pool.
         if end == boundary && end > r.cached {
-            if make_room(model, speculator, model.ring_pages(), &busy, true) {
+            if make_room(model, speculator, model.ring_pages(), &busy, Reclaim::Draft) {
                 let key = active[i].job.key();
                 if let Err(e) = speculator.save_prefix(model, slot, key, chunk, &busy) {
                     eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
@@ -2461,6 +2662,9 @@ mod cuda {
                         r.followed = false;
                     }
                     r.batched += 1;
+                    if rows.len() == 1 {
+                        r.rent += 1;
+                    }
                     r.next = Some(token);
                     r.done = r.take(&[token], stop).is_break();
                 }

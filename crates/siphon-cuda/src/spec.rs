@@ -502,6 +502,33 @@ struct Batched {
     tokens: Vec<u32>,
 }
 
+/// A rebuild of the draft's state in chunks, from [`Speculator::start_rebuild`].
+#[derive(Debug)]
+pub struct Rebuild {
+    /// The slot it prefills in.
+    slot: usize,
+    /// [`Model::slot_sequence`] of the slot after its reset.
+    slot_sequence: u64,
+    /// The draft sequence ([`Speculator::draft_sequence`]) it builds.
+    sequence: u64,
+    /// The key of the positions it prefilled.
+    key: Vec<u32>,
+}
+
+impl Rebuild {
+    /// The slot it prefills in.
+    #[must_use]
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// The key of the positions it prefilled, from position 0.
+    #[must_use]
+    pub fn key(&self) -> &[u32] {
+        &self.key
+    }
+}
+
 /// Which draft a [`Speculator`] runs.
 #[derive(Clone, Copy, Debug)]
 pub enum DraftSource<'a> {
@@ -716,18 +743,15 @@ impl Speculator {
             model.position() == 0,
             "the speculator prefills from position 0"
         );
-        self.prefill_saving(model, Prompt::text(prompt), chunk, None)
+        self.prefill_whole(model, Prompt::text(prompt), chunk)
     }
 
-    /// [`Self::prefill`], which also saves the draft's rings into prefix cache entry
-    /// `entry`, whose tokens start `prompt`: prefill then stops at the entry's boundary to
-    /// copy them, which leaves its results as they were.
-    fn prefill_saving(
+    /// [`Self::prefill`] of a [`Prompt`].
+    fn prefill_whole(
         &mut self,
         model: &mut Model,
-        mut prompt: Prompt<'_>,
+        prompt: Prompt<'_>,
         chunk: usize,
-        entry: Option<usize>,
     ) -> anyhow::Result<u32> {
         prompt.check()?;
         self.fence_host()?;
@@ -735,15 +759,7 @@ impl Speculator {
         self.draft_sequence += 1;
         let tokens = prompt.tokens;
         self.start_prompt(model, tokens)?;
-        let mut start = 0;
-        if let Some(i) = entry {
-            let end = self.entry_len(i);
-            let images = Prompt::images(&mut prompt.images);
-            self.prefill_rows(model, &tokens[..end], images, chunk)?;
-            self.save_entry_rings(model, i)?;
-            start = end;
-        }
-        let first = self.prefill_rows(model, &tokens[start..], prompt.images, chunk)?;
+        let first = self.prefill_rows(model, tokens, prompt.images, chunk)?;
         self.end_prompt(model, tokens.len(), first)
     }
 
@@ -935,34 +951,159 @@ impl Speculator {
     }
 
     /// Builds the draft's state for a sequence that ran without it in slot `from`, whose
-    /// positions 0 .. `tokens.len()` took `tokens`: prefills them with taps into slot
-    /// `slot`, whose sequence is lost, and commits the taps. The draft then follows the sequence from
-    /// the end of `tokens`, for [`Self::resume`]. Prefill sums in other orders than the
-    /// verify pass, so the draft gets slightly different taps than speculation would have
-    /// committed; that changes its drafts, never the target's tokens.
-    ///
-    /// With a prefix cache, the entry of slot `from`, the slot that holds the sequence,
-    /// also gets the draft's rings when its key starts `tokens`' key, so that a later prompt
-    /// that starts with them can speculate from the cache.
+    /// positions 0 .. `tokens.len()` took `tokens`, in one go: [`Self::start_rebuild`] in
+    /// slot `slot`, whose sequence is lost, [`Self::rebuild_step`] until the draft holds
+    /// every position, then [`Self::follow_rebuilt`]. The draft then follows the sequence
+    /// from the end of `tokens`, for [`Self::resume`].
     pub fn rebuild(
         &mut self,
         model: &mut Model,
         slot: usize,
         from: usize,
-        tokens: Prompt<'_>,
+        mut tokens: Prompt<'_>,
     ) -> anyhow::Result<()> {
         ensure!(
             slot != from,
             "the draft is rebuilt in another slot than the sequence's"
         );
         tokens.check()?;
-        let chunk = self.prefill_chunk;
-        let len = tokens.tokens.len();
-        // Before the slots swap places in `with_slot`.
-        let entry = self.entry_starting(model, from, tokens.key, chunk);
+        let mut rebuild = self.start_rebuild(model, slot)?;
+        loop {
+            let step = Prompt {
+                tokens: tokens.tokens,
+                key: tokens.key,
+                images: Prompt::images(&mut tokens.images),
+            };
+            if self.rebuild_step(model, &mut rebuild, step)? {
+                break;
+            }
+        }
+        self.follow_rebuilt(model, rebuild, tokens.tokens)
+    }
+
+    /// Starts building the draft's state for a sequence that ran without it, in chunks
+    /// that other work may come between ([`Self::rebuild_step`]): resets slot `slot`, whose
+    /// sequence is lost, for the rebuild's prefill, and readies the draft for another
+    /// sequence. Entries whose draft state lies in the draft's global caches lose it.
+    pub fn start_rebuild(&mut self, model: &mut Model, slot: usize) -> anyhow::Result<Rebuild> {
+        ensure!(!self.following(), "the draft follows a sequence");
         self.fence_host()?;
         model.reset_slot(slot)?;
-        model.with_slot(slot, |m| self.prefill_saving(m, tokens, chunk, entry))?;
+        // The draft's global caches now take another sequence.
+        self.draft_sequence += 1;
+        self.draft.reset();
+        self.tail_rows = 0;
+        self.prompt_len = 0;
+        Ok(Rebuild {
+            slot,
+            slot_sequence: model.slot_sequence(slot)?,
+            sequence: self.draft_sequence,
+            key: Vec::new(),
+        })
+    }
+
+    /// Whether `rebuild` can go on: nothing else used its slot or the draft since its last
+    /// step.
+    #[must_use]
+    pub fn rebuild_live(&self, model: &Model, rebuild: &Rebuild) -> bool {
+        let done = rebuild.key.len();
+        rebuild.sequence == self.draft_sequence
+            && !self.following()
+            && self.draft.committed() == done
+            && model.slot_sequence(rebuild.slot).ok() == Some(rebuild.slot_sequence)
+            && model.slot_position(rebuild.slot).ok() == Some(done)
+    }
+
+    /// The position the next [`Self::rebuild_step`] of `rebuild` for a sequence whose
+    /// positions took `key` prefills up to: a chunk more, or the boundary of a prefix cache
+    /// entry that `key` starts with, or the end of `key`.
+    #[must_use]
+    pub fn rebuild_end(&self, model: &Model, rebuild: &Rebuild, key: &[u32]) -> usize {
+        let done = rebuild.key.len();
+        let mut end = (done + self.prefill_chunk).min(key.len());
+        if let Some(boundary) = self.entry_after(model, key, done, self.prefill_chunk) {
+            end = end.min(boundary);
+        }
+        end
+    }
+
+    /// Pages of the KV pool that the next [`Self::rebuild_step`] of `rebuild` maps for
+    /// `key`, in its slot and the draft.
+    #[must_use]
+    pub fn rebuild_pages(&self, model: &Model, rebuild: &Rebuild, key: &[u32]) -> usize {
+        let end = self.rebuild_end(model, rebuild, key);
+        model.slot_pages_to(rebuild.slot, end).unwrap_or(0) + self.draft.pages_to(end + STEPS + 1)
+    }
+
+    /// Prefills the next rows of `rebuild` for the sequence whose positions so far took
+    /// `tokens`, whose key must start with the rows it prefilled, up to
+    /// [`Self::rebuild_end`], in its slot, and commits their taps. At the boundary of a
+    /// live prefix cache entry that holds the rebuilt positions and lacks the draft's
+    /// state, copies the draft's rings into it, so that a later prompt that starts with
+    /// it can speculate from the cache. Prefill rows follow the chunks of a prefill from
+    /// position 0 up to the entry, which so gets the rings that prefilling its prompt with
+    /// the draft gives. Prefill sums in other orders than the verify pass, so past the
+    /// prompt the draft gets slightly different taps than speculation would have
+    /// committed; that changes its drafts, never the target's tokens. Returns whether the
+    /// draft holds every position of `tokens`.
+    pub fn rebuild_step(
+        &mut self,
+        model: &mut Model,
+        rebuild: &mut Rebuild,
+        mut tokens: Prompt<'_>,
+    ) -> anyhow::Result<bool> {
+        tokens.check()?;
+        ensure!(
+            self.rebuild_live(model, rebuild),
+            "something else used the rebuild's slot or the draft"
+        );
+        let done = rebuild.key.len();
+        ensure!(
+            tokens.key.starts_with(&rebuild.key),
+            "the sequence differs from the rebuilt one"
+        );
+        let end = self.rebuild_end(model, rebuild, tokens.key);
+        if end > done {
+            let chunk = self.prefill_chunk;
+            let images = Prompt::images(&mut tokens.images);
+            model.with_slot(rebuild.slot, |m| {
+                self.prefill_rows(m, &tokens.tokens[done..end], images, chunk)
+            })?;
+            rebuild.key.extend_from_slice(&tokens.key[done..end]);
+        }
+        for i in self.entries_without_draft(model, &rebuild.key) {
+            self.save_entry_rings(model, i)?;
+        }
+        Ok(end == tokens.key.len())
+    }
+
+    /// Makes the draft follow the sequence that `rebuild` holds every position of, whose
+    /// positions took `tokens`, from its end, for [`Self::resume`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the rebuild by value ends it"
+    )]
+    pub fn follow_rebuilt(
+        &mut self,
+        model: &Model,
+        rebuild: Rebuild,
+        tokens: &[u32],
+    ) -> anyhow::Result<()> {
+        let len = rebuild.key.len();
+        ensure!(tokens.len() == len, "the rebuild holds {len} positions");
+        ensure!(
+            rebuild.sequence == self.draft_sequence && self.draft.committed() == len,
+            "something else used the draft"
+        );
+        let latest: Vec<i32> = tokens
+            .iter()
+            .rev()
+            .take(NOTED_PROMPT)
+            .map(|&t| i32::try_from(t))
+            .collect::<Result<_, _>>()?;
+        self.draft
+            .note_tokens(model.stream(), model.draft_shared(), &latest)?;
+        self.prompt_len = len;
         self.batched = Some(Batched {
             start: len,
             tokens: Vec::new(),
