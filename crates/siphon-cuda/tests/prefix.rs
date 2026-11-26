@@ -14,7 +14,9 @@
 //!
 //! The prompts are slices of the tokens of `reference/out/anyhow-chunked.safetensors` (or
 //! `SIPHON_CAPTURE`). The `dflash` tests run the drafter in `SIPHON_DFLASH`, the `dflash2`
-//! tests the one in `SIPHON_DFLASH2`, and pass without them.
+//! tests the one in `SIPHON_DFLASH2`, and pass without them. `SIPHON_KV` names the global
+//! caches' format (`fp8` unless set, or `bf16`, `nvfp4`, `mixed`), and `SIPHON_KV_POOL_GIB`
+//! puts them in a page pool, as the server runs them.
 
 #![cfg(target_os = "linux")]
 
@@ -29,6 +31,7 @@ use siphon_cuda::{
     model::{DEFAULT_PREFILL_CHUNK, Model},
     ops::attention::KvFormat,
     spec::{DraftSource, Drafts, Prompt, Speculator, Width, load_draft},
+    vmm::{PagePool, Pooled},
     weights::{WeightFormat, Weights},
 };
 
@@ -184,8 +187,278 @@ fn load(
     Ok((gpu, model, spec))
 }
 
-/// The served cache.
-const SERVED: KvFormat = KvFormat::Fp8;
+/// [`load`] with every global cache in a page pool of `pages` pages, as the server runs.
+fn load_pooled(slots: usize, pages: usize) -> anyhow::Result<(Gpu, Model, Speculator)> {
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let gpu = Gpu::new(0)?;
+    let config = TextConfig::load(&model_dir)?;
+    let passes = config.loop_config.num_passes;
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+    let pool = PagePool::new(gpu.context(), pages)?;
+    let mut model = Model::with_kv_pool(
+        &gpu,
+        config,
+        weights,
+        passes,
+        CAPACITY,
+        served()?,
+        WeightFormat::Fp8,
+        Some(pool),
+    )?;
+    model.add_slots(slots - 1)?;
+    let draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Bundled,
+        CAPACITY,
+        &DraftOptions::fast(),
+    )?;
+    let spec = Speculator::with_draft(&model, draft, Width::Fixed(7))?;
+    Ok((gpu, model, spec))
+}
+
+/// Tokens and per-step logits hashes of a sequence decoded in batched steps.
+type Steps = (Vec<u32>, Vec<u64>);
+
+/// Runs `steps` batched steps of `rows`, `(slot, last token)`, and appends each row's token
+/// and logits hash to `out`, by row.
+fn batch_steps(
+    model: &mut Model,
+    rows: &mut [(usize, u32)],
+    out: &mut [&mut Steps],
+    steps: usize,
+) -> anyhow::Result<()> {
+    let vocab = model.config().unpadded_vocab_size;
+    for _ in 0..steps {
+        let next = model.step_batch(rows)?;
+        let logits = model.batch_logits(rows.len())?;
+        for (r, token) in next.into_iter().enumerate() {
+            out[r].0.push(token);
+            out[r].1.push(hash(&logits[r * vocab..(r + 1) * vocab]));
+            rows[r].1 = token;
+        }
+    }
+    Ok(())
+}
+
+/// Reads `bytes` bytes at device address `ptr`.
+fn read_device(ptr: u64, bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let mut out = vec![0u8; bytes];
+    // SAFETY: the caller passes a mapped device range of `bytes` bytes.
+    unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut out, ptr) }?;
+    Ok(out)
+}
+
+/// The bytes of slot `slot`'s global caches below its position, and of its rings and conv
+/// states.
+fn slot_bytes(model: &Model, slot: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+    model.stream().synchronize()?;
+    let position = model.slot_position(slot)?;
+    let kv = model.global_kv(slot)?;
+    let mut out = Vec::new();
+    for (&cache, &bytes) in kv.caches.iter().zip(&kv.position_bytes) {
+        out.push(read_device(cache, position * bytes)?);
+    }
+    for span in model.local_spans(slot)? {
+        out.push(read_device(span.ptr, span.bytes)?);
+    }
+    Ok(out)
+}
+
+/// `Model::transfer_slot` moves a sequence to another slot, by copying while the pool has
+/// pages free and by moving its pages when it does not: either way the new slot holds the
+/// same bytes and decodes the same tokens, and a page move leaves the old slot no pages.
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn transfer_moves_a_sequence_exactly() -> anyhow::Result<()> {
+    let (_gpu, mut model, _spec) = load_pooled(4, 512)?;
+    let capture = capture_tokens()?;
+    let p = &capture[..4500];
+    model.reset_slot(3)?;
+    let first = model.prefill_slot(3, p, CHUNK)?;
+    let mut want: Steps = Default::default();
+    batch_steps(&mut model, &mut [(3, first)], &mut [&mut want], 8)?;
+    model.unmap_slot_from(3, 0)?;
+    model.reset_slot(1)?;
+    model.prefill_slot(1, p, CHUNK)?;
+    let before = slot_bytes(&model, 1)?;
+    let same = |model: &Model, to: usize, how: &str| -> anyhow::Result<()> {
+        let after = slot_bytes(model, to)?;
+        for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+            ensure!(a == b, "buffer {i} differs after a {how} into slot {to}");
+        }
+        Ok(())
+    };
+    // A copy: the pool has the pages.
+    model.transfer_slot(1, 2)?;
+    same(&model, 2, "copy")?;
+    // A page move: other memory takes the pool's pages until one fewer is free than a
+    // copy needs. A slot alone cannot: an NVFP4 slot of the capacity holds 144 pages.
+    let pool = model.kv_pool().context("pooled")?;
+    let page = pool.page_bytes();
+    let take = (pool.free_pages() + 1).saturating_sub(model.pages_for(p.len()));
+    let mut filler = Pooled::reserve(pool, take * page)?;
+    filler.map_to(take * page, model.stream())?;
+    let free = model.kv_pool().context("pooled")?.free_pages();
+    ensure!(
+        free < model.pages_for(p.len()),
+        "{free} pages are still free"
+    );
+    model.transfer_slot(2, 0)?;
+    same(&model, 0, "page move")?;
+    ensure!(
+        model.slot_pages(2)? == 0,
+        "slot 2 keeps its pages after a page move"
+    );
+    drop(filler);
+    model.transfer_slot(0, 1)?;
+    same(&model, 1, "copy back")?;
+    let mut got: Steps = Default::default();
+    batch_steps(&mut model, &mut [(1, first)], &mut [&mut got], 8)?;
+    ensure!(got == want, "the moved sequence decodes other tokens");
+    // An idle slot that returned its rings and the pages past its first chunk, as the
+    // server leaves one for its prefix cache entry, moves what it kept. Copying the
+    // returned rings once crashed the driver.
+    model.reset_slot(1)?;
+    model.prefill_slot(1, p, CHUNK)?;
+    model.unmap_slot_from(1, CHUNK)?;
+    model.transfer_slot(1, 2)?;
+    let kv = model.global_kv(2)?;
+    let kept = slot_bytes(&model, 2)?;
+    for (i, ((a, b), bytes)) in before.iter().zip(&kept).zip(&kv.position_bytes).enumerate() {
+        ensure!(
+            a[..CHUNK * bytes] == b[..],
+            "global cache {i} differs below the kept chunk"
+        );
+    }
+    println!("transfers kept every byte");
+    Ok(())
+}
+
+/// Sequences swapped out to the host tier and back (`Speculator::park`, `unpark`), as the
+/// server's round robin does, continue with the tokens and logits of sequences that never
+/// left their slot: one parked mid-decode and returned to another slot after a second
+/// sequence took its pages, one parked mid-prefill. The pool's pages all return.
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn parked_sequences_return_exactly() -> anyhow::Result<()> {
+    let (_gpu, mut model, mut spec) = load_pooled(3, 512)?;
+    let capture = capture_tokens()?;
+    let p = &capture[..4500];
+    let q = &capture[2000..5000];
+    let total = model.kv_pool().context("pooled")?.total_pages();
+
+    // The references: each alone in slot 1, never moved.
+    let mut want_p: Steps = (Vec::new(), Vec::new());
+    model.reset_slot(1)?;
+    let first = model.prefill_slot(1, p, CHUNK)?;
+    let (want_token, want_first) = (first, hash(&model.logits()?));
+    batch_steps(&mut model, &mut [(1, first)], &mut [&mut want_p], 40)?;
+    let mut want_q: Steps = (Vec::new(), Vec::new());
+    model.reset_slot(1)?;
+    let first_q = model.prefill_slot(1, q, CHUNK)?;
+    batch_steps(&mut model, &mut [(1, first_q)], &mut [&mut want_q], 20)?;
+    model.reset_slot(1)?;
+
+    spec.enable_prefix_cache(&model, 2, TTL)?;
+    spec.enable_host_cache(&model, HOST_BYTES)?;
+
+    // `p` decodes 20 steps in slot 1, then leaves for the host tier.
+    let (slot, cached) = spec.claim_slot(&mut model, p, CHUNK, &[])?;
+    ensure!(cached == 0, "nothing is cached yet");
+    let first = prefill_batched(&mut model, &mut spec, slot, p, 0, &[])?;
+    ensure!(first == want_token, "p's first token differs");
+    let mut got_p: Steps = (Vec::new(), Vec::new());
+    batch_steps(&mut model, &mut [(slot, first)], &mut [&mut got_p], 20)?;
+    let fed: Vec<u32> = p
+        .iter()
+        .chain(&[first])
+        .chain(&got_p.0[..19])
+        .copied()
+        .collect();
+    let id = spec
+        .park(&mut model, slot, &fed, p.len())?
+        .context("p fits the host tier")?;
+    ensure!(
+        model.slot_position(slot)? == 0,
+        "the parked slot keeps its sequence"
+    );
+
+    // `q` takes slot 1's pages and decodes, then `p` returns to another slot and both run.
+    let (slot_q, _) = spec.claim_slot(&mut model, q, CHUNK, &[])?;
+    let first_q = prefill_batched(&mut model, &mut spec, slot_q, q, 0, &[])?;
+    let mut got_q: Steps = (Vec::new(), Vec::new());
+    batch_steps(&mut model, &mut [(slot_q, first_q)], &mut [&mut got_q], 10)?;
+    // Not the slot it left, so that it returns to other addresses.
+    let (slot_p, position) = spec.unpark(&mut model, id, &[slot_q, slot])?;
+    ensure!(
+        position == fed.len(),
+        "p returned at {position}, not {}",
+        fed.len()
+    );
+    ensure!(slot_p != slot, "p returns to another slot than it left");
+    let last_p = *got_p.0.last().context("p decoded")?;
+    let last_q = *got_q.0.last().context("q decoded")?;
+    let mut rows = [(slot_p, last_p), (slot_q, last_q)];
+    let (mut more_p, mut more_q): (Steps, Steps) = Default::default();
+    batch_steps(&mut model, &mut rows, &mut [&mut more_p, &mut more_q], 10)?;
+    got_p.0.extend(more_p.0);
+    got_p.1.extend(more_p.1);
+    got_q.0.extend(more_q.0);
+    got_q.1.extend(more_q.1);
+    ensure!(got_p.0 == want_p.0[..30], "p's tokens differ after a swap");
+    ensure!(got_p.1 == want_p.1[..30], "p's logits differ after a swap");
+    ensure!(
+        got_q.0 == want_q.0,
+        "q's tokens differ beside a returned sequence"
+    );
+    ensure!(
+        got_q.1 == want_q.1,
+        "q's logits differ beside a returned sequence"
+    );
+
+    // `p` again from position 0, parked after its first chunk, then prefilled to the end.
+    for s in [slot_p, slot_q] {
+        spec.evict_slot(&mut model, s)?;
+    }
+    let (slot, _) = spec.claim_slot(&mut model, &capture[..4499], CHUNK, &[])?;
+    model.reset_slot(slot)?;
+    model.prefill_slot(slot, &p[..CHUNK], CHUNK)?;
+    let id = spec
+        .park(&mut model, slot, &p[..CHUNK], p.len())?
+        .context("a chunk fits the host tier")?;
+    let (slot, position) = spec.unpark(&mut model, id, &[])?;
+    ensure!(position == CHUNK, "the prefill returned at {position}");
+    model.prefill_slot(slot, &p[CHUNK..2 * CHUNK], CHUNK)?;
+    let first = model.prefill_slot(slot, &p[2 * CHUNK..], CHUNK)?;
+    ensure!(
+        first == want_token,
+        "the first token differs after a swap mid-prefill"
+    );
+    ensure!(
+        hash(&model.logits()?) == want_first,
+        "the first token's logits differ after a swap mid-prefill"
+    );
+    for s in 0..model.slots() {
+        spec.evict_slot(&mut model, s)?;
+    }
+    spec.trim_draft(&model)?;
+    let free = model.kv_pool().context("pooled")?.free_pages();
+    ensure!(
+        free == total,
+        "{free} of {total} pages are free after every slot left"
+    );
+    println!("parked sequences returned exactly; {total} pages all free");
+    Ok(())
+}
+
+/// The served cache: `SIPHON_KV`, FP8 unless set.
+fn served() -> anyhow::Result<KvFormat> {
+    env::var("SIPHON_KV").map_or(Ok(KvFormat::Fp8), |kv| {
+        kv.parse().map_err(|e| anyhow::anyhow!("SIPHON_KV: {e}"))
+    })
+}
 
 fn prefix_cache_matches_prefill(
     drafter: Option<&std::path::Path>,
@@ -810,7 +1083,7 @@ fn host_cache_round_trips(drafter: Option<&std::path::Path>, kv: KvFormat) -> an
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn host_cache_round_trips_bundled() -> anyhow::Result<()> {
-    host_cache_round_trips(None, SERVED)
+    host_cache_round_trips(None, served()?)
 }
 
 #[test]
@@ -820,13 +1093,13 @@ fn host_cache_round_trips_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    host_cache_round_trips(Some(std::path::Path::new(&dir)), SERVED)
+    host_cache_round_trips(Some(std::path::Path::new(&dir)), served()?)
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn host_cache_matches_prefill_bundled() -> anyhow::Result<()> {
-    host_cache_matches_prefill(None, SERVED)
+    host_cache_matches_prefill(None, served()?)
 }
 
 #[test]
@@ -836,13 +1109,13 @@ fn host_cache_matches_prefill_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    host_cache_matches_prefill(Some(std::path::Path::new(&dir)), SERVED)
+    host_cache_matches_prefill(Some(std::path::Path::new(&dir)), served()?)
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn prefix_cache_entries_bundled() -> anyhow::Result<()> {
-    prefix_cache_entries(None, SERVED)
+    prefix_cache_entries(None, served()?)
 }
 
 #[test]
@@ -852,7 +1125,7 @@ fn prefix_cache_entries_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    prefix_cache_entries(Some(std::path::Path::new(&dir)), SERVED)
+    prefix_cache_entries(Some(std::path::Path::new(&dir)), served()?)
 }
 
 #[test]
@@ -862,13 +1135,13 @@ fn prefix_cache_matches_prefill_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)), SERVED)
+    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)), served()?)
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn prefix_cache_matches_prefill_bundled() -> anyhow::Result<()> {
-    prefix_cache_matches_prefill(None, SERVED)
+    prefix_cache_matches_prefill(None, served()?)
 }
 
 #[test]
@@ -878,7 +1151,7 @@ fn prefix_cache_matches_prefill_dflash() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH is not set; skipped");
         return Ok(());
     };
-    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)), SERVED)
+    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)), served()?)
 }
 
 #[test]

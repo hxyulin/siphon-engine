@@ -107,6 +107,9 @@ pub struct SharedWeights<'a> {
     /// Whether `lm_head` is in mapped host memory, which kernels read over PCIe: fine for
     /// the fold at load and for gathering rows, too slow for the exact head's products.
     pub lm_head_on_host: bool,
+    /// The target's KV page pool, from which a draft built with these takes its global
+    /// layers' memory as it commits positions, if the target's caches are pooled.
+    pub kv_pool: Option<&'a crate::vmm::PagePool>,
 }
 
 impl<'a> From<&'a Weights> for SharedWeights<'a> {
@@ -116,6 +119,7 @@ impl<'a> From<&'a Weights> for SharedWeights<'a> {
             embed_norm: &weights.embed_norm,
             lm_head: weights.lm_head.slice(),
             lm_head_on_host: weights.lm_head.is_host(),
+            kv_pool: None,
         }
     }
 }
@@ -152,6 +156,7 @@ impl<'a> From<&'a SharedTensors> for SharedWeights<'a> {
             embed_norm: &tensors.embed_norm,
             lm_head: &tensors.lm_head,
             lm_head_on_host: false,
+            kv_pool: None,
         }
     }
 }

@@ -194,6 +194,7 @@ impl Model {
             self.visits.iter().all(|v| v.kv.holds(last)),
             "the global KV caches cannot hold position {last}"
         );
+        super::map_visits(&mut self.visits, last + 1, &Arc::clone(&self.ctx.stream))?;
         let keep = match accept {
             Accept::Greedy => 0,
             Accept::Rows(n) => {

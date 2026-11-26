@@ -2,7 +2,7 @@
 //! draft cache, block attention, the Markov head and the LM-head fold. The products run
 //! through [`crate::ops::linear::Linear`]. [`crate::draft::Draft`] puts them together.
 
-use std::sync::Arc;
+use std::{mem::ManuallyDrop, sync::Arc};
 
 use anyhow::{Context as _, bail, ensure};
 use cudarc::driver::{
@@ -13,6 +13,7 @@ use half::bf16;
 
 use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 use crate::ops::linear::launch_by_value;
+use crate::vmm::{PagePool, Pooled};
 use crate::weights::draft::{HEAD_DIM, HIDDEN, KV_HEADS, RANK, TAPS};
 
 /// Rows of a draft block: the anchor and 7 mask rows.
@@ -348,11 +349,30 @@ fn race_args(
 /// `fp8` as E4M3 of the BF16 values (see `put` in the kernel). Position `p` sits in slot
 /// `p % slots`.
 pub struct KvCache {
-    /// The keys' and values' bytes.
-    pub k: CudaSlice<u8>,
-    pub v: CudaSlice<u8>,
+    /// The keys' and values' bytes. With `pooled`, their addresses are the reservations',
+    /// which own the memory, and dropping the cache leaks them.
+    pub k: ManuallyDrop<CudaSlice<u8>>,
+    pub v: ManuallyDrop<CudaSlice<u8>>,
     pub slots: usize,
     pub fp8: bool,
+    /// For a global layer in pooled memory, the keys' and values' reservations.
+    pooled: Option<[Pooled; 2]>,
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        // SAFETY: neither slice is used again.
+        let (k, v) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.k),
+                ManuallyDrop::take(&mut self.v),
+            )
+        };
+        if self.pooled.is_some() {
+            // The reservations own the addresses and free them after this.
+            let _ = (k.leak(), v.leak());
+        }
+    }
 }
 
 impl KvCache {
@@ -366,11 +386,103 @@ impl KvCache {
         ensure!(slots > 0, "a cache needs at least one slot");
         let bytes = slots * KV_WIDTH * if fp8 { 1 } else { 2 };
         Ok(Self {
-            k: stream.alloc_zeros(bytes)?,
-            v: stream.alloc_zeros(bytes)?,
+            k: ManuallyDrop::new(stream.alloc_zeros(bytes)?),
+            v: ManuallyDrop::new(stream.alloc_zeros(bytes)?),
             slots,
             fp8,
+            pooled: None,
         })
+    }
+
+    /// [`KvCache::with_format`] at addresses reserved for `slots` positions, backed by
+    /// pages of `pool` only as [`KvCache::map`] asks.
+    pub fn pooled(
+        stream: &Arc<CudaStream>,
+        slots: usize,
+        fp8: bool,
+        pool: &PagePool,
+    ) -> anyhow::Result<Self> {
+        ensure!(slots > 0, "a cache needs at least one slot");
+        let bytes = slots * KV_WIDTH * if fp8 { 1 } else { 2 };
+        let keys = Pooled::reserve(pool, bytes)?;
+        let values = Pooled::reserve(pool, bytes)?;
+        // SAFETY: each address is a reservation of at least `bytes` that lives as long as
+        // the cache, and `Drop` leaks the slices. Kernels touch only mapped positions.
+        let (k, v) = unsafe {
+            (
+                stream.upgrade_device_ptr(keys.ptr(), bytes),
+                stream.upgrade_device_ptr(values.ptr(), bytes),
+            )
+        };
+        Ok(Self {
+            k: ManuallyDrop::new(k),
+            v: ManuallyDrop::new(v),
+            slots,
+            fp8,
+            pooled: Some([keys, values]),
+        })
+    }
+
+    /// Whether the cache's memory comes from a page pool.
+    #[must_use]
+    pub fn is_pooled(&self) -> bool {
+        self.pooled.is_some()
+    }
+
+    /// Bytes of one position in the keys or the values.
+    #[must_use]
+    pub fn position_bytes(&self) -> usize {
+        KV_WIDTH * if self.fp8 { 1 } else { 2 }
+    }
+
+    /// Pages more that [`KvCache::map`] of `positions` would take.
+    #[must_use]
+    pub fn pages_to(&self, positions: usize) -> usize {
+        let bytes = positions.min(self.slots) * self.position_bytes();
+        self.pooled
+            .as_ref()
+            .map_or(0, |p| p.iter().map(|b| b.pages_to(bytes)).sum())
+    }
+
+    /// Backs the positions below `positions` with pages, zeroed on `stream`. Does nothing
+    /// for a cache that is not pooled.
+    pub fn map(&mut self, positions: usize, stream: &CudaStream) -> anyhow::Result<()> {
+        let bytes = positions.min(self.slots) * self.position_bytes();
+        if let Some(pooled) = &mut self.pooled {
+            for b in pooled {
+                b.map_to(bytes, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the pages past the first `positions` to the pool. Queued work must not
+    /// touch them any more.
+    pub fn unmap_from(&mut self, positions: usize) -> anyhow::Result<()> {
+        let bytes = positions.min(self.slots) * self.position_bytes();
+        if let Some(pooled) = &mut self.pooled {
+            for b in pooled {
+                b.unmap_from(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Positions whose memory is backed: every slot unless pooled.
+    #[must_use]
+    pub fn mapped(&self) -> usize {
+        match &self.pooled {
+            Some([keys, _]) => (keys.mapped_bytes() / self.position_bytes()).min(self.slots),
+            None => self.slots,
+        }
+    }
+
+    /// Pages of the pool that the keys and values hold.
+    #[must_use]
+    pub fn held_pages(&self) -> usize {
+        self.pooled
+            .as_ref()
+            .map_or(0, |p| p.iter().map(|b| b.pages().len()).sum())
     }
 
     /// Device bytes of the keys and values.
@@ -731,8 +843,8 @@ impl DraftKernels {
             .arg(&k)
             .arg(&v)
             .arg(&row_stride)
-            .arg(&mut cache.k)
-            .arg(&mut cache.v)
+            .arg(&mut *cache.k)
+            .arg(&mut *cache.v)
             .arg(&start)
             .arg(&slots)
             .arg(&fp8);
@@ -836,8 +948,8 @@ impl DraftKernels {
         };
         let mut args = KernelArgs::default();
         args.ptr(q, stream)
-            .ptr(&cache.k, stream)
-            .ptr(&cache.v, stream)
+            .ptr(&*cache.k, stream)
+            .ptr(&*cache.v, stream)
             .i32(slots)
             .opt(control, stream)
             .i32(window)
@@ -1251,8 +1363,8 @@ impl DraftKernels {
         let mut fp8_layers = 0;
         for (layer, cache) in caches.iter_mut().enumerate() {
             let slots = i32_arg("slots", cache.slots)?;
-            args.ptr_mut(&mut cache.k, stream)
-                .ptr_mut(&mut cache.v, stream)
+            args.ptr_mut(&mut *cache.k, stream)
+                .ptr_mut(&mut *cache.v, stream)
                 .i32(slots);
             fp8_layers |= i32::from(cache.fp8) << layer;
         }
@@ -1311,8 +1423,8 @@ impl DraftKernels {
             .f32(eps)
             .ptr(q_norm, stream)
             .ptr(k_norm, stream)
-            .ptr_mut(&mut cache.k, stream)
-            .ptr_mut(&mut cache.v, stream)
+            .ptr_mut(&mut *cache.k, stream)
+            .ptr_mut(&mut *cache.v, stream)
             .i32(slots)
             .i32(i32::from(limit))
             .i32(rope as i32)

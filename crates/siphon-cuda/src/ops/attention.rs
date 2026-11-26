@@ -23,7 +23,7 @@
 //! picks its kernels when they are launched, so a captured graph holds the variant of each
 //! cache and nothing branches when it replays.
 
-use std::sync::Arc;
+use std::{mem::ManuallyDrop, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
@@ -40,6 +40,7 @@ use crate::{
         norm::KvConvWeights,
         spec::{BATCH_ROWS, BATCH_STATE_WORDS, BatchRows},
     },
+    vmm::{PagePool, Pooled},
 };
 
 /// Query heads.
@@ -136,9 +137,33 @@ pub enum KvData {
 /// cache at position `p` holds the tokens at positions below `p`.
 #[derive(Debug)]
 pub struct KvCache {
-    data: KvData,
+    /// The buffers. With `pooled`, their addresses are the pooled reservations', which own
+    /// the memory, and dropping the cache leaks them.
+    data: ManuallyDrop<KvData>,
     slots: usize,
     window: Option<usize>,
+    /// For a global cache in pooled memory, the keys' and values' reservations, of which
+    /// the positions below [`KvCache::mapped`] are backed.
+    pooled: Option<[Pooled; 2]>,
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        // SAFETY: `data` is not used again.
+        let data = unsafe { ManuallyDrop::take(&mut self.data) };
+        if self.pooled.is_none() {
+            return;
+        }
+        // The reservations own the addresses; they unmap and free them after this.
+        match data {
+            KvData::Bf16 { keys, values } => {
+                let _ = (keys.leak(), values.leak());
+            }
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                let _ = (keys.leak(), values.leak());
+            }
+        }
+    }
 }
 
 impl KvCache {
@@ -176,6 +201,136 @@ impl KvCache {
         Self::new(stream, capacity, None, format)
     }
 
+    /// [`KvCache::global_with_format`] at addresses reserved for `capacity` positions,
+    /// backed by pages of `pool` only as [`KvCache::map`] asks.
+    pub fn global_pooled(
+        stream: &Arc<CudaStream>,
+        capacity: usize,
+        format: KvFormat,
+        pool: &PagePool,
+    ) -> anyhow::Result<Self> {
+        ensure!(capacity > 0, "a KV cache needs at least one slot");
+        u32::try_from(capacity).context("too many KV cache slots")?;
+        let (len, bytes) = match format {
+            KvFormat::Bf16 => (capacity * KV_ROW, capacity * KV_ROW * size_of::<bf16>()),
+            KvFormat::Fp8 => (capacity * KV_ROW, capacity * KV_ROW),
+            KvFormat::Nvfp4 => (capacity * FP4_ROW, capacity * FP4_ROW),
+            KvFormat::Mixed => anyhow::bail!("a mixed layout gives each cache FP8 or NVFP4"),
+        };
+        let keys = Pooled::reserve(pool, bytes)?;
+        let values = Pooled::reserve(pool, bytes)?;
+        // SAFETY: each address is a reservation of at least `len` elements that lives as
+        // long as the cache; `Drop` leaks the slices, so cudarc never frees them. Kernels
+        // touch only positions below `mapped`, which `map` backs first.
+        let data = unsafe {
+            match format {
+                KvFormat::Bf16 => KvData::Bf16 {
+                    keys: stream.upgrade_device_ptr(keys.ptr(), len),
+                    values: stream.upgrade_device_ptr(values.ptr(), len),
+                },
+                KvFormat::Fp8 => KvData::Fp8 {
+                    keys: stream.upgrade_device_ptr(keys.ptr(), len),
+                    values: stream.upgrade_device_ptr(values.ptr(), len),
+                },
+                KvFormat::Nvfp4 => KvData::Nvfp4 {
+                    keys: stream.upgrade_device_ptr(keys.ptr(), len),
+                    values: stream.upgrade_device_ptr(values.ptr(), len),
+                },
+                KvFormat::Mixed => unreachable!("refused above"),
+            }
+        };
+        Ok(Self {
+            data: ManuallyDrop::new(data),
+            slots: capacity,
+            window: None,
+            pooled: Some([keys, values]),
+        })
+    }
+
+    /// [`KvCache::sliding_ring`] at addresses reserved for the ring, backed by pages of
+    /// `pool` only while [`KvCache::map`] keeps it mapped: a slot without a sequence holds
+    /// none.
+    pub fn sliding_pooled(
+        stream: &Arc<CudaStream>,
+        window: usize,
+        slots: usize,
+        pool: &PagePool,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            slots >= window,
+            "a ring of {slots} slots cannot hold a window of {window}"
+        );
+        let mut cache = Self::global_pooled(stream, slots, KvFormat::Bf16, pool)?;
+        cache.window = Some(window);
+        Ok(cache)
+    }
+
+    /// Whether the cache's memory comes from a page pool.
+    #[must_use]
+    pub fn is_pooled(&self) -> bool {
+        self.pooled.is_some()
+    }
+
+    /// Positions whose memory is backed: every slot unless pooled.
+    #[must_use]
+    pub fn mapped(&self) -> usize {
+        match &self.pooled {
+            Some([keys, _]) => (keys.mapped_bytes() / self.row_bytes()).min(self.slots),
+            None => self.slots,
+        }
+    }
+
+    /// Pages more that [`KvCache::map`] of `positions` would take from the pool.
+    #[must_use]
+    pub fn pages_to(&self, positions: usize) -> usize {
+        let bytes = positions.min(self.slots) * self.row_bytes();
+        self.pooled
+            .as_ref()
+            .map_or(0, |p| p.iter().map(|b| b.pages_to(bytes)).sum())
+    }
+
+    /// Backs the positions below `positions` (at most the capacity) with pages, zeroed on
+    /// `stream`. Does nothing for a cache that is not pooled.
+    pub fn map(&mut self, positions: usize, stream: &CudaStream) -> anyhow::Result<()> {
+        let bytes = positions.min(self.slots) * self.row_bytes();
+        if let Some(pooled) = &mut self.pooled {
+            let more: usize = pooled.iter().map(|b| b.pages_to(bytes)).sum();
+            let free = pooled[0].pool().free_pages();
+            ensure!(
+                more <= free,
+                "the KV pool is out of pages: {more} more needed for {positions} positions, \
+                 {free} free"
+            );
+            for b in pooled {
+                b.map_to(bytes, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the pages past the first `positions` to the pool. Queued work must not
+    /// touch those positions any more. Does nothing for a cache that is not pooled.
+    pub fn unmap_from(&mut self, positions: usize) -> anyhow::Result<()> {
+        let bytes = positions.min(self.slots) * self.row_bytes();
+        if let Some(pooled) = &mut self.pooled {
+            for b in pooled {
+                b.unmap_from(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The pooled keys' and values' reservations.
+    #[must_use]
+    pub fn pooled(&self) -> Option<&[Pooled; 2]> {
+        self.pooled.as_ref()
+    }
+
+    /// The pooled keys' and values' reservations, to map shared pages into.
+    pub fn pooled_mut(&mut self) -> Option<&mut [Pooled; 2]> {
+        self.pooled.as_mut()
+    }
+
     fn new(
         stream: &Arc<CudaStream>,
         slots: usize,
@@ -205,9 +360,10 @@ impl KvCache {
             KvFormat::Mixed => anyhow::bail!("a mixed layout gives each cache FP8 or NVFP4"),
         };
         Ok(Self {
-            data,
+            data: ManuallyDrop::new(data),
             slots,
             window,
+            pooled: None,
         })
     }
 
@@ -229,7 +385,7 @@ impl KvCache {
     #[must_use]
     pub fn ring_buffers(&self, stream: &CudaStream) -> Option<([(u64, usize); 2], usize)> {
         self.window?;
-        let (keys, values, elem) = match &self.data {
+        let (keys, values, elem) = match &*self.data {
             KvData::Bf16 { keys, values } => (
                 keys.device_ptr(stream).0,
                 values.device_ptr(stream).0,
@@ -251,7 +407,7 @@ impl KvCache {
 
     #[must_use]
     pub fn format(&self) -> KvFormat {
-        match self.data {
+        match *self.data {
             KvData::Bf16 { .. } => KvFormat::Bf16,
             KvData::Fp8 { .. } => KvFormat::Fp8,
             KvData::Nvfp4 { .. } => KvFormat::Nvfp4,
@@ -261,7 +417,7 @@ impl KvCache {
     /// Bytes of one slot in each of the key and value buffers.
     #[must_use]
     pub fn row_bytes(&self) -> usize {
-        match self.data {
+        match *self.data {
             KvData::Bf16 { .. } => KV_ROW * size_of::<bf16>(),
             KvData::Fp8 { .. } => KV_ROW,
             KvData::Nvfp4 { .. } => FP4_ROW,
@@ -272,7 +428,7 @@ impl KvCache {
     /// NVFP4 [`FP4_ROW`] bytes.
     #[must_use]
     pub fn row_len(&self) -> usize {
-        match self.data {
+        match *self.data {
             KvData::Nvfp4 { .. } => FP4_ROW,
             _ => KV_ROW,
         }
@@ -288,16 +444,18 @@ impl KvCache {
         &mut self.data
     }
 
-    /// Zeroes every slot.
+    /// Zeroes every slot, of a pooled cache every mapped one: it keeps its pages, which
+    /// the next sequence then needs not map again ([`KvCache::unmap_from`] returns them).
     pub fn clear(&mut self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
-        match &mut self.data {
+        let len = self.mapped() * self.row_len();
+        match &mut *self.data {
             KvData::Bf16 { keys, values } => {
-                stream.memset_zeros(keys)?;
-                stream.memset_zeros(values)?;
+                stream.memset_zeros(&mut keys.slice_mut(..len))?;
+                stream.memset_zeros(&mut values.slice_mut(..len))?;
             }
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                stream.memset_zeros(keys)?;
-                stream.memset_zeros(values)?;
+                stream.memset_zeros(&mut keys.slice_mut(..len))?;
+                stream.memset_zeros(&mut values.slice_mut(..len))?;
             }
         }
         Ok(())
@@ -641,7 +799,7 @@ impl Attention {
         rounding: KvRounding,
     ) -> anyhow::Result<()> {
         ensure!(cache.window.is_none(), "only global caches are rounded");
-        let KvData::Bf16 { keys, values } = &mut cache.data else {
+        let KvData::Bf16 { keys, values } = &mut *cache.data else {
             anyhow::bail!("4-bit rounding needs a BF16 cache");
         };
         let mut args = KernelArgs::default();
@@ -668,7 +826,7 @@ impl Attention {
         rounding: KvRounding,
     ) -> anyhow::Result<()> {
         ensure!(first + rows <= cache.slots, "rows past the cache");
-        let KvData::Bf16 { keys, values } = &mut cache.data else {
+        let KvData::Bf16 { keys, values } = &mut *cache.data else {
             anyhow::bail!("4-bit rounding needs a BF16 cache");
         };
         let mut args = KernelArgs::default();
@@ -778,14 +936,14 @@ impl Attention {
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
         // The entry point for the 8-column tiles of query rows, ceil(3 rows / 8).
         let entry = &self.rows[(3 * rows).div_ceil(8) - 1];
-        let (function, smem) = match cache.data {
+        let (function, smem) = match *cache.data {
             KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
             KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
             KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
         };
         let mut args = KernelArgs::default();
         args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
-        match &mut cache.data {
+        match &mut *cache.data {
             KvData::Bf16 { keys, values } => args.ptr_mut(keys, stream).ptr_mut(values, stream),
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 args.ptr_mut(keys, stream).ptr_mut(values, stream)
@@ -870,7 +1028,7 @@ impl Attention {
         let extent = extent("bias", bias.len(), rows * HEADS)?;
         let slots = u32::try_from(like.slots)?;
         let window = u32::try_from(like.window.unwrap_or(0)).context("window too large")?;
-        let (function, smem) = match like.data {
+        let (function, smem) = match *like.data {
             KvData::Bf16 { .. } => (&self.batch[0], ROWS_SHARED_BYTES[0]),
             KvData::Fp8 { .. } => (&self.batch[1], ROWS_SHARED_BYTES[1]),
             KvData::Nvfp4 { .. } => (&self.batch[2], ROWS_SHARED_BYTES[2]),
@@ -1016,7 +1174,7 @@ impl Attention {
             block_dim: ((KV_ROW / 8) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let function = match cache.data {
+        let function = match *cache.data {
             KvData::Bf16 { .. } => &self.kv_append,
             KvData::Fp8 { .. } => &self.kv_append_fp8,
             KvData::Nvfp4 { .. } => {
@@ -1025,7 +1183,7 @@ impl Attention {
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&k).arg(&v);
-        match &mut cache.data {
+        match &mut *cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 launch.arg(keys).arg(values)
@@ -1078,7 +1236,7 @@ impl Attention {
         let slots = u32::try_from(cache.slots)?;
         let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
 
-        let function = match cache.data {
+        let function = match *cache.data {
             KvData::Bf16 { .. } => &self.decode,
             KvData::Fp8 { .. } => &self.decode_fp8,
             KvData::Nvfp4 { .. } => {
@@ -1087,7 +1245,7 @@ impl Attention {
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&q);
-        match &cache.data {
+        match &*cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 launch.arg(keys).arg(values)
@@ -1209,7 +1367,7 @@ impl Attention {
             .ptr(s.table, stream)
             .ptr(s.sinks, stream)
             .ptr(s.gate, stream);
-        let function = match &mut cache.data {
+        let function = match &mut *cache.data {
             KvData::Bf16 { keys, values } => {
                 args.ptr_mut(keys, stream).ptr_mut(values, stream);
                 &self.decode_step
@@ -1284,14 +1442,14 @@ impl Attention {
             block_dim: (threads as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let function = match cache.data {
+        let function = match *cache.data {
             KvData::Bf16 { .. } => &self.kv_append_rows,
             KvData::Fp8 { .. } => &self.kv_append_rows_fp8,
             KvData::Nvfp4 { .. } => &self.kv_append_rows_fp4,
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(k).arg(v);
-        match &mut cache.data {
+        match &mut *cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 launch.arg(keys).arg(values)
@@ -1397,7 +1555,7 @@ impl Attention {
             self.append_rows(stream, cache, start, rows, &k, &v)?;
         }
 
-        let function = match (&cache.data, products) {
+        let function = match (&*cache.data, products) {
             (KvData::Bf16 { .. }, _) => &self.prefill,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
             (KvData::Fp8 { .. }, Products::Fp8) => &self.prefill_fp8_mma,
@@ -1405,7 +1563,7 @@ impl Attention {
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&q).arg(&k).arg(&v);
-        match &cache.data {
+        match &*cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 launch.arg(keys).arg(values)

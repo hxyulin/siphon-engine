@@ -48,7 +48,7 @@ use siphon::Checkpoint;
 mod host;
 mod prefix;
 
-pub use host::{DISK_FORMAT, DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS};
+pub use host::{DISK_FORMAT, DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS, ParkSaved};
 use prefix::PrefixCache;
 pub use prefix::PrefixHit;
 

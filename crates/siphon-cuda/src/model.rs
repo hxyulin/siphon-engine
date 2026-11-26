@@ -61,6 +61,7 @@ use crate::{
         sample::{Sample, SampleBuffers},
         spec::{Spec, VERIFY_ROWS},
     },
+    vmm::PagePool,
     weights::{
         ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, WeightFormat, Weights,
     },
@@ -84,6 +85,54 @@ struct Kernels {
     routing: Routing,
     sample: Sample,
     spec: Spec,
+}
+
+/// Positions a pooled global cache maps at a time, the default prefill chunk. Each step,
+/// prefill, verify and batched step maps what it writes before it runs, whatever its
+/// chunk (see [`Model::map_slot`]).
+pub const MAP_POSITIONS: usize = prefill::DEFAULT_PREFILL_CHUNK;
+
+/// Maps the global caches of `visits` to hold every position below `end`, rounded up to
+/// [`MAP_POSITIONS`]. Does nothing for caches that are not pooled.
+fn map_visits(visits: &mut [VisitState], end: usize, stream: &CudaStream) -> anyhow::Result<()> {
+    let end = end.next_multiple_of(MAP_POSITIONS);
+    let more = pages_to(visits, end);
+    if more == 0 {
+        return Ok(());
+    }
+    let free = visits
+        .iter()
+        .find_map(|v| v.kv.pooled().map(|p| p[0].pool().free_pages()))
+        .unwrap_or(0);
+    ensure!(
+        more <= free,
+        "the KV pool is out of pages: {more} more needed to reach {end} positions, {free} free"
+    );
+    for v in visits.iter_mut() {
+        let positions = if v.kv.window().is_some() {
+            v.kv.slots()
+        } else {
+            end
+        };
+        v.kv.map(positions, stream)?;
+    }
+    Ok(())
+}
+
+/// Pages that [`map_visits`] of `end` would take: the global caches' to `end`, and the
+/// rings' whole, which a slot maps as soon as it holds a sequence.
+fn pages_to(visits: &[VisitState], end: usize) -> usize {
+    let end = end.next_multiple_of(MAP_POSITIONS);
+    visits
+        .iter()
+        .map(|v| {
+            if v.kv.window().is_some() {
+                v.kv.pages_to(v.kv.slots())
+            } else {
+                v.kv.pages_to(end)
+            }
+        })
+        .sum()
 }
 
 /// The caches one layer visit keeps across tokens.
@@ -383,6 +432,8 @@ pub struct Model {
     sampler: bool,
     /// The settings of a step's or a prefill's draw.
     sample_one: SampleBuffers,
+    /// The pages that back the global caches of every slot, if they are pooled.
+    kv_pool: Option<PagePool>,
 }
 
 /// Everything a step reads but does not change.
@@ -456,11 +507,50 @@ impl Model {
     /// [`Model::with_kv_format`] with decode reading the attention projections and the LM
     /// head in `weight_format`. [`WeightFormat::Fp8`] quantizes them first, keeping the
     /// BF16 weights for prefill.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the kernels, caches and buffers in order"
-    )]
+    ///
+    /// With `SIPHON_KV_POOL_GIB` set, the global caches come from a page pool of that many
+    /// GiB ([`Model::with_kv_pool`]), so that tests run pooled memory unchanged.
     pub fn with_formats(
+        gpu: &Gpu,
+        config: TextConfig,
+        weights: Weights,
+        passes: usize,
+        capacity: usize,
+        kv_format: KvFormat,
+        weight_format: WeightFormat,
+    ) -> anyhow::Result<Self> {
+        let pool = match std::env::var("SIPHON_KV_POOL_GIB") {
+            Ok(gib) => {
+                let gib: f64 = gib.parse().context("SIPHON_KV_POOL_GIB takes GiB")?;
+                let (page, _) = crate::vmm::granularity(gpu.context())?;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a test switch of a few GiB"
+                )]
+                let pages = (gib * f64::from(1u32 << 30) / page as f64) as usize;
+                Some(PagePool::new(gpu.context(), pages)?)
+            }
+            Err(_) => None,
+        };
+        Self::with_kv_pool(
+            gpu,
+            config,
+            weights,
+            passes,
+            capacity,
+            kv_format,
+            weight_format,
+            pool,
+        )
+    }
+
+    /// [`Model::with_formats`] with every slot's global caches at addresses reserved for
+    /// `capacity` positions and backed by pages of `pool` as sequences grow, if given.
+    /// Kernels and graphs keep the addresses, so nothing else changes.
+    #[expect(clippy::too_many_arguments, reason = "the model's formats and memory")]
+    #[expect(clippy::too_many_lines, reason = "every buffer of the model")]
+    pub fn with_kv_pool(
         gpu: &Gpu,
         config: TextConfig,
         mut weights: Weights,
@@ -468,6 +558,7 @@ impl Model {
         capacity: usize,
         kv_format: KvFormat,
         weight_format: WeightFormat,
+        kv_pool: Option<PagePool>,
     ) -> anyhow::Result<Self> {
         let ctx = gpu.context();
         let stream = Arc::clone(gpu.stream());
@@ -496,13 +587,17 @@ impl Model {
         let mut visits: Vec<VisitState> = Vec::new();
         for (v, layer) in config.visit_layers(passes).into_iter().enumerate() {
             let kv = if config.is_sliding(layer) {
-                KvCache::sliding(&stream, config.sliding_window_size)?
+                let window = config.sliding_window_size;
+                match &kv_pool {
+                    Some(pool) => KvCache::sliding_pooled(&stream, window, window, pool)?,
+                    None => KvCache::sliding(&stream, window)?,
+                }
             } else {
-                KvCache::global_with_format(
-                    &stream,
-                    capacity,
-                    formats[v].context("a global visit has a format")?,
-                )?
+                let format = formats[v].context("a global visit has a format")?;
+                match &kv_pool {
+                    Some(pool) => KvCache::global_pooled(&stream, capacity, format, pool)?,
+                    None => KvCache::global_with_format(&stream, capacity, format)?,
+                }
             };
             visits.push(VisitState {
                 kv,
@@ -577,6 +672,125 @@ impl Model {
             sampling: Sampling::GREEDY,
             sampler: false,
             sample_one,
+            kv_pool,
+        })
+    }
+
+    /// Positions each slot's global caches hold at most.
+    #[must_use]
+    pub fn slot_capacity(&self) -> usize {
+        self.visits
+            .iter()
+            .filter(|v| v.kv.window().is_none())
+            .map(|v| v.kv.slots())
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The page pool of the global caches, if they are pooled.
+    #[must_use]
+    pub fn kv_pool(&self) -> Option<&PagePool> {
+        self.kv_pool.as_ref()
+    }
+
+    /// Maps slot `slot`'s global caches to hold every position below `end`, rounded up to
+    /// [`MAP_POSITIONS`], from the page pool. The model maps what each step, prefill,
+    /// verify and batched step writes before it runs, so callers need this only to keep
+    /// memory for a sequence ahead of time, or before copying into a slot. Does nothing
+    /// without a pool.
+    pub fn map_slot(&mut self, slot: usize, end: usize) -> anyhow::Result<()> {
+        let stream = Arc::clone(&self.ctx.stream);
+        if slot == 0 {
+            return map_visits(&mut self.visits, end, &stream);
+        }
+        self.slot_state(slot)?;
+        map_visits(&mut self.slots[slot - 1].visits, end, &stream)
+    }
+
+    /// Pages more that [`Model::map_slot`] of `end` would take.
+    pub fn slot_pages_to(&self, slot: usize, end: usize) -> anyhow::Result<usize> {
+        let visits = if slot == 0 {
+            &self.visits
+        } else {
+            &self.slot_state(slot)?.visits
+        };
+        Ok(pages_to(visits, end))
+    }
+
+    /// Pages of the pool that one slot's rings take while it holds a sequence, and that a
+    /// prefix cache entry's copies of them take.
+    #[must_use]
+    pub fn ring_pages(&self) -> usize {
+        self.pages_for(0)
+    }
+
+    /// Pages that a sequence of `positions` positions takes from the pool in one slot: its
+    /// global caches to that length and its rings.
+    #[must_use]
+    pub fn pages_for(&self, positions: usize) -> usize {
+        let end = positions.next_multiple_of(MAP_POSITIONS);
+        self.visits
+            .iter()
+            .map(|v| {
+                let Some(p) = v.kv.pooled() else { return 0 };
+                let held = if v.kv.window().is_some() {
+                    v.kv.slots()
+                } else {
+                    end.min(v.kv.slots())
+                };
+                2 * (held * v.kv.row_bytes()).div_ceil(p[0].page_bytes())
+            })
+            .sum()
+    }
+
+    /// Pages of the pool that slot `slot`'s global caches hold.
+    pub fn slot_pages(&self, slot: usize) -> anyhow::Result<usize> {
+        let visits = if slot == 0 {
+            &self.visits
+        } else {
+            &self.slot_state(slot)?.visits
+        };
+        Ok(visits
+            .iter()
+            .filter_map(|v| v.kv.pooled())
+            .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
+            .sum())
+    }
+
+    /// Positions of slot `slot`'s global caches that are mapped: the capacity unless
+    /// pooled.
+    pub fn slot_mapped(&self, slot: usize) -> anyhow::Result<usize> {
+        let visits = if slot == 0 {
+            &self.visits
+        } else {
+            &self.slot_state(slot)?.visits
+        };
+        Ok(visits
+            .iter()
+            .filter(|v| v.kv.window().is_none())
+            .map(|v| v.kv.mapped())
+            .min()
+            .unwrap_or(0))
+    }
+
+    /// Returns the pages of slot `slot`'s global caches past its first `positions`
+    /// positions, and its rings, to the pool, after the model's stream has done its work,
+    /// and moves the slot back to `positions` if it was past them. Does nothing without a
+    /// pool.
+    pub fn unmap_slot_from(&mut self, slot: usize, positions: usize) -> anyhow::Result<()> {
+        if self.kv_pool.is_none() {
+            return Ok(());
+        }
+        self.ctx.stream.synchronize()?;
+        self.with_slot(slot, |m| {
+            let keep = positions.next_multiple_of(MAP_POSITIONS);
+            for v in &mut m.visits {
+                // A ring is of use only while the slot decodes; an entry keeps a copy.
+                let keep = if v.kv.window().is_some() { 0 } else { keep };
+                v.kv.unmap_from(keep)?;
+            }
+            m.position = m.position.min(positions);
+            Ok(())
         })
     }
 
@@ -651,7 +865,10 @@ impl Model {
     /// The target tensors the draft shares: the embedding, `embed_norm` and the LM head.
     #[must_use]
     pub fn draft_shared(&self) -> crate::weights::draft::SharedWeights<'_> {
-        crate::weights::draft::SharedWeights::from(&self.ctx.weights)
+        crate::weights::draft::SharedWeights {
+            kv_pool: self.kv_pool.as_ref(),
+            ..crate::weights::draft::SharedWeights::from(&self.ctx.weights)
+        }
     }
 
     /// Starts a new sequence: zeroes every KV cache and conv state and moves to position 0.
@@ -860,6 +1077,7 @@ impl Model {
             state.visits.len(),
             self.visits.len()
         );
+        map_visits(&mut self.visits, state.position.max(1), stream)?;
         for (v, (kv, conv)) in self.visits.iter_mut().zip(&state.visits) {
             // A ring is saved whole, a global cache up to the saved position.
             let ring = v.kv.window().is_some();
@@ -900,6 +1118,11 @@ impl Model {
             self.visits.iter().all(|v| v.kv.holds(position)),
             "the global KV caches cannot hold position {position}"
         );
+        map_visits(
+            &mut self.visits,
+            position + 1,
+            &Arc::clone(&self.ctx.stream),
+        )?;
         self.position = position;
         Ok(())
     }
@@ -949,6 +1172,7 @@ impl Model {
             "the global KV caches are full at {position} tokens"
         );
         let stream = Arc::clone(&self.ctx.stream);
+        map_visits(&mut self.visits, position + 1, &stream)?;
         let s = &mut self.scratch;
         stream.memcpy_htod(&[i32::try_from(token)?], &mut s.token)?;
         stream.memcpy_htod(

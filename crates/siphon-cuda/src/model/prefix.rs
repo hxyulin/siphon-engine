@@ -7,11 +7,13 @@
 //! at one position, so that the sequence can return there while the global caches still
 //! hold its positions below it.
 
+use std::sync::Arc;
+
 use anyhow::ensure;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _};
 
 use super::{Model, VisitState};
-use crate::ops::attention::KvData;
+use crate::ops::attention::{KvCache, KvData};
 
 /// A device buffer's address and length in bytes, for copies to and from host memory
 /// (the prefix cache's host tier, `spec::HostCache`).
@@ -90,8 +92,9 @@ fn visit_spans(visits: &[VisitState], stream: &CudaStream) -> Vec<DeviceSpan> {
 /// [`Model::save_local_state`]. The copies belong to no slot: they can return any slot that
 /// holds the sequence's global caches to that point.
 pub struct LocalState {
-    /// Each visit's ring, `None` for a global cache, and its four conv states.
-    visits: Vec<(Option<KvData>, Vec<CudaSlice<f32>>)>,
+    /// Each visit's ring, `None` for a global cache, and its four conv states. With a KV
+    /// pool the rings take pages only while they hold a copy.
+    visits: Vec<(Option<KvCache>, Vec<CudaSlice<f32>>)>,
     position: usize,
 }
 
@@ -108,7 +111,7 @@ impl LocalState {
     pub(crate) fn spans(&self, stream: &CudaStream) -> Vec<DeviceSpan> {
         let mut spans = Vec::new();
         for (ring, conv) in &self.visits {
-            match ring {
+            match ring.as_ref().map(KvCache::data) {
                 Some(KvData::Bf16 { keys, values }) => {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
@@ -124,13 +127,47 @@ impl LocalState {
         spans
     }
 
-    /// Device bytes the copies take.
+    /// Whether the copies hold a state: saved, and not released since.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.visits
+            .iter()
+            .filter_map(|(ring, _)| ring.as_ref())
+            .all(|r| r.mapped() == r.slots())
+    }
+
+    /// Pages of the KV pool that the copies of the rings hold.
+    #[must_use]
+    pub fn pages(&self) -> usize {
+        self.visits
+            .iter()
+            .filter_map(|(ring, _)| ring.as_ref()?.pooled())
+            .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
+            .sum()
+    }
+
+    /// Returns the pages of the copies of pooled rings to the pool, once `stream` has done
+    /// its work: the copies hold nothing until saved again. Work on other streams that
+    /// reads them must be done.
+    pub fn release(&mut self, stream: &CudaStream) -> anyhow::Result<()> {
+        if self.pages() == 0 {
+            return Ok(());
+        }
+        stream.synchronize()?;
+        for ring in self.visits.iter_mut().filter_map(|(ring, _)| ring.as_mut()) {
+            ring.unmap_from(0)?;
+        }
+        Ok(())
+    }
+
+    /// Device bytes the copies take, but for copies of rings in pooled memory, which take
+    /// pages only while they hold a state ([`Self::pages`]).
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.visits
             .iter()
             .map(|(ring, conv)| {
-                let ring = match ring {
+                let ring = match ring.as_ref().filter(|r| !r.is_pooled()).map(KvCache::data) {
                     Some(KvData::Bf16 { keys, values }) => (keys.len() + values.len()) * 2,
                     Some(KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values }) => {
                         keys.len() + values.len()
@@ -201,6 +238,13 @@ impl Model {
                     .all(|v| v.kv.holds(position.saturating_sub(1))),
                 "the global KV caches cannot hold position {position}"
             );
+            ensure!(
+                m.visits
+                    .iter()
+                    .filter(|v| v.kv.window().is_none())
+                    .all(|v| v.kv.mapped() >= position),
+                "slot {slot}'s global caches are not mapped up to {position}"
+            );
             m.position = position;
             Ok(())
         })
@@ -213,14 +257,13 @@ impl Model {
             .visits
             .iter()
             .map(|v| {
-                let ring = match (v.kv.window(), v.kv.data()) {
+                let ring = match (v.kv.window(), &self.kv_pool) {
                     (None, _) => None,
-                    (Some(_), KvData::Bf16 { keys, values }) => Some(KvData::Bf16 {
-                        keys: stream.alloc_zeros(keys.len())?,
-                        values: stream.alloc_zeros(values.len())?,
-                    }),
-                    (Some(_), KvData::Fp8 { .. } | KvData::Nvfp4 { .. }) => {
-                        anyhow::bail!("sliding rings are BF16")
+                    (Some(window), Some(pool)) => {
+                        Some(KvCache::sliding_pooled(stream, window, v.kv.slots(), pool)?)
+                    }
+                    (Some(window), None) => {
+                        Some(KvCache::sliding_ring(stream, window, v.kv.slots())?)
                     }
                 };
                 let conv = v
@@ -251,7 +294,10 @@ impl Model {
             self.visits.len()
         );
         for (v, (ring, conv)) in self.visits.iter().zip(&mut state.visits) {
-            match (v.kv.data(), ring) {
+            if let Some(ring) = ring.as_mut() {
+                ring.map(ring.slots(), stream)?;
+            }
+            match (v.kv.data(), ring.as_mut().map(KvCache::data_mut)) {
                 (_, None) => ensure!(v.kv.window().is_none(), "the state lacks a ring"),
                 (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
                     ensure!(k.len() == keys.len(), "the ring sizes differ");
@@ -289,9 +335,12 @@ impl Model {
             self.position,
             state.position
         );
-        let stream = &self.ctx.stream;
+        ensure!(state.holds(), "the saved state's copies were released");
+        let stream = Arc::clone(&self.ctx.stream);
+        // A pooled ring of a slot that held no sequence takes its pages now.
+        super::map_visits(&mut self.visits, 0, &stream)?;
         for (v, (ring, conv)) in self.visits.iter_mut().zip(&state.visits) {
-            match (v.kv.data_mut(), ring) {
+            match (v.kv.data_mut(), ring.as_ref().map(KvCache::data)) {
                 (_, None) => {}
                 (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
                     stream.memcpy_dtod(k, keys)?;

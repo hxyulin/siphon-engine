@@ -197,6 +197,25 @@ struct HostEntry {
     used: u64,
 }
 
+/// A sequence parked in host memory mid-generation ([`HostCache::park`]): its global caches
+/// below its position and its rings and conv states at that position.
+struct Parked {
+    /// The chunks of the global caches, by position; the last may be partly filled.
+    kv: Vec<u32>,
+    /// The chunks of the rings and conv states.
+    local: Vec<u32>,
+    position: usize,
+}
+
+/// What [`HostCache::park`] copied: global cache chunks copied and shared with an entry,
+/// and the bytes copied.
+#[derive(Debug)]
+pub struct ParkSaved {
+    pub copied: usize,
+    pub shared: usize,
+    pub bytes: usize,
+}
+
 /// What [`HostCache::save`] copied.
 #[derive(Debug)]
 pub(super) struct Saved {
@@ -216,6 +235,8 @@ pub(super) struct HostCache {
     /// Recorded on `copy` after the last save's copies.
     pending: Option<CudaEvent>,
     entries: Vec<HostEntry>,
+    /// Parked sequences by id, `None` once returned ([`Self::park`]).
+    parked: Vec<Option<Parked>>,
     /// Per chunk, whether its draft part holds the draft's global caches.
     drafted: Vec<bool>,
     /// The target's global caches and the draft's, for their layouts.
@@ -257,6 +278,7 @@ impl HostCache {
             copy,
             pending: None,
             entries: Vec::new(),
+            parked: Vec::new(),
             drafted: vec![false; chunks],
             target,
             draft: draft_kv,
@@ -545,19 +567,22 @@ impl HostCache {
         self.tick += 1;
         let p = HOST_CHUNK_POSITIONS;
         let target = model.global_kv(slot)?;
-        let e = &self.entries[h];
         ensure!(
             target.caches.len() == self.target.caches.len()
                 && target.position_bytes == self.target.position_bytes,
             "the slot's global caches differ from the host cache's"
         );
-        for (j, &c) in e.kv.iter().enumerate() {
+        let chunks = self.entries[h].kv.clone();
+        for (j, &c) in chunks.iter().enumerate() {
+            // Mapping the next chunk overlaps the copies queued before it.
+            model.map_slot(slot, (j + 1) * p)?;
             for (cache, pb, before) in target.layout() {
                 let at = (j * p) as u64 * pb as u64;
                 let host = self.pool.address(c) + p * before;
                 copy(&self.main, Direction::ToDevice, host, cache + at, p * pb)?;
             }
         }
+        let e = &self.entries[h];
         let spans = model.local_spans(slot)?;
         self.pool
             .copy_run(&self.main, &e.local, 0, &spans, Direction::ToDevice)?;
@@ -574,6 +599,7 @@ impl HostCache {
         ensure!(self.has_draft(h), "host entry {h} lacks the draft's state");
         self.fence()?;
         let p = HOST_CHUNK_POSITIONS;
+        draft.map(self.entries[h].tokens.len(), &self.main)?;
         let e = &self.entries[h];
         let draft_kv = draft.global_kv(&self.main);
         let base = p * self.target.bytes_per_position();
@@ -612,6 +638,186 @@ impl HostCache {
         )?;
         rings.set_committed(e.tokens.len());
         Ok(())
+    }
+
+    /// Copies the sequence in slot `slot` into host memory, so that the slot's memory can
+    /// go to other sequences and [`Self::unpark`] can return it exactly: its global caches
+    /// below its position, `key.len()`, and its rings and conv states. `key` is the prompt's
+    /// key ([`super::Prompt::key`]) and the tokens fed after it. Its positions below
+    /// `prompt_len` came from a prefill, so the whole chunks among them are shared with the
+    /// entry whose key agrees with `key` longest, as [`Self::save`] shares; the rest
+    /// is copied. Drops least recently used entries to make room, and returns `None` when
+    /// the sequence does not fit even then. The copies run on the copy stream, so the slot
+    /// may change only after [`Self::fence`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sharing, room, the copies and the record"
+    )]
+    pub fn park(
+        &mut self,
+        model: &Model,
+        slot: usize,
+        key: &[u32],
+        prompt_len: usize,
+    ) -> anyhow::Result<Option<(usize, ParkSaved)>> {
+        let p = HOST_CHUNK_POSITIONS;
+        let position = key.len();
+        ensure!(
+            position > 0 && model.slot_position(slot)? == position,
+            "slot {slot} is at {}, not at the {position} tokens to park",
+            model.slot_position(slot)?
+        );
+        self.tick += 1;
+        let n = position.div_ceil(p);
+        let prefilled = prompt_len.min(position) / p;
+        let longest = self
+            .entries
+            .iter()
+            .map(|e| {
+                let same = e.tokens.iter().zip(key).take_while(|(a, b)| a == b).count();
+                (same / p).min(e.kv.len()).min(prefilled)
+            })
+            .enumerate()
+            .max_by_key(|&(_, k)| k);
+        let mut kv = match longest {
+            Some((i, k)) if k > 0 => self.entries[i].kv[..k].to_vec(),
+            _ => Vec::new(),
+        };
+        let shared = kv.len();
+        for &c in &kv {
+            self.pool.retain(c);
+        }
+        let need = n - shared + self.local_chunks();
+        while self.pool.free.len() < need {
+            let Some(lru) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(i, _)| i)
+            else {
+                for &c in &kv {
+                    self.pool.release(c);
+                }
+                return Ok(None);
+            };
+            let e = self.entries.swap_remove(lru);
+            self.release(&e);
+        }
+        while kv.len() < n {
+            kv.push(self.pool.take().context("a free chunk was counted")?);
+        }
+        let local: Vec<u32> = (0..self.local_chunks())
+            .map(|_| self.pool.take().context("a free chunk was counted"))
+            .collect::<anyhow::Result<_>>()?;
+        let ready = self
+            .main
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        self.copy.wait(&ready)?;
+        let target = model.global_kv(slot)?;
+        ensure!(
+            target.position_bytes == self.target.position_bytes,
+            "the slot's global caches differ from the host cache's"
+        );
+        let mut bytes = 0;
+        for (j, &c) in kv.iter().enumerate().skip(shared) {
+            let len = (position - j * p).min(p);
+            for (cache, pb, before) in target.layout() {
+                let at = (j * p) as u64 * pb as u64;
+                let host = self.pool.address(c) + p * before;
+                copy(&self.copy, Direction::ToHost, host, cache + at, len * pb)?;
+                bytes += len * pb;
+            }
+            self.drafted[c as usize] = false;
+        }
+        self.pool.copy_run(
+            &self.copy,
+            &local,
+            0,
+            &model.local_spans(slot)?,
+            Direction::ToHost,
+        )?;
+        bytes += self.local_bytes;
+        self.pending = Some(
+            self.copy
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+        );
+        let parked = Parked {
+            kv,
+            local,
+            position,
+        };
+        let id = if let Some(free) = self.parked.iter().position(Option::is_none) {
+            self.parked[free] = Some(parked);
+            free
+        } else {
+            self.parked.push(Some(parked));
+            self.parked.len() - 1
+        };
+        Ok(Some((
+            id,
+            ParkSaved {
+                copied: n - shared,
+                shared,
+                bytes,
+            },
+        )))
+    }
+
+    /// Copies parked sequence `id` into slot `slot`, just reset, moves the slot to its
+    /// position and frees its host memory. Returns the position and the bytes copied.
+    pub fn unpark(
+        &mut self,
+        model: &mut Model,
+        id: usize,
+        slot: usize,
+    ) -> anyhow::Result<(usize, usize)> {
+        let parked = self
+            .parked
+            .get_mut(id)
+            .and_then(Option::take)
+            .with_context(|| format!("no parked sequence {id}"))?;
+        // The copies to the host must be done before these read their chunks.
+        self.fence()?;
+        let p = HOST_CHUNK_POSITIONS;
+        let position = parked.position;
+        let copied = (|| -> anyhow::Result<usize> {
+            let target = model.global_kv(slot)?;
+            ensure!(
+                target.position_bytes == self.target.position_bytes,
+                "the slot's global caches differ from the host cache's"
+            );
+            for (j, &c) in parked.kv.iter().enumerate() {
+                let len = (position - j * p).min(p);
+                // Mapping the next chunk overlaps the copies queued before it.
+                model.map_slot(slot, j * p + len)?;
+                for (cache, pb, before) in target.layout() {
+                    let at = (j * p) as u64 * pb as u64;
+                    let host = self.pool.address(c) + p * before;
+                    copy(&self.main, Direction::ToDevice, host, cache + at, len * pb)?;
+                }
+            }
+            let spans = model.local_spans(slot)?;
+            self.pool
+                .copy_run(&self.main, &parked.local, 0, &spans, Direction::ToDevice)?;
+            model.set_loaded_position(slot, position)?;
+            Ok(position * target.bytes_per_position() + self.local_bytes)
+        })();
+        // Saves wait for the model's stream before they write, so the chunks may go back
+        // to the pool while the copies above are queued.
+        for &c in parked.kv.iter().chain(&parked.local) {
+            self.pool.release(c);
+        }
+        Ok((position, copied?))
+    }
+
+    /// Frees parked sequence `id`'s host memory without returning it anywhere.
+    pub fn drop_parked(&mut self, id: usize) {
+        if let Some(parked) = self.parked.get_mut(id).and_then(Option::take) {
+            for &c in parked.kv.iter().chain(&parked.local) {
+                self.pool.release(c);
+            }
+        }
     }
 
     /// Adds a line for the server's log.

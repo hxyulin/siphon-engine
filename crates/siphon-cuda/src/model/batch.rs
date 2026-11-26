@@ -29,10 +29,11 @@ use super::{
     zeros,
 };
 use crate::ops::{
-    attention::{KvCache, KvData, KvFormat},
+    attention::{KvCache, KvData},
     sample::SampleBuffers,
     spec::{BATCH_STATE_WORDS, BatchRows},
 };
+use crate::vmm::PagePool;
 
 /// Most sequences one batched step runs.
 pub use crate::ops::spec::BATCH_ROWS;
@@ -88,19 +89,20 @@ impl BatchBuffers {
     }
 }
 
-/// A visit's caches and conv states for a new sequence, of the sizes and formats of `v`.
-fn empty_like(stream: &Arc<CudaStream>, v: &VisitState) -> anyhow::Result<VisitState> {
-    let kv = match (v.kv.window(), v.kv.data()) {
-        (Some(window), _) => KvCache::sliding_ring(stream, window, v.kv.slots())?,
-        (None, KvData::Bf16 { .. }) => {
-            KvCache::global_with_format(stream, v.kv.slots(), KvFormat::Bf16)?
-        }
-        (None, KvData::Fp8 { .. }) => {
-            KvCache::global_with_format(stream, v.kv.slots(), KvFormat::Fp8)?
-        }
-        (None, KvData::Nvfp4 { .. }) => {
-            KvCache::global_with_format(stream, v.kv.slots(), KvFormat::Nvfp4)?
-        }
+/// A visit's caches and conv states for a new sequence, of the sizes and formats of `v`,
+/// in pages of `pool` if `v`'s are pooled.
+fn empty_like(
+    stream: &Arc<CudaStream>,
+    v: &VisitState,
+    pool: Option<&PagePool>,
+) -> anyhow::Result<VisitState> {
+    let format = v.kv.format();
+    let pool = pool.filter(|_| v.kv.is_pooled());
+    let kv = match (v.kv.window(), pool) {
+        (Some(window), Some(pool)) => KvCache::sliding_pooled(stream, window, v.kv.slots(), pool)?,
+        (Some(window), None) => KvCache::sliding_ring(stream, window, v.kv.slots())?,
+        (None, Some(pool)) => KvCache::global_pooled(stream, v.kv.slots(), format, pool)?,
+        (None, None) => KvCache::global_with_format(stream, v.kv.slots(), format)?,
     };
     Ok(VisitState {
         kv,
@@ -112,6 +114,15 @@ fn empty_like(stream: &Arc<CudaStream>, v: &VisitState) -> anyhow::Result<VisitS
         ],
         round: v.round,
     })
+}
+
+/// Slot `slot`'s visit states, which must exist.
+fn slot_visits(m: &mut Model, slot: usize) -> &mut Vec<VisitState> {
+    if slot == 0 {
+        &mut m.visits
+    } else {
+        &mut m.slots[slot - 1].visits
+    }
 }
 
 /// A visit's line of a state table: its caches' and conv states' device addresses.
@@ -142,7 +153,7 @@ impl Model {
             let visits = self
                 .visits
                 .iter()
-                .map(|v| empty_like(&stream, v))
+                .map(|v| empty_like(&stream, v, self.kv_pool.as_ref()))
                 .collect::<anyhow::Result<_>>()?;
             let sequence = self.new_sequence();
             self.slots.push(Slot {
@@ -222,6 +233,7 @@ impl Model {
         }
         let stream = Arc::clone(&self.ctx.stream);
         let position = self.slot_position(from)?;
+        self.map_slot(to, position.max(1))?;
         let (src, dst) = match (from, to) {
             (0, t) => (&self.visits, &mut self.slots[t - 1].visits),
             (f, 0) => (&self.slots[f - 1].visits, &mut self.visits),
@@ -235,12 +247,25 @@ impl Model {
             }
         };
         for (s, d) in src.iter().zip(dst.iter_mut()) {
-            // A ring whole, a global cache up to the position.
+            // A ring whole, a global cache up to the position, but only what is mapped: an
+            // idle slot may have returned its rings and the pages past its prefix cache
+            // entry to the pool, and the driver faults on a copy from
+            // unmapped addresses. What it returned holds nothing an entry needs.
             let slots = if s.kv.window().is_some() {
-                s.kv.slots()
+                if s.kv.mapped() < s.kv.slots() {
+                    0
+                } else {
+                    s.kv.slots()
+                }
             } else {
-                position.min(s.kv.slots())
+                position.min(s.kv.mapped())
             };
+            if slots == 0 {
+                for (from, to) in s.conv.iter().zip(d.conv.iter_mut()) {
+                    stream.memcpy_dtod(from, to)?;
+                }
+                continue;
+            }
             let len = slots * s.kv.row_len();
             match (s.kv.data(), d.kv.data_mut()) {
                 (KvData::Bf16 { keys, values }, KvData::Bf16 { keys: k, values: v }) => {
@@ -267,6 +292,100 @@ impl Model {
             slot.position = position;
             slot.sequence = sequence;
         }
+        Ok(())
+    }
+
+    /// Moves the sequence in slot `from` to slot `to`. It copies, as [`Model::move_slot`]
+    /// does, when `to` holds the pages for it or the pool has them free: a copy runs at
+    /// device bandwidth, about 1 ms for 40,000 positions, while remapping a page costs about
+    /// 150 µs. Otherwise it maps `from`'s pages into `to`, which needs no second copy of a
+    /// long sequence, and leaves `from` empty at position 0. The sequence in `to` is lost.
+    pub fn transfer_slot(&mut self, from: usize, to: usize) -> anyhow::Result<()> {
+        self.slot_position(from)?;
+        self.slot_position(to)?;
+        if from == to {
+            return Ok(());
+        }
+        let missing = self.slot_pages_to(to, self.slot_position(from)?.max(1))?;
+        let free = self
+            .kv_pool
+            .as_ref()
+            .map_or(usize::MAX, PagePool::free_pages);
+        if missing <= free {
+            return self.move_slot(from, to);
+        }
+        let stream = Arc::clone(&self.ctx.stream);
+        // Nothing queued may touch the pages while they move.
+        stream.synchronize()?;
+        let position = self.slot_position(from)?;
+        let mut moved = Vec::new();
+        for v in slot_visits(self, from).iter_mut() {
+            let pages = match v.kv.pooled_mut() {
+                Some([keys, values]) => {
+                    let pages = [keys.pages().to_vec(), values.pages().to_vec()];
+                    keys.unmap_from(0)?;
+                    values.unmap_from(0)?;
+                    Some(pages)
+                }
+                None => None,
+            };
+            moved.push(pages);
+        }
+        for (v, pages) in slot_visits(self, to).iter_mut().zip(&moved) {
+            if let (Some([keys, values]), Some([k, x])) = (v.kv.pooled_mut(), pages) {
+                keys.unmap_from(0)?;
+                values.unmap_from(0)?;
+                keys.map_shared(k)?;
+                values.map_shared(x)?;
+            }
+        }
+        // Pooled rings moved with their pages; rings of fixed memory and the conv states
+        // are copied.
+        let (src, dst) = match (from, to) {
+            (0, t) => (&self.visits, &mut self.slots[t - 1].visits),
+            (f, 0) => (&self.slots[f - 1].visits, &mut self.visits),
+            (f, t) if f < t => {
+                let (low, high) = self.slots.split_at_mut(t - 1);
+                (&low[f - 1].visits, &mut high[0].visits)
+            }
+            (f, t) => {
+                let (low, high) = self.slots.split_at_mut(f - 1);
+                (&high[0].visits, &mut low[t - 1].visits)
+            }
+        };
+        for (s, d) in src.iter().zip(dst.iter_mut()) {
+            if s.kv.window().is_some() && !s.kv.is_pooled() {
+                let len = s.kv.slots() * s.kv.row_len();
+                match (s.kv.data(), d.kv.data_mut()) {
+                    (KvData::Bf16 { keys, values }, KvData::Bf16 { keys: k, values: v }) => {
+                        stream.memcpy_dtod(&keys.slice(..len), &mut k.slice_mut(..len))?;
+                        stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
+                    }
+                    (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: v })
+                    | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: v }) => {
+                        stream.memcpy_dtod(&keys.slice(..len), &mut k.slice_mut(..len))?;
+                        stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
+                    }
+                    _ => anyhow::bail!("the slots' cache formats differ"),
+                }
+            }
+            for (from, to) in s.conv.iter().zip(d.conv.iter_mut()) {
+                stream.memcpy_dtod(from, to)?;
+            }
+        }
+        let (moved_to, emptied) = (self.new_sequence(), self.new_sequence());
+        let mut set = |slot: usize, position: usize, sequence: u64| {
+            if slot == 0 {
+                self.position = position;
+                self.sequence = sequence;
+            } else {
+                let s = &mut self.slots[slot - 1];
+                s.position = position;
+                s.sequence = sequence;
+            }
+        };
+        set(to, position, moved_to);
+        set(from, 0, emptied);
         Ok(())
     }
 
@@ -395,6 +514,7 @@ impl Model {
                 self.visits.iter().all(|v| v.kv.holds(position)),
                 "slot {slot}: the global KV caches are full at {position} tokens"
             );
+            self.map_slot(slot, position + 1)?;
             positions.push(u32::try_from(position).context("position does not fit the kernels")?);
             tokens.push(i32::try_from(token)?);
         }

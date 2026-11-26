@@ -191,6 +191,39 @@ impl PrefixCache {
         candidates().min_by_key(|&s| self.of_slot(model, s, now).map(|i| self.entries[i].used))
     }
 
+    /// Returns the pages of the copies of every entry that is not live to the pool, once
+    /// the host tier's copies from them are done. Returns the pages freed.
+    fn release_dead(&mut self, model: &Model) -> anyhow::Result<usize> {
+        let now = Instant::now();
+        let dead: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| {
+                self.entries[i].model.pages() > 0 && !self.live(&self.entries[i], model, now)
+            })
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        self.fence()?;
+        let mut freed = 0;
+        for i in dead {
+            let e = &mut self.entries[i];
+            freed += e.model.pages();
+            e.model.release(model.stream())?;
+            e.slot = None;
+        }
+        Ok(freed)
+    }
+
+    /// The slot outside `busy` that a parked sequence returns to: the idle slot without a
+    /// live entry that holds the most pages, which it then maps the fewest of, else the
+    /// slot of [`Self::victim_slot`].
+    fn return_slot(&self, model: &Model, busy: &[usize], now: Instant) -> Option<usize> {
+        (0..model.slots())
+            .filter(|s| !busy.contains(s) && self.of_slot(model, *s, now).is_none())
+            .max_by_key(|&s| model.slot_pages(s).unwrap_or(0))
+            .or_else(|| self.victim_slot(model, busy, now))
+    }
+
     /// Drops the entry of slot `slot`, if any.
     fn drop_slot(&mut self, slot: usize) {
         for e in &mut self.entries {
@@ -591,7 +624,7 @@ impl Speculator {
             .prefix
             .as_ref()
             .and_then(|c| c.of_slot(model, from, now));
-        model.move_slot(from, 0)?;
+        model.transfer_slot(from, 0)?;
         if let (Some(cache), Some(i)) = (self.prefix.as_mut(), entry) {
             let e = &mut cache.entries[i];
             e.slot = Some(0);
@@ -623,7 +656,7 @@ impl Speculator {
             return Ok(());
         }
         cache.drop_slot(to);
-        model.move_slot(0, to)?;
+        model.transfer_slot(0, to)?;
         let e = &mut cache.entries[i];
         e.slot = Some(to);
         e.sequence = model.slot_sequence(to)?;
@@ -736,6 +769,199 @@ impl Speculator {
             ),
         };
         host.note(line);
+    }
+
+    /// Whether the host tier is on, which [`Self::park`] needs.
+    #[must_use]
+    pub fn can_park(&self) -> bool {
+        self.prefix.as_ref().is_some_and(|c| c.host.is_some())
+    }
+
+    /// Copies the sequence in slot `slot` to the host tier ([`HostCache::park`]) and frees
+    /// the slot: drops its entry and resets it. `key` is the prompt's key
+    /// ([`Prompt::key`]) and the tokens fed after it, of which the first `prompt_len` came
+    /// from the prompt. The slot keeps its pages, which a returning sequence of about its
+    /// length maps no more, until the pool needs them ([`Self::release_slot`]). Returns the
+    /// id that [`Self::unpark`] takes, or `None`, leaving the slot as it was, when the host
+    /// tier is off or the sequence does not fit it.
+    pub fn park(
+        &mut self,
+        model: &mut Model,
+        slot: usize,
+        key: &[u32],
+        prompt_len: usize,
+    ) -> anyhow::Result<Option<usize>> {
+        let Some(host) = self.prefix.as_mut().and_then(|c| c.host.as_mut()) else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let Some((id, saved)) = host.park(model, slot, key, prompt_len)? else {
+            host.note(format!(
+                "host cache: a sequence of {} tokens does not fit to park",
+                key.len()
+            ));
+            return Ok(None);
+        };
+        host.note(format!(
+            "host cache: parked {} tokens from slot {slot}: {} MiB, {} chunks copied, {} \
+             shared, {:.1} ms to queue",
+            key.len(),
+            saved.bytes >> 20,
+            saved.copied,
+            saved.shared,
+            started.elapsed().as_secs_f64() * 1e3
+        ));
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.fence()?;
+            cache.drop_slot(slot);
+        }
+        model.reset_slot(slot)?;
+        Ok(Some(id))
+    }
+
+    /// Returns parked sequence `id` ([`Self::park`]) into a slot outside `busy`, which
+    /// loses its sequence and entry, and returns the slot and the sequence's position.
+    pub fn unpark(
+        &mut self,
+        model: &mut Model,
+        id: usize,
+        busy: &[usize],
+    ) -> anyhow::Result<(usize, usize)> {
+        let now = Instant::now();
+        let cache = self
+            .prefix
+            .as_mut()
+            .context("parking needs the prefix cache")?;
+        cache.fence()?;
+        let slot = cache
+            .return_slot(model, busy, now)
+            .context("every slot runs a request")?;
+        cache.drop_slot(slot);
+        model.reset_slot(slot)?;
+        let host = cache
+            .host
+            .as_mut()
+            .context("parking needs the host cache")?;
+        let started = host.start_restore()?;
+        let (position, bytes) = host.unpark(model, id, slot)?;
+        let seconds = host.finish_restore(started)?;
+        host.note(format!(
+            "host cache: returned {position} parked tokens into slot {slot}: {} MiB in {:.1} \
+             ms, {:.1} GB/s",
+            bytes >> 20,
+            seconds * 1e3,
+            bytes as f64 / seconds.max(1e-9) / 1e9
+        ));
+        Ok((slot, position))
+    }
+
+    /// The slot outside `busy` that [`Self::unpark`] would return a sequence to.
+    #[must_use]
+    pub fn return_slot(&self, model: &Model, busy: &[usize]) -> Option<usize> {
+        let now = Instant::now();
+        self.prefix
+            .as_ref()
+            .and_then(|c| c.return_slot(model, busy, now))
+    }
+
+    /// Frees parked sequence `id`'s host memory, for a request that ended while parked.
+    pub fn drop_parked(&mut self, id: usize) {
+        if let Some(host) = self.prefix.as_mut().and_then(|c| c.host.as_mut()) {
+            host.drop_parked(id);
+        }
+    }
+
+    /// Drops slot `slot`'s entry and returns all of its pages to the pool, once the host
+    /// tier's copies from it are done.
+    pub fn evict_slot(&mut self, model: &mut Model, slot: usize) -> anyhow::Result<()> {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.fence()?;
+            cache.drop_slot(slot);
+            cache.release_dead(model)?;
+        }
+        model.unmap_slot_from(slot, 0)?;
+        model.reset_slot(slot)
+    }
+
+    /// Returns the pages of the copies of entries that are no longer live to the pool.
+    /// Returns the pages freed.
+    pub fn release_dead_entries(&mut self, model: &Model) -> anyhow::Result<usize> {
+        self.prefix
+            .as_mut()
+            .map_or(Ok(0), |c| c.release_dead(model))
+    }
+
+    /// Returns the pages of idle slot `slot` that its live entry does not need to the pool:
+    /// past the entry's boundary, and its rings, or all of them without a live entry, once
+    /// the host tier's copies are done. The entry keeps the pages below its boundary until
+    /// [`Self::evict_slot`]. A slot keeps its pages after its request ends, so that the
+    /// next sequence there maps none; the server calls this when the pool runs short.
+    pub fn release_slot(&mut self, model: &mut Model, slot: usize) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let keep = self.prefix.as_ref().map_or(Ok(None), |c| {
+            c.fence().map(|()| {
+                c.of_slot(model, slot, now)
+                    .map(|i| c.entries[i].tokens.len())
+            })
+        })?;
+        if let Some(boundary) = keep {
+            return model.unmap_slot_from(slot, boundary);
+        }
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.drop_slot(slot);
+        }
+        model.unmap_slot_from(slot, 0)?;
+        model.reset_slot(slot)
+    }
+
+    /// The slots outside `busy` that hold pages, least recently used entry first (a slot
+    /// without a live entry before any), with the pages each holds: what
+    /// [`Self::evict_slot`] can return to the pool.
+    #[must_use]
+    pub fn evictable_slots(&self, model: &Model, busy: &[usize]) -> Vec<(usize, usize)> {
+        let now = Instant::now();
+        let mut slots: Vec<(Option<Instant>, usize, usize)> = (0..model.slots())
+            .filter(|s| !busy.contains(s))
+            .filter_map(|s| {
+                let entry = self
+                    .prefix
+                    .as_ref()
+                    .and_then(|c| c.of_slot(model, s, now).map(|i| c.entries[i].model.pages()));
+                let pages = model.slot_pages(s).ok()? + entry.unwrap_or(0);
+                (pages > 0).then(|| {
+                    let used = self
+                        .prefix
+                        .as_ref()
+                        .and_then(|c| c.of_slot(model, s, now).map(|i| c.entries[i].used));
+                    (used, s, pages)
+                })
+            })
+            .collect();
+        slots.sort_by_key(|&(used, s, _)| (used, s == 0));
+        slots.into_iter().map(|(_, s, p)| (s, p)).collect()
+    }
+
+    /// Returns the draft's pages to the pool when it follows no sequence, so that no entry
+    /// keeps its global caches any more. Returns the pages freed.
+    pub fn trim_draft(&mut self, model: &Model) -> anyhow::Result<usize> {
+        if self.following() {
+            return Ok(0);
+        }
+        let held = self.draft.held_pages();
+        if held == 0 {
+            return Ok(0);
+        }
+        self.fence_host()?;
+        self.draft.unmap_from(0, model.stream())?;
+        // The draft's global caches no longer hold any sequence.
+        self.draft_sequence += 1;
+        Ok(held)
+    }
+
+    /// Pages more that the draft takes to commit every position below `end`.
+    #[must_use]
+    pub fn draft_pages_to(&self, end: usize) -> usize {
+        self.draft.pages_to(end)
     }
 
     /// The live entry of slot `slot` whose tokens `tokens` starts with and goes past.

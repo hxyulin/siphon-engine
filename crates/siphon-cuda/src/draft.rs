@@ -283,7 +283,7 @@ impl DraftRings {
         self.caches
             .iter()
             .flatten()
-            .flat_map(|c| [DeviceSpan::of(&c.k, stream), DeviceSpan::of(&c.v, stream)])
+            .flat_map(|c| [DeviceSpan::of(&*c.k, stream), DeviceSpan::of(&*c.v, stream)])
             .collect()
     }
 
@@ -957,7 +957,11 @@ impl Draft {
         let caches = (0..layers)
             .map(|layer| {
                 let fp8 = options.fp8_kv && arch.global(layer);
-                KvCache::with_format(stream, arch.slots(layer, capacity), fp8)
+                let slots = arch.slots(layer, capacity);
+                match shared.kv_pool {
+                    Some(pool) if arch.global(layer) => KvCache::pooled(stream, slots, fp8, pool),
+                    _ => KvCache::with_format(stream, slots, fp8),
+                }
             })
             .collect::<anyhow::Result<_>>()?;
         let s = Scratch::new(stream, config, &arch)?;
@@ -1038,7 +1042,61 @@ impl Draft {
             position <= self.capacity,
             "the draft's cache cannot hold position {position}"
         );
+        if let Some(stream) = self.caches.first().map(|c| Arc::clone(c.k.stream())) {
+            self.map(position + BLOCK, &stream)?;
+        }
         self.committed = position;
+        Ok(())
+    }
+
+    /// Maps the global layers' caches to hold every position below `end`, rounded up to
+    /// [`crate::model::MAP_POSITIONS`], from the target's page pool. The draft maps what
+    /// its commits and rounds write before they run; this is for copies into the caches.
+    /// Does nothing for caches that are not pooled.
+    pub fn map(&mut self, end: usize, stream: &CudaStream) -> anyhow::Result<()> {
+        let end = end.next_multiple_of(crate::model::MAP_POSITIONS);
+        for c in &mut self.caches {
+            c.map(end, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Pages more that [`Self::map`] of `end` would take.
+    #[must_use]
+    pub fn pages_to(&self, end: usize) -> usize {
+        let end = end.next_multiple_of(crate::model::MAP_POSITIONS);
+        self.caches.iter().map(|c| c.pages_to(end)).sum()
+    }
+
+    /// Pages of the pool that the global layers' caches hold.
+    #[must_use]
+    pub fn held_pages(&self) -> usize {
+        self.caches.iter().map(KvCache::held_pages).sum()
+    }
+
+    /// Positions of the global layers' caches that are mapped.
+    #[must_use]
+    pub fn mapped(&self) -> usize {
+        self.caches
+            .iter()
+            .filter(|c| c.slots >= self.capacity)
+            .map(KvCache::mapped)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Returns the global layers' pages past the first `positions` to the pool, after
+    /// `stream` has done its work, and forgets the positions past them.
+    pub fn unmap_from(&mut self, positions: usize, stream: &CudaStream) -> anyhow::Result<()> {
+        if !self.caches.iter().any(KvCache::is_pooled) {
+            return Ok(());
+        }
+        stream.synchronize()?;
+        let keep = positions.next_multiple_of(crate::model::MAP_POSITIONS);
+        for c in &mut self.caches {
+            c.unmap_from(keep)?;
+        }
+        self.committed = self.committed.min(positions);
         Ok(())
     }
 
@@ -1076,7 +1134,7 @@ impl Draft {
         self.caches
             .iter()
             .filter(|c| c.slots < self.capacity)
-            .flat_map(|c| [DeviceSpan::of(&c.k, stream), DeviceSpan::of(&c.v, stream)])
+            .flat_map(|c| [DeviceSpan::of(&*c.k, stream), DeviceSpan::of(&*c.v, stream)])
             .collect()
     }
 
@@ -1092,8 +1150,8 @@ impl Draft {
                 .iter()
                 .flat_map(|c| {
                     [
-                        DeviceSpan::of(&c.k, stream).ptr,
-                        DeviceSpan::of(&c.v, stream).ptr,
+                        DeviceSpan::of(&*c.k, stream).ptr,
+                        DeviceSpan::of(&*c.v, stream).ptr,
                     ]
                 })
                 .collect(),
@@ -1149,8 +1207,8 @@ impl Draft {
         );
         for (cache, copy) in self.caches.iter().zip(&mut rings.caches) {
             if let Some(copy) = copy {
-                stream.memcpy_dtod(&cache.k, &mut copy.k)?;
-                stream.memcpy_dtod(&cache.v, &mut copy.v)?;
+                stream.memcpy_dtod(&*cache.k, &mut *copy.k)?;
+                stream.memcpy_dtod(&*cache.v, &mut *copy.v)?;
             }
         }
         rings.committed = self.committed;
@@ -1174,8 +1232,8 @@ impl Draft {
         );
         for (cache, copy) in self.caches.iter_mut().zip(&rings.caches) {
             if let Some(copy) = copy {
-                stream.memcpy_dtod(&copy.k, &mut cache.k)?;
-                stream.memcpy_dtod(&copy.v, &mut cache.v)?;
+                stream.memcpy_dtod(&*copy.k, &mut *cache.k)?;
+                stream.memcpy_dtod(&*copy.v, &mut *cache.v)?;
             }
         }
         self.committed = rings.committed;
@@ -1317,6 +1375,7 @@ impl Draft {
             start + rows,
             self.capacity
         );
+        self.map(start + rows + BLOCK, stream)?;
         self.sync_shortlist(stream)?;
         if rows > 0 {
             let mut dst = self.inputs.taps.slice_mut(..rows * row_len);
@@ -1362,6 +1421,7 @@ impl Draft {
             start + rows,
             self.capacity
         );
+        self.map(start + rows + BLOCK, stream)?;
         self.sync_shortlist(stream)?;
         let mut dst = self.inputs.taps.slice_mut(..rows * row_len);
         stream.memcpy_dtod(&taps, &mut dst)?;
@@ -1447,6 +1507,7 @@ impl Draft {
             start + rows,
             self.capacity
         );
+        self.map(start + rows, stream)?;
         match &self.arch {
             Arch::Stock { weights, alpha, .. } => {
                 let s = &mut self.s;
@@ -1609,6 +1670,7 @@ impl Draft {
             "the block at {position} exceeds the capacity {}",
             self.capacity
         );
+        self.map(position + BLOCK, stream)?;
         self.sync_shortlist(stream)?;
         self.kernels
             .set_control(stream, &mut self.inputs.control, position, 0, anchor)?;
