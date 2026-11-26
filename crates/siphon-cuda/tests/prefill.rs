@@ -29,8 +29,8 @@
 //! and every FP8 prefill product on: attention (the default), expert activations and dense
 //! products. Stepping keeps its own kernels, so the FP8 products' rounding adds to the
 //! differences. The first visit's keys and values then come from projections of MXFP8
-//! inputs (relative rounding up to 2^-4 per input), so its state limit is 2^-4; the KL and
-//! top-1 limits stay.
+//! inputs (relative rounding up to 2^-4 per input) and are stored as E4M3 in the sliding
+//! ring (another 2^-4 step), so its state limit is 2^-3; the KL and top-1 limits stay.
 
 #![cfg(target_os = "linux")]
 
@@ -51,9 +51,9 @@ const DECODE: usize = 8;
 /// Every this many prompt positions, and the last, the full logits are compared.
 const SAMPLE_EVERY: usize = 97;
 const MAX_STATE_ERROR: f64 = 1.0 / 128.0;
-/// The first-visit state limit with FP8 prefill products: the E4M3 rounding of the
-/// projections' inputs.
-const MAX_FP8_STATE_ERROR: f64 = 1.0 / 16.0;
+/// The first-visit state limit with FP8 prefill products and FP8 sliding rings: E4M3
+/// rounding of both the projections' inputs and the cached ring elements.
+const MAX_FP8_STATE_ERROR: f64 = 1.0 / 8.0;
 const MAX_MEAN_KL: f64 = 4e-3;
 const MAX_KL: f64 = 0.12;
 const MIN_TOP1: f64 = 0.97;

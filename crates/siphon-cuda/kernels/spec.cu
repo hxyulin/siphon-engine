@@ -93,35 +93,49 @@ extern "C" __global__ void conv_rollback(const unsigned long long* states, const
 // slot (start + j) mod slots of each sliding visit's BF16 keys and values. rings holds a
 // keys and a values pointer per visit; backup is [visits, 8, 2, 1024]. Grid: (rows,
 // visits), 128 threads.
+// Saves the slots that rows 0..gridDim.x of a verify at *start will overwrite in each
+// sliding ring: slot (*start + j) % slots of each ring's keys and values (`row_bytes`
+// bytes per slot: 2048 for BF16, 1024 for FP8).
 extern "C" __global__ void __launch_bounds__(128)
-ring_backup(const unsigned long long* rings, unsigned slots, const unsigned* start, __nv_bfloat16* backup) {
+ring_backup(const unsigned long long* rings, unsigned slots, const unsigned* start, uint8_t* backup,
+            unsigned row_bytes) {
     const int j = blockIdx.x;
     const int v = blockIdx.y;
     const size_t slot = (*start + j) % slots;
-    const int c = threadIdx.x * 8;
-    const auto* keys = reinterpret_cast<const __nv_bfloat16*>(rings[2 * v]);
-    const auto* values = reinterpret_cast<const __nv_bfloat16*>(rings[2 * v + 1]);
-    __nv_bfloat16* dst = backup + (size_t(v) * kVerifyRows + j) * 2 * kKvDims;
-    *reinterpret_cast<uint4*>(dst + c) = *reinterpret_cast<const uint4*>(keys + slot * kKvDims + c);
-    *reinterpret_cast<uint4*>(dst + kKvDims + c) = *reinterpret_cast<const uint4*>(values + slot * kKvDims + c);
+    const unsigned byte_off = threadIdx.x * 16u;
+    if (byte_off >= row_bytes) {
+        return;
+    }
+    const auto* keys = reinterpret_cast<const uint8_t*>(rings[2 * v]);
+    const auto* values = reinterpret_cast<const uint8_t*>(rings[2 * v + 1]);
+    uint8_t* dst = backup + (size_t(v) * kVerifyRows + j) * 2 * size_t(row_bytes);
+    *reinterpret_cast<uint4*>(dst + byte_off) =
+        *reinterpret_cast<const uint4*>(keys + slot * size_t(row_bytes) + byte_off);
+    *reinterpret_cast<uint4*>(dst + row_bytes + byte_off) =
+        *reinterpret_cast<const uint4*>(values + slot * size_t(row_bytes) + byte_off);
 }
 
 // Puts back the slots of the rejected rows j > result[0], from ring_backup's copy.
 extern "C" __global__ void __launch_bounds__(128)
-ring_restore(const unsigned long long* rings, unsigned slots, const unsigned* start, const __nv_bfloat16* backup,
-             const int* result) {
+ring_restore(const unsigned long long* rings, unsigned slots, const unsigned* start, const uint8_t* backup,
+             const int* result, unsigned row_bytes) {
     const int j = blockIdx.x;
     if (j <= result[0]) {
         return;
     }
     const int v = blockIdx.y;
     const size_t slot = (*start + j) % slots;
-    const int c = threadIdx.x * 8;
-    auto* keys = reinterpret_cast<__nv_bfloat16*>(rings[2 * v]);
-    auto* values = reinterpret_cast<__nv_bfloat16*>(rings[2 * v + 1]);
-    const __nv_bfloat16* src = backup + (size_t(v) * kVerifyRows + j) * 2 * kKvDims;
-    *reinterpret_cast<uint4*>(keys + slot * kKvDims + c) = *reinterpret_cast<const uint4*>(src + c);
-    *reinterpret_cast<uint4*>(values + slot * kKvDims + c) = *reinterpret_cast<const uint4*>(src + kKvDims + c);
+    const unsigned byte_off = threadIdx.x * 16u;
+    if (byte_off >= row_bytes) {
+        return;
+    }
+    auto* keys = reinterpret_cast<uint8_t*>(rings[2 * v]);
+    auto* values = reinterpret_cast<uint8_t*>(rings[2 * v + 1]);
+    const uint8_t* src = backup + (size_t(v) * kVerifyRows + j) * 2 * size_t(row_bytes);
+    *reinterpret_cast<uint4*>(keys + slot * size_t(row_bytes) + byte_off) =
+        *reinterpret_cast<const uint4*>(src + byte_off);
+    *reinterpret_cast<uint4*>(values + slot * size_t(row_bytes) + byte_off) =
+        *reinterpret_cast<const uint4*>(src + row_bytes + byte_off);
 }
 
 // Greedy acceptance of a verify of m rows: tokens [m] holds the anchor and m - 1 drafts,

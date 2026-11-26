@@ -99,8 +99,12 @@ fn empty_like(
     let format = v.kv.format();
     let pool = pool.filter(|_| v.kv.is_pooled());
     let kv = match (v.kv.window(), pool) {
-        (Some(window), Some(pool)) => KvCache::sliding_pooled(stream, window, v.kv.slots(), pool)?,
-        (Some(window), None) => KvCache::sliding_ring(stream, window, v.kv.slots())?,
+        (Some(window), Some(pool)) => {
+            KvCache::sliding_pooled_with_format(stream, window, v.kv.slots(), format, pool)?
+        }
+        (Some(window), None) => {
+            KvCache::sliding_ring_with_format(stream, window, v.kv.slots(), format)?
+        }
         (None, Some(pool)) => KvCache::global_pooled(stream, v.kv.slots(), format, pool)?,
         (None, None) => KvCache::global_with_format(stream, v.kv.slots(), format)?,
     };

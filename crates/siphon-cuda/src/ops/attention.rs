@@ -183,11 +183,21 @@ impl KvCache {
         window: usize,
         slots: usize,
     ) -> anyhow::Result<Self> {
+        Self::sliding_ring_with_format(stream, window, slots, KvFormat::Bf16)
+    }
+
+    /// [`KvCache::sliding_ring`] storing `format` (`Bf16` or `Fp8`) elements.
+    pub fn sliding_ring_with_format(
+        stream: &Arc<CudaStream>,
+        window: usize,
+        slots: usize,
+        format: KvFormat,
+    ) -> anyhow::Result<Self> {
         ensure!(
             slots >= window,
             "a ring of {slots} slots cannot hold a window of {window}"
         );
-        Self::new(stream, slots, Some(window), KvFormat::Bf16)
+        Self::new(stream, slots, Some(window), format)
     }
 
     /// A BF16 cache of `capacity` slots for a global layer, which sees every earlier key.
@@ -259,11 +269,26 @@ impl KvCache {
         slots: usize,
         pool: &PagePool,
     ) -> anyhow::Result<Self> {
+        Self::sliding_pooled_with_format(stream, window, slots, KvFormat::Bf16, pool)
+    }
+
+    /// [`KvCache::sliding_pooled`] storing `format` (`Bf16` or `Fp8`) elements.
+    pub fn sliding_pooled_with_format(
+        stream: &Arc<CudaStream>,
+        window: usize,
+        slots: usize,
+        format: KvFormat,
+        pool: &PagePool,
+    ) -> anyhow::Result<Self> {
         ensure!(
             slots >= window,
             "a ring of {slots} slots cannot hold a window of {window}"
         );
-        let mut cache = Self::global_pooled(stream, slots, KvFormat::Bf16, pool)?;
+        ensure!(
+            matches!(format, KvFormat::Bf16 | KvFormat::Fp8),
+            "sliding caches are BF16 or FP8"
+        );
+        let mut cache = Self::global_pooled(stream, slots, format, pool)?;
         cache.window = Some(window);
         Ok(cache)
     }
@@ -343,8 +368,8 @@ impl KvCache {
         ensure!(slots > 0, "a KV cache needs at least one slot");
         u32::try_from(slots).context("too many KV cache slots")?;
         ensure!(
-            window.is_none() || format == KvFormat::Bf16,
-            "sliding caches are BF16"
+            window.is_none() || matches!(format, KvFormat::Bf16 | KvFormat::Fp8),
+            "sliding caches are BF16 or FP8"
         );
         let len = slots * KV_ROW;
         let data = match format {
@@ -1557,8 +1582,8 @@ impl Attention {
         // A sliding cache appends after attention, a global one before.
         let input_keys = u32::from(cache.window.is_some());
         ensure!(
-            input_keys == 0 || cache.format() == KvFormat::Bf16,
-            "sliding caches are BF16"
+            input_keys == 0 || matches!(cache.format(), KvFormat::Bf16 | KvFormat::Fp8),
+            "sliding caches are BF16 or FP8"
         );
         if input_keys == 0 {
             self.append_rows(stream, cache, start, rows, &k, &v)?;

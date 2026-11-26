@@ -583,14 +583,23 @@ impl Model {
         let history = config.sconv_kernel_size - 1;
         let kv_dims = config.num_key_value_heads * config.head_dim;
         let hidden = config.hidden_size;
+        let sliding_format = kv_format.sliding_format();
         let formats = config.cache_formats(passes, kv_format);
         let mut visits: Vec<VisitState> = Vec::new();
         for (v, layer) in config.visit_layers(passes).into_iter().enumerate() {
             let kv = if config.is_sliding(layer) {
                 let window = config.sliding_window_size;
                 match &kv_pool {
-                    Some(pool) => KvCache::sliding_pooled(&stream, window, window, pool)?,
-                    None => KvCache::sliding(&stream, window)?,
+                    Some(pool) => KvCache::sliding_pooled_with_format(
+                        &stream,
+                        window,
+                        window,
+                        sliding_format,
+                        pool,
+                    )?,
+                    None => {
+                        KvCache::sliding_ring_with_format(&stream, window, window, sliding_format)?
+                    }
                 }
             } else {
                 let format = formats[v].context("a global visit has a format")?;
@@ -805,7 +814,12 @@ impl Model {
         let window = self.ctx.config.sliding_window_size;
         for v in &mut self.visits {
             if v.kv.window().is_some() {
-                v.kv = KvCache::sliding_ring(&self.ctx.stream, window, slots)?;
+                v.kv = KvCache::sliding_ring_with_format(
+                    &self.ctx.stream,
+                    window,
+                    slots,
+                    v.kv.format(),
+                )?;
             }
         }
         self.graph = None;

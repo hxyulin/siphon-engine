@@ -259,12 +259,19 @@ impl Model {
             .map(|v| {
                 let ring = match (v.kv.window(), &self.kv_pool) {
                     (None, _) => None,
-                    (Some(window), Some(pool)) => {
-                        Some(KvCache::sliding_pooled(stream, window, v.kv.slots(), pool)?)
-                    }
-                    (Some(window), None) => {
-                        Some(KvCache::sliding_ring(stream, window, v.kv.slots())?)
-                    }
+                    (Some(window), Some(pool)) => Some(KvCache::sliding_pooled_with_format(
+                        stream,
+                        window,
+                        v.kv.slots(),
+                        v.kv.format(),
+                        pool,
+                    )?),
+                    (Some(window), None) => Some(KvCache::sliding_ring_with_format(
+                        stream,
+                        window,
+                        v.kv.slots(),
+                        v.kv.format(),
+                    )?),
                 };
                 let conv = v
                     .conv

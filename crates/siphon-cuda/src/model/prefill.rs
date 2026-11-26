@@ -819,6 +819,7 @@ impl Ctx {
                 &p.start,
                 m,
                 &mut v.ring_backup,
+                v.ring_row_bytes,
             )?;
         }
         self.kernels.elementwise.embedding(
@@ -1156,6 +1157,7 @@ impl Ctx {
             m,
             &v.ring_backup,
             &v.result,
+            v.ring_row_bytes,
         )
     }
 

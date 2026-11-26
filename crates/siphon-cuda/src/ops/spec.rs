@@ -213,9 +213,10 @@ impl Spec {
     }
 
     /// Saves the slots that rows `0..rows` of a verify at `start` will overwrite in each
-    /// sliding ring: slot `(start + j) % slots` of the BF16 keys and values whose addresses
-    /// `rings` holds, a keys and a values address per visit. `backup` is
-    /// `[visits, 8, 2, 1024]`.
+    /// sliding ring: slot `(start + j) % slots` of the keys and values whose addresses
+    /// `rings` holds, a keys and a values address per visit, `row_bytes` per slot (`2048`
+    /// for BF16, `1024` for FP8). `backup` is `[visits, 8, 2, row_bytes]` bytes.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
     pub fn ring_backup(
         &self,
         stream: &CudaStream,
@@ -223,15 +224,23 @@ impl Spec {
         slots: usize,
         start: &CudaSlice<u32>,
         rows: usize,
-        backup: &mut CudaSlice<bf16>,
+        backup: &mut CudaSlice<u8>,
+        row_bytes: usize,
     ) -> anyhow::Result<()> {
-        let (config, slots) = ring_config(rings, slots, start, rows, backup.len())?;
+        let (config, slots, row_bytes) =
+            ring_config(rings, slots, start, rows, backup.len(), row_bytes)?;
         let mut launch = stream.launch_builder(&self.ring_backup);
-        launch.arg(rings).arg(&slots).arg(start).arg(backup);
+        launch
+            .arg(rings)
+            .arg(&slots)
+            .arg(start)
+            .arg(backup)
+            .arg(&row_bytes);
         // SAFETY: the arguments match `ring_backup(const unsigned long long*, unsigned, const
-        // unsigned*, bf16*)`. The caller vouches that `rings` holds the addresses of BF16
-        // rings of `slots` rows of 1024; block (j, v) reads one slot below `slots` of visit
-        // `v` and writes row `j` of visit `v` in `backup`, which holds 8 rows per visit.
+        // unsigned*, uint8_t*, unsigned)`. The caller vouches that `rings` holds the addresses
+        // of rings of `slots` rows of `row_bytes` bytes; block (j, v) reads one slot below
+        // `slots` of visit `v` and writes row `j` of visit `v` in `backup`, which holds 8 rows
+        // per visit.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -245,10 +254,12 @@ impl Spec {
         slots: usize,
         start: &CudaSlice<u32>,
         rows: usize,
-        backup: &CudaSlice<bf16>,
+        backup: &CudaSlice<u8>,
         result: &CudaSlice<i32>,
+        row_bytes: usize,
     ) -> anyhow::Result<()> {
-        let (config, slots) = ring_config(rings, slots, start, rows, backup.len())?;
+        let (config, slots, row_bytes) =
+            ring_config(rings, slots, start, rows, backup.len(), row_bytes)?;
         check_len("result", result.len(), RESULT_LEN)?;
         let mut launch = stream.launch_builder(&self.ring_restore);
         launch
@@ -256,9 +267,10 @@ impl Spec {
             .arg(&slots)
             .arg(start)
             .arg(backup)
-            .arg(result);
+            .arg(result)
+            .arg(&row_bytes);
         // SAFETY: the arguments match `ring_restore(const unsigned long long*, unsigned, const
-        // unsigned*, const bf16*, const int*)`, with the same bounds as `ring_backup`.
+        // unsigned*, const uint8_t*, const int*, unsigned)`, with the same bounds as `ring_backup`.
         unsafe { launch.launch(config) }?;
         Ok(())
     }
@@ -343,7 +355,8 @@ fn ring_config(
     start: &CudaSlice<u32>,
     rows: usize,
     backup_len: usize,
-) -> anyhow::Result<(LaunchConfig, u32)> {
+    row_bytes: usize,
+) -> anyhow::Result<(LaunchConfig, u32, u32)> {
     ensure!(
         rings.len().is_multiple_of(2) && !rings.is_empty(),
         "{} ring addresses, not pairs",
@@ -354,12 +367,21 @@ fn ring_config(
         (1..=VERIFY_ROWS).contains(&rows),
         "{rows} rows, expected 1 to {VERIFY_ROWS}"
     );
+    ensure!(
+        row_bytes == KV_DIMS || row_bytes == 2 * KV_DIMS,
+        "ring row_bytes {row_bytes}, expected {KV_DIMS} or {}",
+        2 * KV_DIMS
+    );
     check_len("start", start.len(), 1)?;
-    check_len("backup", backup_len, visits * VERIFY_ROWS * 2 * KV_DIMS)?;
+    check_len("backup", backup_len, visits * VERIFY_ROWS * 2 * row_bytes)?;
     let config = LaunchConfig {
         grid_dim: (u32::try_from(rows)?, u32::try_from(visits)?, 1),
         block_dim: (u32::try_from(KV_DIMS / 8)?, 1, 1),
         shared_mem_bytes: 0,
     };
-    Ok((config, u32::try_from(slots).context("too many slots")?))
+    Ok((
+        config,
+        u32::try_from(slots).context("too many slots")?,
+        u32::try_from(row_bytes).context("row_bytes too large")?,
+    ))
 }

@@ -1965,7 +1965,9 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 }
             }
         } else if constexpr (kFp8) {
-            // 8 chunks of 16 E4M3 values per row.
+            // 8 chunks of 16 E4M3 values per row. For sliding rings (`tile.input`), convert
+            // the chunk's new BF16 keys/values to E4M3 on the fly into shared memory so the
+            // ring is only updated after prefill attention finishes reading wrapped slots.
             constexpr int kChunks = kHeadDim / 16;
             const int chunk = threadIdx.x % kChunks;
 #pragma unroll
@@ -1973,13 +1975,39 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 const bool valid = tile.p0 + row < tile.end;
                 unsigned source = first + row;
                 source = source >= wrap ? source - wrap : source;
-                const size_t offset = size_t(valid ? source : 0) * kKvRow + g.kv_head * kHeadDim + chunk * 16;
-                if constexpr (kMma8) {
-                    copy_async16(&sm.k8[stage][k8_offset(row, chunk)], k_cache + offset, valid);
-                    copy_async16(&sm.v8[stage][v8_offset(row, chunk)], v_cache + offset, valid);
+                if (tile.input) {
+                    uint4 kk = make_uint4(0, 0, 0, 0);
+                    uint4 vv = make_uint4(0, 0, 0, 0);
+                    if (valid) {
+                        const size_t offset = size_t(source) * kKvRow + g.kv_head * kHeadDim + chunk * 16;
+                        auto pack16 = [](const __nv_bfloat16* src) {
+                            float a[8], b[8];
+                            unpack_bf16x8(*reinterpret_cast<const uint4*>(src), a);
+                            unpack_bf16x8(*reinterpret_cast<const uint4*>(src + 8), b);
+                            return make_uint4(pack_e4m3x4(a[0], a[1], a[2], a[3]),
+                                              pack_e4m3x4(a[4], a[5], a[6], a[7]),
+                                              pack_e4m3x4(b[0], b[1], b[2], b[3]),
+                                              pack_e4m3x4(b[4], b[5], b[6], b[7]));
+                        };
+                        kk = pack16(k_in + offset);
+                        vv = pack16(v_in + offset);
+                    }
+                    if constexpr (kMma8) {
+                        *reinterpret_cast<uint4*>(&sm.k8[stage][k8_offset(row, chunk)]) = kk;
+                        *reinterpret_cast<uint4*>(&sm.v8[stage][v8_offset(row, chunk)]) = vv;
+                    } else {
+                        *reinterpret_cast<uint4*>(&sm.k8[stage][row * kHeadDim + chunk * 16]) = kk;
+                        *reinterpret_cast<uint4*>(&sm.v8[stage][row * kHeadDim + chunk * 16]) = vv;
+                    }
                 } else {
-                    copy_async16(&sm.k8[stage][row * kHeadDim + chunk * 16], k_cache + offset, valid);
-                    copy_async16(&sm.v8[stage][row * kHeadDim + chunk * 16], v_cache + offset, valid);
+                    const size_t offset = size_t(valid ? source : 0) * kKvRow + g.kv_head * kHeadDim + chunk * 16;
+                    if constexpr (kMma8) {
+                        copy_async16(&sm.k8[stage][k8_offset(row, chunk)], k_cache + offset, valid);
+                        copy_async16(&sm.v8[stage][v8_offset(row, chunk)], v_cache + offset, valid);
+                    } else {
+                        copy_async16(&sm.k8[stage][row * kHeadDim + chunk * 16], k_cache + offset, valid);
+                        copy_async16(&sm.v8[stage][row * kHeadDim + chunk * 16], v_cache + offset, valid);
+                    }
                 }
             }
         } else {

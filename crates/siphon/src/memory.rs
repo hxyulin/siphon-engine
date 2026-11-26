@@ -374,7 +374,8 @@ impl Planner {
         // One slot's sliding rings and conv states. With a pool, a slot's rings and an
         // entry's copies of them come from the pool while in use, and only the conv states
         // stay fixed.
-        let ring_bytes = sliding_visits * c.sliding_window_size * 2 * kv_dims * 2;
+        let ring_row_bytes = inputs.kv.sliding_format().row_bytes(kv_dims);
+        let ring_bytes = sliding_visits * c.sliding_window_size * 2 * ring_row_bytes;
         let conv_bytes = visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4;
         let slot_rings = ring_bytes + conv_bytes;
         let fixed_rings = if inputs.pooled {
@@ -442,7 +443,7 @@ impl Planner {
             rings: 2
                 * 2
                 * sliding_visits
-                * (c.sliding_window_size * kv_dims * 2).next_multiple_of(KV_PAGE_BYTES),
+                * (c.sliding_window_size * ring_row_bytes).next_multiple_of(KV_PAGE_BYTES),
         });
         // The batched step's chunk buffers for one row per stream, its state tables,
         // positions and tokens, and its rows' taps for the draft.

@@ -102,8 +102,10 @@ pub(super) struct VerifyBuffers {
     pub rings: CudaSlice<u64>,
     /// Slots of every sliding ring.
     pub ring_slots: usize,
-    /// The ring slots the pass overwrites, BF16 `[sliding visits, 8, 2, 1024]`.
-    pub ring_backup: CudaSlice<bf16>,
+    /// Bytes per slot of each sliding ring's key or value buffer (`2048` for BF16, `1024` for FP8).
+    pub ring_row_bytes: usize,
+    /// The ring slots the pass overwrites, `[sliding visits, 8, 2, ring_row_bytes]` bytes.
+    pub ring_backup: CudaSlice<u8>,
     /// Each row's token, greedy or drawn.
     pub argmax: CudaSlice<i32>,
     /// Rows to keep whatever the drafts, or 0 for greedy acceptance.
@@ -121,6 +123,7 @@ impl VerifyBuffers {
         let mut states = Vec::with_capacity(visits.len() * STREAMS);
         let mut rings = Vec::new();
         let mut ring_slots = None;
+        let mut ring_row_bytes = None;
         for (i, v) in visits.iter().enumerate() {
             for (state, dims) in v.conv.iter().zip(STREAM_DIMS) {
                 ensure!(
@@ -131,26 +134,42 @@ impl VerifyBuffers {
                 states.push(state.device_ptr(stream).0);
             }
             if v.kv.window().is_some() {
-                let KvData::Bf16 { keys, values } = v.kv.data() else {
-                    anyhow::bail!("visit {i}: sliding caches are BF16");
+                let (keys, values, row_bytes) = match v.kv.data() {
+                    KvData::Bf16 { keys, values } => (
+                        keys.device_ptr(stream).0,
+                        values.device_ptr(stream).0,
+                        1024 * 2,
+                    ),
+                    KvData::Fp8 { keys, values } => {
+                        (keys.device_ptr(stream).0, values.device_ptr(stream).0, 1024)
+                    }
+                    KvData::Nvfp4 { .. } => {
+                        anyhow::bail!("visit {i}: sliding caches are BF16 or FP8")
+                    }
                 };
-                rings.push(keys.device_ptr(stream).0);
-                rings.push(values.device_ptr(stream).0);
+                rings.push(keys);
+                rings.push(values);
                 ensure!(
                     *ring_slots.get_or_insert(v.kv.slots()) == v.kv.slots(),
                     "the sliding rings differ in size"
+                );
+                ensure!(
+                    *ring_row_bytes.get_or_insert(row_bytes) == row_bytes,
+                    "the sliding rings differ in format"
                 );
             }
         }
         let sliding = rings.len() / 2;
         ensure!(sliding > 0, "no sliding visits");
+        let ring_row_bytes = ring_row_bytes.unwrap_or(1024 * 2);
         Ok(Self {
             states: stream.clone_htod(&states)?,
             conv_backup: zeros(stream, visits.len() * STATE_ROWS * VISIT_CHANNELS)?,
             inputs: zeros(stream, visits.len() * VERIFY_ROWS * VISIT_CHANNELS)?,
             rings: stream.clone_htod(&rings)?,
             ring_slots: ring_slots.unwrap_or(0),
-            ring_backup: zeros(stream, sliding * VERIFY_ROWS * 2 * 1024)?,
+            ring_row_bytes,
+            ring_backup: zeros(stream, sliding * VERIFY_ROWS * 2 * ring_row_bytes)?,
             argmax: zeros(stream, VERIFY_ROWS)?,
             keep: zeros(stream, 1)?,
             result: zeros(stream, RESULT_LEN)?,

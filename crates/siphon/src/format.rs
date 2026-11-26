@@ -70,7 +70,9 @@ impl fmt::Display for OutputProjection {
     }
 }
 
-/// Element format of the global-layer KV caches. Sliding caches are always BF16.
+/// Element format of the global-layer KV caches. Under quantized settings (`Fp8`, `Nvfp4`,
+/// `Mixed`), sliding-window caches store E4M3 ([`KvFormat::sliding_format`]); under `Bf16`
+/// they stay BF16.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvFormat {
     /// BF16, the projections' own values.
@@ -102,6 +104,16 @@ impl KvFormat {
             Self::Mixed if global < MIXED_FP8_VISITS => Self::Fp8,
             Self::Mixed => Self::Nvfp4,
             f => f,
+        }
+    }
+
+    /// The format of the sliding-window caches under this setting: BF16 under
+    /// [`KvFormat::Bf16`], E4M3 under every quantized KV setting (`Fp8`, `Nvfp4`, `Mixed`).
+    #[must_use]
+    pub const fn sliding_format(self) -> Self {
+        match self {
+            Self::Bf16 => Self::Bf16,
+            Self::Fp8 | Self::Nvfp4 | Self::Mixed => Self::Fp8,
         }
     }
 
