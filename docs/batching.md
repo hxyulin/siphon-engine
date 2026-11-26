@@ -2,6 +2,8 @@
 
 Siphon serves one sequence at a time. This note describes how it runs up to 32 sequences together with plain decode, reusing the verify pass's multi-row kernels, and how the server schedules them. [engine.md](engine.md) describes the verify pass this builds on.
 
+![Three streams sharing the GPU: speculation alone, chunked prefill between batched steps, a turn in host RAM, and the return to speculation](img/streams.svg)
+
 ## Goal and exactness
 
 A batched step runs one row for each of up to 32 sequences. Every sequence must get exactly the tokens it would get if it were served alone.
