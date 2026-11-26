@@ -318,6 +318,70 @@ On an RTX PRO 6000 Blackwell Workstation Edition with `--host-cache 12`, two con
 
 `tests/drain.rs` checks a deploy end to end with the real binary: a running request finishes all of its 1,500 tokens after SIGTERM, while `/health` and a new request get 503 with `Retry-After`, the server saves and exits with status 0, and the next server loads the entry and gives the same request the same reply from 2,048 cached tokens. `host_cache_round_trips` in `crates/siphon-cuda/tests/prefix.rs` checks that entries read back from disk restore with the first token's logits, tokens and draft acceptance of a cold prefill, with the bundled draft and DFlash 2, that a manifest of another identity is discarded with its files, and that a directory without a manifest loads nothing.
 
+## Serving on an RTX 4090
+
+Measured with the `sm_89` build ([engine.md](engine.md#rtx-4090-sm_89)), the Inkling 2 Mini Fast NVFP4 checkpoint with its tuned bundled draft, FP8 weights, greedy decoding at effort 0, and 23.13 GiB free after the CUDA context. Context is the limit on this card: the weights take 16.8 GiB, so the KV pool gets about 4 GiB.
+
+For one user, such as a coding agent:
+
+```sh
+siphon-serve <model-dir> --streams 2 --kv mixed --host-cache 12 --cache-dir <dir>
+```
+
+Two streams let the agent's background requests run beside its conversation instead of taking its only prefix cache entry, for 4,096 positions less than one stream. The mixed cache plans 314,368 positions at about FP8's quality. The host cache restores a conversation that another request pushed off the GPU, and `--cache-dir` keeps it across restarts.
+
+For the most context in one stream, at NVFP4's lower quality and without the host cache, which needs chunks of 2048:
+
+```sh
+siphon-serve <model-dir> --kv nvfp4 --drafter <dflash2-dir> --prefill-chunk 1024 --margin 0.1
+```
+
+For 2 to 4 users:
+
+```sh
+siphon-serve <model-dir> --streams 4 --kv mixed --host-cache 12
+```
+
+The four streams share a pool of 311,296 positions.
+
+The longest context of one stream, planned and filled with one prompt:
+
+| Configuration | Positions planned | Prompt | First token | Decode | Peak / planned |
+| --- | ---: | ---: | ---: | ---: | --- |
+| FP8 cache | 227,328 | 225,901 | 41.2 s | 184 tok/s | 23,330 / 23,419 MiB |
+| Mixed cache | 319,488 | 316,494 | 69.3 s | 158 tok/s | 23,318 / 23,407 MiB |
+| NVFP4 cache | 370,688 | 367,616 | 87.9 s | 156 tok/s | 23,322 / 23,411 MiB |
+| NVFP4, DFlash 2, chunks of 1024, margin 0.1 | 497,664 | 478,195 | 138.5 s | 207 tok/s | 23,490 / 23,564 MiB |
+
+Each option's effect on the planned positions with the NVFP4 cache, against 370,688 for the bundled draft:
+
+| Option | Bundled draft | DFlash 2 | Cost |
+| --- | ---: | ---: | --- |
+| none | 370,688 | 436,224 | |
+| `--prefill-chunk 1024` | 407,552 | 479,232 | First token 8 to 11% later; no `--host-cache` |
+| `--margin 0.1` | 385,024 | 450,560 | 0.15 GiB less headroom; the peak stayed 74 MiB under the plan |
+| both | 421,888 | 497,664 | |
+| `--output-projection fp8` | 356,352 | 417,792 | Adds an FP8 copy of the output projections |
+| `--weights bf16` | 374,784 | 440,320 | Plain decode about 27% slower |
+
+Time to first token on one stream: 0.94 s at 8,221 tokens, 3.77 s at 32,483 and 14.5 s at 103,597 with the FP8 cache, within 2% of that with the NVFP4 cache; 1.03, 4.17 and 15.8 s with chunks of 1024. A prefix cache hit at 155,648 tokens answered in 0.49 s, a restore from the host cache in 0.72 s (2,907 MiB in 157 ms) and a restore after a restart in 1.09 s, against 25.5 s cold.
+
+Decode on one stream, tok/s, with the same replies for both drafts:
+
+| Prompt | Bundled draft | DFlash 2 |
+| --- | ---: | ---: |
+| Code | 349 | 390 |
+| JSON | 411 | 442 |
+| Prose | 235 to 249 | 252 to 263 |
+| 36,184-token prompt | 308 | 283 |
+| 103,620-token prompt | 240 | 222 |
+
+DFlash 2 is 5 to 12% faster on short prompts and 8% slower on long ones, and it leaves room for 65,536 more NVFP4 positions. On the 103,620-token prompt the mixed and NVFP4 caches decoded 246 and 234 tok/s against FP8's 240. Their replies differ from FP8's, so speculation accepts other tokens and the rates are not a like-for-like comparison.
+
+Concurrent requests of 512 tokens each: 2 on `--streams 2` ran 262 tok/s in all, 134 each; 4 on `--streams 4` ran 341 tok/s in all, 87 each, with the FP8 or NVFP4 cache. While a 100,000-token prompt prefilled, the default `--decode-floor 20` gave a decoding request 20.8 tok/s and made the prefill 7% longer; a floor of 40 gave 40 tok/s for 23%.
+
+When requests outgrow the pool, they take turns through the host cache: two prompts of 112K tokens on 223,232 positions each returned 1,500 tokens, and four of 67K to 75K each answered correctly, with swaps of 16 to 25 GB/s. `--host-cache 16` left 11.5 GB of 31 GB of RAM free; size it to the RAM other processes need.
+
 ## Known gaps
 
 Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of 41,281 tokens (largest 153,426) and a median reply of 151 tokens. The prefix cache served 90% of the tokens of prompts over 4,096.
