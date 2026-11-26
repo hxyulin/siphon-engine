@@ -90,8 +90,8 @@ seconds it ends what is left with an error. Then it saves --cache-dir and exits.
 --prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
---prefill-dense picks prefill's dense products: bf16 (the default) or fp8, which runs the
-attention input projections and message gate down projections on FP8 tensor cores with
+--prefill-dense picks dense products in prefill and large batched passes (>= 48 rows): bf16
+(the default) keeps BF16/row-invariant products, and fp8 runs MXFP8 tensor-core GEMMs with
 --weights fp8.
 --expert-activations picks prefill's (and wide batched) expert activations: bf16 (the
 default), quantized (NVFP4/MXFP8 tensor cores), or fp8 (MXFP8 activations on FP8 tensor

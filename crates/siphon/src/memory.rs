@@ -772,10 +772,18 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     } else {
         0
     };
+    // At 48+ rows, invariant chunks also allocate MXFP8 scratch for opt-in FP8 dense GEMMs.
+    let dense = if rows >= 48 {
+        let values = rows * (3 * hidden).max(c.num_attention_heads * c.head_dim);
+        values + values / 32
+    } else {
+        0
+    };
     rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2 + 2 * hidden * 4)
         + attention
         + extra_head
         + extra_sync
+        + dense
 }
 
 /// The bundled draft's shape: the checkpoint's tensors outside the text and vision models

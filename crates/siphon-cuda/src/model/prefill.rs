@@ -114,6 +114,9 @@ const STEP_ROWS: usize = VERIFY_ROWS;
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
 const _: () = assert!(HEAD_ROWS == siphon::memory::HEAD_ROWS);
+/// Smallest batched/invariant row count that uses native FP8 tensor-core dense GEMMs
+/// (`LinearFp8::gemm`) when `prefill_dense == Products::Fp8`.
+pub(super) const BATCH_FP8_DENSE_MIN_ROWS: usize = 48;
 /// Receives each chunk's feature taps and the position of its first row.
 pub(super) type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
@@ -197,8 +200,9 @@ struct GateRows {
     /// A gate's output, F32 `[rows, hidden]`, and in invariant chunks one per slot of a launch.
     out: CudaSlice<f32>,
     /// The MXFP8 inputs of `Products::Fp8` dense products: up to three inputs of
-    /// `2 * hidden` values per row (empty in invariant chunks, which never use them). The
-    /// attention input projections borrow it too.
+    /// `2 * hidden` values per row in prefill, or `max(3 * hidden, q_dims)` per row in
+    /// invariant chunks with at least [`BATCH_FP8_DENSE_MIN_ROWS`] rows. The attention
+    /// projections and batched LM head borrow it too.
     dense: Fp8Rows,
 }
 
@@ -207,9 +211,17 @@ impl GateRows {
         stream: &Arc<CudaStream>,
         rows: usize,
         hidden: usize,
+        q_dims: usize,
         rank: usize,
         invariant: bool,
     ) -> anyhow::Result<Self> {
+        let dense_len = if !invariant {
+            dense_values(rows, hidden)
+        } else if rows >= BATCH_FP8_DENSE_MIN_ROWS {
+            rows * (3 * hidden).max(q_dims)
+        } else {
+            0
+        };
         Ok(Self {
             invariant,
             inputs: [
@@ -224,14 +236,7 @@ impl GateRows {
                 stream,
                 if invariant { GATE_SLOTS } else { 1 } * rows * hidden,
             )?,
-            dense: Fp8Rows::new(
-                stream,
-                if invariant {
-                    0
-                } else {
-                    dense_values(rows, hidden)
-                },
-            )?,
+            dense: Fp8Rows::new(stream, dense_len)?,
         })
     }
 }
@@ -351,6 +356,10 @@ impl PrefillScratch {
     /// them), the router and experts those of `Routing::moe_router_step_rows` and
     /// `ops::experts_rows`, and attention those of `Attention::attention_rows`. The verify
     /// pass sets it, so that each of its rows equals a verify of that row alone.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "allocates prefill scratch buffers together"
+    )]
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         cfg: &TextConfig,
@@ -394,7 +403,14 @@ impl PrefillScratch {
                 .then(|| zeros(stream, MESSAGE_SLOTS * looped * rows * hidden))
                 .transpose()?,
             attention_inputs: zeros(stream, rows * 3 * hidden)?,
-            gate: GateRows::new(stream, rows, hidden, cfg.loop_config.gate_rank, invariant)?,
+            gate: GateRows::new(
+                stream,
+                rows,
+                hidden,
+                q_dims,
+                cfg.loop_config.gate_rank,
+                invariant,
+            )?,
             qkv_in: [
                 zeros(stream, rows * hidden)?,
                 zeros(stream, rows * hidden)?,
@@ -1441,7 +1457,7 @@ impl Ctx {
             }],
             m,
             true,
-            None,
+            Some(&mut p.gate.dense),
         )?;
         self.kernels.elementwise.logit_softcap(
             &self.stream,
@@ -2159,11 +2175,11 @@ impl Ctx {
             }],
             m,
             invariant,
-            // The output projection stays BF16 under `Products::Fp8`: alone, its FP8
-            // product raised the gate's |log-prob difference| on regex-readme from 0.035
-            // to 0.043, against 0.038 for all the input projections and none for the
-            // message gates.
-            None,
+            // In prefill (`!invariant`) the output projection stays BF16 under
+            // `Products::Fp8` for the prefill quality gate; in batched/invariant passes
+            // with `OutputProjection::Fp8` (`w.fp8.o.is_some()`) and `m >= 48`, it uses
+            // native FP8 tensor cores when `prefill_dense == Products::Fp8`.
+            invariant.then_some(&mut *dense),
         )
     }
 

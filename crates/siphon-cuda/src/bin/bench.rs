@@ -712,6 +712,7 @@ mod linux {
             args.weights,
         )?;
         args.kv_options.apply(&mut model)?;
+        model.set_prefill_dense(args.prefill_dense)?;
         model.add_slots(largest - 1)?;
         let mut speculator = if args.follow {
             let draft = load_draft(
@@ -1014,6 +1015,7 @@ mod linux {
                 args.weights,
             )?;
             args.kv_options.apply(&mut model)?;
+            model.set_prefill_dense(args.prefill_dense)?;
             println!(
                 "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
                  before load: {}",

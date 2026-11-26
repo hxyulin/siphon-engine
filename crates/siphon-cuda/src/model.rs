@@ -452,7 +452,7 @@ struct Ctx {
     prefill_attention: PrefillAttention,
     /// What `prefill_attention` picks for the chunk being enqueued, set per chunk.
     chunk_attention: Products,
-    /// How prefill's dense products multiply.
+    /// How prefill's (and large batched passes') dense products multiply.
     prefill_dense: Products,
     /// The 4-bit rounding of the global caches' writes, for the visits with `round` set.
     kv_rounding: KvRounding,
@@ -939,11 +939,14 @@ impl Model {
         Ok(())
     }
 
-    /// Makes [`Model::prefill`] run its dense products with `products`: with
-    /// [`Products::Fp8`], the attention input projections and the message gates' down
-    /// projections run on FP8 tensor cores with MXFP8 inputs (the output projection stays
-    /// BF16). It reads the FP8 weight copies, so it needs a model loaded with
-    /// [`WeightFormat::Fp8`]; decode and verify are unaffected.
+    /// Makes [`Model::prefill`] — and batched passes ([`Model::step_batch`],
+    /// [`Model::verify_batch`]) of at least 48 rows — run their dense products with
+    /// `products`: with [`Products::Fp8`], the attention input projections, the message
+    /// gates' down projections (in prefill), and in batched passes the FP8 output
+    /// projection and LM head run on FP8 tensor cores with MXFP8 inputs. It reads the FP8
+    /// weight copies, so it needs a model loaded with [`WeightFormat::Fp8`]; decode and
+    /// single-sequence verify are unaffected. Drops the captured batched graphs when
+    /// changed.
     pub fn set_prefill_dense(&mut self, products: Products) -> anyhow::Result<()> {
         ensure!(
             crate::BLOCK_SCALED_MMA || products == Products::Bf16,
@@ -953,7 +956,11 @@ impl Model {
             products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
             "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"
         );
-        self.ctx.prefill_dense = products;
+        if self.ctx.prefill_dense != products {
+            self.ctx.prefill_dense = products;
+            self.batch_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch_verify_graphs.clear();
+        }
         Ok(())
     }
 
@@ -2404,6 +2411,32 @@ impl Ctx {
                 p.out.len()
             );
         }
+        let use_fp8_gemm = self.prefill_dense == Products::Fp8
+            && crate::BLOCK_SCALED_MMA
+            && if invariant {
+                m >= prefill::BATCH_FP8_DENSE_MIN_ROWS
+            } else {
+                m > 1
+            };
+        if let Some(scratch) = dense
+            && use_fp8_gemm
+            && products.iter().all(|p| p.fp8.is_some())
+        {
+            let mut gemms: Vec<Fp8Gemm<'_>> = products
+                .iter_mut()
+                .filter_map(|p| {
+                    Some(Fp8Gemm {
+                        weight: p.fp8?,
+                        x: p.x.slice(..),
+                        out: p.out.slice_mut(..),
+                    })
+                })
+                .collect();
+            return self
+                .kernels
+                .linear_fp8
+                .gemm(&self.stream, &mut gemms, m, scratch);
+        }
         if invariant {
             ensure!(
                 m <= linear_rows::MAX_ROWS,
@@ -2422,26 +2455,6 @@ impl Ctx {
                 .kernels
                 .linear_rows
                 .run(&self.stream, &mut rows, m, Start::Early);
-        }
-        if let Some(scratch) = dense
-            && self.prefill_dense == Products::Fp8
-            && m > 1
-            && products.iter().all(|p| p.fp8.is_some())
-        {
-            let mut gemms: Vec<Fp8Gemm<'_>> = products
-                .iter_mut()
-                .filter_map(|p| {
-                    Some(Fp8Gemm {
-                        weight: p.fp8?,
-                        x: p.x.slice(..),
-                        out: p.out.slice_mut(..),
-                    })
-                })
-                .collect();
-            return self
-                .kernels
-                .linear_fp8
-                .gemm(&self.stream, &mut gemms, m, scratch);
         }
         let mut gemms: Vec<Gemm<'_, bf16>> = products
             .iter_mut()
