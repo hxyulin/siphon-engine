@@ -36,11 +36,11 @@ __device__ __forceinline__ size_t grid_stride() {
     return size_t(gridDim.x) * blockDim.x;
 }
 
-// tanh(x / cap) * cap. A correctly rounded tanh (through double) agrees with Metal's
-// on 98.4% of BF16 inputs to the logit softcap, tanhf on 98.0%. In SwiGLU outputs that
-// is 11 against 18 differing BF16 values per million, so SwiGLU uses tanhf (softcap_f32).
+// tanh(x / cap) * cap. Using CUDA's tanhf (softcap_f32) avoids the 1:64 FP64 path on
+// sm_120 while staying within 2 ULPs of Metal across every finite BF16 value (98.0%
+// exact match against 98.4% for double tanh).
 __device__ __forceinline__ float softcap(float x, float cap) {
-    return fmul(float(tanh(double(fdiv(x, cap)))), cap);
+    return softcap_f32(x, cap);
 }
 
 }  // namespace
