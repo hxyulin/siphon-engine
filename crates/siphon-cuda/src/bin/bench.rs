@@ -686,7 +686,9 @@ mod linux {
         let text = tokens(args.prompt.as_deref().context("--batch needs --prompt")?)?;
         ensure!(text.len() >= 8 * 64, "the capture is too short");
         let token = |row: usize, step: usize| {
-            let offset = row % 8 * text.len() / 8 + row / 8 * text.len() / 32;
+            let offset = row % 8 * text.len() / 8
+                + (row / 8) % 4 * text.len() / 32
+                + row / 32 * text.len() / 64;
             text[(offset + step) % text.len()]
         };
         let config = TextConfig::load(&args.model)?;

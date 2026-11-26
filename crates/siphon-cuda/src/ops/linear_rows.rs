@@ -1,4 +1,4 @@
-//! Dense products of 1 to 32 rows with BF16 or FP8 weights (`kernels/linear_rows.cu`).
+//! Dense products of 1 to 256 rows with BF16 or FP8 weights (`kernels/linear_rows.cu`).
 //!
 //! [`LinearRows::run`] computes `out [m, n] = x [m, k] @ weight [n, k]^T` for a batch of
 //! products that share `k` and the weight format, streaming each weight from DRAM once for
@@ -7,7 +7,7 @@
 //! [`crate::ops::linear_fp8::LinearFp8::quantize`].
 //!
 //! Each output row depends on its input row only, bit for bit: it is the same for every
-//! `m` from 1 to 32, whatever the other rows hold. The sums run on tensor cores in F32, in
+//! `m` from 1 to 256, whatever the other rows hold. The sums run on tensor cores in F32, in
 //! an order that differs from the decode GEMVs' and the prefill GEMM's.
 
 use std::sync::Arc;
@@ -32,10 +32,12 @@ use crate::{
 pub const MAX_PRODUCTS: usize = 8;
 /// Rows of one column tile: the 8 columns of an `m16n8k16` product.
 const TILE_COLUMNS: usize = 8;
-/// Most column tiles one launch runs, `NT` of the kernel's entry points.
+/// Most column tiles one block runs, `NT` of the kernel's entry points.
 const MAX_TILES: usize = 4;
-/// Most rows one launch takes.
-pub const MAX_ROWS: usize = TILE_COLUMNS * MAX_TILES;
+/// Rows one block covers at most (`TILE_COLUMNS * MAX_TILES`).
+const CHUNK_ROWS: usize = TILE_COLUMNS * MAX_TILES;
+/// Most rows one launch takes (chunks of [`CHUNK_ROWS`] along `gridDim.x` above 32).
+pub const MAX_ROWS: usize = 256;
 /// Weight rows per block, `kTileRows` in the kernel.
 const TILE_ROWS: usize = 16;
 /// Most warps per block, `kMaxWarps` in the kernel.
@@ -123,13 +125,16 @@ struct Batch {
 }
 
 /// One weight format and `k`: its entry point for each count of column tiles, 1 to
-/// [`MAX_TILES`], and the tile-pair entry points for 3 and 4 column tiles.
+/// [`MAX_TILES`], the tile-pair entry points for 3 and 4 column tiles, and the chunked
+/// 4-tile entry points for `m > 32`.
 #[derive(Debug)]
 struct Entry {
     fp8: bool,
     k: usize,
     functions: Vec<CudaFunction>,
     pairs: Vec<CudaFunction>,
+    chunk: CudaFunction,
+    chunk_pair: CudaFunction,
 }
 
 /// Fewest column tiles that run blocks of two weight tiles. Each block reads its inputs
@@ -138,24 +143,34 @@ struct Entry {
 const PAIR_FROM_TILES: usize = 3;
 
 impl Entry {
-    /// The entry point, blocks and shared memory per warp for `column_tiles` column tiles:
-    /// tile pairs from [`PAIR_FROM_TILES`] when twice the shared memory fits. Pairs change
-    /// which block runs a tile, not its instructions, so no result changes.
+    /// The entry point, grid `(x, y)` and shared memory per warp for `m` rows: single-chunk
+    /// entry points up to [`CHUNK_ROWS`], and 32-row chunks along `gridDim.x` above so
+    /// sibling chunks share each weight tile in L2.
     fn shape(
         &self,
-        column_tiles: usize,
+        m: usize,
         splits: usize,
         tiles: usize,
         pairs: usize,
-    ) -> (&CudaFunction, usize, usize) {
-        if column_tiles >= PAIR_FROM_TILES && 2 * splits <= MAX_WARPS {
-            (
-                &self.pairs[column_tiles - PAIR_FROM_TILES],
-                pairs,
-                2 * WARP_SMEM,
-            )
+    ) -> (&CudaFunction, (usize, usize), usize) {
+        if m > CHUNK_ROWS {
+            let chunks = m.div_ceil(CHUNK_ROWS);
+            if 2 * splits <= MAX_WARPS {
+                (&self.chunk_pair, (chunks, pairs), 2 * WARP_SMEM)
+            } else {
+                (&self.chunk, (chunks, tiles), WARP_SMEM)
+            }
         } else {
-            (&self.functions[column_tiles - 1], tiles, WARP_SMEM)
+            let column_tiles = m.div_ceil(TILE_COLUMNS);
+            if column_tiles >= PAIR_FROM_TILES && 2 * splits <= MAX_WARPS {
+                (
+                    &self.pairs[column_tiles - PAIR_FROM_TILES],
+                    (pairs, 1),
+                    2 * WARP_SMEM,
+                )
+            } else {
+                (&self.functions[column_tiles - 1], (tiles, 1), WARP_SMEM)
+            }
         }
     }
 }
@@ -200,11 +215,15 @@ impl LinearRows {
             let pairs = (PAIR_FROM_TILES..=MAX_TILES)
                 .map(|tiles| load(format!("{name}_{tiles}_pair")))
                 .collect::<anyhow::Result<_>>()?;
+            let chunk = load(format!("{name}_{MAX_TILES}_chunk"))?;
+            let chunk_pair = load(format!("{name}_{MAX_TILES}_pair_chunk"))?;
             entries.push(Entry {
                 fp8,
                 k,
                 functions,
                 pairs,
+                chunk,
+                chunk_pair,
             });
         }
         Ok(Self { entries })
@@ -322,10 +341,9 @@ impl LinearRows {
             TARGET_WARPS_BF16
         };
         let splits = target.div_ceil(tiles).clamp(1, MAX_WARPS.min(stages));
-        let (function, blocks, per_warp) =
-            entry.shape(m.div_ceil(TILE_COLUMNS), splits, tiles, pairs);
+        let (function, (grid_x, grid_y), per_warp) = entry.shape(m, splits, tiles, pairs);
         let config = LaunchConfig {
-            grid_dim: (u32::try_from(blocks)?, 1, 1),
+            grid_dim: (u32::try_from(grid_x)?, u32::try_from(grid_y)?, 1),
             block_dim: (u32::try_from(32 * splits)?, 1, 1),
             shared_mem_bytes: u32::try_from(splits * per_warp)?,
         };

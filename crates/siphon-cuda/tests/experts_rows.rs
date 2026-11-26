@@ -206,9 +206,9 @@ fn layer(s: &Setup, fp4: bool) -> anyhow::Result<Layer> {
 fn rows_are_invariant() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
-    let mut sync = stream.alloc_zeros::<u32>(1 + MAX_ROWS * SLOTS)?;
+    let mut sync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(MAX_ROWS))?;
     // Random routing, then three experts that every row routes to, so that their pairs fill
-    // every column tile.
+    // every column tile (including 256 pairs on one expert at MAX_ROWS = 256).
     for (fp4, shared) in [(true, 0), (false, 0), (true, 3), (false, 3)] {
         let name = match (fp4, shared) {
             (true, 0) => "nvfp4",
@@ -219,22 +219,24 @@ fn rows_are_invariant() -> anyhow::Result<()> {
         let l = layer(&s, fp4)?;
         let x = common::pseudo_random_bf16(MAX_ROWS * HIDDEN, 5, 1.0, 0.0);
         let ids = routing_sharing(MAX_ROWS, 7, shared);
-        let (act8, out8) = run_rows(&s, &l, &x, &ids, &mut sync)?;
+        let (act_max, out_max) = run_rows(&s, &l, &x, &ids, &mut sync)?;
         let (again_act, again_out) = run_rows(&s, &l, &x, &ids, &mut sync)?;
         assert!(
-            same(&act8, &again_act) && same(&out8, &again_out),
+            same(&act_max, &again_act) && same(&out_max, &again_out),
             "{name}: a second call differs"
         );
         let pair_act = |r: usize| r * SLOTS * INTERMEDIATE..(r + 1) * SLOTS * INTERMEDIATE;
         let pair_out = |r: usize| r * SLOTS * HIDDEN..(r + 1) * SLOTS * HIDDEN;
-        for m in 1..MAX_ROWS {
+        for &m in &[
+            1, 2, 3, 4, 8, 9, 16, 24, 31, 32, 33, 48, 63, 64, 96, 128, 192, 255,
+        ] {
             let (act, out) = run_rows(&s, &l, &x[..m * HIDDEN], &ids[..m * SLOTS], &mut sync)?;
             assert!(
-                same(&act, &act8[..act.len()]) && same(&out, &out8[..out.len()]),
+                same(&act, &act_max[..act.len()]) && same(&out, &out_max[..out.len()]),
                 "{name}: rows of m = {m} differ from m = {MAX_ROWS}"
             );
         }
-        for r in 0..MAX_ROWS {
+        for &r in &[0, 1, 7, 8, 31, 32, 33, 63, 64, 127, 128, 254, 255] {
             let (act, out) = run_rows(
                 &s,
                 &l,
@@ -243,7 +245,7 @@ fn rows_are_invariant() -> anyhow::Result<()> {
                 &mut sync,
             )?;
             assert!(
-                same(&act, &act8[pair_act(r)]) && same(&out, &out8[pair_out(r)]),
+                same(&act, &act_max[pair_act(r)]) && same(&out, &out_max[pair_out(r)]),
                 "{name}: row {r} alone differs from row {r} of {MAX_ROWS}"
             );
         }
@@ -254,8 +256,8 @@ fn rows_are_invariant() -> anyhow::Result<()> {
         ids_other[..SLOTS].copy_from_slice(&ids[..SLOTS]);
         let (act, out) = run_rows(&s, &l, &x_other, &ids_other, &mut sync)?;
         assert!(
-            same(&act[pair_act(0)], &act8[pair_act(0)])
-                && same(&out[pair_out(0)], &out8[pair_out(0)]),
+            same(&act[pair_act(0)], &act_max[pair_act(0)])
+                && same(&out[pair_out(0)], &out_max[pair_out(0)]),
             "{name}: row 0 depends on the other rows"
         );
         eprintln!("{name}: pairs bit-identical for m = 1 to {MAX_ROWS}, alone and with other rows");
@@ -291,7 +293,7 @@ fn compare(label: &str, got: &[bf16], want: &[bf16]) -> f64 {
 fn rows_against_decode_and_prefill() -> anyhow::Result<()> {
     let setup = Setup::new()?;
     let stream = setup.stream();
-    let mut sync = stream.alloc_zeros::<u32>(1 + MAX_ROWS * SLOTS)?;
+    let mut sync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(MAX_ROWS))?;
     let mut decode_sync = stream.alloc_zeros::<u32>(1 + SLOTS)?;
     let mut scratch = ExpertScratch::new(stream, MAX_ROWS, EXPERTS)?;
     for fp4 in [true, false] {

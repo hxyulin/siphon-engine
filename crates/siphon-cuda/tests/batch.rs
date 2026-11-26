@@ -244,6 +244,12 @@ fn batch_matches_alone_32_bf16() -> anyhow::Result<()> {
     batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16, 32)
 }
 
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_64_fp8() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Fp8, WeightFormat::Fp8, 64)
+}
+
 /// Each slot's tokens and logits' hashes for `STEPS` batched steps of slots `0..firsts.len()`
 /// together, slot `s` from its first token `firsts[s]` with `samplings[s]`.
 fn decode_slots(

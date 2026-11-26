@@ -37,8 +37,8 @@ const GATE_TILE_THREADS: u32 = 256;
 const GATE_MAX_BLOCKS: usize = 5;
 /// Rows of one cluster of [`Misc::message_gate_rows`], `gate_rows::kMaxRows` in the kernel.
 const GATE_CLUSTER_ROWS: usize = 8;
-/// Most rows of [`Misc::message_gate_rows`]: four clusters per gate.
-pub const GATE_ROWS_MAX: usize = 4 * GATE_CLUSTER_ROWS;
+/// Most rows of [`Misc::message_gate_rows`]: 32 clusters per gate.
+pub const GATE_ROWS_MAX: usize = 32 * GATE_CLUSTER_ROWS;
 /// Dynamic shared memory of `message_gate_rows_2304` and `message_gate_rows_fp8_2304`,
 /// `gate_rows::smem_bytes` in the kernel: the down stages of two warp splits (5 of 4 KiB
 /// each for BF16 weights, 3 for FP8), then the block's forget and gain rows.

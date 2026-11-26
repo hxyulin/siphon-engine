@@ -21,8 +21,8 @@ pub const TOP_K: usize = 8;
 /// Rows of one cluster of [`Routing::moe_router_step_rows`], `kStepRouterRows` in the
 /// kernel.
 const STEP_ROUTER_GROUP: usize = 8;
-/// Most rows [`Routing::moe_router_step_rows`] takes: four clusters.
-pub const STEP_ROUTER_ROWS: usize = 4 * STEP_ROUTER_GROUP;
+/// Most rows [`Routing::moe_router_step_rows`] takes: 32 clusters of 8 rows.
+pub const STEP_ROUTER_ROWS: usize = 32 * STEP_ROUTER_GROUP;
 /// Blocks of `moe_router_step_2304`, one cluster, `kRouterCluster` in the kernel.
 const STEP_ROUTER_CLUSTER: u32 = 16;
 /// Threads per block of `moe_router_step_rows_2304`, `kRowsRouterThreads` in the kernel:

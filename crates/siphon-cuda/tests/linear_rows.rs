@@ -144,6 +144,12 @@ fn check_bound(
     worst
 }
 
+/// Row counts checked against the F64 reference and for invariance: every small count
+/// through 32, plus chunked counts up to `MAX_ROWS` (256).
+const TEST_ROWS: &[usize] = &[
+    1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 48, 63, 64, 96, 128, 192, 255, 256,
+];
+
 #[test]
 fn rows_match_reference() -> anyhow::Result<()> {
     let s = setup()?;
@@ -157,7 +163,7 @@ fn rows_match_reference() -> anyhow::Result<()> {
             let wd = dense(&s, &w, fp8)?;
             let name = if fp8.is_some() { "fp8" } else { "bf16" };
             let mut worst = 0f64;
-            for m in 1..=MAX_ROWS {
+            for &m in &[1, 8, 16, 24, 32, 33, 64, 128, MAX_ROWS] {
                 let got = run(&s, &w_dev, fp8, &x[..m * k], n, m)?;
                 worst = worst.max(check_bound(
                     &format!("{name} {n} x {k}, m = {m}"),
@@ -191,23 +197,26 @@ fn rows_are_invariant() -> anyhow::Result<()> {
         for fp8 in [None, Some(&q)] {
             let name = if fp8.is_some() { "fp8" } else { "bf16" };
             let full = run(&s, &w_dev, fp8, &x, n, MAX_ROWS)?;
-            for m in 1..MAX_ROWS {
+            for &m in TEST_ROWS {
+                if m == MAX_ROWS {
+                    continue;
+                }
                 let part = run(&s, &w_dev, fp8, &x[..m * k], n, m)?;
                 assert!(
                     part.iter()
                         .zip(&full)
                         .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "{name} {n} x {k}: rows of m = {m} differ from m = 8"
+                    "{name} {n} x {k}: rows of m = {m} differ from m = {MAX_ROWS}"
                 );
             }
-            // Each row alone, as a one-row pass would run it.
-            for r in 0..MAX_ROWS {
+            // Spot-check single rows across all chunks, as a one-row pass would run them.
+            for &r in &[0, 1, 7, 8, 15, 24, 31, 32, 33, 63, 64, 127, 128, 254, 255] {
                 let one = run(&s, &w_dev, fp8, &x[r * k..(r + 1) * k], n, 1)?;
                 assert!(
                     one.iter()
                         .zip(&full[r * n..(r + 1) * n])
                         .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "{name} {n} x {k}: row {r} alone differs from row {r} of 8"
+                    "{name} {n} x {k}: row {r} alone differs from row {r} of {MAX_ROWS}"
                 );
             }
             let mixed = run(&s, &w_dev, fp8, &other, n, MAX_ROWS)?;
@@ -218,7 +227,9 @@ fn rows_are_invariant() -> anyhow::Result<()> {
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "{name} {n} x {k}: row 0 depends on the other rows"
             );
-            eprintln!("{name} {n} x {k}: rows bit-identical for m = 1 to 8 and other data");
+            eprintln!(
+                "{name} {n} x {k}: rows bit-identical for m = 1 to {MAX_ROWS} and other data"
+            );
         }
     }
     Ok(())

@@ -1,8 +1,8 @@
-// Dense products `out = x @ W^T` for 1 to 32 rows, with BF16 or FP8 E4M3 weights, BF16
+// Dense products `out = x @ W^T` for 1 to 256 rows, with BF16 or FP8 E4M3 weights, BF16
 // inputs and outputs and F32 accumulation: the attention projections, the message gates'
 // down projections and the LM head of a step of a few rows, such as a speculative verify.
 //
-// x is [m, k] and out [m, n], row-major, m from 1 to 32. W is [n, k] row-major: BF16 as
+// x is [m, k] and out [m, n], row-major, m from 1 to 256. W is [n, k] row-major: BF16 as
 // stored in the checkpoint, or the E4M3 bytes of an Fp8Matrix (linear_fp8.cu), whose rows
 // are padded to a multiple of 32 and followed by one F32 scale per row.
 //
@@ -128,7 +128,10 @@ __device__ __forceinline__ int slot_index(int r, int c) { return r * kChunks + (
 // input loads. Each tile runs the same instructions on its own accumulators either way, so
 // kT changes no result; it halves the input bytes each weight byte needs, which at 3 and 4
 // column tiles are 3 and 4 times the FP8 weight bytes and come from L2.
-template <bool kFp8, int K, int NT, int kT>
+// With kChunked, gridDim.x chunks m into groups of 8 * NT rows (32) and gridDim.y indexes
+// weight tiles so sibling column chunks of the same weight tile execute concurrently and
+// share the tile's weights in L2.
+template <bool kFp8, int K, int NT, int kT, bool kChunked = false>
 __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     constexpr int kBytes = kFp8 ? 1 : 2;
     constexpr int kKPerStage = kStageBytes / kBytes;
@@ -136,9 +139,11 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     static_assert(kStagesPerRow * kKPerStage == K, "whole stages per row");
     static_assert(kT == 1 || kT == 2, "one tile or a pair");
 
+    const int tile_block = kChunked ? int(blockIdx.y) : int(blockIdx.x);
+    const int col_base = kChunked ? int(blockIdx.x) * (8 * NT) : 0;
     int s = 0;
     int begin = 0;
-    while (s + 1 < b.count && int(blockIdx.x) >= (kT == 1 ? b.seg[s].tile_end : b.seg[s].pair_end)) {
+    while (s + 1 < b.count && tile_block >= (kT == 1 ? b.seg[s].tile_end : b.seg[s].pair_end)) {
         begin = kT == 1 ? b.seg[s].tile_end : b.seg[s].pair_end;
         ++s;
     }
@@ -150,7 +155,7 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     const int t = lane % 4;
     // Weight row of the block's first tile; tile u starts kTileRows u rows later, and a
     // second tile past the segment's rows computes clamped rows it never stores.
-    const int r0 = (int(blockIdx.x) - begin) * kT * kTileRows;
+    const int r0 = (tile_block - begin) * kT * kTileRows;
     uint4* buf = ring + warp * kSlots * kT * kSlotVecs;
     // The launcher keeps splits at most kStagesPerRow, so every warp has a stage.
     const int stages = (kStagesPerRow - warp + splits - 1) / splits;
@@ -192,8 +197,9 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
     float acc[kT][NT][4];
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
-        x[n] = reinterpret_cast<const uint4*>(seg.x + size_t(g + 8 * n) * K);
-        live[n] = g + 8 * n < b.m;
+        const int col_row = col_base + g + 8 * n;
+        x[n] = reinterpret_cast<const uint4*>(seg.x + size_t(col_row) * K);
+        live[n] = col_row < b.m;
 #pragma unroll
         for (int u = 0; u < kT; ++u) {
             acc[u][n][0] = acc[u][n][1] = acc[u][n][2] = acc[u][n][3] = 0.f;
@@ -290,15 +296,15 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
             }
         }
     }
-    // acc[u][n][0], acc[u][n][1]: weight row g of tile u, input rows 8 n + 2t and
-    // 8 n + 2t + 1; acc[u][n][2], acc[u][n][3]: weight row g + 8.
+    // acc[u][n][0], acc[u][n][1]: weight row g of tile u, input rows col_base + 8 n + 2t and
+    // col_base + 8 n + 2t + 1; acc[u][n][2], acc[u][n][3]: weight row g + 8.
 #pragma unroll
     for (int u = 0; u < kT; ++u) {
 #pragma unroll
         for (int n = 0; n < NT; ++n) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                const int col = 8 * n + 2 * t + (e & 1);
+                const int col = col_base + 8 * n + 2 * t + (e & 1);
                 const int row = r0 + u * kTileRows + g + (e >> 1) * 8;
                 if (col < b.m && row < seg.n) {
                     const float v = kFp8 ? seg.scale[row] * acc[u][n][e] : acc[u][n][e];
@@ -315,20 +321,23 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
 // `<name>_<NT>` for NT tiles of 8 rows, up to 8 NT rows. Blocks of 1 to kMaxWarps warps,
 // one tile of 16 weight rows each, with splits x kSlots x 4 KiB of dynamic shared memory.
 // `<name>_<NT>_pair`, for 3 and 4 column tiles, gives each block a pair of tiles (see
-// rows_product) with twice the shared memory.
-#define ROWS_ENTRY_NT(name, fp8, K, NT, kT)                                                \
+// rows_product) with twice the shared memory. `<name>_4[_pair]_chunk` tiles m > 32 in
+// 32-row chunks along gridDim.x with weight tiles along gridDim.y.
+#define ROWS_ENTRY_NT(name, fp8, K, NT, kT, chunked)                                       \
     extern "C" __global__ void __launch_bounds__(kMaxWarps * 32)                           \
         name(const __grid_constant__ Batch batch) {                                        \
         extern __shared__ uint4 ring[];                                                    \
-        rows_product<fp8, K, NT, kT>(batch, ring);                                         \
+        rows_product<fp8, K, NT, kT, chunked>(batch, ring);                                \
     }
 #define ROWS_ENTRY(name, fp8, K)                                                           \
-    ROWS_ENTRY_NT(name, fp8, K, 1, 1)                                                      \
-    ROWS_ENTRY_NT(name##_2, fp8, K, 2, 1)                                                  \
-    ROWS_ENTRY_NT(name##_3, fp8, K, 3, 1)                                                  \
-    ROWS_ENTRY_NT(name##_4, fp8, K, 4, 1)                                                  \
-    ROWS_ENTRY_NT(name##_3_pair, fp8, K, 3, 2)                                             \
-    ROWS_ENTRY_NT(name##_4_pair, fp8, K, 4, 2)
+    ROWS_ENTRY_NT(name, fp8, K, 1, 1, false)                                               \
+    ROWS_ENTRY_NT(name##_2, fp8, K, 2, 1, false)                                           \
+    ROWS_ENTRY_NT(name##_3, fp8, K, 3, 1, false)                                           \
+    ROWS_ENTRY_NT(name##_4, fp8, K, 4, 1, false)                                           \
+    ROWS_ENTRY_NT(name##_3_pair, fp8, K, 3, 2, false)                                      \
+    ROWS_ENTRY_NT(name##_4_pair, fp8, K, 4, 2, false)                                      \
+    ROWS_ENTRY_NT(name##_4_chunk, fp8, K, 4, 1, true)                                      \
+    ROWS_ENTRY_NT(name##_4_pair_chunk, fp8, K, 4, 2, true)
 
 // The attention input projections and the LM head.
 ROWS_ENTRY(rows_bf16_k2304, false, 2304)

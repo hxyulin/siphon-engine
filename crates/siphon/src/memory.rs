@@ -60,7 +60,7 @@ pub const POOL_RUNTIME_BYTES: usize = 64 << 20;
 /// Rows of the largest verify pass.
 pub const VERIFY_ROWS: usize = 8;
 /// Rows of the largest batched step: one per stream.
-pub const BATCH_ROWS: usize = 32;
+pub const BATCH_ROWS: usize = 64;
 /// Draft tokens per round; a draft's capacity is the target's plus this and the anchor.
 pub const DRAFT_STEPS: usize = 7;
 /// Slots of the bundled draft's sliding rings: a window of 1024 and a block of 8.
@@ -727,8 +727,8 @@ fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
 }
 
 /// What `PrefillScratch::new` adds for an invariant chunk, the verify pass: every looped
-/// layer's message weights and normalized messages, and an output for each of the 3 gates
-/// one launch runs (`misc::GATE_SLOTS`).
+/// layer's message weights and normalized messages, an output for each of the 3 gates
+/// one launch runs (`misc::GATE_SLOTS`), and any LM-head/sync headroom past [`HEAD_ROWS`].
 fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     let hidden = c.hidden_size;
     let looped = c.loop_config.core_end - c.loop_config.core_start;
@@ -737,8 +737,21 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     let attention = rows.saturating_sub(VERIFY_ROWS)
         * (ROWS_ATTENTION_ROWS / VERIFY_ROWS * (c.head_dim + 2) * 4
             + 2 * c.num_key_value_heads * 4);
+    let extra_head =
+        rows.saturating_sub(HEAD_ROWS) * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
+    // Above 32 rows, `ExpertsRows::sync_len` adds grouped routing metadata (`ExpertRowsMeta`).
+    let extra_sync = if rows > 32 {
+        let base = 1 + rows * (c.num_experts_per_tok + 1);
+        let pairs = rows * c.num_experts_per_tok;
+        let wide = 1 + pairs.min(c.n_routed_experts) + rows + 904 / 4 + pairs.div_ceil(2);
+        wide.saturating_sub(base) * 4
+    } else {
+        0
+    };
     rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2 + 2 * hidden * 4)
         + attention
+        + extra_head
+        + extra_sync
 }
 
 /// The bundled draft's shape: the checkpoint's tensors outside the text and vision models

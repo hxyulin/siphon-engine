@@ -78,7 +78,7 @@ impl Default for TapLayout {
 pub const VERIFY_ROWS: usize = 8;
 const _: () = assert!(VERIFY_ROWS == siphon::memory::VERIFY_ROWS);
 /// Most rows one batched step takes, one per sequence.
-pub const BATCH_ROWS: usize = 32;
+pub const BATCH_ROWS: usize = 64;
 const _: () = assert!(BATCH_ROWS == siphon::memory::BATCH_ROWS);
 /// Conv state rows per stream.
 pub const STATE_ROWS: usize = 3;

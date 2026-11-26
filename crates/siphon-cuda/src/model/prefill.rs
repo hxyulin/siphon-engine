@@ -390,7 +390,10 @@ impl PrefillScratch {
             mlp_x: zeros(stream, rows * hidden)?,
             moe: MoeRows {
                 invariant,
-                expert_sync: zeros(stream, 1 + rows * (top_k + 1))?,
+                expert_sync: zeros(
+                    stream,
+                    crate::ops::experts_rows::ExpertsRows::sync_len(rows),
+                )?,
                 logits: zeros(stream, rows * cfg.n_routed_experts)?,
                 router: RouterRowsScratch::new(stream, rows)?,
                 indices: zeros(stream, rows * top_k)?,
@@ -406,8 +409,14 @@ impl PrefillScratch {
                 )?,
             },
             final_hidden: zeros(stream, rows * hidden)?,
-            head_logits: zeros(stream, HEAD_ROWS * cfg.vocab_size)?,
-            head_capped: zeros(stream, HEAD_ROWS * cfg.unpadded_vocab_size)?,
+            head_logits: zeros(
+                stream,
+                if invariant { rows.max(HEAD_ROWS) } else { HEAD_ROWS } * cfg.vocab_size,
+            )?,
+            head_capped: zeros(
+                stream,
+                if invariant { rows.max(HEAD_ROWS) } else { HEAD_ROWS } * cfg.unpadded_vocab_size,
+            )?,
             head_host: vec![0.0; HEAD_ROWS * cfg.unpadded_vocab_size],
         })
     }
@@ -1044,7 +1053,7 @@ impl Ctx {
         ensure!(every > 0, "logits every 0 rows");
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
         let step = if fp8.is_some() {
-            linear_rows::MAX_ROWS
+            HEAD_ROWS.min(linear_rows::MAX_ROWS)
         } else {
             HEAD_ROWS
         };

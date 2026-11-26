@@ -22,7 +22,7 @@ use anyhow::{Context as _, bail, ensure};
 use serde_json::json;
 
 /// Requests that may run at once: up to the rows of a batched step.
-const STREAMS: std::ops::RangeInclusive<usize> = 1..=32;
+const STREAMS: std::ops::RangeInclusive<usize> = 1..=64;
 #[cfg(target_os = "linux")]
 const _: () = assert!(*STREAMS.end() == siphon::memory::BATCH_ROWS);
 /// Rows of a prefill chunk.
@@ -45,7 +45,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
 running request together. One request may take all of them, up to the model's limit of
 1,048,576. Without it the server takes the most that fit in GPU memory. Either way it plans
 the memory before loading the weights and stops if the plan does not fit.
---streams runs up to N requests at once (1 to 32), as many as the pool holds; each stream
+--streams runs up to N requests at once (1 to 64), as many as the pool holds; each stream
 costs its sliding rings and prefix cache entry, about 0.33 GiB. A request alone speculates;
 once another arrives, all run batched plain decode. Either way a request gets the same
 tokens. With --host-cache, requests that do not fit the pool together take turns, swapped
@@ -183,7 +183,7 @@ fn args() -> anyhow::Result<Args> {
             "--queue" => queue = value()?.parse()?,
             "--streams" => {
                 streams = value()?.parse()?;
-                ensure!(STREAMS.contains(&streams), "--streams takes 1 to 32");
+                ensure!(STREAMS.contains(&streams), "--streams takes 1 to 64");
             }
             "--drafter" => drafter = Some(PathBuf::from(value()?)),
             "--draft" => draft = value()?,
