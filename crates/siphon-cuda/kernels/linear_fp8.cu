@@ -576,6 +576,20 @@ __device__ __forceinline__ bool argmax_better(float a, int ia, float b, int ib) 
 __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const uint8_t* x,
                             const uint8_t* x_scale, float* partial_vals, int* partial_idxs,
                             int m, int vocab, int k, uint8_t* smem) {
+    constexpr int kBm = 128;
+    constexpr int kBn = 128;
+    constexpr int kWarpsM = 2;
+    constexpr int kWarpsN = 4;
+    constexpr int kStages = 3;
+    constexpr int kWarpRows = kBm / kWarpsM;
+    constexpr int kWarpCols = kBn / kWarpsN;
+    constexpr int kMi = kWarpRows / 16;
+    constexpr int kNi = kWarpCols / 8;
+    constexpr int kStageA = kBm * kBk;
+    constexpr int kStageB = kBn * kBk;
+    constexpr int kStageScales = kBm * 4;
+    constexpr int kStage = kStageA + kStageB + kStageScales;
+    constexpr int kSmemBytes = kStages * kStage;
     static_assert(kBm * kWarpsN * (sizeof(float) + sizeof(int)) <= kSmemBytes,
                   "tile argmax partials fit shared memory");
     pdl_trigger();
@@ -790,8 +804,8 @@ extern "C" __global__ void __launch_bounds__(128, 2)
 }
 
 // Fused FP8 GEMM + tile-argmax entry point for the LM head (m > 32). Grid: ceil(m / 128) *
-// ceil(vocab / 128) blocks; dynamic shared memory gemm8::kSmemBytes.
-extern "C" __global__ void __launch_bounds__(gemm8::kThreads, 1)
+// ceil(vocab / 128) blocks; dynamic shared memory 99,840 bytes (3 stages of 128 x 128).
+extern "C" __global__ void __launch_bounds__(256, 1)
     gemm_fp8_128x128_argmax(const uint8_t* weight, const float* scales, const uint8_t* x,
                             const uint8_t* x_scale, float* partial_vals, int* partial_idxs,
                             int m, int vocab, int k) {
