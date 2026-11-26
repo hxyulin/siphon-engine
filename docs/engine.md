@@ -666,7 +666,7 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 `siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk, the number of streams and the capacity. Each stream gets its own global caches of the capacity, rings and conv states, and more than one stream adds the batched step's buffers. It counts:
 
 - the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32, less the tensors in host memory (see [Tensors in host memory](#tensors-in-host-memory)): the embedding table, and with `--weights fp8` the BF16 LM head. The vision tower's `model.visual.*` tensors count only with `--vision`, below. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
-- the FP8 copies of `--weights fp8`, 1.14 GB;
+- the FP8 copies of `--weights fp8`, 0.97 GB, or 1.14 GB with `--output-projection fp8`;
 - the global KV caches: 32 KiB per position, or 16 KiB with `--kv fp8`, over the 8 global visits;
 - the 40 sliding rings of 1,024 slots (160 MiB), the conv states and the decode step's vocabulary-sized buffers;
 - the prefill buffers, 0.38 MB per chunk row plus 64 MB, and the verify pass's;
@@ -765,7 +765,7 @@ The medians moved by at most +0.3%. The draft round in `siphon-serve` went from 
 Decode reads 3.62 GB of BF16 dense weights per token: every visit's attention input and output projections, the looped layers' message gates (113 MB), and the LM head. `bench`, `eval` and `parity` take `--weights bf16|fp8`, and `Model::with_formats` takes the same choice:
 
 - `bf16`, the default, reads the checkpoint's weights.
-- `fp8` quantizes those matrices at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. Decode then reads 1.82 GB for them. Prefill keeps the BF16 weights unless `--prefill-dense fp8` (see [Prefill on FP8 tensor cores](#dense-products)), except the LM head's: its BF16 copy moves to host memory and the prefill's head reads the FP8 copy (see [Tensors in host memory](#tensors-in-host-memory)). The copies take 1.14 GB of device memory: one per layer, since the looped layers' three visits share theirs.
+- `fp8` quantizes the attention input projections, the message gates and the LM head at load time on the GPU to E4M3, with one F32 scale per row, `amax / 448`. The output projection stays BF16 (see [The output projection](#the-output-projection)) unless `--output-projection fp8` (`Weights::output`) quantizes it too. Decode then reads 2.16 GB for these matrices, or 1.82 GB with an FP8 output projection. Prefill keeps the BF16 weights unless `--prefill-dense fp8` (see [Prefill on FP8 tensor cores](#dense-products)), except the LM head's: its BF16 copy moves to host memory and the prefill's head reads the FP8 copy (see [Tensors in host memory](#tensors-in-host-memory)). The copies take 0.97 GB of device memory, or 1.14 GB with the output projection's: one per layer, since the looped layers' three visits share theirs.
 
 The FP8 path lowers precision on purpose. Each byte is the BF16 weight over its row's scale, rounded to the nearest E4M3 value. The products widen each value exactly, sum in F32, and multiply the row's scale into the sum once before rounding to BF16. The router and the small vectors stay as they are. `tests/linear_fp8.rs` checks the quantizer against a CPU model and the products against an F64 reference over the quantized weights.
 
@@ -774,9 +774,67 @@ Engine stepping with the BF16 cache, against the F32 captures of `anyhow`, `half
 | Dense weights | Mean KL | \|log-prob difference\| | Top-1 | Decode at context 0 |
 | --- | --- | --- | --- | --- |
 | `bf16` | 1.5e-3, 9.4e-4, 1.1e-3 | 0.023, 0.028, 0.028 | 99.0%, 98.6%, 98.5% | 4.09 ms |
-| `fp8` | 2.3e-3, 1.5e-3, 2.2e-3 | 0.029, 0.038, 0.040 | 98.7%, 98.2%, 98.0% | 3.05 ms |
+| `fp8`, FP8 output projection | 2.3e-3, 1.5e-3, 2.2e-3 | 0.029, 0.038, 0.040 | 98.7%, 98.2%, 98.0% | 3.05 ms |
 
 The FP8 path's mean KL is 1.5 to 2.0 times the BF16 path's, and its \|log-prob difference\| 1.3 to 1.4 times. It still passes the gate against MLX's BF16 captures.
+
+### The output projection
+
+With the FP8 cache, stepping on an FP8 copy of every dense matrix failed the gate on `regex-readme`: the range after the window wraps came to a \|log-prob difference\| of 0.0451 against the 0.045 limit. Rounding single matrices to their E4M3 values in place, with BF16 weights otherwise, put most of the excess on the output projection, then the value projection; the query and key projections, the other input projections, the message gates and the LM head added little. The excess was spread over the text, mostly on tokens MLX finds unlikely, as small logit noise is. So `--weights fp8` now leaves the output projection BF16.
+
+Two fixes were tried. One keeps the output projection's BF16 weights in decode. The other gave its FP8 copy a scale per 32 weights of a row: a UE8M0 power of two, the block's `amax / 448` rounded up, as MXFP8 scales its blocks. A power-of-two scale multiplies exactly, so the GEMV applied it to each sum of 16 products and the multi-row kernel folded it into the 2^112 of its E4M3 widening, and neither added a rounding. Stepping and `eval --verify 8`, FP8 weights and cache, on an RTX 5090. The \|log-prob difference\| is the mean over all positions and, after the slash, that of the worst range; the KL is the mean at MLX's sampled positions:
+
+| Text, tokens | Output projection | Stepping against F32 | Stepping against MLX | Verify against F32 | Verify KL against MLX |
+| --- | --- | --- | --- | --- | --- |
+| `regex-readme`, 2,798 | FP8, row scales | 0.0413 / 0.0456 | 0.0408 / **0.0451** | 0.0411 | 3.0e-3 |
+| | FP8, block scales | 0.0397 / 0.0434 | 0.0394 / 0.0432 | 0.0399 | 2.0e-3 |
+| | BF16 | 0.0372 / 0.0411 | 0.0358 / 0.0390 | 0.0360 | 2.7e-3 |
+| | BF16 weights throughout | 0.0309 / 0.0331 | 0.0319 / 0.0339 | 0.0308 | 9.5e-4 |
+| `half`, 2,785 | FP8, row scales | 0.0392 / 0.0426 | 0.0387 / 0.0406 | 0.0375 | 1.1e-3 |
+| | FP8, block scales | 0.0376 / 0.0395 | 0.0379 / 0.0400 | 0.0370 | 8.7e-4 |
+| | BF16 | 0.0352 / 0.0369 | 0.0366 / 0.0385 | 0.0347 | 1.4e-3 |
+| | BF16 weights throughout | 0.0291 / 0.0312 | 0.0320 / 0.0341 | 0.0289 | 1.1e-3 |
+| `anyhow`, 11,186 | FP8, row scales | 0.0299 / 0.0354 | 0.0304 / 0.0340 | 0.0305 | 2.6e-3 |
+| | FP8, block scales | 0.0325 / 0.0365 | 0.0326 / 0.0378 | 0.0313 | 2.5e-3 |
+| | BF16 | 0.0288 / 0.0335 | 0.0298 / 0.0341 | 0.0289 | 2.9e-3 |
+| | BF16 weights throughout | 0.0246 / 0.0290 | 0.0254 / 0.0298 | 0.0254 | 2.3e-3 |
+| 4K Gutenberg text, 3,993 | FP8, row scales | 0.0677 / 0.0712 | 0.0682 / 0.0719 | 0.0688 | 5.8e-3 |
+| | FP8, block scales | 0.0669 / 0.0672 | 0.0685 / 0.0702 | 0.0680 | 6.7e-3 |
+| | BF16 | 0.0624 / 0.0648 | 0.0613 / 0.0635 | 0.0595 | 4.7e-3 |
+| | BF16 weights throughout | 0.0480 / 0.0492 | 0.0498 / 0.0518 | 0.0486 | 2.2e-3 |
+| 32K Gutenberg text, 31,993 | FP8, row scales | 0.0658 / 0.0676 | 0.0675 / 0.0691 | 0.0659 | 5.4e-3 |
+| | FP8, block scales | 0.0652 / 0.0691 | 0.0664 / 0.0689 | 0.0651 | 6.0e-3 |
+| | BF16 | 0.0598 / 0.0610 | 0.0613 / 0.0625 | 0.0593 | 4.8e-3 |
+| | BF16 weights throughout | 0.0450 / 0.0466 | 0.0479 / 0.0495 | 0.0450 | 2.8e-3 |
+| 128K Gutenberg text, 128,000 | FP8, row scales | 0.0615 / 0.0621 | 0.0624 / 0.0630 | 0.0617 | 4.2e-3 |
+| | FP8, block scales | 0.0608 / 0.0614 | 0.0619 / 0.0625 | 0.0609 | 4.0e-3 |
+| | BF16 | 0.0560 / 0.0565 | 0.0570 / 0.0575 | 0.0559 | 3.7e-3 |
+| | BF16 weights throughout | 0.0427 / 0.0432 | 0.0441 / 0.0446 | 0.0428 | 2.6e-3 |
+
+The Gutenberg texts are quickbench's fidelity texts, with F32 captures made as for the code texts (`capture --float32`, 18 s, 262 s and 31 minutes on an M5 Max). They fail the gate's \|log-prob difference\| limit with any weights, since the limit comes from MLX's noise on code.
+
+The BF16 output projection lowers the \|log-prob difference\| against F32 on every text and mode, by 0.001 to 0.002 on `anyhow` and by 0.003 to 0.009 on the others, and every code text passes the gate in both modes. The block scales help `regex-readme` and `half` but make `anyhow` worse, and leave the prose texts within 0.001 to 0.002 of row scales. E4M3 keeps 3 mantissa bits in every binade, so a finer scale changes how a weight rounds but not by how much; it gains only on weights that a row's scale pushes into the subnormals. Block scales on the value projection as well gave nothing either way. The block scales were dropped. The verify KL at the 80 to 100 sampled positions moves both ways by more than these differences on the code texts, so the table also gives the verify pass's \|log-prob difference\| over all positions.
+
+The cost, on an RTX 5090 and on an RTX 4090 with the `sm_89` port applied, from `bench` (plain steps, 200 per context) and `bench --spec auto` (the verify pass alone, 8 rows and 1 row), the second of two alternating runs, which agreed within 2%:
+
+| GPU | Output projection | Plain step, context 0 | Plain step, 32K | Verify of 8 rows at 10,674 · 32K | Verify of 1 row at 10,674 · 32K |
+| --- | --- | ---: | ---: | ---: | ---: |
+| RTX 5090 | FP8 | 2.776 ms · 360 tok/s | 3.288 ms · 304 tok/s | 7.74 · 8.14 ms | 4.12 · 4.55 ms |
+| | BF16 | 2.933 ms · 340 tok/s | 3.413 ms · 293 tok/s | 7.86 · 8.27 ms | 4.20 · 4.65 ms |
+| RTX 4090 | FP8 | 4.835 ms · 207 tok/s | 6.026 ms · 166 tok/s | 13.68 · 14.34 ms | 6.84 · 7.67 ms |
+| | BF16 | 5.092 ms · 196 tok/s | 6.371 ms · 157 tok/s | 14.00 · 14.39 ms | 7.09 · 7.91 ms |
+
+Decode reads 0.34 GB more per token. A plain step takes 4 to 6% longer and a verify pass 0.3 to 3.6% longer, since the verify streams the matrix once for all its rows. Speculative tok/s cannot be compared directly here: each build's greedy continuation is its own text. The plan drops the copy's 170 MB, which gives the longest FP8 context on an idle 32 GB card 9,216 more positions (657,408 with the bundled draft). The block scales cost 0.3% of a plain step.
+
+`--output-projection fp8` reproduces the earlier FP8 logits bit for bit. The verify pass's logits, `smallm verify --hash 1` over `anyhow-chunked`, on an RTX 5090 (`sm_120a`):
+
+| Weights and cache | Output projection | Width 1 | Width 3 | Width 8 |
+| --- | --- | --- | --- | --- |
+| FP8 | BF16 (default) | `ecb8ef5d7c18444c` | `f4ed3f1f56f4aa8b` | `e7e9433e3d18e5b6` |
+| FP8 | FP8 | `93ecee4b34af1ded` | `4b6b4009599bb7e5` | `4f41eb437bf879d3` |
+| BF16 | | `9ad367f3963f7b15` | `1850454fe63cef4f` | `aa9bae88dba01800` |
+
+The FP8 hashes change because the output projection's products now multiply BF16 weights, through the BF16 GEMV and the BF16 multi-row kernel. The BF16 hashes do not change.
 
 The pixi environment includes Nsight Systems (`nsys`, CLI only) and Nsight Compute (`ncu`) from conda-forge. `ncu` 2026.4 is the release for the pinned CUDA 13.5 toolkit. A kernel trace of 20 steps:
 

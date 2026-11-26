@@ -54,7 +54,7 @@ Siphon also runs [`hxyulin/Inkling-2-Mini-Fast-NVFP4`](https://huggingface.co/hx
 
 ## Performance
 
-All numbers come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, unless a section names another commit, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default.
+All numbers come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, unless a section names another commit, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default. These runs read an FP8 copy of the attention output projection, now `--output-projection fp8`. The default reads its BF16 weights, which takes 0.16 ms more per plain step at context 0 and 0.13 ms at 32K, and 1 to 2% more per verify pass ([engine.md](docs/engine.md#the-output-projection)).
 
 ### Decode
 
@@ -108,7 +108,7 @@ Neither mode is clearly more accurate. On 23 quickbench items at a3fc890, 4 atte
 
 A batch of one takes 3.14 ms per step against 2.71 ms for plain decode, because the batch keeps the verify pass's numerics. A request that speculates alone runs at 508 to 875 tok/s greedy and 345 to 711 tok/s at temperature 1, so batching serves more in total from about three streams on. The batched steps here decode greedily. Over HTTP with `--streams 8`, temperature 1 served 734 tok/s in all against 780 greedy (see [Sampling](#sampling)).
 
-A 32 GB card fits 8 streams of 69,632 positions. An RTX PRO 6000 Blackwell Max-Q (95 GiB, 1,645 GB/s, 275 W) fits 16 streams of 284,672 positions or 32 of 132,096, and serves more with each step up to 32. The same batched-step benchmark there:
+A 32 GB card fits 8 streams of 71,680 positions. An RTX PRO 6000 Blackwell Max-Q (95 GiB, 1,645 GB/s, 275 W) fits 16 streams of 284,672 positions or 32 of 132,096, and serves more with each step up to 32. The same batched-step benchmark there:
 
 | Context of each stream | 1 stream | 8 streams | 16 streams | 32 streams |
 | ---: | ---: | ---: | ---: | ---: |
@@ -143,10 +143,10 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 
 | Dense weights, KV cache | DSpark draft | DFlash 2 |
 | --- | ---: | ---: |
-| FP8, FP8 | 648,192 | 717,824 |
+| FP8, FP8 | 657,408 | 729,088 |
 | BF16, BF16 | 349,184 | 365,568 |
 
-`--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts to 670,720 and 744,448 for 6 to 7% of prefill speed.
+`--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts to 679,936 and 754,688 for 6 to 7% of prefill speed.
 
 `siphon-plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
 

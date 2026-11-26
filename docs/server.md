@@ -25,6 +25,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--margin GiB` | `0.25` | Free memory the plan leaves unclaimed. |
 | `--prefill-chunk N` | `2048` | Rows of each prefill chunk, 1 to 2048. 1024 frees 0.4 GiB for the context and costs 6 to 7% of prefill speed. |
 | `--weights fp8\|bf16` | `fp8` | Dense weights: FP8 copies or the checkpoint's BF16. |
+| `--output-projection bf16\|fp8` | `bf16` | The attention output projection decode reads with FP8 weights. `fp8` saves 4 to 6% of a plain step and moves the logits further from the model. |
 | `--kv fp8\|bf16` | `fp8` | Global KV cache format. |
 | `--streams N` | `1` | Requests that run at once, 1 to 32, each with its own KV cache. |
 | `--queue N` | `8` | Requests that wait beyond the running ones. |
@@ -136,7 +137,7 @@ Two prompts with different images have the same tokens, so the [prefix cache](#p
 
 The speculative draft reads the target's hidden states at every prompt position, image positions included, so it sees what the target sees. Verify decides every token, so images do not change speculation's output either way. Acceptance on replies about images is not measured yet.
 
-`siphon-plan --vision [--max-image-pixels N]` adds the tower's weights, its buffers for the largest image and the image rows of one prefill chunk to the plan. On an idle 32 GB RTX 5090, `--vision` at the defaults takes 0.69 GiB and cuts the longest context with FP8 weights and caches from 648,192 to 608,256 positions, with the default 0.25 GiB margin. Without `--vision` the plan and the server are as before.
+`siphon-plan --vision [--max-image-pixels N]` adds the tower's weights, its buffers for the largest image and the image rows of one prefill chunk to the plan. On an idle 32 GB RTX 5090, `--vision` at the defaults takes 0.69 GiB and cuts the longest context with FP8 weights and caches from 657,408 to 617,472 positions, with the default 0.25 GiB margin. Without `--vision` the plan and the server are as before.
 
 ## Sampling
 
@@ -184,7 +185,7 @@ Each choice of a request with `n` choices counts as a request in the request cou
 
 ## Concurrent requests
 
-With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit. `siphon-plan --streams N` shows that context: with FP8 weights and caches, 69,632 positions for 8 streams on a 32 GB card, and 284,672 for 16 or 132,096 for 32 on an RTX PRO 6000 Blackwell Max-Q.
+With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit. `siphon-plan --streams N` shows that context: with FP8 weights and caches, 71,680 positions for 8 streams on a 32 GB card, and 284,672 for 16 or 132,096 for 32 on an RTX PRO 6000 Blackwell Max-Q.
 
 More streams serve more in total and less per stream. On an RTX PRO 6000 Blackwell Max-Q, 32 streams at 10,674 tokens of context ran 1,138 tok/s in all against 661 for 8 ([batching.md](batching.md#16-and-32-streams-on-an-rtx-pro-6000-blackwell-max-q)). With `--streams 32 --context 16384`, 32 concurrent requests of 512 tokens came back at 1,198 tok/s in all.
 
