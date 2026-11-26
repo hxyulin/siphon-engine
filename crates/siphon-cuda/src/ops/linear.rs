@@ -257,12 +257,15 @@ const fn tile(
 struct GemmTiles {
     /// Tiles with the largest `m` each serves; the last serves every larger `m`.
     by_m: &'static [(usize, GemmTile)],
-    /// Replaces the last tile of `by_m` when its tiles alone fill the GPU.
-    wide: Option<GemmTile>,
+    /// Wider tiles tried in order (largest first) when the last tile of `by_m` is picked
+    /// and the wide tile's own tiles fill the GPU.
+    wide: &'static [GemmTile],
 }
 
 /// Small tiles keep enough blocks streaming weights at small `m`. Measured on the RTX
-/// 5090 over the runner's shapes; see `gemm_throughput` in `tests/linear.rs`.
+/// 5090 over the runner's shapes; see `gemm_throughput` in `tests/linear.rs`. At large `m`
+/// (prefill chunks), `128x128` with 3 pipeline stages and 8 warps halves weight reads from
+/// DRAM/L2 and hides memory latency with `cp_async_wait<1>`.
 const GEMM_BF16_TILES: GemmTiles = GemmTiles {
     by_m: &[
         (32, tile("gemm_bf16_16x64", [16, 64, 64], [1, 2, 2], 4)),
@@ -272,7 +275,10 @@ const GEMM_BF16_TILES: GemmTiles = GemmTiles {
             tile("gemm_bf16_64x64", [64, 64, 64], [2, 2, 1], 3),
         ),
     ],
-    wide: Some(tile("gemm_bf16_64x128", [64, 128, 64], [2, 2, 1], 2)),
+    wide: &[
+        tile("gemm_bf16_128x128", [128, 128, 64], [2, 4, 1], 3),
+        tile("gemm_bf16_64x128", [64, 128, 64], [2, 2, 1], 2),
+    ],
 };
 
 const GEMM_F32_TILES: GemmTiles = GemmTiles {
@@ -283,7 +289,7 @@ const GEMM_F32_TILES: GemmTiles = GemmTiles {
             tile("gemm_f32_64x64", [64, 64, 32], [2, 2, 1], 3),
         ),
     ],
-    wide: None,
+    wide: &[],
 };
 
 /// Most blocks of one tile's split, the portable cluster size limit.
@@ -336,7 +342,7 @@ impl GemmKernel {
 #[derive(Debug)]
 struct GemmKernels {
     by_m: Vec<(usize, GemmKernel)>,
-    wide: Option<GemmKernel>,
+    wide: Vec<GemmKernel>,
 }
 
 impl GemmKernels {
@@ -355,7 +361,12 @@ impl GemmKernels {
                 .iter()
                 .map(|&(max_m, tile)| Ok((max_m, load(tile)?)))
                 .collect::<anyhow::Result<_>>()?,
-            wide: tiles.wide.map(load).transpose()?,
+            wide: tiles
+                .wide
+                .iter()
+                .copied()
+                .map(load)
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 
@@ -366,10 +377,14 @@ impl GemmKernels {
             .iter()
             .position(|(max_m, _)| m <= *max_m)
             .unwrap_or(last);
-        match &self.wide {
-            Some(wide) if i == last && wide.tiles(m, ns) >= wide.slots => wide,
-            _ => &self.by_m[i].1,
+        if i == last {
+            for wide in &self.wide {
+                if m >= wide.tile.bm && wide.tiles(m, ns) >= wide.slots {
+                    return wide;
+                }
+            }
         }
+        &self.by_m[i].1
     }
 }
 

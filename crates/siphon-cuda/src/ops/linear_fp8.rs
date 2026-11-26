@@ -139,16 +139,22 @@ struct Entry {
 pub struct LinearFp8 {
     entries: Vec<Entry>,
     quantize: CudaFunction,
-    /// `gemm_fp8_128x128` and `quantize_rows_mxfp8_dense`.
+    /// `gemm_fp8_128x128`, `gemm_fp8_64x64`, and `quantize_rows_mxfp8_dense`.
     gemm: CudaFunction,
+    gemm_small: CudaFunction,
     quantize_rows: CudaFunction,
+    /// Multiprocessor count, for picking between the 128x128 and 64x64 tiles.
+    sms: usize,
 }
 
-/// Rows and columns of a `gemm_fp8_128x128` tile, and its threads and dynamic shared memory
-/// (`gemm8::kSmemBytes`: 3 stages of 128 x and W rows of 128 bytes and 128 x row scales).
+/// Rows and columns of `gemm_fp8_128x128` and `gemm_fp8_64x64`, their threads and dynamic
+/// shared memory (3 stages of x and W rows of 128 bytes and x row scales).
 const GEMM_TILE: usize = 128;
 const GEMM_THREADS: u32 = 256;
 const GEMM_SHARED: u32 = 3 * (2 * 128 * 128 + 128 * 4);
+const GEMM_SMALL_TILE: usize = 64;
+const GEMM_SMALL_THREADS: u32 = 128;
+const GEMM_SMALL_SHARED: u32 = 3 * (2 * 64 * 128 + 64 * 4);
 /// k of [`LinearFp8::gemm`] must be a multiple of this: one pipeline stage.
 const GEMM_K: usize = 128;
 
@@ -209,11 +215,22 @@ struct GemmBatch {
 impl LinearFp8 {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "linear_fp8", cubin!("linear_fp8"))?;
+        let sms = usize::try_from(
+            ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )?;
         let entry = |k, name: &str| -> anyhow::Result<Entry> {
             Ok(Entry {
                 k,
                 function: module.load_function(name)?,
             })
+        };
+        let load_gemm = |name: &str, shared: u32| -> anyhow::Result<CudaFunction> {
+            let function = module.load_function(name)?;
+            function.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared.cast_signed(),
+            )?;
+            Ok(function)
         };
         Ok(Self {
             entries: vec![
@@ -221,15 +238,10 @@ impl LinearFp8 {
                 entry(3072, "gemv_fp8_k3072")?,
             ],
             quantize: module.load_function("quantize_e4m3_rows")?,
-            gemm: {
-                let function = module.load_function("gemm_fp8_128x128")?;
-                function.set_attribute(
-                    cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    GEMM_SHARED.cast_signed(),
-                )?;
-                function
-            },
+            gemm: load_gemm("gemm_fp8_128x128", GEMM_SHARED)?,
+            gemm_small: load_gemm("gemm_fp8_64x64", GEMM_SMALL_SHARED)?,
             quantize_rows: module.load_function("quantize_rows_mxfp8_dense")?,
+            sms,
         })
     }
 
@@ -257,6 +269,22 @@ impl LinearFp8 {
             k.is_multiple_of(GEMM_K),
             "the FP8 GEMM needs k a multiple of {GEMM_K}, not {k}"
         );
+        let tiles_128: usize = m.div_ceil(GEMM_TILE)
+            * products
+                .iter()
+                .map(|p| p.weight.rows.div_ceil(GEMM_TILE))
+                .sum::<usize>();
+        let (function, tile_size, threads, shared) = if m > GEMM_SMALL_TILE && tiles_128 >= self.sms
+        {
+            (&self.gemm, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
+        } else {
+            (
+                &self.gemm_small,
+                GEMM_SMALL_TILE,
+                GEMM_SMALL_THREADS,
+                GEMM_SMALL_SHARED,
+            )
+        };
         // Each distinct input, by address, and its offset in the scratch.
         let mut inputs: Vec<(u64, usize)> = Vec::new();
         let mut batch = GemmBatch {
@@ -296,7 +324,7 @@ impl LinearFp8 {
                 inputs.push((x_ptr, offset));
                 offset
             };
-            tiles += m.div_ceil(GEMM_TILE) * n.div_ceil(GEMM_TILE);
+            tiles += m.div_ceil(tile_size) * n.div_ceil(tile_size);
             let (w_ptr, _) = p.weight.data.device_ptr(stream);
             let (out_ptr, _) = p.out.device_ptr_mut(stream);
             batch.p[i] = GemmProduct {
@@ -311,8 +339,8 @@ impl LinearFp8 {
         }
         let config = LaunchConfig {
             grid_dim: (u32::try_from(tiles)?, 1, 1),
-            block_dim: (GEMM_THREADS, 1, 1),
-            shared_mem_bytes: GEMM_SHARED,
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: shared,
         };
         // SAFETY: `batch` has the kernel's `gemm8::Batch` layout. Each product's x region
         // holds m rows of k quantized values and m * k / 32 scales, written above on this
@@ -320,7 +348,7 @@ impl LinearFp8 {
         // kernel reads only rows below n of it (zero-filling the rest) and x rows below m.
         // It stores only rows below m and columns below n of `out`, sized m x n above. k is a
         // multiple of 128, the stage width, so every 16-byte copy is aligned and in bounds.
-        unsafe { launch_by_value(stream, &self.gemm, config, &batch, false) }
+        unsafe { launch_by_value(stream, function, config, &batch, false) }
     }
 
     /// Quantizes `x` (`[rows, k]`) into `scratch` at value offset `offset` (a multiple of

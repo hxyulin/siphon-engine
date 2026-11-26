@@ -584,10 +584,11 @@ const GEMM_CASES: &[(usize, usize, &[usize])] = &[
     (129, 2304, &[384, 24]),
     (300, 520, &[136, 255]),
     (1024, 264, &[136]),
-    // Enough tiles to fill the GPU without splitting k, and to pick the 64 x 128 tile.
+    // Enough tiles to fill the GPU without splitting k, and to pick the 64 x 128 and 128 x 128 tiles.
     (3, 64, &[24_000]),
     (512, 72, &[3072]),
     (1024, 72, &[2817]),
+    (2048, 64, &[2305]),
 ];
 
 /// Every case of [`GEMM_CASES`] through `gemm_bf16`, against the F64 reference.
@@ -820,7 +821,7 @@ fn gemm_checkpoint_weights() -> anyhow::Result<()> {
 }
 
 /// Row counts of the timed GEMMs.
-const GEMM_TIMED_M: [usize; 7] = [1, 16, 64, 128, 256, 512, 1024];
+const GEMM_TIMED_M: [usize; 8] = [1, 16, 64, 128, 256, 512, 1024, 2048];
 
 /// Timed GEMM batches: products as `n`, sharing `k`.
 const GEMM_TIMED: &[(&str, usize, &[usize])] = &[

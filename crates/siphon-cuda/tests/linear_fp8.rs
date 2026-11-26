@@ -250,6 +250,7 @@ fn gemm_matches_reference() -> anyhow::Result<()> {
             &[(3072, 0), (24, 0), (1024, 1), (32, 1), (384, 2)],
         ),
         (2048, 3072, &[(2304, 0)]),
+        (1921, 2304, &[(2305, 0)]),
         (77, 4608, &[(64, 0), (64, 1), (64, 2)]),
         (2, 2304, &[(130, 0)]),
     ];
@@ -551,4 +552,110 @@ fn time_case(
     let fp8_us = time(true)?;
     let bf16_us = time(false)?;
     Ok((fp8_us, bf16_us))
+}
+
+/// Times `LinearFp8::gemm` (including MXFP8 input quantization) next to `Linear::gemm_bf16`
+/// on the model's prefill dense shapes at M = 512, 1024, 2048. Run with
+/// `cargo test --release --test linear_fp8 -- --ignored --nocapture gemm_fp8_throughput`.
+#[test]
+#[ignore = "timing, not a check"]
+fn gemm_fp8_throughput() -> anyhow::Result<()> {
+    use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};
+    use siphon_cuda::ops::linear::Gemm;
+
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        eprintln!("skipped: FP8 GEMM needs the block-scaled MMA, which sm_89 lacks");
+        return Ok(());
+    }
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let fp8 = LinearFp8::load(gpu.context())?;
+    let linear = Linear::load(gpu.context())?;
+    let mut scratch = Fp8Rows::new(stream, 3 * 2048 * 4608)?;
+
+    let batches: &[(&str, usize, &[usize])] = &[
+        (
+            "attention inputs",
+            2304,
+            &[3072, 384, 3072, 24, 1024, 1024, 32, 32],
+        ),
+        ("o", 3072, &[2304]),
+        ("gate down (3x)", 4608, &[64, 64, 64]),
+    ];
+    eprintln!(
+        "{:18} {:>5} {:>10} {:>10} {:>10} {:>10} {:>8}",
+        "batch", "m", "fp8 (us)", "fp8 TF/s", "bf16 (us)", "bf16 TF/s", "speedup"
+    );
+    for &(label, k, ns) in batches {
+        let n_sum: usize = ns.iter().sum();
+        let bf16_w: Vec<_> = ns
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| stream.clone_htod(&hash_values(10 + i as u32, n * k)))
+            .collect::<Result<_, _>>()?;
+        let fp8_w: Vec<_> = bf16_w
+            .iter()
+            .zip(ns)
+            .map(|(w, &n)| fp8.quantize_any(stream, w, n, k))
+            .collect::<anyhow::Result<_>>()?;
+        for m in [512, 1024, 2048] {
+            let x = stream.clone_htod(&hash_values(99, m * k))?;
+            let mut outs: Vec<_> = ns
+                .iter()
+                .map(|&n| stream.alloc_zeros::<bf16>(m * n))
+                .collect::<Result<_, _>>()?;
+            let mut bench = |use_fp8: bool| -> anyhow::Result<f64> {
+                const LAUNCHES: usize = 20;
+                const REPLAYS: usize = 5;
+                stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                for _ in 0..LAUNCHES {
+                    if use_fp8 {
+                        let mut products: Vec<_> = fp8_w
+                            .iter()
+                            .zip(&mut outs)
+                            .map(|(w, out)| Fp8Gemm {
+                                weight: w,
+                                x: x.slice(..),
+                                out: out.slice_mut(..),
+                            })
+                            .collect();
+                        fp8.gemm(stream, &mut products, m, &mut scratch)?;
+                    } else {
+                        let mut products: Vec<_> = bf16_w
+                            .iter()
+                            .zip(&mut outs)
+                            .map(|(w, out)| Gemm::new(w, &x, out))
+                            .collect();
+                        linear.gemm_bf16(stream, &mut products, m)?;
+                    }
+                }
+                let graph = stream
+                    .end_capture(CUgraphInstantiate_flags(0))?
+                    .ok_or_else(|| anyhow::anyhow!("empty capture"))?;
+                graph.launch()?;
+                let start = gpu
+                    .context()
+                    .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+                let end = gpu
+                    .context()
+                    .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+                start.record(stream)?;
+                for _ in 0..REPLAYS {
+                    graph.launch()?;
+                }
+                end.record(stream)?;
+                Ok(f64::from(start.elapsed_ms(&end)?) * 1e3 / (REPLAYS * LAUNCHES) as f64)
+            };
+            let fp8_us = bench(true)?;
+            let bf16_us = bench(false)?;
+            let flop = 2.0 * (m * n_sum * k) as f64;
+            eprintln!(
+                "{label:18} {m:5} {fp8_us:10.2} {:10.1} {bf16_us:10.2} {:10.1} {:7.2}x",
+                flop / fp8_us / 1e6,
+                flop / bf16_us / 1e6,
+                bf16_us / fp8_us,
+            );
+        }
+    }
+    Ok(())
 }

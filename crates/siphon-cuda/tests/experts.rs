@@ -1986,6 +1986,7 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
 /// (NVFP4 or MXFP8 inputs) and FP8 (MXFP8 inputs), each with its quantization.
 #[test]
 #[ignore = "benchmark; run alone on an idle GPU with --nocapture"]
+#[expect(clippy::too_many_lines, reason = "benchmark prints activation matrix")]
 fn bench_expert_activations() -> anyhow::Result<()> {
     if !siphon_cuda::BLOCK_SCALED_MMA {
         eprintln!("skipped: the quantized products need the block-scaled MMA, which sm_89 lacks");
@@ -1998,10 +1999,16 @@ fn bench_expert_activations() -> anyhow::Result<()> {
     let mut xq = QuantizedRows::new(stream, rows * SLOTS * INTERMEDIATE, rows * SLOTS)?;
     let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
     let indices = stream.clone_htod(&routing(rows, Routing::Uniform, 11))?;
-    println!("| format | projection | bf16 (us) | quantized (us) | fp8 (us) |");
-    println!("| --- | --- | ---: | ---: | ---: |");
+    println!(
+        "| format | projection | bf16 (us) | bf16 (TF/s) | quantized (us) | quant (TF/s) | fp8 (us) | fp8 (TF/s) |"
+    );
+    println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     for fp4 in [true, false] {
-        for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
+        for (name, k, inputs_per_row, swiglu) in [
+            ("w13_swiglu", HIDDEN, 1, true),
+            ("w13", HIDDEN, 1, false),
+            ("w2", INTERMEDIATE, SLOTS, false),
+        ] {
             let projection = Synthetic::new(&s, fp4, HIDDEN, k, 3)?;
             let weights = projection.gpu.weights();
             let x = stream.clone_htod(&common::pseudo_random_bf16(
@@ -2010,7 +2017,8 @@ fn bench_expert_activations() -> anyhow::Result<()> {
                 1.0,
                 0.0,
             ))?;
-            let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * HIDDEN)?;
+            let out_n = if swiglu { INTERMEDIATE } else { HIDDEN };
+            let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * out_n)?;
             let mut time = |mode: usize| -> anyhow::Result<f64> {
                 if mode == 0 {
                     s.experts
@@ -2021,9 +2029,20 @@ fn bench_expert_activations() -> anyhow::Result<()> {
                 }
                 let mut call = |out: &mut CudaSlice<bf16>| -> anyhow::Result<()> {
                     if mode == 0 {
-                        return s
-                            .experts
-                            .expert_matmul_grouped(stream, &x, &weights, out, &scratch);
+                        return if swiglu {
+                            s.experts.expert_matmul_swiglu_grouped(
+                                stream,
+                                &x,
+                                &weights,
+                                out,
+                                &scratch,
+                                GATE_SOFTCAP,
+                                UP_SOFTCAP,
+                            )
+                        } else {
+                            s.experts
+                                .expert_matmul_grouped(stream, &x, &weights, out, &scratch)
+                        };
                     }
                     if mode == 1 {
                         s.experts
@@ -2032,8 +2051,20 @@ fn bench_expert_activations() -> anyhow::Result<()> {
                         s.experts
                             .quantize_rows_fp8(stream, &x, k, weights.format, &mut xq)?;
                     }
-                    s.experts
-                        .expert_matmul_quantized_grouped(stream, &xq, &weights, out, &scratch)
+                    if swiglu {
+                        s.experts.expert_matmul_quantized_swiglu_grouped(
+                            stream,
+                            &xq,
+                            &weights,
+                            out,
+                            &scratch,
+                            GATE_SOFTCAP,
+                            UP_SOFTCAP,
+                        )
+                    } else {
+                        s.experts
+                            .expert_matmul_quantized_grouped(stream, &xq, &weights, out, &scratch)
+                    }
                 };
                 let mut best = f64::INFINITY;
                 for repeat in 0..8 {
@@ -2050,8 +2081,14 @@ fn bench_expert_activations() -> anyhow::Result<()> {
                 Ok(best)
             };
             let format = if fp4 { "NVFP4" } else { "MXFP8" };
+            let flops = 2.0 * (rows * SLOTS * HIDDEN * k) as f64;
             let (bf16_us, quantized_us, fp8_us) = (time(0)?, time(1)?, time(2)?);
-            println!("| {format} | {name} | {bf16_us:.1} | {quantized_us:.1} | {fp8_us:.1} |");
+            println!(
+                "| {format} | {name} | {bf16_us:.1} | {:.1} | {quantized_us:.1} | {:.1} | {fp8_us:.1} | {:.1} |",
+                flops / bf16_us / 1e6,
+                flops / quantized_us / 1e6,
+                flops / fp8_us / 1e6,
+            );
         }
     }
     Ok(())

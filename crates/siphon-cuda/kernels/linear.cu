@@ -552,6 +552,14 @@ struct Loader {
             cp_async16(stage + dst[i], ok ? src[i] + k0 : src[i], ok);
         }
     }
+
+    __device__ void load_full(uint32_t stage, int k0) const {
+#pragma unroll
+        for (int i = 0; i < LOADS; ++i) {
+            const bool ok = live >> i & 1;
+            cp_async16(stage + dst[i], ok ? src[i] + k0 : src[i], ok);
+        }
+    }
 };
 
 template <typename Tx, int BM, int BN, int BK, int WM, int WN, int WK, int STAGES>
@@ -583,6 +591,7 @@ __device__ void gemm(const Batch& b, char* smem) {
     const int wk = warp % WK;
     const int wn = warp / WK % WN;
     const int wm = warp / (WK * WN);
+    const bool warp_active = m0 + wm * T::kWarpM < m && n0 + wn * T::kWarpN < n;
 
     const uint32_t smem0 = smem_addr(smem);
     const Loader<Tx, BK, T::kLoadsA, T::kThreads> load_a(static_cast<const Tx*>(p.x), m0, m, k,
@@ -590,8 +599,14 @@ __device__ void gemm(const Batch& b, char* smem) {
     const Loader<__nv_bfloat16, BK, T::kLoadsB, T::kThreads> load_b(p.w, n0, n, k, tid);
     auto load = [&](int stage, int step) {
         const uint32_t base = smem0 + stage * T::kStage;
-        load_a.load(base, step * BK, k);
-        load_b.load(base + T::kStageA, step * BK, k);
+        const int k0 = step * BK;
+        if (k0 + BK <= k) {
+            load_a.load_full(base, k0);
+            load_b.load_full(base + T::kStageA, k0);
+        } else {
+            load_a.load(base, k0, k);
+            load_b.load(base + T::kStageA, k0, k);
+        }
     };
 
     // ldmatrix rows of this lane: A rows lane % 16 and chunk lane / 16 of each 16 x 16
@@ -619,69 +634,132 @@ __device__ void gemm(const Batch& b, char* smem) {
         cp_async_commit();
     }
 
-    int stage = 0;
-    for (int step = first_step; step < k_steps; ++step) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        const int next = step + STAGES - 1;
-        if (next < k_steps) {
-            load((stage + STAGES - 1) % STAGES, next);
-        }
-        cp_async_commit();
-
+    auto compute_stage = [&](int stage) {
         const uint32_t st_addr = smem0 + stage * T::kStage;
         const char* st_ptr = smem + stage * T::kStage;
+        if constexpr (sizeof(Tx) == 2 && T::kNi <= 4) {
+            // Double-buffer A and B fragments across k slices so ldmatrix overlaps MMA.
+            constexpr int kKSlices = BK / (16 * WK);
+            auto load_bf = [&](uint32_t (&bf)[T::kNi][2], int kk) {
 #pragma unroll
-        for (int kk = wk * 16; kk < BK; kk += 16 * WK) {
-            uint32_t bf[T::kNi][2];
+                for (int nj = 0; nj < T::kNi; nj += 2) {
+                    uint32_t r[4];
+                    ldmatrix_x4(r, st_addr + b_base + nj * 8 * LB::kRowBytes +
+                                       ((kk / 8) ^ b_xor) * 16);
+                    bf[nj][0] = r[0];
+                    bf[nj][1] = r[1];
+                    bf[nj + 1][0] = r[2];
+                    bf[nj + 1][1] = r[3];
+                }
+            };
+            auto load_af = [&](uint32_t (&af)[T::kMi][4], int kk) {
 #pragma unroll
-            for (int nj = 0; nj < T::kNi; nj += 2) {
-                uint32_t r[4];
-                ldmatrix_x4(r, st_addr + b_base + nj * 8 * LB::kRowBytes +
-                                   ((kk / 8) ^ b_xor) * 16);
-                bf[nj][0] = r[0];
-                bf[nj][1] = r[1];
-                bf[nj + 1][0] = r[2];
-                bf[nj + 1][1] = r[3];
-            }
+                for (int mi = 0; mi < T::kMi; ++mi) {
+                    ldmatrix_x4(af[mi], st_addr + a_base + mi * 16 * LA::kRowBytes +
+                                            ((kk / 8) ^ a_xor) * 16);
+                }
+            };
+            uint32_t bf[2][T::kNi][2];
+            uint32_t af[2][T::kMi][4];
+            load_bf(bf[0], wk * 16);
+            load_af(af[0], wk * 16);
 #pragma unroll
-            for (int mi = 0; mi < T::kMi; ++mi) {
-                if constexpr (sizeof(Tx) == 2) {
-                    uint32_t af[4];
-                    ldmatrix_x4(af, st_addr + a_base + mi * 16 * LA::kRowBytes +
-                                        ((kk / 8) ^ a_xor) * 16);
+            for (int ks = 0; ks < kKSlices; ++ks) {
+                const int cur = ks & 1;
+                const int nxt = cur ^ 1;
+                if (ks + 1 < kKSlices) {
+                    const int kk_nxt = (wk + (ks + 1) * WK) * 16;
+                    load_bf(bf[nxt], kk_nxt);
+                    load_af(af[nxt], kk_nxt);
+                }
+#pragma unroll
+                for (int mi = 0; mi < T::kMi; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < T::kNi; ++ni) {
-                        mma(acc[mi][ni], af, bf[ni][0], bf[ni][1]);
+                        mma(acc[mi][ni], af[cur][mi], bf[cur][ni][0], bf[cur][ni][1]);
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int kk = wk * 16; kk < BK; kk += 16 * WK) {
+                uint32_t bf[T::kNi][2];
+#pragma unroll
+                for (int nj = 0; nj < T::kNi; nj += 2) {
+                    uint32_t r[4];
+                    ldmatrix_x4(r, st_addr + b_base + nj * 8 * LB::kRowBytes +
+                                       ((kk / 8) ^ b_xor) * 16);
+                    bf[nj][0] = r[0];
+                    bf[nj][1] = r[1];
+                    bf[nj + 1][0] = r[2];
+                    bf[nj + 1][1] = r[3];
+                }
+                if constexpr (sizeof(Tx) == 2) {
+                    uint32_t af[2][4];
+                    ldmatrix_x4(af[0], st_addr + a_base + ((kk / 8) ^ a_xor) * 16);
+#pragma unroll
+                    for (int mi = 0; mi < T::kMi; ++mi) {
+                        const int cur = mi & 1;
+                        if (mi + 1 < T::kMi) {
+                            ldmatrix_x4(af[cur ^ 1],
+                                        st_addr + a_base + (mi + 1) * 16 * LA::kRowBytes +
+                                            ((kk / 8) ^ a_xor) * 16);
+                        }
+#pragma unroll
+                        for (int ni = 0; ni < T::kNi; ++ni) {
+                            mma(acc[mi][ni], af[cur], bf[ni][0], bf[ni][1]);
+                        }
                     }
                 } else {
-                    // Fragment layout of mma's A operand: rows g and g + 8, columns 2t,
-                    // 2t + 1 and the same plus 8.
-                    const int g = lane / 4, t = lane % 4;
-                    const float* base = reinterpret_cast<const float*>(
-                        st_ptr + (wm * T::kWarpM + mi * 16 + g) * LA::kRowBytes) + kk + 2 * t;
-                    constexpr int kRow = LA::kRowBytes / 4;
-                    uint32_t hi[4], mid[4], lo[4];
-                    const float2 v[4] = {
-                        *reinterpret_cast<const float2*>(base),
-                        *reinterpret_cast<const float2*>(base + 8 * kRow),
-                        *reinterpret_cast<const float2*>(base + 8),
-                        *reinterpret_cast<const float2*>(base + 8 * kRow + 8),
-                    };
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        split3(v[i], hi[i], mid[i], lo[i]);
-                    }
+                    for (int mi = 0; mi < T::kMi; ++mi) {
+                        // Fragment layout of mma's A operand: rows g and g + 8, columns 2t,
+                        // 2t + 1 and the same plus 8.
+                        const int g = lane / 4, t = lane % 4;
+                        const float* base = reinterpret_cast<const float*>(
+                            st_ptr + (wm * T::kWarpM + mi * 16 + g) * LA::kRowBytes) + kk + 2 * t;
+                        constexpr int kRow = LA::kRowBytes / 4;
+                        uint32_t hi[4], mid[4], lo[4];
+                        const float2 v[4] = {
+                            *reinterpret_cast<const float2*>(base),
+                            *reinterpret_cast<const float2*>(base + 8 * kRow),
+                            *reinterpret_cast<const float2*>(base + 8),
+                            *reinterpret_cast<const float2*>(base + 8 * kRow + 8),
+                        };
 #pragma unroll
-                    for (int ni = 0; ni < T::kNi; ++ni) {
-                        mma(acc[mi][ni], lo, bf[ni][0], bf[ni][1]);
-                        mma(acc[mi][ni], mid, bf[ni][0], bf[ni][1]);
-                        mma(acc[mi][ni], hi, bf[ni][0], bf[ni][1]);
+                        for (int i = 0; i < 4; ++i) {
+                            split3(v[i], hi[i], mid[i], lo[i]);
+                        }
+#pragma unroll
+                        for (int ni = 0; ni < T::kNi; ++ni) {
+                            mma(acc[mi][ni], lo, bf[ni][0], bf[ni][1]);
+                            mma(acc[mi][ni], mid, bf[ni][0], bf[ni][1]);
+                            mma(acc[mi][ni], hi, bf[ni][0], bf[ni][1]);
+                        }
                     }
                 }
             }
         }
-        stage = stage + 1 == STAGES ? 0 : stage + 1;
+    };
+
+    const int n_steps = k_steps - first_step;
+    for (int rel0 = 0; rel0 < n_steps; rel0 += STAGES) {
+#pragma unroll
+        for (int st = 0; st < STAGES; ++st) {
+            const int rel = rel0 + st;
+            if (rel < n_steps) {
+                cp_async_wait<STAGES - 2>();
+                __syncthreads();
+                const int next = first_step + rel + STAGES - 1;
+                if (next < k_steps) {
+                    load((st + STAGES - 1) % STAGES, next);
+                }
+                cp_async_commit();
+                if (warp_active) {
+                    compute_stage(st);
+                }
+            }
+        }
     }
 
     constexpr int kValues = T::kMi * T::kNi * 4;  // accumulators per thread
@@ -838,12 +916,22 @@ __device__ void gemm(const Batch& b, char* smem) {
         gemm::gemm<Tx, BM, BN, BK, WM, WN, WK, STAGES>(batch, gemm_smem);                  \
     }
 
+#define GEMM_ENTRY_BOUNDS(name, Tx, BM, BN, BK, WM, WN, WK, STAGES, MIN_BLOCKS)            \
+    extern "C" __global__ void __launch_bounds__(                                          \
+        gemm::Tile<Tx, BM, BN, BK, WM, WN, WK, STAGES>::kThreads, MIN_BLOCKS)              \
+        name(const __grid_constant__ gemm::Batch batch) {                                  \
+        extern __shared__ __align__(16) char gemm_smem[];                                  \
+        gemm::gemm<Tx, BM, BN, BK, WM, WN, WK, STAGES>(batch, gemm_smem);                  \
+    }
+
 // Small m: 16 or 32 rows, BK = 64 for long contiguous weight reads, two blocks per SM.
 GEMM_ENTRY(gemm_bf16_16x64, __nv_bfloat16, 16, 64, 64, 1, 2, 2, 4)
 GEMM_ENTRY(gemm_bf16_32x64, __nv_bfloat16, 32, 64, 64, 1, 2, 2, 4)
-// Large m: 32 x 32 warp tiles, two blocks per SM; 64 x 128 when its tiles fill the GPU.
+// Large m: 32 x 32 warp tiles, two blocks per SM; 64 x 128 or 128 x 128 (3 stages, 8 warps,
+// 96 KiB SMEM, 1 block/SM) when their tiles fill the GPU.
 GEMM_ENTRY(gemm_bf16_64x64, __nv_bfloat16, 64, 64, 64, 2, 2, 1, 3)
 GEMM_ENTRY(gemm_bf16_64x128, __nv_bfloat16, 64, 128, 64, 2, 2, 1, 2)
+GEMM_ENTRY_BOUNDS(gemm_bf16_128x128, __nv_bfloat16, 128, 128, 64, 2, 4, 1, 3, 1)
 // F32 inputs: shared rows hold F32 x, so BK = 32 keeps the large tile at two blocks per SM.
 GEMM_ENTRY(gemm_f32_16x64, float, 16, 64, 64, 1, 2, 2, 3)
 GEMM_ENTRY(gemm_f32_64x64, float, 64, 64, 32, 2, 2, 1, 3)

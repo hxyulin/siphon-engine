@@ -54,6 +54,8 @@ const GEMM_COLUMNS: usize = 128;
 const GEMM_PAIRS: usize = 64;
 /// Pairs per tile of the quantized products, `kQTileT` in the kernel.
 const QUANTIZED_PAIRS: usize = 128;
+/// Allocation bound for `ExpertScratch::tiles`, matching `siphon::memory::rows_scratch`.
+const SCRATCH_TILE_PAIRS: usize = 64;
 const GEMM_K: usize = 64;
 const GEMM_THREADS: u32 = 256;
 /// Threads per block of `expert_gemm_q8_*`.
@@ -164,8 +166,8 @@ impl ExpertFormat<'_> {
     }
 
     /// Dynamic shared memory of an `expert_gemm_*` block: per pipeline stage, the weight bytes
-    /// and the BF16 inputs, then 2 slots of scales for a pair of stages. Both formats run 3
-    /// stages, so that two blocks fit in an SM.
+    /// and the BF16 inputs (64 pairs), then 2 slots of scales for a pair of stages. Both
+    /// formats run 3 stages (38,912 B NVFP4, 50,176 B MXFP8), so two blocks fit in an SM.
     fn gemm_shared_bytes(self) -> usize {
         let stages = 3;
         let scale_slots = 2;
@@ -394,10 +396,15 @@ impl ExpertScratch {
     }
 }
 
-/// Most tiles `pairs` pairs over `experts` experts can need: one partial tile per expert
-/// besides the full ones, and never more tiles than pairs.
+/// Most tiles `pairs` pairs over `experts` experts can need with tiles of `tile_pairs`
+/// pairs: one partial tile per expert besides the full ones, and never more tiles than pairs.
+fn max_tiles_for(pairs: usize, experts: usize, tile_pairs: usize) -> usize {
+    pairs.min(pairs / tile_pairs + experts)
+}
+
+/// Allocation bound for `ExpertScratch::tiles`, matching `siphon::memory::rows_scratch`.
 fn max_tiles(pairs: usize, experts: usize) -> usize {
-    pairs.min(pairs / GEMM_PAIRS + experts)
+    max_tiles_for(pairs, experts, SCRATCH_TILE_PAIRS)
 }
 
 #[derive(Debug)]
@@ -489,8 +496,9 @@ impl Experts {
                 matmul.load_function("expert_gemm_q_mxfp8_swiglu")?,
             ],
         ];
-        // MXFP8 needs the most: 3 stages of 16 KiB and 1 KiB of scales against NVFP4's 3 of
-        // 12 KiB and 2 KiB of scales, and the quantized kernels' 2 of 16 KiB and 8 KiB.
+        // MXFP8 needs the most: 3 stages of 16 KiB and 1 KiB of scales (50,176 B) against
+        // NVFP4's 3 of 12 KiB and 2 KiB of scales (38,912 B), and the quantized kernels'
+        // 2 of 16 KiB and 8 KiB (40,960 B).
         let shared = i32::try_from(
             ExpertFormat::Mxfp8
                 .gemm_shared_bytes()
@@ -1160,7 +1168,7 @@ impl Experts {
         let config = LaunchConfig {
             grid_dim: (
                 u32::try_from(n.div_ceil(GEMM_COLUMNS))?,
-                u32::try_from(max_tiles(pairs, experts) + 1)?,
+                u32::try_from(max_tiles_for(pairs, experts, tile_pairs) + 1)?,
                 1,
             ),
             block_dim: (threads, 1, 1),

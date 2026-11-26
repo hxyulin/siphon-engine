@@ -274,23 +274,7 @@ quantize_e4m3_rows(const __nv_bfloat16* __restrict__ w, int k, uint8_t* __restri
 namespace gemm8 {
 
 constexpr int kMaxProducts = 8;
-constexpr int kBm = 128;
-constexpr int kBn = 128;
 constexpr int kBk = 128;
-constexpr int kWarpsM = 2;
-constexpr int kWarpsN = 4;
-constexpr int kThreads = 32 * kWarpsM * kWarpsN;
-constexpr int kStages = 3;
-constexpr int kWarpRows = kBm / kWarpsM;
-constexpr int kWarpCols = kBn / kWarpsN;
-constexpr int kMi = kWarpRows / 16;
-constexpr int kNi = kWarpCols / 8;
-constexpr int kStageA = kBm * kBk;
-constexpr int kStageB = kBn * kBk;
-constexpr int kStageScales = kBm * 4;
-constexpr int kStage = kStageA + kStageB + kStageScales;
-constexpr int kSmemBytes = kStages * kStage;
-static_assert(kSmemBytes <= 99 * 1024, "one block fits in an SM's shared memory");
 
 struct Product {
     const uint8_t* w;
@@ -360,7 +344,27 @@ __device__ __forceinline__ int offset(int row, int chunk) {
     return row * kBk + ((chunk ^ (row & 7)) << 4);
 }
 
+template <int kBm, int kBn, int kWarpsM, int kWarpsN, int kStages>
 __device__ void gemm(const Batch& b, uint8_t* smem) {
+    constexpr int kThreads = 32 * kWarpsM * kWarpsN;
+    constexpr int kWarpRows = kBm / kWarpsM;
+    constexpr int kWarpCols = kBn / kWarpsN;
+    constexpr int kMi = kWarpRows / 16;
+    constexpr int kNi = kWarpCols / 8;
+    constexpr int kStageA = kBm * kBk;
+    constexpr int kStageB = kBn * kBk;
+    constexpr int kStageScales = kBm * 4;
+    constexpr int kStage = kStageA + kStageB + kStageScales;
+    constexpr int kSmemBytes = kStages * kStage;
+    constexpr int kCopyRows = kThreads / 8;
+    constexpr int kLoadsA = kBm / kCopyRows;
+    constexpr int kLoadsB = kBn / kCopyRows;
+    static_assert(kSmemBytes <= 99 * 1024, "one block fits in an SM's shared memory");
+    static_assert(kBm % (16 * kWarpsM) == 0 && kBn % (16 * kWarpsN) == 0,
+                  "whole 16 x 16 warp slices");
+    static_assert(kBm % kCopyRows == 0 && kBn % kCopyRows == 0, "threads share copies evenly");
+    static_assert(kThreads >= kBm, "one thread per A row for scale copies");
+
     const int block = blockIdx.x;
     int s = 0;
     int tile_begin = 0;
@@ -380,24 +384,31 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
     const int warp = tid / 32;
     const int wn = warp % kWarpsN;
     const int wm = warp / kWarpsN;
+    const bool warp_active = m0 + wm * kWarpRows < m && n0 + wn * kWarpCols < n;
 
-    // Copies: each thread 4 chunks of x rows and 4 of W rows per stage (rows tid / 8 +
-    // 32i, chunk tid % 8), and threads below 128 the 4 scales of x row tid.
+    // Copies: each thread kLoadsA chunks of x rows and kLoadsB of W rows per stage (rows
+    // tid / 8 + kCopyRows * i, chunk tid % 8), and threads below kBm the 4 scales of x row tid.
     const int chunk = tid % 8;
-    const uint8_t* a_src[4];
-    const uint8_t* b_src[4];
-    uint32_t dst[4];
+    const uint8_t* a_src[kLoadsA];
+    const uint8_t* b_src[kLoadsB];
+    uint32_t a_dst[kLoadsA];
+    uint32_t b_dst[kLoadsB];
     uint32_t a_live = 0;
     uint32_t b_live = 0;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int row = tid / 8 + 32 * i;
-        dst[i] = offset(row, chunk);
+    for (int i = 0; i < kLoadsA; ++i) {
+        const int row = tid / 8 + kCopyRows * i;
+        a_dst[i] = offset(row, chunk);
         const bool a_ok = m0 + row < m;
-        const bool b_ok = n0 + row < n;
         a_live |= uint32_t(a_ok) << i;
-        b_live |= uint32_t(b_ok) << i;
         a_src[i] = p.x + size_t(a_ok ? m0 + row : 0) * k + chunk * 16;
+    }
+#pragma unroll
+    for (int i = 0; i < kLoadsB; ++i) {
+        const int row = tid / 8 + kCopyRows * i;
+        b_dst[i] = offset(row, chunk);
+        const bool b_ok = n0 + row < n;
+        b_live |= uint32_t(b_ok) << i;
         b_src[i] = p.w + size_t(b_ok ? n0 + row : 0) * k + chunk * 16;
     }
     const bool scale_ok = tid < kBm && m0 + tid < m;
@@ -408,9 +419,12 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         const uint32_t base = smem0 + stage * kStage;
         const int k0 = step * kBk;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            cp_async16(base + dst[i], a_src[i] + k0, a_live >> i & 1);
-            cp_async16(base + kStageA + dst[i], b_src[i] + k0, b_live >> i & 1);
+        for (int i = 0; i < kLoadsA; ++i) {
+            cp_async16(base + a_dst[i], a_src[i] + k0, a_live >> i & 1);
+        }
+#pragma unroll
+        for (int i = 0; i < kLoadsB; ++i) {
+            cp_async16(base + kStageA + b_dst[i], b_src[i] + k0, b_live >> i & 1);
         }
         if (tid < kBm) {
             cp_async4(base + kStageA + kStageB + 4 * tid, scale_src + step * 4, scale_ok);
@@ -436,16 +450,7 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         cp_async_commit();
     }
 
-    int stage = 0;
-    for (int step = 0; step < steps; ++step) {
-        cp_async_wait<kStages - 2>();
-        __syncthreads();
-        const int next = step + kStages - 1;
-        if (next < steps) {
-            load((stage + kStages - 1) % kStages, next);
-        }
-        cp_async_commit();
-
+    auto compute_stage = [&](int stage) {
         const uint32_t base = smem0 + stage * kStage;
         const uint32_t* scales =
             reinterpret_cast<const uint32_t*>(smem + stage * kStage + kStageA + kStageB);
@@ -454,34 +459,72 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         for (int mi = 0; mi < kMi; ++mi) {
             sa[mi] = scales[scale_row + 16 * mi];
         }
-        auto k_step = [&]<int kK>() {
-            uint32_t bf[kNi][2];
+        // Double-buffer A and B fragments across the four k32 slices so ldmatrix latency
+        // hides behind the 16 FP8 MMAs of the previous slice.
+        auto load_bf = [&](uint32_t (&bf)[kNi][2], int kk_idx) {
 #pragma unroll
             for (int nj = 0; nj < kNi; nj += 2) {
                 uint32_t r[4];
-                ldmatrix_x4(r, base + kStageA + offset(b_row + nj * 8, 2 * kK + lane / 8 % 2));
+                ldmatrix_x4(r, base + kStageA + offset(b_row + nj * 8, 2 * kk_idx + lane / 8 % 2));
                 bf[nj][0] = r[0];
                 bf[nj][1] = r[1];
                 bf[nj + 1][0] = r[2];
                 bf[nj + 1][1] = r[3];
             }
+        };
+        auto load_af = [&](uint32_t (&af)[kMi][4], int kk_idx) {
 #pragma unroll
             for (int mi = 0; mi < kMi; ++mi) {
-                uint32_t af[4];
-                ldmatrix_x4(af, base + offset(a_row + mi * 16, 2 * kK + lane / 16));
+                ldmatrix_x4(af[mi], base + offset(a_row + mi * 16, 2 * kk_idx + lane / 16));
+            }
+        };
+        uint32_t bf[2][kNi][2];
+        uint32_t af[2][kMi][4];
+        load_bf(bf[0], 0);
+        load_af(af[0], 0);
+        auto run_k = [&]<int kK>() {
+            constexpr int cur = kK & 1;
+            constexpr int nxt = cur ^ 1;
+            if constexpr (kK + 1 < 4) {
+                load_bf(bf[nxt], kK + 1);
+                load_af(af[nxt], kK + 1);
+            }
+#pragma unroll
+            for (int mi = 0; mi < kMi; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < kNi; ++ni) {
-                    mma<kK>(acc[mi][ni], af, bf[ni][0], bf[ni][1], sa[mi]);
+                    mma<kK>(acc[mi][ni], af[cur][mi], bf[cur][ni][0], bf[cur][ni][1], sa[mi]);
                 }
             }
         };
-        k_step.template operator()<0>();
-        k_step.template operator()<1>();
-        k_step.template operator()<2>();
-        k_step.template operator()<3>();
-        stage = stage + 1 == kStages ? 0 : stage + 1;
+        run_k.template operator()<0>();
+        run_k.template operator()<1>();
+        run_k.template operator()<2>();
+        run_k.template operator()<3>();
+    };
+
+    for (int step0 = 0; step0 < steps; step0 += kStages) {
+#pragma unroll
+        for (int st = 0; st < kStages; ++st) {
+            const int step = step0 + st;
+            if (step < steps) {
+                cp_async_wait<kStages - 2>();
+                __syncthreads();
+                const int next = step + kStages - 1;
+                if (next < steps) {
+                    load((st + kStages - 1) % kStages, next);
+                }
+                cp_async_commit();
+                if (warp_active) {
+                    compute_stage(st);
+                }
+            }
+        }
     }
 
+    if (!warp_active) {
+        return;
+    }
     const int g = lane / 4, t = lane % 4;
 #pragma unroll
     for (int ni = 0; ni < kNi; ++ni) {
@@ -517,12 +560,21 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
 
 }  // namespace gemm8
 
-// The FP8 GEMM entry point. Grid: one block per 128 x 128 tile of every product; dynamic
-// shared memory gemm8::kSmemBytes (99,840 bytes). k must be a multiple of 128.
-extern "C" __global__ void __launch_bounds__(gemm8::kThreads, 1)
+// The FP8 GEMM entry points. Grid: one block per tile of every product; k must be a
+// multiple of 128.
+// - gemm_fp8_128x128: 99,840 bytes dynamic shared memory, 1 CTA/SM, for large prefill batches.
+// - gemm_fp8_64x64:   49,920 bytes dynamic shared memory, 2 CTAs/SM, for narrow/small batches
+//   (such as message gate down projections with n = 64).
+extern "C" __global__ void __launch_bounds__(256, 1)
     gemm_fp8_128x128(const __grid_constant__ gemm8::Batch batch) {
     extern __shared__ __align__(16) uint8_t gemm8_smem[];
-    gemm8::gemm(batch, gemm8_smem);
+    gemm8::gemm<128, 128, 2, 4, 3>(batch, gemm8_smem);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    gemm_fp8_64x64(const __grid_constant__ gemm8::Batch batch) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm<64, 64, 2, 2, 3>(batch, gemm8_smem);
 }
 
 // Quantizes `rows` BF16 rows of k values (`x`) to MXFP8 for gemm_fp8: E4M3 `values`
