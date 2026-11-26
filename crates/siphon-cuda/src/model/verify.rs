@@ -14,8 +14,8 @@
 //! State after accepting `a` drafts of a pass at position `P`: the position is
 //! `P + a + 1`, the global caches keep their stale rows past it (attention never reads
 //! them, and later rows overwrite them), the sliding rings get back the slots that
-//! rejected rows overwrote, and the conv states are rebuilt from their backup and the
-//! recorded inputs of rows `0..=a`.
+//! rejected rows overwrote, and the conv states (left untouched during the pass) are
+//! shifted in place from their pre-verify values and the recorded inputs of rows `0..=a`.
 
 use std::sync::Arc;
 
@@ -94,8 +94,6 @@ pub struct PendingVerify {
 pub(super) struct VerifyBuffers {
     /// Device addresses of every visit's four conv states, in visit order.
     pub states: CudaSlice<u64>,
-    /// The conv states before the pass, F32 `[visits, 3 * 6656]`.
-    pub conv_backup: CudaSlice<f32>,
     /// Each visit's conv inputs of the pass's rows, BF16 `[visits, 8, 6656]`.
     pub inputs: CudaSlice<bf16>,
     /// Device addresses of the sliding visits' keys and values, a pair per visit.
@@ -167,7 +165,6 @@ impl VerifyBuffers {
         let ring_row_bytes = ring_row_bytes.unwrap_or(1024 * 2);
         Ok(Self {
             states: stream.clone_htod(&states)?,
-            conv_backup: zeros(stream, visits.len() * STATE_ROWS * VISIT_CHANNELS)?,
             inputs: zeros(stream, visits.len() * VERIFY_ROWS * VISIT_CHANNELS)?,
             rings: stream.clone_htod(&rings)?,
             ring_slots: ring_slots.unwrap_or(0),

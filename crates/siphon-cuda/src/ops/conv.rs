@@ -387,10 +387,13 @@ impl Conv {
         self.shift_state(stream, &combined.slice(..), state, HIDDEN, rows)
     }
 
-    /// [`Conv::moe_conv_residual_rows`] for the 1 to 8 rows of a step, which also shifts
-    /// the visit's other conv inputs in `convs` into their states, as
-    /// [`Conv::shift_state`] would after the kernels that read them, and records every
-    /// stream's inputs into `convs.inputs` if given. One launch instead of six.
+    /// [`Conv::moe_conv_residual_rows`] for the 1 to 8 rows of a step. With `convs.inputs`
+    /// set to `None` (a small prefill chunk), it also shifts the visit's other conv inputs in
+    /// `convs` into their states, as [`Conv::shift_state`] would after the kernels that read
+    /// them. With `convs.inputs` set to `Some(...)` (verify mode), it records every stream's
+    /// inputs into `convs.inputs` and leaves all four conv states untouched so
+    /// [`crate::ops::spec::Spec::conv_rollback`] can shift them in place. One launch instead
+    /// of six.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
     pub fn moe_conv_residual_step_rows(
         &self,
@@ -581,9 +584,11 @@ impl Conv {
     }
 
     /// Batched multi-row form of [`Self::moe_conv_residual_step_rows`]: `seqs` sequences
-    /// each running `rows_per_seq` (`1..=8`) verify rows, recording each sequence's conv
-    /// inputs into `inputs` (`[max_seqs, 8, VISIT_CHANNELS]`) if given, and shifting all
-    /// four conv states of every sequence.
+    /// each running `rows_per_seq` (`1..=8`) verify rows. With `inputs` set to `Some(...)`
+    /// (verify mode), it records each sequence's conv inputs into
+    /// `inputs` (`[max_seqs, 8, VISIT_CHANNELS]`) and leaves all four conv states untouched
+    /// for [`crate::ops::spec::Spec::conv_rollback_batch`]; with `inputs` set to `None`, it
+    /// shifts all four conv states of every sequence.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
     pub fn moe_conv_residual_batch_verify(
         &self,

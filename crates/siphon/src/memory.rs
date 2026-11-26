@@ -398,7 +398,6 @@ impl Planner {
                     + invariant_scratch(c, VERIFY_ROWS)
                     + VERIFY_ROWS * taps * hidden * 2
                     + visits.len() * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
-                    + visits.len() * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4
                     // The speculator's prompt tail, twice, and its run of plain steps.
                     + (2 * TAIL_ROWS + PLAIN_RUN_ROWS) * taps * hidden * 2;
                 // A device copy of the BF16 LM head for the exact base logits, which the
@@ -462,7 +461,6 @@ impl Planner {
                 + invariant_scratch(c, spec_rows)
                 + spec_rows * taps * hidden * 2
                 + visits.len() * spec_seqs * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
-                + visits.len() * spec_seqs * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4
                 + sliding_visits * spec_seqs * VERIFY_ROWS * 2 * ring_row_bytes;
             // Batched DFlash 2 activations, split-KV partials, and shortlist/vocab logits.
             let draft_scratch = 220 << 20;

@@ -979,10 +979,10 @@ impl Ctx {
     /// `capped` and `next`. Other chunks skip the final norm and the LM head unless
     /// `logits` asks for every row or the chunk records its taps.
     ///
-    /// In the verify scratch, the chunk is a verify pass instead: it backs up the conv
-    /// states and the ring slots it will overwrite, records each visit's conv inputs, and
-    /// ends with every row's logits and greedy token, the acceptance and the rollback (see
-    /// `kernels/spec.cu`). The decode scratch is left alone.
+    /// In the verify scratch, the chunk is a verify pass instead: it backs up the ring
+    /// slots it will overwrite, records each visit's conv inputs while leaving conv states
+    /// untouched, and ends with every row's logits and greedy token, the acceptance and the
+    /// in-place rollback (see `kernels/spec.cu`). The decode scratch is left alone.
     ///
     /// In the batch scratch, the chunk is a batched step instead: row r is the next token of
     /// its own sequence, whose caches, conv states and position the batch's state tables
@@ -1059,9 +1059,6 @@ impl Ctx {
             Ok::<_, anyhow::Error>((visit, plan.next().flatten()))
         };
         if let Some(v) = p.verify.as_mut() {
-            self.kernels
-                .spec
-                .conv_backup(&self.stream, &v.states, &mut v.conv_backup)?;
             self.kernels.spec.ring_backup(
                 &self.stream,
                 &v.rings,
@@ -1077,14 +1074,6 @@ impl Ctx {
         {
             let width = bv.width;
             let seqs = m / width;
-            self.kernels.spec.conv_backup_batch(
-                &self.stream,
-                &b.tables,
-                num_visits,
-                b.max_seqs,
-                seqs,
-                &mut bv.conv_backup,
-            )?;
             self.kernels.spec.ring_backup_batch(
                 &self.stream,
                 &b.tables,
@@ -1434,13 +1423,7 @@ impl Ctx {
                 &mut v.anchor,
             )?;
         }
-        spec.conv_rollback(
-            &self.stream,
-            &v.states,
-            &v.conv_backup,
-            &v.inputs,
-            &v.result,
-        )?;
+        spec.conv_rollback(&self.stream, &v.states, &v.inputs, &v.result)?;
         spec.ring_restore(
             &self.stream,
             &v.rings,
@@ -1536,7 +1519,6 @@ impl Ctx {
                 num_visits,
                 b.max_seqs,
                 seqs,
-                &bv.conv_backup,
                 &bv.inputs,
                 &bv.results.slice(..seqs * RESULT_LEN),
             )?;

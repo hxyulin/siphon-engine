@@ -15,7 +15,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
 
 /// Hidden width.
 pub const HIDDEN: usize = 2304;
@@ -96,9 +96,14 @@ pub const STREAM_DIMS: [usize; STREAMS] = [KV_DIMS, KV_DIMS, HIDDEN, HIDDEN];
 /// I32 values of an acceptance result: the accepted count, the verify tokens and the
 /// argmax of each row.
 pub const RESULT_LEN: usize = 1 + 2 * VERIFY_ROWS;
-/// Blocks per (stream, visit) of the conv backup and rollback.
-const STATE_BLOCKS: u32 = 9;
-const THREADS: u32 = 256;
+/// Vectorized in-place conv rollback geometry: 8 channels per thread (`uint4` + 2x `float4`),
+/// 96 threads per block, 3 blocks cover `HIDDEN = 2304`.
+const ROLLBACK_VEC: usize = 8;
+const ROLLBACK_THREADS: u32 = 96;
+const STATE_BLOCKS: u32 = 3;
+const _: () = assert!(STATE_BLOCKS as usize * ROLLBACK_THREADS as usize * ROLLBACK_VEC == HIDDEN);
+const _: () = assert!(KV_DIMS.is_multiple_of(ROLLBACK_VEC));
+const _: () = assert!(VISIT_CHANNELS.is_multiple_of(ROLLBACK_VEC));
 
 fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
     ensure!(len == want, "{name} has {len} elements, expected {want}");
@@ -108,13 +113,11 @@ fn check_len(name: &str, len: usize, want: usize) -> anyhow::Result<()> {
 #[derive(Debug)]
 pub struct Spec {
     copy_tap: CudaFunction,
-    conv_backup: CudaFunction,
     conv_rollback: CudaFunction,
     ring_backup: CudaFunction,
     ring_restore: CudaFunction,
     accept_greedy: CudaFunction,
     accept_margin: CudaFunction,
-    conv_backup_batch: CudaFunction,
     conv_rollback_batch: CudaFunction,
     ring_backup_batch: CudaFunction,
     ring_restore_batch: CudaFunction,
@@ -128,13 +131,11 @@ impl Spec {
         let f = |name: &str| module.load_function(name);
         Ok(Self {
             copy_tap: f("copy_tap")?,
-            conv_backup: f("conv_backup")?,
             conv_rollback: f("conv_rollback")?,
             ring_backup: f("ring_backup")?,
             ring_restore: f("ring_restore")?,
             accept_greedy: f("accept_greedy")?,
             accept_margin: f("accept_margin")?,
-            conv_backup_batch: f("conv_backup_batch")?,
             conv_rollback_batch: f("conv_rollback_batch")?,
             ring_backup_batch: f("ring_backup_batch")?,
             ring_restore_batch: f("ring_restore_batch")?,
@@ -172,63 +173,45 @@ impl Spec {
             block_dim: (u32::try_from(HIDDEN / 8)?, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.copy_tap);
-        launch.arg(&src).arg(&mut taps).arg(&tap).arg(&count);
+        let mut args = KernelArgs::default();
+        args.ptr(&src, stream)
+            .ptr_mut(&mut taps, stream)
+            .i32(tap)
+            .i32(count);
         // SAFETY: the arguments match `copy_tap(const bf16*, bf16*, int, int)`; block `r`
         // reads row `r` of `src` and writes row `r`, tap `tap` of `taps`, both checked to
-        // exist.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // exist, and the kernel calls `pdl_wait()` before reading `src`.
+        unsafe { args.launch_pdl(stream, &self.copy_tap, config) }
     }
 
-    /// Copies every visit's four conv states into `backup` `[visits, 3 * 6656]`. `states`
-    /// holds the device addresses of the states, F32 `[3, dims]` each, 4 per visit in the
-    /// order of [`STREAM_DIMS`].
-    pub fn conv_backup(
-        &self,
-        stream: &CudaStream,
-        states: &CudaSlice<u64>,
-        backup: &mut CudaSlice<f32>,
-    ) -> anyhow::Result<()> {
-        let visits = visits(states)?;
-        check_len("backup", backup.len(), visits * STATE_ROWS * VISIT_CHANNELS)?;
-        let mut launch = stream.launch_builder(&self.conv_backup);
-        launch.arg(states).arg(backup);
-        // SAFETY: the arguments match `conv_backup(const unsigned long long*, float*)`. The
-        // caller vouches that each address in `states` is a live F32 [3, dims] buffer of the
-        // stream's dims; block (x, s, v) copies stream `s` of visit `v` into its place in
-        // `backup`, which holds every visit.
-        unsafe { launch.launch(state_config(visits)?) }?;
-        Ok(())
-    }
-
-    /// Sets every conv state to rows `keep .. keep + 3` of its backup followed by its
-    /// recorded inputs, where `keep` is `result[0] + 1`. `inputs` is `[visits, 8, 6656]`.
+    /// Shifts every conv state in place to rows `keep .. keep + 3` of its pre-verify state
+    /// followed by its recorded inputs, where `keep` is `result[0] + 1`. `states` holds the
+    /// device addresses of the states, F32 `[3, dims]` each, 4 per visit in the order of
+    /// [`STREAM_DIMS`]. `inputs` is `[visits, 8, 6656]`.
     pub fn conv_rollback(
         &self,
         stream: &CudaStream,
         states: &CudaSlice<u64>,
-        backup: &CudaSlice<f32>,
         inputs: &CudaSlice<bf16>,
         result: &CudaSlice<i32>,
     ) -> anyhow::Result<()> {
         let visits = visits(states)?;
-        check_len("backup", backup.len(), visits * STATE_ROWS * VISIT_CHANNELS)?;
         check_len(
             "inputs",
             inputs.len(),
             visits * VERIFY_ROWS * VISIT_CHANNELS,
         )?;
         check_len("result", result.len(), RESULT_LEN)?;
-        let mut launch = stream.launch_builder(&self.conv_rollback);
-        launch.arg(states).arg(backup).arg(inputs).arg(result);
-        // SAFETY: the arguments match `conv_rollback(const unsigned long long*, const float*,
-        // const bf16*, const int*)`. The caller vouches for the addresses in `states`, as in
-        // `conv_backup`, and that `result[0]` is below the recorded rows, which the
-        // acceptance kernel guarantees; the kernel then reads backup rows below 3 and input
-        // rows below 8.
-        unsafe { launch.launch(state_config(visits)?) }?;
-        Ok(())
+        let mut args = KernelArgs::default();
+        args.ptr(states, stream)
+            .ptr(inputs, stream)
+            .ptr(result, stream);
+        // SAFETY: the arguments match `conv_rollback(const unsigned long long*, const bf16*,
+        // const int*)`. The caller vouches that each address in `states` is a live 16-byte
+        // aligned F32 [3, dims] buffer of the stream's dims, and that `result[0]` is in
+        // `0..VERIFY_ROWS`, which the acceptance kernel guarantees; the kernel calls
+        // `pdl_wait()` before reading any buffer and shifts each state in place.
+        unsafe { args.launch_pdl(stream, &self.conv_rollback, state_config(visits)?) }
     }
 
     /// Saves the slots that rows `0..rows` of a verify at `start` will overwrite in each
@@ -248,20 +231,18 @@ impl Spec {
     ) -> anyhow::Result<()> {
         let (config, slots, row_bytes) =
             ring_config(rings, slots, start, rows, backup.len(), row_bytes)?;
-        let mut launch = stream.launch_builder(&self.ring_backup);
-        launch
-            .arg(rings)
-            .arg(&slots)
-            .arg(start)
-            .arg(backup)
-            .arg(&row_bytes);
+        let mut args = KernelArgs::default();
+        args.ptr(rings, stream)
+            .u32(slots)
+            .ptr(start, stream)
+            .ptr_mut(backup, stream)
+            .u32(row_bytes);
         // SAFETY: the arguments match `ring_backup(const unsigned long long*, unsigned, const
         // unsigned*, uint8_t*, unsigned)`. The caller vouches that `rings` holds the addresses
         // of rings of `slots` rows of `row_bytes` bytes; block (j, v) reads one slot below
         // `slots` of visit `v` and writes row `j` of visit `v` in `backup`, which holds 8 rows
-        // per visit.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // per visit, after `pdl_wait()`.
+        unsafe { args.launch_pdl(stream, &self.ring_backup, config) }
     }
 
     /// Puts back the slots of the rows after `result[0]` from [`Self::ring_backup`]'s copy.
@@ -280,18 +261,17 @@ impl Spec {
         let (config, slots, row_bytes) =
             ring_config(rings, slots, start, rows, backup.len(), row_bytes)?;
         check_len("result", result.len(), RESULT_LEN)?;
-        let mut launch = stream.launch_builder(&self.ring_restore);
-        launch
-            .arg(rings)
-            .arg(&slots)
-            .arg(start)
-            .arg(backup)
-            .arg(result)
-            .arg(&row_bytes);
+        let mut args = KernelArgs::default();
+        args.ptr(rings, stream)
+            .u32(slots)
+            .ptr(start, stream)
+            .ptr(backup, stream)
+            .ptr(result, stream)
+            .u32(row_bytes);
         // SAFETY: the arguments match `ring_restore(const unsigned long long*, unsigned, const
-        // unsigned*, const uint8_t*, const int*, unsigned)`, with the same bounds as `ring_backup`.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // unsigned*, const uint8_t*, const int*, unsigned)`, with the same bounds as
+        // `ring_backup`, and the kernel calls `pdl_wait()` before reading `result` or `backup`.
+        unsafe { args.launch_pdl(stream, &self.ring_restore, config) }
     }
 
     /// Greedy acceptance of a verify of `rows` rows: `tokens` holds the anchor and the
@@ -321,19 +301,17 @@ impl Spec {
         check_len("result", result.len(), RESULT_LEN)?;
         check_len("anchor", anchor.len(), 1)?;
         let rows = i32::try_from(rows)?;
-        let mut launch = stream.launch_builder(&self.accept_greedy);
-        launch
-            .arg(&tokens)
-            .arg(&argmax)
-            .arg(keep)
-            .arg(&rows)
-            .arg(result)
-            .arg(anchor);
+        let mut args = KernelArgs::default();
+        args.ptr(&tokens, stream)
+            .ptr(&argmax, stream)
+            .ptr(keep, stream)
+            .i32(rows)
+            .ptr_mut(result, stream)
+            .ptr_mut(anchor, stream);
         // SAFETY: the arguments match `accept_greedy(const int*, const int*, const unsigned*,
-        // int, int*, int*)`; the one thread reads `rows` tokens and argmax values and writes
-        // at most `RESULT_LEN` results and one anchor.
-        unsafe { launch.launch(one_block(1)) }?;
-        Ok(())
+        // int, int*, int*)`; the one thread reads `rows` tokens and argmax values after
+        // `pdl_wait()` and writes at most `RESULT_LEN` results and one anchor.
+        unsafe { args.launch_pdl(stream, &self.accept_greedy, one_block(1)) }
     }
 
     /// Margin-tolerant acceptance of a verify of `rows` rows: like [`Self::accept_greedy`],
@@ -390,43 +368,9 @@ impl Spec {
         Ok(())
     }
 
-    /// Batched [`Self::conv_backup`]: saves every `(visit, seq)` conv state referenced by
-    /// `tables` (`[visits, max_seqs, BATCH_STATE_WORDS]`) into `backup`
-    /// (`[visits, max_seqs, 3 * VISIT_CHANNELS]`) for `seqs` active sequences.
-    pub fn conv_backup_batch(
-        &self,
-        stream: &CudaStream,
-        tables: &CudaSlice<u64>,
-        visits: usize,
-        max_seqs: usize,
-        seqs: usize,
-        backup: &mut CudaSlice<f32>,
-    ) -> anyhow::Result<()> {
-        ensure!(visits > 0 && seqs > 0 && seqs <= max_seqs, "invalid batch verify dims");
-        check_len("tables", tables.len(), visits * max_seqs * BATCH_STATE_WORDS)?;
-        check_len(
-            "backup",
-            backup.len(),
-            visits * max_seqs * STATE_ROWS * VISIT_CHANNELS,
-        )?;
-        let max_seqs_arg = i32::try_from(max_seqs)?;
-        let seqs_arg = i32::try_from(seqs)?;
-        let mut launch = stream.launch_builder(&self.conv_backup_batch);
-        launch
-            .arg(tables)
-            .arg(&max_seqs_arg)
-            .arg(&seqs_arg)
-            .arg(backup);
-        // SAFETY: the arguments match `conv_backup_batch(const unsigned long long*, int, int,
-        // float*)`; `tables` holds live conv state addresses for `seqs <= max_seqs` across
-        // `visits`, and `backup` is sized for `[visits, max_seqs, 3 * VISIT_CHANNELS]`.
-        unsafe { launch.launch(state_config(visits * seqs)?) }?;
-        Ok(())
-    }
-
-    /// Batched [`Self::conv_rollback`]: rebuilds every `(visit, seq)` conv state from
-    /// `backup` and `inputs` (`[visits, max_seqs, 8, VISIT_CHANNELS]`) using `results`
-    /// (`[seqs, RESULT_LEN]`).
+    /// Batched [`Self::conv_rollback`]: shifts every `(visit, seq)` conv state in place from
+    /// its pre-verify values and `inputs` (`[visits, max_seqs, 8, VISIT_CHANNELS]`) using
+    /// `results` (`[seqs, RESULT_LEN]`).
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
     pub fn conv_rollback_batch(
         &self,
@@ -435,17 +379,14 @@ impl Spec {
         visits: usize,
         max_seqs: usize,
         seqs: usize,
-        backup: &CudaSlice<f32>,
         inputs: &CudaSlice<bf16>,
         results: &CudaView<'_, i32>,
     ) -> anyhow::Result<()> {
-        ensure!(visits > 0 && seqs > 0 && seqs <= max_seqs, "invalid batch verify dims");
+        ensure!(
+            visits > 0 && seqs > 0 && seqs <= max_seqs,
+            "invalid batch verify dims"
+        );
         check_len("tables", tables.len(), visits * max_seqs * BATCH_STATE_WORDS)?;
-        check_len(
-            "backup",
-            backup.len(),
-            visits * max_seqs * STATE_ROWS * VISIT_CHANNELS,
-        )?;
         check_len(
             "inputs",
             inputs.len(),
@@ -454,19 +395,23 @@ impl Spec {
         check_len("results", results.len(), seqs * RESULT_LEN)?;
         let max_seqs_arg = i32::try_from(max_seqs)?;
         let seqs_arg = i32::try_from(seqs)?;
-        let mut launch = stream.launch_builder(&self.conv_rollback_batch);
-        launch
-            .arg(tables)
-            .arg(&max_seqs_arg)
-            .arg(&seqs_arg)
-            .arg(backup)
-            .arg(inputs)
-            .arg(results);
+        let mut args = KernelArgs::default();
+        args.ptr(tables, stream)
+            .i32(max_seqs_arg)
+            .i32(seqs_arg)
+            .ptr(inputs, stream)
+            .ptr(results, stream);
         // SAFETY: the arguments match `conv_rollback_batch(const unsigned long long*, int, int,
-        // const float*, const bf16*, const int*)`; bounds match `conv_backup_batch` and
-        // `results[seq * RESULT_LEN]` is in `0..VERIFY_ROWS`.
-        unsafe { launch.launch(state_config(visits * seqs)?) }?;
-        Ok(())
+        // const bf16*, const int*)`; `tables` holds distinct live 16-byte aligned conv state
+        // addresses for `seqs <= max_seqs` across `visits`, `results[seq * RESULT_LEN]` is in
+        // `0..VERIFY_ROWS`, and the kernel calls `pdl_wait()` before reading any buffer.
+        unsafe {
+            args.launch_pdl(
+                stream,
+                &self.conv_rollback_batch,
+                state_config(visits * seqs)?,
+            )
+        }
     }
 
     /// Batched [`Self::ring_backup`]: saves the `rows` (`1..=VERIFY_ROWS`) ring slots per
@@ -498,20 +443,19 @@ impl Spec {
             backup.len(),
             row_bytes,
         )?;
-        let mut launch = stream.launch_builder(&self.ring_backup_batch);
-        launch
-            .arg(tables)
-            .arg(sliding_visits)
-            .arg(&max_seqs_arg)
-            .arg(&slots_arg)
-            .arg(positions)
-            .arg(backup)
-            .arg(&row_bytes_arg);
+        let mut args = KernelArgs::default();
+        args.ptr(tables, stream)
+            .ptr(sliding_visits, stream)
+            .i32(max_seqs_arg)
+            .u32(slots_arg)
+            .ptr(positions, stream)
+            .ptr_mut(backup, stream)
+            .u32(row_bytes_arg);
         // SAFETY: the arguments match `ring_backup_batch(const unsigned long long*, const int*,
         // int, unsigned, const unsigned*, uint8_t*, unsigned)`. Every sliding visit index in
-        // `sliding_visits` is below `visits` and points to live `[slots, row_bytes]` ring pairs.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // `sliding_visits` is below `visits` and points to live `[slots, row_bytes]` ring pairs,
+        // and the kernel calls `pdl_wait()` before reading any buffer.
+        unsafe { args.launch_pdl(stream, &self.ring_backup_batch, config) }
     }
 
     /// Batched [`Self::ring_restore`]: puts back rejected ring slots (`j > results[seq, 0]`).
@@ -544,20 +488,19 @@ impl Spec {
             row_bytes,
         )?;
         check_len("results", results.len(), seqs * RESULT_LEN)?;
-        let mut launch = stream.launch_builder(&self.ring_restore_batch);
-        launch
-            .arg(tables)
-            .arg(sliding_visits)
-            .arg(&max_seqs_arg)
-            .arg(&slots_arg)
-            .arg(positions)
-            .arg(backup)
-            .arg(results)
-            .arg(&row_bytes_arg);
+        let mut args = KernelArgs::default();
+        args.ptr(tables, stream)
+            .ptr(sliding_visits, stream)
+            .i32(max_seqs_arg)
+            .u32(slots_arg)
+            .ptr(positions, stream)
+            .ptr(backup, stream)
+            .ptr(results, stream)
+            .u32(row_bytes_arg);
         // SAFETY: the arguments match `ring_restore_batch(const unsigned long long*, const
-        // int*, int, unsigned, const unsigned*, const uint8_t*, const int*, unsigned)`.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // int*, int, unsigned, const unsigned*, const uint8_t*, const int*, unsigned)`, and
+        // the kernel calls `pdl_wait()` before reading any buffer.
+        unsafe { args.launch_pdl(stream, &self.ring_restore_batch, config) }
     }
 
     /// Batched [`Self::accept_greedy`] for `seqs` sequences, each verifying `rows` tokens.
@@ -590,18 +533,17 @@ impl Spec {
             block_dim: (1, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = stream.launch_builder(&self.accept_greedy_batch);
-        launch
-            .arg(&tokens)
-            .arg(&argmax)
-            .arg(keep)
-            .arg(&rows_arg)
-            .arg(results)
-            .arg(anchors);
+        let mut args = KernelArgs::default();
+        args.ptr(&tokens, stream)
+            .ptr(&argmax, stream)
+            .ptr(keep, stream)
+            .i32(rows_arg)
+            .ptr_mut(results, stream)
+            .ptr_mut(anchors, stream);
         // SAFETY: the arguments match `accept_greedy_batch(const int*, const int*, const
-        // unsigned*, int, int*, int*)`; block `seq` accesses its own slice of each buffer.
-        unsafe { launch.launch(config) }?;
-        Ok(())
+        // unsigned*, int, int*, int*)`; block `seq` accesses its own slice of each buffer
+        // after `pdl_wait()`.
+        unsafe { args.launch_pdl(stream, &self.accept_greedy_batch, config) }
     }
 
     /// Batched [`Self::accept_margin`] for `seqs` sequences, each verifying `rows` tokens.
@@ -689,7 +631,7 @@ fn state_config(visits: usize) -> anyhow::Result<LaunchConfig> {
             u32::try_from(STREAMS)?,
             u32::try_from(visits).context("too many visits")?,
         ),
-        block_dim: (THREADS, 1, 1),
+        block_dim: (ROLLBACK_THREADS, 1, 1),
         shared_mem_bytes: 0,
     })
 }
@@ -724,7 +666,7 @@ fn ring_config(
     check_len("backup", backup_len, visits * VERIFY_ROWS * 2 * row_bytes)?;
     let config = LaunchConfig {
         grid_dim: (u32::try_from(rows)?, u32::try_from(visits)?, 1),
-        block_dim: (u32::try_from(KV_DIMS / 8)?, 1, 1),
+        block_dim: (u32::try_from(row_bytes / 16)?, 1, 1),
         shared_mem_bytes: 0,
     };
     Ok((
@@ -776,7 +718,7 @@ fn ring_batch_config(
             u32::try_from(num_sliding)?,
             u32::try_from(seqs)?,
         ),
-        block_dim: (u32::try_from(KV_DIMS / 8)?, 1, 1),
+        block_dim: (u32::try_from(row_bytes / 16)?, 1, 1),
         shared_mem_bytes: 0,
     };
     Ok((

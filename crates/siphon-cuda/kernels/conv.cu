@@ -331,20 +331,20 @@ constexpr int kVisitChannels = 2 * kKvDims + 2 * kHidden;
 
 }  // namespace
 
-// moe_conv_residual_rows_2304 for the 1 to 8 rows of a step, which also does the work of
-// the kernels after it in a visit of a step: it shifts the rows' inputs into all four conv
-// states of the visit, as shift_state_rows does, from `k_raw`, `v_raw` ([rows, 1024]),
-// `proj` and the combines, after every kernel that reads those states has run. With a
-// non-null `inputs`, it also records the rows' conv inputs into inputs [8, 6656] as
-// conv_rollback in spec.cu reads them. Every row rounds as moe_conv_residual_rows_2304
-// does.
+// moe_conv_residual_rows_2304 for the 1 to 8 rows of a step. With a null `inputs` (a
+// small prefill chunk), it also shifts the rows' inputs into all four conv states of the
+// visit, as shift_state_rows does, from `k_raw`, `v_raw` ([rows, 1024]), `proj` and the
+// combines, after every kernel that reads those states has run. With a non-null `inputs`
+// (verify mode), it records the rows' conv inputs into inputs [8, 6656] and leaves all
+// four conv states untouched so conv_rollback in spec.cu can shift them in place from
+// their pre-verify values without a conv_backup copy. Every row rounds as
+// moe_conv_residual_rows_2304 does.
 //
 // Thread (lane, warp r) of block b takes channel c = 32 b + lane of row r: it combines the
 // row's experts, convolves the row from the combines of rows r - 3 .. r, which the block
 // shares in shared memory (the old state for rows before the step), and writes the row's
-// outputs and recorded inputs. The block reads every old state row of its channels before
-// its barrier and writes the new ones after it, so it alone touches them. Grid: 2304 / 32
-// blocks of 32 rows threads.
+// outputs and recorded inputs (or shifted states). Grid: 2304 / 32 blocks of 32 * rows
+// threads.
 extern "C" __global__ void __launch_bounds__(kStepBlockCols * kMoeConvRows)
 moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weights,
                                  const __nv_bfloat16* __restrict__ weight, float* state,
@@ -362,6 +362,7 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
     const int r = threadIdx.x / 32;
     const int c = blockIdx.x * kStepBlockCols + lane;
     const bool kv = c < kKvDims;
+    const bool record_only = inputs != nullptr;
     float taps[kKernel];
     load_bf16x4(weight + size_t(c) * kKernel, taps);
     pdl_trigger();
@@ -374,14 +375,10 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
         e[x] = w[x] != 0.f ? __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]) : 0.f;
     }
     const float res = residual[size_t(r) * kHidden + c];
-    // Rows 0 .. 2 load the old states' rows of their number.
+    // Rows 0 .. 2 load the post-MLP conv state rows needed for row 0's output.
+    // The other three states only ever contribute rows k >= rows (below, when !record_only).
     if (r < kOld) {
         comb[r][lane] = state[size_t(r) * kHidden + c];
-        proj_old[r][lane] = proj_state[size_t(r) * kHidden + c];
-        if (kv) {
-            k_old[r][lane] = k_state[size_t(r) * kKvDims + c];
-            v_old[r][lane] = v_state[size_t(r) * kKvDims + c];
-        }
     }
     float total = 0.f;
 #pragma unroll
@@ -392,16 +389,20 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
     }
     const float mine = round_bf16(total);
     comb[r + kOld][lane] = mine;
-    // With fewer than 3 rows, rows 1 and 2 load the old state rows past the warps.
+    // With fewer than 3 rows, warp 0 loads the old state rows past the active warps.
+    // In verify mode (`record_only`), conv states are not shifted here so proj/k/v old
+    // state rows are never read.
     if (rows < kOld && r == 0) {
 #pragma unroll
         for (int k = 1; k < kOld; ++k) {
             if (k >= rows) {
                 comb[k][lane] = state[size_t(k) * kHidden + c];
-                proj_old[k][lane] = proj_state[size_t(k) * kHidden + c];
-                if (kv) {
-                    k_old[k][lane] = k_state[size_t(k) * kKvDims + c];
-                    v_old[k][lane] = v_state[size_t(k) * kKvDims + c];
+                if (!record_only) {
+                    proj_old[k][lane] = proj_state[size_t(k) * kHidden + c];
+                    if (kv) {
+                        k_old[k][lane] = k_state[size_t(k) * kKvDims + c];
+                        v_old[k][lane] = v_state[size_t(k) * kKvDims + c];
+                    }
                 }
             }
         }
@@ -416,7 +417,7 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
     }
     const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), mine), kShortDivisor));
     out[size_t(r) * kHidden + c] = __float2bfloat16(__fadd_rn(res, y));
-    if (inputs != nullptr) {
+    if (record_only) {
         __nv_bfloat16* row = inputs + size_t(r) * kVisitChannels;
         row[2 * kKvDims + kHidden + c] = __float2bfloat16(mine);
         row[2 * kKvDims + c] = proj[size_t(r) * kHidden + c];
@@ -424,6 +425,7 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
             row[c] = k_raw[size_t(r) * kKvDims + c];
             row[kKvDims + c] = v_raw[size_t(r) * kKvDims + c];
         }
+        return;
     }
     // New state row k is window row k + rows: an old row, or the input of row k + rows - 3.
     // Warp r writes rows k = r, r + rows, ... below 3.
@@ -565,9 +567,10 @@ moe_conv_residual_batch_2304(const __nv_bfloat16* experts, const float* weights,
 
 // Batched multi-row form of moe_conv_residual_step_rows_2304: sequence seq = blockIdx.y
 // runs `rows` (1..=8) consecutive verify rows starting at row0 = seq * rows, using its own
-// four conv states (words 2..5 of `states[seq]`), optionally recording its conv inputs into
-// `inputs[seq, 0..rows, 6656]`, and shifting all four states. Grid: (2304 / 32, seqs),
-// 32 * rows threads.
+// four conv states (words 2..5 of `states[seq]`). With a non-null `inputs`, it records its
+// conv inputs into `inputs[seq, 0..rows, 6656]` and leaves all four conv states untouched
+// for in-place `conv_rollback_batch`; with a null `inputs`, it shifts all four states.
+// Grid: (2304 / 32, seqs), 32 * rows threads.
 extern "C" __global__ void __launch_bounds__(kStepBlockCols * kMoeConvRows)
 moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* weights,
                                     const __nv_bfloat16* __restrict__ weight, const float* residual,
@@ -585,14 +588,12 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     const int r = threadIdx.x / 32;
     const int c = blockIdx.x * kStepBlockCols + lane;
     const bool kv = c < kKvDims;
+    const bool record_only = inputs != nullptr;
     float taps[kKernel];
     load_bf16x4(weight + size_t(c) * kKernel, taps);
     pdl_trigger();
     pdl_wait();
     float* const state = batch_state(states, seq, 5);
-    float* const proj_state = batch_state(states, seq, 4);
-    float* const k_state = batch_state(states, seq, 2);
-    float* const v_state = batch_state(states, seq, 3);
     const __nv_bfloat16* seq_experts = experts + row0 * kTopK * kHidden;
     const float* seq_weights = weights + row0 * kTopK;
     const float* seq_residual = residual + row0 * kHidden;
@@ -610,11 +611,6 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     const float res = seq_residual[size_t(r) * kHidden + c];
     if (r < kOld) {
         comb[r][lane] = state[size_t(r) * kHidden + c];
-        proj_old[r][lane] = proj_state[size_t(r) * kHidden + c];
-        if (kv) {
-            k_old[r][lane] = k_state[size_t(r) * kKvDims + c];
-            v_old[r][lane] = v_state[size_t(r) * kKvDims + c];
-        }
     }
     float total = 0.f;
 #pragma unroll
@@ -626,14 +622,19 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     const float mine = round_bf16(total);
     comb[r + kOld][lane] = mine;
     if (rows < kOld && r == 0) {
+        const float* const proj_state = !record_only ? batch_state(states, seq, 4) : nullptr;
+        const float* const k_state = (!record_only && kv) ? batch_state(states, seq, 2) : nullptr;
+        const float* const v_state = (!record_only && kv) ? batch_state(states, seq, 3) : nullptr;
 #pragma unroll
         for (int k = 1; k < kOld; ++k) {
             if (k >= rows) {
                 comb[k][lane] = state[size_t(k) * kHidden + c];
-                proj_old[k][lane] = proj_state[size_t(k) * kHidden + c];
-                if (kv) {
-                    k_old[k][lane] = k_state[size_t(k) * kKvDims + c];
-                    v_old[k][lane] = v_state[size_t(k) * kKvDims + c];
+                if (!record_only) {
+                    proj_old[k][lane] = proj_state[size_t(k) * kHidden + c];
+                    if (kv) {
+                        k_old[k][lane] = k_state[size_t(k) * kKvDims + c];
+                        v_old[k][lane] = v_state[size_t(k) * kKvDims + c];
+                    }
                 }
             }
         }
@@ -647,7 +648,7 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     }
     const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), mine), kShortDivisor));
     seq_out[size_t(r) * kHidden + c] = __float2bfloat16(__fadd_rn(res, y));
-    if (inputs != nullptr) {
+    if (record_only) {
         __nv_bfloat16* row = inputs + (size_t(seq) * kMoeConvRows + r) * kVisitChannels;
         row[2 * kKvDims + kHidden + c] = __float2bfloat16(mine);
         row[2 * kKvDims + c] = seq_proj[size_t(r) * kHidden + c];
@@ -655,7 +656,11 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
             row[c] = seq_k[size_t(r) * kKvDims + c];
             row[kKvDims + c] = seq_v[size_t(r) * kKvDims + c];
         }
+        return;
     }
+    float* const proj_state = batch_state(states, seq, 4);
+    float* const k_state = kv ? batch_state(states, seq, 2) : nullptr;
+    float* const v_state = kv ? batch_state(states, seq, 3) : nullptr;
     for (int k = r; k < kOld; k += rows) {
         const int i = k + rows;
         const bool fresh = i >= kOld;

@@ -70,8 +70,6 @@ pub(super) struct BatchVerifyState {
     pub(super) ring_slots: usize,
     /// Bytes per slot of each sliding ring's key or value buffer.
     pub(super) ring_row_bytes: usize,
-    /// Conv states before the pass, F32 `[visits, max_seqs, 3 * VISIT_CHANNELS]`.
-    pub(super) conv_backup: CudaSlice<f32>,
     /// Recorded conv inputs, BF16 `[visits, max_seqs, VERIFY_ROWS, VISIT_CHANNELS]`.
     pub(super) inputs: CudaSlice<bf16>,
     /// Sliding ring slots overwritten by the pass, `[sliding, max_seqs, VERIFY_ROWS, 2, row_bytes]`.
@@ -131,10 +129,6 @@ impl BatchVerifyState {
             sliding_visits: stream.clone_htod(&sliding_visits)?,
             ring_slots: ring_slots.unwrap_or(0),
             ring_row_bytes,
-            conv_backup: zeros(
-                stream,
-                visits.len() * max_seqs * STATE_ROWS * VISIT_CHANNELS,
-            )?,
             inputs: zeros(
                 stream,
                 visits.len() * max_seqs * VERIFY_ROWS * VISIT_CHANNELS,

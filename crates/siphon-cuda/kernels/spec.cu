@@ -2,24 +2,31 @@
 // rollback of the state that rejected rows changed.
 //
 // A verify runs m <= 8 rows (the anchor and m - 1 drafts) at positions start..start+m-1
-// through chunked prefill. Each row appends to every KV cache and shifts every conv
-// state, as a step would. After the acceptance keeps rows 0..a, two kinds of state hold
-// rejected rows:
+// through chunked prefill. Each row appends to every KV cache, while conv states stay at
+// their pre-verify values during the pass. After the acceptance keeps rows 0..a, two kinds
+// of state need updating:
 // - the sliding rings, where row j overwrote slot (start + j) mod slots, which held the
 //   key of position start + j - slots. ring_backup saves those slots before the pass
 //   and ring_restore puts back the rejected rows' slots after it. Global caches need
 //   nothing: attention reads only slots below each row's position, and later rows
 //   overwrite the stale ones.
 // - the conv states, F32 [3, dims] per visit and stream (keys, values, post-attention,
-//   post-MLP). conv_backup saves them before the pass, each visit's last kernel
-//   (moe_conv_residual_step_rows_2304 in conv.cu) records its m input rows during it, and
-//   conv_rollback rebuilds each state as the last 3
-//   rows of [old state; inputs of rows 0..a].
+//   post-MLP). During verify, each visit's conv kernels only read the pre-verify states
+//   and its last kernel (moe_conv_residual_step_rows_2304 /
+//   moe_conv_residual_batch_verify_2304 in conv.cu) records its m input rows into `inputs`
+//   without modifying any conv state. After acceptance, conv_rollback shifts each state in
+//   place to the last 3 rows of [old state; inputs of rows 0..a] without a backup buffer:
+//   since keep = a + 1 >= 1, keep + r > r for all r in {0, 1, 2}, and for a >= 2 no old
+//   state row is even read.
 //
-// None of these kernels is launched with programmatic dependent launch.
+// Every kernel below uses programmatic dependent launch (pdl.cuh), issuing pdl_trigger()
+// and pdl_wait() before any global load and avoiding __restrict__ on pointers written by
+// earlier kernels.
 
 #include <cuda_bf16.h>
 #include <cstdint>
+
+#include "pdl.cuh"
 
 namespace {
 
@@ -31,6 +38,14 @@ constexpr int kStreams = 4;
 // One row of conv inputs of a visit: keys, values, post-attention and post-MLP inputs.
 constexpr int kVisitChannels = 2 * kKvDims + 2 * kHidden;
 
+// Vectorized in-place conv rollback: 8 channels per thread (one 16-byte uint4 BF16 load
+// from `inputs`, two 16-byte float4 loads/stores on F32 `state`).
+constexpr int kRollbackVec = 8;
+constexpr int kRollbackThreads = 96;
+static_assert(kKvDims % kRollbackVec == 0, "kKvDims is 16-byte aligned for uint4/float4");
+static_assert(kHidden % (kRollbackThreads * kRollbackVec) == 0, "blocks cover kHidden");
+static_assert(kVisitChannels % kRollbackVec == 0, "kVisitChannels is 16-byte aligned");
+
 __device__ __forceinline__ int stream_dims(int s) {
     return s < 2 ? kKvDims : kHidden;
 }
@@ -40,72 +55,93 @@ __device__ __forceinline__ int stream_offset(int s) {
     return s < 2 ? s * kKvDims : 2 * kKvDims + (s - 2) * kHidden;
 }
 
+__device__ __forceinline__ void bf16x8_to_f32x8(const __nv_bfloat16* p, float4& lo, float4& hi) {
+    const uint4 packed = *reinterpret_cast<const uint4*>(p);
+    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+    lo = make_float4(__bfloat162float(vals[0]), __bfloat162float(vals[1]),
+                     __bfloat162float(vals[2]), __bfloat162float(vals[3]));
+    hi = make_float4(__bfloat162float(vals[4]), __bfloat162float(vals[5]),
+                     __bfloat162float(vals[6]), __bfloat162float(vals[7]));
+}
+
+__device__ __forceinline__ void rollback_channels_inplace(float* state, const __nv_bfloat16* rows,
+                                                          int dims, int keep, int c) {
+    float4 lo[kStateRows];
+    float4 hi[kStateRows];
+#pragma unroll
+    for (int r = 0; r < kStateRows; ++r) {
+        const int i = keep + r;
+        if (i < kStateRows) {
+            const float* src = state + size_t(i) * dims + c;
+            lo[r] = *reinterpret_cast<const float4*>(src);
+            hi[r] = *reinterpret_cast<const float4*>(src + 4);
+        } else {
+            bf16x8_to_f32x8(rows + size_t(i - kStateRows) * kVisitChannels + c, lo[r], hi[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kStateRows; ++r) {
+        float* dst = state + size_t(r) * dims + c;
+        *reinterpret_cast<float4*>(dst) = lo[r];
+        *reinterpret_cast<float4*>(dst + 4) = hi[r];
+    }
+}
+
 }  // namespace
 
 // Copies rows of src [rows, 2304] into tap `tap` of taps [rows, count, 2304]. One block of
 // 288 threads per row, 8 values per thread.
 extern "C" __global__ void __launch_bounds__(288)
 copy_tap(const __nv_bfloat16* src, __nv_bfloat16* taps, int tap, int count) {
+    pdl_trigger();
+    pdl_wait();
     const size_t r = blockIdx.x;
     const int c = threadIdx.x * 8;
     *reinterpret_cast<uint4*>(taps + (r * count + tap) * kHidden + c) =
         *reinterpret_cast<const uint4*>(src + r * kHidden + c);
 }
 
-// Copies every conv state into backup [visits, 3 * kVisitChannels]: stream s of a visit at
-// 3 * stream_offset(s). states holds the visits' F32 [3, dims] buffers, 4 per visit.
-// Grid: (blocks, 4, visits).
-extern "C" __global__ void conv_backup(const unsigned long long* states, float* backup) {
+// Shifts every conv state in place to rows keep..keep+2 of [state (3 rows); inputs (m rows)],
+// where keep = result[0] + 1 rows of the verify were accepted. inputs is [visits, 8,
+// kVisitChannels]. Grid: (3, 4, visits), 96 threads.
+extern "C" __global__ void __launch_bounds__(kRollbackThreads)
+conv_rollback(const unsigned long long* states, const __nv_bfloat16* inputs, const int* result) {
+    pdl_trigger();
+    pdl_wait();
     const int s = blockIdx.y;
-    const int v = blockIdx.z;
-    const int n = kStateRows * stream_dims(s);
-    const float* src = reinterpret_cast<const float*>(states[v * kStreams + s]);
-    float* dst = backup + size_t(v) * kStateRows * kVisitChannels + kStateRows * stream_offset(s);
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-// Sets every conv state to rows keep..keep+2 of [backup (3 rows); inputs (m rows)], where
-// keep = result[0] + 1 rows of the verify were accepted. inputs is [visits, 8,
-// kVisitChannels]. Grid: (blocks, 4, visits).
-extern "C" __global__ void conv_rollback(const unsigned long long* states, const float* backup,
-                                         const __nv_bfloat16* inputs, const int* result) {
-    const int s = blockIdx.y;
-    const int v = blockIdx.z;
     const int dims = stream_dims(s);
+    const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * kRollbackVec;
+    if (c0 >= dims) {
+        return;
+    }
+    const int v = blockIdx.z;
     const int offset = stream_offset(s);
     const int keep = result[0] + 1;
     float* state = reinterpret_cast<float*>(states[v * kStreams + s]);
-    const float* old = backup + size_t(v) * kStateRows * kVisitChannels + kStateRows * offset;
     const __nv_bfloat16* rows = inputs + size_t(v) * kVerifyRows * kVisitChannels + offset;
-    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < dims; c += gridDim.x * blockDim.x) {
-#pragma unroll
-        for (int r = 0; r < kStateRows; ++r) {
-            const int i = keep + r;
-            state[r * dims + c] = i < kStateRows ? old[i * dims + c]
-                                                 : __bfloat162float(rows[(i - kStateRows) * kVisitChannels + c]);
-        }
+    const int stride = gridDim.x * blockDim.x * kRollbackVec;
+    for (int c = c0; c < dims; c += stride) {
+        rollback_channels_inplace(state, rows, dims, keep, c);
     }
 }
 
-// Saves the ring slots that rows 0..gridDim.x-1 of a verify at *start will overwrite:
-// slot (start + j) mod slots of each sliding visit's BF16 keys and values. rings holds a
-// keys and a values pointer per visit; backup is [visits, 8, 2, 1024]. Grid: (rows,
-// visits), 128 threads.
-// Saves the slots that rows 0..gridDim.x of a verify at *start will overwrite in each
+// Saves the slots that rows 0..gridDim.x-1 of a verify at *start will overwrite in each
 // sliding ring: slot (*start + j) % slots of each ring's keys and values (`row_bytes`
-// bytes per slot: 2048 for BF16, 1024 for FP8, 576 for NVFP4).
+// bytes per slot: 2048 for BF16, 1024 for FP8, 576 for NVFP4). rings holds a keys and a
+// values pointer per visit; backup is [visits, 8, 2, row_bytes]. Grid: (rows, visits),
+// row_bytes / 16 threads.
 extern "C" __global__ void __launch_bounds__(128)
 ring_backup(const unsigned long long* rings, unsigned slots, const unsigned* start, uint8_t* backup,
             unsigned row_bytes) {
+    pdl_trigger();
+    pdl_wait();
     const int j = blockIdx.x;
     const int v = blockIdx.y;
-    const size_t slot = (*start + j) % slots;
     const unsigned byte_off = threadIdx.x * 16u;
     if (byte_off >= row_bytes) {
         return;
     }
+    const size_t slot = (*start + j) % slots;
     const auto* keys = reinterpret_cast<const uint8_t*>(rings[2 * v]);
     const auto* values = reinterpret_cast<const uint8_t*>(rings[2 * v + 1]);
     uint8_t* dst = backup + (size_t(v) * kVerifyRows + j) * 2 * size_t(row_bytes);
@@ -119,16 +155,18 @@ ring_backup(const unsigned long long* rings, unsigned slots, const unsigned* sta
 extern "C" __global__ void __launch_bounds__(128)
 ring_restore(const unsigned long long* rings, unsigned slots, const unsigned* start, const uint8_t* backup,
              const int* result, unsigned row_bytes) {
+    pdl_trigger();
+    pdl_wait();
     const int j = blockIdx.x;
     if (j <= result[0]) {
         return;
     }
-    const int v = blockIdx.y;
-    const size_t slot = (*start + j) % slots;
     const unsigned byte_off = threadIdx.x * 16u;
     if (byte_off >= row_bytes) {
         return;
     }
+    const int v = blockIdx.y;
+    const size_t slot = (*start + j) % slots;
     auto* keys = reinterpret_cast<uint8_t*>(rings[2 * v]);
     auto* values = reinterpret_cast<uint8_t*>(rings[2 * v + 1]);
     const uint8_t* src = backup + (size_t(v) * kVerifyRows + j) * 2 * size_t(row_bytes);
@@ -145,6 +183,8 @@ ring_restore(const unsigned long long* rings, unsigned slots, const unsigned* st
 // anchor, argmax[accepted], to anchor. One thread.
 extern "C" __global__ void accept_greedy(const int* tokens, const int* argmax, const unsigned* keep, int m,
                                          int* result, int* anchor) {
+    pdl_trigger();
+    pdl_wait();
     int accepted = 0;
     if (*keep != 0) {
         accepted = min(int(*keep), m) - 1;
@@ -210,63 +250,51 @@ constexpr int kBatchStateWords = 6;
 constexpr int kResultLen = 1 + 2 * kVerifyRows;
 }  // namespace
 
-// Copies every (visit, seq) conv state into backup [visits, max_seqs, 3 * kVisitChannels].
-// Grid: (blocks, 4, visits * seqs).
-extern "C" __global__ void conv_backup_batch(const unsigned long long* tables, int max_seqs, int seqs,
-                                             float* backup) {
+// Shifts every (visit, seq) conv state in place from its pre-verify values and inputs
+// [visits, max_seqs, 8, kVisitChannels] using results [seqs, kResultLen].
+// Grid: (3, 4, visits * seqs), 96 threads.
+extern "C" __global__ void __launch_bounds__(kRollbackThreads)
+conv_rollback_batch(const unsigned long long* tables, int max_seqs, int seqs,
+                    const __nv_bfloat16* inputs, const int* results) {
+    pdl_trigger();
+    pdl_wait();
     const int s = blockIdx.y;
-    const int v = blockIdx.z / seqs;
-    const int seq = blockIdx.z % seqs;
-    const int n = kStateRows * stream_dims(s);
-    const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
-    const float* src = reinterpret_cast<const float*>(tables[entry * kBatchStateWords + 2 + s]);
-    float* dst = backup + entry * kStateRows * kVisitChannels + kStateRows * stream_offset(s);
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-// Rebuilds every (visit, seq) conv state from backup and inputs [visits, max_seqs, 8,
-// kVisitChannels] using results [seqs, kResultLen]. Grid: (blocks, 4, visits * seqs).
-extern "C" __global__ void conv_rollback_batch(const unsigned long long* tables, int max_seqs, int seqs,
-                                               const float* backup, const __nv_bfloat16* inputs,
-                                               const int* results) {
-    const int s = blockIdx.y;
-    const int v = blockIdx.z / seqs;
-    const int seq = blockIdx.z % seqs;
     const int dims = stream_dims(s);
+    const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * kRollbackVec;
+    if (c0 >= dims) {
+        return;
+    }
+    const int v = blockIdx.z / seqs;
+    const int seq = blockIdx.z % seqs;
     const int offset = stream_offset(s);
     const int keep = results[size_t(seq) * kResultLen] + 1;
     const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
     float* state = reinterpret_cast<float*>(tables[entry * kBatchStateWords + 2 + s]);
-    const float* old = backup + entry * kStateRows * kVisitChannels + kStateRows * offset;
     const __nv_bfloat16* rows = inputs + entry * kVerifyRows * kVisitChannels + offset;
-    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < dims; c += gridDim.x * blockDim.x) {
-#pragma unroll
-        for (int r = 0; r < kStateRows; ++r) {
-            const int i = keep + r;
-            state[r * dims + c] = i < kStateRows ? old[i * dims + c]
-                                                 : __bfloat162float(rows[(i - kStateRows) * kVisitChannels + c]);
-        }
+    const int stride = gridDim.x * blockDim.x * kRollbackVec;
+    for (int c = c0; c < dims; c += stride) {
+        rollback_channels_inplace(state, rows, dims, keep, c);
     }
 }
 
 // Saves the sliding ring slots that rows 0..gridDim.x-1 of each sequence overwrite:
 // sliding_visits [num_sliding] maps sliding index sv -> visit index v in `tables`.
 // backup is [num_sliding, max_seqs, 8, 2, row_bytes] bytes. Grid: (rows, num_sliding, seqs),
-// 128 threads.
+// row_bytes / 16 threads.
 extern "C" __global__ void __launch_bounds__(128)
 ring_backup_batch(const unsigned long long* tables, const int* sliding_visits, int max_seqs, unsigned slots,
                   const unsigned* positions, uint8_t* backup, unsigned row_bytes) {
+    pdl_trigger();
+    pdl_wait();
     const int j = blockIdx.x;
     const int sv = blockIdx.y;
     const int seq = blockIdx.z;
-    const int v = sliding_visits[sv];
-    const size_t slot = (positions[seq] + j) % slots;
     const unsigned byte_off = threadIdx.x * 16u;
     if (byte_off >= row_bytes) {
         return;
     }
+    const int v = sliding_visits[sv];
+    const size_t slot = (positions[seq] + j) % slots;
     const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
     const auto* keys = reinterpret_cast<const uint8_t*>(tables[entry * kBatchStateWords]);
     const auto* values = reinterpret_cast<const uint8_t*>(tables[entry * kBatchStateWords + 1]);
@@ -279,22 +307,24 @@ ring_backup_batch(const unsigned long long* tables, const int* sliding_visits, i
 }
 
 // Restores rejected sliding ring slots j > results[seq * kResultLen] for every sequence.
-// Grid: (rows, num_sliding, seqs), 128 threads.
+// Grid: (rows, num_sliding, seqs), row_bytes / 16 threads.
 extern "C" __global__ void __launch_bounds__(128)
 ring_restore_batch(const unsigned long long* tables, const int* sliding_visits, int max_seqs, unsigned slots,
                    const unsigned* positions, const uint8_t* backup, const int* results, unsigned row_bytes) {
+    pdl_trigger();
+    pdl_wait();
     const int j = blockIdx.x;
     const int seq = blockIdx.z;
     if (j <= results[size_t(seq) * kResultLen]) {
         return;
     }
-    const int sv = blockIdx.y;
-    const int v = sliding_visits[sv];
-    const size_t slot = (positions[seq] + j) % slots;
     const unsigned byte_off = threadIdx.x * 16u;
     if (byte_off >= row_bytes) {
         return;
     }
+    const int sv = blockIdx.y;
+    const int v = sliding_visits[sv];
+    const size_t slot = (positions[seq] + j) % slots;
     const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
     auto* keys = reinterpret_cast<uint8_t*>(tables[entry * kBatchStateWords]);
     auto* values = reinterpret_cast<uint8_t*>(tables[entry * kBatchStateWords + 1]);
@@ -311,6 +341,8 @@ ring_restore_batch(const unsigned long long* tables, const int* sliding_visits, 
 // anchors is [seqs]. Grid: (seqs, 1, 1), 1 thread.
 extern "C" __global__ void accept_greedy_batch(const int* tokens, const int* argmax, const unsigned* keep,
                                                int m, int* results, int* anchors) {
+    pdl_trigger();
+    pdl_wait();
     const int seq = blockIdx.x;
     const int* seq_tokens = tokens + size_t(seq) * size_t(m);
     const int* seq_argmax = argmax + size_t(seq) * size_t(m);
