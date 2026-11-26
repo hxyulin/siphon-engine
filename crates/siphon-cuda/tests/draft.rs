@@ -23,7 +23,9 @@ use half::bf16;
 use siphon_cuda::{
     Gpu,
     draft::rope_inv_freq,
-    ops::draft::{ArgmaxPartials, AttentionScratch, DraftKernels, KvCache, LOGIT_BLOCKS},
+    ops::draft::{
+        ArgmaxPartials, AttentionScratch, BLOCK, CONTROL, DraftKernels, KvCache, LOGIT_BLOCKS,
+    },
 };
 
 const EPS: f32 = 1e-6;
@@ -483,4 +485,131 @@ fn fold_matches_reference() -> anyhow::Result<()> {
     )?;
     t.check("fold weight", &weight, "fold.weight", 0)?;
     t.check("fold bias", &bias, "fold.bias", 0)
+}
+
+#[test]
+fn silu_mul_rows_vectorized_and_tail_exact() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let kernels = DraftKernels::load(gpu.context())?;
+    let stream = gpu.stream();
+
+    // Exact reference in F32 rounded to BF16.
+    let ref_silu_mul = |g: bf16, u: bf16| -> bf16 {
+        let gf = g.to_f32();
+        let uf = u.to_f32();
+        let silu = gf / (1.0f32 + (-gf).exp());
+        bf16::from_f32(silu * uf)
+    };
+
+    // 1. Large 16-byte-aligned multiple-of-8 length (matches B=32 DFlash 2 MLP: 256 * 6912).
+    let n_vec = 256 * 6912;
+    let gate_h: Vec<bf16> = (0..n_vec)
+        .map(|i| bf16::from_f32(((i % 199) as f32 - 99.0) * 0.05))
+        .collect();
+    let up_h: Vec<bf16> = (0..n_vec)
+        .map(|i| bf16::from_f32(((i % 151) as f32 - 75.0) * 0.03))
+        .collect();
+    let gate = stream.clone_htod(&gate_h)?;
+    let up = stream.clone_htod(&up_h)?;
+    let mut out = stream.alloc_zeros::<bf16>(n_vec)?;
+    kernels.silu_mul_rows(stream, &gate, &up, &mut out)?;
+    let got = stream.clone_dtoh(&out)?;
+    let want: Vec<bf16> = gate_h
+        .iter()
+        .zip(&up_h)
+        .map(|(&g, &u)| ref_silu_mul(g, u))
+        .collect();
+    assert_bf16_close("silu_mul_rows aligned", &got, &want, 1);
+
+    // 2. Unaligned offset + non-multiple-of-8 length (exercises scalar fallback).
+    let mut out_tail = stream.alloc_zeros::<bf16>(32)?;
+    kernels.silu_mul_rows(
+        stream,
+        &gate.slice(1..14),
+        &up.slice(1..14),
+        &mut out_tail.slice_mut(1..14),
+    )?;
+    let got_tail = stream.clone_dtoh(&out_tail)?;
+    assert_bf16_close("silu_mul_rows tail", &got_tail[1..14], &want[1..14], 1);
+    Ok(())
+}
+
+#[test]
+fn batch_helper_kernels_exact() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let kernels = DraftKernels::load(gpu.context())?;
+    let stream = gpu.stream();
+
+    // 1. set_control_kept_batch: verifies clamping of negative, normal, and overflow kept counts.
+    let seqs = 3usize;
+    let stride = 4usize;
+    let starts = stream.clone_htod(&[10i32, 200, 1024])?;
+    let results = stream.clone_htod(&[-1i32, 99, 99, 99, 3, 99, 99, 99, 12, 99, 99, 99])?;
+    let anchors = stream.clone_htod(&[42i32, 7, 100])?;
+    let mut controls = stream.alloc_zeros::<i32>(seqs * CONTROL)?;
+    kernels.set_control_kept_batch(
+        stream,
+        &mut controls,
+        &starts,
+        &results,
+        stride,
+        8,
+        &anchors,
+        seqs,
+    )?;
+    let got_ctrl = stream.clone_dtoh(&controls)?;
+    assert_eq!(got_ctrl, vec![10, 1, 42, 200, 4, 7, 1024, 8, 100]);
+
+    // 2. block_input_batch: verifies vectorized uint4 copy of mask_embed into rows 1..7.
+    let vocab = 128usize;
+    let embed = stream.alloc_zeros::<bf16>(vocab * HIDDEN)?;
+    let embed_norm = stream.clone_htod(&vec![bf16::from_f32(1.0); HIDDEN])?;
+    let mask_h: Vec<bf16> = (0..HIDDEN)
+        .map(|c| bf16::from_f32(((c % 97) as f32 - 48.0) * 0.125))
+        .collect();
+    let mask_embed = stream.clone_htod(&mask_h)?;
+    let mut block_out = stream.alloc_zeros::<bf16>(seqs * BLOCK * HIDDEN)?;
+    kernels.block_input_batch(
+        stream,
+        &controls,
+        &embed,
+        &embed_norm,
+        &mask_embed,
+        &mut block_out,
+        seqs,
+        EPS,
+    )?;
+    let got_block = stream.clone_dtoh(&block_out)?;
+    for s in 0..seqs {
+        for r in 1..BLOCK {
+            let off = (s * BLOCK + r) * HIDDEN;
+            assert_eq!(
+                &got_block[off..off + HIDDEN],
+                mask_h.as_slice(),
+                "seq {s} row {r} mask_embed mismatch"
+            );
+        }
+    }
+
+    // 3. gather_mask_rows: verifies vectorized uint4 copy of rows 1..=steps for each sequence.
+    let steps = 5usize;
+    let y_h: Vec<bf16> = (0..seqs * BLOCK * HIDDEN)
+        .map(|i| bf16::from_f32(((i / HIDDEN) as f32) + ((i % 17) as f32) * 0.0625))
+        .collect();
+    let y = stream.clone_htod(&y_h)?;
+    let mut y_steps = stream.alloc_zeros::<bf16>(seqs * steps * HIDDEN)?;
+    kernels.gather_mask_rows(stream, &y, &mut y_steps, seqs, steps)?;
+    let got_steps = stream.clone_dtoh(&y_steps)?;
+    for s in 0..seqs {
+        for e in 0..steps {
+            let src_off = (s * BLOCK + e + 1) * HIDDEN;
+            let dst_off = (s * steps + e) * HIDDEN;
+            assert_eq!(
+                &got_steps[dst_off..dst_off + HIDDEN],
+                &y_h[src_off..src_off + HIDDEN],
+                "seq {s} step {e} gather mismatch"
+            );
+        }
+    }
+    Ok(())
 }

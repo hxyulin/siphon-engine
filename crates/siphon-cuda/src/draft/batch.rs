@@ -6,12 +6,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
+    CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
 
-use super::{Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, RoundGraph, STEPS};
+use super::{Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, STEPS};
 use crate::{
     DeviceIn,
     model::Sampling,
@@ -33,6 +33,46 @@ use crate::{
 /// Maximum sequences one batched DFlash 2 round drafts.
 pub const MAX_BATCH_DRAFT_SEQS: usize = MAX_BATCH_SEQS;
 
+/// Captured batched DFlash 2 round and the external device addresses baked into it.
+/// Per-round varying metadata (`controls`, `starts`, `races`, `cache_table`) lives inside
+/// [`BatchDflash2`] at stable addresses; external inputs (`shared` weights and, for
+/// `commit_width > 0`, `Model::batch_verify_*` buffers) are checked on every launch so any
+/// reallocation or alternate caller buffer transparently recaptures.
+struct BatchRoundGraph {
+    graph: CudaGraph,
+    lm_head: u64,
+    embed: u64,
+    embed_norm: u64,
+    taps: u64,
+    results: u64,
+    anchors: u64,
+}
+
+// SAFETY: a graph exec may be launched from any thread with its context bound, which
+// `CudaGraph::launch` does, and the draft launches it only through `&mut Draft`.
+unsafe impl Send for BatchRoundGraph {}
+
+/// External device buffers from `Model::start_verify_batch` consumed inside a captured
+/// `batch_commit_and_draft` graph.
+struct BatchCommitInputs<'a> {
+    taps: CudaView<'a, bf16>,
+    results: CudaView<'a, i32>,
+    anchors: CudaView<'a, i32>,
+    width: usize,
+}
+
+/// Ensures no slot appears twice in one batched DFlash 2 call (two active sequences cannot
+/// share one KV ring).
+fn check_distinct_slots(slots: &[usize]) -> anyhow::Result<()> {
+    for (i, &slot) in slots.iter().enumerate() {
+        ensure!(
+            !slots[..i].contains(&slot),
+            "duplicate slot {slot} in batched DFlash 2 call"
+        );
+    }
+    Ok(())
+}
+
 /// Per-slot sliding rings and batched intermediates for DFlash 2.
 pub(super) struct BatchDflash2 {
     /// Sliding rings for slots `1..` (slot 0 reuses `Draft::caches`).
@@ -51,12 +91,12 @@ pub(super) struct BatchDflash2 {
     starts: CudaSlice<i32>,
     /// Per-sequence sampling race descriptors, `[max_seqs * 4]`.
     races: CudaSlice<u32>,
+    /// Host mirror of `races` so unchanged sampling descriptors skip H2D uploads.
+    last_races: Vec<u32>,
     /// Active slot list whose ring pointers `cache_table` holds.
     members: Vec<usize>,
     /// `[max_seqs, layers, 2]` device addresses `(cache_k, cache_v)`.
     cache_table: CudaSlice<u64>,
-    /// Device copy of taps to commit, BF16 `[max_seqs * BLOCK, taps, HIDDEN]`.
-    taps: CudaSlice<bf16>,
     /// Commit intermediates.
     ctx_raw: CudaSlice<bf16>,
     ctx_normed: CudaSlice<bf16>,
@@ -91,15 +131,13 @@ pub(super) struct BatchDflash2 {
     /// Ready-to-verify tokens `[max_seqs * BLOCK]` (`[anchor, d0..d_{steps-1}]` per seq).
     verify_tokens: CudaSlice<i32>,
     /// Captured graphs keyed by `(seqs, commit_width, draft_steps)`.
-    graphs: HashMap<(usize, usize, usize), RoundGraph>,
+    graphs: HashMap<(usize, usize, usize), BatchRoundGraph>,
 }
 
 impl BatchDflash2 {
-    #[expect(clippy::too_many_arguments, reason = "batch buffer dimensions")]
     fn new(
         stream: &Arc<CudaStream>,
         layers: usize,
-        tap_count: usize,
         q_width: usize,
         mlp_width: usize,
         base_ld: usize,
@@ -120,9 +158,9 @@ impl BatchDflash2 {
             controls: zi(max_seqs * CONTROL)?,
             starts: zi(max_seqs)?,
             races: stream.alloc_zeros(max_seqs * RACE_WORDS)?,
+            last_races: vec![0; max_seqs * RACE_WORDS],
             members: Vec::new(),
             cache_table: stream.alloc_zeros(max_seqs * layers * 2)?,
-            taps: z(max_rows * tap_count * HIDDEN)?,
             ctx_raw: z(max_rows * HIDDEN)?,
             ctx_normed: z(max_rows * HIDDEN)?,
             ctx_k: z(layers * max_rows * KV_WIDTH)?,
@@ -254,7 +292,6 @@ impl Draft {
             let mut b = BatchDflash2::new(
                 stream,
                 layers,
-                self.arch.tap_count(),
                 self.arch.q_width(),
                 self.arch.mlp_width(),
                 base_ld,
@@ -478,26 +515,32 @@ impl Draft {
         );
         ensure!(anchors.len() == seqs && samplings.len() == seqs, "mismatched batch lengths");
         ensure!((1..=STEPS).contains(&steps), "{steps} drafts, expected 1 to {STEPS}");
+        check_distinct_slots(slots)?;
         let max_slot = slots.iter().copied().max().unwrap_or(0);
         self.ensure_batch_dflash2(stream, seqs, max_slot)?;
         self.sync_shortlist(stream)?;
         self.upload_batch_meta(stream, slots, samplings)?;
-        let mut controls = Vec::with_capacity(seqs * CONTROL);
-        for (&slot, &anchor) in slots.iter().zip(anchors) {
+        let mut controls = [0i32; MAX_BATCH_SEQS * CONTROL];
+        for (i, (&slot, &anchor)) in slots.iter().zip(anchors).enumerate() {
             let pos = self.slot_committed(slot);
             ensure!(pos > 0, "slot {slot} has no committed DFlash 2 context");
-            controls.push(i32::try_from(pos)?);
-            controls.push(0);
-            controls.push(i32::try_from(anchor)?);
+            let base = i * CONTROL;
+            controls[base] = i32::try_from(pos)?;
+            controls[base + 1] = 0;
+            controls[base + 2] = i32::try_from(anchor)?;
         }
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
-        stream.memcpy_htod(&controls, &mut b.controls.slice_mut(..seqs * CONTROL))?;
-        self.launch_batch_graph(stream, shared, seqs, 0, steps)
+        stream.memcpy_htod(
+            &controls[..seqs * CONTROL],
+            &mut b.controls.slice_mut(..seqs * CONTROL),
+        )?;
+        self.launch_batch_graph(stream, shared, seqs, None, steps)
     }
 
     /// Commits each sequence's kept verify taps and drafts the next `draft_steps` (`1..=7`)
-    /// tokens for all `slots` concurrently, reading `results` and `anchors` directly from
-    /// `Model::start_verify_batch`'s device buffers without host synchronization.
+    /// tokens for all `slots` concurrently, reading `taps`, `results` and `anchors` directly
+    /// from `Model::start_verify_batch`'s device buffers inside the captured CUDA graph
+    /// without host synchronization or extra tap copies.
     #[expect(clippy::too_many_arguments, reason = "explicit device inputs from verify_batch")]
     pub fn batch_commit_and_draft(
         &mut self,
@@ -520,6 +563,7 @@ impl Draft {
         ensure!(starts.len() == seqs && samplings.len() == seqs, "mismatched batch lengths");
         ensure!((1..=BLOCK).contains(&verify_width), "bad verify_width {verify_width}");
         ensure!((1..=STEPS).contains(&draft_steps), "bad draft_steps {draft_steps}");
+        check_distinct_slots(slots)?;
         let row_len = self.row_len();
         ensure!(
             taps.len() == seqs * verify_width * row_len,
@@ -527,28 +571,38 @@ impl Draft {
             taps.len(),
             seqs * verify_width
         );
+        ensure!(
+            results.len() == seqs * RESULT_LEN,
+            "results has {} elements, expected {}",
+            results.len(),
+            seqs * RESULT_LEN
+        );
+        ensure!(
+            anchors.len() == seqs,
+            "anchors has {} elements, expected {seqs}",
+            anchors.len()
+        );
+        let mut starts_i32 = [0i32; MAX_BATCH_SEQS];
+        for (dst, &s) in starts_i32[..seqs].iter_mut().zip(starts) {
+            let end = s
+                .checked_add(verify_width + BLOCK)
+                .context("start position overflow")?;
+            let _ = i32::try_from(end)?;
+            *dst = i32::try_from(s)?;
+        }
         let max_slot = slots.iter().copied().max().unwrap_or(0);
         self.ensure_batch_dflash2(stream, seqs, max_slot)?;
         self.sync_shortlist(stream)?;
         self.upload_batch_meta(stream, slots, samplings)?;
-        let starts_i32: Vec<i32> = starts
-            .iter()
-            .map(|&s| Ok(i32::try_from(s)?))
-            .collect::<anyhow::Result<_>>()?;
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
-        stream.memcpy_htod(&starts_i32, &mut b.starts.slice_mut(..seqs))?;
-        stream.memcpy_dtod(taps, &mut b.taps.slice_mut(..taps.len()))?;
-        self.kernels.set_control_kept_batch(
-            stream,
-            &mut b.controls.slice_mut(..seqs * CONTROL),
-            &b.starts.slice(..seqs),
-            results,
-            RESULT_LEN,
-            verify_width,
-            anchors,
-            seqs,
-        )?;
-        self.launch_batch_graph(stream, shared, seqs, verify_width, draft_steps)
+        stream.memcpy_htod(&starts_i32[..seqs], &mut b.starts.slice_mut(..seqs))?;
+        let commit = BatchCommitInputs {
+            taps: taps.view(),
+            results: results.view(),
+            anchors: anchors.view(),
+            width: verify_width,
+        };
+        self.launch_batch_graph(stream, shared, seqs, Some(&commit), draft_steps)
     }
 
     /// Ready-to-verify tokens `[seqs * width]` produced by the last batched DFlash 2 round
@@ -575,7 +629,8 @@ impl Draft {
         Ok(stream.clone_dtoh(&b.confidence.slice(..seqs * steps))?)
     }
 
-    /// Uploads `cache_table` (when `slots` changed) and `races` for the active sequences.
+    /// Uploads `cache_table` (when `slots` changed) and `races` (when `samplings` changed)
+    /// into stable device buffers before launching the captured CUDA graph.
     fn upload_batch_meta(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -601,16 +656,20 @@ impl Draft {
             stream.memcpy_htod(&table, &mut b.cache_table.slice_mut(..table.len()))?;
             b.members = slots.to_vec();
         }
-        let mut races = Vec::with_capacity(seqs * RACE_WORDS);
-        for &s in samplings {
+        let mut races = [0u32; MAX_BATCH_SEQS * RACE_WORDS];
+        let race_len = seqs * RACE_WORDS;
+        for (i, &s) in samplings.iter().enumerate() {
             let words = if s.is_greedy() {
                 race_words(0.0, 0)
             } else {
                 race_words(s.temperature, s.seed)
             };
-            races.extend_from_slice(&words);
+            races[i * RACE_WORDS..(i + 1) * RACE_WORDS].copy_from_slice(&words);
         }
-        stream.memcpy_htod(&races, &mut b.races.slice_mut(..races.len()))?;
+        if b.last_races[..race_len] != races[..race_len] {
+            stream.memcpy_htod(&races[..race_len], &mut b.races.slice_mut(..race_len))?;
+            b.last_races[..race_len].copy_from_slice(&races[..race_len]);
+        }
         Ok(())
     }
 
@@ -620,10 +679,21 @@ impl Draft {
         stream: &Arc<CudaStream>,
         shared: SharedWeights<'_>,
         seqs: usize,
-        commit_width: usize,
+        commit: Option<&BatchCommitInputs<'_>>,
         draft_steps: usize,
     ) -> anyhow::Result<()> {
         let lm_head = shared.lm_head.device_ptr(stream).0;
+        let embed = shared.embed.device_ptr(stream).0;
+        let embed_norm = shared.embed_norm.device_ptr(stream).0;
+        let (commit_width, taps_ptr, results_ptr, anchors_ptr) = match commit {
+            Some(c) => (
+                c.width,
+                c.taps.device_ptr(stream).0,
+                c.results.device_ptr(stream).0,
+                c.anchors.device_ptr(stream).0,
+            ),
+            None => (0, 0, 0, 0),
+        };
         let key = (seqs, commit_width, draft_steps);
         let needs_capture = self
             .batch
@@ -631,17 +701,36 @@ impl Draft {
             .context("batch DFlash 2 missing")?
             .graphs
             .get(&key)
-            .is_none_or(|g| g.lm_head != lm_head);
+            .is_none_or(|g| {
+                g.lm_head != lm_head
+                    || g.embed != embed
+                    || g.embed_norm != embed_norm
+                    || g.taps != taps_ptr
+                    || g.results != results_ptr
+                    || g.anchors != anchors_ptr
+            });
         if needs_capture {
             stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
             let enqueued =
-                self.enqueue_batch_dflash2(stream, shared, seqs, commit_width, draft_steps);
+                self.enqueue_batch_dflash2(stream, shared, seqs, commit, draft_steps);
+            // End the capture even when enqueueing failed, so the stream is usable again.
             let graph = stream.end_capture(CUgraphInstantiate_flags(0));
             enqueued.context("capturing batched DFlash 2 round")?;
             let graph = graph?.context("batched DFlash 2 capture recorded no work")?;
             graph.upload()?;
             let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
-            b.graphs.insert(key, RoundGraph { graph, lm_head });
+            b.graphs.insert(
+                key,
+                BatchRoundGraph {
+                    graph,
+                    lm_head,
+                    embed,
+                    embed_norm,
+                    taps: taps_ptr,
+                    results: results_ptr,
+                    anchors: anchors_ptr,
+                },
+            );
         }
         let b = self.batch.as_ref().context("batch DFlash 2 missing")?;
         let round = b
@@ -652,7 +741,7 @@ impl Draft {
         Ok(())
     }
 
-    /// Enqueues the batched DFlash 2 commit (when `commit_width > 0`), 5-layer block forward,
+    /// Enqueues the batched DFlash 2 commit (when `commit` is `Some`), 5-layer block forward,
     /// LM head, top-16, and selector walk.
     #[expect(clippy::too_many_lines, reason = "linear top-to-bottom DFlash 2 round")]
     fn enqueue_batch_dflash2(
@@ -660,7 +749,7 @@ impl Draft {
         stream: &CudaStream,
         shared: SharedWeights<'_>,
         seqs: usize,
-        commit_width: usize,
+        commit: Option<&BatchCommitInputs<'_>>,
         draft_steps: usize,
     ) -> anyhow::Result<()> {
         let Arch::Dflash2 {
@@ -679,18 +768,25 @@ impl Draft {
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
         let fp8_kv = b.fp8_kv;
         let lr = &self.linear_rows;
-        let controls = b.controls.slice(..seqs * CONTROL);
         let cache_table = b.cache_table.slice(..seqs * layers * 2);
 
-        // 1. Optional context commit (`seqs * commit_width` rows).
-        if commit_width > 0 {
-            let cm = seqs * commit_width;
-            let row_len = weights.taps.len() * HIDDEN;
-            let taps_in = b.taps.slice(..cm * row_len);
+        // 1. Optional context commit (`seqs * commit.width` rows).
+        if let Some(c) = commit {
+            k.set_control_kept_batch(
+                stream,
+                &mut b.controls.slice_mut(..seqs * CONTROL),
+                &b.starts.slice(..seqs),
+                &c.results,
+                RESULT_LEN,
+                c.width,
+                &c.anchors,
+                seqs,
+            )?;
+            let cm = seqs * c.width;
             run_rows_products(
                 lr,
                 stream,
-                &taps_in,
+                &c.taps,
                 cm,
                 &mut [(
                     Some(&weights.fc),
@@ -728,6 +824,7 @@ impl Draft {
             run_rows_products(lr, stream, &normed, cm, &mut prods)?;
             let k_norms: Vec<&CudaSlice<bf16>> =
                 weights.layers.iter().map(|l| &l.k_norm).collect();
+            let controls = b.controls.slice(..seqs * CONTROL);
             k.dflash_commit_rope_store_batch(
                 stream,
                 &b.ctx_k.slice(..layers * layer_kv),
@@ -738,12 +835,13 @@ impl Draft {
                 &k_norms,
                 &cache_table,
                 DFLASH2_SLOTS,
-                commit_width,
+                c.width,
                 seqs,
                 rope,
                 fp8_kv,
             )?;
         }
+        let controls = b.controls.slice(..seqs * CONTROL);
 
         // 2. Block input (`seqs * 8` rows).
         let bm = seqs * BLOCK;

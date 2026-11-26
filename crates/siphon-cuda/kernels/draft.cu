@@ -86,6 +86,24 @@ __device__ void store_normed_row(const float (&v)[kRowVec], const __nv_bfloat16*
     }
 }
 
+// Copies one 2304-wide BF16 row across `kRowThreads` threads, using 16-byte loads/stores
+// when both pointers are 16-byte aligned.
+__device__ __forceinline__ void copy_hidden_row(const __nv_bfloat16* src, __nv_bfloat16* dst) {
+    static_assert(kHidden % 8 == 0, "hidden divides uint4");
+    if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15u) == 0) {
+        constexpr int kVec = kHidden / 8;
+        const auto* s = reinterpret_cast<const uint4*>(src);
+        auto* d = reinterpret_cast<uint4*>(dst);
+        for (int c = threadIdx.x; c < kVec; c += kRowThreads) {
+            d[c] = s[c];
+        }
+        return;
+    }
+    for (int c = threadIdx.x; c < kHidden; c += kRowThreads) {
+        dst[c] = src[c];
+    }
+}
+
 // The argmax rule of vLLM's `greedy_argmax`: NaN counts as -inf, ties go to the first index.
 __device__ __forceinline__ bool better(float a, int ia, float b, int ib) {
     a = isnan(a) ? -INFINITY : a;
@@ -136,6 +154,8 @@ draft_mix_rms_norm(const __nv_bfloat16* taps, const float* alpha, const __nv_bfl
 extern "C" __global__ void __launch_bounds__(kRowThreads)
 draft_add_rms_norm(const __nv_bfloat16* x, __nv_bfloat16* residual, const __nv_bfloat16* weight,
                    __nv_bfloat16* out, float eps) {
+    pdl_wait();
+    pdl_trigger();
     const size_t base = size_t(blockIdx.x) * kHidden;
     float v[kRowVec];
 #pragma unroll
@@ -157,11 +177,11 @@ extern "C" __global__ void __launch_bounds__(kRowThreads)
 draft_block_input(const int32_t* anchor, const __nv_bfloat16* embed, int32_t vocab,
                   const __nv_bfloat16* embed_norm, const __nv_bfloat16* mask_embed,
                   __nv_bfloat16* out, float eps) {
+    pdl_wait();
+    pdl_trigger();
     __nv_bfloat16* row = out + size_t(blockIdx.x) * kHidden;
     if (blockIdx.x > 0) {
-        for (int c = threadIdx.x; c < kHidden; c += kRowThreads) {
-            row[c] = mask_embed[c];
-        }
+        copy_hidden_row(mask_embed, row);
         return;
     }
     const int32_t id = *anchor;
@@ -397,7 +417,7 @@ __device__ __forceinline__ void cp_async_wait() {
 // bytes of the next chunk's keys and values into registers before the current chunk's
 // arithmetic and widens them exactly to BF16 into shared memory after it, so the
 // arithmetic is the BF16 cache's over the widened values.
-template <int G, bool FP8>
+template <int G, bool FP8, bool kPdl = true>
 __device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const void* cache_k,
                                                 const void* cache_v, int32_t slots,
                                                 const int32_t* control, int32_t window,
@@ -416,8 +436,10 @@ __device__ __forceinline__ void attention_split(const __nv_bfloat16* q, const vo
         smem + sizeof(float) * kQueryRows * kHeadDim + 2 * 2 * kKeyChunk * kKeyStride +
         2 * 2 * kKeyChunk * kHeadDim);
 
-    pdl_wait();
-    pdl_trigger();
+    if constexpr (kPdl) {
+        pdl_wait();
+        pdl_trigger();
+    }
     attention_range(control, window, first, keys);
     const int per_split = keys_per_split(keys);
     const int splits = (keys + per_split - 1) / per_split;
@@ -701,9 +723,43 @@ draft_attention_combine(const float* partial_out, const float* partial_stats,
         __float2bfloat16_rn(value / sum);
 }
 
+namespace {
+
+__device__ __forceinline__ uint16_t silu_mul_bf16_bits(float g, float u) {
+    const float silu = __fdiv_rn(g, __fadd_rn(1.f, expf(-g)));
+    return __bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(silu, u)));
+}
+
+__device__ __forceinline__ uint32_t silu_mul_pair(uint32_t g_pair, uint32_t u_pair) {
+    const uint32_t lo = silu_mul_bf16_bits(bf_lo(g_pair), bf_lo(u_pair));
+    const uint32_t hi = silu_mul_bf16_bits(bf_hi(g_pair), bf_hi(u_pair));
+    return lo | (hi << 16);
+}
+
+}  // namespace
+
 // out = bf16(silu(gate) * up) over n elements, in F32 with IEEE exp and division.
 extern "C" __global__ void draft_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                                           __nv_bfloat16* out, size_t n) {
+    pdl_wait();
+    pdl_trigger();
+    if ((n & 7u) == 0 &&
+        ((reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(up) |
+          reinterpret_cast<uintptr_t>(out)) &
+         15u) == 0) {
+        const size_t vec_n = n / 8;
+        const auto* gv = reinterpret_cast<const uint4*>(gate);
+        const auto* uv = reinterpret_cast<const uint4*>(up);
+        auto* ov = reinterpret_cast<uint4*>(out);
+        for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < vec_n;
+             i += size_t(gridDim.x) * blockDim.x) {
+            const uint4 g = gv[i];
+            const uint4 u = uv[i];
+            ov[i] = make_uint4(silu_mul_pair(g.x, u.x), silu_mul_pair(g.y, u.y),
+                               silu_mul_pair(g.z, u.z), silu_mul_pair(g.w, u.w));
+        }
+        return;
+    }
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
          i += size_t(gridDim.x) * blockDim.x) {
         const float g = bf(gate[i]);
@@ -1032,6 +1088,7 @@ extern "C" __global__ void draft_set_control_kept(int32_t* control, int32_t star
                                                   const int32_t* kept, int32_t max_rows,
                                                   const int32_t* anchor) {
     pdl_wait();
+    pdl_trigger();
     control[0] = start;
     control[1] = min(max(*kept, 0) + 1, max_rows);
     control[2] = *anchor;
@@ -2569,6 +2626,7 @@ extern "C" __global__ void draft_set_control_kept_batch(
     int32_t* controls, const int32_t* starts, const int32_t* results, int32_t result_stride,
     int32_t max_rows, const int32_t* anchors) {
     pdl_wait();
+    pdl_trigger();
     const int seq = blockIdx.x;
     const int32_t kept = results[size_t(seq) * result_stride];
     int32_t* c = controls + size_t(seq) * 3;
@@ -2637,9 +2695,7 @@ draft_block_input_batch(const int32_t* controls, const __nv_bfloat16* embed, int
     const int seq = blockIdx.y;
     __nv_bfloat16* row = out + (size_t(seq) * kBlock + r) * kHidden;
     if (r > 0) {
-        for (int c = threadIdx.x; c < kHidden; c += kRowThreads) {
-            row[c] = mask_embed[c];
-        }
+        copy_hidden_row(mask_embed, row);
         return;
     }
     const int32_t id = controls[size_t(seq) * 3 + 2];
@@ -2737,15 +2793,18 @@ draft_attention_g4_batch(const __nv_bfloat16* q, const unsigned long long* cache
                          int32_t layer, int32_t layers, int32_t slots, const int32_t* controls,
                          int32_t window, int32_t row_window, int32_t max_splits,
                          float* partial_out, float* partial_stats) {
+    pdl_wait();
+    pdl_trigger();
     const int seq = blockIdx.z;
     const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
     const void* ck = reinterpret_cast<const void*>(cache_table[entry]);
     const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
     const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
     const size_t p_rows = size_t(seq) * max_splits * kKvHeads * kBlock * kMaxGroup;
-    attention_split<kMaxGroup, false>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window,
-                                      row_window, 0, 0, partial_out + p_rows * kHeadDim,
-                                      partial_stats + p_rows * 2);
+    attention_split<kMaxGroup, false, false>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3,
+                                             window, row_window, 0, 0,
+                                             partial_out + p_rows * kHeadDim,
+                                             partial_stats + p_rows * 2);
 }
 
 // Batched DFlash 2 block attention (G=4, E4M3 FP8 rings). Grid: (8, max_splits, seqs), 256 threads.
@@ -2754,15 +2813,18 @@ draft_attention_g4_batch_fp8(const __nv_bfloat16* q, const unsigned long long* c
                              int32_t layer, int32_t layers, int32_t slots, const int32_t* controls,
                              int32_t window, int32_t row_window, int32_t max_splits,
                              float* partial_out, float* partial_stats) {
+    pdl_wait();
+    pdl_trigger();
     const int seq = blockIdx.z;
     const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
     const void* ck = reinterpret_cast<const void*>(cache_table[entry]);
     const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
     const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
     const size_t p_rows = size_t(seq) * max_splits * kKvHeads * kBlock * kMaxGroup;
-    attention_split<kMaxGroup, true>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window,
-                                     row_window, 0, 0, partial_out + p_rows * kHeadDim,
-                                     partial_stats + p_rows * 2);
+    attention_split<kMaxGroup, true, false>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3,
+                                            window, row_window, 0, 0,
+                                            partial_out + p_rows * kHeadDim,
+                                            partial_stats + p_rows * 2);
 }
 
 // Batched draft_attention_combine for seqs blocks. Grid: (8, 8 * group, seqs), 128 threads.
@@ -2811,9 +2873,7 @@ draft_gather_mask_rows(const __nv_bfloat16* y, __nv_bfloat16* out, int32_t steps
     const int seq = blockIdx.y;
     const __nv_bfloat16* src = y + (size_t(seq) * kBlock + e + 1) * kHidden;
     __nv_bfloat16* dst = out + (size_t(seq) * steps + e) * kHidden;
-    for (int c = threadIdx.x; c < kHidden; c += kRowThreads) {
-        dst[c] = src[c];
-    }
+    copy_hidden_row(src, dst);
 }
 
 // Batched DFlash 2 selector walk over seqs sequences, each with `steps` (1..7) draft rows.
