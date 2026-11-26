@@ -612,6 +612,8 @@ impl Model {
                     None => KvCache::global_with_format(&stream, capacity, format)?,
                 }
             };
+            // NVFP4 caches take rows already rounded to their values (`kv_round_bf16`).
+            let round = kv.format() == KvFormat::Nvfp4;
             visits.push(VisitState {
                 kv,
                 conv: [
@@ -620,8 +622,7 @@ impl Model {
                     stream.alloc_zeros(history * hidden)?,
                     stream.alloc_zeros(history * hidden)?,
                 ],
-                // NVFP4 caches take rows already rounded to their values (`kv_round_bf16`).
-                round: formats[v] == Some(KvFormat::Nvfp4),
+                round,
             });
         }
         let loops = config.loop_config;
@@ -643,6 +644,7 @@ impl Model {
             )?;
         }
         let sample_one = SampleBuffers::new(&stream, 1)?;
+        let has_nvfp4 = visits.iter().any(|v| v.kv.format() == KvFormat::Nvfp4);
         Ok(Self {
             ctx: Ctx {
                 config,
@@ -653,7 +655,7 @@ impl Model {
                 prefill_attention: DEFAULT_PREFILL_ATTENTION,
                 chunk_attention: Products::Bf16,
                 prefill_dense: Products::Bf16,
-                kv_rounding: if formats.contains(&Some(KvFormat::Nvfp4)) {
+                kv_rounding: if has_nvfp4 {
                     KvRounding {
                         quant: KvQuant::Nvfp4,
                         ..KvRounding::default()

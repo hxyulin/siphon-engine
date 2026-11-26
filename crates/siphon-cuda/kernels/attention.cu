@@ -1944,24 +1944,61 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         const unsigned first = tile.input ? tile.p0 - start : tile.p0 % slots;
         const unsigned wrap = tile.input ? 0xffffffffu : slots;
         if constexpr (F::kFp4) {
-            // 4 chunks of 32 E2M1 values per row, unswizzled, then the row's 8 scales after
-            // the tile's data.
-            constexpr int kChunks = kFp4HeadBytes / 16;
-            const int chunk = threadIdx.x % kChunks;
+            constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+            if (tile.input) {
+                // For sliding rings (`tile.input`), pack the chunk's new BF16 keys/values
+                // into NVFP4 in shared memory so the ring is only updated after prefill
+                // attention finishes reading wrapped slots.
+                auto pack_group = [](const __nv_bfloat16* src, uint8_t& scale) {
+                    float lo[8], hi[8], vals[16];
+                    unpack_bf16x8(*reinterpret_cast<const uint4*>(src), lo);
+                    unpack_bf16x8(*reinterpret_cast<const uint4*>(src + 8), hi);
 #pragma unroll
-            for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
-                const bool valid = tile.p0 + row < tile.end;
-                unsigned source = first + row;
-                source = source >= wrap ? source - wrap : source;
-                const unsigned slot = valid ? source : 0;
-                const size_t offset = fp4_data(slot, g.kv_head) + chunk * 16;
-                copy_async16(&sm.k8[stage][row * kFp4HeadBytes + chunk * 16], k_cache + offset, valid);
-                copy_async16(&sm.v8[stage][row * kFp4HeadBytes + chunk * 16], v_cache + offset, valid);
-                if (chunk == 0) {
-                    const size_t scales = fp4_scales(slot, g.kv_head);
-                    constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
-                    copy_async8(&sm.k8[stage][kScalesAt + row * kFp4HeadScales], k_cache + scales, valid);
-                    copy_async8(&sm.v8[stage][kScalesAt + row * kFp4HeadScales], v_cache + scales, valid);
+                    for (int i = 0; i < 8; ++i) {
+                        vals[i] = lo[i];
+                        vals[8 + i] = hi[i];
+                    }
+                    return fp4_group(vals, scale);
+                };
+#pragma unroll
+                for (int i = threadIdx.x; i < kPrefillKeys * kFp4HeadScales; i += kThreads) {
+                    const int row = i / kFp4HeadScales;
+                    const int group = i % kFp4HeadScales;
+                    const bool valid = tile.p0 + row < tile.end;
+                    uint2 kd = make_uint2(0, 0);
+                    uint2 vd = make_uint2(0, 0);
+                    uint8_t ks = 0;
+                    uint8_t vs = 0;
+                    if (valid) {
+                        const unsigned source = first + row;
+                        const size_t offset = size_t(source) * kKvRow + g.kv_head * kHeadDim + group * 16;
+                        kd = pack_group(k_in + offset, ks);
+                        vd = pack_group(v_in + offset, vs);
+                    }
+                    *reinterpret_cast<uint2*>(&sm.k8[stage][row * kFp4HeadBytes + group * 8]) = kd;
+                    *reinterpret_cast<uint2*>(&sm.v8[stage][row * kFp4HeadBytes + group * 8]) = vd;
+                    sm.k8[stage][kScalesAt + row * kFp4HeadScales + group] = ks;
+                    sm.v8[stage][kScalesAt + row * kFp4HeadScales + group] = vs;
+                }
+            } else {
+                // 4 chunks of 32 E2M1 values per row, unswizzled, then the row's 8 scales after
+                // the tile's data.
+                constexpr int kChunks = kFp4HeadBytes / 16;
+                const int chunk = threadIdx.x % kChunks;
+#pragma unroll
+                for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
+                    const bool valid = tile.p0 + row < tile.end;
+                    unsigned source = first + row;
+                    source = source >= wrap ? source - wrap : source;
+                    const unsigned slot = valid ? source : 0;
+                    const size_t offset = fp4_data(slot, g.kv_head) + chunk * 16;
+                    copy_async16(&sm.k8[stage][row * kFp4HeadBytes + chunk * 16], k_cache + offset, valid);
+                    copy_async16(&sm.v8[stage][row * kFp4HeadBytes + chunk * 16], v_cache + offset, valid);
+                    if (chunk == 0) {
+                        const size_t scales = fp4_scales(slot, g.kv_head);
+                        copy_async8(&sm.k8[stage][kScalesAt + row * kFp4HeadScales], k_cache + scales, valid);
+                        copy_async8(&sm.v8[stage][kScalesAt + row * kFp4HeadScales], v_cache + scales, valid);
+                    }
                 }
             }
         } else if constexpr (kFp8) {
@@ -2684,8 +2721,7 @@ kv_append_rows_fp4(const __nv_bfloat16* k, const __nv_bfloat16* v, uint8_t* k_ca
     }
 }
 
-// `prefill_attention_bf16` over NVFP4 caches. Every key comes from the cache
-// (input_keys must be 0).
+// `prefill_attention_bf16` over NVFP4 caches (global and sliding rings with `input_keys == 1`).
 extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
 prefill_attention_fp4(const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
                       const uint8_t* k_cache, const uint8_t* v_cache, const __nv_bfloat16* bias,

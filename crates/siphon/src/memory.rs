@@ -1007,9 +1007,13 @@ mod tests {
         assert_eq!(global * 2 * KvFormat::Fp8.row_bytes(kv_dims), 16 << 10);
         // NVFP4: 576 bytes per buffer and position, 9 KiB per position over 8 caches.
         assert_eq!(KvFormat::Nvfp4.row_bytes(kv_dims), 576);
+        assert_eq!(KvFormat::Nvfp4All.row_bytes(kv_dims), 576);
+        assert_eq!(KvFormat::Nvfp4.sliding_format(), KvFormat::Fp8);
+        assert_eq!(KvFormat::Nvfp4All.sliding_format(), KvFormat::Nvfp4);
         let passes = c.loop_config.num_passes;
         assert_eq!(c.global_cache_bytes(passes, KvFormat::Fp8), 16 << 10);
         assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4), 9 << 10);
+        assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4All), 9 << 10);
         // Mixed: visits 5 and 11 in FP8, 2 KiB each, the other 6 in NVFP4.
         assert_eq!(
             c.global_cache_bytes(passes, KvFormat::Mixed),
@@ -1020,6 +1024,9 @@ mod tests {
         assert_eq!(formats[11], Some(KvFormat::Fp8));
         assert_eq!(formats[17], Some(KvFormat::Nvfp4));
         assert_eq!(formats[47], Some(KvFormat::Nvfp4));
+        let all_formats = c.cache_formats(passes, KvFormat::Nvfp4All);
+        assert_eq!(all_formats[5], Some(KvFormat::Nvfp4));
+        assert_eq!(all_formats[47], Some(KvFormat::Nvfp4));
     }
 
     #[test]
@@ -1223,6 +1230,11 @@ mod tests {
             pool(KvFormat::Mixed).plan(6144).kv - rings,
             (4 * 6 + 12 * 4) * mib
         );
+        // NVFP4-all: 40 packed NVFP4 rings of 1.125 MiB each also share one 2 MiB page each.
+        assert_eq!(pool(KvFormat::Nvfp4All).plan(0).kv, rings);
+        assert_eq!(pool(KvFormat::Nvfp4All).plan(4096).kv - rings, 16 * 4 * mib);
+        assert_eq!(pool(KvFormat::Nvfp4All).plan(6144).kv - rings, 16 * 4 * mib);
+        assert_eq!(pool(KvFormat::Nvfp4All).bytes_per_position(), 9 << 10);
         assert_eq!(pool(KvFormat::Nvfp4).bytes_per_position(), 9 << 10);
         std::fs::remove_dir_all(dir).expect("cleaning up");
     }

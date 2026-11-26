@@ -597,8 +597,11 @@ fn ring_config(
         "{rows} rows, expected 1 to {VERIFY_ROWS}"
     );
     ensure!(
-        row_bytes == KV_DIMS || row_bytes == 2 * KV_DIMS,
-        "ring row_bytes {row_bytes}, expected {KV_DIMS} or {}",
+        row_bytes == crate::ops::attention::FP4_ROW
+            || row_bytes == KV_DIMS
+            || row_bytes == 2 * KV_DIMS,
+        "ring row_bytes {row_bytes}, expected {}, {KV_DIMS} or {}",
+        crate::ops::attention::FP4_ROW,
         2 * KV_DIMS
     );
     check_len("start", start.len(), 1)?;
@@ -639,8 +642,11 @@ fn ring_batch_config(
         "{rows} rows, expected 1 to {VERIFY_ROWS}"
     );
     ensure!(
-        row_bytes == KV_DIMS || row_bytes == 2 * KV_DIMS,
-        "ring row_bytes {row_bytes}, expected {KV_DIMS} or {}",
+        row_bytes == crate::ops::attention::FP4_ROW
+            || row_bytes == KV_DIMS
+            || row_bytes == 2 * KV_DIMS,
+        "ring row_bytes {row_bytes}, expected {}, {KV_DIMS} or {}",
+        crate::ops::attention::FP4_ROW,
         2 * KV_DIMS
     );
     check_len(

@@ -311,7 +311,11 @@ impl Model {
                     stream.memcpy_dtod(keys, k)?;
                     stream.memcpy_dtod(values, x)?;
                 }
-                (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x })) => {
+                (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
+                | (
+                    KvData::Nvfp4 { keys, values },
+                    Some(KvData::Nvfp4 { keys: k, values: x }),
+                ) => {
                     ensure!(k.len() == keys.len(), "the ring sizes differ");
                     stream.memcpy_dtod(keys, k)?;
                     stream.memcpy_dtod(values, x)?;
@@ -353,7 +357,11 @@ impl Model {
                     stream.memcpy_dtod(k, keys)?;
                     stream.memcpy_dtod(x, values)?;
                 }
-                (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x })) => {
+                (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
+                | (
+                    KvData::Nvfp4 { keys, values },
+                    Some(KvData::Nvfp4 { keys: k, values: x }),
+                ) => {
                     stream.memcpy_dtod(k, keys)?;
                     stream.memcpy_dtod(x, values)?;
                 }

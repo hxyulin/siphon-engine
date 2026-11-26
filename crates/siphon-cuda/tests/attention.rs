@@ -294,7 +294,7 @@ fn stored(format: KvFormat, x: bf16) -> f32 {
     match format {
         KvFormat::Bf16 => x.to_f32(),
         KvFormat::Fp8 => e4m3_value(e4m3_from_f32(x.to_f32())),
-        KvFormat::Nvfp4 | KvFormat::Mixed => {
+        KvFormat::Nvfp4 | KvFormat::Nvfp4All | KvFormat::Mixed => {
             unimplemented!("NVFP4 rounds groups, not single values")
         }
     }
@@ -613,7 +613,7 @@ fn check_random(cache: KvCache, tokens: usize, checks: &[usize], seed: u64) -> a
         (Some(_), _) => "sliding",
         (None, KvFormat::Bf16) => "global",
         (None, KvFormat::Fp8) => "fp8 global",
-        (None, KvFormat::Nvfp4 | KvFormat::Mixed) => "nvfp4 global",
+        (None, KvFormat::Nvfp4 | KvFormat::Nvfp4All | KvFormat::Mixed) => "nvfp4 global",
     };
     run_decode(
         &gpu,
@@ -1134,7 +1134,7 @@ fn check_prefill_with(
         (None, KvFormat::Bf16) => "global",
         (None, KvFormat::Fp8) if fp8_products => "fp8 global, fp8 products",
         (None, KvFormat::Fp8) => "fp8 global",
-        (None, KvFormat::Nvfp4 | KvFormat::Mixed) => "nvfp4 global",
+        (None, KvFormat::Nvfp4 | KvFormat::Nvfp4All | KvFormat::Mixed) => "nvfp4 global",
     };
 
     let tokens: usize = chunks.iter().map(|c| c.rows).sum();

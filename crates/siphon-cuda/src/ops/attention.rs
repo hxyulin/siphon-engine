@@ -246,7 +246,7 @@ impl KvCache {
         Self::sliding_ring_with_format(stream, window, slots, KvFormat::Bf16)
     }
 
-    /// [`KvCache::sliding_ring`] storing `format` (`Bf16` or `Fp8`) elements.
+    /// [`KvCache::sliding_ring`] storing `format` (`Bf16`, `Fp8` or `Nvfp4`) elements.
     pub fn sliding_ring_with_format(
         stream: &Arc<CudaStream>,
         window: usize,
@@ -287,7 +287,7 @@ impl KvCache {
 
     /// A pooled cache of `capacity` slots. A ring whose key buffer is not a whole number
     /// of pages keeps its keys and values in one reservation, so that an FP8 ring of 1 MiB
-    /// buffers takes one 2 MiB page, not two.
+    /// buffers or an NVFP4 ring of 576 KiB buffers takes one 2 MiB page, not two.
     fn new_pooled(
         stream: &Arc<CudaStream>,
         capacity: usize,
@@ -301,7 +301,9 @@ impl KvCache {
             KvFormat::Bf16 => (capacity * KV_ROW, capacity * KV_ROW * size_of::<bf16>()),
             KvFormat::Fp8 => (capacity * KV_ROW, capacity * KV_ROW),
             KvFormat::Nvfp4 => (capacity * FP4_ROW, capacity * FP4_ROW),
-            KvFormat::Mixed => anyhow::bail!("a mixed layout gives each cache FP8 or NVFP4"),
+            KvFormat::Mixed | KvFormat::Nvfp4All => {
+                anyhow::bail!("each cache takes a concrete format (BF16, FP8 or NVFP4)")
+            }
         };
         let packed = window.is_some() && !bytes.is_multiple_of(pool.page_bytes());
         let (pooled, keys, values) = if packed {
@@ -331,7 +333,7 @@ impl KvCache {
                     keys: stream.upgrade_device_ptr(keys, len),
                     values: stream.upgrade_device_ptr(values, len),
                 },
-                KvFormat::Mixed => unreachable!("refused above"),
+                KvFormat::Mixed | KvFormat::Nvfp4All => unreachable!("refused above"),
             }
         };
         Ok(Self {
@@ -354,8 +356,9 @@ impl KvCache {
         Self::sliding_pooled_with_format(stream, window, slots, KvFormat::Bf16, pool)
     }
 
-    /// [`KvCache::sliding_pooled`] storing `format` (`Bf16` or `Fp8`) elements. An FP8
-    /// ring's keys and values share pages: one reservation holds the keys, then the values.
+    /// [`KvCache::sliding_pooled`] storing `format` (`Bf16`, `Fp8` or `Nvfp4`) elements. An
+    /// FP8 or NVFP4 ring's keys and values share pages: one reservation holds the keys, then
+    /// the values.
     pub fn sliding_pooled_with_format(
         stream: &Arc<CudaStream>,
         window: usize,
@@ -368,8 +371,8 @@ impl KvCache {
             "a ring of {slots} slots cannot hold a window of {window}"
         );
         ensure!(
-            matches!(format, KvFormat::Bf16 | KvFormat::Fp8),
-            "sliding caches are BF16 or FP8"
+            matches!(format, KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4),
+            "sliding caches are BF16, FP8 or NVFP4"
         );
         Self::new_pooled(stream, slots, Some(window), format, pool)
     }
@@ -473,8 +476,8 @@ impl KvCache {
         ensure!(slots > 0, "a KV cache needs at least one slot");
         u32::try_from(slots).context("too many KV cache slots")?;
         ensure!(
-            window.is_none() || matches!(format, KvFormat::Bf16 | KvFormat::Fp8),
-            "sliding caches are BF16 or FP8"
+            window.is_none() || matches!(format, KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4),
+            "sliding caches are BF16, FP8 or NVFP4"
         );
         let len = slots * KV_ROW;
         let data = match format {
@@ -490,7 +493,9 @@ impl KvCache {
                 keys: stream.alloc_zeros(slots * FP4_ROW)?,
                 values: stream.alloc_zeros(slots * FP4_ROW)?,
             },
-            KvFormat::Mixed => anyhow::bail!("a mixed layout gives each cache FP8 or NVFP4"),
+            KvFormat::Mixed | KvFormat::Nvfp4All => {
+                anyhow::bail!("each cache takes a concrete format (BF16, FP8 or NVFP4)")
+            }
         };
         Ok(Self {
             data: ManuallyDrop::new(data),
@@ -518,18 +523,17 @@ impl KvCache {
     #[must_use]
     pub fn ring_buffers(&self, stream: &CudaStream) -> Option<([(u64, usize); 2], usize)> {
         self.window?;
-        let (keys, values, elem) = match &*self.data {
-            KvData::Bf16 { keys, values } => (
-                keys.device_ptr(stream).0,
-                values.device_ptr(stream).0,
-                size_of::<bf16>(),
-            ),
+        let (keys, values) = match &*self.data {
+            KvData::Bf16 { keys, values } => {
+                (keys.device_ptr(stream).0, values.device_ptr(stream).0)
+            }
             KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                (keys.device_ptr(stream).0, values.device_ptr(stream).0, 1)
+                (keys.device_ptr(stream).0, values.device_ptr(stream).0)
             }
         };
-        let bytes = self.slots * KV_ROW * elem;
-        Some(([(keys, bytes), (values, bytes)], KV_ROW * elem))
+        let row_bytes = self.row_bytes();
+        let bytes = self.slots * row_bytes;
+        Some(([(keys, bytes), (values, bytes)], row_bytes))
     }
 
     /// The sliding window, or `None` for a global layer.
@@ -1881,8 +1885,12 @@ impl Attention {
         // A sliding cache appends after attention, a global one before.
         let input_keys = u32::from(cache.window.is_some());
         ensure!(
-            input_keys == 0 || matches!(cache.format(), KvFormat::Bf16 | KvFormat::Fp8),
-            "sliding caches are BF16 or FP8"
+            input_keys == 0
+                || matches!(
+                    cache.format(),
+                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4
+                ),
+            "sliding caches are BF16, FP8 or NVFP4"
         );
         if input_keys == 0 {
             self.append_rows(stream, cache, &start, rows, &k, &v)?;

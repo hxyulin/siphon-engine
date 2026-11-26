@@ -95,7 +95,7 @@ extern "C" __global__ void conv_rollback(const unsigned long long* states, const
 // visits), 128 threads.
 // Saves the slots that rows 0..gridDim.x of a verify at *start will overwrite in each
 // sliding ring: slot (*start + j) % slots of each ring's keys and values (`row_bytes`
-// bytes per slot: 2048 for BF16, 1024 for FP8).
+// bytes per slot: 2048 for BF16, 1024 for FP8, 576 for NVFP4).
 extern "C" __global__ void __launch_bounds__(128)
 ring_backup(const unsigned long long* rings, unsigned slots, const unsigned* start, uint8_t* backup,
             unsigned row_bytes) {

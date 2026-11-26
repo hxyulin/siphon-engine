@@ -105,6 +105,7 @@ fn format_name(weights: WeightFormat, kv: KvFormat) -> String {
         KvFormat::Fp8 => "FP8",
         KvFormat::Bf16 => "BF16",
         KvFormat::Nvfp4 => "NVFP4",
+        KvFormat::Nvfp4All => "NVFP4-all",
         KvFormat::Mixed => "mixed",
     };
     format!("{weights} / {kv}")

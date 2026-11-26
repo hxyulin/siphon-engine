@@ -102,7 +102,8 @@ pub(super) struct VerifyBuffers {
     pub rings: CudaSlice<u64>,
     /// Slots of every sliding ring.
     pub ring_slots: usize,
-    /// Bytes per slot of each sliding ring's key or value buffer (`2048` for BF16, `1024` for FP8).
+    /// Bytes per slot of each sliding ring's key or value buffer (`2048` for BF16, `1024`
+    /// for FP8, `576` for NVFP4).
     pub ring_row_bytes: usize,
     /// The ring slots the pass overwrites, `[sliding visits, 8, 2, ring_row_bytes]` bytes.
     pub ring_backup: CudaSlice<u8>,
@@ -143,9 +144,11 @@ impl VerifyBuffers {
                     KvData::Fp8 { keys, values } => {
                         (keys.device_ptr(stream).0, values.device_ptr(stream).0, 1024)
                     }
-                    KvData::Nvfp4 { .. } => {
-                        anyhow::bail!("visit {i}: sliding caches are BF16 or FP8")
-                    }
+                    KvData::Nvfp4 { keys, values } => (
+                        keys.device_ptr(stream).0,
+                        values.device_ptr(stream).0,
+                        crate::ops::attention::FP4_ROW,
+                    ),
                 };
                 rings.push(keys);
                 rings.push(values);

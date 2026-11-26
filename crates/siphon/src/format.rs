@@ -70,9 +70,9 @@ impl fmt::Display for OutputProjection {
     }
 }
 
-/// Element format of the global-layer KV caches. Under quantized settings (`Fp8`, `Nvfp4`,
-/// `Mixed`), sliding-window caches store E4M3 ([`KvFormat::sliding_format`]); under `Bf16`
-/// they stay BF16.
+/// Element format of the KV caches. Under quantized settings (`Fp8`, `Nvfp4`, `Mixed`),
+/// sliding-window caches store E4M3 ([`KvFormat::sliding_format`]); under `Nvfp4All`, both
+/// global and sliding-window caches store NVFP4; under `Bf16` they stay BF16.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvFormat {
     /// BF16, the projections' own values.
@@ -84,8 +84,11 @@ pub enum KvFormat {
     Fp8,
     /// NVFP4: E2M1 values with one E4M3 scale per 16 elements, the scale `amax / 6`
     /// rounded to nearest, 4.5 bits per element. Each slot of a cache holds a head's 64
-    /// bytes of values per KV head, then their 8 scales per KV head.
+    /// bytes of values per KV head, then their 8 scales per KV head. Global visits use
+    /// NVFP4 and sliding-window visits stay E4M3.
     Nvfp4,
+    /// NVFP4 for both global visits and sliding-window visits.
+    Nvfp4All,
     /// FP8 for the first [`MIXED_FP8_VISITS`] global visits and NVFP4 for the rest. Layer 5
     /// and the first pass of layer 11 are the visits whose rounding to 4 bits costs the
     /// most (see engine.md, "KV cache reduction").
@@ -97,34 +100,37 @@ pub const MIXED_FP8_VISITS: usize = 2;
 
 impl KvFormat {
     /// The format of the cache of global visit `global` (its index among the global
-    /// visits, in visit order): this format, or for [`KvFormat::Mixed`] FP8 or NVFP4.
+    /// visits, in visit order): this format, [`KvFormat::Nvfp4`] for [`KvFormat::Nvfp4All`],
+    /// or for [`KvFormat::Mixed`] FP8 or NVFP4.
     #[must_use]
     pub fn cache_format(self, global: usize) -> Self {
         match self {
             Self::Mixed if global < MIXED_FP8_VISITS => Self::Fp8,
-            Self::Mixed => Self::Nvfp4,
+            Self::Mixed | Self::Nvfp4All => Self::Nvfp4,
             f => f,
         }
     }
 
     /// The format of the sliding-window caches under this setting: BF16 under
-    /// [`KvFormat::Bf16`], E4M3 under every quantized KV setting (`Fp8`, `Nvfp4`, `Mixed`).
+    /// [`KvFormat::Bf16`], NVFP4 under [`KvFormat::Nvfp4All`], and E4M3 under the other
+    /// quantized KV settings (`Fp8`, `Nvfp4`, `Mixed`).
     #[must_use]
     pub const fn sliding_format(self) -> Self {
         match self {
             Self::Bf16 => Self::Bf16,
             Self::Fp8 | Self::Nvfp4 | Self::Mixed => Self::Fp8,
+            Self::Nvfp4All => Self::Nvfp4,
         }
     }
 
     /// Bytes one position takes in a key or a value buffer of `dims` elements of a cache of
-    /// this format; for [`KvFormat::Mixed`], of an NVFP4 cache.
+    /// this format; for [`KvFormat::Mixed`] and [`KvFormat::Nvfp4All`], of an NVFP4 cache.
     #[must_use]
     pub fn row_bytes(self, dims: usize) -> usize {
         match self {
             Self::Bf16 => 2 * dims,
             Self::Fp8 => dims,
-            Self::Nvfp4 | Self::Mixed => dims / 2 + dims / 16,
+            Self::Nvfp4 | Self::Nvfp4All | Self::Mixed => dims / 2 + dims / 16,
         }
     }
 }
@@ -137,8 +143,11 @@ impl FromStr for KvFormat {
             "bf16" => Ok(Self::Bf16),
             "fp8" => Ok(Self::Fp8),
             "nvfp4" => Ok(Self::Nvfp4),
+            "nvfp4-all" => Ok(Self::Nvfp4All),
             "mixed" => Ok(Self::Mixed),
-            _ => bail!("unknown KV cache format {s:?}; expected bf16, fp8, nvfp4 or mixed"),
+            _ => bail!(
+                "unknown KV cache format {s:?}; expected bf16, fp8, nvfp4, nvfp4-all or mixed"
+            ),
         }
     }
 }
@@ -149,6 +158,7 @@ impl fmt::Display for KvFormat {
             Self::Bf16 => "bf16",
             Self::Fp8 => "fp8",
             Self::Nvfp4 => "nvfp4",
+            Self::Nvfp4All => "nvfp4-all",
             Self::Mixed => "mixed",
         })
     }

@@ -39,7 +39,7 @@ const DECODE_FLOOR: f64 = 20.0;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] \
-                     [--output-projection bf16|fp8] [--kv fp8|bf16|nvfp4|mixed] [--streams 1] \
+                     [--output-projection bf16|fp8] [--kv fp8|bf16|nvfp4|nvfp4-all|mixed] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--draft-shortlist N] [--draft-context-rows N] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
@@ -112,6 +112,7 @@ image_url parts and base64 image blocks in Anthropic messages. Image URLs are no
 with more images than this (default 16).
 --kv nvfp4 stores the global KV caches as NVFP4 (E2M1 values, one E4M3 scale per 16): 9 KiB
 per position instead of 16 with fp8, at about twice FP8's divergence from a BF16 cache.
+--kv nvfp4-all stores both global and sliding-window KV caches as NVFP4.
 --kv mixed keeps the first two global visits in FP8 and the other six in NVFP4: 10.75 KiB per
 position, at about FP8's divergence.
 --kv-quant nvfp4|q4_0 [--kv-rotate] [--kv-quant-visits V,...]
@@ -196,8 +197,8 @@ fn args() -> anyhow::Result<Args> {
             "--kv" => {
                 kv = value()?;
                 ensure!(
-                    ["fp8", "bf16", "nvfp4", "mixed"].contains(&kv.as_str()),
-                    "--kv takes fp8, bf16, nvfp4 or mixed"
+                    ["fp8", "bf16", "nvfp4", "nvfp4-all", "mixed"].contains(&kv.as_str()),
+                    "--kv takes fp8, bf16, nvfp4, nvfp4-all or mixed"
                 );
             }
             "--queue" => queue = value()?.parse()?,

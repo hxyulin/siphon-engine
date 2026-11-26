@@ -111,9 +111,7 @@ impl BatchVerifyState {
                 let row_bytes = match v.kv.data() {
                     KvData::Bf16 { .. } => 1024 * 2,
                     KvData::Fp8 { .. } => 1024,
-                    KvData::Nvfp4 { .. } => {
-                        anyhow::bail!("visit {i}: sliding caches are BF16 or FP8")
-                    }
+                    KvData::Nvfp4 { .. } => crate::ops::attention::FP4_ROW,
                 };
                 sliding_visits.push(i32::try_from(i)?);
                 ensure!(
