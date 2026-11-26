@@ -164,7 +164,7 @@ fn rows_are_invariant() -> anyhow::Result<()> {
         gpu,
     };
     let stream = setup.gpu.stream();
-    let mut scratch = RowsAttentionScratch::new(stream)?;
+    let mut scratch = RowsAttentionScratch::new(stream, ROWS_MAX)?;
     for &(kind, start) in CASES {
         let label = format!("{kind:?} at {start}");
         let rows = Rows::new(start as u32);
@@ -227,7 +227,7 @@ fn rows_against_decode_attention() -> anyhow::Result<()> {
         gpu,
     };
     let stream = setup.gpu.stream();
-    let mut scratch = RowsAttentionScratch::new(stream)?;
+    let mut scratch = RowsAttentionScratch::new(stream, ROWS_MAX)?;
     let mut decode = AttentionScratch::new(stream)?;
     let width = HEADS * HEAD_DIM;
     for &(kind, start) in CASES {

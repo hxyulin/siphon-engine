@@ -1599,7 +1599,8 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
 // experts and every row (router_sums_rows), so each element of x loads once per block.
 // The 9 warp sums of each (row, expert) pair add in router_logit's order, each block sends
 // its 8 logits of row r to block r, and block r routes row r as moe_router_step_2304's
-// block 0 routes its row.
+// block 0 routes its row. Above 8 rows, cluster y (blockIdx.y) takes rows 8 y .. 8 y + 7
+// the same way.
 constexpr int kStepRouterRows = 8;
 static_assert(kStepRouterRows <= kClusterRouterBlocks, "a block per row routes");
 constexpr int kRowsRouterThreads = kStepThreads;
@@ -1623,6 +1624,15 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
     const int warp = t / 32;
     const uint32_t rank = cluster_rank();
     const uint32_t barrier = smem_addr(&arrived);
+    // This cluster's rows.
+    {
+        const int row0 = int(blockIdx.y) * kStepRouterRows;
+        x += size_t(row0) * kHidden;
+        logits += size_t(row0) * kExperts;
+        indices += size_t(row0) * kTopK;
+        weights += size_t(row0) * kTopK;
+        rows = min(rows - row0, kStepRouterRows);
+    }
     // Block `rank` routes row `rank`, if there is one.
     const bool routes = int(rank) < rows;
     if (t == 0) {

@@ -1,4 +1,4 @@
-//! The expert MLP of 1 to 8 rows in one kernel (`kernels/experts_rows.cu`).
+//! The expert MLP of 1 to 32 rows in one kernel (`kernels/experts_rows.cu`).
 //!
 //! [`ExpertsRows::expert_mlp_rows`] runs, for every (row, slot) pair, the routed expert's
 //! `w13`, the softcapped SwiGLU and `w2`, as [`crate::ops::experts::Experts::expert_mlp`]
@@ -26,9 +26,11 @@ use crate::{
 };
 
 /// Most rows one call takes.
-pub const MAX_ROWS: usize = 8;
+pub const MAX_ROWS: usize = 32;
 /// Experts each row routes to.
 const SLOTS: usize = 8;
+/// Routed experts.
+const EXPERTS: usize = 128;
 /// `w13` is `[experts, 2 * K2, K13]` and `w2` `[experts, N2, K2]`.
 const K13: usize = 2304;
 const K2: usize = 1152;
@@ -99,7 +101,7 @@ impl ExpertsRows {
     ///   `2304` interleaved gate and up rows of input width 2304 and `w2` of 2304 rows of
     ///   input width 1152;
     /// - `act`: BF16 `[m * 8, 1152]` and `out`: BF16 `[m * 8, 2304]`, written;
-    /// - `sync`: at least `1 + 8 m` zeros, which the kernel leaves zero.
+    /// - `sync`: at least `1 + 9 m` zeros, which the kernel leaves zero.
     ///
     /// Launches with programmatic dependent launch; the kernel reads nothing before the
     /// previous kernel ends.
@@ -145,11 +147,14 @@ impl ExpertsRows {
             act.len(),
             out.len()
         );
+        // One counter per column group of up to 8 pairs: at most one per distinct expert,
+        // plus one per 8 pairs of the experts with more.
+        let groups = (m * SLOTS).min(EXPERTS) + m;
         ensure!(
-            sync.len() > m * SLOTS,
+            sync.len() > groups,
             "sync has {} counters, expected at least {}",
             sync.len(),
-            1 + m * SLOTS
+            1 + groups
         );
         ensure!(
             w13.k == K13 && w13.n == 2 * K2 && w2.k == K2 && w2.n == N2,
@@ -218,7 +223,7 @@ impl ExpertsRows {
         // const u8*, const u8*, const float*, const u8*, const u8*, const float*, bf16*,
         // bf16*, float, float, unsigned*)`. The checks above give `x` m rows of 2304, `act`
         // and `out` 8 m pairs of 1152 and 2304, the weights the kernel's shapes for every
-        // expert id the router writes, and `sync` 1 + 8 m counters, zero as the kernel
+        // expert id the router writes, and `sync` a counter per column group, zero as the kernel
         // leaves them. The grid holds only blocks that fit on the GPU at once with the
         // ring's shared memory, which the kernel's waits need. Only the NVFP4 kernels read
         // the global scales. The kernel reads nothing before `pdl_wait`.

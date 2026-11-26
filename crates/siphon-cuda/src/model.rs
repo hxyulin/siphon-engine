@@ -911,7 +911,7 @@ impl Model {
             .flatten()
         {
             if p.sample.is_none() {
-                p.sample = Some(SampleBuffers::new(&stream, VERIFY_ROWS)?);
+                p.sample = Some(SampleBuffers::new(&stream, p.rows)?);
             }
         }
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
@@ -2010,7 +2010,7 @@ impl Ctx {
     /// and `k`, as one batch.
     ///
     /// Runs the tensor-core GEMM, which hands `m = 1` to the batched GEMV, unless
-    /// `invariant`. With `invariant`, `m` is at most 8 and the multi-row products of
+    /// `invariant`. With `invariant`, `m` is at most 32 and the multi-row products of
     /// [`LinearRows`] run: each row's result is the same, bit for bit, for every `m` and
     /// whatever the other rows hold, and the FP8 copies stream when every product has one.
     ///

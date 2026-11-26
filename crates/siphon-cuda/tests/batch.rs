@@ -12,7 +12,8 @@
 //! The prompts are slices of the tokens of `reference/out/anyhow-chunked.safetensors` (or
 //! `SIPHON_CAPTURE`), of lengths on both sides of the sliding-window wrap at 1024. The
 //! sequences join and leave the batch at different steps, so the batch size, the rows'
-//! order and their positions all change during the run.
+//! order and their positions all change during the run. `batch_matches_alone_*` runs 5
+//! sequences, `_16_*` and `_32_*` that many, which fill a batch of 16 or 32 rows.
 //!
 //! `shared_prefill_matches_separate` checks the server's prefill sharing for requests with
 //! `n` choices: one slot prefills a prompt, `Model::move_slot` copies it into the others,
@@ -46,6 +47,22 @@ const STEPS: usize = 40;
 /// The batched step at which each sequence starts decoding.
 const JOINS: [usize; 5] = [0, 0, 3, 7, 12];
 const CAPACITY: usize = 4096;
+
+/// (first token, length, joining step) of `n` sequences: [`PROMPTS`] and [`JOINS`], then
+/// more of the same lengths from other places in the capture, joining at steps 0 to 12.
+fn sequences(n: usize) -> Vec<(usize, usize, usize)> {
+    (0..n)
+        .map(|i| {
+            let (first, len) = PROMPTS[i % PROMPTS.len()];
+            let round = i / PROMPTS.len();
+            (
+                first + 211 * round,
+                len + 3 * round,
+                (JOINS[i % JOINS.len()] + round) % 13,
+            )
+        })
+        .collect()
+}
 
 fn capture_tokens() -> anyhow::Result<Vec<u32>> {
     let path = env::var_os("SIPHON_CAPTURE").map_or_else(
@@ -101,13 +118,14 @@ fn alone(model: &mut Model, prompt: &[u32]) -> anyhow::Result<(Vec<u32>, Vec<u64
     Ok((tokens, hashes))
 }
 
-fn batch_matches_alone(kv: KvFormat, weights: WeightFormat) -> anyhow::Result<()> {
+fn batch_matches_alone(kv: KvFormat, weights: WeightFormat, n: usize) -> anyhow::Result<()> {
     let (_gpu, mut model) = load(kv, weights)?;
     let vocab = model.config().unpadded_vocab_size;
     let capture = capture_tokens()?;
-    let prompts: Vec<&[u32]> = PROMPTS
+    let sequences = sequences(n);
+    let prompts: Vec<&[u32]> = sequences
         .iter()
-        .map(|&(first, len)| &capture[first..first + len])
+        .map(|&(first, len, _)| &capture[first..first + len])
         .collect();
     let want = prompts
         .iter()
@@ -135,11 +153,13 @@ fn batch_matches_alone(kv: KvFormat, weights: WeightFormat) -> anyhow::Result<()
         got.push((vec![first], Vec::new()));
     }
     let mut step = 0;
+    let mut widest = 0;
     while got.iter().any(|(tokens, _)| tokens.len() <= STEPS) {
         // Joined sequences that still need tokens, the later joiners first.
         let mut rows: Vec<usize> = (0..prompts.len())
-            .filter(|&i| JOINS[i] <= step && got[i].0.len() <= STEPS)
+            .filter(|&i| sequences[i].2 <= step && got[i].0.len() <= STEPS)
             .collect();
+        widest = widest.max(rows.len());
         rows.reverse();
         let batch: Vec<(usize, u32)> = rows
             .iter()
@@ -165,19 +185,45 @@ fn batch_matches_alone(kv: KvFormat, weights: WeightFormat) -> anyhow::Result<()
             "prompt {i}: the batch differs from one-row verifies"
         );
     }
+    println!("{n} sequences, at most {widest} rows per step");
+    ensure!(widest == n, "the batch never held all {n} sequences");
     Ok(())
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn batch_matches_alone_fp8() -> anyhow::Result<()> {
-    batch_matches_alone(KvFormat::Fp8, WeightFormat::Fp8)
+    batch_matches_alone(KvFormat::Fp8, WeightFormat::Fp8, PROMPTS.len())
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn batch_matches_alone_bf16() -> anyhow::Result<()> {
-    batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16)
+    batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16, PROMPTS.len())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_16_fp8() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Fp8, WeightFormat::Fp8, 16)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_16_bf16() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16, 16)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_32_fp8() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Fp8, WeightFormat::Fp8, 32)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_32_bf16() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16, 32)
 }
 
 /// Each slot's tokens and logits' hashes for `STEPS` batched steps of slots `0..firsts.len()`

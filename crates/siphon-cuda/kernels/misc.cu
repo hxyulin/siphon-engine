@@ -1120,8 +1120,9 @@ message_gate_norm_rows_2304(const float* out, const __nv_bfloat16* __restrict__ 
 }
 
 // ---------------------------------------------------------------------------
-// The whole MessageGate for the rows of a verify chunk (1 to 8 rows), up to three gates
-// per launch, one cluster of 16 blocks per gate (blockIdx.y). It sums as the three
+// The whole MessageGate for the rows of a verify chunk or a batched step (1 to 32 rows),
+// up to three gates per launch, one cluster of 16 blocks per gate (blockIdx.y) and group
+// of 8 rows (blockIdx.z). It sums as the three
 // kernels it replaces do: the down projection of rows_*_k4608 (linear_rows.cu), then
 // message_gate_out_rows_2304 with a rebuilt message, then message_gate_norm_rows_2304.
 // So its results equal theirs bit for bit, and each row's result depends on that row
@@ -1276,7 +1277,9 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     const int gq = lane / 4;
     const int tq = lane % 4;
     const uint32_t rank = gate_cluster_rank();
-    const int rows = a.rows;
+    // This cluster's rows: row0 .. row0 + rows - 1 of the launch.
+    const int row0 = int(blockIdx.z) * kMaxRows;
+    const int rows = min(a.rows - row0, kMaxRows);
     const uint32_t parts_barrier = gate_smem_addr(&arrived[0]);
     const uint32_t down_barrier = gate_smem_addr(&arrived[1]);
     if (t == 0) {
@@ -1361,8 +1364,10 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
         // Every stage's inputs, then the products in rows_product's order. Stages below
         // kS / 2 cover the state, the rest the message.
         static_assert(kS % 2 == 0, "no stage spans both halves");
-        const uint4* xs = reinterpret_cast<const uint4*>(a.g[gate].x_state + size_t(gq) * a.x_state_stride);
-        const uint4* xm = reinterpret_cast<const uint4*>(a.g[gate].x_message + size_t(gq) * a.x_message_stride);
+        const uint4* xs =
+            reinterpret_cast<const uint4*>(a.g[gate].x_state + size_t(row0 + gq) * a.x_state_stride);
+        const uint4* xm =
+            reinterpret_cast<const uint4*>(a.g[gate].x_message + size_t(row0 + gq) * a.x_message_stride);
         const bool live = gq < rows;
         uint4 xv[kMS][kXVecs];
 #pragma unroll
@@ -1470,7 +1475,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
         gate_mma(acc_g[1], af, bg[2], bg[3]);
     }
     if (gq < rows) {
-        const int row = gq;
+        const int row = row0 + gq;
         const float* pw = a.g[gate].probs + size_t(row) * a.probs_stride;
         const int nb = a.nb;
         float wi[kGtMaxBlocks];
@@ -1520,8 +1525,8 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     if (int(rank) >= rows) {
         return;
     }
-    // message_gate_norm_rows_2304 for row `rank`.
-    const size_t at = size_t(rank) * kHidden;
+    // message_gate_norm_rows_2304 for row `rank` of the cluster's rows.
+    const size_t at = size_t(row0 + int(rank)) * kHidden;
     const float4 av = __ldcg(reinterpret_cast<const float4*>(a.g[gate].out + at + ca));
     const float4 bv = __ldcg(reinterpret_cast<const float4*>(a.g[gate].out + at + cb));
     const float va[4] = {av.x, av.y, av.z, av.w};
@@ -1561,7 +1566,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
 }  // namespace gate_rows
 
 // gate_rows::run with BF16 down weights, and with E4M3 down weights. The grid is
-// (16, gates) blocks of 288 threads, one cluster per gate, with
+// (16, gates, ceil(rows / 8)) blocks of 288 threads, one cluster per gate and 8 rows, with
 // gate_rows::smem_bytes<fp8>() bytes of dynamic shared memory.
 extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
 message_gate_rows_2304(const __grid_constant__ gate_rows::GateRowsArgs args) {

@@ -30,11 +30,11 @@ use super::{
 use crate::ops::{
     attention::{HEAD_DIM, KV_HEADS, KvCache, KvData, KvFormat},
     sample::SampleBuffers,
-    spec::{BATCH_STATE_WORDS, BatchRows, VERIFY_ROWS},
+    spec::{BATCH_STATE_WORDS, BatchRows},
 };
 
 /// Most sequences one batched step runs.
-pub const BATCH_ROWS: usize = VERIFY_ROWS;
+pub use crate::ops::spec::BATCH_ROWS;
 
 /// A sequence slot besides slot 0: its caches and position.
 #[derive(Debug)]
@@ -48,7 +48,9 @@ pub(super) struct Slot {
 
 /// What a batched step keeps besides a chunk's intermediates.
 pub(super) struct BatchBuffers {
-    /// Each visit's state table, `[visits, BATCH_ROWS, BATCH_STATE_WORDS]` device addresses
+    /// Most rows a step takes: the slots when the buffers were made, up to [`BATCH_ROWS`].
+    max_rows: usize,
+    /// Each visit's state table, `[visits, max_rows, BATCH_STATE_WORDS]` device addresses
     /// (see [`BATCH_STATE_WORDS`]).
     tables: CudaSlice<u64>,
     /// Each row's position.
@@ -60,25 +62,26 @@ pub(super) struct BatchBuffers {
 }
 
 impl BatchBuffers {
-    fn new(stream: &Arc<CudaStream>, visits: usize) -> anyhow::Result<Self> {
+    fn new(stream: &Arc<CudaStream>, visits: usize, max_rows: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            tables: zeros(stream, visits * BATCH_ROWS * BATCH_STATE_WORDS)?,
-            positions: zeros(stream, BATCH_ROWS)?,
-            argmax: zeros(stream, BATCH_ROWS)?,
+            max_rows,
+            tables: zeros(stream, visits * max_rows * BATCH_STATE_WORDS)?,
+            positions: zeros(stream, max_rows)?,
+            argmax: zeros(stream, max_rows)?,
             members: Vec::new(),
         })
     }
 
     /// The rows' states in visit `visit`, for a step of `rows` rows.
     pub(super) fn rows(&self, visit: usize, rows: usize) -> BatchRows<'_> {
-        let at = visit * BATCH_ROWS * BATCH_STATE_WORDS;
+        let at = visit * self.max_rows * BATCH_STATE_WORDS;
         BatchRows {
             states: self.tables.slice(at..at + rows * BATCH_STATE_WORDS),
             positions: self.positions.slice(..rows),
         }
     }
 
-    /// Each row's token, greedy or drawn, `[BATCH_ROWS]`.
+    /// Each row's token, greedy or drawn, `[max_rows]`.
     pub(super) fn argmax_mut(&mut self) -> &mut CudaSlice<i32> {
         &mut self.argmax
     }
@@ -279,7 +282,7 @@ impl Model {
             .taps
             .as_ref()
             .context("batched steps do not record taps")?;
-        ensure!(row < BATCH_ROWS, "a batch has at most {BATCH_ROWS} rows");
+        ensure!(row < p.rows, "a batch has at most {} rows", p.rows);
         let row_len = p.tap_layout.len() * self.ctx.hidden();
         Ok(taps.slice(row * row_len..(row + 1) * row_len))
     }
@@ -374,7 +377,7 @@ impl Model {
             positions.push(u32::try_from(position).context("position does not fit the kernels")?);
             tokens.push(i32::try_from(token)?);
         }
-        self.ensure_batch()?;
+        self.ensure_batch(m)?;
         let stream = Arc::clone(&self.ctx.stream);
         let members: Vec<usize> = rows.iter().map(|&(slot, _)| slot).collect();
         let p = self
@@ -383,8 +386,8 @@ impl Model {
             .context("the batch buffers are missing")?;
         let b = p.batch.as_mut().context("the batch buffers are missing")?;
         if b.members != members {
-            // Every visit's table, BATCH_ROWS lines each.
-            let mut table = vec![0u64; self.visits.len() * BATCH_ROWS * BATCH_STATE_WORDS];
+            // Every visit's table, max_rows lines each.
+            let mut table = vec![0u64; self.visits.len() * b.max_rows * BATCH_STATE_WORDS];
             for (r, &slot) in members.iter().enumerate() {
                 let visits = if slot == 0 {
                     &self.visits
@@ -392,7 +395,7 @@ impl Model {
                     &self.slots[slot - 1].visits
                 };
                 for (i, v) in visits.iter().enumerate() {
-                    let at = (i * BATCH_ROWS + r) * BATCH_STATE_WORDS;
+                    let at = (i * b.max_rows + r) * BATCH_STATE_WORDS;
                     table[at..at + BATCH_STATE_WORDS].copy_from_slice(&state_words(&stream, v));
                 }
             }
@@ -432,29 +435,34 @@ impl Model {
     /// `[rows, unpadded_vocab]`.
     pub fn batch_logits(&self, rows: usize) -> anyhow::Result<Vec<f32>> {
         let p = self.batch.as_ref().context("no batched step has run")?;
-        ensure!(rows <= BATCH_ROWS, "a batch has at most {BATCH_ROWS} rows");
+        ensure!(rows <= p.rows, "a batch has at most {} rows", p.rows);
         let n = rows * self.ctx.config.unpadded_vocab_size;
         Ok(self.ctx.stream.clone_dtoh(&p.head_capped.slice(..n))?)
     }
 
-    fn ensure_batch(&mut self) -> anyhow::Result<()> {
-        if self.batch.is_some() {
+    /// Makes the batched step's buffers for one row per slot, or for at least `m` rows,
+    /// unless large enough ones exist. New buffers drop the graphs, which hold the old
+    /// ones' addresses.
+    fn ensure_batch(&mut self, m: usize) -> anyhow::Result<()> {
+        let rows = self.slots().max(m).min(BATCH_ROWS);
+        if self.batch.as_ref().is_some_and(|p| p.rows >= rows) {
             return Ok(());
         }
+        self.batch = None;
+        self.batch_graphs.iter_mut().for_each(|g| *g = None);
         let stream = &self.ctx.stream;
-        let mut p =
-            PrefillScratch::new(stream, &self.ctx.config, self.max_blocks, BATCH_ROWS, true)?;
+        let mut p = PrefillScratch::new(stream, &self.ctx.config, self.max_blocks, rows, true)?;
         if self.batch_taps {
             p.record_taps = true;
             p.tap_layout = self.tap_layout.clone();
             p.taps = Some(zeros(
                 stream,
-                BATCH_ROWS * p.tap_layout.len() * self.ctx.hidden(),
+                rows * p.tap_layout.len() * self.ctx.hidden(),
             )?);
         }
-        p.batch = Some(BatchBuffers::new(stream, self.visits.len())?);
+        p.batch = Some(BatchBuffers::new(stream, self.visits.len(), rows)?);
         if self.sampler {
-            p.sample = Some(SampleBuffers::new(stream, BATCH_ROWS)?);
+            p.sample = Some(SampleBuffers::new(stream, rows)?);
         }
         self.batch = Some(p);
         Ok(())

@@ -15,7 +15,7 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::spec::BATCH_STATE_WORDS,
+    ops::spec::{BATCH_ROWS, BATCH_STATE_WORDS},
 };
 
 /// Taps per channel.
@@ -488,8 +488,8 @@ impl Conv {
         let proj = proj.view();
         let mut residual = residual.view_mut();
         ensure!(
-            (1..=MOE_CONV_ROWS).contains(&rows),
-            "{rows} rows, expected 1 to {MOE_CONV_ROWS}"
+            (1..=BATCH_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {BATCH_ROWS}"
         );
         check_len("weight", weight.len(), HIDDEN * KERNEL)?;
         check_len("proj", proj.len(), rows * HIDDEN)?;
@@ -533,8 +533,8 @@ impl Conv {
         let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
         let mut out = out.view_mut();
         ensure!(
-            (1..=MOE_CONV_ROWS).contains(&rows),
-            "{rows} rows, expected 1 to {MOE_CONV_ROWS}"
+            (1..=BATCH_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {BATCH_ROWS}"
         );
         check_len("weight", weight.len(), HIDDEN * KERNEL)?;
         check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;

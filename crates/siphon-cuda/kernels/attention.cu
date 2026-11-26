@@ -3297,8 +3297,11 @@ constexpr int kBatchStateWords = 6;
 // rows' state tables, [rows, kBatchStateWords] addresses; positions: [rows]. q, k_new,
 // v_new, bias, sinks, gate and out are [rows, ...] as in attention_rows; each row takes
 // its own 24 query rows of the partials and its own 16 counters ([rows, 16]). A one-row
-// instance has 3 combiners, so at most 2 blocks per instance wait: 128 in a batch of 8,
-// fewer than the GPU holds at once, so the blocks they wait for always get an SM.
+// instance has 3 combiners, so at most 2 blocks per KV head and instance wait, for blocks
+// of their own instance. The GPU starts blocks in index order, z last, so a waiting block
+// whose instance has a block not yet started is in the instance being started: at most
+// 16 blocks wait for blocks that have no SM yet, far fewer than the GPU holds at once
+// (376 on 188 SMs), and every other waiting block waits for blocks that are running.
 // Grid (8, kRowsBlocks + kRowsRecentBlocks, rows), 128 threads, sizeof(RowsShared<F>)
 // bytes of dynamic shared memory.
 template <class F>

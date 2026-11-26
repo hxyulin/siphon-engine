@@ -35,8 +35,10 @@ const GATE_TILE_THREADS: u32 = 256;
 
 /// Block states a message rebuilt by [`Misc::message_gate_out_rows`] can mix.
 const GATE_MAX_BLOCKS: usize = 5;
-/// Most rows of [`Misc::message_gate_rows`].
-pub const GATE_ROWS_MAX: usize = 8;
+/// Rows of one cluster of [`Misc::message_gate_rows`], `gate_rows::kMaxRows` in the kernel.
+const GATE_CLUSTER_ROWS: usize = 8;
+/// Most rows of [`Misc::message_gate_rows`]: four clusters per gate.
+pub const GATE_ROWS_MAX: usize = 4 * GATE_CLUSTER_ROWS;
 /// Dynamic shared memory of `message_gate_rows_2304` and `message_gate_rows_fp8_2304`,
 /// `gate_rows::smem_bytes` in the kernel: the down stages of two warp splits (5 of 4 KiB
 /// each for BF16 weights, 3 for FP8), then the block's forget and gain rows.
@@ -816,14 +818,18 @@ impl Misc {
             (&self.message_gate_rows_2304, GATE_ROWS_SMEM_BF16)
         };
         let config = LaunchConfig {
-            grid_dim: (GATE_CLUSTER, u32::try_from(n)?, 1),
+            grid_dim: (
+                GATE_CLUSTER,
+                u32::try_from(n)?,
+                u32::try_from(rows.div_ceil(GATE_CLUSTER_ROWS))?,
+            ),
             block_dim: (GATE_OUT_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
         // SAFETY: `args` has the layout of `gate_rows::GateRowsArgs`. The checks above size every
         // buffer for `rows` rows of the `n` gates of the grid's y dimension, the message
         // weights for `nb` block states, and the grid is one cluster of 16 blocks per gate
-        // as the kernel is compiled, with its dynamic shared memory. The kernel reads only
+        // and 8 rows as the kernel is compiled, with its dynamic shared memory. The kernel reads only
         // weights before `pdl_wait`.
         unsafe { launch_by_value(stream, function, config, &args, true) }
     }

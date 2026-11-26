@@ -15,6 +15,11 @@ use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 use anyhow::{Context as _, bail, ensure};
 use serde_json::json;
 
+/// Requests that may run at once: up to the rows of a batched step.
+const STREAMS: std::ops::RangeInclusive<usize> = 1..=32;
+#[cfg(target_os = "linux")]
+const _: () = assert!(*STREAMS.end() == siphon::memory::BATCH_ROWS);
+
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
@@ -23,7 +28,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
---streams runs up to N requests at once (1 to 8), each with its own KV cache of --context
+--streams runs up to N requests at once (1 to 32), each with its own KV cache of --context
 positions. A request alone speculates; once another arrives, all run batched plain decode.
 Either way a request gets the same tokens. Up to --queue more requests wait.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
@@ -107,7 +112,7 @@ fn args() -> anyhow::Result<Args> {
             "--queue" => queue = value()?.parse()?,
             "--streams" => {
                 streams = value()?.parse()?;
-                ensure!((1..=8).contains(&streams), "--streams takes 1 to 8");
+                ensure!(STREAMS.contains(&streams), "--streams takes 1 to 32");
             }
             "--drafter" => drafter = Some(PathBuf::from(value()?)),
             "--draft" => draft = value()?,

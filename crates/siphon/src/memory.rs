@@ -35,12 +35,21 @@ pub const CONTEXT_BYTES: usize = 512 << 20;
 /// capacities from 65,536 to the largest that fit. This is the largest, rounded up.
 pub const RUNTIME_BYTES: usize = 128 << 20;
 
+/// What each stream past the first adds beyond its counted buffers: the CUDA graph of one
+/// more batch size and the allocator's rounding of its caches' buffers. Measured on an RTX
+/// PRO 6000 Blackwell Max-Q with `siphon-serve --context 16384`: the modules and graphs
+/// took 0.03 GiB at 1 stream and 0.11 GiB at 32, and the peak after a request came 48 MiB
+/// under the plan without this at 1 stream and 11 to 43 MiB over it at 32.
+pub const STREAM_RUNTIME_BYTES: usize = 4 << 20;
+
 /// Free memory a plan leaves unclaimed, for other processes on the GPU and the
 /// allocator's growth past the plan.
 pub const SAFETY_MARGIN: usize = 512 << 20;
 
 /// Rows of the largest verify pass.
 pub const VERIFY_ROWS: usize = 8;
+/// Rows of the largest batched step: one per stream.
+pub const BATCH_ROWS: usize = 32;
 /// Draft tokens per round; a draft's capacity is the target's plus this and the anchor.
 pub const DRAFT_STEPS: usize = 7;
 /// Slots of the bundled draft's sliding rings: a window of 1024 and a block of 8.
@@ -117,8 +126,8 @@ pub struct PlanInputs<'a> {
     pub draft: DraftChoice<'a>,
     /// Rows of the largest prefill chunk, or 0 if nothing prefills.
     pub prefill_chunk: usize,
-    /// Sequence slots, each with its own caches of the capacity, 1 to [`VERIFY_ROWS`].
-    /// More than one adds the batched step's buffers.
+    /// Sequence slots, each with its own caches of the capacity, 1 to [`BATCH_ROWS`].
+    /// More than one adds the batched step's buffers, sized for one row per slot.
     pub streams: usize,
     /// Entries of the speculator's prefix cache, 0 for none: each copies one slot's
     /// sliding rings and conv states and the draft's rings.
@@ -155,7 +164,7 @@ pub struct Plan {
     pub draft_kv: usize,
     /// The prefix cache's copies of the rings and conv states.
     pub prefix: usize,
-    /// [`RUNTIME_BYTES`].
+    /// [`RUNTIME_BYTES`], and [`STREAM_RUNTIME_BYTES`] per stream past the first.
     pub runtime: usize,
 }
 
@@ -281,8 +290,8 @@ impl Planner {
 
         let streams = inputs.streams;
         ensure!(
-            (1..=VERIFY_ROWS).contains(&streams),
-            "{streams} streams; 1 to {VERIFY_ROWS} fit a batched step"
+            (1..=BATCH_ROWS).contains(&streams),
+            "{streams} streams; 1 to {BATCH_ROWS} fit a batched step"
         );
         // One slot's sliding rings and conv states.
         let slot_rings = sliding_visits * c.sliding_window_size * 2 * kv_dims * 2
@@ -323,14 +332,14 @@ impl Planner {
             }
         };
         let kv_per_position = streams * global_visits * 2 * kv_dims * inputs.kv.element_bytes();
-        // The batched step's chunk buffers, its state tables, positions and tokens, and its
-        // rows' taps for the draft.
+        // The batched step's chunk buffers for one row per stream, its state tables,
+        // positions and tokens, and its rows' taps for the draft.
         let batch = if streams > 1 {
-            rows_scratch(c, VERIFY_ROWS, inputs.sms)
-                + invariant_scratch(c, VERIFY_ROWS)
-                + visits.len() * VERIFY_ROWS * 6 * 8
-                + VERIFY_ROWS * 8
-                + VERIFY_ROWS * taps * hidden * 2
+            rows_scratch(c, streams, inputs.sms)
+                + invariant_scratch(c, streams)
+                + visits.len() * streams * 6 * 8
+                + streams * 8
+                + streams * taps * hidden * 2
         } else {
             0
         };
@@ -354,7 +363,7 @@ impl Planner {
             draft: draft_bytes,
             draft_kv: (DRAFT_STEPS + 1) * draft_kv_per_position,
             prefix,
-            runtime: RUNTIME_BYTES,
+            runtime: RUNTIME_BYTES + (streams - 1) * STREAM_RUNTIME_BYTES,
         };
         Ok(Self {
             fixed,
@@ -535,7 +544,7 @@ fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
     let pairs = rows * top_k;
     let quantized = pairs * width.max(hidden / top_k);
     let per_rows = rows * (2 * bf16_per_row + 4 * f32_per_row + 4)
-        + 4 * (1 + pairs) // expert counters
+        + 4 * (1 + pairs + rows) // expert counters
         + 4 * pairs // perm
         + 16 * pairs.min(pairs / 64 + experts) // tiles
         + quantized + quantized / 16 + 4 * pairs
@@ -560,7 +569,13 @@ fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
 fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     let hidden = c.hidden_size;
     let looped = c.loop_config.core_end - c.loop_config.core_start;
+    // The multi-row attention's partials and counters past the 8 rows `rows_scratch`
+    // counts, for a batched step's rows.
+    let attention = rows.saturating_sub(VERIFY_ROWS)
+        * (ROWS_ATTENTION_ROWS / VERIFY_ROWS * (c.head_dim + 2) * 4
+            + 2 * c.num_key_value_heads * 4);
     rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2 + 2 * hidden * 4)
+        + attention
 }
 
 /// The bundled draft's shape: the checkpoint's tensors outside the text and vision models

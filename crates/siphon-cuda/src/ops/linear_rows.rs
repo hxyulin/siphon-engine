@@ -1,4 +1,4 @@
-//! Dense products of 1 to 8 rows with BF16 or FP8 weights (`kernels/linear_rows.cu`).
+//! Dense products of 1 to 32 rows with BF16 or FP8 weights (`kernels/linear_rows.cu`).
 //!
 //! [`LinearRows::run`] computes `out [m, n] = x [m, k] @ weight [n, k]^T` for a batch of
 //! products that share `k` and the weight format, streaming each weight from DRAM once for
@@ -7,7 +7,7 @@
 //! [`crate::ops::linear_fp8::LinearFp8::quantize`].
 //!
 //! Each output row depends on its input row only, bit for bit: it is the same for every
-//! `m` from 1 to 8, whatever the other rows hold. The sums run on tensor cores in F32, in
+//! `m` from 1 to 32, whatever the other rows hold. The sums run on tensor cores in F32, in
 //! an order that differs from the decode GEMVs' and the prefill GEMM's.
 
 use std::sync::Arc;
@@ -30,8 +30,12 @@ use crate::{
 
 /// Products one launch accepts, `kMaxSegments` in the kernel.
 pub const MAX_PRODUCTS: usize = 8;
-/// Most rows one launch takes: the 8 columns of an `m16n8k16` product.
-pub const MAX_ROWS: usize = 8;
+/// Rows of one column tile: the 8 columns of an `m16n8k16` product.
+const TILE_COLUMNS: usize = 8;
+/// Most column tiles one launch runs, `NT` of the kernel's entry points.
+const MAX_TILES: usize = 4;
+/// Most rows one launch takes.
+pub const MAX_ROWS: usize = TILE_COLUMNS * MAX_TILES;
 /// Weight rows per block, `kTileRows` in the kernel.
 const TILE_ROWS: usize = 16;
 /// Most warps per block, `kMaxWarps` in the kernel.
@@ -117,12 +121,13 @@ struct Batch {
     pdl: i32,
 }
 
-/// One entry point: its weight format and the `k` it serves.
+/// One weight format and `k`: its entry point for each count of column tiles, 1 to
+/// [`MAX_TILES`].
 #[derive(Debug)]
 struct Entry {
     fp8: bool,
     k: usize,
-    function: CudaFunction,
+    functions: Vec<CudaFunction>,
 }
 
 #[derive(Debug)]
@@ -143,14 +148,24 @@ impl LinearRows {
             (false, 4608, "rows_bf16_k4608"),
             (true, 4608, "rows_fp8_k4608"),
         ] {
-            let function = module.load_function(name)?;
-            function
-                .set_attribute(
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    smem,
-                )
-                .with_context(|| format!("raising the shared memory of {name}"))?;
-            entries.push(Entry { fp8, k, function });
+            let functions = (1..=MAX_TILES)
+                .map(|tiles| {
+                    let name = if tiles == 1 {
+                        name.to_owned()
+                    } else {
+                        format!("{name}_{tiles}")
+                    };
+                    let function = module.load_function(&name)?;
+                    function
+                        .set_attribute(
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem,
+                        )
+                        .with_context(|| format!("raising the shared memory of {name}"))?;
+                    Ok(function)
+                })
+                .collect::<anyhow::Result<_>>()?;
+            entries.push(Entry { fp8, k, functions });
         }
         Ok(Self { entries })
     }
@@ -278,7 +293,7 @@ impl LinearRows {
         unsafe {
             launch_by_value(
                 stream,
-                &entry.function,
+                &entry.functions[m.div_ceil(TILE_COLUMNS) - 1],
                 config,
                 &batch,
                 start == Start::Early,

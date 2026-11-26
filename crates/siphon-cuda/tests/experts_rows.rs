@@ -133,16 +133,23 @@ impl Projection {
 
 /// 8 distinct experts per row; rows overlap, as consecutive tokens do.
 fn routing(rows: usize, seed: u64) -> Vec<i32> {
+    routing_sharing(rows, seed, 0)
+}
+
+/// [`routing`] in which every row also routes to experts 0 to `shared - 1`, at slots that
+/// change from row to row, so those experts have a pair in every row.
+fn routing_sharing(rows: usize, seed: u64, shared: i32) -> Vec<i32> {
     let mut random = SplitMix(seed);
     let mut ids = Vec::with_capacity(rows * SLOTS);
-    for _ in 0..rows {
-        let mut picked: Vec<i32> = Vec::new();
+    for r in 0..rows {
+        let mut picked: Vec<i32> = (0..shared).collect();
         while picked.len() < SLOTS {
             let e = i32::from(random.byte()) % i32::try_from(EXPERTS).expect("fits");
             if !picked.contains(&e) {
                 picked.push(e);
             }
         }
+        picked.rotate_left(r % SLOTS);
         ids.extend(picked);
     }
     ids
@@ -200,11 +207,18 @@ fn rows_are_invariant() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
     let mut sync = stream.alloc_zeros::<u32>(1 + MAX_ROWS * SLOTS)?;
-    for fp4 in [true, false] {
-        let name = if fp4 { "nvfp4" } else { "mxfp8" };
+    // Random routing, then three experts that every row routes to, so that their pairs fill
+    // every column tile.
+    for (fp4, shared) in [(true, 0), (false, 0), (true, 3), (false, 3)] {
+        let name = match (fp4, shared) {
+            (true, 0) => "nvfp4",
+            (false, 0) => "mxfp8",
+            (true, _) => "nvfp4, shared experts",
+            (false, _) => "mxfp8, shared experts",
+        };
         let l = layer(&s, fp4)?;
         let x = common::pseudo_random_bf16(MAX_ROWS * HIDDEN, 5, 1.0, 0.0);
-        let ids = routing(MAX_ROWS, 7);
+        let ids = routing_sharing(MAX_ROWS, 7, shared);
         let (act8, out8) = run_rows(&s, &l, &x, &ids, &mut sync)?;
         let (again_act, again_out) = run_rows(&s, &l, &x, &ids, &mut sync)?;
         assert!(
@@ -217,7 +231,7 @@ fn rows_are_invariant() -> anyhow::Result<()> {
             let (act, out) = run_rows(&s, &l, &x[..m * HIDDEN], &ids[..m * SLOTS], &mut sync)?;
             assert!(
                 same(&act, &act8[..act.len()]) && same(&out, &out8[..out.len()]),
-                "{name}: rows of m = {m} differ from m = 8"
+                "{name}: rows of m = {m} differ from m = {MAX_ROWS}"
             );
         }
         for r in 0..MAX_ROWS {
@@ -230,13 +244,13 @@ fn rows_are_invariant() -> anyhow::Result<()> {
             )?;
             assert!(
                 same(&act, &act8[pair_act(r)]) && same(&out, &out8[pair_out(r)]),
-                "{name}: row {r} alone differs from row {r} of 8"
+                "{name}: row {r} alone differs from row {r} of {MAX_ROWS}"
             );
         }
         // Row 0 unchanged, the other rows with other inputs and other experts.
         let mut x_other = common::pseudo_random_bf16(MAX_ROWS * HIDDEN, 9, 30.0, 0.5);
         x_other[..HIDDEN].copy_from_slice(&x[..HIDDEN]);
-        let mut ids_other = routing(MAX_ROWS, 21);
+        let mut ids_other = routing_sharing(MAX_ROWS, 21, shared);
         ids_other[..SLOTS].copy_from_slice(&ids[..SLOTS]);
         let (act, out) = run_rows(&s, &l, &x_other, &ids_other, &mut sync)?;
         assert!(
@@ -244,7 +258,7 @@ fn rows_are_invariant() -> anyhow::Result<()> {
                 && same(&out[pair_out(0)], &out8[pair_out(0)]),
             "{name}: row 0 depends on the other rows"
         );
-        eprintln!("{name}: pairs bit-identical for m = 1 to 8, alone and with other rows");
+        eprintln!("{name}: pairs bit-identical for m = 1 to {MAX_ROWS}, alone and with other rows");
     }
     Ok(())
 }

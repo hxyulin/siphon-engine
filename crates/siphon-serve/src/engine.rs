@@ -227,7 +227,7 @@ pub struct Options {
     pub widths: Vec<usize>,
     /// Jobs that wait while `streams` run.
     pub queue: usize,
-    /// Requests that run at once, each in its own sequence slot, 1 to 8.
+    /// Requests that run at once, each in its own sequence slot, 1 to 32.
     pub streams: usize,
     /// A DFlash draft's export directory, in place of the bundled draft.
     pub drafter: Option<PathBuf>,

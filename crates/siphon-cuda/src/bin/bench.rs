@@ -33,7 +33,8 @@
 //! For each context and batch size, every sequence's caches skip to that length, and the
 //! runner times `--steps` batched steps after `--warmup`, and plain steps and one-row
 //! verifies for comparison, each the median step. Row r feeds the capture's tokens from
-//! offset r / 8 of its length on, so the rows route their experts as different texts do.
+//! offset (r mod 8) / 8 + (r div 8) / 32 of its length on, so the rows route their experts
+//! as different texts do.
 //! It prints the time per step and the tokens per second in all and per sequence, and the
 //! mean batched step. With `--follow`, the bundled draft follows row 0 as siphon-serve's
 //! does: batched steps record their rows' taps, and the draft keeps row 0's and commits
@@ -653,9 +654,9 @@ mod linux {
     }
 
     /// `--batch`: batched steps of each size at each context, against a plain step and a
-    /// one-row verify there. Row r feeds the capture's tokens from offset r / 8 of its
-    /// length on, whatever the model predicts, so that the rows route as different texts
-    /// do.
+    /// one-row verify there. Row r feeds the capture's tokens from offset
+    /// (r mod 8) / 8 + (r div 8) / 32 of its length on, whatever the model predicts, so
+    /// that the rows route as different texts do.
     #[expect(clippy::too_many_lines, reason = "one table of runs")]
     fn bench_batch(args: &Args, sizes: &[usize]) -> anyhow::Result<()> {
         let largest = sizes.iter().max().copied().unwrap_or(1);
@@ -665,8 +666,10 @@ mod linux {
         );
         let text = tokens(args.prompt.as_deref().context("--batch needs --prompt")?)?;
         ensure!(text.len() >= 8 * 64, "the capture is too short");
-        let token =
-            |row: usize, step: usize| text[(row * text.len() / BATCH_ROWS + step) % text.len()];
+        let token = |row: usize, step: usize| {
+            let offset = row % 8 * text.len() / 8 + row / 8 * text.len() / 32;
+            text[(offset + step) % text.len()]
+        };
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let contexts = args.contexts.clone().unwrap_or(DEFAULT_CONTEXTS.to_vec());

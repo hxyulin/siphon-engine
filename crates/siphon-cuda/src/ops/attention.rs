@@ -38,7 +38,7 @@ use crate::{
     ops::{
         Products,
         norm::KvConvWeights,
-        spec::{BATCH_STATE_WORDS, BatchRows},
+        spec::{BATCH_ROWS, BATCH_STATE_WORDS, BatchRows},
     },
 };
 
@@ -406,6 +406,8 @@ pub struct Attention {
 /// return to zero at the end of every call.
 #[derive(Debug)]
 pub struct RowsAttentionScratch {
+    /// Rows the partials and counters serve.
+    rows: usize,
     out: CudaSlice<f32>,
     max: CudaSlice<f32>,
     sum: CudaSlice<f32>,
@@ -413,13 +415,21 @@ pub struct RowsAttentionScratch {
 }
 
 impl RowsAttentionScratch {
-    pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
-        let rows = ROWS_MAX * HEADS * ROWS_PARTS;
+    /// Partials and counters for calls of up to `rows` rows: at least [`ROWS_MAX`] for
+    /// [`Attention::attention_rows`], up to [`BATCH_ROWS`] for [`Attention::attention_batch`].
+    pub fn new(stream: &Arc<CudaStream>, rows: usize) -> anyhow::Result<Self> {
+        ensure!(
+            (1..=BATCH_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {BATCH_ROWS}"
+        );
+        let rows = rows.max(ROWS_MAX);
+        let queries = rows * HEADS * ROWS_PARTS;
         Ok(Self {
-            out: stream.alloc_zeros(rows * HEAD_DIM)?,
-            max: stream.alloc_zeros(rows)?,
-            sum: stream.alloc_zeros(rows)?,
-            counters: stream.alloc_zeros(2 * KV_HEADS * ROWS_MAX)?,
+            rows,
+            out: stream.alloc_zeros(queries * HEAD_DIM)?,
+            max: stream.alloc_zeros(queries)?,
+            sum: stream.alloc_zeros(queries)?,
+            counters: stream.alloc_zeros(2 * KV_HEADS * rows)?,
         })
     }
 }
@@ -588,7 +598,7 @@ impl Attention {
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
-    /// [`Attention::attention_rows`] for the rows of a batched step, 1 to [`ROWS_MAX`],
+    /// [`Attention::attention_rows`] for the rows of a batched step, 1 to [`BATCH_ROWS`],
     /// each the next token of its own sequence: row `r` attends from its query into its own
     /// cache at its own position, as a call with that one row on that cache would, bit for
     /// bit, and its key and value go to that cache. `batch` names each row's caches and
@@ -617,8 +627,9 @@ impl Attention {
             check_len("gate", gate.len(), rows * HEADS * HEAD_DIM)?;
         }
         ensure!(
-            (1..=ROWS_MAX).contains(&rows),
-            "{rows} rows, expected 1 to {ROWS_MAX}"
+            (1..=scratch.rows).contains(&rows),
+            "{rows} rows, the scratch holds {}",
+            scratch.rows
         );
         check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
         check_len("k", k.len(), rows * KV_ROW)?;
@@ -665,7 +676,7 @@ impl Attention {
         // index r runs attention_rows' one-row kernel for row r on the caches of words 0 and
         // 1 of its state table, which the caller keeps live caches of `like`'s format and
         // slots that hold the row's position; the row takes the scratch's partials of query
-        // rows 24 r .. 24 r + 23 and counters 16 r .. 16 r + 15, within the scratch's 8 rows.
+        // rows 24 r .. 24 r + 23 and counters 16 r .. 16 r + 15, within the scratch's rows.
         // Before `pdl_wait` it reads only the table, the positions and the caches, which the
         // host writes before the step and no kernel of the step writes before this one.
         unsafe { args.launch_pdl(stream, function, config) }

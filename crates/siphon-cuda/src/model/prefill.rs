@@ -35,7 +35,7 @@ use crate::{
             DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsBatch, RowsPartial,
         },
         sample::SampleBuffers,
-        spec::{BatchRows, TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
+        spec::{BATCH_ROWS, BatchRows, TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -275,7 +275,8 @@ pub(super) struct PrefillScratch {
 impl PrefillScratch {
     /// Buffers for chunks of up to `rows` rows. With `invariant`, each row's results depend
     /// only on its position, its token and the state before it, bit for bit: not on the
-    /// chunk's start, its row count up to 8 or its other rows. The dense products then run
+    /// chunk's start, its row count (up to 8 in a verify, 32 in a batched step) or its other
+    /// rows. The dense products then run
     /// the multi-row kernels of `ops::linear_rows` (on the FP8 copies when the model has
     /// them), the router and experts those of `Routing::moe_router_step_rows` and
     /// `ops::experts_rows`, and attention those of `Attention::attention_rows`. The verify
@@ -329,7 +330,10 @@ impl PrefillScratch {
             ],
             attention: AttentionRows {
                 invariant,
-                rows: attention::RowsAttentionScratch::new(stream)?,
+                rows: attention::RowsAttentionScratch::new(
+                    stream,
+                    if invariant { rows.min(BATCH_ROWS) } else { 1 },
+                )?,
                 k_raw: zeros(stream, rows * kv_dims)?,
                 v_raw: zeros(stream, rows * kv_dims)?,
                 k_dynamic: zeros(stream, rows * dynamic)?,
@@ -353,7 +357,7 @@ impl PrefillScratch {
             mlp_x: zeros(stream, rows * hidden)?,
             moe: MoeRows {
                 invariant,
-                expert_sync: zeros(stream, 1 + rows * top_k)?,
+                expert_sync: zeros(stream, 1 + rows * (top_k + 1))?,
                 logits: zeros(stream, rows * cfg.n_routed_experts)?,
                 router: RouterRowsScratch::new(stream, rows)?,
                 indices: zeros(stream, rows * top_k)?,
@@ -1068,8 +1072,8 @@ impl Ctx {
         let mh = m * hidden;
         let batch = p.batch.as_ref().map(|b| b.rows(index, m));
         ensure!(
-            batch.is_none() || m <= STEP_ROWS,
-            "a batched step takes at most {STEP_ROWS} rows"
+            batch.is_none() || m <= BATCH_ROWS,
+            "a batched step takes at most {BATCH_ROWS} rows"
         );
         if p.record_taps
             && let Some(tap) = p.tap_layout.visits.iter().position(|&v| v == index)
@@ -1160,8 +1164,9 @@ impl Ctx {
             m,
             batch.as_ref(),
         )?;
-        // Up to STEP_ROWS rows, the kernel that ends the visit shifts every conv state.
-        let step = m <= STEP_ROWS;
+        // Up to STEP_ROWS rows, and in a batched step, the kernel that ends the visit shifts
+        // every conv state.
+        let step = m <= STEP_ROWS || batch.is_some();
 
         // The post-attention conv and residual add run inside the MLP's depth attention.
         // Without message gates, its output goes straight to the router input after the
@@ -1501,6 +1506,9 @@ impl Ctx {
         let heads = cfg.num_attention_heads;
         let taps = cfg.num_key_value_heads * cfg.sconv_kernel_size;
         let invariant = t.invariant;
+        // Up to STEP_ROWS rows, and in a batched step, `attention_post_rows` also computes
+        // the relative bias, and the kernel that ends the visit shifts the conv states.
+        let step = m <= STEP_ROWS || batch.is_some();
         // The FP8 copies in `input_projections` order, which the multi-row products read.
         let fp8 = |i: usize| w.fp8.as_ref().map(|f| &f.inputs[i]);
 
@@ -1562,8 +1570,7 @@ impl Ctx {
                 qk_threshold: cfg.qk_l2_clip_threshold,
                 rel_threshold: cfg.rel_l2_clip_threshold,
                 eps: self.eps(),
-                // Up to STEP_ROWS rows, the same launch computes the relative bias.
-                bias: (m <= STEP_ROWS).then(|| {
+                bias: step.then(|| {
                     (
                         &a.rel_table,
                         rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
@@ -1573,8 +1580,7 @@ impl Ctx {
             },
             m,
         )?;
-        // Up to STEP_ROWS rows, the kernel that ends the visit shifts the states.
-        if m > STEP_ROWS {
+        if !step {
             let [k_state, v_state, ..] = &mut state.conv;
             self.kernels.conv.shift_state(
                 &self.stream,
@@ -1591,7 +1597,7 @@ impl Ctx {
                 m,
             )?;
         }
-        if m > STEP_ROWS {
+        if !step {
             self.kernels.attention.relative_bias_rows(
                 &self.stream,
                 &rows(&t.r, m, rel_dims),

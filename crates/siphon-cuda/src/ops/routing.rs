@@ -18,8 +18,11 @@ const HIDDEN: usize = 2304;
 pub const EXPERTS: usize = 128;
 /// Experts chosen per token.
 pub const TOP_K: usize = 8;
-/// Most rows [`Routing::moe_router_step_rows`] takes, `kStepRouterRows` in the kernel.
-pub const STEP_ROUTER_ROWS: usize = 8;
+/// Rows of one cluster of [`Routing::moe_router_step_rows`], `kStepRouterRows` in the
+/// kernel.
+const STEP_ROUTER_GROUP: usize = 8;
+/// Most rows [`Routing::moe_router_step_rows`] takes: four clusters.
+pub const STEP_ROUTER_ROWS: usize = 4 * STEP_ROUTER_GROUP;
 /// Blocks of `moe_router_step_2304`, one cluster, `kRouterCluster` in the kernel.
 const STEP_ROUTER_CLUSTER: u32 = 16;
 /// Threads per block of `moe_router_step_rows_2304`, `kRowsRouterThreads` in the kernel:
@@ -876,8 +879,8 @@ impl Routing {
 
     /// [`Self::moe_router_step`] for `rows` rows of a step, 1 to [`STEP_ROUTER_ROWS`]: `x`
     /// `[rows, 2304]`, `logits` `[rows, 128]`, `indices` and `weights` `[rows, 8]`. Each
-    /// row's results equal a one-row [`Self::moe_router_step`] call's bit for bit. The
-    /// router weights stream once for all rows.
+    /// row's results equal a one-row [`Self::moe_router_step`] call's bit for bit. Each
+    /// cluster reads the router weights once for its 8 rows.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
     pub fn moe_router_step_rows(
         &self,
@@ -914,7 +917,11 @@ impl Routing {
             "indices or weights length"
         );
         let config = LaunchConfig {
-            grid_dim: (STEP_ROUTER_CLUSTER, 1, 1),
+            grid_dim: (
+                STEP_ROUTER_CLUSTER,
+                u32::try_from(rows.div_ceil(STEP_ROUTER_GROUP))?,
+                1,
+            ),
             block_dim: (STEP_ROUTER_ROWS_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -929,9 +936,9 @@ impl Routing {
             .f32(route_scale);
         // SAFETY: the arguments match `moe_router_step_rows_2304(const bf16*, int, const
         // float*, const float*, float*, int32_t*, float*, float)`, every buffer has the
-        // length the kernel reads or writes for `rows` rows, the grid is the kernel's one
-        // cluster of 16 blocks of 288 threads, and the kernel reads only the router
-        // and the bias before `pdl_wait`.
+        // length the kernel reads or writes for `rows` rows, the grid is one of the
+        // kernel's clusters of 16 blocks of 288 threads per 8 rows, and the kernel reads
+        // only the router and the bias before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_step_rows_2304, config) }
     }
 

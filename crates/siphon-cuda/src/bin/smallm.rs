@@ -733,7 +733,7 @@ mod linux {
             Gpu,
             ops::attention::{
                 Attention, AttentionScratch, HEAD_DIM, HEADS, KV_HEADS, KvCache, KvFormat,
-                RowsAttentionScratch,
+                ROWS_MAX, RowsAttentionScratch,
             },
         };
 
@@ -743,7 +743,7 @@ mod linux {
             let gpu = Gpu::new(0)?;
             let stream = gpu.stream();
             let attention = Attention::load(gpu.context())?;
-            let mut rows_scratch = RowsAttentionScratch::new(stream)?;
+            let mut rows_scratch = RowsAttentionScratch::new(stream, ROWS_MAX)?;
             let mut decode = AttentionScratch::new(stream)?;
             let kv_row = KV_HEADS * HEAD_DIM;
             let q = stream.clone_htod(&vec![bf16::from_f32(0.1); 8 * HEADS * HEAD_DIM])?;
