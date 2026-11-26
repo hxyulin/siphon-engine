@@ -56,6 +56,8 @@ job: trace-7f3a chatcmpl-6929a1c4000003: 31204 prompt tokens (30720 cached), pre
 
 A request with `n` choices logs one line per choice, labelled `choice i`.
 
+A request body may be compressed with `Content-Encoding: gzip` or `zstd`; other encodings get a 415. A body may hold 32 bytes per position of the context, at least 2 MiB, plus 20 MiB per image with `--vision`. The limit applies to the decompressed bytes, so a small compressed body that inflates past it gets a 413, as an uncompressed one does. Responses that are not streamed are compressed with gzip or zstd when `Accept-Encoding` asks for it. Streams are never compressed, so each event reaches the client as the server sends it.
+
 ## Routes
 
 | Route | Notes |

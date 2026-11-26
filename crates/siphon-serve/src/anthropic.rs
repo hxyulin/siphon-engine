@@ -91,6 +91,7 @@ fn error_kind(status: StatusCode) -> (StatusCode, &'static str) {
         StatusCode::BAD_REQUEST => (status, "invalid_request_error"),
         StatusCode::UNAUTHORIZED => (status, "authentication_error"),
         StatusCode::NOT_FOUND => (status, "not_found_error"),
+        StatusCode::PAYLOAD_TOO_LARGE => (status, "request_too_large"),
         StatusCode::SERVICE_UNAVAILABLE => (
             StatusCode::from_u16(529).expect("529 is a valid status"),
             "overloaded_error",

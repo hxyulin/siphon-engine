@@ -61,6 +61,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::{compression::CompressionLayer, decompression::RequestDecompressionLayer};
 
 use crate::{
     anthropic,
@@ -109,6 +110,12 @@ fn choice_samplings(
 /// takes about 5 bytes per token; JSON escapes and token-id arrays take more.
 const BODY_BYTES_PER_POSITION: usize = 32;
 
+/// The routes, behind the API key where one is set.
+///
+/// Request bodies may come compressed with `Content-Encoding: gzip` or `zstd`, and the body
+/// limit applies to the decompressed bytes, which the handlers read through it. Responses
+/// are compressed as `Accept-Encoding` asks, except server-sent events, which tower-http's
+/// default predicate leaves alone, so that streams are neither compressed nor buffered.
 pub fn router(app: Arc<App>) -> Router {
     // axum's default limit of 2 MB holds a prompt of only about 400K tokens.
     let body_limit = (app.engine.max_context() * BODY_BYTES_PER_POSITION).max(2 << 20)
@@ -139,6 +146,8 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .with_state(app)
         .layer(middleware::from_fn(request_id))
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new())
 }
 
 /// A request's id: the client's `x-request-id` or `x-client-request-id` when valid, else
@@ -262,15 +271,22 @@ impl From<InvalidRequest> for ApiError {
 }
 
 impl From<JsonRejection> for ApiError {
+    /// A 413 for a body past the limit, else a 400.
     fn from(e: JsonRejection) -> Self {
-        Self::bad_request(e.body_text())
+        let status = match e.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        Self::new(status, e.body_text())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (kind, code) = match self.status {
-            StatusCode::BAD_REQUEST => ("invalid_request_error", Value::Null),
+            StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => {
+                ("invalid_request_error", Value::Null)
+            }
             StatusCode::NOT_FOUND => ("invalid_request_error", json!("model_not_found")),
             StatusCode::UNAUTHORIZED => ("authentication_error", Value::Null),
             _ => ("server_error", Value::Null),

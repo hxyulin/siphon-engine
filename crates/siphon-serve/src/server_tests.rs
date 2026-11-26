@@ -10,6 +10,7 @@ use axum::{
     body::{self, Body},
     http::{Request, Response},
 };
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -33,20 +34,31 @@ impl Server {
         max_context: usize,
         script: impl Fn(&Vocab, &Job) -> Vec<Event> + Send + 'static,
     ) -> Self {
-        let (engine, jobs) = Engine::fake(max_context);
+        Self::with_engine(max_context, move |vocab, job| {
+            for event in script(vocab, job) {
+                let _ = job.events.send(event);
+            }
+        })
+    }
+
+    /// A server whose engine runs `engine` on each job, on one thread.
+    pub(crate) fn with_engine(
+        max_context: usize,
+        engine: impl Fn(&Vocab, &Job) + Send + 'static,
+    ) -> Self {
+        let (fake, jobs) = Engine::fake(max_context);
         let labels = Arc::new(Mutex::new(Vec::new()));
         let taken = Arc::clone(&labels);
-        let script_vocab = vocab();
+        let engine_vocab = vocab();
         thread::spawn(move || {
             for submission in jobs {
                 for job in submission {
                     taken.lock().unwrap().push(job.label.to_string());
-                    for event in script(&script_vocab, &job) {
-                        let _ = job.events.send(event);
-                    }
+                    engine(&engine_vocab, &job);
                 }
             }
         });
+        let engine = fake;
         let app = Arc::new(App {
             vocab: vocab(),
             engine,
@@ -318,5 +330,157 @@ async fn timings_reach_every_route() {
     assert_eq!(
         events.iter().filter(|e| e.get("timings").is_some()).count(),
         1
+    );
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A POST of `bytes` to `path` with `Content-Encoding: encoding`.
+fn encoded_post(path: &str, bytes: Vec<u8>, encoding: &str) -> Request<Body> {
+    Request::post(path)
+        .header("content-type", "application/json")
+        .header("content-encoding", encoding)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn compressed_bodies_decompress_within_the_limit() {
+    let server = Server::new(4096, |vocab, _| text_reply(vocab, "Hello.", 0));
+    let request = json!({"messages": [{"role": "user", "content": "Count to three."}],
+                         "max_tokens": 16, "seed": 1});
+    let plain = request.to_string().into_bytes();
+    let reply = |response: Response<Body>| async move {
+        assert_eq!(response.status(), 200);
+        let mut body = json_body(response).await;
+        // Fields that differ between any two requests.
+        for field in ["id", "created", "timings"] {
+            body.as_object_mut().unwrap().remove(field);
+        }
+        body
+    };
+    let expected = reply(
+        server
+            .call(encoded_post(
+                "/v1/chat/completions",
+                plain.clone(),
+                "identity",
+            ))
+            .await,
+    )
+    .await;
+    for (encoding, bytes) in [
+        ("gzip", gzip(&plain)),
+        ("zstd", zstd::encode_all(&plain[..], 3).unwrap()),
+    ] {
+        let response = server
+            .call(encoded_post("/v1/chat/completions", bytes, encoding))
+            .await;
+        assert_eq!(reply(response).await, expected, "{encoding}");
+    }
+
+    // An encoding the server does not decode.
+    let response = server
+        .call(encoded_post("/v1/chat/completions", plain.clone(), "br"))
+        .await;
+    assert_eq!(response.status(), 415);
+
+    // A body that inflates past the 2 MiB limit gets a 413, Anthropic's too.
+    let mut big = request.clone();
+    big["messages"][0]["content"] = json!(" ".repeat(3 << 20));
+    let bomb = gzip(big.to_string().as_bytes());
+    assert!(bomb.len() < 64 << 10, "{} compressed bytes", bomb.len());
+    let response = server
+        .call(encoded_post("/v1/chat/completions", bomb.clone(), "gzip"))
+        .await;
+    assert_eq!(response.status(), 413);
+    let error = json_body(response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+    let response = server
+        .call(encoded_post("/v1/messages", bomb, "gzip"))
+        .await;
+    assert_eq!(response.status(), 413);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "request_too_large"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn responses_compress_and_streams_do_not() {
+    // The engine sends the first token, then waits until the test has read it.
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let server = Server::with_engine(4096, move |vocab, job| {
+        let mut events = text_reply(vocab, "Hello there.", 0).into_iter();
+        for event in events.by_ref().take(2) {
+            let _ = job.events.send(event);
+        }
+        let Some(Event::Tokens(ids)) = events.next() else {
+            unreachable!("text_reply's third event holds the tokens")
+        };
+        let _ = job.events.send(Event::Tokens(ids[..2].to_vec()));
+        if job.label.contains("chatcmpl") {
+            let _ = wait.lock().unwrap().recv();
+        }
+        let _ = job.events.send(Event::Tokens(ids[2..].to_vec()));
+        for event in events {
+            let _ = job.events.send(event);
+        }
+    });
+    let gzip_accepted = [("accept-encoding", "gzip")];
+
+    // A whole reply comes back compressed, as asked.
+    let response = server
+        .call(post("/v1/messages", &messages_body(false), &gzip_accepted))
+        .await;
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut text)
+        .unwrap();
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["content"][0]["text"], "Hello there.");
+
+    // A stream is not compressed, and its first chunk arrives while the job still runs.
+    let response = server
+        .call(post(
+            "/v1/chat/completions",
+            &chat_body(true),
+            &gzip_accepted,
+        ))
+        .await;
+    assert!(response.headers().get("content-encoding").is_none());
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut stream = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("the first chunk came before the job ended")
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&first)
+            .unwrap()
+            .contains("\"role\":\"assistant\""),
+        "{first:?}"
+    );
+    go.send(()).unwrap();
+    let mut rest = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        rest.extend_from_slice(&chunk.unwrap());
+    }
+    assert!(
+        std::str::from_utf8(&rest)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
     );
 }
