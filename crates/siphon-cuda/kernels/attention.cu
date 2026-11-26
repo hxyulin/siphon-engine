@@ -239,15 +239,42 @@ __device__ __forceinline__ size_t fp4_scales(unsigned slot, int head) {
 // Four bytes of E2M1 pairs as four F16 pairs, byte i's low nibble in the low half of
 // word i.
 __device__ __forceinline__ void e2m1x8_to_f16x8(uint32_t raw, uint32_t (&h)[4]) {
+#if SIPHON_SM89
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        h[i] = e2m1x2_to_f16x2_sm89(raw >> (8 * i));
+    }
+#else
     asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
         "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\n"
         "cvt.rn.f16x2.e2m1x2 %2, b2;\ncvt.rn.f16x2.e2m1x2 %3, b3;\n}"
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(raw));
+#endif
 }
+
+#if SIPHON_SM89
+// The E2M1 code of `y`, as cvt.rn.satfinite.e2m1x2.f32 rounds it: to nearest, ties to the
+// even code, saturated at 6, sign kept, NaN to 6. Ada has no E2M1 converter. The
+// magnitude's code is the number of rounding thresholds it reaches.
+__device__ __forceinline__ uint32_t e2m1_code_sm89(float y) {
+    const float a = fabsf(y);
+    const uint32_t code = uint32_t(a > 0.25f) + uint32_t(a >= 0.75f) + uint32_t(a > 1.25f) +
+                          uint32_t(a >= 1.75f) + uint32_t(a > 2.5f) + uint32_t(a >= 3.5f) + uint32_t(a > 5.f);
+    return isnan(y) ? 7u : code | (__float_as_uint(y) >> 31 << 3);
+}
+#endif
 
 // Eight values, already divided by their scale, as four bytes of E2M1 pairs.
 __device__ __forceinline__ uint32_t pack_e2m1x8(const float (&x)[8]) {
+#if SIPHON_SM89
+    uint32_t r = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        r |= e2m1_code_sm89(x[i]) << (4 * i);
+    }
+    return r;
+#else
     uint32_t r;
     asm("{\n.reg .b8 b0, b1, b2, b3;\n"
         "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\ncvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
@@ -256,6 +283,7 @@ __device__ __forceinline__ uint32_t pack_e2m1x8(const float (&x)[8]) {
         : "=r"(r)
         : "f"(x[0]), "f"(x[1]), "f"(x[2]), "f"(x[3]), "f"(x[4]), "f"(x[5]), "f"(x[6]), "f"(x[7]));
     return r;
+#endif
 }
 
 __device__ __forceinline__ uint8_t fp4_scale_of(float amax) {
