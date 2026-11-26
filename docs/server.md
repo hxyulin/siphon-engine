@@ -191,13 +191,38 @@ Fields the server cannot honour get a 400: `best_of` other than `n` (ranking cho
 | `vllm:generation_tokens_total` | counter | Tokens the engine generated, including any a stop string cut off. |
 | `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total` | counter | Prompt tokens looked up in the prefix cache, and those found there. |
 | `vllm:request_success_total` | counter | Finished requests, labelled `finished_reason`: `stop`, `length`, `abort` (the client left) or `error`. |
-
-Each choice of a request with `n` choices counts as a request in the request counts, the gauges and the latency histograms, since it runs as its own sequence. Its prompt counts once, with choice 0, in `vllm:prompt_tokens_total` and the prefix cache counters.
 | `vllm:num_requests_running`, `vllm:num_requests_waiting` | gauge | Requests the engine has started, and requests still in its queue. |
 | `vllm:request_queue_time_seconds` | histogram | Time from queueing to the engine starting the request. |
 | `vllm:time_to_first_token_seconds` | histogram | Time from queueing to the first token. |
 | `vllm:inter_token_latency_seconds` | histogram | Time per token after the first. Speculation delivers several tokens at once, so a gap that delivered n tokens counts n times as gap / n. The buckets start at 0.5 ms, below vLLM's 10 ms. |
 | `vllm:e2e_request_latency_seconds` | histogram | Time from queueing to the end of the request. |
+
+Each choice of a request with `n` choices counts as a request in the request counts, the gauges and the latency histograms, since it runs as its own sequence. Its prompt counts once, with choice 0, in `vllm:prompt_tokens_total` and the prefix cache counters.
+
+### Request timings
+
+Each completion, chat and Messages response carries a `timings` object with the field names of llama.cpp's server, so tools written for llama.cpp read them. Siphon adds its queue time, time to first token and speculation:
+
+| Field | Value |
+| --- | --- |
+| `cache_n` | Prompt tokens read from the prefix cache. |
+| `prompt_n` | Prompt tokens prefilled: the prompt less `cache_n`. |
+| `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second` | Time from the engine starting the request to its first token, per `prompt_n` token, and `prompt_n` per second. |
+| `predicted_n` | Generated tokens in the reply, as `usage` counts them. |
+| `predicted_ms`, `predicted_per_token_ms`, `predicted_per_second` | Time from the first token to the end, per `predicted_n` token, and `predicted_n` per second. |
+| `queue_ms` | Time from queueing to the engine starting the request. |
+| `ttft_ms` | Time from queueing to the first token: `queue_ms` plus `prompt_ms`. |
+| `draft_rounds`, `tokens_per_round` | Speculation rounds and the tokens each delivered on average, when the request speculated. A plain step under `--fallback` counts as a round of one token. |
+
+The times are taken when the engine's events reach the HTTP layer. The queue starts once the server has parsed and tokenized the request, so parsing does not count as prefill. The prompt time includes any prefix cache restore and image encoding. A request with `n` choices counts from its earliest start and first token to its last end, and sums the choices' tokens and rounds.
+
+A response that is not streamed has `timings` at the top level and a `Server-Timing` header, `queue;dur=…, prefill;dur=…, decode;dur=…` in milliseconds. A stream has sent its headers before the times are known, so its last chunk holds `timings`: in a chat or completion stream, the chunk with the last `finish_reason`, or the usage chunk when `stream_options.include_usage` asks for one, and in a Messages stream, the `message_delta` event. OpenAI's and Anthropic's SDKs ignore fields they do not know.
+
+The log repeats the numbers in the request's last `job:` line:
+
+```text
+job: trace-7f3a chatcmpl-6929a1c4000003: timings {"cache_n":30720,"predicted_ms":1210.4,"predicted_n":612,...}
+```
 
 ## Concurrent requests
 

@@ -10,6 +10,7 @@ mod request;
 #[cfg(test)]
 mod server_tests;
 mod stop;
+mod timings;
 mod tokenize;
 mod vision;
 

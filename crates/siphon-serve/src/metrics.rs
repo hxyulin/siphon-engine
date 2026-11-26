@@ -160,10 +160,10 @@ impl Metrics {
         Tracker {
             metrics: Arc::clone(self),
             prompt: prompt as u64,
-            submitted: Instant::now(),
             phase: Phase::Waiting,
             cached: 0,
             last: None,
+            times: Times::new(Instant::now()),
         }
     }
 
@@ -264,17 +264,51 @@ enum Phase {
     Finished,
 }
 
+/// When one job's events arrived, and how it speculated, for the request's `timings`
+/// ([`crate::timings`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Times {
+    /// When the HTTP layer queued the job, after it parsed and tokenized the request.
+    pub submitted: Instant,
+    /// When the engine took the job from its queue.
+    pub started: Option<Instant>,
+    /// When the first tokens arrived.
+    pub first: Option<Instant>,
+    /// When the job ended.
+    pub ended: Option<Instant>,
+    /// Speculation rounds, and the tokens they delivered.
+    pub rounds: u64,
+    pub round_tokens: u64,
+    /// Whether the next tokens come from a speculation round.
+    pub(crate) round: bool,
+}
+
+impl Times {
+    /// A job submitted at `submitted` that has had no events yet.
+    pub fn new(submitted: Instant) -> Self {
+        Self {
+            submitted,
+            started: None,
+            first: None,
+            ended: None,
+            rounds: 0,
+            round_tokens: 0,
+            round: false,
+        }
+    }
+}
+
 /// One request's part in the metrics. Dropping it before [`Tracker::finish`] counts the
 /// request as aborted.
 #[derive(Debug)]
 pub struct Tracker {
     metrics: Arc<Metrics>,
     prompt: u64,
-    submitted: Instant,
     phase: Phase,
     cached: u64,
     /// When the last tokens arrived.
     last: Option<Instant>,
+    times: Times,
 }
 
 impl Tracker {
@@ -288,10 +322,22 @@ impl Tracker {
             return;
         }
         self.phase = Phase::Running;
+        self.times.started = Some(now);
         let mut s = self.metrics.state();
         s.waiting -= 1;
         s.running += 1;
-        s.queue.observe((now - self.submitted).as_secs_f64(), 1);
+        s.queue
+            .observe((now - self.times.submitted).as_secs_f64(), 1);
+    }
+
+    /// The next tokens come from a speculation round.
+    pub fn round(&mut self) {
+        self.times.round = true;
+    }
+
+    /// When the job's events arrived so far.
+    pub fn times(&self) -> Times {
+        self.times
     }
 
     /// Prompt tokens whose state came from the prefix cache.
@@ -310,11 +356,17 @@ impl Tracker {
         }
         self.started_at(now);
         let n = n as u64;
+        if std::mem::take(&mut self.times.round) {
+            self.times.rounds += 1;
+            self.times.round_tokens += n;
+        }
+        self.times.first.get_or_insert(now);
         let mut s = self.metrics.state();
         s.generation_tokens += n;
         match self.last {
             None => {
-                s.ttft.observe((now - self.submitted).as_secs_f64(), 1);
+                s.ttft
+                    .observe((now - self.times.submitted).as_secs_f64(), 1);
                 s.prompt_tokens += self.prompt;
                 s.cache_queries += self.prompt;
                 // A later choice of an n-choice request counts no prompt, so none of its
@@ -343,12 +395,13 @@ impl Tracker {
             Phase::Running => s.running -= 1,
         }
         self.phase = Phase::Finished;
+        self.times.ended = Some(now);
         let index = Reason::ALL
             .iter()
             .position(|&r| r == reason)
             .expect("ALL lists every reason");
         s.finished[index] += 1;
-        s.e2e.observe((now - self.submitted).as_secs_f64(), 1);
+        s.e2e.observe((now - self.times.submitted).as_secs_f64(), 1);
     }
 }
 

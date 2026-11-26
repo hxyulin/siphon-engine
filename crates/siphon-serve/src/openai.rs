@@ -66,10 +66,11 @@ use crate::{
     anthropic,
     chat::{self, Ending, InvalidRequest, Vocab},
     engine::{Engine, Event, Finish, Job, Refused, Sampling},
-    metrics::{Metrics, Reason, Tracker},
+    metrics::{Metrics, Reason, Times, Tracker},
     parse::{Delta, Detokenizer, Parser, ToolCall},
     request::{self, SamplingDefaults, SamplingFields, ToolChoice},
     stop::Stops,
+    timings::Timings,
     tokenize::{self, DecodeRequest, EncodeRequest},
     vision::PromptImage,
 };
@@ -690,6 +691,7 @@ impl Results {
         match &event {
             Event::Started => self.tracker.started(),
             Event::Cached(n) => self.tracker.cached(*n),
+            Event::Round => self.tracker.round(),
             Event::Tokens(ids) => self.tracker.tokens(ids.len()),
             Event::Done(finish) => self.tracker.finish(reason(*finish)),
             Event::Failed(_) => self.tracker.finish(Reason::Error),
@@ -697,9 +699,11 @@ impl Results {
         Poll::Ready(event)
     }
 
-    /// Ends the job with `finish`, which a stop the output matched may have set first.
-    pub(crate) fn close(mut self, finish: Finish) {
+    /// Ends the job with `finish`, which a stop the output matched may have set first, and
+    /// returns when its events arrived.
+    pub(crate) fn close(mut self, finish: Finish) -> Times {
         self.tracker.finish(reason(finish));
+        self.tracker.times()
     }
 }
 
@@ -707,6 +711,8 @@ impl Results {
 pub(crate) struct Fanout {
     /// Each choice's events, `None` once the choice has ended.
     choices: Vec<Option<Results>>,
+    /// When each choice's events arrived so far.
+    times: Vec<Times>,
     /// The choice to look at first, which turns, so that no choice waits behind another.
     turn: usize,
 }
@@ -714,9 +720,21 @@ pub(crate) struct Fanout {
 impl Fanout {
     pub(crate) fn new(results: Vec<Results>) -> Self {
         Self {
+            times: results.iter().map(|r| r.tracker.times()).collect(),
             choices: results.into_iter().map(Some).collect(),
             turn: 0,
         }
+    }
+
+    /// The request's timings so far, for a prompt of `prompt_tokens` with `cached` read
+    /// from the prefix cache and choices that generated `predicted_n` tokens in all.
+    pub(crate) fn timings(
+        &self,
+        prompt_tokens: usize,
+        cached: usize,
+        predicted_n: usize,
+    ) -> Timings {
+        Timings::new(&self.times, prompt_tokens, cached, predicted_n)
     }
 
     /// The next event of an open choice, with the choice's index. Waits forever when no
@@ -728,6 +746,7 @@ impl Fanout {
                 if let Some(results) = &mut self.choices[i]
                     && let Poll::Ready(event) = results.poll_next(cx)
                 {
+                    self.times[i] = results.tracker.times();
                     self.turn = (i + 1) % n;
                     return Poll::Ready((i, event));
                 }
@@ -741,7 +760,7 @@ impl Fanout {
     /// and cancels its job if it still runs.
     pub(crate) fn close(&mut self, i: usize, finish: Finish) {
         if let Some(results) = self.choices[i].take() {
-            results.close(finish);
+            self.times[i] = results.close(finish);
         }
     }
 }
@@ -867,12 +886,14 @@ async fn respond(
     )?;
     let prompt_ids = return_token_ids.then_some(prompt);
     let fanout = Fanout::new(results);
+    let label = id.label(&reply.id, 0, 1);
     if let Delivery::Stream { include_usage } = delivery {
         let (out, rx) = mpsc::channel(64);
         let chunks = Chunks {
             out,
             reply,
             prompt_ids,
+            label,
         };
         tokio::spawn(
             async move { stream(&app.vocab, fanout, outputs, chunks, include_usage).await },
@@ -883,25 +904,35 @@ async fn respond(
         return Ok(body.into_response());
     }
     // Runs in the handler, so that a client that leaves drops the jobs.
-    let body = whole(&app.vocab, fanout, outputs, reply, prompt_ids).await?;
-    Ok(Json(body).into_response())
+    let (body, timings) = whole(&app.vocab, fanout, outputs, reply, prompt_ids).await?;
+    timings.log(&label);
+    Ok(with_server_timing(Json(body).into_response(), &timings))
 }
 
-/// The body of a reply that is not streamed, with one choice per entry of `outputs`.
+/// `response` with a `Server-Timing` header of `timings`.
+pub(crate) fn with_server_timing(mut response: Response, timings: &Timings) -> Response {
+    response
+        .headers_mut()
+        .insert("server-timing", timings.server_timing());
+    response
+}
+
+/// The body of a reply that is not streamed, with one choice per entry of `outputs`, and
+/// its timings, which the body holds too.
 async fn whole(
     vocab: &Vocab,
     mut fanout: Fanout,
     mut outputs: Vec<Output>,
     mut reply: Reply,
     prompt_ids: Option<Vec<u32>>,
-) -> Result<Value, ApiError> {
+) -> Result<(Value, Timings), ApiError> {
     let mut messages: Vec<Delta> = outputs.iter().map(|_| Delta::default()).collect();
     let mut finishes: Vec<Option<Finish>> = vec![None; outputs.len()];
     while finishes.iter().any(Option::is_none) {
         let (i, event) = fanout.next().await;
         let output = &mut outputs[i];
         let finish = match event {
-            Event::Started => continue,
+            Event::Started | Event::Round => continue,
             Event::Cached(n) => {
                 if i == 0 {
                     reply.cached_tokens = n;
@@ -944,7 +975,9 @@ async fn whole(
     if let Some(ids) = prompt_ids {
         body["prompt_token_ids"] = json!(ids);
     }
-    Ok(body)
+    let timings = reply.timings(&fanout, &outputs);
+    body["timings"] = timings.json();
+    Ok((body, timings))
 }
 
 pub(crate) fn append(message: &mut Delta, delta: Delta) {
@@ -1268,6 +1301,12 @@ impl Reply {
         value
     }
 
+    /// The timings of a reply whose choices are `outputs`, generated by `fanout`.
+    fn timings(&self, fanout: &Fanout, outputs: &[Output]) -> Timings {
+        let predicted = outputs.iter().map(|o| o.tokens).sum();
+        fanout.timings(self.prompt_tokens, self.cached_tokens, predicted)
+    }
+
     /// The usage of a reply whose choices are `outputs`: the prompt once, and the tokens of
     /// every choice.
     fn usage(&self, outputs: &[Output]) -> Value {
@@ -1289,15 +1328,24 @@ struct Chunks {
     reply: Reply,
     /// The prompt's ids, sent with the first chunk (`return_token_ids`).
     prompt_ids: Option<Vec<u32>>,
+    /// The request's label for the log.
+    label: Arc<str>,
 }
 
 impl Chunks {
-    /// Sends one chunk per choice; false once the client has left.
-    async fn send(&mut self, choices: Vec<Value>) -> bool {
-        for choice in choices {
+    /// Sends one chunk per choice, the last with `timings` if given; false once the client
+    /// has left.
+    async fn send(&mut self, choices: Vec<Value>, mut timings: Option<&Timings>) -> bool {
+        let last = choices.len().saturating_sub(1);
+        for (k, choice) in choices.into_iter().enumerate() {
             let mut chunk = self.reply.body(true, vec![choice]);
             if let Some(ids) = self.prompt_ids.take() {
                 chunk["prompt_token_ids"] = json!(ids);
+            }
+            if k == last
+                && let Some(timings) = timings.take()
+            {
+                chunk["timings"] = timings.json();
             }
             if !self.raw(chunk.to_string()).await {
                 return false;
@@ -1348,7 +1396,7 @@ async fn stream(
         let (i, event) = fanout.next().await;
         let output = &mut outputs[i];
         let (delta, finish) = match event {
-            Event::Started => continue,
+            Event::Started | Event::Round => continue,
             Event::Cached(cached) => {
                 if i == 0 {
                     chunks.reply.cached_tokens = cached;
@@ -1370,7 +1418,7 @@ async fn stream(
             let roles = (0..n)
                 .map(|i| Reply::streamed(i, json!({"delta": {"role": "assistant", "content": ""}})))
                 .collect();
-            if !chunks.send(roles).await {
+            if !chunks.send(roles, None).await {
                 return;
             }
         }
@@ -1390,17 +1438,25 @@ async fn stream(
             attach_ids(&chunks.reply, i, &mut choices, &output.ids[sent[i]..]);
             sent[i] = output.ids.len();
         }
-        if !chunks.send(choices).await {
+        // The last choice's finish chunk carries the timings, unless a usage chunk follows.
+        let timings = (open == 0).then(|| chunks.reply.timings(&fanout, &outputs));
+        if !chunks
+            .send(choices, timings.as_ref().filter(|_| !include_usage))
+            .await
+        {
             return;
         }
     }
+    let timings = chunks.reply.timings(&fanout, &outputs);
     if include_usage {
         let mut chunk = chunks.reply.body(true, Vec::new());
         chunk["usage"] = chunks.reply.usage(&outputs);
+        chunk["timings"] = timings.json();
         if !chunks.raw(chunk.to_string()).await {
             return;
         }
     }
+    timings.log(&chunks.label);
     let _ = chunks.raw("[DONE]".to_owned()).await;
 }
 
@@ -1802,7 +1858,8 @@ mod tests {
             Some(vec![1, 2, 3]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         let choices = body["choices"].as_array().unwrap();
         let texts: Vec<&str> = choices
             .iter()
@@ -1848,6 +1905,7 @@ mod tests {
             out,
             reply: reply(Kind::Chat),
             prompt_ids: None,
+            label: "test".into(),
         };
         stream(&vocab, fanout, vec![output; 3], chunks, true).await;
         let mut frames = Vec::new();

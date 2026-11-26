@@ -46,6 +46,7 @@ use crate::{
     parse::{Delta, Parser, ToolCall},
     request::{self, SamplingFields, ToolChoice},
     stop::Stops,
+    timings::Timings,
 };
 
 /// Whether `path` is one of this module's routes, whose errors take Anthropic's shape.
@@ -670,16 +671,29 @@ async fn respond(app: Arc<App>, prepared: Prepared, id: &RequestId) -> Result<Re
         .first()
         .copied()
         .ok_or_else(|| ApiError::internal("no sampling"))?;
-    let label = |_| id.label(&message.id, 0, 1);
-    let results = submit(&app, &prompt, images, max_tokens, false, sampling, &label)?;
+    let label = id.label(&message.id, 0, 1);
+    let results = submit(&app, &prompt, images, max_tokens, false, sampling, &|_| {
+        Arc::clone(&label)
+    })?;
     if matches!(delivery, Delivery::Whole) {
         // Runs in the handler, so that a client that leaves drops the job.
         let (out, mut rx) = mpsc::channel(1);
-        run(&app.vocab, results, output, message, out, false).await;
-        return Ok(whole(rx.recv().await));
+        let timings = run(&app.vocab, results, output, message, out, false).await;
+        if let Some(timings) = &timings {
+            timings.log(&label);
+        }
+        let response = whole(rx.recv().await);
+        return Ok(match &timings {
+            Some(timings) => openai::with_server_timing(response, timings),
+            None => response,
+        });
     }
     let (out, rx) = mpsc::channel(64);
-    tokio::spawn(async move { run(&app.vocab, results, output, message, out, true).await });
+    tokio::spawn(async move {
+        if let Some(timings) = run(&app.vocab, results, output, message, out, true).await {
+            timings.log(&label);
+        }
+    });
     let events = ReceiverStream::new(rx).map(|frame| Ok::<_, Infallible>(sse(frame)));
     Ok(Sse::new(events).into_response())
 }
@@ -723,8 +737,10 @@ impl Frames {
 }
 
 /// Turns the engine's events for one request into Anthropic's stream events, or, unless
-/// `stream`, into one `message` frame with the whole body. Returning drops `results`, which
-/// cancels the job: when the client has left or a stop ended the output.
+/// `stream`, into one `message` frame with the whole body, and returns the request's
+/// timings, which the body or the `message_delta` event holds, unless the job failed or
+/// the client left. Returning drops `results`, which cancels the job: when the client has
+/// left or a stop ended the output.
 ///
 /// `message_start` goes out with the first content block, so that a client or proxy that
 /// times the first event measures the prefill, and its usage then holds the cached tokens.
@@ -737,7 +753,7 @@ async fn run(
     mut message: Message,
     out: mpsc::Sender<Frame>,
     stream: bool,
-) {
+) -> Option<Timings> {
     let mut frames = Frames {
         out,
         last: Instant::now(),
@@ -757,7 +773,7 @@ async fn run(
                             (KEEP_ALIVE, Value::Null)
                         };
                         if !frames.send(vec![keep_alive]).await {
-                            return;
+                            return None;
                         }
                     }
                 }
@@ -766,7 +782,7 @@ async fn run(
             results.next().await
         };
         match event {
-            Event::Started => continue,
+            Event::Started | Event::Round => continue,
             Event::Cached(n) => {
                 message.cached_tokens = n;
                 continue;
@@ -777,7 +793,7 @@ async fn run(
                 let _ = frames
                     .send(vec![("error", error_body("api_error", &e))])
                     .await;
-                return;
+                return None;
             }
         }
         if stream && !events.is_empty() {
@@ -785,22 +801,31 @@ async fn run(
                 events.insert(0, message_start(&message));
             }
             if !frames.send(events).await {
-                return;
+                return None;
             }
         }
         if output.done {
             break Finish::Stop;
         }
     };
-    results.close(finish);
+    let times = results.close(finish);
     let mut events = Vec::new();
     blocks.push(&output.finish(vocab, finish), &mut events);
     blocks.close(&mut events);
     let stop = stop_reason(&output, finish);
+    let timings = Timings::new(
+        &[times],
+        message.prompt_tokens,
+        message.cached_tokens,
+        output.tokens,
+    );
     if !stream {
-        let body = message.body(&blocks.content, Some(stop), output.tokens);
-        let _ = frames.send(vec![("message", body)]).await;
-        return;
+        let mut body = message.body(&blocks.content, Some(stop), output.tokens);
+        body["timings"] = timings.json();
+        return frames
+            .send(vec![("message", body)])
+            .await
+            .then_some(timings);
     }
     if !started {
         events.insert(0, message_start(&message));
@@ -809,10 +834,10 @@ async fn run(
         "message_delta",
         json!({"type": "message_delta",
                "delta": {"stop_reason": stop.0, "stop_sequence": stop.1},
-               "usage": message.usage(output.tokens)}),
+               "usage": message.usage(output.tokens), "timings": timings.json()}),
     ));
     events.push(("message_stop", json!({"type": "message_stop"})));
-    let _ = frames.send(events).await;
+    frames.send(events).await.then_some(timings)
 }
 
 /// The `message_start` event of `message`, before any content.
@@ -1188,6 +1213,19 @@ mod tests {
         frames
     }
 
+    /// Removes the timings from the last frame, the `message_delta` or the message, and
+    /// returns them.
+    fn take_timings(frames: &mut [Frame]) -> Value {
+        let (name, data) = frames
+            .iter_mut()
+            .rev()
+            .find(|(name, _)| *name != "message_stop")
+            .expect("a frame");
+        data.as_object_mut()
+            .and_then(|data| data.remove("timings"))
+            .unwrap_or_else(|| panic!("no timings in {name}"))
+    }
+
     /// Ids of a reply that thinks, writes text and calls a tool, as the engine sends them:
     /// without the turn's end token.
     fn reply(vocab: &Vocab) -> Vec<u32> {
@@ -1222,7 +1260,10 @@ mod tests {
             Event::Tokens(ids),
             Event::Done(Finish::Stop),
         ];
-        let frames = collect(&vocab, &[], Calls::Free, events, true).await;
+        let mut frames = collect(&vocab, &[], Calls::Free, events, true).await;
+        let timings = take_timings(&mut frames);
+        assert_eq!(timings["predicted_n"], n);
+        assert_eq!(timings["cache_n"], 4);
         let delta = |index: usize, delta: Value| {
             (
                 "content_block_delta",
@@ -1365,7 +1406,8 @@ mod tests {
         let mut events = vec![Event::Started, Event::Cached(4)];
         events.extend(ids.into_iter().map(|id| Event::Tokens(vec![id])));
         events.push(Event::Done(Finish::Stop));
-        let frames = collect(&vocab, &[], Calls::Free, events, false).await;
+        let mut frames = collect(&vocab, &[], Calls::Free, events, false).await;
+        assert_eq!(take_timings(&mut frames)["prompt_n"], 6);
         assert_eq!(
             frames,
             [(

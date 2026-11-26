@@ -82,6 +82,37 @@ pub(crate) fn text_reply(vocab: &Vocab, text: &str, cached: usize) -> Vec<Event>
     ]
 }
 
+/// [`text_reply`] in two speculation rounds, the first of three tokens.
+pub(crate) fn speculated_reply(vocab: &Vocab, text: &str, cached: usize) -> Vec<Event> {
+    let mut events = text_reply(vocab, text, cached);
+    let Event::Tokens(ids) = events.remove(2) else {
+        unreachable!("text_reply's third event holds the tokens")
+    };
+    let (a, b) = ids.split_at(3);
+    let rounds = [
+        Event::Round,
+        Event::Tokens(a.to_vec()),
+        Event::Round,
+        Event::Tokens(b.to_vec()),
+    ];
+    events.splice(2..2, rounds);
+    events
+}
+
+/// The data of each `data:` line of a server-sent stream.
+pub(crate) async fn sse_data(response: Response<Body>) -> Vec<Value> {
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
 /// A POST of `body` as JSON to `path`, with `headers`.
 pub(crate) fn post(path: &str, body: &Value, headers: &[(&str, &str)]) -> Request<Body> {
     let mut request = Request::post(path).header("content-type", "application/json");
@@ -161,4 +192,131 @@ async fn request_ids_reach_the_response_and_the_job() {
         .await;
     assert_eq!(response.status(), 400);
     assert!(header(&response).starts_with("req-"));
+}
+
+/// Checks `timings` against a reply of `predicted_n` tokens in two rounds, after a prompt
+/// that read 2 tokens from the cache.
+fn check_timings(timings: &Value, prompt_tokens: u64, predicted_n: u64) {
+    assert_eq!(timings["cache_n"], 2, "{timings}");
+    assert_eq!(timings["prompt_n"], prompt_tokens - 2, "{timings}");
+    assert_eq!(timings["predicted_n"], predicted_n, "{timings}");
+    assert_eq!(timings["draft_rounds"], 2, "{timings}");
+    let per_round = timings["tokens_per_round"].as_f64().unwrap();
+    assert!(
+        (per_round - predicted_n as f64 / 2.0).abs() < 1e-3,
+        "{timings}"
+    );
+    for field in [
+        "prompt_ms",
+        "prompt_per_token_ms",
+        "prompt_per_second",
+        "predicted_ms",
+        "predicted_per_token_ms",
+        "predicted_per_second",
+        "queue_ms",
+        "ttft_ms",
+    ] {
+        assert!(
+            timings[field].as_f64().unwrap() >= 0.0,
+            "{field} in {timings}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn timings_reach_every_route() {
+    let server = Server::new(4096, |vocab, _| speculated_reply(vocab, "Hello there.", 2));
+
+    // Chat, whole: a top-level field and a Server-Timing header.
+    let response = server
+        .call(post("/v1/chat/completions", &chat_body(false), &[]))
+        .await;
+    let header = response.headers()["server-timing"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        header.starts_with("queue;dur=")
+            && header.contains(", prefill;dur=")
+            && header.contains(", decode;dur="),
+        "{header}"
+    );
+    let body = json_body(response).await;
+    let usage = &body["usage"];
+    check_timings(
+        &body["timings"],
+        usage["prompt_tokens"].as_u64().unwrap(),
+        usage["completion_tokens"].as_u64().unwrap(),
+    );
+
+    // Chat, streamed: the finish chunk holds them, or the usage chunk when asked for.
+    let response = server
+        .call(post("/v1/chat/completions", &chat_body(true), &[]))
+        .await;
+    assert!(response.headers().get("server-timing").is_none());
+    let chunks = sse_data(response).await;
+    let last = chunks.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        chunks.iter().filter(|c| c.get("timings").is_some()).count(),
+        1
+    );
+    let predicted = body["usage"]["completion_tokens"].as_u64().unwrap();
+    let prompt = body["usage"]["prompt_tokens"].as_u64().unwrap();
+    check_timings(&last["timings"], prompt, predicted);
+
+    let mut with_usage = chat_body(true);
+    with_usage["stream_options"] = json!({"include_usage": true});
+    let response = server
+        .call(post("/v1/chat/completions", &with_usage, &[]))
+        .await;
+    let chunks = sse_data(response).await;
+    let last = chunks.last().unwrap();
+    assert!(last.get("usage").is_some());
+    assert_eq!(
+        chunks.iter().filter(|c| c.get("timings").is_some()).count(),
+        1
+    );
+    check_timings(&last["timings"], prompt, predicted);
+
+    // Completions, whole.
+    let response = server
+        .call(post(
+            "/v1/completions",
+            &json!({"prompt": "Hello there, how are you?", "max_tokens": 16}),
+            &[],
+        ))
+        .await;
+    assert!(response.headers().contains_key("server-timing"));
+    let body = json_body(response).await;
+    check_timings(
+        &body["timings"],
+        body["usage"]["prompt_tokens"].as_u64().unwrap(),
+        body["usage"]["completion_tokens"].as_u64().unwrap(),
+    );
+
+    // Messages, whole and streamed: the body, and the message_delta event.
+    let response = server
+        .call(post("/v1/messages", &messages_body(false), &[]))
+        .await;
+    assert!(response.headers().contains_key("server-timing"));
+    let body = json_body(response).await;
+    let usage = &body["usage"];
+    let prompt = usage["input_tokens"].as_u64().unwrap() + 2;
+    let predicted = usage["output_tokens"].as_u64().unwrap();
+    check_timings(&body["timings"], prompt, predicted);
+    let response = server
+        .call(post("/v1/messages", &messages_body(true), &[]))
+        .await;
+    let events = sse_data(response).await;
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .unwrap();
+    check_timings(&delta["timings"], prompt, predicted);
+    assert_eq!(
+        events.iter().filter(|e| e.get("timings").is_some()).count(),
+        1
+    );
 }

@@ -253,8 +253,8 @@ pub enum Finish {
 }
 
 /// What the engine reports for a job, in order: `Started`, `Cached` at most once, `Tokens`
-/// any number of times, then `Done` or `Failed`. A job whose client left while it waited
-/// gets none.
+/// any number of times, each after a `Round` when a speculation round delivered them, then
+/// `Done` or `Failed`. A job whose client left while it waited gets none.
 #[cfg_attr(
     all(not(target_os = "linux"), not(test)),
     expect(dead_code, reason = "only the Linux engine runs jobs")
@@ -265,6 +265,9 @@ pub enum Event {
     Started,
     /// Prompt tokens whose state came from the prefix cache.
     Cached(usize),
+    /// The next `Tokens` come from one speculation round, or from a plain step under
+    /// `--fallback`.
+    Round,
     Tokens(Vec<u32>),
     Done(Finish),
     Failed(String),
@@ -1881,6 +1884,7 @@ mod cuda {
             let remaining = request.job.max_tokens - request.output.len();
             speculator.generate_with(model, remaining, Drafts::Dspark, |ids| {
                 request.speculated += ids.len();
+                let _ = request.job.events.send(Event::Round);
                 last = ids.last().copied().unwrap_or(last);
                 if request.take(ids, stop).is_break() {
                     return ControlFlow::Break(());
