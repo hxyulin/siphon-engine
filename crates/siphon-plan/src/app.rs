@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use ratatui::crossterm::event::KeyCode;
 use siphon::{
-    Checkpoint, KvFormat, TextConfig, WeightFormat,
+    Checkpoint, KvFormat, OutputProjection, TextConfig, WeightFormat,
     memory::{self, DraftApprox, DraftChoice, Plan, PlanInputs, Planner, VisionInputs},
 };
 
@@ -62,6 +62,8 @@ pub struct Settings {
     pub streams: usize,
     /// The vision tower, with `--vision`.
     pub vision: Option<VisionInputs>,
+    /// `--output-projection`.
+    pub output: OutputProjection,
 }
 
 pub struct App {
@@ -102,6 +104,7 @@ impl App {
             context,
             streams,
             vision,
+            output,
         } = settings;
         let config = TextConfig::load(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir)?;
@@ -127,6 +130,7 @@ impl App {
                             config: &config,
                             checkpoint: &checkpoint,
                             weights,
+                            output,
                             kv,
                             draft: match draft {
                                 Draft::Bundled => DraftChoice::Bundled(approx),

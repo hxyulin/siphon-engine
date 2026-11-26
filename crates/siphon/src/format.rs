@@ -9,8 +9,10 @@ pub enum WeightFormat {
     /// The checkpoint's BF16 weights.
     #[default]
     Bf16,
-    /// E4M3 copies with one F32 scale per row, made at load time. Decode reads half the
-    /// bytes; prefill keeps the BF16 weights.
+    /// E4M3 copies with one F32 scale per row, made at load time, of the attention input
+    /// projections, the message gates and the LM head; the output projection follows
+    /// [`OutputProjection`]. Decode reads about half the bytes; prefill keeps the BF16
+    /// weights.
     Fp8,
 }
 
@@ -27,6 +29,39 @@ impl FromStr for WeightFormat {
 }
 
 impl fmt::Display for WeightFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
+}
+
+/// The attention output projection decode reads under [`WeightFormat::Fp8`]. Its FP8 copy
+/// moved the engine furthest from the model of all the FP8 copies, so it stays BF16 unless
+/// asked: on an RTX 5090 the FP8 copy saves 0.16 ms of a 2.93 ms step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputProjection {
+    /// The checkpoint's BF16 weights, which prefill reads too.
+    #[default]
+    Bf16,
+    /// An E4M3 copy with one scale per row, as the other FP8 copies.
+    Fp8,
+}
+
+impl FromStr for OutputProjection {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "bf16" => Ok(Self::Bf16),
+            "fp8" => Ok(Self::Fp8),
+            _ => bail!("unknown output projection format {s:?}; expected bf16 or fp8"),
+        }
+    }
+}
+
+impl fmt::Display for OutputProjection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Bf16 => "bf16",

@@ -38,8 +38,8 @@ use crate::{
 };
 
 const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] \
-                     [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--vision] \
-                     [--max-image-pixels N] [--print]
+                     [--prefill-chunk N] [--output-projection bf16|fp8] [--free GiB] [--context N] \
+                     [--streams N] [--vision] [--max-image-pixels N] [--print]
 --drafter adds a DFlash drafter's plan beside the bundled draft's.
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's
 --memory does.
@@ -47,6 +47,8 @@ const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory Gi
 (0.25 GiB by default).
 --prefill-chunk plans prefill chunks of N rows, 1 to 2048, as siphon-serve's --prefill-chunk
 does (2048 by default).
+--output-projection plans the attention output projection decode reads with FP8 weights, as
+siphon-serve's --output-projection does (bf16 by default).
 --free sets the free memory right after creating the CUDA context instead of asking
 nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
@@ -65,6 +67,7 @@ struct Args {
     memory: Option<usize>,
     margin: usize,
     prefill_chunk: usize,
+    output: siphon::OutputProjection,
     free: Option<usize>,
     context: Option<usize>,
     streams: usize,
@@ -93,6 +96,7 @@ fn args() -> anyhow::Result<Args> {
     let mut memory = None;
     let mut margin = memory::DEFAULT_MARGIN;
     let mut prefill_chunk = memory::DEFAULT_PREFILL_CHUNK;
+    let mut output = siphon::OutputProjection::default();
     let mut free = None;
     let mut context = None;
     let mut streams = 1;
@@ -117,6 +121,7 @@ fn args() -> anyhow::Result<Args> {
                     memory::MAX_PREFILL_CHUNK
                 );
             }
+            "--output-projection" => output = value()?.parse()?,
             "--free" => free = Some(gib_arg(&value()?, "--free")?),
             "--context" => context = Some(value()?.parse().context("--context takes positions")?),
             "--streams" => {
@@ -149,6 +154,7 @@ fn args() -> anyhow::Result<Args> {
         memory,
         margin,
         prefill_chunk,
+        output,
         free,
         context,
         streams,
@@ -182,6 +188,7 @@ fn main() -> anyhow::Result<()> {
             context: args.context,
             streams: args.streams,
             vision,
+            output: args.output,
         },
     )?;
     if args.print || !io::stdout().is_terminal() {

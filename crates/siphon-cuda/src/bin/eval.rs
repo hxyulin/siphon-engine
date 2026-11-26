@@ -2,7 +2,7 @@
 //! still computes the same model as MLX-LM, within a multiple of MLX's own noise.
 //!
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
-//!        [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
+//!        [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
 //!        [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8]
 //!        [--prefill-dense bf16|fp8]
 //!
@@ -14,7 +14,8 @@
 //! the log-probability of the actual next token, and perplexity. It also reports
 //! KL(MLX || engine) at the captured positions and how many greedy tokens after the
 //! text match MLX. It exits with status 1 if a check fails. `--weights fp8` makes the
-//! stepping read FP8 copies of the attention projections and the LM head; prefill keeps
+//! stepping read FP8 copies of the attention input projections, the message gates and the
+//! LM head, and with `--output-projection fp8` of the output projection too; prefill keeps
 //! the BF16 weights but for the LM head, whose BF16 copy then sits in host memory.
 //! `--dump FILE` writes one line per position: the position, the engine's and MLX's
 //! log-probability of the next token, and their top-1 tokens, to compare with other
@@ -52,7 +53,7 @@ mod linux {
             PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
-        weights::{WeightFormat, Weights},
+        weights::{OutputProjection, WeightFormat, Weights},
     };
 
     // Thresholds, from MLX's disagreement with itself between its chunked (multi-row)
@@ -79,6 +80,7 @@ mod linux {
         passes: Option<usize>,
         kv: KvFormat,
         weights: WeightFormat,
+        output: OutputProjection,
         dump: Option<PathBuf>,
         /// Chunk size for `Model::prefill`, or `None` to step token by token.
         prefill: Option<usize>,
@@ -94,6 +96,7 @@ mod linux {
         let mut passes = None;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut output = OutputProjection::default();
         let mut dump = None;
         let mut prefill = None;
         let mut verify = None;
@@ -110,6 +113,11 @@ mod linux {
                 weights = it.next().context("--weights needs bf16 or fp8")?.parse()?;
             } else if arg == "--dump" {
                 dump = Some(PathBuf::from(it.next().context("--dump needs a file")?));
+            } else if arg == "--output-projection" {
+                output = it
+                    .next()
+                    .context("--output-projection needs blocks, rows or bf16")?
+                    .parse()?;
             } else if arg == "--expert-activations" {
                 expert_activations = it
                     .next()
@@ -145,7 +153,8 @@ mod linux {
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
-             [--weights bf16|fp8] [--prefill CHUNK] [--verify WIDTH] [--dump FILE] \
+             [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] \
+             [--verify WIDTH] [--dump FILE] \
              [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
              [--prefill-dense bf16|fp8]",
         )?;
@@ -159,6 +168,7 @@ mod linux {
             passes,
             kv,
             weights,
+            output,
             dump,
             prefill,
             verify,
@@ -385,7 +395,8 @@ mod linux {
         let gpu = Gpu::new(0)?;
         let start = Instant::now();
         let checkpoint = Checkpoint::open(&args.model)?;
-        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        weights.output = args.output;
         gpu.stream().synchronize()?;
         eprintln!("loaded weights in {:.1} s", start.elapsed().as_secs_f64());
         let capacity = n + capture.continuation.len();

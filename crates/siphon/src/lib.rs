@@ -9,4 +9,4 @@ pub mod vision;
 
 pub use checkpoint::{Checkpoint, TensorEntry};
 pub use config::{LoopConfig, TextConfig};
-pub use format::{KvFormat, VisionFormat, WeightFormat};
+pub use format::{KvFormat, OutputProjection, VisionFormat, WeightFormat};

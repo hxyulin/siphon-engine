@@ -1436,8 +1436,8 @@ impl Ctx {
         window: Option<Window>,
     ) -> anyhow::Result<()> {
         let w = &self.weights.layers[layer];
-        let mut prefetch: Vec<&dyn Prefetch> = match &w.fp8 {
-            Some(fp8) => vec![&fp8.o],
+        let mut prefetch: Vec<&dyn Prefetch> = match w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
+            Some(o) => vec![o],
             None => vec![&w.attention.o],
         };
         if let Some(gates) = w.message_gates.as_ref().filter(|_| gated) {
@@ -1859,10 +1859,10 @@ impl Ctx {
             },
         )?;
         // decode_step triggers early, and no prefetch starts here.
-        if let Some(fp8) = &w.fp8 {
+        if let Some(o) = w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
             self.kernels.linear_fp8.gemv(
                 &self.stream,
-                &mut [Fp8Gemv::new(&fp8.o, &t.gated, &mut t.proj)],
+                &mut [Fp8Gemv::new(o, &t.gated, &mut t.proj)],
                 Start::Early,
             )
         } else {

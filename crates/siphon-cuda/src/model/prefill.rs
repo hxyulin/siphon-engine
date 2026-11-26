@@ -1763,7 +1763,7 @@ impl Ctx {
         self.gemm_rows(
             &mut [RowProduct {
                 weight: &a.o,
-                fp8: w.fp8.as_ref().map(|f| &f.o),
+                fp8: w.fp8.as_ref().and_then(|f| f.o.as_ref()),
                 x: rows(&t.gated, m, q_dims),
                 out: rows_mut(&mut t.proj, m, hidden),
             }],

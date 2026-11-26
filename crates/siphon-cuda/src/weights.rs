@@ -60,6 +60,8 @@ pub struct Weights {
     /// FP8 copy of `lm_head`, after [`Weights::quantize_fp8`], which every LM-head product
     /// then reads.
     pub lm_head_fp8: Option<Fp8Matrix>,
+    /// The output projection's format in [`Weights::quantize_fp8`].
+    pub output: OutputProjection,
 }
 
 /// A BF16 tensor in device memory or in mapped host memory.
@@ -86,7 +88,7 @@ impl Table {
     }
 }
 
-pub use siphon::WeightFormat;
+pub use siphon::{OutputProjection, WeightFormat};
 
 #[derive(Debug)]
 pub struct LayerWeights {
@@ -118,7 +120,9 @@ pub struct LayerWeights {
 pub struct Fp8Projections {
     /// The input projections, in the order of [`AttentionWeights::input_projections`].
     pub inputs: Vec<Fp8Matrix>,
-    pub o: Fp8Matrix,
+    /// The output projection with [`OutputProjection::Fp8`]; decode reads the BF16 weights
+    /// otherwise.
+    pub o: Option<Fp8Matrix>,
 }
 
 #[derive(Debug)]
@@ -311,12 +315,14 @@ impl Weights {
             lm_head: Table::Device(loader.bf16("model.llm.unembed.weight", &[vocab, hidden])?),
             message_queries: load_message_queries(&loader, config)?,
             lm_head_fp8: None,
+            output: OutputProjection::default(),
         })
     }
 
-    /// Quantizes every layer's attention input and output projections, its message gates
-    /// and the LM head to FP8 copies, which decode then reads, and moves the BF16 LM head to
-    /// mapped host memory. Returns the bytes the copies take.
+    /// Quantizes every layer's attention input projections, its message gates and the LM
+    /// head to FP8 copies, and its output projection too with [`OutputProjection::Fp8`],
+    /// which decode then reads, and moves the BF16 LM head to mapped host memory. Returns
+    /// the bytes the copies take.
     pub fn quantize_fp8(
         &mut self,
         linear: &LinearFp8,
@@ -339,8 +345,12 @@ impl Weights {
                 .into_iter()
                 .map(|w| quantize(w, hidden))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let o = quantize(&a.o, a.o.len() / hidden)?;
-            bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>() + o.bytes();
+            let o = match self.output {
+                OutputProjection::Fp8 => Some(quantize(&a.o, a.o.len() / hidden)?),
+                OutputProjection::Bf16 => None,
+            };
+            bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>()
+                + o.as_ref().map_or(0, Fp8Matrix::bytes);
             layer.fp8 = Some(Fp8Projections { inputs, o });
             for gate in layer.message_gates.iter_mut().flatten() {
                 let quantize_gate =

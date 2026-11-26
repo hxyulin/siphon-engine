@@ -281,6 +281,9 @@ pub struct Options {
     /// Rows of each prefill chunk; `None` runs `DEFAULT_PREFILL_CHUNK`.
     pub prefill_chunk: Option<usize>,
     pub fp8_weights: bool,
+    /// Whether decode reads an FP8 copy of the attention output projection with FP8
+    /// weights, instead of its BF16 weights.
+    pub fp8_output: bool,
     pub fp8_kv: bool,
     /// Verify widths the adaptive policy chooses among.
     pub widths: Vec<usize>,
@@ -456,7 +459,7 @@ mod cuda {
             WidthPolicy, load_draft, price,
         },
         vision::{VisionFormat, VisionTower},
-        weights::{WeightFormat, Weights},
+        weights::{OutputProjection, WeightFormat, Weights},
     };
 
     use super::{Control, Engine, Event, Finish, Job, Options};
@@ -709,6 +712,7 @@ mod cuda {
             config: &config,
             checkpoint: &checkpoint,
             weights: weight_format,
+            output: output_projection(options),
             kv,
             draft: options
                 .drafter
@@ -723,7 +727,8 @@ mod cuda {
             vision: vision_inputs(options)?,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
-        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        weights.output = output_projection(options);
         let mut model =
             Model::with_formats(&gpu, config, weights, passes, capacity, kv, weight_format)?;
         model.set_prefill_attention(options.prefill_attention.parse()?);
@@ -832,6 +837,15 @@ mod cuda {
                 })
             })
             .transpose()
+    }
+
+    /// The attention output projection's format `options` ask for.
+    fn output_projection(options: &Options) -> OutputProjection {
+        if options.fp8_output {
+            OutputProjection::Fp8
+        } else {
+            OutputProjection::Bf16
+        }
     }
 
     /// The weight and KV cache formats `options` ask for.

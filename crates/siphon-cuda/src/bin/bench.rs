@@ -20,7 +20,9 @@
 //! produces are meaningless, but each step does the same work as a real one. Without
 //! `--contexts`, it runs 0, 4096 and 32768, and 131072 if the cache fits in free memory.
 //! `--kv fp8` stores the global-layer KV caches as E4M3 instead of BF16. `--weights fp8`
-//! makes decode read FP8 copies of the attention projections and the LM head.
+//! makes decode read FP8 copies of the attention input projections, the message gates and
+//! the LM head, and `--output-projection fp8` of the output projection too (every mode
+//! takes it).
 //!
 //! Results are comparable only on an otherwise idle GPU, so the output records the GPU
 //! clocks, the processes on the GPU and the time.
@@ -104,7 +106,7 @@ mod linux {
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
-        weights::{WeightFormat, Weights},
+        weights::{OutputProjection, WeightFormat, Weights},
     };
 
     /// Bytes of weights one decode step reads.
@@ -119,7 +121,7 @@ mod linux {
     const LONG_CONTEXT: usize = 131_072;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
                          [--steps N] [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] \
-                         [--json]\n       \
+                         [--output-projection bf16|fp8] [--json]\n       \
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--expert-activations bf16|quantized|fp8] \
@@ -134,6 +136,7 @@ mod linux {
         warmup: usize,
         kv: KvFormat,
         weights: WeightFormat,
+        output: OutputProjection,
         expert_activations: ExpertActivations,
         prefill_attention: PrefillAttention,
         prefill_dense: Products,
@@ -184,6 +187,7 @@ mod linux {
         let mut warmup = 10;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut output = OutputProjection::default();
         let mut expert_activations = ExpertActivations::Bf16;
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         let mut prefill_dense = Products::Bf16;
@@ -216,6 +220,7 @@ mod linux {
                 "--warmup" => warmup = value()?.parse()?,
                 "--kv" => kv = value()?.parse()?,
                 "--weights" => weights = value()?.parse()?,
+                "--output-projection" => output = value()?.parse()?,
                 "--expert-activations" => expert_activations = value()?.parse()?,
                 "--prefill-attention" => prefill_attention = value()?.parse()?,
                 "--prefill-dense" => prefill_dense = value()?.parse()?,
@@ -266,6 +271,7 @@ mod linux {
             warmup,
             kv,
             weights,
+            output,
             expert_activations,
             prefill_attention,
             prefill_dense,
@@ -411,7 +417,8 @@ mod linux {
     ) -> anyhow::Result<Model> {
         eprintln!("loading weights");
         let checkpoint = Checkpoint::open(&args.model)?;
-        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        weights.output = args.output;
         let mut model = Model::with_formats(
             gpu,
             config,
@@ -563,6 +570,7 @@ mod linux {
             config: &config,
             checkpoint: &checkpoint,
             weights: args.weights,
+            output: args.output,
             kv: args.kv,
             draft: DraftChoice::None,
             prefill_chunk: 0,
@@ -576,7 +584,8 @@ mod linux {
             .take()
             .unwrap_or_else(|| default_contexts(&planner, free, tail));
         eprintln!("loading weights");
-        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        weights.output = args.output;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -679,7 +688,8 @@ mod linux {
         let before = gpu_state()?;
         let checkpoint = Checkpoint::open(&args.model)?;
         eprintln!("loading weights");
-        let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+        weights.output = args.output;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -980,7 +990,8 @@ mod linux {
             let before = gpu_state()?;
             eprintln!("loading weights");
             let checkpoint = Checkpoint::open(&args.model)?;
-            let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+            let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+            weights.output = args.output;
             let mut model = Model::with_formats(
                 &gpu,
                 config,

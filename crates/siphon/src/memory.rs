@@ -16,7 +16,7 @@ use std::{fmt, path::Path};
 use anyhow::{Context as _, ensure};
 use safetensors::Dtype;
 
-use crate::{Checkpoint, KvFormat, TextConfig, VisionFormat, WeightFormat};
+use crate::{Checkpoint, KvFormat, OutputProjection, TextConfig, VisionFormat, WeightFormat};
 
 /// Device memory the CUDA context takes, rounded up: 507 MiB on an RTX 5090 with driver
 /// 620, measured as `nvidia-smi`'s free memory before `siphon-serve` started less the free
@@ -148,6 +148,8 @@ pub struct PlanInputs<'a> {
     /// The target checkpoint, of which only the headers are read.
     pub checkpoint: &'a Checkpoint,
     pub weights: WeightFormat,
+    /// The output projection's format under [`WeightFormat::Fp8`].
+    pub output: OutputProjection,
     pub kv: KvFormat,
     pub draft: DraftChoice<'a>,
     /// Rows of the largest prefill chunk, or 0 if nothing prefills.
@@ -394,7 +396,7 @@ impl Planner {
             weights: target_weight_bytes(inputs.checkpoint, inputs.weights),
             fp8_copies: match inputs.weights {
                 WeightFormat::Bf16 => 0,
-                WeightFormat::Fp8 => fp8_copy_bytes(c),
+                WeightFormat::Fp8 => fp8_copy_bytes(c, inputs.output),
             },
             kv: 0,
             rings,
@@ -500,9 +502,10 @@ fn fp8_rows(rows: usize, k: usize) -> usize {
     rows * k + 4 * rows
 }
 
-/// `Weights::quantize_fp8`: every layer's attention input and output projections, the
-/// looped layers' message gates and the LM head.
-fn fp8_copy_bytes(c: &TextConfig) -> usize {
+/// `Weights::quantize_fp8`: every layer's attention input projections, its output
+/// projection with [`OutputProjection::Fp8`], the looped layers' message gates and the LM
+/// head.
+fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
     let hidden = c.hidden_size;
     let q_dims = c.num_attention_heads * c.head_dim;
     let kv_dims = c.num_key_value_heads * c.head_dim;
@@ -530,7 +533,10 @@ fn fp8_copy_bytes(c: &TextConfig) -> usize {
                 .iter()
                 .map(|&rows| fp8_matrix(rows, hidden))
                 .sum::<usize>()
-                + fp8_matrix(hidden, q_dims)
+                + match output {
+                    OutputProjection::Fp8 => fp8_matrix(hidden, q_dims),
+                    OutputProjection::Bf16 => 0,
+                }
                 + gates
         })
         .sum();
@@ -848,9 +854,12 @@ mod tests {
     }
 
     #[test]
-    fn fp8_copies_take_about_1_14_gb() {
-        let bytes = fp8_copy_bytes(&config());
+    fn fp8_copies_take_about_1_14_gb_or_0_97_without_the_output_projection() {
+        let bytes = fp8_copy_bytes(&config(), OutputProjection::Fp8);
         assert!((1.13e9..1.15e9).contains(&(bytes as f64)), "{bytes}");
+        // Without the copies of the 24 output projections of 2304 x 3072.
+        let bf16 = fp8_copy_bytes(&config(), OutputProjection::Bf16);
+        assert_eq!(bytes - bf16, 24 * (2304 * 3072 + 4 * 2304));
     }
 
     #[test]
@@ -963,6 +972,7 @@ mod tests {
                 config: &c,
                 checkpoint: &checkpoint,
                 weights: WeightFormat::Fp8,
+                output: OutputProjection::default(),
                 kv: KvFormat::Fp8,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,

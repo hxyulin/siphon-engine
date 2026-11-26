@@ -5,7 +5,8 @@
 //! smallm dense <model-dir>
 //! smallm experts <model-dir> <routing-capture>
 //! smallm attention
-//! smallm verify <model-dir> <capture> --width M [--passes N] [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1]
+//! smallm verify <model-dir> <capture> --width M [--passes N] [--weights bf16|fp8]
+//!        [--output-projection bf16|fp8] [--kv bf16|fp8] [--hash 1]
 //!     [--prefill-attention auto|bf16|fp8]
 //! ```
 //!
@@ -58,7 +59,7 @@ mod linux {
         Gpu,
         model::{Accept, DEFAULT_PREFILL_ATTENTION, Model, PrefillLogits, VerifyTokens},
         ops::attention::KvFormat,
-        weights::{WeightFormat, Weights},
+        weights::{OutputProjection, WeightFormat, Weights},
     };
 
     struct Args {
@@ -138,19 +139,21 @@ mod linux {
     fn verify() -> anyhow::Result<()> {
         let mut it = env::args().skip(2);
         let usage = "usage: smallm verify <model-dir> <capture> --width M [--passes N] \
-                     [--weights bf16|fp8] [--kv bf16|fp8] [--hash 1] \
-                     [--prefill-attention auto|bf16|fp8]";
+                     [--weights bf16|fp8] [--output-projection bf16|fp8] [--kv bf16|fp8] \
+                     [--hash 1] [--prefill-attention auto|bf16|fp8]";
         let model_dir = PathBuf::from(it.next().context(usage)?);
         let capture = PathBuf::from(it.next().context(usage)?);
         let (mut width, mut passes, mut weights, mut kv, mut hash) =
             (4usize, 20usize, WeightFormat::Bf16, KvFormat::Bf16, false);
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
+        let mut output = OutputProjection::default();
         while let Some(flag) = it.next() {
             let value = it.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--width" => width = value.parse()?,
                 "--passes" => passes = value.parse()?,
                 "--weights" => weights = value.parse()?,
+                "--output-projection" => output = value.parse()?,
                 "--kv" => kv = value.parse()?,
                 "--hash" => hash = value == "1",
                 "--prefill-attention" => prefill_attention = value.parse()?,
@@ -167,7 +170,8 @@ mod linux {
         let passes_cfg = config.loop_config.num_passes;
         let gpu = Gpu::new(0)?;
         let checkpoint = Checkpoint::open(&model_dir)?;
-        let w = Weights::load(&checkpoint, &config, gpu.stream())?;
+        let mut w = Weights::load(&checkpoint, &config, gpu.stream())?;
+        w.output = output;
         let mut model =
             Model::with_formats(&gpu, config, w, passes_cfg, text.len() + 16, kv, weights)?;
         model.set_prefill_attention(prefill_attention);
@@ -327,7 +331,11 @@ mod linux {
                     .map(|&(layer, _)| {
                         let attn = &weights.layers[layer].attention;
                         let fp8w = weights.layers[layer].fp8.as_ref();
-                        vec![(&attn.o, fp8w.map(|fp8w| &fp8w.o), attn.o.len() / hidden)]
+                        vec![(
+                            &attn.o,
+                            fp8w.and_then(|fp8w| fp8w.o.as_ref()),
+                            attn.o.len() / hidden,
+                        )]
                     })
                     .collect(),
                 Kind::GateDown => visits
