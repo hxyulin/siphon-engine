@@ -39,6 +39,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
+                     [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
                      [--decode-floor 20] [--greedy] [--vision] \
                      [--max-image-pixels 2073600] [--max-images 16]
 --context sets the positions of the KV cache pool: the prompts and generated tokens of every
@@ -89,6 +90,13 @@ seconds it ends what is left with an error. Then it saves --cache-dir and exits.
 --prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
+--prefill-dense picks prefill's dense products: bf16 (the default) or fp8, which runs the
+attention input projections and message gate down projections on FP8 tensor cores with
+--weights fp8.
+--expert-activations picks prefill's (and wide batched) expert activations: bf16 (the
+default), quantized (NVFP4/MXFP8 tensor cores), or fp8 (MXFP8 activations on FP8 tensor
+cores). Together with --prefill-dense fp8 and --prefill-attention fp8, quantized expert
+activations cut prefill time by ~40% on Blackwell.
 --vision loads the vision tower and takes images in requests: base64 data: URLs in OpenAI
 image_url parts and base64 image blocks in Anthropic messages. Image URLs are not fetched.
 --max-image-pixels shrinks a larger image to this many pixels, keeping its aspect ratio
@@ -151,6 +159,8 @@ fn args() -> anyhow::Result<Args> {
     let mut cache_dir = None;
     let mut drain_timeout = 600;
     let mut prefill_attention = "auto".to_owned();
+    let mut prefill_dense = "bf16".to_owned();
+    let mut expert_activations = "bf16".to_owned();
     let mut greedy = false;
     let mut decode_floor = DECODE_FLOOR;
     let mut vision = false;
@@ -195,6 +205,20 @@ fn args() -> anyhow::Result<Args> {
             "--cache-dir" => cache_dir = Some(PathBuf::from(value()?)),
             "--drain-timeout" => drain_timeout = value()?.parse()?,
             "--prefill-attention" => prefill_attention = value()?,
+            "--prefill-dense" => {
+                prefill_dense = value()?;
+                ensure!(
+                    ["bf16", "fp8"].contains(&prefill_dense.as_str()),
+                    "--prefill-dense takes bf16 or fp8"
+                );
+            }
+            "--expert-activations" => {
+                expert_activations = value()?;
+                ensure!(
+                    ["bf16", "quantized", "fp8"].contains(&expert_activations.as_str()),
+                    "--expert-activations takes bf16, quantized or fp8"
+                );
+            }
             "--greedy" => greedy = true,
             "--vision" => vision = true,
             "--max-image-pixels" => {
@@ -271,6 +295,8 @@ fn args() -> anyhow::Result<Args> {
             host_cache,
             cache_dir,
             prefill_attention,
+            prefill_dense,
+            expert_activations,
             greedy,
             decode_floor,
             vision: vision.then_some(engine::VisionOptions {

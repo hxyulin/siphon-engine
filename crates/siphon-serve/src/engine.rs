@@ -331,6 +331,11 @@ pub struct Options {
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
+    /// Prefill's dense product precision (`bf16` or `fp8`), as `Products` parses it.
+    pub prefill_dense: String,
+    /// Expert activation precision (`bf16`, `quantized`, or `fp8`), as `ExpertActivations`
+    /// parses it.
+    pub expert_activations: String,
     /// Whether every request decodes greedily, whatever it asks.
     pub greedy: bool,
     /// Tokens per second that each decoding request gets at least while another prefills,
@@ -867,6 +872,8 @@ mod cuda {
         )?;
         kv_options.apply(&mut model)?;
         model.set_prefill_attention(options.prefill_attention.parse()?)?;
+        model.set_prefill_dense(options.prefill_dense.parse()?)?;
+        model.set_expert_activations(options.expert_activations.parse()?)?;
         if !options.greedy {
             model.enable_sampling()?;
         }
@@ -1090,6 +1097,8 @@ mod cuda {
             "weights": if options.fp8_weights { "fp8" } else { "bf16" },
             "draft": options.draft,
             "prefill_attention": options.prefill_attention,
+            "prefill_dense": options.prefill_dense,
+            "expert_activations": options.expert_activations,
             "kernels": siphon_cuda::KERNELS_HASH,
         }))
     }
