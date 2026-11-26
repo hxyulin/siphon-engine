@@ -641,11 +641,30 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 - the prefix cache's copies of one slot's rings and conv states and of the draft's rings (see [Prefix cache](#prefix-cache)), 171 MiB with the bundled draft and 203 MiB with DFlash 2;
 - `RUNTIME_BYTES`, 128 MiB for the module images, the CUDA graphs, the small buffers and the allocator's rounding. It was measured with a thread that sampled `cuMemGetInfo` every millisecond while `siphon-serve` loaded, prefilled more than a chunk and generated speculatively; the uncounted part came to 69 to 87 MiB. Each stream past the first adds `STREAM_RUNTIME_BYTES`, 4 MiB, for one more batch size's CUDA graph and the allocator's rounding of its caches: on an RTX PRO 6000 Blackwell Max-Q at 16,384 positions, the modules and graphs took 0.03 GiB at 1 stream and 0.11 GiB at 32, and without it the peak came 11 to 43 MiB past the plan at 32 streams.
 
-The CUDA context itself takes 507 MiB. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less a 0.5 GiB margin. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.
+The CUDA context itself takes 507 MiB, or 392 MiB on an RTX 4090. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less `--margin`, 0.25 GiB by default (0.5 GiB before). `siphon-serve` sets `CUDA_MODULE_LOADING=EAGER` unless the environment sets it, so every kernel's code loads with its module at startup, before the memory check, rather than at its first launch. On an RTX 4090 the modules took 16 MiB eagerly against 10 MiB lazily, and a filled context peaked at the same bytes either way.
+
+`--prefill-chunk N` (`siphon-serve` and `siphon-plan`) sets the rows of each prefill chunk, 2048 by default. The prefill buffers take 0.85 GiB at 2048 rows and 0.45 GiB at 1024, and the planner sizes them from the chunk. Prefix cache entries fall on its multiples. Chunks of 1024 cost 6 to 7% of prefill speed: on an RTX 4090, 8,939 against 9,570 tok/s at 8,192 tokens and 8,291 against 8,841 at 32,768; on an RTX 5090, 32,768 tokens took 2.55 s against 2.39 s.
+
+Planned against measured, FP8 weights and cache, the bundled draft, the most that fit the free memory (23.13 GiB on an RTX 4090, 30.46 GiB on an RTX 5090), each filled by one prompt and 256 generated tokens:
+
+| GPU | Margin, chunk | Streams | Capacity | Planned MiB | Peak MiB | Over, MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| RTX 4090 | 0.5 GiB, 2048 | 1 | 207,872 | 23,171 | 23,168 | 3 |
+| | 0.5 GiB, 1024 | 1 | 230,400 | 23,162 | 23,136 | 26 |
+| | 0.25 GiB, 2048 | 1 | 222,208 | 23,423 | 23,424 | -1 |
+| | 0.25 GiB, 1024 | 1 | 244,736 | 23,414 | 23,392 | 22 |
+| | 0.25 GiB, 1024 | 2 | 117,760 | 23,419 | 23,404 | 15 |
+| | 0.5 GiB, 2048, short requests | 2 | 97,280 | 23,144 | 23,148 | -4 |
+| RTX 5090 | 0.5 GiB, 2048 | 1 | 633,856 | 30,670 | 30,622 | 48 |
+| | 0.25 GiB, 2048 | 1 | 648,192 | 30,922 | 30,878 | 44 |
+| | 0.25 GiB, 1024 | 1 | 671,744 | 30,931 | 30,878 | 53 |
+| | 0.25 GiB, 1024 | 2 | 343,040 | 30,915 | 30,850 | 65 |
+
+The planned and peak bytes here include the context. The peak came at most 4 MiB past the plan on the 4090, where the `sm_89` build's 10 MB of module globals take part of `RUNTIME_BYTES`, and stayed 44 to 65 MiB under it on the 5090. Either way at least 252 MiB of the 0.25 GiB margin stayed free. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.
 
 `siphon-serve` also checks the plan against what it uses. It allocates the full prefill chunk's buffers at startup (`Model::reserve_prefill`), so every buffer the plan counts exists once the warmup has run. Every buffer comes from the device's memory pool, because cudarc allocates with `cuMemAllocAsync`. `Gpu::memory` reads the pool's reserved bytes and their peak (`cuMemPoolGetAttribute`) along with the device's free memory. The bytes outside the pool, the module images and the CUDA graphs, are the drop in free memory since the context was created less the pool's bytes, measured once after warmup. The check prints the pool's peak plus those bytes against the plan, prints the peak again after a job whenever it rises, and warns once if a job takes it past the plan.
 
-`siphon-plan` draws the plan in the terminal. It plans every combination of weight format, KV format and draft (the bundled draft, a `--drafter`, none) with `siphon::memory`. It takes the free memory after the context from nvidia-smi's free memory less the 507 MiB context, which is how the context was measured. `--streams N` plans N streams as `siphon-serve --streams N` does.
+`siphon-plan` draws the plan in the terminal. It plans every combination of weight format, KV format and draft (the bundled draft, a `--drafter`, none) with `siphon::memory`. It takes the free memory after the context from nvidia-smi's free memory less the context, 507 MiB or the RTX 4090's 392 MiB, which is how the context was measured. `--margin` and `--prefill-chunk` plan as `siphon-serve`'s do. `--streams N` plans N streams as `siphon-serve --streams N` does.
 
 Planned against measured, as the memory check of `siphon-serve` reports it after a request: the pool's peak plus the bytes outside the pool. At 65,536 positions the request had a 3,820-token prompt and 256 speculative tokens. At the largest capacity, the most that fit 30.46 GiB of free memory, its prompt and 512 speculative tokens left 399 to 436 positions of the cache unused:
 

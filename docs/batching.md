@@ -32,7 +32,7 @@ The model keeps sequence slots. Slot 0 is the model's existing state, which `Mod
 
 The planner gives every slot the same capacity: `--streams N` slots of `capacity` positions each. It counts N sets of global caches, rings and conv states, one batch scratch (the verify pass's multi-row buffers for N rows and their taps), 4 MiB per stream past the first for its batch size's CUDA graph and the allocator's rounding, and the draft and verify buffers once. Without `--context`, the server takes the largest capacity at which N slots fit.
 
-On a 32 GB card with FP8 weights and caches and the bundled draft, about 11 GiB remain after the fixed parts. Eight slots get 77,824 positions each, four 163,840. On an RTX PRO 6000 Blackwell Max-Q, with 94.46 GiB free after the CUDA context, `siphon-plan --streams N` gives 584,704 positions each to 8 slots, 283,648 to 16 and 131,072 to 32. At 32 streams the rings, conv states and prefix cache entries take 10.5 GiB of the 93.7 GiB plan.
+On a 32 GB card with FP8 weights and caches and the bundled draft, about 11 GiB remain after the fixed parts. With a prefix cache entry per slot, eight slots get 69,632 positions each, four 159,744. On an RTX PRO 6000 Blackwell Max-Q, with 94.46 GiB free after the CUDA context, `siphon-plan --streams N` gives 586,752 positions each to 8 slots, 284,672 to 16 and 132,096 to 32. At 32 streams the rings, conv states and prefix cache entries take 10.5 GiB of the 94.2 GiB plan.
 
 `siphon-serve --streams 32 --context 16384` checks the plan against its memory pool after a request of each stream: 38,288 MiB at peak against 38,369 MiB planned, and 28,772 against 28,827 at 16 streams.
 

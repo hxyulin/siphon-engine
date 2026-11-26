@@ -43,8 +43,10 @@ pub const RUNTIME_BYTES: usize = 128 << 20;
 pub const STREAM_RUNTIME_BYTES: usize = 4 << 20;
 
 /// Free memory a plan leaves unclaimed unless `--margin` says otherwise, for other
-/// processes on the GPU and the allocator's growth past the plan.
-pub const DEFAULT_MARGIN: usize = 512 << 20;
+/// processes on the GPU and the allocator's growth past the plan. Filled to their largest
+/// contexts, the peak came at most 4 MiB past the plan on an RTX 4090 and stayed 44 to
+/// 65 MiB under it on an RTX 5090 (`docs/engine.md`).
+pub const DEFAULT_MARGIN: usize = 256 << 20;
 
 /// Rows of a prefill chunk unless `--prefill-chunk` says otherwise, and the most it takes.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;

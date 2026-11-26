@@ -108,7 +108,7 @@ Neither mode is clearly more accurate. On 23 quickbench items at a3fc890, 4 atte
 
 A batch of one takes 3.14 ms per step against 2.71 ms for plain decode, because the batch keeps the verify pass's numerics. A request that speculates alone runs at 508 to 875 tok/s greedy and 345 to 711 tok/s at temperature 1, so batching serves more in total from about three streams on. The batched steps here decode greedily. Over HTTP with `--streams 8`, temperature 1 served 734 tok/s in all against 780 greedy (see [Sampling](#sampling)).
 
-A 32 GB card fits 8 streams of 77,824 positions. An RTX PRO 6000 Blackwell Max-Q (95 GiB, 1,645 GB/s, 275 W) fits 16 streams of 283,648 positions or 32 of 131,072, and serves more with each step up to 32. The same batched-step benchmark there:
+A 32 GB card fits 8 streams of 69,632 positions. An RTX PRO 6000 Blackwell Max-Q (95 GiB, 1,645 GB/s, 275 W) fits 16 streams of 284,672 positions or 32 of 132,096, and serves more with each step up to 32. The same batched-step benchmark there:
 
 | Context of each stream | 1 stream | 8 streams | 16 streams | 32 streams |
 | ---: | ---: | ---: | ---: | ---: |
@@ -139,12 +139,14 @@ With `--streams 8`, eight agent-like conversations at once, each growing from 15
 
 ### Context length
 
-The server plans its GPU memory from the config and the checkpoint headers before it loads anything. Without `--context` it takes the longest context that fits, up to the model's 1,048,576 positions. With 30.45 GiB free after the CUDA context, the longest contexts are:
+The server plans its GPU memory from the config and the checkpoint headers before it loads anything. Without `--context` it takes the longest context that fits the free memory less a 0.25 GiB margin (`--margin`), up to the model's 1,048,576 positions. With 30.45 GiB free after the CUDA context, the longest contexts are:
 
 | Dense weights, KV cache | DSpark draft | DFlash 2 |
 | --- | ---: | ---: |
-| FP8, FP8 | 633,856 | 701,440 |
-| BF16, BF16 | 340,992 | 357,376 |
+| FP8, FP8 | 648,192 | 717,824 |
+| BF16, BF16 | 349,184 | 365,568 |
+
+`--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts to 670,720 and 744,448 for 6 to 7% of prefill speed.
 
 `siphon-plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
 

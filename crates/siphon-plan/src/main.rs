@@ -39,7 +39,7 @@ const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory Gi
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's
 --memory does.
 --margin sets the free memory the plan leaves unclaimed, as siphon-serve's --margin does
-(0.5 GiB by default).
+(0.25 GiB by default).
 --prefill-chunk plans prefill chunks of N rows, 1 to 2048, as siphon-serve's --prefill-chunk
 does (2048 by default).
 --free sets the free memory right after creating the CUDA context instead of asking

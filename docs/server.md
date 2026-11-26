@@ -8,11 +8,11 @@ SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
 
 ## Startup
 
-Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. Without `--context`, it takes the longest context that fits the free memory less a 0.5 GiB margin, up to the model's 1,048,576 positions. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
+Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. Without `--context`, it takes the longest context that fits the free memory less `--margin` (0.25 GiB by default), up to the model's 1,048,576 positions. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
 
 It then loads the model, prices each verify width on a short prompt, and serves. After warmup it compares the memory the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the module images and CUDA graphs from the change in free memory. After each job it checks the pool's peak again and warns if the peak went past the plan.
 
-`siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] [--context N] [--print]` shows the same plan in a terminal before you start the server, and runs on macOS too. It draws the GPU memory as a bar and a table of what holds it, with the longest context for every combination of formats and drafts. Keys switch the formats and the draft and move the context. It reads the free memory from nvidia-smi, or takes `--free`, or assumes an idle 32 GB RTX 5090.
+`siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N] [--free GiB] [--context N] [--print]` shows the same plan in a terminal before you start the server, and runs on macOS too. It draws the GPU memory as a bar and a table of what holds it, with the longest context for every combination of formats and drafts. Keys switch the formats and the draft and move the context. It reads the free memory from nvidia-smi, or takes `--free`, or assumes an idle 32 GB RTX 5090.
 
 ## Options
 
@@ -22,6 +22,8 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--name` | `inkling-2-mini` | Model id in responses and `/v1/models`. |
 | `--context N` | most that fits | KV cache positions per stream: prompt plus generated tokens. |
 | `--memory GiB` | free memory | Caps the GPU memory the plan may use, the CUDA context included. |
+| `--margin GiB` | `0.25` | Free memory the plan leaves unclaimed. |
+| `--prefill-chunk N` | `2048` | Rows of each prefill chunk, 1 to 2048. 1024 frees 0.4 GiB for the context and costs 6 to 7% of prefill speed. |
 | `--weights fp8\|bf16` | `fp8` | Dense weights: FP8 copies or the checkpoint's BF16. |
 | `--kv fp8\|bf16` | `fp8` | Global KV cache format. |
 | `--streams N` | `1` | Requests that run at once, 1 to 32, each with its own KV cache. |
@@ -124,7 +126,7 @@ A stream sends one choice per chunk, as vLLM and OpenAI do. A chat stream starts
 
 A request with `n` choices takes `n` places among the running and queued requests: up to `--queue` may wait beyond the `--streams` that run. If they do not all fit, the request gets the queue-full 503, and none of its choices runs. An `n` above `--streams` plus `--queue` gets a 400. A client that leaves cancels every choice.
 
-With `--streams` of 2 or more, the choices run batched, not speculating. The first choice to prefill copies its state into the slots of the others, and each draws its first token from the same logits with its own seed, so the prompt is prefilled once and each choice gets the tokens of its own prefill. Choices that start later, because the slots were full, prefill the prompt themselves. With `--streams 1`, the choices run one after another, and each one after the first reads the prompt up to its last multiple of 2,048 tokens from the [prefix cache](#prefix-cache).
+With `--streams` of 2 or more, the choices run batched, not speculating. The first choice to prefill copies its state into the slots of the others, and each draws its first token from the same logits with its own seed, so the prompt is prefilled once and each choice gets the tokens of its own prefill. Choices that start later, because the slots were full, prefill the prompt themselves. With `--streams 1`, the choices run one after another, and each one after the first reads the prompt up to its last multiple of `--prefill-chunk` tokens from the [prefix cache](#prefix-cache).
 
 With `--streams 8` and the prefix cache off, one request with `n: 4` on a 12,916-token prompt, 256 tokens per choice, took 2.67 s. Four concurrent `n: 1` requests with the same seeds took 5.31 s and returned the same tokens. Streamed, the `n: 4` request's first token came after 0.87 s.
 
@@ -154,15 +156,15 @@ Each choice of a request with `n` choices counts as a request in the request cou
 
 ## Concurrent requests
 
-With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit. `siphon-plan --streams N` shows that context: with FP8 weights and caches, 77,824 positions for 8 streams on a 32 GB card, and 283,648 for 16 or 131,072 for 32 on an RTX PRO 6000 Blackwell Max-Q.
+With `--streams N`, up to N requests run at once and up to `--queue` more wait. Each stream has its own KV cache of `--context` positions. Without `--context`, the server takes the longest context at which N caches fit. `siphon-plan --streams N` shows that context: with FP8 weights and caches, 69,632 positions for 8 streams on a 32 GB card, and 284,672 for 16 or 132,096 for 32 on an RTX PRO 6000 Blackwell Max-Q.
 
 More streams serve more in total and less per stream. On an RTX PRO 6000 Blackwell Max-Q, 32 streams at 10,674 tokens of context ran 1,138 tok/s in all against 661 for 8 ([batching.md](batching.md#16-and-32-streams-on-an-rtx-pro-6000-blackwell-max-q)). With `--streams 32 --context 16384`, 32 concurrent requests of 512 tokens came back at 1,198 tok/s in all.
 
-A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of 2,048 tokens between the batch's steps. Either way each request gets the same tokens it would get alone, greedy or sampled with a seed. [batching.md](batching.md) has the design.
+A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of `--prefill-chunk` tokens (2,048 by default) between the batch's steps. Either way each request gets the same tokens it would get alone, greedy or sampled with a seed. [batching.md](batching.md) has the design.
 
 ## Prefix cache
 
-Chat clients and agents resend the whole conversation each turn. The server keeps the state of recent prompts, one per stream unless `--prefix-cache-entries` says fewer, each at its last multiple of 2,048 tokens. A request whose prompt starts with one of them prefills only the rest, batched or alone, and gets the same tokens and logits as without the cache. The usage object reports the reused tokens as `prompt_tokens_details.cached_tokens`.
+Chat clients and agents resend the whole conversation each turn. The server keeps the state of recent prompts, one per stream unless `--prefix-cache-entries` says fewer, each at its last multiple of `--prefill-chunk` tokens (2,048 by default). A request whose prompt starts with one of them prefills only the rest, batched or alone, and gets the same tokens and logits as without the cache. The usage object reports the reused tokens as `prompt_tokens_details.cached_tokens`.
 
 Each entry belongs to a stream's KV cache, so a request that hits one runs in that stream. A new prompt takes a stream without an entry, else the one whose entry was used least recently, and an entry unused for `--prefix-cache-ttl` seconds is dropped. So up to `--streams` conversations, such as an agent and its parallel subagents, each keep their own history cached between turns. Prompts that share only a beginning, such as two conversations with the same system prompt, do not share an entry.
 

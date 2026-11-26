@@ -36,7 +36,7 @@ way it plans the memory before loading the weights and stops if the plan does no
 positions. A request alone speculates; once another arrives, all run batched plain decode.
 Either way a request gets the same tokens. Up to --queue more requests wait.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
-plan may use the free memory at startup less --margin, 0.5 GiB by default.
+plan may use the free memory at startup less --margin, 0.25 GiB by default.
 --prefill-chunk runs prompts in chunks of N rows, 1 to 2048. Its buffers grow with N: 0.85 GiB
 at 2048 rows and 0.47 GiB at 1024, and the memory they free goes to the context.
 --drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
