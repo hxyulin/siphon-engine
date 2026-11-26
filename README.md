@@ -50,6 +50,8 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 
 [docs/server.md](docs/server.md) lists the options, routes and request fields.
 
+Siphon also runs [`hxyulin/Inkling-2-Mini-Fast-NVFP4`](https://huggingface.co/hxyulin/Inkling-2-Mini-Fast-NVFP4), the official checkpoint with [Lucebox's tuned attention output projections](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF), with no options changed. On 100 GPQA questions at temperature 1 it answered 81 correctly against the official checkpoint's 77, with 3,055 output tokens per reply on average against 11,871. These numbers come from a build with Q8_0 copies of the tuned matrices, about 0.8% from the BF16 ones in that repo.
+
 ## Performance
 
 All numbers come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, unless a section names another commit, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default.
