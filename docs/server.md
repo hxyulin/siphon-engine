@@ -26,7 +26,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--prefill-chunk N` | `2048` | Rows of each prefill chunk, 1 to 2048. 1024 frees 0.4 GiB for the context and costs 6 to 7% of prefill speed. |
 | `--weights fp8\|bf16` | `fp8` | Dense weights: FP8 copies or the checkpoint's BF16. |
 | `--output-projection bf16\|fp8` | `bf16` | The attention output projection decode reads with FP8 weights. `fp8` saves 4 to 6% of a plain step and moves the logits further from the model. |
-| `--kv fp8\|bf16` | `fp8` | Global KV cache format. |
+| `--kv fp8\|bf16\|nvfp4\|mixed` | `fp8` | Global KV cache format: 16, 32, 9 or 10.75 KiB per position. See [engine.md](engine.md#kv-cache-reduction). |
 | `--streams N` | `1` | Requests that run at once, 1 to 32, each with its own KV cache. |
 | `--queue N` | `8` | Requests that wait beyond the running ones. |
 | `--decode-floor R` | `20` | Tokens per second each decoding request gets at least while another prefills. 0 runs one batched step per prefill chunk. |

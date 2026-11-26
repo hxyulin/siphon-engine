@@ -667,7 +667,7 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 
 - the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32, less the tensors in host memory (see [Tensors in host memory](#tensors-in-host-memory)): the embedding table, and with `--weights fp8` the BF16 LM head. The vision tower's `model.visual.*` tensors count only with `--vision`, below. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
 - the FP8 copies of `--weights fp8`, 0.97 GB, or 1.14 GB with `--output-projection fp8`;
-- the global KV caches: 32 KiB per position, or 16 KiB with `--kv fp8`, over the 8 global visits;
+- the global KV caches: 32 KiB per position, 16 KiB with `--kv fp8`, 9 KiB with `--kv nvfp4` or 10.75 KiB with `--kv mixed`, over the 8 global visits (`TextConfig::global_cache_bytes`);
 - the 40 sliding rings of 1,024 slots (160 MiB), the conv states and the decode step's vocabulary-sized buffers;
 - the prefill buffers, 0.38 MB per chunk row plus 64 MB, and the verify pass's;
 - the draft's tensors less the BF16 projections that `fp8_backbone` frees, the bundled draft's fold, the copies its approximations make (the shortlist rows of the LM head, the FP8 backbone), its rings, its buffers and the speculator's tap tails. A draft without an FP8 or shortlist head under `--weights fp8` keeps its own device copy of the BF16 LM head;
@@ -728,12 +728,153 @@ The E4M3 draft cache, the tensors in host memory and the BF16 draft projections 
 
 ## KV cache format
 
-The global layers (5, 11, 17 and 23, 8 of the 48 layer visits) keep every earlier key and value, so at long context their attention reads most of the bytes of a step. `bench`, `eval` and `parity` take `--kv bf16|fp8`, and `Model::with_kv_format` takes the same choice:
+The global layers (5, 11, 17 and 23, 8 of the 48 layer visits) keep every earlier key and value, so at long context their attention reads most of the bytes of a step. `bench`, `eval`, `parity` and `kvdiff` take `--kv bf16|fp8|nvfp4`, and `Model::with_kv_format` takes the same choice:
 
 - `bf16`, the default, stores the keys and values as computed.
 - `fp8` stores the global caches as E4M3, which halves the bytes global attention reads. The sliding-window caches stay BF16.
 
+- `nvfp4` stores them as NVFP4, 4.5 bits per element. See [KV cache reduction](#kv-cache-reduction).
+
 The FP8 cache has no scale. Keys are L2-clipped to norm √512 and values are RMS-normed per head, so no element exceeds 22.7, far inside E4M3's ±448. The append kernel rounds each BF16 value to the nearest E4M3 value, ties to even. Attention decodes E4M3 exactly with the hardware converter, so it differs from BF16 only by that rounding. Ingine stores its FP8 global caches the same way.
+
+## KV cache reduction
+
+The global caches are 16 KiB per position with the FP8 cache, and at long context they hold most of the memory and are most of the bytes a step reads. Two ways to shrink them were measured: 4-bit elements, and one cache per looped global layer instead of one per pass. The second lost and was removed (see [Shared loop caches](#shared-loop-caches-removed)).
+
+| Configuration | Flags | Per position |
+| --- | --- | ---: |
+| BF16 | `--kv bf16` | 32 KiB |
+| FP8 (default) | `--kv fp8` | 16 KiB |
+| NVFP4 | `--kv nvfp4` | 9 KiB |
+| Mixed: FP8 for visits 5 and 11, NVFP4 for the rest | `--kv mixed` | 10.75 KiB |
+
+### NVFP4 cache
+
+`--kv nvfp4` (`KvFormat::Nvfp4`) stores the global keys and values as NVFP4: E2M1 values with one E4M3 scale per 16 elements, the scale `amax / 6` rounded to nearest and each value `x / scale` rounded to nearest even and saturated at 6. A slot holds 576 bytes per buffer: the 8 heads' values, 64 bytes each, then their 8 scales each. The scales need no global factor: keys are L2-clipped and values RMS-normed, so a group's `amax / 6` stays far inside E4M3's range.
+
+Rounding a group a second time gives the same bytes, since its largest element is then exactly 6 times the scale. So the verify pass, batched steps and prefill round their rows to NVFP4 values in BF16 first (`kv_round_bf16`), and the appends (`kv_append_rows_fp4`, the combine of `attention_rows_fp4`) store them without further change: every reader, including a row reading its own key, sees the same value. The fused decode step rounds its new row across the 4 lanes of each group. The attention kernels read the 4-bit bytes and scales straight into shared memory with `cp.async` and decode them with the hardware converter (`cvt.rn.f16x2.e2m1x2`) times the scale, which is exact in F16 and BF16; no full-size copy exists:
+
+- decode (`decode_step_fp4`): tiles of 64 keys, each warp decoding its 32 dims of a key in the score phase and each lane its 4 dims in the value phase;
+- verify and batched steps (`attention_rows_fp4_*`, `attention_batch_fp4`): the E4M3 kernels' fragment layout, with each lane decoding 32 dims of a key for S and one group of 16 dims of 4 keys for P V;
+- prefill (`prefill_attention_fp4`): staged tiles decoded in shared memory to BF16 keys and F16 values, then the BF16 path. The FP8 tensor-core attention that `--prefill-attention auto` uses past 16,384 keys has no NVFP4 variant yet.
+
+Prefill over the NVFP4 cache gives the same logits as the BF16 cache with the same rounding (`--kv bf16 --kv-quant nvfp4`, below) to every printed digit on the 4K fidelity text. Verify and decode differ slightly, through their F16 products and the decode step's rounding of its own row. `batch_matches_alone_nvfp4` and `batch_matches_alone_16_nvfp4` (batched rows equal one-row verifies bit for bit), `prefix_cache_entries_nvfp4` and `nvfp4_prefill_matches_stepping` pass. The prefix cache's host tier copies each global cache with its own bytes per position (`GlobalKv::layout`), values and scales alike, so a mixed slot's FP8 and NVFP4 caches round-trip too: `host_cache_matches_prefill_nvfp4`, `host_cache_round_trips_nvfp4`, their mixed variants and siphon-serve's `drain_then_restart_from_disk` with `SIPHON_KV=nvfp4` and `mixed` pass.
+
+### Mixed cache
+
+`--kv mixed` (`KvFormat::Mixed`) keeps the first two global visits (layer 5 and layer 11's first pass, `MIXED_FP8_VISITS`) in FP8 and the other six in NVFP4, after the measurements below found those two the most sensitive to 4 bits. Each cache picks its kernels by its own format, so nothing else changes. `TextConfig::cache_formats` gives each visit's format, and the planner sums the caches (`TextConfig::global_cache_bytes`). `batch_matches_alone_mixed` and `prefix_cache_entries_mixed` pass.
+
+### Method
+
+Quality was measured before any 4-bit kernel existed: `KvOptions` (`--kv-quant nvfp4|q4_0`, with `--kv bf16`) rounds the keys and values each global visit writes through a 4-bit format and back, keeping the BF16 storage, which holds NVFP4 values exactly. `q4_0` is llama.cpp's format: 4-bit integers with one F16 scale per 32 elements, as the third-party llama.cpp build for this model stores its global caches. A decode step rounds its row after its own attention; every other path rounds before. Variants: `--kv-rotate` (a 128-point Hadamard rotation per head before rounding), `--kv-quant-visits` (only some visits rounded), and, in prefill only, `--kv-recent N` (the newest N positions rounded to E4M3, older ones to 4 bits) with `--kv-keys-per-channel` (aged keys with one scale per channel and group of positions, as KIVI does).
+
+- **Fidelity against MLX**: `eval` over quickbench's fidelity captures of 4K and 32K tokens (Gutenberg prose), through prefill in chunks of 2,048 and through verify passes of 8 rows with FP8 weights, as served.
+- **Long-context divergence**: no MLX references exist past 32K, so `kvdiff` teacher-forces a long text through prefill in chunks of 2,048 and keeps, at every 64th position, the 256 largest log-probabilities. Against the run of the BF16 cache it reports KL (over those 256 tokens and the rest as one outcome), top-1 agreement and the next token's log-probability, by range of positions. The texts are 1,048,000 tokens of 11 Gutenberg books (`prose`) and of CPython 3.13.1's `Lib/` sources without tests (`code`). 256K-token runs used the RTX 5090, 1M-token runs the RTX PRO 6000.
+- **Tasks**: Lucebox's 130 questions (MATH-500 0 to 39, HumanEval 0 to 39, MMLU-Pro 0 to 49) at temperature 0 and 1, and 100 GPQA Diamond questions at temperature 1, through siphon-serve with 32,768-token caps, 8 streams of 40,960 positions (6 for the BF16 cache of the rounding runs). Two runs of 100 questions differ by about 9 points by chance; the intervals are Wilson 95%.
+- **Recall**: through siphon-serve, greedy, `reasoning_effort` low: six vault codes hidden at depths 5% to 95% of Gutenberg text, asked for at once; a generated 10-line Python function hidden at 15% or 40% of CPython sources, to be written out again exactly; and the local-ai-registry lab's context gate (a code at the end of archive lines).
+
+### Results
+
+Long-context divergence from the BF16 cache, positions 128K to 256K of the 256K-token texts:
+
+| Configuration | Code KL | Code top-1 | Prose KL | Prose top-1 |
+| --- | ---: | ---: | ---: | ---: |
+| FP8 | 4.0e-3 | 98.9% | 2.8e-3 | 97.7% |
+| NVFP4 | 8.5e-3 | 98.1% | 5.4e-3 | 96.7% |
+| q4_0 | 6.7e-3 | 98.3% | 5.4e-3 | 96.2% |
+| NVFP4, rotated | 7.0e-3 | 98.4% | 6.0e-3 | 96.2% |
+| q4_0, rotated | 5.8e-3 | 98.4% | 4.9e-3 | 96.5% |
+
+The same over 1,048,000 tokens (the code text's last quarter is repetitive source, with a mean next-token loss of 0.12 nats against 0.68 before it):
+
+| Configuration | Code KL, 512K to 768K | Code top-1 | Code KL, all | Prose KL, 512K to 768K | Prose top-1 | Prose KL, all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP8 | 3.8e-3 | 98.4% | 3.0e-3 | 2.9e-3 | 97.5% | 2.8e-3 |
+| NVFP4 | 6.8e-3 | 98.0% | 5.1e-3 | 6.7e-3 | 96.8% | 6.0e-3 |
+| q4_0 | 6.2e-3 | 98.0% | 5.1e-3 | 6.9e-3 | 96.5% | 6.2e-3 |
+
+The 4-bit formats double FP8's divergence and stay flat from 64K to 1M; NVFP4 raises the mean next-token loss on prose by 0.2% (1.9935 against 1.9900 nats at 128K to 256K). Rotation helped q4_0 by 10% to 15% and NVFP4 on code only, and NVFP4 and q4_0 are within 20% of each other either way.
+
+Which global visits matter, positions 64K to 128K of the 128K-token texts, with only one visit's writes rounded to NVFP4 (visits 11, 23, 35 are layer 11's three passes; 17, 29, 41 layer 17's):
+
+| Visits rounded | Prose KL | Code KL |
+| --- | ---: | ---: |
+| all 8 | 4.8e-3 | 6.5e-3 |
+| 5 | 3.0e-3 | 3.8e-3 |
+| 11 | 1.9e-3 | 5.2e-3 |
+| 17 | 1.3e-3 | 1.5e-3 |
+| 23 | 9.1e-4 | 9.5e-4 |
+| 29 | 6.1e-4 | 5.0e-4 |
+| 35 | 5.4e-4 | 4.0e-4 |
+| 41 | 5.0e-4 | 3.5e-4 |
+| 47 | 6.7e-4 | 2.8e-4 |
+| FP8 cache, for scale | 2.6e-3 | 3.2e-3 |
+
+The first pass's caches and layer 5's carry most of the error; the later passes' caches are 5 to 10 times less sensitive, and the errors do not add up. Keeping visits 5 and 11 unrounded (BF16) brought all-NVFP4's 4.8e-3 and 6.5e-3 down to 2.9e-3 and 2.5e-3, FP8's level; keeping only visit 5, to 3.7e-3 and 5.6e-3. The real mixed cache, with those two visits in FP8, gave 3.9e-3 and 3.8e-3.
+
+The FP8 recent window helped little: 4.3e-3 on prose and 4.4e-3 on code with the newest 4,096 positions in E4M3, 4.5e-3 and 5.1e-3 with 1,024, against 4.8e-3 and 6.5e-3, and both raised the code's mean next-token loss by 1.3%. KIVI's per-channel keys on top of a 1,024-position window gave 5.1e-3 and 4.5e-3. Neither earns a second storage format.
+
+Fidelity against MLX, mean KL at the captures' sampled positions and top-1 agreement over all positions:
+
+| Configuration | 32K prefill | top-1 | 32K verify | top-1 | 4K verify | top-1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 2.4e-3 | 97.6% | 4.9e-3 | 96.6% | 5.6e-3 | 96.5% |
+| FP8 | 2.5e-3 | 97.4% | 5.4e-3 | 96.5% | 5.8e-3 | 96.5% |
+| Mixed | 3.8e-3 | 96.9% | 6.0e-3 | 96.1% | 5.1e-3 | 96.1% |
+| NVFP4 | 5.1e-3 | 96.6% | 6.7e-3 | 95.9% | 8.4e-3 | 96.0% |
+
+The verify pass runs on FP8 weights, as served, which adds its own 3e-3.
+
+Tasks, with Wilson 95% intervals (NVFP4 through the rounding on a BF16 cache, 6 streams; prefill over it equals the real cache's bit for bit):
+
+| Configuration | 130 questions, greedy | 130 questions, T=1 | GPQA, T=1 | GPQA cut off |
+| --- | ---: | ---: | ---: | ---: |
+| FP8 | 113, 86.9% (80.1 to 91.7) | 122, 93.8% (88.3 to 96.8) | 77, 77.0% (67.8 to 84.2) | 14 |
+| NVFP4 | 116, 89.2% (82.7 to 93.5) | 121, 93.1% (87.4 to 96.3) | 76, 76.0% (66.8 to 83.3) | 13 |
+The mixed cache was not run on the tasks: its divergence lies between FP8's and NVFP4's, which these sets cannot tell apart. Every difference lies inside the intervals. The FP8 runs of the 130 questions gave the same scores as the main build's earlier runs, as seeded runs do.
+
+Recall, passes per trial (greedy, `reasoning_effort` low, 4,096-token cap; 32K and 128K on 3 trials, 512K on 2, 1M on 1, all on the RTX 5090):
+
+| Configuration | 32K | 128K | 512K | 1M |
+| --- | --- | --- | --- | --- |
+| FP8 | 7/7 | 7/7 | 5/5 | does not fit |
+| NVFP4 | 7/7 | 7/7 | 4/5 | 3/3 |
+| Mixed | not run | 7/7 | 5/5 | not run |
+
+Each cell counts the context gate, the needle trials and the code-copy trials. Every failure was a needle trial whose reasoning looped until the 4,096-token cap, without an answer; every reply that answered named all 6 codes, and every code copy was exact. The gate prompts hold 26K, 106K, 426K and 832K tokens.
+
+Speed on the RTX 5090, FP8 weights, the same hold for each row's configurations. Decode is `bench`'s median step over 200 after 20, with every cache filled to the context; speculation is `bench --spec auto` over 512 tokens of the anyhow capture, so its tokens per round depend on the text each cache produces; prefill is the time to the first token of random ids:
+
+| Configuration | Decode 32K | 128K | 512K | Speculative 32K | 128K | 512K | Prefill 32K | 128K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP8 | 309.6 tok/s | 236.0 | 124.5 | 806.7 | 717.4 | | 2.14 s | 10.05 s |
+| NVFP4 | 322.3 | 267.6 | 166.8 | 846.6 | 721.3 | 487.0 | 2.27 s | 12.28 s |
+| Mixed | 320.1 | 260.0 | 153.8 | 824.8 | 729.5 | | 2.24 s | 11.73 s |
+
+A second run of the decode rows in the same hold agreed within 0.1%. These runs predate the BF16 output projection that `--weights fp8` now keeps (`--output-projection`), so their absolute times include the FP8 copy; the comparisons between caches hold, since all read the same weights. NVFP4 reads 44% fewer cache bytes: decode is 4% faster at 32K, 13% at 128K and 34% at 512K. Its prefill is 6% slower at 32K and 22% at 128K, because past 16,384 keys the FP8 cache's prefill runs attention on FP8 tensor cores and NVFP4 has no such variant; at 508K tokens through siphon-serve the prefill took 98.9 s against 67.0 s.
+
+Memory: the planner's longest context (`siphon-plan --print`, default 0.25 GiB margin) with the bundled draft and FP8 weights, the prefix cache's entry per stream included (the RTX PRO 6000 Blackwell Workstation Edition with 95.1 GiB free, the RTX 5090 with 30.46 GiB):
+
+| Configuration | 5090, 1 stream | 2 | 4 | 8 | PRO 6000, 8 streams |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP8 | 657,408 | 335,872 | 161,792 | 71,680 | 592,896 |
+| Mixed | 928,768 | 486,400 | 238,592 | 105,472 | 875,520 |
+| NVFP4 | 1,048,576 | 571,392 | 281,600 | 125,952 | 1,041,408 |
+
+On the RTX PRO 6000 every configuration reaches the model's 1,048,576 positions at 1, 2 and 4 streams. The servers' own check stayed under the plan in every recall run: after a job at 1M on the RTX 5090, 30,302 MiB used of 30,352 MiB planned for NVFP4; at 512K, 28,574 of 28,636 for FP8 and 25,054 of 25,094 for NVFP4. No scratch copy grows with the context: the NVFP4 kernels decode tiles in shared memory.
+
+### What to run
+
+- **Default: FP8**, as before. It is the closest to the BF16 cache.
+- **Opt-in: `--kv nvfp4`** where memory or long-context decode speed matters more than the last bit of fidelity: 9 KiB per position, 1.6 times FP8's context, decode 34% faster at 512K, at about twice FP8's divergence and no measurable task or recall loss. `--kv mixed` takes 10.75 KiB for divergence close to FP8's.
+
+What lost: shared loop caches (below); the Hadamard rotation (10% to 15% better for q4_0, worse for NVFP4 on prose); an FP8 window of recent positions (at most a third less divergence, and a second format); KIVI's per-channel keys (no gain); q4_0 over NVFP4 (within 20% either way, and no hardware decode).
+
+Open: NVFP4 prefill attention on tensor cores (the FP8 MMA cannot take NVFP4's values exactly; the experts' hi/lo split could); the BF16 rounding leaves a decode step's own row unrounded for that step's attention, so its token-by-token runs differ slightly from the real NVFP4 cache; the FP8 cache's tests that compare single elements (`tests/attention.rs`) have no NVFP4 counterpart, which `eval` and the end-to-end tests cover instead.
+
+### Shared loop caches (removed)
+
+Layers 11 and 17 run in each of the loop's three passes, so they make 6 of the 8 global visits. Giving each of them one cache that all its passes write, as Transformers' `recurrent_kv_cache_mode="last_loop"` does ([PR 51161](https://github.com/huggingface/transformers/pull/51161)), takes 8 KiB per position with FP8: the earlier passes then read the last pass's keys and values at earlier positions. It lost, and the code lives on the branch `experiment/kv-loop-shared`. Against the BF16 cache at 128K to 256K its KL was 2.9e-2 on code and 4.4e-2 on prose, 7 and 16 times FP8's, and top-1 agreement fell from 98.9% to 96.5% on code and from 97.7% to 90.5% on prose (89.7% at 512K to 768K of the 1M-token text). Against MLX at 32K its KL was 3.5e-2 through prefill and 7.0e-2 through verify. On GPQA it scored 69/100 (59.4% to 77.2%) against FP8's 77, with 27 replies cut off at 32,768 tokens against 14. NVFP4 saves 7 of its 8 KiB at a third to an eighth of the divergence. The PR's identical greedy tokens came from a 2,048-token prompt run as one forward pass, where only the 128 decode steps see the approximation; in Siphon every prefill chunk after the first and every decode step do.
 
 ## Tensors in host memory
 

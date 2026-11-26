@@ -20,7 +20,7 @@ A sequence keeps, for each of the 48 layer visits:
 
 | State | Size |
 | --- | --- |
-| Global KV cache (8 visits) | 16 KiB per position with `--kv fp8`, 32 KiB with BF16 |
+| Global KV cache (8 visits) | 16 KiB per position with `--kv fp8`, 32 KiB with BF16, 9 KiB with NVFP4, 10.75 KiB mixed |
 | Sliding ring (40 visits) | 1,024 slots, 160 MiB in all, BF16 |
 | Conv states: keys, values, post-attention, post-MLP | 3 rows each, 3.7 MB in all, F32 |
 
