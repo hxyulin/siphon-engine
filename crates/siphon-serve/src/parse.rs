@@ -24,12 +24,40 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// One step of a streamed tool call, in the order the model wrote them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolPart {
+    /// A call opens, with its name.
+    Start(String),
+    /// A piece of the open call's arguments. A call's pieces join to its
+    /// [`ToolCall::arguments`].
+    Arguments(String),
+    /// The open call ends.
+    End,
+}
+
 /// The text and tool calls that some ids added.
 #[derive(Debug, Default)]
 pub struct Delta {
     pub content: String,
     pub reasoning: String,
+    /// The calls that ended, whole.
     pub tool_calls: Vec<ToolCall>,
+    /// The steps of the calls that opened, grew or ended.
+    pub tool_parts: Vec<ToolPart>,
+}
+
+impl Delta {
+    /// Adds `part`, joining an arguments piece to one just before it.
+    pub fn tool_part(&mut self, part: ToolPart) {
+        if let (ToolPart::Arguments(new), Some(ToolPart::Arguments(last))) =
+            (&part, self.tool_parts.last_mut())
+        {
+            last.push_str(new);
+            return;
+        }
+        self.tool_parts.push(part);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +70,24 @@ enum State {
     Tool,
 }
 
+/// How far the parser has read an open tool block's payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scan {
+    /// The text so far can still open `{"name":"..","args":{`.
+    Head,
+    /// The text opens no call that can stream; the block is parsed whole at its end.
+    Whole,
+    /// Inside the argument object, which streams: its nesting depth, and whether a string
+    /// or an escape in one is open.
+    Args {
+        depth: usize,
+        string: bool,
+        escape: bool,
+    },
+    /// After the argument object.
+    Tail,
+}
+
 /// Parses one generation, fed a few ids at a time.
 #[derive(Clone)]
 pub struct Parser {
@@ -50,6 +96,13 @@ pub struct Parser {
     header: Vec<u32>,
     tool: Vec<u32>,
     tool_name: Vec<u32>,
+    /// The open tool block's text, and the part of it before its arguments.
+    tool_text: Detokenizer,
+    tool_head: String,
+    scan: Scan,
+    /// The streaming call's name and its arguments so far.
+    call_name: String,
+    call_arguments: String,
     content: Detokenizer,
     reasoning: Detokenizer,
     reasoning_tokens: usize,
@@ -70,6 +123,11 @@ impl Parser {
             header: Vec::new(),
             tool: Vec::new(),
             tool_name,
+            tool_text: Detokenizer::default(),
+            tool_head: String::new(),
+            scan: Scan::Head,
+            call_name: String::new(),
+            call_arguments: String::new(),
             content: Detokenizer::default(),
             reasoning: Detokenizer::default(),
             reasoning_tokens: 0,
@@ -102,7 +160,6 @@ impl Parser {
             } else if id == s.content_invoke_tool_json {
                 self.end_tool(vocab, &mut delta);
                 self.state = State::Tool;
-                self.tool.clear();
                 self.tool_name = std::mem::take(&mut self.header);
             } else if id == s.end_message || id == s.content_model_end_sampling {
                 self.end_tool(vocab, &mut delta);
@@ -117,7 +174,11 @@ impl Parser {
                         self.reasoning_tokens += 1;
                         delta.reasoning += &self.reasoning.push(vocab, id);
                     }
-                    State::Tool => self.tool.push(id),
+                    State::Tool => {
+                        self.tool.push(id);
+                        let text = self.tool_text.push(vocab, id);
+                        self.scan(text, &mut delta);
+                    }
                 }
             }
         }
@@ -133,14 +194,103 @@ impl Parser {
         delta
     }
 
-    /// Closes a tool block, if one is open: a call when its payload is a JSON object with
+    /// Reads `text`, the next of an open tool block's payload: opens the call once its
+    /// payload reaches its argument object, then streams the object.
+    fn scan(&mut self, mut text: String, delta: &mut Delta) {
+        if self.scan == Scan::Head {
+            self.tool_head.push_str(&text);
+            match call_head(&self.tool_head) {
+                Head::More => return,
+                Head::Not => {
+                    self.scan = Scan::Whole;
+                    return;
+                }
+                Head::Call(name, at) => {
+                    delta.tool_part(ToolPart::Start(name.clone()));
+                    self.call_name = name;
+                    text = self.tool_head.split_off(at);
+                    self.scan = Scan::Args {
+                        depth: 0,
+                        string: false,
+                        escape: false,
+                    };
+                }
+            }
+        }
+        let Scan::Args {
+            mut depth,
+            mut string,
+            mut escape,
+        } = self.scan
+        else {
+            return;
+        };
+        let mut end = text.len();
+        let mut closed = false;
+        for (i, c) in text.char_indices() {
+            if string {
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == '"' {
+                    string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => string = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = i + c.len_utf8();
+                        closed = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.scan = if closed {
+            Scan::Tail
+        } else {
+            Scan::Args {
+                depth,
+                string,
+                escape,
+            }
+        };
+        let piece = &text[..end];
+        if !piece.is_empty() {
+            self.call_arguments.push_str(piece);
+            delta.tool_part(ToolPart::Arguments(piece.to_owned()));
+        }
+    }
+
+    /// Closes a tool block, if one is open. A call that streamed ends with the arguments it
+    /// streamed. Otherwise the payload is parsed whole: a call when it is a JSON object with
     /// an `args` object, else its text as content.
     fn end_tool(&mut self, vocab: &Vocab, delta: &mut Delta) {
         if self.state != State::Tool {
             return;
         }
         self.state = State::Text;
-        let raw = vocab.decode(&self.tool);
+        let rest = self.tool_text.flush(vocab);
+        self.scan(rest, delta);
+        let ids = std::mem::take(&mut self.tool);
+        let scan = std::mem::replace(&mut self.scan, Scan::Head);
+        self.tool_text = Detokenizer::default();
+        self.tool_head.clear();
+        if matches!(scan, Scan::Args { .. } | Scan::Tail) {
+            delta.tool_part(ToolPart::End);
+            delta.tool_calls.push(ToolCall {
+                name: std::mem::take(&mut self.call_name),
+                arguments: std::mem::take(&mut self.call_arguments),
+            });
+            return;
+        }
+        let raw = vocab.decode(&ids);
         let header = vocab.decode(&self.tool_name);
         match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(mut payload)) => {
@@ -152,11 +302,69 @@ impl Parser {
                     Some(args @ Value::Object(_)) => args.to_string(),
                     _ => "{}".to_owned(),
                 };
+                delta.tool_part(ToolPart::Start(name.clone()));
+                delta.tool_part(ToolPart::Arguments(arguments.clone()));
+                delta.tool_part(ToolPart::End);
                 delta.tool_calls.push(ToolCall { name, arguments });
             }
             _ => delta.content += &raw,
         }
     }
+}
+
+/// What the start of a tool payload says.
+#[derive(Debug, PartialEq, Eq)]
+enum Head {
+    /// It can still open a call.
+    More,
+    /// It cannot.
+    Not,
+    /// It opens a call of this name, whose argument object starts at this byte.
+    Call(String, usize),
+}
+
+/// Reads the start of a tool payload as `{"name":"<name>","args":{`, with any JSON
+/// whitespace between the tokens.
+fn call_head(text: &str) -> Head {
+    match read_head(text) {
+        Ok(at) => at,
+        Err(head) => head,
+    }
+}
+
+/// [`call_head`], with [`Head::More`] and [`Head::Not`] as errors.
+fn read_head(text: &str) -> Result<Head, Head> {
+    fn literal(rest: &mut &str, literal: &str) -> Result<(), Head> {
+        *rest = rest.trim_start_matches([' ', '\t', '\n', '\r']);
+        if let Some(after) = rest.strip_prefix(literal) {
+            *rest = after;
+            Ok(())
+        } else if literal.starts_with(*rest) {
+            Err(Head::More)
+        } else {
+            Err(Head::Not)
+        }
+    }
+    let mut rest = text;
+    for token in ["{", "\"name\"", ":", "\""] {
+        literal(&mut rest, token)?;
+    }
+    let mut escape = false;
+    let close = rest
+        .char_indices()
+        .find_map(|(i, c)| {
+            let close = !escape && c == '"';
+            escape = !escape && c == '\\';
+            close.then_some(i)
+        })
+        .ok_or(Head::More)?;
+    let name = serde_json::from_str::<String>(&text[text.len() - rest.len() - 1..][..close + 2])
+        .map_err(|_| Head::Not)?;
+    rest = &rest[close + 1..];
+    for token in [",", "\"args\"", ":", "{"] {
+        literal(&mut rest, token)?;
+    }
+    Ok(Head::Call(name, text.len() - rest.len() - 1))
 }
 
 /// Turns ids into text a few at a time, special tokens included, holding back ids that end
@@ -243,5 +451,76 @@ mod tests {
             parser.reasoning_tokens(),
             vocab.encode("Let me think.").len()
         );
+    }
+
+    #[test]
+    fn call_heads_open_at_the_argument_object() {
+        let head = r#"{"name": "get_weather", "args": {"#;
+        for end in 0..head.len() - 1 {
+            assert_eq!(call_head(&head[..end]), Head::More, "{}", &head[..end]);
+        }
+        assert_eq!(
+            call_head(head),
+            Head::Call("get_weather".to_owned(), head.len() - 1)
+        );
+        assert_eq!(
+            call_head(r#"{"name":"a\"b","args":{}}"#),
+            Head::Call("a\"b".to_owned(), 22)
+        );
+        for not in [
+            r#"{"args":{}"#,
+            r#"{"name":"a","args":["#,
+            "[",
+            r#"{"name":1"#,
+        ] {
+            assert_eq!(call_head(not), Head::Not, "{not}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    fn other_payloads_end_whole() {
+        let vocab = vocab();
+        let s = vocab.special;
+        let run = |payload: &str| {
+            let mut ids = vec![s.message_model];
+            ids.extend(vocab.encode("f"));
+            ids.push(s.content_invoke_tool_json);
+            ids.extend(vocab.encode(payload));
+            ids.push(s.end_message);
+            let mut parser = Parser::new(&vocab, &Ending::Generate);
+            let mut all = Delta::default();
+            for &id in &ids {
+                let delta = parser.push(&vocab, &[id]);
+                all.content += &delta.content;
+                all.tool_calls.extend(delta.tool_calls);
+                for part in delta.tool_parts {
+                    all.tool_part(part);
+                }
+            }
+            all
+        };
+        // Arguments before the name: one call, its parts at its end.
+        let all = run(r#"{"args":{"b":1,"a":2},"name":"g"}"#);
+        let call = ToolCall {
+            name: "g".to_owned(),
+            arguments: r#"{"a":2,"b":1}"#.to_owned(),
+        };
+        assert_eq!(all.tool_calls, std::slice::from_ref(&call));
+        assert_eq!(
+            all.tool_parts,
+            [
+                ToolPart::Start(call.name),
+                ToolPart::Arguments(call.arguments),
+                ToolPart::End
+            ]
+        );
+        // Not JSON: text.
+        let all = run("no call");
+        assert_eq!(all.content, "no call");
+        assert!(all.tool_calls.is_empty() && all.tool_parts.is_empty());
+        // Streamed arguments are kept as written, and text after them is dropped.
+        let all = run(r#"{"name":"g","args":{ "a" : [1, "}"] } }"#);
+        assert_eq!(all.tool_calls[0].arguments, r#"{ "a" : [1, "}"] }"#);
     }
 }

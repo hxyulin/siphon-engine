@@ -484,3 +484,223 @@ async fn responses_compress_and_streams_do_not() {
             .ends_with("data: [DONE]\n\n")
     );
 }
+
+/// The calls of [`tool_reply`]: names and argument objects as the model writes them.
+const CALLS: [(&str, &str); 2] = [
+    (
+        "get_weather",
+        r#"{"city":"Paris \"Rive {Gauche}\"","units":["C"]}"#,
+    ),
+    ("get_time", r#"{"zone":"Europe/Paris"}"#),
+];
+
+/// A reply that thinks and makes both [`CALLS`], one token per event. After a prompt that
+/// opens a call (a forced `tool_choice`), the first call's block is already open.
+fn tool_reply(vocab: &Vocab, job: &Job) -> Vec<Event> {
+    let s = vocab.special;
+    let forced = job.prompt.last() == Some(&s.content_invoke_tool_json);
+    let mut ids = Vec::new();
+    if !forced {
+        ids.push(s.content_thinking);
+        ids.extend(vocab.encode("Two calls."));
+        ids.push(s.end_message);
+    }
+    for (i, (name, args)) in CALLS.iter().enumerate() {
+        if !(forced && i == 0) {
+            ids.push(s.message_model);
+            ids.extend(vocab.encode(name));
+            ids.push(s.content_invoke_tool_json);
+        }
+        ids.extend(vocab.encode(&format!(r#"{{"name":"{name}","args":{args}}}"#)));
+        ids.push(s.end_message);
+    }
+    let mut events = vec![Event::Started, Event::Cached(0)];
+    events.extend(ids.into_iter().map(|id| Event::Tokens(vec![id])));
+    events.push(Event::Done(Finish::Stop));
+    events
+}
+
+fn weather_tools() -> Value {
+    json!([{"type": "function", "function": {"name": "get_weather", "parameters": {}}},
+           {"type": "function", "function": {"name": "get_time", "parameters": {}}}])
+}
+
+/// Each streamed call of `chunks`, a chat stream: its name, its id, and its argument
+/// pieces. Checks that a call's first chunk names it and the later ones only add
+/// arguments.
+fn chat_calls(chunks: &[Value]) -> Vec<(String, String, Vec<String>)> {
+    let mut calls: Vec<(String, String, Vec<String>)> = Vec::new();
+    for call in chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten()
+    {
+        let index = call["index"].as_u64().unwrap() as usize;
+        let piece = call["function"]["arguments"].as_str().unwrap().to_owned();
+        if index == calls.len() {
+            assert_eq!(call["type"], "function", "{call}");
+            assert_eq!(piece, "", "{call}");
+            let name = call["function"]["name"].as_str().unwrap().to_owned();
+            calls.push((name, call["id"].as_str().unwrap().to_owned(), Vec::new()));
+        } else {
+            assert_eq!(index + 1, calls.len(), "{call}");
+            assert!(call.get("id").is_none() && call["function"].get("name").is_none());
+            calls[index].2.push(piece);
+        }
+    }
+    calls
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn chat_streams_tool_calls_piece_by_piece() {
+    let server = Server::new(4096, tool_reply);
+    let request = |stream: bool, choice: Value| {
+        let body = json!({"messages": [{"role": "user", "content": "Weather and time?"}],
+                          "tools": weather_tools(), "tool_choice": choice,
+                          "max_tokens": 200, "stream": stream});
+        post("/v1/chat/completions", &body, &[])
+    };
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    // Parallel calls, a call forced by name, and calls required.
+    for (choice, n) in [(json!("auto"), 2), (named, 1), (json!("required"), 2)] {
+        let whole = json_body(server.call(request(false, choice.clone())).await).await;
+        let message = &whole["choices"][0]["message"];
+        let want = message["tool_calls"].as_array().unwrap();
+        assert_eq!(want.len(), n, "{choice}: {message}");
+        let chunks = sse_data(server.call(request(true, choice.clone())).await).await;
+        let calls = chat_calls(&chunks);
+        assert_eq!(calls.len(), n, "{choice}");
+        for (i, (name, id, pieces)) in calls.iter().enumerate() {
+            assert_eq!(name, CALLS[i].0);
+            assert!(id.starts_with("call_"));
+            assert!(
+                pieces.len() > 1,
+                "{choice}: arguments in one piece: {pieces:?}"
+            );
+            assert_eq!(pieces.concat(), CALLS[i].1);
+            assert_eq!(want[i]["function"]["arguments"], CALLS[i].1);
+            assert_eq!(want[i]["function"]["name"], CALLS[i].0);
+        }
+        let last = &chunks.last().unwrap()["choices"][0];
+        assert_eq!(last["finish_reason"], "tool_calls", "{choice}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn messages_stream_tool_input_piece_by_piece() {
+    let server = Server::new(4096, tool_reply);
+    let request = |stream: bool, choice: Value| {
+        let body = json!({"messages": [{"role": "user", "content": "Weather and time?"}],
+                          "tools": [{"name": "get_weather", "input_schema": {}},
+                                    {"name": "get_time", "input_schema": {}}],
+                          "tool_choice": choice, "max_tokens": 200, "stream": stream});
+        post("/v1/messages", &body, &[])
+    };
+    let named = json!({"type": "tool", "name": "get_weather"});
+    for (choice, n) in [(json!({"type": "auto"}), 2), (named, 1)] {
+        let whole = json_body(server.call(request(false, choice.clone())).await).await;
+        let uses: Vec<&Value> = whole["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect();
+        assert_eq!(uses.len(), n, "{choice}: {whole}");
+        let events = sse_data(server.call(request(true, choice.clone())).await).await;
+        let starts: Vec<&Value> = events
+            .iter()
+            .filter(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(starts.len(), n, "{choice}");
+        for (i, start) in starts.iter().enumerate() {
+            let index = &start["index"];
+            assert_eq!(start["content_block"]["name"], CALLS[i].0);
+            assert_eq!(start["content_block"]["input"], json!({}));
+            let at = events.iter().position(|e| e == *start).unwrap();
+            let pieces: Vec<&str> = events[at + 1..]
+                .iter()
+                .take_while(|e| e["type"] != "content_block_stop")
+                .map(|e| {
+                    assert_eq!(e["index"], *index);
+                    assert_eq!(e["delta"]["type"], "input_json_delta");
+                    e["delta"]["partial_json"].as_str().unwrap()
+                })
+                .collect();
+            assert!(pieces.len() > 1, "{choice}: input in one piece: {pieces:?}");
+            assert_eq!(pieces.concat(), CALLS[i].1);
+            let input: Value = serde_json::from_str(CALLS[i].1).unwrap();
+            assert_eq!(uses[i]["input"], input);
+            assert_eq!(
+                uses[i]["id"].as_str().unwrap().split('_').next(),
+                Some("toolu")
+            );
+        }
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn responses_stream_function_arguments_piece_by_piece() {
+    let server = Server::new(4096, tool_reply);
+    let request = |stream: bool, choice: Value| {
+        let body = json!({"input": "Weather and time?",
+                          "tools": [{"type": "function", "name": "get_weather", "parameters": {}},
+                                    {"type": "function", "name": "get_time", "parameters": {}}],
+                          "tool_choice": choice, "max_output_tokens": 200, "stream": stream});
+        post("/v1/responses", &body, &[])
+    };
+    let named = json!({"type": "function", "name": "get_weather"});
+    for (choice, n) in [(json!("auto"), 2), (named, 1)] {
+        let whole = json_body(server.call(request(false, choice.clone())).await).await;
+        let items: Vec<&Value> = whole["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .collect();
+        assert_eq!(items.len(), n, "{choice}: {whole}");
+        let events = sse_data(server.call(request(true, choice.clone())).await).await;
+        let added: Vec<&Value> = events
+            .iter()
+            .filter(|e| {
+                e["type"] == "response.output_item.added" && e["item"]["type"] == "function_call"
+            })
+            .collect();
+        assert_eq!(added.len(), n, "{choice}");
+        for (i, start) in added.iter().enumerate() {
+            let item = &start["item"];
+            assert_eq!(item["name"], CALLS[i].0);
+            assert_eq!(item["arguments"], "");
+            assert_eq!(item["status"], "in_progress");
+            let at = events.iter().position(|e| e == *start).unwrap();
+            let pieces: Vec<&str> = events[at + 1..]
+                .iter()
+                .take_while(|e| e["type"] == "response.function_call_arguments.delta")
+                .map(|e| {
+                    assert_eq!(e["item_id"], item["id"]);
+                    e["delta"].as_str().unwrap()
+                })
+                .collect();
+            assert!(
+                pieces.len() > 1,
+                "{choice}: arguments in one piece: {pieces:?}"
+            );
+            assert_eq!(pieces.concat(), CALLS[i].1);
+            let done = &events[at + 1 + pieces.len()];
+            assert_eq!(done["type"], "response.function_call_arguments.done");
+            assert_eq!(done["arguments"], CALLS[i].1);
+            assert_eq!(done["name"], CALLS[i].0);
+            assert_eq!(items[i]["arguments"], CALLS[i].1);
+            assert_eq!(items[i]["name"], CALLS[i].0);
+        }
+    }
+}

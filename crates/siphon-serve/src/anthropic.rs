@@ -36,7 +36,7 @@ use crate::{
         self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, blocking,
         tool_ending,
     },
-    parse::{Delta, Parser, ToolCall},
+    parse::{Delta, Parser, ToolPart},
     request::{self, SamplingFields, ToolChoice},
     sse::{self, Frame, Prompt},
     stop::Stops,
@@ -575,14 +575,16 @@ fn stop_reason(output: &Output, finish: Finish) -> (&'static str, Value) {
 enum Open {
     Thinking,
     Text,
+    Tool,
 }
 
 impl Open {
-    /// The block's text field, and the type of the delta that adds to it.
+    /// The field of a delta that adds to the block, and the delta's type.
     fn field(self) -> (&'static str, &'static str) {
         match self {
             Self::Thinking => ("thinking", "thinking_delta"),
             Self::Text => ("text", "text_delta"),
+            Self::Tool => ("partial_json", "input_json_delta"),
         }
     }
 }
@@ -590,8 +592,10 @@ impl Open {
 /// Builds a reply's content blocks from parsed deltas, and the events that stream them.
 struct Blocks {
     content: Vec<Value>,
-    /// The kind of the last block while it is open. Tool blocks close at once.
+    /// The kind of the last block while it is open.
     open: Option<Open>,
+    /// The open tool block's arguments so far.
+    arguments: String,
     /// The message id without its prefix, for tool ids.
     base: String,
 }
@@ -601,11 +605,12 @@ impl Blocks {
         Self {
             content: Vec::new(),
             open: None,
+            arguments: String::new(),
             base: message_id.trim_start_matches("msg_").to_owned(),
         }
     }
 
-    /// Adds `delta`'s thinking, then its text, then its tool calls.
+    /// Adds `delta`'s thinking, then its text, then its tool calls' parts.
     fn push(&mut self, delta: &Delta, events: &mut Vec<Frame>) {
         if !delta.reasoning.is_empty() {
             self.text(Open::Thinking, &delta.reasoning, events);
@@ -613,21 +618,28 @@ impl Blocks {
         if !delta.content.is_empty() {
             self.text(Open::Text, &delta.content, events);
         }
-        for call in &delta.tool_calls {
-            self.tool(call, events);
+        for part in &delta.tool_parts {
+            match part {
+                ToolPart::Start(name) => self.tool(name, events),
+                ToolPart::Arguments(piece) if self.open == Some(Open::Tool) => {
+                    self.arguments.push_str(piece);
+                    self.grow(piece, events);
+                }
+                ToolPart::Arguments(_) => {}
+                ToolPart::End => self.close(events),
+            }
         }
     }
 
-    /// Adds `text` to the open block of `kind`, opening one if needed. A delta event for
-    /// the same block at the end of `events` grows instead of a new one being added.
+    /// Adds `text` to the open thinking or text block of `kind`, opening one if needed.
     fn text(&mut self, kind: Open, text: &str, events: &mut Vec<Frame>) {
-        let (field, delta_type) = kind.field();
+        let (field, _) = kind.field();
         if self.open != Some(kind) {
             self.close(events);
-            let block = match kind {
-                Open::Thinking => json!({"type": "thinking", "thinking": "", "signature": ""}),
-                Open::Text => json!({"type": "text", "text": ""}),
-            };
+            let mut block = json!({"type": field, field: ""});
+            if kind == Open::Thinking {
+                block["signature"] = json!("");
+            }
             events.push((
                 "content_block_start",
                 json!({"type": "content_block_start", "index": self.content.len(),
@@ -640,6 +652,17 @@ impl Blocks {
         if let Some(Value::String(all)) = self.content[index].get_mut(field) {
             all.push_str(text);
         }
+        self.grow(text, events);
+    }
+
+    /// Streams `text` as a delta of the open block. A delta event for the same block at the
+    /// end of `events` grows instead of a new one being added.
+    fn grow(&mut self, text: &str, events: &mut Vec<Frame>) {
+        let Some(kind) = self.open else {
+            return;
+        };
+        let (field, delta_type) = kind.field();
+        let index = self.content.len() - 1;
         let pointer = format!("/delta/{field}");
         if let Some(("content_block_delta", last)) = events.last_mut()
             && last["index"] == index
@@ -655,18 +678,29 @@ impl Blocks {
         ));
     }
 
-    /// Closes the open block. A thinking block gets an empty signature first.
+    /// Closes the open block. A thinking block gets an empty signature first, and a tool
+    /// block takes its arguments as its input.
     fn close(&mut self, events: &mut Vec<Frame>) {
         let Some(kind) = self.open.take() else {
             return;
         };
         let index = self.content.len() - 1;
-        if kind == Open::Thinking {
-            events.push((
+        match kind {
+            Open::Thinking => events.push((
                 "content_block_delta",
                 json!({"type": "content_block_delta", "index": index,
                        "delta": {"type": "signature_delta", "signature": ""}}),
-            ));
+            )),
+            Open::Tool => {
+                // The parser streams a call's argument object as the model wrote it; an
+                // empty object stands in if it does not parse, as when the reply was cut.
+                let input = match serde_json::from_str(&std::mem::take(&mut self.arguments)) {
+                    Ok(Value::Object(input)) => input,
+                    _ => Map::new(),
+                };
+                self.content[index]["input"] = Value::Object(input);
+            }
+            Open::Text => {}
         }
         events.push((
             "content_block_stop",
@@ -674,35 +708,18 @@ impl Blocks {
         ));
     }
 
-    /// Adds a whole tool call as a block. The parser makes a call only from a payload whose
-    /// `args` is a JSON object, so its arguments always parse; an empty object stands in if
-    /// they ever do not.
-    fn tool(&mut self, call: &ToolCall, events: &mut Vec<Frame>) {
+    /// Opens a tool block for a call of `name`.
+    fn tool(&mut self, name: &str, events: &mut Vec<Frame>) {
         self.close(events);
         let index = self.content.len();
-        let id = format!("toolu_{}_{index}", self.base);
-        let input = match serde_json::from_str(&call.arguments) {
-            Ok(Value::Object(input)) => input,
-            _ => Map::new(),
-        };
-        events.extend([
-            (
-                "content_block_start",
-                json!({"type": "content_block_start", "index": index, "content_block":
-                       {"type": "tool_use", "id": id, "name": call.name, "input": {}}}),
-            ),
-            (
-                "content_block_delta",
-                json!({"type": "content_block_delta", "index": index,
-                       "delta": {"type": "input_json_delta", "partial_json": call.arguments}}),
-            ),
-            (
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            ),
-        ]);
-        self.content
-            .push(json!({"type": "tool_use", "id": id, "name": call.name, "input": input}));
+        let block = json!({"type": "tool_use", "id": format!("toolu_{}_{index}", self.base),
+                           "name": name, "input": {}});
+        events.push((
+            "content_block_start",
+            json!({"type": "content_block_start", "index": index, "content_block": block}),
+        ));
+        self.content.push(block);
+        self.open = Some(Open::Tool);
     }
 }
 

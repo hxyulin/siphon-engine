@@ -41,7 +41,7 @@ use crate::{
         self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, blocking,
         tool_ending,
     },
-    parse::{Delta, Parser, ToolCall},
+    parse::{Delta, Parser, ToolPart},
     request::{self, SamplingFields, ToolChoice},
     sse::{self, Frame, KEEP_ALIVE, Prompt},
     stop::Stops,
@@ -379,6 +379,8 @@ fn with(mut data: Value, fields: Value) -> Value {
 enum Open {
     Reasoning,
     Text,
+    /// A function call, whose arguments grow.
+    Call,
 }
 
 /// One response: its output items, built from parsed deltas, and the events that stream
@@ -493,6 +495,7 @@ impl Reply {
             ],
             Open::Reasoning => &["response.reasoning_text.delta"],
             Open::Text => &["response.output_text.delta"],
+            Open::Call => &["response.function_call_arguments.delta"],
         };
         let trailing = events
             .iter()
@@ -514,17 +517,19 @@ impl Reply {
             let fields = match name {
                 "response.reasoning_summary_text.delta" => json!({"summary_index": 0}),
                 "response.output_text.delta" => json!({"content_index": 0, "logprobs": []}),
+                "response.function_call_arguments.delta" => json!({}),
                 _ => json!({"content_index": 0}),
             };
             events.push(event(name, with(at.clone(), fields)));
         }
     }
 
-    /// Opens an item of `kind` and returns its index.
+    /// Opens a reasoning or message item of `kind` and returns its index.
     fn open_item(&mut self, kind: Open, events: &mut Vec<Frame>) -> usize {
         self.close(events);
         let index = self.output.len();
         let (item, part) = match kind {
+            Open::Call => return self.open_call("", events),
             Open::Reasoning => (
                 json!({"type": "reasoning", "id": self.item_id("rs", index), "summary": [],
                        "content": []}),
@@ -565,18 +570,36 @@ impl Reply {
         let index = self.output.len() - 1;
         let text = std::mem::take(&mut self.text);
         let at = json!({"item_id": self.output[index]["id"], "output_index": index});
-        let (done, part) = match kind {
-            Open::Reasoning => (
+        let reasoning = match kind {
+            Open::Call => {
+                let item = &mut self.output[index];
+                let fields = json!({"name": item["name"], "arguments": text});
+                events.push(event(
+                    "response.function_call_arguments.done",
+                    with(at, fields),
+                ));
+                item["arguments"] = json!(text);
+                item["status"] = json!("completed");
+                let done = json!({"output_index": index, "item": item});
+                events.push(event("response.output_item.done", done));
+                return;
+            }
+            Open::Reasoning => true,
+            Open::Text => false,
+        };
+        let (done, part) = if reasoning {
+            (
                 "response.reasoning_text.done",
                 json!({"type": "reasoning_text", "text": text}),
-            ),
-            Open::Text => (
+            )
+        } else {
+            (
                 "response.output_text.done",
                 json!({"type": "output_text", "text": text, "annotations": []}),
-            ),
+            )
         };
         let mut fields = json!({"content_index": 0, "text": text});
-        if kind == Open::Text {
+        if !reasoning {
             fields["logprobs"] = json!([]);
         }
         events.push(event(done, with(at.clone(), fields)));
@@ -587,52 +610,44 @@ impl Reply {
         ));
         let item = &mut self.output[index];
         item["content"] = json!([part]);
-        match kind {
-            Open::Reasoning => {
-                if self.encrypted {
-                    item["encrypted_content"] = json!(BASE64.encode(&text));
-                }
-                if self.summary {
-                    let part = json!({"type": "summary_text", "text": text});
-                    item["summary"] = json!([part]);
-                    let fields = json!({"summary_index": 0, "text": text});
-                    events.push(event(
-                        "response.reasoning_summary_text.done",
-                        with(at.clone(), fields),
-                    ));
-                    let fields = json!({"summary_index": 0, "part": part});
-                    events.push(event(
-                        "response.reasoning_summary_part.done",
-                        with(at, fields),
-                    ));
-                }
+        if reasoning {
+            if self.encrypted {
+                item["encrypted_content"] = json!(BASE64.encode(&text));
             }
-            Open::Text => item["status"] = json!("completed"),
+            if self.summary {
+                let part = json!({"type": "summary_text", "text": text});
+                item["summary"] = json!([part]);
+                let fields = json!({"summary_index": 0, "text": text});
+                events.push(event(
+                    "response.reasoning_summary_text.done",
+                    with(at.clone(), fields),
+                ));
+                let fields = json!({"summary_index": 0, "part": part});
+                events.push(event(
+                    "response.reasoning_summary_part.done",
+                    with(at, fields),
+                ));
+            }
+        } else {
+            item["status"] = json!("completed");
         }
         let done = json!({"output_index": index, "item": self.output[index]});
         events.push(event("response.output_item.done", done));
     }
 
-    /// Adds a whole function call as an item.
-    fn call(&mut self, call: &ToolCall, events: &mut Vec<Frame>) {
+    /// Opens a function call item for a call of `name` and returns its index.
+    fn open_call(&mut self, name: &str, events: &mut Vec<Frame>) -> usize {
         self.close(events);
         let index = self.output.len();
-        let id = self.item_id("fc", index);
-        let mut item = json!({"type": "function_call", "id": id,
-                              "call_id": self.item_id("call", index), "name": call.name,
-                              "arguments": "", "status": "in_progress"});
+        let item = json!({"type": "function_call", "id": self.item_id("fc", index),
+                          "call_id": self.item_id("call", index), "name": name,
+                          "arguments": "", "status": "in_progress"});
         let added = json!({"output_index": index, "item": item});
         events.push(event("response.output_item.added", added));
-        let delta = json!({"item_id": id, "output_index": index, "delta": call.arguments});
-        events.push(event("response.function_call_arguments.delta", delta));
-        let done = json!({"item_id": id, "output_index": index, "name": call.name,
-                          "arguments": call.arguments});
-        events.push(event("response.function_call_arguments.done", done));
-        item["arguments"] = json!(call.arguments);
-        item["status"] = json!("completed");
-        let done = json!({"output_index": index, "item": item});
-        events.push(event("response.output_item.done", done));
         self.output.push(item);
+        self.open = Some(Open::Call);
+        self.text.clear();
+        index
     }
 }
 
@@ -667,8 +682,17 @@ impl sse::Reply for Reply {
         if !delta.content.is_empty() {
             self.grow(Open::Text, &delta.content, events);
         }
-        for call in &delta.tool_calls {
-            self.call(call, events);
+        for part in &delta.tool_parts {
+            match part {
+                ToolPart::Start(name) => {
+                    self.open_call(name, events);
+                }
+                ToolPart::Arguments(piece) if self.open == Some(Open::Call) => {
+                    self.grow(Open::Call, piece, events);
+                }
+                ToolPart::Arguments(_) => {}
+                ToolPart::End => self.close(events),
+            }
         }
     }
 
