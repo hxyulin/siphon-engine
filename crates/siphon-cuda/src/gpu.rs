@@ -12,6 +12,12 @@ use cudarc::{
 /// The target the kernels are compiled for, `SIPHON_CUDA_ARCH` at build time.
 const KERNEL_ARCH: &str = env!("SIPHON_CUDA_ARCH");
 
+/// Whether the kernels have the block-scaled MMA (`mma.sync ... block_scale`), which only
+/// `sm_120a` has. The `sm_89` build for the RTX 4090 lacks it, so it refuses the prefill
+/// options that need it: FP8 global attention, quantized or FP8 expert activations and FP8
+/// dense products.
+pub const BLOCK_SCALED_MMA: bool = !cfg!(sm89);
+
 /// One CUDA device and the stream every op launches on.
 ///
 /// All work runs on that one stream, so cudarc's per-buffer events, which order work
@@ -29,10 +35,15 @@ impl Gpu {
             CudaContext::new(ordinal).with_context(|| format!("opening CUDA device {ordinal}"))?;
         let (major, minor) = ctx.compute_capability()?;
         let device = format!("sm_{major}{minor}");
+        let runs = if cfg!(sm89) {
+            "the RTX 4090"
+        } else {
+            "the RTX 5090 and RTX PRO 6000 Blackwell"
+        };
         ensure!(
             KERNEL_ARCH.trim_end_matches('a') == device,
-            "the kernels are built for {KERNEL_ARCH}, which the RTX 5090 and RTX PRO 6000 \
-             Blackwell run, but CUDA device {ordinal}, {}, is {device}",
+            "the kernels are built for {KERNEL_ARCH}, which {runs} run, but CUDA device \
+             {ordinal}, {}, is {device}",
             ctx.name()?
         );
         // SAFETY: nothing has been allocated in this context yet, and every buffer and launch
@@ -287,7 +298,8 @@ impl KernelArgs {
 
     /// Launches `func` with programmatic stream serialization, so it may start before the
     /// previous kernel on `stream` finishes. The kernel must call `pdl_wait()` from
-    /// `kernels/pdl.cuh` before it reads anything an earlier kernel writes.
+    /// `kernels/pdl.cuh` before it reads anything an earlier kernel writes. The `sm_89`
+    /// build launches without it, since Ada has no programmatic dependent launch.
     ///
     /// # Safety
     ///
@@ -323,7 +335,7 @@ impl KernelArgs {
             sharedMemBytes: cfg.shared_mem_bytes,
             hStream: stream.cu_stream(),
             attrs: &raw mut attr,
-            numAttrs: 1,
+            numAttrs: u32::from(!cfg!(sm89)),
         };
         stream.context().bind_to_thread()?;
         // SAFETY: `params` points at one slot per kernel parameter, which outlive the call;

@@ -2,7 +2,8 @@
 //! `SIPHON_KERNELS_HASH`, which the prefix cache's saved files record.
 //!
 //! Only runs when targeting Linux. Finds `nvcc` through `NVCC`, then `CUDA_HOME`,
-//! then `PATH`. `SIPHON_CUDA_ARCH` overrides the default `sm_120a` target.
+//! then `PATH`. `SIPHON_CUDA_ARCH` overrides the default `sm_120a` target: `sm_89` builds
+//! for the RTX 4090 and sets the `sm89` cfg, which turns off what only `sm_120a` can run.
 
 use std::{env, fs, path::PathBuf, process::Command};
 
@@ -13,6 +14,10 @@ fn main() {
     }
     let arch = env::var("SIPHON_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".to_owned());
     println!("cargo::rustc-env=SIPHON_CUDA_ARCH={arch}");
+    println!("cargo::rustc-check-cfg=cfg(sm89)");
+    if arch == "sm_89" {
+        println!("cargo::rustc-cfg=sm89");
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         println!("cargo::rustc-env=SIPHON_KERNELS_HASH=none");
         return;

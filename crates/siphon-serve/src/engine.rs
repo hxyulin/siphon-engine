@@ -804,7 +804,7 @@ mod cuda {
             Some(pool),
         )?;
         kv_options.apply(&mut model)?;
-        model.set_prefill_attention(options.prefill_attention.parse()?);
+        model.set_prefill_attention(options.prefill_attention.parse()?)?;
         if !options.greedy {
             model.enable_sampling()?;
         }

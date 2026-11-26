@@ -878,6 +878,10 @@ impl Model {
     /// [`ExpertActivations::Fp8`] first checks that the NVFP4 weight scales allow the FP8
     /// products' exact split (see [`Experts::fp8_inexact_scales`]), and fails otherwise.
     pub fn set_expert_activations(&mut self, activations: ExpertActivations) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA || activations == ExpertActivations::Bf16,
+            "{activations:?} expert activations need the block-scaled MMA, which this sm_89 build lacks"
+        );
         if activations == ExpertActivations::Fp8 {
             for (layer, w) in self.ctx.weights.layers.iter().enumerate() {
                 if matches!(w.experts.format, ExpertFormat::Nvfp4 { .. }) {
@@ -902,8 +906,14 @@ impl Model {
 
     /// Makes [`Model::prefill`] run attention over an FP8 cache as `attention` says
     /// ([`DEFAULT_PREFILL_ATTENTION`] until set). Decode and BF16 caches are unaffected.
-    pub fn set_prefill_attention(&mut self, attention: PrefillAttention) {
+    /// [`PrefillAttention::Fp8`] needs [`crate::BLOCK_SCALED_MMA`].
+    pub fn set_prefill_attention(&mut self, attention: PrefillAttention) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA || attention != PrefillAttention::Fp8,
+            "FP8 prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
+        );
         self.ctx.prefill_attention = attention;
+        Ok(())
     }
 
     /// Makes [`Model::prefill`] run its dense products with `products`: with
@@ -912,6 +922,10 @@ impl Model {
     /// BF16). It reads the FP8 weight copies, so it needs a model loaded with
     /// [`WeightFormat::Fp8`]; decode and verify are unaffected.
     pub fn set_prefill_dense(&mut self, products: Products) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA || products == Products::Bf16,
+            "FP8 dense products need the block-scaled MMA, which this sm_89 build lacks"
+        );
         ensure!(
             products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
             "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"

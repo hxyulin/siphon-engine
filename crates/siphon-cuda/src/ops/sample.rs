@@ -11,9 +11,10 @@ use cudarc::driver::{
 use crate::gpu::{DeviceIn, DeviceOut, cubin, load_module};
 
 /// Threads of `sample_prepare`'s blocks, and its blocks per row, one cluster:
-/// `kPrepareThreads` and `kCluster` in the kernel.
+/// `kPrepareThreads` and `kCluster` in the kernel. Ada has no clusters, so the `sm_89`
+/// build runs one block per row.
 const PREPARE_THREADS: u32 = 512;
-const PREPARE_CLUSTER: u32 = 8;
+const PREPARE_CLUSTER: u32 = if cfg!(sm89) { 1 } else { 8 };
 /// Threads and blocks per row of `sample_race`, `kRaceBlocks` in the kernel.
 const RACE_THREADS: u32 = 256;
 const RACE_BLOCKS: usize = 32;

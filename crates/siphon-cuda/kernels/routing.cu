@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "cluster_sm89.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -1359,17 +1360,24 @@ __device__ __forceinline__ uint32_t smem_addr(const void* p) {
 }
 
 __device__ __forceinline__ uint32_t cluster_rank() {
+#if SIPHON_SM89
+    // Both cluster kernels run clusters of kClusterRouterBlocks.
+    return blockIdx.x % 16;
+#else
     uint32_t r;
     asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
     return r;
+#endif
 }
 
 // Address `a` of this block's shared memory in block `rank` of the cluster.
+#if !SIPHON_SM89
 __device__ __forceinline__ uint32_t cluster_addr(uint32_t a, uint32_t rank) {
     uint32_t r;
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank));
     return r;
 }
+#endif
 
 // The sum of the router dot products of one row, as moe_router_step_rows_2304 adds them:
 // virtual thread t = 32 w + lane of a 288-thread block sums its 8 products in order
@@ -1479,6 +1487,12 @@ constexpr int kClusterRouterBlocks = 16;
 constexpr int kClusterRouterWarps = kExperts / kClusterRouterBlocks;
 constexpr int kClusterRouterThreads = 32 * kClusterRouterWarps;
 static_assert(kClusterRouterThreads == 2 * kExperts, "two threads per expert rank it");
+static_assert(kClusterRouterBlocks == 16, "cluster_rank on sm_89");
+
+#if SIPHON_SM89
+// Every block's static shared memory, for up to 4 clusters (32 rows).
+__device__ sm89::Mailboxes<4 * kClusterRouterBlocks, 8192> router_mail;
+#endif
 
 }  // namespace
 
@@ -1489,7 +1503,7 @@ static_assert(kClusterRouterThreads == 2 * kExperts, "two threads per expert ran
 // block sends its 8 logits to block 0 with two st.async stores, and block 0 routes: each
 // expert's rank among the biased scores, ties to the lower index, counted by two threads
 // over half the experts each, as route_top8 does.
-extern "C" __global__ void __cluster_dims__(kClusterRouterBlocks, 1, 1) __launch_bounds__(kClusterRouterThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kClusterRouterBlocks) __launch_bounds__(kClusterRouterThreads)
 moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, const float* __restrict__ bias,
                      float* logits, int32_t* indices, float* weights, float route_scale) {
     __shared__ __align__(16) float all[kExperts];
@@ -1504,6 +1518,7 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
     const int warp = t / 32;
     const uint32_t rank = cluster_rank();
     const uint32_t barrier = smem_addr(&arrived);
+#if !SIPHON_SM89
     if (t == 0) {
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(barrier) : "memory");
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -1516,6 +1531,7 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
     // Every block arrives now and waits before its first remote store, so block 0's
     // barrier is ready by then.
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
 
     const int e = int(rank) * kClusterRouterWarps + warp;
     const auto* row = reinterpret_cast<const float4*>(router + size_t(e) * kHidden);
@@ -1533,6 +1549,17 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
         mine[warp] = logit;
     }
     __syncthreads();
+#if SIPHON_SM89
+    if (t < kClusterRouterWarps / 4) {
+        const float4 v = reinterpret_cast<const float4*>(mine)[t];
+        router_mail.send<4>(kClusterRouterBlocks, 0, smem_addr(all + rank * kClusterRouterWarps + 4 * t), barrier,
+                            {__float_as_uint(v.x), __float_as_uint(v.y), __float_as_uint(v.z), __float_as_uint(v.w)});
+    }
+    if (rank != 0) {
+        return;
+    }
+    router_mail.wait<true>(kClusterRouterBlocks, barrier, all, sizeof(all));
+#else
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (t < kClusterRouterWarps / 4) {
         const float4 v = reinterpret_cast<const float4*>(mine)[t];
@@ -1549,6 +1576,7 @@ moe_router_step_2304(const __nv_bfloat16* x, const float* __restrict__ router, c
         "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
         " @!p bra wait;\n}" ::"r"(barrier)
         : "memory");
+#endif
 
     // route_top8 on the gathered logits.
     if (t < kExperts) {
@@ -1606,7 +1634,7 @@ static_assert(kStepRouterRows <= kClusterRouterBlocks, "a block per row routes")
 constexpr int kRowsRouterThreads = kStepThreads;
 static_assert(kRowsRouterThreads >= 2 * kExperts, "two threads per expert rank it");
 
-extern "C" __global__ void __cluster_dims__(kClusterRouterBlocks, 1, 1) __launch_bounds__(kRowsRouterThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kClusterRouterBlocks) __launch_bounds__(kRowsRouterThreads)
 moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restrict__ router,
                           const float* __restrict__ bias, float* logits, int32_t* indices,
                           float* weights, float route_scale) {
@@ -1635,6 +1663,7 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
     }
     // Block `rank` routes row `rank`, if there is one.
     const bool routes = int(rank) < rows;
+#if !SIPHON_SM89
     if (t == 0) {
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(barrier) : "memory");
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -1647,6 +1676,7 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
     // Every block arrives now and waits before its first remote store, so the routing
     // blocks' barriers are ready by then.
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
 
     // w[j], w[8 + j]: expert 8 rank + j's elements of virtual warp `warp`.
     float4 w[2 * kClusterRouterWarps];
@@ -1697,6 +1727,19 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
         mine[t / kClusterRouterWarps][t % kClusterRouterWarps] = total;
     }
     __syncthreads();
+#if SIPHON_SM89
+    if (t < 2 * rows) {
+        const int r = t / 2;
+        const int q = t % 2;
+        const float4 v = reinterpret_cast<const float4*>(mine[r])[q];
+        router_mail.send<4>(kClusterRouterBlocks, r, smem_addr(all + rank * kClusterRouterWarps + 4 * q), barrier,
+                            {__float_as_uint(v.x), __float_as_uint(v.y), __float_as_uint(v.z), __float_as_uint(v.w)});
+    }
+    if (!routes) {
+        return;
+    }
+    router_mail.wait<true>(kClusterRouterBlocks, barrier, all, sizeof(all));
+#else
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     // Thread 2 r + q sends this block's logits 4 q .. 4 q + 3 of row r to block r.
     if (t < 2 * rows) {
@@ -1716,6 +1759,7 @@ moe_router_step_rows_2304(const __nv_bfloat16* x, int rows, const float* __restr
         "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
         " @!p bra wait;\n}" ::"r"(barrier)
         : "memory");
+#endif
 
     // route_top8 on row `rank`'s gathered logits.
     const int r = int(rank);

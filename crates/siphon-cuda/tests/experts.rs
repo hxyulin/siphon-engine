@@ -1610,6 +1610,7 @@ fn gpu_quantize(
 }
 
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn quantize_rows_matches_cpu_model() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let table = e4m3_table();
@@ -1814,16 +1815,19 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
 }
 
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_quantized_nvfp4_matches_reference() -> anyhow::Result<()> {
     check_quantized(true, false)
 }
 
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_quantized_mxfp8_matches_reference() -> anyhow::Result<()> {
     check_quantized(false, false)
 }
 
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_fp8_nvfp4_matches_reference() -> anyhow::Result<()> {
     check_quantized(true, true)
 }
@@ -1844,6 +1848,7 @@ fn fp8_exact_block(a: u8, b: u8) -> bool {
 /// The FP8 NVFP4 products stay exact at the edge of their range: block scales up to 2^10
 /// apart, subnormal and zero scales; and `fp8_inexact_scales` counts the scales beyond it.
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_fp8_nvfp4_exact_at_wide_scale_gaps() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
@@ -1918,6 +1923,7 @@ fn matmul_fp8_nvfp4_exact_at_wide_scale_gaps() -> anyhow::Result<()> {
 /// `expert_matmul_quantized_swiglu_grouped` equals `expert_matmul_quantized_grouped`
 /// followed by `softcapped_swiglu`, bit for bit, unknown ids included.
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
@@ -1981,6 +1987,10 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
 #[test]
 #[ignore = "benchmark; run alone on an idle GPU with --nocapture"]
 fn bench_expert_activations() -> anyhow::Result<()> {
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        eprintln!("skipped: the quantized products need the block-scaled MMA, which sm_89 lacks");
+        return Ok(());
+    }
     let s = Setup::new()?;
     let stream = s.stream();
     let rows = 2048;

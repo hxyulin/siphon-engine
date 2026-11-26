@@ -24,6 +24,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "cluster_sm89.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -286,8 +287,10 @@ __device__ __forceinline__ unsigned long long global_ns() {
 extern "C" __global__ void __launch_bounds__(32)
 prefetch_l2_paced(const __grid_constant__ Ranges r, float bytes_per_ns) {
     constexpr long long kChunk = 4096;
+#if !SIPHON_SM89
     uint64_t policy;
     asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+#endif
     const unsigned long long t0 = global_ns();
     const long long lanes = (long long)gridDim.x * 32;
     const long long lane = blockIdx.x * 32ll + threadIdx.x;
@@ -302,8 +305,15 @@ prefetch_l2_paced(const __grid_constant__ Ranges r, float bytes_per_ns) {
                 __nanosleep(100);
             }
             const unsigned n = unsigned(min(kChunk, bytes - c * kChunk));
+#if SIPHON_SM89
+            // No bulk prefetch: one L2 prefetch per 128-byte line.
+            for (unsigned line = 0; line < n; line += 128) {
+                asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p + c * kChunk + line) : "memory");
+            }
+#else
             asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;"
                          ::"l"(p + c * kChunk), "r"(n), "l"(policy) : "memory");
+#endif
         }
         chunk_base += chunks;
     }
@@ -391,6 +401,15 @@ __device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint3
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+#if SIPHON_SM89
+// Each block's parked sums for the split-k reduction, BM x BN floats at block x times
+// BM x BN, and a barrier per cluster. A split launch holds at most a GPU's worth of
+// blocks, 256 on the 4090, so 2^21 floats cover tiles up to 64 x 128.
+constexpr int kRedFloats = 1 << 21;
+constexpr int kMaxClusters = 1024;
+__device__ float red_sm89[kRedFloats];
+__device__ sm89::BarrierState barriers_sm89[kMaxClusters];
+#else
 // Float at shared address `addr` of block `rank` of this cluster.
 __device__ __forceinline__ float ld_cluster(uint32_t addr, int rank) {
     uint32_t remote;
@@ -405,6 +424,7 @@ __device__ __forceinline__ void cluster_sync() {
         "barrier.cluster.arrive.release.aligned;\n"
         "barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
+#endif
 
 __device__ __forceinline__ uint32_t pack(__nv_bfloat16 lo, __nv_bfloat16 hi) {
     return uint32_t(__bfloat16_as_ushort(lo)) | (uint32_t(__bfloat16_as_ushort(hi)) << 16);
@@ -721,6 +741,48 @@ __device__ void gemm(const Batch& b, char* smem) {
         return;
     }
 
+#if SIPHON_SM89
+    // The same reduction with the parked sums in global memory.
+    cp_async_wait<0>();
+    if (size_t(blockIdx.x + 1) * BM * BN > size_t(kRedFloats)) {
+        __trap();
+    }
+    if (wk == 0) {
+        float* dst = red_sm89 + size_t(blockIdx.x) * BM * BN + slice * kValues * 32 + lane;
+#pragma unroll
+        for (int v = 0; v < kValues; ++v) {
+            dst[v * 32] = (&acc[0][0][0])[v];
+        }
+    }
+    sm89::barrier(barriers_sm89, kMaxClusters, splits);
+    if (wk == 0) {
+        const int cluster0 = int(blockIdx.x) - rank;
+#pragma unroll
+        for (int mi = 0; mi < T::kMi; ++mi)
+#pragma unroll
+            for (int ni = 0; ni < T::kNi; ++ni) {
+                if ((mi * T::kNi + ni) % splits != rank) {
+                    continue;
+                }
+                float v[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    v[e] = acc[mi][ni][e];
+                }
+                for (int j = 0; j < splits; ++j) {
+                    if (j == rank) {
+                        continue;
+                    }
+                    const float* src = red_sm89 + size_t(cluster0 + j) * BM * BN + slice * kValues * 32 + lane;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        v[e] += __ldcg(src + ((mi * T::kNi + ni) * 4 + e) * 32);
+                    }
+                }
+                store(mi, ni, v);
+            }
+    }
+#else
     // Split k: every block of the cluster parks its sums in shared memory, then block r
     // adds up and stores the 16 x 8 slices (mi, ni) with (mi kNi + ni) % splits == r.
     // The second barrier keeps each block's shared memory alive until the reads finish.
@@ -761,6 +823,7 @@ __device__ void gemm(const Batch& b, char* smem) {
             }
     }
     cluster_sync();
+#endif
 }
 
 }  // namespace gemm

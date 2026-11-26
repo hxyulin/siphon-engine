@@ -234,6 +234,7 @@ fn mxfp8_rows(x: &[bf16]) -> Vec<f64> {
 /// products that share an input and that do not, partial row and column tiles, and k of
 /// the attention inputs, the output projection and the message gates.
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn gemm_matches_reference() -> anyhow::Result<()> {
     // (m, k, [(n, input)]): products with the same input index share x.
     type Case = (usize, usize, &'static [(usize, usize)]);

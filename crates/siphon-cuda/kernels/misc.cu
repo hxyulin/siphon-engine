@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstdint>
 
+#include "cluster_sm89.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -541,11 +542,22 @@ __device__ __forceinline__ uint32_t gate_smem_addr(const void* p) {
 }
 
 __device__ __forceinline__ uint32_t gate_cluster_rank() {
+#if SIPHON_SM89
+    return blockIdx.x % kGateCluster;
+#else
     uint32_t r;
     asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
     return r;
+#endif
 }
 
+#if SIPHON_SM89
+// Every block's static shared memory: message_gate_step's 3 clusters, and
+// gate_rows::run's 4 clusters for each of 3 gates.
+__device__ sm89::Mailboxes<3 * kGateCluster, 12288> gate_step_mail;
+__device__ sm89::Mailboxes<12 * kGateCluster, 4096> gate_rows_mail;
+__device__ sm89::BarrierState gate_rows_barriers[12];
+#else
 // Address `a` of this block's shared memory in block `rank` of the cluster.
 __device__ __forceinline__ uint32_t gate_cluster_addr(uint32_t a, uint32_t rank) {
     uint32_t r;
@@ -556,12 +568,25 @@ __device__ __forceinline__ uint32_t gate_cluster_addr(uint32_t a, uint32_t rank)
 __device__ __forceinline__ void gate_expect(uint32_t barrier, uint32_t bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(barrier), "r"(bytes) : "memory");
 }
+#endif
 
-__device__ __forceinline__ void gate_wait(uint32_t barrier) {
+// Waits until `bytes` have arrived at `target` on `barrier`. Every thread of the calling
+// warp calls it, or of the block with kBlock. Only sm_89 uses the template arguments and
+// `target`, and kRows picks gate_rows_mail there.
+template <bool kBlock, bool kRows>
+__device__ __forceinline__ void gate_wait(uint32_t barrier, void* target, uint32_t bytes) {
+#if SIPHON_SM89
+    if constexpr (kRows) {
+        gate_rows_mail.wait<kBlock>(kGateCluster, barrier, target, bytes);
+    } else {
+        gate_step_mail.wait<kBlock>(kGateCluster, barrier, target, bytes);
+    }
+#else
     asm volatile(
         "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
         " @!p bra wait;\n}" ::"r"(barrier)
         : "memory");
+#endif
 }
 
 template <bool kFp8>
@@ -584,6 +609,7 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
     const uint32_t gather_barrier = gate_smem_addr(&arrived[0]);
     const uint32_t down_barrier = gate_smem_addr(&arrived[1]);
     const uint32_t norm_barrier = gate_smem_addr(&arrived[2]);
+#if !SIPHON_SM89
     if (t == 0) {
         for (int i = 0; i < 3; ++i) {
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(gate_smem_addr(&arrived[i])) : "memory");
@@ -598,6 +624,7 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
     // Every block arrives now and waits before its first remote store, so the barriers of
     // the whole cluster are ready by then.
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
 
     // Weights first, as message_gate_step loads them, for both halves.
     DownChunk<kFp8> dw[kGateHalves][kDownPerThread];
@@ -676,22 +703,30 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
         mine[t] = acc;
     }
     __syncthreads();
+#if !SIPHON_SM89
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
     // Thread q < 32 sends rows 4 d .. of this block's half h, q = 2 d + h, to block d, as
     // partial 2 rank + h.
     if (t < kGateCluster * kGateHalves) {
         const uint32_t dst_rank = uint32_t(t / kGateHalves);
         const int half = t % kGateHalves;
         const float4 v = reinterpret_cast<const float4*>(mine + half * kGateRank)[dst_rank];
+#if SIPHON_SM89
+        gate_step_mail.send<4>(kGateCluster, int(dst_rank), gate_smem_addr(&gathered[int(rank) * kGateHalves + half][0]),
+                               gather_barrier,
+                               {__float_as_uint(v.x), __float_as_uint(v.y), __float_as_uint(v.z), __float_as_uint(v.w)});
+#else
         const uint32_t dst =
             gate_cluster_addr(gate_smem_addr(&gathered[int(rank) * kGateHalves + half][0]), dst_rank);
         asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(dst),
                      "r"(__float_as_uint(v.x)), "r"(__float_as_uint(v.y)), "r"(__float_as_uint(v.z)),
                      "r"(__float_as_uint(v.w)), "r"(gate_cluster_addr(gather_barrier, dst_rank))
                      : "memory");
+#endif
     }
     if (warp == 0) {
-        gate_wait(gather_barrier);
+        gate_wait<false, false>(gather_barrier, gathered, sizeof(gathered));
         // Lane t < 4: row 4 rank + t, added over the 32 partials in order.
         float acc = 0.f;
         if (lane < kGateRowsPerRank) {
@@ -711,14 +746,19 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
             down[blockIdx.y * kGateRank + int(rank) * kGateRowsPerRank + lane] = d;
         }
         if (lane < kGateCluster) {
+#if SIPHON_SM89
+            gate_step_mail.send<2>(kGateCluster, lane, gate_smem_addr(down_s + int(rank) * kGateRowsPerRank),
+                                   down_barrier, {b0 | (b1 << 16), b2 | (b3 << 16)});
+#else
             const uint32_t dst =
                 gate_cluster_addr(gate_smem_addr(down_s + int(rank) * kGateRowsPerRank), uint32_t(lane));
             asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];" ::"r"(dst),
                          "r"(b0 | (b1 << 16)), "r"(b2 | (b3 << 16)), "r"(gate_cluster_addr(down_barrier, uint32_t(lane)))
                          : "memory");
+#endif
         }
     }
-    gate_wait(down_barrier);
+    gate_wait<true, false>(down_barrier, down_s, sizeof(down_s));
 
     float o[kGateHalves];
 #pragma unroll
@@ -780,15 +820,20 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
         const float s0 = __shfl_sync(0xffffffffu, acc, 0);
         const float s1 = __shfl_sync(0xffffffffu, acc, 1);
         if (lane < kGateCluster) {
+#if SIPHON_SM89
+            gate_step_mail.send<2>(kGateCluster, lane, gate_smem_addr(norm_parts + int(rank) * kGateHalves),
+                                   norm_barrier, {__float_as_uint(s0), __float_as_uint(s1)});
+#else
             const uint32_t dst =
                 gate_cluster_addr(gate_smem_addr(norm_parts + int(rank) * kGateHalves), uint32_t(lane));
             asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];" ::"r"(dst),
                          "r"(__float_as_uint(s0)), "r"(__float_as_uint(s1)),
                          "r"(gate_cluster_addr(norm_barrier, uint32_t(lane)))
                          : "memory");
+#endif
         }
     }
-    gate_wait(norm_barrier);
+    gate_wait<true, false>(norm_barrier, norm_parts, sizeof(norm_parts));
     const float total = warp_sum(norm_parts[lane]);
     const float inv = 1.f / sqrtf(total / static_cast<float>(kHidden) + eps);
     if (sub == 0) {
@@ -806,7 +851,7 @@ message_gate_step(const GateWeights<kFp8>& wt, const __nv_bfloat16* input, const
 // out + 2304 s and, with a norm weight, normed_s = bf16(rms_norm(out) * norm_weight_s).
 // `down`, if not null, receives each gate's BF16 down projection ([slots, 64]). The grid
 // is (16, gates) blocks, one cluster per gate.
-extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
 message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __nv_bfloat16* __restrict__ down_weight1,
                        const __nv_bfloat16* __restrict__ down_weight2, const __nv_bfloat16* input0,
                        const __nv_bfloat16* input1, const __nv_bfloat16* input2,
@@ -842,7 +887,7 @@ message_gate_step_2304(const __nv_bfloat16* __restrict__ down_weight0, const __n
 // each matrix in the layout of linear_fp8.cu, and *_scale_s their F32 row scales. Each
 // product sums the exactly widened weights in F32 and multiplies the row's scale into the
 // sum once.
-extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
 message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __restrict__ down1,
                            const uint8_t* __restrict__ down2, const float* __restrict__ down_scale0,
                            const float* __restrict__ down_scale1, const float* __restrict__ down_scale2,
@@ -1237,17 +1282,25 @@ __device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 lo, __nv_bfloat16 hi
 }
 
 __device__ __forceinline__ void send_v2(uint32_t local, uint32_t barrier, uint32_t rank, float x, float y) {
+#if SIPHON_SM89
+    gate_rows_mail.send<2>(kGateCluster, int(rank), local, barrier, {__float_as_uint(x), __float_as_uint(y)});
+#else
     asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];" ::"r"(
                      gate_cluster_addr(local, rank)),
                  "r"(__float_as_uint(x)), "r"(__float_as_uint(y)), "r"(gate_cluster_addr(barrier, rank))
                  : "memory");
+#endif
 }
 
 __device__ __forceinline__ void send_v4(uint32_t local, uint32_t barrier, uint32_t rank, uint4 v) {
+#if SIPHON_SM89
+    gate_rows_mail.send<4>(kGateCluster, int(rank), local, barrier, {v.x, v.y, v.z, v.w});
+#else
     asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(
                      gate_cluster_addr(local, rank)),
                  "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "r"(gate_cluster_addr(barrier, rank))
                  : "memory");
+#endif
 }
 
 template <bool kFp8>
@@ -1282,6 +1335,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     const int rows = min(a.rows - row0, kMaxRows);
     const uint32_t parts_barrier = gate_smem_addr(&arrived[0]);
     const uint32_t down_barrier = gate_smem_addr(&arrived[1]);
+#if !SIPHON_SM89
     if (t == 0) {
         for (int i = 0; i < 2; ++i) {
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(gate_smem_addr(&arrived[i])) : "memory");
@@ -1292,6 +1346,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     }
     // Every block arrives now and waits before its first remote store.
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
 
     // Weights first, all at once: this block's down stages, then its forget and gain rows.
     auto* fs = reinterpret_cast<__nv_bfloat16*>(ring + kUnitsPerBlock * kMS * kSlotVecs);
@@ -1358,7 +1413,9 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     if (rows > 0) {
         pdl_wait();
     }
+#if !SIPHON_SM89
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
 
     if (warp < kUnitsPerBlock) {
         // Every stage's inputs, then the products in rows_product's order. Stages below
@@ -1431,7 +1488,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
         send_v2(gate_smem_addr(&parts[split][r_hi % kOwnedRows][2 * tq]), parts_barrier,
                 uint32_t(r_hi / kOwnedRows), acc[2], acc[3]);
     } else if (warp == kOwnerWarp) {
-        gate_wait(parts_barrier);
+        gate_wait<false, true>(parts_barrier, parts, sizeof(parts));
         // Lane l: down row 4 rank + l / 8 of row l % 8, added over the splits in order.
         const int i = lane / kMaxRows;
         const int j = lane % kMaxRows;
@@ -1453,7 +1510,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     }
     wait_copies<0>();
     __syncthreads();
-    gate_wait(down_barrier);
+    gate_wait<true, true>(down_barrier, down_t, sizeof(down_t));
 
     // The gate products: warp w takes columns 16 w .. 16 w + 15 of the block as two groups
     // of 8, A holding the down projection's rows (rows 8 .. 15 zero).
@@ -1521,7 +1578,11 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
         return;
     }
     // Every block's outputs are visible to the cluster after the barrier.
+#if SIPHON_SM89
+    sm89::barrier(gate_rows_barriers, 12, kGateCluster);
+#else
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
     if (int(rank) >= rows) {
         return;
     }
@@ -1568,13 +1629,13 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
 // gate_rows::run with BF16 down weights, and with E4M3 down weights. The grid is
 // (16, gates, ceil(rows / 8)) blocks of 288 threads, one cluster per gate and 8 rows, with
 // gate_rows::smem_bytes<fp8>() bytes of dynamic shared memory.
-extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
 message_gate_rows_2304(const __grid_constant__ gate_rows::GateRowsArgs args) {
     extern __shared__ uint4 gate_ring[];
     gate_rows::run<false>(args, gate_ring);
 }
 
-extern "C" __global__ void __cluster_dims__(kGateCluster, 1, 1) __launch_bounds__(kGateThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
 message_gate_rows_fp8_2304(const __grid_constant__ gate_rows::GateRowsArgs args) {
     extern __shared__ uint4 gate_ring[];
     gate_rows::run<true>(args, gate_ring);

@@ -174,7 +174,7 @@ mod linux {
         w.output = output;
         let mut model =
             Model::with_formats(&gpu, config, w, passes_cfg, text.len() + 16, kv, weights)?;
-        model.set_prefill_attention(prefill_attention);
+        model.set_prefill_attention(prefill_attention)?;
         model.prefill(prompt, 2048, PrefillLogits::Last)?;
         // FNV-1a over the bits of every pass's logits.
         let mut fnv = 0xcbf2_9ce4_8422_2325_u64;

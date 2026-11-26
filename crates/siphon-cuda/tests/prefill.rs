@@ -158,6 +158,10 @@ fn prefill_matches_stepping() -> anyhow::Result<()> {
 #[test]
 #[ignore = "needs the checkpoint (SIPHON_MODEL) and about 20 GB of GPU memory"]
 fn fp8_prefill_matches_stepping() -> anyhow::Result<()> {
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        eprintln!("skipped: the FP8 prefill products need the block-scaled MMA, which sm_89 lacks");
+        return Ok(());
+    }
     prefill_matches_stepping_with(KvFormat::Fp8, WeightFormat::Fp8, true)
 }
 
@@ -182,7 +186,7 @@ fn load(
     let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
     let mut model = Model::with_formats(gpu, config, weights, passes, 2048, kv, weight_format)?;
     if fp8_products {
-        model.set_prefill_attention(PrefillAttention::Fp8);
+        model.set_prefill_attention(PrefillAttention::Fp8)?;
         model.set_expert_activations(ExpertActivations::Fp8)?;
         model.set_prefill_dense(Products::Fp8)?;
     }

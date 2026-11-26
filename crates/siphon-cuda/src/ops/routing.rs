@@ -234,19 +234,24 @@ impl Routing {
             depth_attention_step_2304: module.load_function("depth_attention_step_2304")?,
             moe_router_step_2304: {
                 let f = module.load_function("moe_router_step_2304")?;
-                // Its compiled cluster of 16 blocks is above the portable limit of 8.
-                f.set_attribute(
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-                    1,
-                )?;
+                // Its compiled cluster of 16 blocks is above the portable limit of 8. The
+                // sm_89 build has no clusters.
+                if !cfg!(sm89) {
+                    f.set_attribute(
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                        1,
+                    )?;
+                }
                 f
             },
             moe_router_step_rows_2304: {
                 let f = module.load_function("moe_router_step_rows_2304")?;
-                f.set_attribute(
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-                    1,
-                )?;
+                if !cfg!(sm89) {
+                    f.set_attribute(
+                        CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                        1,
+                    )?;
+                }
                 f
             },
             depth_attention_rows_2304: ROWS_QUERY_COUNTS

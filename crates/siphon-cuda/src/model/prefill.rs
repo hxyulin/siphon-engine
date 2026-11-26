@@ -63,7 +63,8 @@ pub const FP8_ATTENTION_KEYS: usize = 16_384;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillAttention {
     /// BF16 for chunks whose last row reads up to [`FP8_ATTENTION_KEYS`] keys, FP8 after,
-    /// so prompts up to that length prefill exactly as with `Bf16`.
+    /// so prompts up to that length prefill exactly as with `Bf16`. Always BF16 without
+    /// [`crate::BLOCK_SCALED_MMA`].
     Auto,
     Bf16,
     Fp8,
@@ -73,7 +74,7 @@ impl PrefillAttention {
     /// The products for a chunk whose last row sits at position `end - 1`.
     fn products(self, end: usize) -> Products {
         match self {
-            Self::Auto if end > FP8_ATTENTION_KEYS => Products::Fp8,
+            Self::Auto if end > FP8_ATTENTION_KEYS && crate::BLOCK_SCALED_MMA => Products::Fp8,
             Self::Auto | Self::Bf16 => Products::Bf16,
             Self::Fp8 => Products::Fp8,
         }

@@ -18,10 +18,18 @@
 
 #pragma once
 
+#include "arch.cuh"
+
+// Ada has no programmatic dependent launch: every kernel starts after the one before it
+// ends, so both calls do nothing there.
 __device__ __forceinline__ void pdl_wait() {
+#if !SIPHON_SM89
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 }
 
 __device__ __forceinline__ void pdl_trigger() {
+#if !SIPHON_SM89
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 }

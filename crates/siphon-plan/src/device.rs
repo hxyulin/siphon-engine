@@ -10,8 +10,14 @@ use siphon::memory::CONTEXT_BYTES;
 const RTX_5090_TOTAL: usize = 32_607 << 20;
 const RTX_5090_IDLE_HELD: usize = (459 + 454) << 20;
 
-/// Streaming multiprocessors by device name, which nvidia-smi does not report.
-const SMS: [(&str, usize); 2] = [("RTX 5090", 170), ("RTX PRO 6000 Blackwell", 188)];
+/// Streaming multiprocessors by device name, which nvidia-smi does not report. The first
+/// matching prefix wins, so the RTX 4090 D comes before the RTX 4090.
+const SMS: [(&str, usize); 4] = [
+    ("RTX 5090", 170),
+    ("RTX PRO 6000 Blackwell", 188),
+    ("RTX 4090 D", 114),
+    ("RTX 4090", 128),
+];
 
 /// The CUDA context by device name where it differs from `CONTEXT_BYTES`, the RTX 5090's:
 /// measured as nvidia-smi's free memory less the free memory right after creating the

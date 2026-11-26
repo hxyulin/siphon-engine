@@ -62,7 +62,12 @@ const CONFIGS: [Config; 2] = [
         name: "fp8",
         weights: WeightFormat::Fp8,
         kv: KvFormat::Fp8,
-        experts: ExpertActivations::Quantized,
+        // The sm_89 build has no quantized expert products.
+        experts: if siphon_cuda::BLOCK_SCALED_MMA {
+            ExpertActivations::Quantized
+        } else {
+            ExpertActivations::Bf16
+        },
     },
 ];
 

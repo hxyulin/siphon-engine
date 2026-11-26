@@ -1398,6 +1398,7 @@ fn fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
 }
 
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
     let chunks = [
         Chunk::full(77),
@@ -1441,6 +1442,7 @@ fn long_fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
 }
 
 #[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn long_fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
     check_prefill_with(
         |stream| KvCache::global_with_format(stream, 40_960, KvFormat::Fp8),

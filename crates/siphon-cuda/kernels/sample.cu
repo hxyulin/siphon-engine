@@ -31,6 +31,7 @@
 
 #include <cooperative_groups.h>
 
+#include "arch.cuh"
 #include "race.cuh"
 
 namespace cg = cooperative_groups;
@@ -38,8 +39,25 @@ namespace cg = cooperative_groups;
 namespace {
 
 // sample_prepare runs each row in a cluster of kCluster blocks of kPrepareThreads, kCluster
-// and PREPARE_THREADS in ops/sample.rs.
+// and PREPARE_THREADS in ops/sample.rs. Ada has no clusters, so one block takes each row
+// there. The histograms count in integers and the maxima compare exactly, so the results
+// do not depend on how many blocks share a row.
+#if SIPHON_SM89
+constexpr int kCluster = 1;
+
+// The cluster_group calls sample_prepare makes, for a cluster of one block.
+struct ClusterGroup {
+    __device__ void sync() { __syncthreads(); }
+    __device__ unsigned block_rank() const { return 0; }
+    template <typename T>
+    __device__ T* map_shared_rank(T* p, int) const {
+        return p;
+    }
+};
+#else
 constexpr int kCluster = 8;
+using ClusterGroup = cg::cluster_group;
+#endif
 constexpr int kPrepareThreads = 512;
 constexpr int kWarps = kPrepareThreads / 32;
 constexpr int kRaceThreads = 256;
@@ -306,7 +324,8 @@ struct Search {
     Hist hist;
     // After merge(), this block's share of the cluster's histogram: bins
     // rank * per .. rank * per + per - 1, per = bins / kCluster.
-    unsigned long long merged[kBins / kCluster];
+    // Unused on sm_89, where a block's histogram is the cluster's.
+    unsigned long long merged[SIPHON_SM89 ? 1 : kBins / kCluster];
     unsigned long long scan[33];
     unsigned found[3];
     unsigned uscratch[32];
@@ -334,8 +353,11 @@ struct Part {
 // Sums every block's histogram of `bins` bins into each block's share of it, `merged`.
 // Starts with a cluster barrier, so that every block's histogram is complete and every
 // block has finished reading the shares of the last merge.
-__device__ void merge(Search& sh, int bins, cg::cluster_group& cluster) {
+__device__ void merge(Search& sh, int bins, ClusterGroup& cluster) {
     cluster.sync();
+#if SIPHON_SM89
+    return;
+#endif
     const int per = bins / kCluster;
     const int first = static_cast<int>(cluster.block_rank()) * per;
     for (int j = threadIdx.x; j < per; j += kPrepareThreads) {
@@ -350,13 +372,16 @@ __device__ void merge(Search& sh, int bins, cg::cluster_group& cluster) {
 }
 
 // Bin `bin` of the cluster's histogram of `bins` bins, after merge().
-__device__ __forceinline__ unsigned long long merged(Search& sh, int bins, int bin, cg::cluster_group& cluster) {
+__device__ __forceinline__ unsigned long long merged(Search& sh, int bins, int bin, ClusterGroup& cluster) {
+#if SIPHON_SM89
+    return sh.hist.get(bin);
+#endif
     const int per = bins / kCluster;
     return cluster.map_shared_rank(sh.merged, bin / per)[bin % per];
 }
 
 // The sum of every bin of the cluster's histogram, after merge().
-__device__ unsigned long long merged_total(Search& sh, int bins, cg::cluster_group& cluster) {
+__device__ unsigned long long merged_total(Search& sh, int bins, ClusterGroup& cluster) {
     unsigned long long own = 0;
     for (int b = threadIdx.x; b < bins; b += kPrepareThreads) {
         own += merged(sh, bins, b, cluster);
@@ -371,7 +396,7 @@ __device__ unsigned long long merged_total(Search& sh, int bins, cg::cluster_gro
 // rule out.
 __device__ unsigned pick(Search& sh, int bins, bool descending, unsigned long long above,
                          unsigned long long target, unsigned long long* before_bin,
-                         cg::cluster_group& cluster) {
+                         ClusterGroup& cluster) {
     const int per = bins > kPrepareThreads ? bins / kPrepareThreads : 1;
     const int first = per * threadIdx.x;
     const auto at = [&](int rank) { return descending ? bins - 1 - rank : rank; };
@@ -403,7 +428,7 @@ __device__ unsigned pick(Search& sh, int bins, bool descending, unsigned long lo
 // The k-th largest key of the row among those at or above `lowest`: a radix over all keys,
 // 11, 11 and 10 bits at a time. Only for a k past every token within kRange of the maximum.
 __device__ unsigned count_threshold(const Part& part, unsigned lowest, unsigned long long k, Search& sh,
-                                    cg::cluster_group& cluster) {
+                                    ClusterGroup& cluster) {
     unsigned prefix = 0;
     unsigned long long above = 0;
     for (int hi = 32; hi > 0;) {
@@ -444,7 +469,7 @@ __device__ unsigned count_threshold(const Part& part, unsigned lowest, unsigned 
 // copies its tokens of the bin where the weight reaches the target to shared memory (when
 // they fit), and a radix over their keys, 11 bits at a time, finds the exact key.
 __device__ unsigned threshold(const Part& part, unsigned lowest, float top, float inv_t, bool by_mass,
-                              unsigned long long k, float share, Search& sh, cg::cluster_group& cluster) {
+                              unsigned long long k, float share, Search& sh, ClusterGroup& cluster) {
     sh.hist.clear(kBins);
     if (threadIdx.x == 0) {
         sh.count = 0;
@@ -566,10 +591,14 @@ __device__ unsigned threshold(const Part& part, unsigned lowest, float top, floa
 // The first stage, one cluster of kCluster blocks per row of logits [rows, n], each block
 // taking an eighth of the row: a greedy row writes its argmax to out; a sampling row writes
 // its thresholds to state for sample_race. Grid: rows * kCluster blocks.
-extern "C" __global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kPrepareThreads)
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kCluster) __launch_bounds__(kPrepareThreads)
 sample_prepare(const float* logits, int n, const Params* params, State* state, int* out) {
     __shared__ Search sh;
+#if SIPHON_SM89
+    ClusterGroup cluster;
+#else
     cg::cluster_group cluster = cg::this_cluster();
+#endif
     const int rank = static_cast<int>(cluster.block_rank());
     const int row = blockIdx.x / kCluster;
     const float* x = logits + static_cast<size_t>(row) * n;

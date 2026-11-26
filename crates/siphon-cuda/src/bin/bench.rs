@@ -115,8 +115,8 @@ mod linux {
     /// Bytes `--weights fp8` saves per step: the 3.51 GB of BF16 attention projections
     /// and LM head read as 1.76 GB of E4M3 values and scales.
     const FP8_SAVED_BYTES_PER_TOKEN: f64 = 1.75e9;
-    /// RTX 5090 DRAM bandwidth.
-    const PEAK_BANDWIDTH: f64 = 1.79e12;
+    /// DRAM bandwidth of the RTX 5090, or of the RTX 4090 for the sm_89 build.
+    const PEAK_BANDWIDTH: f64 = if cfg!(sm89) { 1.008e12 } else { 1.79e12 };
     const DEFAULT_CONTEXTS: [usize; 3] = [0, 4096, 32768];
     /// Added to the defaults when the memory plan fits.
     const LONG_CONTEXT: usize = 131_072;
@@ -439,7 +439,7 @@ mod linux {
         )?;
         args.kv_options.apply(&mut model)?;
         model.set_expert_activations(args.expert_activations)?;
-        model.set_prefill_attention(args.prefill_attention);
+        model.set_prefill_attention(args.prefill_attention)?;
         model.set_prefill_dense(args.prefill_dense)?;
         Ok(model)
     }

@@ -442,9 +442,11 @@ pub struct Linear {
 impl Linear {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "linear", cubin!("linear"))?;
-        // Thread-block clusters split k for the GEMM.
+        // Thread-block clusters split k for the GEMM. The sm_89 build splits it over plain
+        // blocks that meet in global memory.
         ensure!(
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH)? != 0,
+            cfg!(sm89)
+                || ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH)? != 0,
             "the device cannot launch thread-block clusters"
         );
         let f = |name: &str| module.load_function(name);
@@ -764,7 +766,8 @@ pub(crate) unsafe fn launch_by_value<B>(
         sharedMemBytes: cfg.shared_mem_bytes,
         hStream: stream.cu_stream(),
         attrs: &raw mut attr,
-        numAttrs: 1,
+        // Ada has no programmatic dependent launch.
+        numAttrs: u32::from(!cfg!(sm89)),
     };
     let mut params = [ptr::from_ref(batch).cast_mut().cast::<c_void>()];
     stream.context().bind_to_thread()?;
@@ -919,7 +922,8 @@ unsafe fn launch_clusters(
         sharedMemBytes: u32::try_from(kernel.tile.smem_bytes(x_bytes))?,
         hStream: stream.cu_stream(),
         attrs: &raw mut cluster,
-        numAttrs: 1,
+        // The sm_89 kernels run the same grid as plain blocks.
+        numAttrs: u32::from(!cfg!(sm89)),
     };
     let mut params = [ptr::from_ref(batch).cast_mut().cast::<c_void>()];
     stream.context().bind_to_thread()?;

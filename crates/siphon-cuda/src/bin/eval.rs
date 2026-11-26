@@ -417,7 +417,7 @@ mod linux {
         )?;
         args.kv_options.apply(&mut model)?;
         model.set_expert_activations(args.expert_activations)?;
-        model.set_prefill_attention(args.prefill_attention);
+        model.set_prefill_attention(args.prefill_attention)?;
         model.set_prefill_dense(args.prefill_dense)?;
 
         let mut sampled = capture.positions.iter().copied().enumerate().peekable();

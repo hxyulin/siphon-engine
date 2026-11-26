@@ -36,6 +36,7 @@
 #include <cstdint>
 
 #include "mlx_ops.cuh"
+#include "arch.cuh"
 #include "mxfp8.cuh"
 
 namespace {
@@ -75,9 +76,17 @@ __device__ void cp_async16(void* dst, const void* src, int src_bytes) {
                  "r"(src_bytes));
 }
 
-// Starts loading `bytes` (a multiple of 16, 16-byte aligned) into L2.
+// Starts loading `bytes` (a multiple of 16, 16-byte aligned) into L2. Ada has no bulk
+// prefetch, so there it prefetches each 128-byte line the range touches.
 __device__ void prefetch_l2_bulk(const void* src, uint32_t bytes) {
+#if SIPHON_SM89
+    const auto* p = static_cast<const char*>(src);
+    for (uint32_t line = 0; line < bytes; line += 128) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(p + line) : "memory");
+    }
+#else
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
+#endif
 }
 
 __device__ void cp_async_commit() {
@@ -556,10 +565,15 @@ __device__ float e4m3_round(float x) {
 __device__ uint32_t e2m1x2(float lo, float hi, float& lo_value, float& hi_value) {
     uint32_t byte;
     uint32_t halves;
+#if SIPHON_SM89
+    __trap();
+    byte = halves = 0;
+#else
     asm("{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %3, %2; cvt.u32.u8 %0, b; "
         "cvt.rn.f16x2.e2m1x2 %1, b; }"
         : "=r"(byte), "=r"(halves)
         : "f"(lo), "f"(hi));
+#endif
     const __half2 h = *reinterpret_cast<const __half2*>(&halves);
     lo_value = __low2float(h);
     hi_value = __high2float(h);
@@ -705,6 +719,9 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
 template <int kThreadB>
 __device__ __forceinline__ void mma_fp4(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
                                             uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
+#if SIPHON_SM89
+    __trap();
+#else
     asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1."
         "e2m1.f32.ue4m3 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
         "{%13}, {%14,%15};"
@@ -712,11 +729,15 @@ __device__ __forceinline__ void mma_fp4(float (&c)[4], const uint32_t (&a)[4], u
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
           "h"(uint16_t(0)), "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(0)),
           "h"(uint16_t(kThreadB)));
+#endif
 }
 
 template <int kByte>
 __device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
                                             uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
+#if SIPHON_SM89
+    __trap();
+#else
     asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
         "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
         "{%13}, {%14,%15};"
@@ -724,6 +745,7 @@ __device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], u
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
           "h"(uint16_t(kByte)), "h"(uint16_t(0)), "r"(scale_b), "h"(uint16_t(kByte)),
           "h"(uint16_t(0)));
+#endif
 }
 
 // One CTA of the quantized GEMM: 128 output columns of one tile of up to 128
@@ -1127,12 +1149,16 @@ __device__ __forceinline__ void split_e2m1x8(uint32_t x, uint4 entry, uint32_t (
 // 4g's `scale_b`.
 __device__ __forceinline__ void mma_fp8_scaled(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
                                                uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
+#if SIPHON_SM89
+    __trap();
+#else
     asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
         "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, "
         "{%11,%11}, {%12}, {%11,%11};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
           "h"(uint16_t(0)), "r"(scale_b));
+#endif
 }
 
 // One CTA of the FP8-activation NVFP4 GEMM: 128 output columns of one tile of

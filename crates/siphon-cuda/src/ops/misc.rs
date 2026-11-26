@@ -284,13 +284,16 @@ fn grid_stride(n: usize) -> LaunchConfig {
     }
 }
 
-/// Loads a kernel compiled with a cluster of 16 blocks, above the portable limit of 8.
+/// Loads a kernel compiled with a cluster of 16 blocks, above the portable limit of 8. The
+/// sm_89 build compiles it without clusters.
 fn cluster_function(module: &Arc<CudaModule>, name: &str) -> anyhow::Result<CudaFunction> {
     let f = module.load_function(name)?;
-    f.set_attribute(
-        CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-        1,
-    )?;
+    if !cfg!(sm89) {
+        f.set_attribute(
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+            1,
+        )?;
+    }
     Ok(f)
 }
 

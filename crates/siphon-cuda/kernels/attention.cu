@@ -1617,11 +1617,15 @@ __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t select
 // g + 8 from byte 0 of lanes 4g and 4g + 1's `scale_a`, B scales 1.
 __device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
                                         uint32_t scale_a) {
+#if SIPHON_SM89
+    __trap();
+#else
     asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %11}, {%12}, {%11, %11};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a), "h"(uint16_t(0)),
           "r"(0x7f7f7f7fu));
+#endif
 }
 
 // Element offset of 16-byte chunk `chunk` of row `row` in a [rows, 128] BF16
