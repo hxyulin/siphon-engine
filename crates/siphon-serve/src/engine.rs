@@ -497,7 +497,7 @@ mod cuda {
         kv_options::KvOptions,
         model::{
             BATCH_VERIFY_MAX_ROWS, DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS, Model,
-            Sampling as ModelSampling,
+            PackedPrefill, Sampling as ModelSampling,
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
@@ -2548,10 +2548,11 @@ mod cuda {
         });
     }
 
-    /// Prefills one chunk of the oldest request of `active` still prefilling, in its slot,
-    /// and keeps the prompt's state in the prefix cache when the chunk ends at the prompt's
-    /// last multiple of the chunk. Returns the number of prompt tokens processed (0 if none).
-    #[expect(clippy::too_many_lines, reason = "prefill chunk with taps, images, and prefix cache")]
+    /// Prefills one chunk — packing multiple short prompts up to `prefill_chunk` total rows
+    /// when possible, or one chunk of the highest-priority request otherwise — and keeps
+    /// prompt states in the prefix cache at chunk boundaries. Returns the total prompt tokens
+    /// processed (0 if none).
+    #[expect(clippy::too_many_lines, reason = "packed and single prefill chunk with taps, images, and prefix cache")]
     fn prefill_chunk(
         model: &mut Model,
         speculator: &mut Speculator,
@@ -2560,58 +2561,238 @@ mod cuda {
         parked: &mut Vec<Request>,
         stop: &[u32],
     ) -> usize {
-        // The fewest prompt tokens left first, but a request past the age limit first of
-        // all, in arrival order.
-        let pick = |active: &[Request]| {
-            let prefilling = || {
-                active
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| r.next.is_none() && !r.done)
-            };
-            prefilling()
-                .filter(|(_, r)| r.job.queued.elapsed() >= AGE_LIMIT)
-                .min_by_key(|(_, r)| r.job.queued)
-                .or_else(|| prefilling().min_by_key(|(_, r)| r.job.prompt.len() - r.prefilled))
-                .map(|(i, _)| i)
-        };
-        let Some(i) = pick(active) else {
+        // Priority order: aged requests first (by arrival), then shortest remaining prompt.
+        let mut order: Vec<usize> = active
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.next.is_none() && !r.done)
+            .map(|(i, _)| i)
+            .collect();
+        if order.is_empty() {
             return 0;
-        };
-        // Room for the chunk, swapping out others if need be; the chunk's request may go
-        // too, and then another prefills.
+        }
+        let now = Instant::now();
+        order.sort_by_key(|&i| {
+            let r = &active[i];
+            let aged = now.duration_since(r.job.queued) >= AGE_LIMIT;
+            if aged {
+                (0u8, Some(r.job.queued), 0usize)
+            } else {
+                (1u8, None, r.job.prompt.len() - r.prefilled)
+            }
+        });
+        let first_slot = active[order[0]].slot;
         let chunk = speculator.prefill_chunk();
         let want = |m: &Model, r: &Request| {
             let end = (r.prefilled + chunk).min(r.job.prompt.len());
             m.slot_pages_to(r.slot, end).unwrap_or(0)
         };
-        let slot = active[i].slot;
+        // Ensure KV pool room for the highest-priority request (parking others if needed).
         let room = room_for(
             model,
             speculator,
             active,
             parked,
-            Some(slot),
+            Some(first_slot),
             true,
-            |m, a| a.iter().find(|r| r.slot == slot).map_or(0, |r| want(m, r)),
+            |m, a| a.iter().find(|r| r.slot == first_slot).map_or(0, |r| want(m, r)),
         );
-        let Some(i) = active.iter().position(|r| r.slot == slot) else {
+        let Some(i0) = active.iter().position(|r| r.slot == first_slot) else {
             return 0;
         };
         if !room {
-            active[i].fail(&anyhow::anyhow!("the KV pool is full"));
+            active[i0].fail(&anyhow::anyhow!("the KV pool is full"));
             return 1;
         }
+        // Drop closed/cancelled requests before deciding whether to pack.
+        for r in active.iter_mut() {
+            if r.next.is_some() || r.done {
+                continue;
+            }
+            if r.job.events.is_closed() {
+                r.done = true;
+            } else if r.job.cancelled() {
+                r.fail(&anyhow::anyhow!(CANCELLED));
+            }
+        }
+        let Some(i0) = active
+            .iter()
+            .position(|r| r.slot == first_slot && r.next.is_none() && !r.done)
+        else {
+            return 0;
+        };
+
+        // Siblings of the same `job.group` share one prefill via `share_prefill` + `redraw_slot`,
+        // so exclude requests with unprefilled siblings from multi-prompt packing.
+        let has_unprefilled_sibling = |active: &[Request], idx: usize| {
+            let (slot, group) = (active[idx].slot, active[idx].job.group);
+            active.iter().any(|other| {
+                other.job.group == group
+                    && other.slot != slot
+                    && !other.done
+                    && other.next.is_none()
+                    && other.prefilled == 0
+            })
+        };
+
+        // Greedily pack additional short prefilling requests into the same `chunk`-row pass.
+        let first_rem = active[i0].job.prompt.len() - active[i0].prefilled;
+        let mut packed_slots = vec![first_slot];
+        let mut packed_rows = first_rem.min(chunk);
+        if first_rem < chunk && !has_unprefilled_sibling(active, i0) {
+            let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+            let mut candidates: Vec<usize> = active
+                .iter()
+                .enumerate()
+                .filter(|&(idx, r)| {
+                    idx != i0
+                        && r.next.is_none()
+                        && !r.done
+                        && !has_unprefilled_sibling(active, idx)
+                        && (r.job.prompt.len() - r.prefilled) <= chunk - packed_rows
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+            candidates.sort_by_key(|&idx| {
+                let r = &active[idx];
+                let aged = now.duration_since(r.job.queued) >= AGE_LIMIT;
+                if aged {
+                    (0u8, Some(r.job.queued), 0usize)
+                } else {
+                    (1u8, None, r.job.prompt.len() - r.prefilled)
+                }
+            });
+            let mut pages_needed = want(model, &active[i0]);
+            for idx in candidates {
+                let rem = active[idx].job.prompt.len() - active[idx].prefilled;
+                if packed_rows + rem > chunk || packed_slots.len() >= siphon_cuda::model::BATCH_ROWS
+                {
+                    continue;
+                }
+                let extra_pages = want(model, &active[idx]);
+                if make_room(
+                    model,
+                    speculator,
+                    pages_needed + extra_pages,
+                    &busy,
+                    Reclaim::Draft,
+                ) {
+                    pages_needed += extra_pages;
+                    packed_rows += rem;
+                    packed_slots.push(active[idx].slot);
+                }
+            }
+        }
+
+        if packed_slots.len() >= 2 {
+            let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+            let hidden = model.config().hidden_size;
+            let batch_spec = speculator.supports_batch_spec();
+            let indices: Vec<usize> = packed_slots
+                .iter()
+                .filter_map(|&slot| active.iter().position(|r| r.slot == slot))
+                .collect();
+            // Encode any overlapping images before borrowing `active` immutably for slices.
+            let mut encoded_images: Vec<Vec<ImageRows>> = Vec::with_capacity(indices.len());
+            for &idx in &indices {
+                let r = &mut active[idx];
+                let start = r.prefilled;
+                let end = r.job.prompt.len();
+                let imgs = if r.job.images.is_empty() {
+                    Vec::new()
+                } else {
+                    match image_rows(
+                        tower,
+                        hidden,
+                        &r.job.images,
+                        &mut r.kept,
+                        &mut r.encodes,
+                        (start, end),
+                    ) {
+                        Ok(imgs) => imgs,
+                        Err(e) => {
+                            r.fail(&e);
+                            return 1;
+                        }
+                    }
+                };
+                encoded_images.push(imgs);
+            }
+            let mut commit_draft = Vec::with_capacity(indices.len());
+            let mut reset_draft = Vec::with_capacity(indices.len());
+            let mut slices = Vec::with_capacity(indices.len());
+            let mut ends = Vec::with_capacity(indices.len());
+            let mut total_processed = 0usize;
+            for (&idx, imgs) in indices.iter().zip(encoded_images) {
+                let r = &active[idx];
+                let len = r.job.prompt.len();
+                let end = (r.prefilled + chunk).min(len);
+                total_processed += end - r.prefilled;
+                ends.push((idx, end, len));
+                commit_draft.push(batch_spec && r.draft_ready);
+                reset_draft.push(r.prefilled == 0);
+                slices.push(PackedPrefill {
+                    slot: r.slot,
+                    tokens: &r.job.prompt[r.prefilled..end],
+                    images: imgs,
+                    need_first_token: end == len,
+                    sampling: r.sampling,
+                });
+            }
+            let results = speculator.prefill_packed_batch(
+                model,
+                &slices,
+                &commit_draft,
+                &reset_draft,
+                chunk,
+            );
+            drop(slices);
+            match results {
+                Ok(tokens) => {
+                    for ((idx, end, len), first) in ends.into_iter().zip(tokens) {
+                        let boundary = len.saturating_sub(1) / chunk * chunk;
+                        let slot = active[idx].slot;
+                        active[idx].prefilled = end;
+                        if end == boundary && end > active[idx].cached {
+                            if make_room(model, speculator, model.ring_pages(), &busy, Reclaim::Draft)
+                            {
+                                let key = active[idx].job.key();
+                                if let Err(e) = speculator.save_prefix(model, slot, key, chunk, &busy)
+                                {
+                                    eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+                                }
+                            } else {
+                                eprintln!(
+                                    "no room in the KV pool to keep a prompt in the prefix cache"
+                                );
+                            }
+                        }
+                        if end == len
+                            && let Some(first) = first
+                        {
+                            let r = &mut active[idx];
+                            r.kept = None;
+                            r.prefill_s = r.started.elapsed().as_secs_f64();
+                            r.send_images();
+                            r.next = Some(first);
+                            r.done = r.take(&[first], stop).is_break();
+                        }
+                    }
+                    log_host(speculator);
+                    return total_processed.max(1);
+                }
+                Err(e) => {
+                    for &idx in &indices {
+                        active[idx].fail(&e);
+                    }
+                    return total_processed.max(1);
+                }
+            }
+        }
+
+        let i = i0;
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
         let r = &mut active[i];
-        if r.job.events.is_closed() {
-            r.done = true;
-            return 0;
-        }
-        if r.job.cancelled() {
-            r.fail(&anyhow::anyhow!(CANCELLED));
-            return 0;
-        }
         let len = r.job.prompt.len();
         let end = (r.prefilled + chunk).min(len);
         let processed = end - r.prefilled;
