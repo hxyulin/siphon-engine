@@ -114,7 +114,7 @@ const STEP_ROWS: usize = VERIFY_ROWS;
 const HEAD_ROWS: usize = 32;
 const _: () = assert!(HEAD_ROWS == siphon::memory::HEAD_ROWS);
 /// Receives each chunk's feature taps and the position of its first row.
-type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
+pub(super) type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
 /// The embedding rows of one image in a prompt. Prefill writes them over the rows of the
 /// image's placeholder tokens after `embed_norm`, as Transformers' Inkling 2 scatters the

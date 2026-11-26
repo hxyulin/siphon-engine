@@ -4,7 +4,7 @@
 
 use std::{mem::ManuallyDrop, sync::Arc};
 
-use anyhow::{Context as _, bail, ensure};
+use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
     DevicePtrMut as _, LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
@@ -26,6 +26,10 @@ const GROUP: usize = 3;
 const MAX_GROUP: usize = 4;
 /// Most splits of one block attention.
 pub const MAX_ATTENTION_SPLITS: usize = 128;
+/// Most splits of one DFlash 2 sliding-window attention (2056 keys / 128 per split).
+pub const DFLASH2_MAX_SPLITS: usize = 17;
+/// Most concurrent sequences in one batched DFlash 2 round (32 * 8 = 256 rows).
+pub const MAX_BATCH_SEQS: usize = 32;
 /// Fewest keys one attention split takes, a multiple of the kernel's chunk of 32.
 const MIN_KEYS_PER_SPLIT: usize = 128;
 /// Blocks of the first argmax pass over the vocabulary in [`DraftKernels::markov_logits`].
@@ -74,6 +78,7 @@ pub struct DraftKernels {
     store_kv: CudaFunction,
     attention: CudaFunction,
     attention_g4: CudaFunction,
+    attention_g4_fp8: CudaFunction,
     attention_fp8: CudaFunction,
     attention_combine: CudaFunction,
     silu_mul: CudaFunction,
@@ -107,6 +112,17 @@ pub struct DraftKernels {
     topk_partial: CudaFunction,
     topk_merge: CudaFunction,
     select: CudaFunction,
+    set_control_kept_batch: CudaFunction,
+    dflash_commit_rope_store_batch: CudaFunction,
+    block_input_batch: CudaFunction,
+    conv_batch: CudaFunction,
+    conv_add_rms_norm_batch: CudaFunction,
+    block_rope_store_batch: CudaFunction,
+    attention_g4_batch: CudaFunction,
+    attention_g4_batch_fp8: CudaFunction,
+    attention_combine_batch: CudaFunction,
+    gather_mask_rows: CudaFunction,
+    select_batch: CudaFunction,
 }
 
 /// A matrix `[rows, k]` of E4M3 values with one F32 scale per row, `amax / 448`, as
@@ -201,6 +217,26 @@ struct DflashCommit {
     fp8_layers: i32,
 }
 
+/// Kernel parameter of `draft_dflash_commit_rope_store_batch`, as `DflashBatchCommit` in
+/// `kernels/draft.cu`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DflashBatchCommit {
+    ctx_k: u64,
+    ctx_v: u64,
+    controls: u64,
+    inv_freq: u64,
+    k_norm: [u64; DFLASH_MAX_LAYERS],
+    cache_table: u64,
+    slots: i32,
+    width: i32,
+    seqs: i32,
+    layers: i32,
+    eps: f32,
+    rope: i32,
+    fp8: i32,
+}
+
 /// The RoPE arithmetic of the draft kernels, `kRope*` in the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rope {
@@ -247,7 +283,31 @@ impl AttentionScratch {
     }
 }
 
-/// The first-pass partials of [`DraftKernels::topk`] for up to 7 rows of up to
+/// Split partials of batched DFlash 2 attention for up to `max_seqs` sequences.
+pub struct BatchAttentionScratch {
+    out: CudaSlice<f32>,
+    stats: CudaSlice<f32>,
+    max_seqs: usize,
+    max_splits: usize,
+}
+
+impl BatchAttentionScratch {
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        max_seqs: usize,
+        max_splits: usize,
+    ) -> anyhow::Result<Self> {
+        let rows = max_seqs * max_splits * KV_HEADS * BLOCK * MAX_GROUP;
+        Ok(Self {
+            out: stream.alloc_zeros(rows * HEAD_DIM)?,
+            stats: stream.alloc_zeros(rows * 2)?,
+            max_seqs,
+            max_splits,
+        })
+    }
+}
+
+/// The first-pass partials of [`DraftKernels::topk`] for up to `max_rows` rows of up to
 /// 262,144 values each.
 pub struct TopkScratch {
     values: CudaSlice<f32>,
@@ -256,7 +316,11 @@ pub struct TopkScratch {
 
 impl TopkScratch {
     pub fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
-        let n = (BLOCK - 1) * TOPK_SPAN;
+        Self::new_for_rows(stream, BLOCK - 1)
+    }
+
+    pub fn new_for_rows(stream: &Arc<CudaStream>, max_rows: usize) -> anyhow::Result<Self> {
+        let n = max_rows * TOPK_SPAN;
         Ok(Self {
             values: stream.alloc_zeros(n)?,
             ids: stream.alloc_zeros(n)?,
@@ -552,11 +616,17 @@ impl DraftKernels {
         let f = |name: &str| module.load_function(name);
         let attention = f("draft_attention")?;
         let attention_g4 = f("draft_attention_g4")?;
+        let attention_g4_fp8 = f("draft_attention_g4_fp8")?;
         let attention_fp8 = f("draft_attention_fp8")?;
+        let attention_g4_batch = f("draft_attention_g4_batch")?;
+        let attention_g4_batch_fp8 = f("draft_attention_g4_batch_fp8")?;
         for (func, group) in [
             (&attention, GROUP),
             (&attention_g4, MAX_GROUP),
+            (&attention_g4_fp8, MAX_GROUP),
             (&attention_fp8, GROUP),
+            (&attention_g4_batch, MAX_GROUP),
+            (&attention_g4_batch_fp8, MAX_GROUP),
         ] {
             func.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -572,6 +642,7 @@ impl DraftKernels {
             store_kv: f("draft_store_kv")?,
             attention,
             attention_g4,
+            attention_g4_fp8,
             attention_fp8,
             attention_combine: f("draft_attention_combine")?,
             silu_mul: f("draft_silu_mul")?,
@@ -605,6 +676,17 @@ impl DraftKernels {
             topk_partial: f("draft_topk_partial")?,
             topk_merge: f("draft_topk_merge")?,
             select: f("draft_select")?,
+            set_control_kept_batch: f("draft_set_control_kept_batch")?,
+            dflash_commit_rope_store_batch: f("draft_dflash_commit_rope_store_batch")?,
+            block_input_batch: f("draft_block_input_batch")?,
+            conv_batch: f("draft_conv_batch")?,
+            conv_add_rms_norm_batch: f("draft_conv_add_rms_norm_batch")?,
+            block_rope_store_batch: f("draft_block_rope_store_batch")?,
+            attention_g4_batch,
+            attention_g4_batch_fp8,
+            attention_combine_batch: f("draft_attention_combine_batch")?,
+            gather_mask_rows: f("draft_gather_mask_rows")?,
+            select_batch: f("draft_select_batch")?,
         })
     }
 
@@ -962,7 +1044,7 @@ impl DraftKernels {
             (true, false) => &self.attention,
             (true, true) => &self.attention_fp8,
             (false, false) => &self.attention_g4,
-            (false, true) => bail!("no E4M3 block attention with 4 query heads per KV head"),
+            (false, true) => &self.attention_g4_fp8,
         };
         // SAFETY: the arguments match `draft_attention(const bf16*, const void*, const void*,
         // int, const int*, int, int, int, int, float*, float*)`, `draft_attention_fp8` and
@@ -2028,11 +2110,12 @@ impl DraftKernels {
         count: Option<&CudaSlice<i32>>,
         map: Option<&CudaSlice<i32>>,
         scratch: &mut TopkScratch,
-        values: &mut CudaSlice<f32>,
-        ids: &mut CudaSlice<i32>,
+        values: &mut impl DeviceOut<f32>,
+        ids: &mut impl DeviceOut<i32>,
     ) -> anyhow::Result<()> {
+        let (mut values, mut ids) = (values.view_mut(), ids.view_mut());
         ensure!(
-            (1..BLOCK).contains(&rows) && n > 0 && ld >= n,
+            rows > 0 && n > 0 && ld >= n,
             "{rows} rows of {n} values {ld} apart"
         );
         ensure!(
@@ -2052,8 +2135,10 @@ impl DraftKernels {
             parts <= TOPK_SPAN && rows * parts <= scratch.values.len(),
             "{n} values exceed the top-k scratch"
         );
-        check_len("values", values.len(), (BLOCK - 1) * TOP_K)?;
-        check_len("ids", ids.len(), (BLOCK - 1) * TOP_K)?;
+        ensure!(
+            values.len() >= rows * TOP_K && ids.len() >= rows * TOP_K,
+            "top-k outputs too short for {rows} rows"
+        );
         let mut args = KernelArgs::default();
         args.ptr(logits, stream)
             .i32(i32_arg("ld", ld)?)
@@ -2076,8 +2161,8 @@ impl DraftKernels {
         args.ptr(&scratch.values, stream)
             .ptr(&scratch.ids, stream)
             .i32(i32_arg("parts", parts)?)
-            .ptr_mut(values, stream)
-            .ptr_mut(ids, stream);
+            .ptr_mut(&mut values, stream)
+            .ptr_mut(&mut ids, stream);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows)?, 1, 1),
             block_dim: (256, 1, 1),
@@ -2277,6 +2362,523 @@ impl DraftKernels {
         // It reads rows below `vocab` and FOLD_BLOCKS lower bounds, and writes FOLD_BLOCKS
         // partials.
         unsafe { args.launch_pdl(stream, &self.markov_exact, config) }?;
+        Ok(())
+    }
+
+    /// View-based [`Self::add_rms_norm`] over `rows` rows of `HIDDEN` BF16 elements.
+    pub fn add_rms_norm_rows(
+        &self,
+        stream: &CudaStream,
+        x: Option<&CudaView<'_, bf16>>,
+        residual: &mut impl DeviceOut<bf16>,
+        weight: &CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let (mut residual, mut out) = (residual.view_mut(), out.view_mut());
+        let rows = rows_of("residual", residual.len(), HIDDEN)?;
+        if let Some(x) = x {
+            check_len("x", x.len(), residual.len())?;
+        }
+        check_len("weight", weight.len(), HIDDEN)?;
+        check_len("out", out.len(), residual.len())?;
+        let null = 0u64;
+        let mut launch = stream.launch_builder(&self.add_rms_norm);
+        match x {
+            Some(x) => launch.arg(x),
+            None => launch.arg(&null),
+        };
+        launch
+            .arg(&mut residual)
+            .arg(weight)
+            .arg(&mut out)
+            .arg(&eps);
+        // SAFETY: matches `draft_add_rms_norm(const bf16*, bf16*, const bf16*, bf16*, float)`.
+        unsafe { launch.launch(row_config(rows)?) }?;
+        Ok(())
+    }
+
+    /// View-based `silu(gate) * up` over `gate.len()` BF16 elements.
+    pub fn silu_mul_rows(
+        &self,
+        stream: &CudaStream,
+        gate: &impl DeviceIn<bf16>,
+        up: &impl DeviceIn<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+    ) -> anyhow::Result<()> {
+        let (gate, up, mut out) = (gate.view(), up.view(), out.view_mut());
+        let n = gate.len();
+        check_len("up", up.len(), n)?;
+        check_len("out", out.len(), n)?;
+        let blocks = n.div_ceil(256).min(1024);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks.max(1))?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = stream.launch_builder(&self.silu_mul);
+        launch.arg(&gate).arg(&up).arg(&mut out).arg(&n);
+        // SAFETY: matches `draft_silu_mul(const bf16*, const bf16*, bf16*, size_t)`.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Populates per-sequence `[start, min(kept + 1, max_rows), anchor]` controls from
+    /// `Model::verify_batch` device outputs.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn set_control_kept_batch(
+        &self,
+        stream: &CudaStream,
+        controls: &mut impl DeviceOut<i32>,
+        starts: &impl DeviceIn<i32>,
+        results: &impl DeviceIn<i32>,
+        result_stride: usize,
+        max_rows: usize,
+        anchors: &impl DeviceIn<i32>,
+        seqs: usize,
+    ) -> anyhow::Result<()> {
+        let mut controls = controls.view_mut();
+        let (starts, results, anchors) = (starts.view(), results.view(), anchors.view());
+        ensure!(seqs > 0, "no sequences");
+        check_len("controls", controls.len(), seqs * CONTROL)?;
+        check_len("starts", starts.len(), seqs)?;
+        check_len("results", results.len(), seqs * result_stride)?;
+        check_len("anchors", anchors.len(), seqs)?;
+        let mut args = KernelArgs::default();
+        args.ptr_mut(&mut controls, stream)
+            .ptr(&starts, stream)
+            .ptr(&results, stream)
+            .i32(i32_arg("result_stride", result_stride)?)
+            .i32(i32_arg("max_rows", max_rows)?)
+            .ptr(&anchors, stream);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(seqs)?, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_set_control_kept_batch`; every buffer holds `seqs` entries.
+        unsafe { args.launch_pdl(stream, &self.set_control_kept_batch, config) }?;
+        Ok(())
+    }
+
+    /// Batched DFlash 2 context commit: norm, RoPE and ring stores into per-sequence
+    /// rings referenced by `cache_table` (`[seqs, layers, 2]` u64 device pointers).
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn dflash_commit_rope_store_batch(
+        &self,
+        stream: &CudaStream,
+        ctx_k: &impl DeviceIn<bf16>,
+        ctx_v: &impl DeviceIn<bf16>,
+        controls: &impl DeviceIn<i32>,
+        inv_freq: &CudaSlice<f32>,
+        eps: f32,
+        k_norms: &[&CudaSlice<bf16>],
+        cache_table: &impl DeviceIn<u64>,
+        slots: usize,
+        width: usize,
+        seqs: usize,
+        rope: Rope,
+        fp8: bool,
+    ) -> anyhow::Result<()> {
+        let layers = k_norms.len();
+        ensure!(
+            seqs > 0 && (1..=BLOCK).contains(&width) && (1..=DFLASH_MAX_LAYERS).contains(&layers),
+            "invalid batch commit dims ({seqs} seqs, {width} width, {layers} layers)"
+        );
+        let (ctx_k, ctx_v, controls, cache_table) = (
+            ctx_k.view(),
+            ctx_v.view(),
+            controls.view(),
+            cache_table.view(),
+        );
+        check_len("ctx_k", ctx_k.len(), layers * seqs * width * KV_WIDTH)?;
+        check_len("ctx_v", ctx_v.len(), layers * seqs * width * KV_WIDTH)?;
+        check_len("controls", controls.len(), seqs * CONTROL)?;
+        check_len("inv_freq", inv_freq.len(), HEAD_DIM / 2)?;
+        check_len("cache_table", cache_table.len(), seqs * layers * 2)?;
+        let mut c = DflashBatchCommit {
+            ctx_k: ctx_k.device_ptr(stream).0,
+            ctx_v: ctx_v.device_ptr(stream).0,
+            controls: controls.device_ptr(stream).0,
+            inv_freq: inv_freq.device_ptr(stream).0,
+            cache_table: cache_table.device_ptr(stream).0,
+            slots: i32_arg("slots", slots)?,
+            width: i32_arg("width", width)?,
+            seqs: i32_arg("seqs", seqs)?,
+            layers: i32_arg("layers", layers)?,
+            eps,
+            rope: rope as i32,
+            fp8: i32::from(fp8),
+            ..DflashBatchCommit::default()
+        };
+        for (l, norm) in k_norms.iter().enumerate() {
+            check_len("k_norm", norm.len(), HEAD_DIM)?;
+            c.k_norm[l] = norm.device_ptr(stream).0;
+        }
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(width)?,
+                KV_HEADS as u32,
+                u32::try_from(seqs * layers)?,
+            ),
+            block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: `c` matches `DflashBatchCommit`; `cache_table` holds live ring pointers.
+        unsafe { launch_by_value(stream, &self.dflash_commit_rope_store_batch, config, &c, true) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::block_input`]: fills `out` `[seqs, 8, HIDDEN]` from `controls`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn block_input_batch(
+        &self,
+        stream: &CudaStream,
+        controls: &impl DeviceIn<i32>,
+        embed: &CudaSlice<bf16>,
+        embed_norm: &CudaSlice<bf16>,
+        mask_embed: &CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        seqs: usize,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let controls = controls.view();
+        let mut out = out.view_mut();
+        ensure!(seqs > 0, "no sequences");
+        check_len("controls", controls.len(), seqs * CONTROL)?;
+        let vocab = i32_arg("vocab", rows_of("embed", embed.len(), HIDDEN)?)?;
+        check_len("embed_norm", embed_norm.len(), HIDDEN)?;
+        check_len("mask_embed", mask_embed.len(), HIDDEN)?;
+        check_len("out", out.len(), seqs * BLOCK * HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&controls, stream)
+            .ptr(embed, stream)
+            .i32(vocab)
+            .ptr(embed_norm, stream)
+            .ptr(mask_embed, stream)
+            .ptr_mut(&mut out, stream)
+            .f32(eps);
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, u32::try_from(seqs)?, 1),
+            block_dim: (ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_block_input_batch`.
+        unsafe { args.launch_pdl(stream, &self.block_input_batch, config) }?;
+        Ok(())
+    }
+
+    /// Batched DFlash 2 input convolution over `seqs` independent 8-row blocks.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn conv_batch(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        coef: &impl DeviceIn<bf16>,
+        side: usize,
+        base: &CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        seqs: usize,
+    ) -> anyhow::Result<()> {
+        let (x, coef, mut out) = (x.view(), coef.view(), out.view_mut());
+        ensure!(seqs > 0 && side < 2, "invalid conv_batch args");
+        check_len("x", x.len(), seqs * BLOCK * HIDDEN)?;
+        check_len("coef", coef.len(), seqs * BLOCK * CONV_COEFFICIENTS)?;
+        check_len("base", base.len(), 4 * HIDDEN)?;
+        check_len("out", out.len(), seqs * BLOCK * HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(&coef, stream)
+            .i32(i32_arg("side", side)?)
+            .ptr(base, stream)
+            .ptr_mut(&mut out, stream);
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, u32::try_from(seqs)?, 1),
+            block_dim: (ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_conv_batch`.
+        unsafe { args.launch_pdl(stream, &self.conv_batch, config) }?;
+        Ok(())
+    }
+
+    /// Batched DFlash 2 output convolution fused with residual add and RMSNorm.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn conv_add_rms_norm_batch(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        coef: &impl DeviceIn<bf16>,
+        base: &CudaSlice<bf16>,
+        residual: &mut impl DeviceOut<bf16>,
+        weight: &CudaSlice<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        seqs: usize,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let (x, coef) = (x.view(), coef.view());
+        let (mut residual, mut out) = (residual.view_mut(), out.view_mut());
+        ensure!(seqs > 0, "no sequences");
+        check_len("x", x.len(), seqs * BLOCK * HIDDEN)?;
+        check_len("coef", coef.len(), seqs * BLOCK * CONV_COEFFICIENTS)?;
+        check_len("base", base.len(), 4 * HIDDEN)?;
+        check_len("residual", residual.len(), seqs * BLOCK * HIDDEN)?;
+        check_len("weight", weight.len(), HIDDEN)?;
+        check_len("out", out.len(), seqs * BLOCK * HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&x, stream)
+            .ptr(&coef, stream)
+            .ptr(base, stream)
+            .ptr_mut(&mut residual, stream)
+            .ptr(weight, stream)
+            .ptr_mut(&mut out, stream)
+            .f32(eps);
+        let config = LaunchConfig {
+            grid_dim: (BLOCK as u32, u32::try_from(seqs)?, 1),
+            block_dim: (ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_conv_add_rms_norm_batch`.
+        unsafe { args.launch_pdl(stream, &self.conv_add_rms_norm_batch, config) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::block_rope_store`] for `seqs` DFlash 2 blocks at `layer`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn block_rope_store_batch(
+        &self,
+        stream: &CudaStream,
+        q: &mut impl DeviceOut<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        controls: &impl DeviceIn<i32>,
+        inv_freq: &CudaSlice<f32>,
+        eps: f32,
+        q_norm: &CudaSlice<bf16>,
+        k_norm: &CudaSlice<bf16>,
+        cache_table: &impl DeviceIn<u64>,
+        layer: usize,
+        layers: usize,
+        slots: usize,
+        seqs: usize,
+        rope: Rope,
+        q_heads: usize,
+        fp8: bool,
+    ) -> anyhow::Result<()> {
+        let mut q = q.view_mut();
+        let (k, v, controls, cache_table) = (k.view(), v.view(), controls.view(), cache_table.view());
+        ensure!(seqs > 0 && layer < layers, "invalid batch rope dims");
+        check_len("q", q.len(), seqs * BLOCK * q_heads * HEAD_DIM)?;
+        check_len("k", k.len(), seqs * BLOCK * KV_WIDTH)?;
+        check_len("v", v.len(), seqs * BLOCK * KV_WIDTH)?;
+        check_len("controls", controls.len(), seqs * CONTROL)?;
+        check_len("inv_freq", inv_freq.len(), HEAD_DIM / 2)?;
+        check_len("q_norm", q_norm.len(), HEAD_DIM)?;
+        check_len("k_norm", k_norm.len(), HEAD_DIM)?;
+        check_len("cache_table", cache_table.len(), seqs * layers * 2)?;
+        let mut args = KernelArgs::default();
+        args.ptr_mut(&mut q, stream)
+            .ptr(&k, stream)
+            .ptr(&v, stream)
+            .ptr(&controls, stream)
+            .ptr(inv_freq, stream)
+            .f32(eps)
+            .ptr(q_norm, stream)
+            .ptr(k_norm, stream)
+            .ptr(&cache_table, stream)
+            .i32(i32_arg("layer", layer)?)
+            .i32(i32_arg("layers", layers)?)
+            .i32(i32_arg("slots", slots)?)
+            .i32(rope as i32)
+            .i32(i32_arg("q_heads", q_heads)?)
+            .i32(i32::from(fp8));
+        let config = LaunchConfig {
+            grid_dim: (
+                BLOCK as u32,
+                u32::try_from(q_heads + KV_HEADS)?,
+                u32::try_from(seqs)?,
+            ),
+            block_dim: ((HEAD_DIM / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_block_rope_store_batch`.
+        unsafe { args.launch_pdl(stream, &self.block_rope_store_batch, config) }?;
+        Ok(())
+    }
+
+    /// Batched DFlash 2 block attention (`G = 4`) + combine across `seqs` sequences.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn attention_g4_batch(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        cache_table: &impl DeviceIn<u64>,
+        layer: usize,
+        layers: usize,
+        slots: usize,
+        controls: &impl DeviceIn<i32>,
+        window: usize,
+        row_window: usize,
+        max_keys: usize,
+        seqs: usize,
+        fp8: bool,
+        scratch: &mut BatchAttentionScratch,
+        out: &mut impl DeviceOut<bf16>,
+    ) -> anyhow::Result<()> {
+        let (q, cache_table, controls) = (q.view(), cache_table.view(), controls.view());
+        let mut out = out.view_mut();
+        ensure!(
+            seqs > 0 && seqs <= scratch.max_seqs && layer < layers && max_keys <= slots,
+            "invalid attention_g4_batch dims"
+        );
+        check_len("q", q.len(), seqs * BLOCK * MAX_GROUP * KV_WIDTH)?;
+        check_len("out", out.len(), q.len())?;
+        check_len("controls", controls.len(), seqs * CONTROL)?;
+        check_len("cache_table", cache_table.len(), seqs * layers * 2)?;
+        let grid_splits = max_keys
+            .div_ceil(MIN_KEYS_PER_SPLIT)
+            .clamp(1, scratch.max_splits);
+        let config = LaunchConfig {
+            grid_dim: (
+                KV_HEADS as u32,
+                u32::try_from(grid_splits)?,
+                u32::try_from(seqs)?,
+            ),
+            block_dim: ((BLOCK * 32) as u32, 1, 1),
+            shared_mem_bytes: attention_smem(MAX_GROUP),
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&q, stream)
+            .ptr(&cache_table, stream)
+            .i32(i32_arg("layer", layer)?)
+            .i32(i32_arg("layers", layers)?)
+            .i32(i32_arg("slots", slots)?)
+            .ptr(&controls, stream)
+            .i32(i32_arg("window", window)?)
+            .i32(i32_arg("row_window", row_window)?)
+            .i32(i32_arg("max_splits", scratch.max_splits)?)
+            .ptr_mut(&mut scratch.out, stream)
+            .ptr_mut(&mut scratch.stats, stream);
+        let kernel = if fp8 {
+            &self.attention_g4_batch_fp8
+        } else {
+            &self.attention_g4_batch
+        };
+        // SAFETY: matches `draft_attention_g4_batch[_fp8]`.
+        unsafe { args.launch_pdl(stream, kernel, config) }?;
+
+        let config = LaunchConfig {
+            grid_dim: (
+                KV_HEADS as u32,
+                (BLOCK * MAX_GROUP) as u32,
+                u32::try_from(seqs)?,
+            ),
+            block_dim: (HEAD_DIM as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&scratch.out, stream)
+            .ptr(&scratch.stats, stream)
+            .ptr(&controls, stream)
+            .i32(i32_arg("window", window)?)
+            .i32(i32_arg("max_splits", scratch.max_splits)?)
+            .i32(i32_arg("group", MAX_GROUP)?)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: matches `draft_attention_combine_batch`.
+        unsafe { args.launch_pdl(stream, &self.attention_combine_batch, config) }?;
+        Ok(())
+    }
+
+    /// Gathers mask rows `1..=steps` of each sequence in `y` `[seqs, 8, HIDDEN]` into
+    /// contiguous `out` `[seqs * steps, HIDDEN]`.
+    pub fn gather_mask_rows(
+        &self,
+        stream: &CudaStream,
+        y: &impl DeviceIn<bf16>,
+        out: &mut impl DeviceOut<bf16>,
+        seqs: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        let y = y.view();
+        let mut out = out.view_mut();
+        ensure!(seqs > 0 && (1..BLOCK).contains(&steps), "invalid gather dims");
+        check_len("y", y.len(), seqs * BLOCK * HIDDEN)?;
+        check_len("out", out.len(), seqs * steps * HIDDEN)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&y, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32_arg("steps", steps)?);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(steps)?, u32::try_from(seqs)?, 1),
+            block_dim: (ROW_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_gather_mask_rows`.
+        unsafe { args.launch_pdl(stream, &self.gather_mask_rows, config) }?;
+        Ok(())
+    }
+
+    /// Batched DFlash 2 selector walk across `seqs` sequences.
+    #[expect(clippy::too_many_arguments, reason = "mirrors kernel signature")]
+    pub fn select_batch(
+        &self,
+        stream: &CudaStream,
+        cand: &impl DeviceIn<i32>,
+        unary: &impl DeviceIn<f32>,
+        hp: &impl DeviceIn<bf16>,
+        predecessor: &CudaSlice<bf16>,
+        successor: &CudaSlice<bf16>,
+        controls: &impl DeviceIn<i32>,
+        seqs: usize,
+        steps: usize,
+        softcap: f32,
+        ids: &mut impl DeviceOut<i32>,
+        confidence: &mut impl DeviceOut<f32>,
+        mut verify_tokens: Option<CudaViewMut<'_, i32>>,
+        races: &impl DeviceIn<u32>,
+    ) -> anyhow::Result<()> {
+        let (cand, unary, hp, controls, races) = (
+            cand.view(),
+            unary.view(),
+            hp.view(),
+            controls.view(),
+            races.view(),
+        );
+        let (mut ids, mut confidence) = (ids.view_mut(), confidence.view_mut());
+        ensure!(seqs > 0 && (1..BLOCK).contains(&steps), "invalid select_batch dims");
+        check_len("cand", cand.len(), seqs * steps * TOP_K)?;
+        check_len("unary", unary.len(), seqs * steps * TOP_K)?;
+        check_len("hp", hp.len(), seqs * steps * RANK)?;
+        let vocab = rows_of("predecessor", predecessor.len(), RANK)?;
+        check_len("successor", successor.len(), vocab * RANK)?;
+        check_len("controls", controls.len(), seqs * CONTROL)?;
+        check_len("ids", ids.len(), seqs * steps)?;
+        check_len("confidence", confidence.len(), seqs * steps)?;
+        check_len("races", races.len(), seqs * RACE_WORDS)?;
+        if let Some(vt) = &verify_tokens {
+            check_len("verify_tokens", vt.len(), seqs * (steps + 1))?;
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&cand, stream)
+            .ptr(&unary, stream)
+            .ptr(&hp, stream)
+            .ptr(predecessor, stream)
+            .ptr(successor, stream)
+            .i32(i32_arg("vocab", vocab)?)
+            .ptr(&controls, stream)
+            .i32(i32_arg("steps", steps)?)
+            .f32(softcap)
+            .ptr_mut(&mut ids, stream)
+            .ptr_mut(&mut confidence, stream)
+            .opt_mut(verify_tokens.as_mut(), stream)
+            .ptr(&races, stream);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(seqs)?, 1, 1),
+            block_dim: ((TOP_K * 32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: matches `draft_select_batch`.
+        unsafe { args.launch_pdl(stream, &self.select_batch, config) }?;
         Ok(())
     }
 }

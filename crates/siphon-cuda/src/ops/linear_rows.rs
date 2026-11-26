@@ -59,6 +59,13 @@ pub enum RowsWeight<'a> {
     Bf16(CudaView<'a, bf16>),
     /// E4M3 with one F32 scale per row.
     Fp8(&'a Fp8Matrix),
+    /// E4M3 values `[rows, k]` and F32 scales `[rows]` in separate buffers (e.g. draft weights).
+    Fp8Raw {
+        values: CudaView<'a, u8>,
+        scales: CudaView<'a, f32>,
+        rows: usize,
+        k: usize,
+    },
 }
 
 /// One product `out = x @ weight^T` of a batch, over `m` rows.
@@ -96,8 +103,32 @@ impl<'a> RowsProduct<'a> {
         }
     }
 
+    /// As [`Self::fp8`] with separate E4M3 values `[rows, k]` and F32 scales `[rows]`.
+    pub fn fp8_raw(
+        values: CudaView<'a, u8>,
+        scales: CudaView<'a, f32>,
+        rows: usize,
+        k: usize,
+        x: &'a impl DeviceIn<bf16>,
+        out: &'a mut impl DeviceOut<bf16>,
+    ) -> Self {
+        Self {
+            weight: RowsWeight::Fp8Raw {
+                values,
+                scales,
+                rows,
+                k,
+            },
+            x: x.view(),
+            out: out.view_mut(),
+        }
+    }
+
     fn is_fp8(&self) -> bool {
-        matches!(self.weight, RowsWeight::Fp8(_))
+        matches!(
+            self.weight,
+            RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. }
+        )
     }
 }
 
@@ -190,8 +221,14 @@ impl LinearRows {
             (true, 2304, "rows_fp8_k2304"),
             (false, 3072, "rows_bf16_k3072"),
             (true, 3072, "rows_fp8_k3072"),
+            (false, 4096, "rows_bf16_k4096"),
+            (true, 4096, "rows_fp8_k4096"),
             (false, 4608, "rows_bf16_k4608"),
             (true, 4608, "rows_fp8_k4608"),
+            (false, 6912, "rows_bf16_k6912"),
+            (true, 6912, "rows_fp8_k6912"),
+            (false, 9216, "rows_bf16_k9216"),
+            (true, 9216, "rows_fp8_k9216"),
         ] {
             let load = |name: String| -> anyhow::Result<CudaFunction> {
                 let function = module.load_function(&name)?;
@@ -241,6 +278,7 @@ impl LinearRows {
     ///
     /// All products share `k`, one [`Self::supports`], and the weight format. Inputs and
     /// BF16 weights start 16-byte aligned.
+    #[expect(clippy::too_many_lines, reason = "validates and launches batched products")]
     pub fn run(
         &self,
         stream: &CudaStream,
@@ -312,6 +350,22 @@ impl LinearRows {
                         w.values().device_ptr(stream).0,
                         w.scales().device_ptr(stream).0,
                     )
+                }
+                RowsWeight::Fp8Raw {
+                    values,
+                    scales,
+                    rows,
+                    k,
+                } => {
+                    ensure!(
+                        *rows == out_rows && *k == width,
+                        "product {i}: weight is {rows} x {k}, expected {out_rows} x {width}"
+                    );
+                    ensure!(
+                        values.len() >= out_rows * width && scales.len() >= out_rows,
+                        "product {i}: FP8 raw buffers too short for {out_rows} x {width}"
+                    );
+                    (values.device_ptr(stream).0, scales.device_ptr(stream).0)
                 }
             };
             let x = p.x.device_ptr(stream).0;

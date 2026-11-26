@@ -348,3 +348,12 @@ ROWS_ENTRY(rows_fp8_k3072, true, 3072)
 // The message gates' down projections.
 ROWS_ENTRY(rows_bf16_k4608, false, 4608)
 ROWS_ENTRY(rows_fp8_k4608, true, 4608)
+// DFlash 2 attention output projection (32 heads x 128).
+ROWS_ENTRY(rows_bf16_k4096, false, 4096)
+ROWS_ENTRY(rows_fp8_k4096, true, 4096)
+// DFlash 2 MLP down projection.
+ROWS_ENTRY(rows_bf16_k6912, false, 6912)
+ROWS_ENTRY(rows_fp8_k6912, true, 6912)
+// DFlash 2 context fusion projection (4 taps x 2304).
+ROWS_ENTRY(rows_bf16_k9216, false, 9216)
+ROWS_ENTRY(rows_fp8_k9216, true, 9216)

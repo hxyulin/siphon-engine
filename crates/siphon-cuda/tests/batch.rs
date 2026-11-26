@@ -656,3 +656,167 @@ fn batch_verify_matches_alone_fp8() -> anyhow::Result<()> {
 fn batch_verify_matches_alone_nvfp4() -> anyhow::Result<()> {
     batch_verify_matches_alone(KvFormat::Nvfp4, WeightFormat::Fp8)
 }
+
+/// End-to-end bit-exact parity for Batched DFlash 2 + `Model::verify_batch`:
+/// 5 sequences spanning the sliding-window wrap (mixed greedy + coupled sampling) decode
+/// concurrently with DFlash 2 (`DraftOptions::fast()`, FP8 KV + FP8 backbone + shortlist)
+/// and `Model::verify_batch`, and must emit 100% identical tokens to single-sequence
+/// `Model::verify`.
+#[test]
+#[ignore = "needs the checkpoint, SIPHON_DFLASH (DFlash 2), and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end batched DFlash 2 parity test")]
+fn batch_dflash2_matches_alone() -> anyhow::Result<()> {
+    let Some(dflash_dir) = env::var_os("SIPHON_DFLASH") else {
+        println!("SIPHON_DFLASH is not set; skipped");
+        return Ok(());
+    };
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    model.enable_sampling()?;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let capture = capture_tokens()?;
+    let prompts: Vec<&[u32]> = PROMPTS
+        .iter()
+        .map(|&(first, len)| &capture[first..first + len])
+        .collect();
+    let n = prompts.len();
+    let samplings: Vec<Sampling> = (0..n)
+        .map(|i| {
+            if i % 2 == 0 {
+                Ok(Sampling::GREEDY)
+            } else {
+                Sampling::new(0.8, 0, 0.95, 0.0, 200 + i as u64)
+            }
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let gen_tokens = 64usize;
+
+    let mut draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Dflash(std::path::Path::new(&dflash_dir)),
+        CAPACITY,
+        &DraftOptions::fast(),
+    )?;
+    ensure!(draft.is_dflash2(), "SIPHON_DFLASH must be a DFlash 2 drafter");
+    let linear = siphon_cuda::ops::linear::Linear::load(model.stream().context())?;
+
+    // Ground truth via single-sequence one-row verifies in slot 0.
+    let mut want: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for (i, prompt) in prompts.iter().enumerate() {
+        model.reset()?;
+        model.set_sampling(samplings[i]);
+        let mut tok = model.prefill(prompt, DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+        let mut seq = vec![tok];
+        while seq.len() <= gen_tokens {
+            let v = model.verify(VerifyTokens::Host(&[tok]), Accept::Rows(1))?;
+            tok = v.next();
+            seq.push(tok);
+        }
+        want.push(seq);
+    }
+
+    // Prefill all 5 slots with taps committed into each slot's DFlash 2 rings.
+    model.add_slots(n - 1)?;
+    let slots: Vec<usize> = vec![2, 1, 0, 3, 4];
+    let mut got: Vec<Vec<u32>> = Vec::with_capacity(n);
+    let mut anchors = Vec::with_capacity(n);
+    let stream = std::sync::Arc::clone(model.stream());
+    for (i, &prompt) in prompts.iter().enumerate() {
+        let slot = slots[i];
+        model.reset_slot(slot)?;
+        draft.reset_slot(slot);
+        model.set_sampling(samplings[i]);
+        let prompt_i32: Vec<i32> = prompt
+            .iter()
+            .map(|&t| Ok(i32::try_from(t)?))
+            .collect::<anyhow::Result<_>>()?;
+        draft.note_tokens(&stream, model.draft_shared(), &prompt_i32)?;
+        let first = model.prefill_slot_with_taps(
+            slot,
+            prompt,
+            DEFAULT_PREFILL_CHUNK,
+            &mut |pos, taps| draft.commit_slot(&stream, &linear, slot, &taps, pos),
+        )?;
+        got.push(vec![first]);
+        anchors.push(first);
+    }
+
+    let draft_steps = 7usize;
+    let width = draft_steps + 1;
+    let accepts = vec![Accept::Greedy; n];
+    draft.batch_draft_initial(
+        &stream,
+        model.draft_shared(),
+        &slots,
+        &anchors,
+        &samplings,
+        draft_steps,
+    )?;
+
+    let mut rounds = 0usize;
+    let mut total_emitted = 0usize;
+    let started = std::time::Instant::now();
+    while got.iter().any(|g| g.len() <= gen_tokens) {
+        let starts: Vec<usize> = slots
+            .iter()
+            .map(|&s| model.slot_position(s))
+            .collect::<anyhow::Result<_>>()?;
+        let pending = model.start_verify_batch(
+            &slots,
+            BatchVerifyTokens::Device {
+                tokens: draft.batch_verify_tokens(n, width)?,
+                width,
+            },
+            &accepts,
+            &samplings,
+        )?;
+        draft.batch_commit_and_draft(
+            &stream,
+            model.draft_shared(),
+            &slots,
+            &starts,
+            &model.batch_verify_taps()?,
+            &model.batch_verify_results()?,
+            &model.batch_verify_anchors()?,
+            &samplings,
+            width,
+            draft_steps,
+        )?;
+        let verdicts = model.finish_verify_batch(pending)?;
+        rounds += 1;
+        for (i, v) in verdicts.iter().enumerate() {
+            let emitted = v.emitted();
+            total_emitted += emitted.len();
+            draft.set_slot_committed(slots[i], starts[i] + v.accepted + 1)?;
+            got[i].extend_from_slice(&emitted);
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "batched DFlash 2 ({n} seqs, W={width}): {rounds} rounds, {total_emitted} tokens ({:.2} tok/round/seq, {:.1} agg tok/s)",
+        total_emitted as f64 / (rounds * n) as f64,
+        total_emitted as f64 / elapsed,
+    );
+    for i in 0..n {
+        let len = want[i].len().min(got[i].len());
+        let differ = want[i][..len]
+            .iter()
+            .zip(&got[i][..len])
+            .position(|(a, b)| a != b);
+        println!(
+            "seq {i} (slot {}, {}): checked {len} tokens, first diff {differ:?}",
+            slots[i],
+            if samplings[i].is_greedy() {
+                "greedy"
+            } else {
+                "sampled"
+            }
+        );
+        ensure!(
+            differ.is_none(),
+            "seq {i}: batched DFlash 2 differs from single-sequence verify"
+        );
+    }
+    Ok(())
+}

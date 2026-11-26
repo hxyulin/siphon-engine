@@ -496,7 +496,8 @@ mod cuda {
         draft::DraftOptions,
         kv_options::KvOptions,
         model::{
-            DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS, Model, Sampling as ModelSampling,
+            BATCH_VERIFY_MAX_ROWS, DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS, Model,
+            Sampling as ModelSampling,
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
@@ -915,6 +916,14 @@ mod cuda {
             for slot in 0..options.streams {
                 model.reset_slot(slot)?;
             }
+            if speculator.supports_batch_spec() {
+                let spec_seqs = options.streams.min(speculator.max_batch_spec_seqs());
+                model.reserve_batch_verify(spec_seqs)?;
+                speculator.reserve_batch_spec(&model, spec_seqs, options.streams - 1)?;
+                eprintln!(
+                    "batched DFlash 2 speculation enabled (up to {spec_seqs} sequences per verify)"
+                );
+            }
             eprintln!("serving up to {} requests at once", options.streams);
         }
         drop(saved);
@@ -1173,6 +1182,9 @@ mod cuda {
         shared: bool,
         /// Whether the draft follows this request through batched steps.
         followed: bool,
+        /// Whether this slot's DFlash 2 sliding rings hold its positions for batched
+        /// speculation.
+        draft_ready: bool,
         /// Whether returning to speculation failed, so that the request stays batched.
         stay_batched: bool,
         /// Tokens emitted by speculation and by batched steps.
@@ -1217,6 +1229,7 @@ mod cuda {
                 failed: false,
                 shared: false,
                 followed: false,
+                draft_ready: false,
                 stay_batched: false,
                 speculated: 0,
                 batched: 0,
@@ -1530,8 +1543,18 @@ mod cuda {
             );
             match ran {
                 Ok(true) => {
-                    speculator.follow(&model);
-                    request.followed = true;
+                    if speculator.supports_batch_spec() {
+                        if let Err(e) = speculator.sync_slot0_draft(&model) {
+                            eprintln!("syncing slot 0 DFlash 2 state failed: {e:#}");
+                            speculator.follow(&model);
+                            request.followed = true;
+                        } else {
+                            request.draft_ready = true;
+                        }
+                    } else {
+                        speculator.follow(&model);
+                        request.followed = true;
+                    }
                     resumed = batched(
                         &mut model,
                         &mut speculator,
@@ -1914,6 +1937,8 @@ mod cuda {
                         request.slot = slot;
                         request.prefilled = cached;
                         request.cached = cached;
+                        request.draft_ready = speculator.supports_batch_spec()
+                            && (cached == 0 || speculator.slot_draft_committed(slot) == cached);
                         let _ = request.job.events.send(Event::Cached(cached));
                         active.push(request);
                     }
@@ -1934,6 +1959,7 @@ mod cuda {
                             r.since.elapsed().as_secs_f64()
                         );
                         r.slot = slot;
+                        r.draft_ready = false;
                         r.since = Instant::now();
                         active.push(r);
                     }
@@ -2099,6 +2125,21 @@ mod cuda {
         speculator: &mut Speculator,
         r: &mut Request,
     ) -> anyhow::Result<bool> {
+        if r.draft_ready && speculator.supports_batch_spec() {
+            let started = Instant::now();
+            let from = r.slot;
+            let position = model.slot_position(r.slot)?;
+            let next = r.next.context("the request has no next token")?;
+            speculator.resume_dflash2_slot(model, r.slot, next)?;
+            r.slot = 0;
+            model.stream().synchronize()?;
+            eprintln!(
+                "speculating again (DFlash 2) at position {position} from slot {from}, {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            r.followed = false;
+            return Ok(true);
+        }
         if !r.followed {
             return Ok(false);
         }
@@ -2393,6 +2434,7 @@ mod cuda {
                         eprintln!("returning to speculation failed, staying batched: {e:#}");
                         speculator.forget();
                         r.followed = false;
+                        r.draft_ready = false;
                         r.stay_batched = true;
                     }
                 }
@@ -2403,8 +2445,15 @@ mod cuda {
                 // Room for every row's next position, swapping requests out if need be. When
                 // none can go to the host tier, the latest to start of those that need pages
                 // fail until the rest fit.
-                let next_pages =
-                    |m: &Model, r: &Request| m.slot_pages_to(r.slot, r.position() + 1).unwrap_or(0);
+                let batch_spec = speculator.supports_batch_spec();
+                let next_pages = |m: &Model, r: &Request| {
+                    let advance = if batch_spec && r.draft_ready {
+                        VERIFY_ROWS
+                    } else {
+                        1
+                    };
+                    m.slot_pages_to(r.slot, r.position() + advance).unwrap_or(0)
+                };
                 while !room_for(
                     model,
                     speculator,
@@ -2428,11 +2477,12 @@ mod cuda {
                     };
                     r.fail(&anyhow::anyhow!("the KV pool is full"));
                 }
-                if !step_rows(model, speculator, &mut active, stop) {
+                let emitted = step_rows(model, speculator, &mut active, stop);
+                if emitted == 0 {
                     break;
                 }
                 retire(model, speculator, &mut active);
-                steps += 1;
+                steps += emitted;
                 if !chunked || !floor_steps(sched.floor, steps, synced, first_step) {
                     break;
                 }
@@ -2478,6 +2528,7 @@ mod cuda {
     /// Prefills one chunk of the oldest request of `active` still prefilling, in its slot,
     /// and keeps the prompt's state in the prefix cache when the chunk ends at the prompt's
     /// last multiple of the chunk. Returns whether it ran one.
+    #[expect(clippy::too_many_lines, reason = "prefill chunk with taps, images, and prefix cache")]
     fn prefill_chunk(
         model: &mut Model,
         speculator: &mut Speculator,
@@ -2543,7 +2594,27 @@ mod cuda {
         let boundary = len.saturating_sub(1) / chunk * chunk;
         model.set_sampling(r.sampling);
         let tokens = &r.job.prompt[r.prefilled..end];
-        let prefilled = if r.job.images.is_empty() {
+        let use_draft = r.draft_ready && speculator.supports_batch_spec();
+        let reset_draft = r.prefilled == 0;
+        let prefilled = if use_draft {
+            if r.job.images.is_empty() {
+                speculator.prefill_slot_batch(model, r.slot, tokens, None, chunk, reset_draft)
+            } else {
+                let hidden = model.config().hidden_size;
+                let (images, kept, encodes) = (&r.job.images, &mut r.kept, &mut r.encodes);
+                let mut source = |start: usize, end: usize| {
+                    image_rows(tower, hidden, images, kept, encodes, (start, end))
+                };
+                speculator.prefill_slot_batch(
+                    model,
+                    r.slot,
+                    tokens,
+                    Some(&mut source),
+                    chunk,
+                    reset_draft,
+                )
+            }
+        } else if r.job.images.is_empty() {
             model.prefill_slot(r.slot, tokens, chunk)
         } else {
             // The tower runs here, inside the chunk, so the decode floor counts it as
@@ -2583,7 +2654,7 @@ mod cuda {
             r.send_images();
             r.next = Some(first);
             r.done = r.take(&[first], stop).is_break();
-            share_prefill(model, active, i, stop);
+            share_prefill(model, speculator, active, i, stop);
         }
         true
     }
@@ -2599,11 +2670,18 @@ mod cuda {
     /// slot ends up byte for byte as its own prefill would leave it. Its first token is the
     /// draw its own prefill would make, since a draw depends only on the logits, the
     /// sampling and the position.
-    fn share_prefill(model: &mut Model, active: &mut [Request], from: usize, stop: &[u32]) {
-        let (slot, group, len) = {
+    fn share_prefill(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut [Request],
+        from: usize,
+        stop: &[u32],
+    ) {
+        let (slot, group, len, draft_ready) = {
             let r = &active[from];
-            (r.slot, r.job.group, r.job.prompt.len())
+            (r.slot, r.job.group, r.job.prompt.len(), r.draft_ready)
         };
+        let copy_draft = draft_ready && speculator.supports_batch_spec();
         let siblings = active.iter_mut().filter(|r| {
             r.job.group == group
                 && r.slot != slot
@@ -2614,11 +2692,17 @@ mod cuda {
         for r in siblings {
             let copied = model
                 .move_slot(slot, r.slot)
-                .and_then(|()| model.redraw_slot(r.slot, r.sampling));
+                .and_then(|()| {
+                    if copy_draft {
+                        speculator.copy_slot_draft(model, slot, r.slot)?;
+                    }
+                    model.redraw_slot(r.slot, r.sampling)
+                });
             match copied {
                 Ok(first) => {
                     r.prefilled = len;
                     r.shared = true;
+                    r.draft_ready = copy_draft;
                     r.prefill_s = r.started.elapsed().as_secs_f64();
                     r.next = Some(first);
                     r.done = r.take(&[first], stop).is_break();
@@ -2628,54 +2712,105 @@ mod cuda {
         }
     }
 
-    /// Runs one batched step of the requests of `active` that have a next token, and keeps
-    /// the taps of the one the draft follows. Returns false when none has one.
+    /// Runs one batched decode step or batched DFlash 2 speculation round over the requests
+    /// of `active` that have a next token. Returns the minimum number of tokens emitted per
+    /// active decoding request (0 when none decoded).
     fn step_rows(
         model: &mut Model,
         speculator: &mut Speculator,
         active: &mut [Request],
         stop: &[u32],
-    ) -> bool {
-        let stepped: Vec<&Request> = active
-            .iter()
-            .filter(|r| !r.done && r.next.is_some())
-            .collect();
-        let rows: Vec<(usize, u32)> = stepped
-            .iter()
-            .map(|r| (r.slot, r.next.unwrap_or_default()))
-            .collect();
-        let sampling: Vec<ModelSampling> = stepped.iter().map(|r| r.sampling).collect();
-        if rows.is_empty() {
-            return false;
-        }
-        match model.step_batch_sampled(&rows, &sampling) {
-            Ok(next) => {
-                let mut next = next.into_iter();
-                let stepped = active.iter_mut().filter(|r| !r.done && r.next.is_some());
-                for (row, r) in stepped.enumerate() {
-                    let token = next.next().unwrap_or_default();
-                    if r.followed
-                        && let Err(e) = speculator.keep_batched(model, row, token)
-                    {
-                        eprintln!("the draft stops following a request: {e:#}");
-                        speculator.forget();
-                        r.followed = false;
-                    }
-                    r.batched += 1;
-                    if rows.len() == 1 {
-                        r.rent += 1;
-                    }
-                    r.next = Some(token);
-                    r.done = r.take(&[token], stop).is_break();
-                }
+    ) -> usize {
+        let batch_spec = speculator.supports_batch_spec();
+        let mut spec_indices = Vec::new();
+        let mut plain_indices = Vec::new();
+        for (idx, r) in active.iter().enumerate() {
+            if r.done || r.next.is_none() {
+                continue;
             }
-            Err(e) => {
-                for r in active.iter_mut().filter(|r| !r.done && r.next.is_some()) {
-                    r.fail(&e);
-                }
+            if batch_spec && r.draft_ready {
+                spec_indices.push(idx);
+            } else {
+                plain_indices.push(idx);
             }
         }
-        true
+        if spec_indices.is_empty() && plain_indices.is_empty() {
+            return 0;
+        }
+        let mut min_emitted = usize::MAX;
+        if !spec_indices.is_empty() {
+            let max_seqs = speculator.max_batch_spec_seqs();
+            for chunk in spec_indices.chunks(max_seqs) {
+                let width = (BATCH_VERIFY_MAX_ROWS / chunk.len()).min(VERIFY_ROWS);
+                let slots: Vec<usize> = chunk.iter().map(|&i| active[i].slot).collect();
+                let anchors: Vec<u32> = chunk
+                    .iter()
+                    .map(|&i| active[i].next.unwrap_or_default())
+                    .collect();
+                let samplings: Vec<ModelSampling> =
+                    chunk.iter().map(|&i| active[i].sampling).collect();
+                match speculator.speculate_batch_round(model, &slots, &anchors, &samplings, width) {
+                    Ok(verdicts) => {
+                        for (&idx, verdict) in chunk.iter().zip(verdicts) {
+                            let r = &mut active[idx];
+                            let emitted = verdict.emitted();
+                            min_emitted = min_emitted.min(emitted.len());
+                            r.speculated += emitted.len();
+                            let _ = r.job.events.send(Event::Round);
+                            r.next = Some(verdict.next());
+                            r.done = r.take(&emitted, stop).is_break();
+                        }
+                    }
+                    Err(e) => {
+                        speculator.invalidate_batch_draft();
+                        for &idx in chunk {
+                            active[idx].fail(&e);
+                        }
+                        min_emitted = min_emitted.min(1);
+                    }
+                }
+            }
+        }
+        if !plain_indices.is_empty() {
+            let rows: Vec<(usize, u32)> = plain_indices
+                .iter()
+                .map(|&i| (active[i].slot, active[i].next.unwrap_or_default()))
+                .collect();
+            let sampling: Vec<ModelSampling> =
+                plain_indices.iter().map(|&i| active[i].sampling).collect();
+            match model.step_batch_sampled(&rows, &sampling) {
+                Ok(next) => {
+                    for (row, (&idx, token)) in plain_indices.iter().zip(next).enumerate() {
+                        let r = &mut active[idx];
+                        if r.followed
+                            && let Err(e) = speculator.keep_batched(model, row, token)
+                        {
+                            eprintln!("the draft stops following a request: {e:#}");
+                            speculator.forget();
+                            r.followed = false;
+                        }
+                        r.batched += 1;
+                        if rows.len() == 1 && spec_indices.is_empty() {
+                            r.rent += 1;
+                        }
+                        r.next = Some(token);
+                        r.done = r.take(&[token], stop).is_break();
+                    }
+                    min_emitted = min_emitted.min(1);
+                }
+                Err(e) => {
+                    for &idx in &plain_indices {
+                        active[idx].fail(&e);
+                    }
+                    min_emitted = min_emitted.min(1);
+                }
+            }
+        }
+        if min_emitted == usize::MAX {
+            0
+        } else {
+            min_emitted.max(1)
+        }
     }
 }
 

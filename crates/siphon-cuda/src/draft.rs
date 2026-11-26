@@ -22,6 +22,9 @@
 //! weights and activations, F32 accumulation, and rounding where vLLM rounds (see
 //! `kernels/draft.cu`).
 
+mod batch;
+pub use batch::MAX_BATCH_DRAFT_SEQS;
+
 use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
@@ -264,6 +267,8 @@ pub struct Draft {
     /// A device copy of the BF16 LM head for the base logits, when they read it and the
     /// target keeps it in mapped host memory.
     head_copy: Option<CudaSlice<bf16>>,
+    /// Per-slot sliding rings and batched buffers for DFlash 2.
+    batch: Option<batch::BatchDflash2>,
 }
 
 /// Copies of a draft's sliding rings at one committed position, from
@@ -956,7 +961,7 @@ impl Draft {
         let layers = arch.layers();
         let caches = (0..layers)
             .map(|layer| {
-                let fp8 = options.fp8_kv && arch.global(layer);
+                let fp8 = options.fp8_kv && (arch.global(layer) || matches!(arch, Arch::Dflash2 { .. }));
                 let slots = arch.slots(layer, capacity);
                 match shared.kv_pool {
                     Some(pool) if arch.global(layer) => KvCache::pooled(stream, slots, fp8, pool),
@@ -1009,6 +1014,7 @@ impl Draft {
             backbone,
             head,
             head_copy,
+            batch: None,
         })
     }
 
@@ -1118,6 +1124,9 @@ impl Draft {
         list.stale = true;
         if list.bucket() != bucket {
             self.graphs = Default::default();
+            if let Some(b) = self.batch.as_mut() {
+                b.clear_graphs();
+            }
         }
     }
 
@@ -1183,7 +1192,7 @@ impl Draft {
             .iter()
             .map(|c| {
                 (c.slots < self.capacity)
-                    .then(|| KvCache::new(stream, c.slots))
+                    .then(|| KvCache::with_format(stream, c.slots, c.fp8))
                     .transpose()
             })
             .collect::<anyhow::Result<_>>()?;
@@ -1297,6 +1306,9 @@ impl Draft {
         )?;
         if changed {
             self.graphs = Default::default();
+            if let Some(b) = self.batch.as_mut() {
+                b.clear_graphs();
+            }
         }
         Ok(())
     }

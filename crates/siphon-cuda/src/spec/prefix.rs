@@ -501,6 +501,7 @@ impl Speculator {
         chunk: usize,
         busy: &[usize],
     ) -> anyhow::Result<(usize, usize)> {
+        self.batch_drafted.clear();
         let now = Instant::now();
         let Some(cache) = self.prefix.as_mut() else {
             let slot = (1..model.slots())
@@ -508,6 +509,7 @@ impl Speculator {
                 .find(|s| !busy.contains(s))
                 .context("every slot runs a request")?;
             model.reset_slot(slot)?;
+            self.draft.reset_slot(slot);
             return Ok((slot, 0));
         };
         cache.fence()?;
@@ -517,13 +519,25 @@ impl Speculator {
             let slot = e.slot.context("a live entry has a slot")?;
             model.restore_local_state(slot, &e.model)?;
             e.used = now;
-            return Ok((slot, e.tokens.len()));
+            let len = e.tokens.len();
+            if self.draft.is_dflash2() {
+                if e.draft_sequence.is_some() {
+                    self.draft
+                        .restore_slot_rings(model.stream(), slot, &e.draft)?;
+                } else {
+                    self.draft.reset_slot(slot);
+                }
+            }
+            return Ok((slot, len));
         }
         let slot = cache
             .victim_slot(model, busy, now)
             .context("every slot runs a request")?;
         cache.drop_slot(slot);
         model.reset_slot(slot)?;
+        if self.draft.is_dflash2() {
+            self.draft.reset_slot(slot);
+        }
         let Some(Source::Host(j, len)) = source else {
             return Ok((slot, 0));
         };
@@ -554,6 +568,10 @@ impl Speculator {
                 let e = &mut cache.entries[i];
                 host.restore_rings(j, &mut e.draft)?;
                 e.draft_sequence = Some(sequence);
+                if self.draft.is_dflash2() {
+                    self.draft
+                        .restore_slot_rings(model.stream(), slot, &e.draft)?;
+                }
             }
         }
         Ok((slot, len))
@@ -590,7 +608,17 @@ impl Speculator {
             .or_else(|| cache.free_entry(model, busy, now));
         if let Some(i) = entry {
             self.save_entry(model, i, slot, &prompt[..boundary], chunk)?;
-            self.save_host(model, i, false);
+            let has_draft =
+                self.draft.is_dflash2() && self.draft.slot_committed(slot) == boundary;
+            if has_draft {
+                let sequence = self.draft_sequence;
+                let cache = self.prefix.as_mut().context("the cache is on")?;
+                let e = &mut cache.entries[i];
+                self.draft
+                    .save_slot_rings(model.stream(), slot, &mut e.draft)?;
+                e.draft_sequence = Some(sequence);
+            }
+            self.save_host(model, i, has_draft);
         }
         Ok(())
     }

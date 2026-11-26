@@ -660,6 +660,15 @@ draft_attention_g4(const __nv_bfloat16* q, const void* cache_k, const void* cach
                                       first, keys, partial_out, partial_stats);
 }
 
+// draft_attention_g4 over E4M3 caches (DFlash 2 with FP8 KV).
+extern "C" __global__ void __launch_bounds__(kAttnThreads)
+draft_attention_g4_fp8(const __nv_bfloat16* q, const void* cache_k, const void* cache_v,
+                       int32_t slots, const int32_t* control, int32_t window, int32_t row_window,
+                       int32_t first, int32_t keys, float* partial_out, float* partial_stats) {
+    attention_split<kMaxGroup, true>(q, cache_k, cache_v, slots, control, window, row_window,
+                                     first, keys, partial_out, partial_stats);
+}
+
 // Combines the splits of draft_attention into out, BF16 [8, group * 8 * 128]. Grid (8
 // KV heads, 8 * group query rows), 128 threads. With `control` not null the split count
 // comes from the round's position, as in draft_attention; otherwise from first and keys.
@@ -2542,6 +2551,399 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
             if (lane == 0) {
                 draft_ids[e] = cand[e * kTopK + bi];
                 confidence[e] = 1.f / sum;
+                chosen = bi;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Batched DFlash 2: B sequences (1..=32) drafted concurrently, each with an 8-row block
+// (8 * B <= 256 rows total) and its own per-layer sliding KV rings addressed through
+// cache_table [seqs, layers, 2] (pairs of (cache_k, cache_v) device pointers).
+
+// Writes controls[seq] = [starts[seq], min(max(results[seq * result_stride], 0) + 1, max_rows),
+// anchors[seq]] for every sequence after a batched verify. Grid: (seqs, 1, 1), 1 thread.
+extern "C" __global__ void draft_set_control_kept_batch(
+    int32_t* controls, const int32_t* starts, const int32_t* results, int32_t result_stride,
+    int32_t max_rows, const int32_t* anchors) {
+    pdl_wait();
+    const int seq = blockIdx.x;
+    const int32_t kept = results[size_t(seq) * result_stride];
+    int32_t* c = controls + size_t(seq) * 3;
+    c[0] = starts[seq];
+    c[1] = min(max(kept, 0) + 1, max_rows);
+    c[2] = anchors[seq];
+}
+
+// Kernel parameter for draft_dflash_commit_rope_store_batch, as DflashBatchCommit in
+// src/ops/draft.rs.
+struct DflashBatchCommit {
+    const __nv_bfloat16* ctx_k;
+    const __nv_bfloat16* ctx_v;
+    const int32_t* controls;
+    const float* inv_freq;
+    const __nv_bfloat16* k_norm[kDflashMaxLayers];
+    const unsigned long long* cache_table;
+    int32_t slots;
+    int32_t width;
+    int32_t seqs;
+    int32_t layers;
+    float eps;
+    int32_t rope;
+    int32_t fp8;
+};
+
+// Commits up to `width` verified rows per sequence into each sequence's per-layer sliding
+// rings. ctx_k and ctx_v are [layers, seqs * width, 1024] BF16. Grid: (width, 8, seqs * layers),
+// 64 threads.
+extern "C" __global__ void __launch_bounds__(kHalf)
+draft_dflash_commit_rope_store_batch(const __grid_constant__ DflashBatchCommit c) {
+    constexpr int kWidth = kKvHeads * kHeadDim;
+    pdl_wait();
+    pdl_trigger();
+    const int seq = static_cast<int>(blockIdx.z) / c.layers;
+    const int layer = static_cast<int>(blockIdx.z) % c.layers;
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int32_t* ctrl = c.controls + size_t(seq) * 3;
+    if (row >= control_rows(ctrl)) {
+        return;
+    }
+    const int32_t position = ctrl[0] + row;
+    if (position < 0) {
+        return;
+    }
+    const size_t src =
+        ((size_t(layer) * c.seqs + size_t(seq)) * c.width + size_t(row)) * kWidth + head * kHeadDim;
+    const size_t dst = size_t(position % c.slots) * kWidth + head * kHeadDim;
+    const size_t entry = (size_t(seq) * c.layers + size_t(layer)) * 2;
+    void* ck = reinterpret_cast<void*>(c.cache_table[entry]);
+    void* cv = reinterpret_cast<void*>(c.cache_table[entry + 1]);
+    rope_store_head(c.ctx_k + src, c.ctx_v + src, ck, cv, dst, c.fp8 != 0, c.k_norm[layer],
+                    c.inv_freq, position, c.eps, c.rope);
+}
+
+// Batched draft_block_input: out is [seqs, 8, 2304]. Row 0 of sequence seq is the normed
+// embedding of controls[seq * 3 + 2], rows 1..7 are mask_embed. Grid: (8, seqs, 1), 256 threads.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_block_input_batch(const int32_t* controls, const __nv_bfloat16* embed, int32_t vocab,
+                        const __nv_bfloat16* embed_norm, const __nv_bfloat16* mask_embed,
+                        __nv_bfloat16* out, float eps) {
+    pdl_wait();
+    pdl_trigger();
+    const int r = blockIdx.x;
+    const int seq = blockIdx.y;
+    __nv_bfloat16* row = out + (size_t(seq) * kBlock + r) * kHidden;
+    if (r > 0) {
+        for (int c = threadIdx.x; c < kHidden; c += kRowThreads) {
+            row[c] = mask_embed[c];
+        }
+        return;
+    }
+    const int32_t id = controls[size_t(seq) * 3 + 2];
+    const bool valid = id >= 0 && id < vocab;
+    float v[kRowVec];
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        const int c = threadIdx.x + i * kRowThreads;
+        v[i] = valid ? bf(embed[size_t(id) * kHidden + c]) : 0.f;
+    }
+    store_normed_row(v, embed_norm, row, eps);
+}
+
+// Batched DFlash 2 input convolution over seqs independent 8-row blocks.
+// Grid: (8, seqs, 1), 256 threads.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_conv_batch(const __nv_bfloat16* x, const __nv_bfloat16* coef, int32_t side,
+                 const __nv_bfloat16* base, __nv_bfloat16* out) {
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.x;
+    const int seq = blockIdx.y;
+    const size_t x_off = size_t(seq) * kBlock * kHidden;
+    const size_t c_off = size_t(seq) * kBlock * kConvCoefficients;
+    float v[kRowVec];
+    conv_row(x + x_off, coef + c_off, side, base, row, v);
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        out[x_off + size_t(row) * kHidden + threadIdx.x + i * kRowThreads] =
+            __float2bfloat16_rn(v[i]);
+    }
+}
+
+// Batched DFlash 2 output convolution fused with residual add and RMSNorm over seqs
+// independent 8-row blocks. Grid: (8, seqs, 1), 256 threads.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_conv_add_rms_norm_batch(const __nv_bfloat16* x, const __nv_bfloat16* coef,
+                              const __nv_bfloat16* base, __nv_bfloat16* residual,
+                              const __nv_bfloat16* weight, __nv_bfloat16* out, float eps) {
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.x;
+    const int seq = blockIdx.y;
+    const size_t x_off = size_t(seq) * kBlock * kHidden;
+    const size_t c_off = size_t(seq) * kBlock * kConvCoefficients;
+    float v[kRowVec];
+    conv_row(x + x_off, coef + c_off, 1, base, row, v);
+    const size_t base_index = x_off + size_t(row) * kHidden;
+#pragma unroll
+    for (int i = 0; i < kRowVec; ++i) {
+        const size_t c = base_index + threadIdx.x + i * kRowThreads;
+        v[i] = __fadd_rn(bf(residual[c]), round_bf16(v[i]));
+        residual[c] = __float2bfloat16_rn(v[i]);
+    }
+    store_normed_row(v, weight, out + base_index, eps);
+}
+
+// Batched draft_block_rope_store for seqs independent 8-row blocks into per-sequence
+// sliding rings at layer `layer`. Grid: (8, q_heads + 8, seqs), 64 threads.
+extern "C" __global__ void __launch_bounds__(kHalf)
+draft_block_rope_store_batch(__nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+                             const int32_t* controls, const float* inv_freq, float eps,
+                             const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                             const unsigned long long* cache_table, int32_t layer, int32_t layers,
+                             int32_t slots, int32_t rope, int32_t q_heads, int32_t fp8) {
+    constexpr int kWidth = kKvHeads * kHeadDim;
+    pdl_wait();
+    pdl_trigger();
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int seq = blockIdx.z;
+    const int32_t* ctrl = controls + size_t(seq) * 3;
+    const int32_t position = ctrl[0] + control_rows(ctrl) + row;
+    const size_t row_idx = size_t(seq) * kBlock + row;
+    if (head < q_heads) {
+        __nv_bfloat16* x = q + row_idx * q_heads * kHeadDim + head * kHeadDim;
+        norm_rope_head(x, x, q_norm, inv_freq, position, eps, rope);
+        return;
+    }
+    const int g = head - q_heads;
+    if (position < 0) {
+        return;
+    }
+    const size_t src = row_idx * kWidth + g * kHeadDim;
+    const size_t dst = size_t(position % slots) * kWidth + g * kHeadDim;
+    const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
+    void* ck = reinterpret_cast<void*>(cache_table[entry]);
+    void* cv = reinterpret_cast<void*>(cache_table[entry + 1]);
+    rope_store_head(k + src, v + src, ck, cv, dst, fp8 != 0, k_norm, inv_freq, position, eps, rope);
+}
+
+// Batched DFlash 2 block attention (G=4, BF16 rings). Grid: (8, max_splits, seqs), 256 threads.
+extern "C" __global__ void __launch_bounds__(kAttnThreads)
+draft_attention_g4_batch(const __nv_bfloat16* q, const unsigned long long* cache_table,
+                         int32_t layer, int32_t layers, int32_t slots, const int32_t* controls,
+                         int32_t window, int32_t row_window, int32_t max_splits,
+                         float* partial_out, float* partial_stats) {
+    const int seq = blockIdx.z;
+    const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
+    const void* ck = reinterpret_cast<const void*>(cache_table[entry]);
+    const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
+    const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
+    const size_t p_rows = size_t(seq) * max_splits * kKvHeads * kBlock * kMaxGroup;
+    attention_split<kMaxGroup, false>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window,
+                                      row_window, 0, 0, partial_out + p_rows * kHeadDim,
+                                      partial_stats + p_rows * 2);
+}
+
+// Batched DFlash 2 block attention (G=4, E4M3 FP8 rings). Grid: (8, max_splits, seqs), 256 threads.
+extern "C" __global__ void __launch_bounds__(kAttnThreads)
+draft_attention_g4_batch_fp8(const __nv_bfloat16* q, const unsigned long long* cache_table,
+                             int32_t layer, int32_t layers, int32_t slots, const int32_t* controls,
+                             int32_t window, int32_t row_window, int32_t max_splits,
+                             float* partial_out, float* partial_stats) {
+    const int seq = blockIdx.z;
+    const size_t entry = (size_t(seq) * layers + size_t(layer)) * 2;
+    const void* ck = reinterpret_cast<const void*>(cache_table[entry]);
+    const void* cv = reinterpret_cast<const void*>(cache_table[entry + 1]);
+    const size_t q_off = size_t(seq) * kBlock * kMaxGroup * kKvHeads * kHeadDim;
+    const size_t p_rows = size_t(seq) * max_splits * kKvHeads * kBlock * kMaxGroup;
+    attention_split<kMaxGroup, true>(q + q_off, ck, cv, slots, controls + size_t(seq) * 3, window,
+                                     row_window, 0, 0, partial_out + p_rows * kHeadDim,
+                                     partial_stats + p_rows * 2);
+}
+
+// Batched draft_attention_combine for seqs blocks. Grid: (8, 8 * group, seqs), 128 threads.
+extern "C" __global__ void __launch_bounds__(kHeadDim)
+draft_attention_combine_batch(const float* partial_out, const float* partial_stats,
+                              const int32_t* controls, int32_t window, int32_t max_splits,
+                              int32_t group, __nv_bfloat16* out) {
+    pdl_wait();
+    pdl_trigger();
+    const int seq = blockIdx.z;
+    const int32_t* ctrl = controls + size_t(seq) * 3;
+    int32_t first = 0, keys = 0;
+    attention_range(ctrl, window, first, keys);
+    const int per_split = keys_per_split(keys);
+    const int splits = (keys + per_split - 1) / per_split;
+    const int query_rows = kBlock * group;
+    const int kv = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
+    const size_t p_base = size_t(seq) * max_splits * kKvHeads * query_rows;
+    const float* po = partial_out + p_base * kHeadDim;
+    const float* ps = partial_stats + p_base * 2;
+    float m = -INFINITY;
+    for (int s = 0; s < splits; ++s) {
+        m = fmaxf(m, ps[((size_t(s) * kKvHeads + kv) * query_rows + r) * 2]);
+    }
+    float sum = 0.f, value = 0.f;
+    for (int s = 0; s < splits; ++s) {
+        const size_t row = (size_t(s) * kKvHeads + kv) * query_rows + r;
+        const float stat = ps[row * 2];
+        const float w = stat == -INFINITY ? 0.f : expf(stat - m);
+        sum = fmaf(ps[row * 2 + 1], w, sum);
+        value = fmaf(po[row * kHeadDim + d], w, value);
+    }
+    const int token = r / group, head = kv * group + r % group;
+    const size_t out_off = size_t(seq) * kBlock * group * kKvHeads * kHeadDim;
+    out[out_off + size_t(token) * group * kKvHeads * kHeadDim + head * kHeadDim + d] =
+        __float2bfloat16_rn(value / sum);
+}
+
+// Copies rows 1..=steps of each sequence's 8-row block in y [seqs, 8, 2304] into contiguous
+// out [seqs * steps, 2304]. Grid: (steps, seqs, 1), 256 threads.
+extern "C" __global__ void __launch_bounds__(kRowThreads)
+draft_gather_mask_rows(const __nv_bfloat16* y, __nv_bfloat16* out, int32_t steps) {
+    pdl_wait();
+    pdl_trigger();
+    const int e = blockIdx.x;
+    const int seq = blockIdx.y;
+    const __nv_bfloat16* src = y + (size_t(seq) * kBlock + e + 1) * kHidden;
+    __nv_bfloat16* dst = out + (size_t(seq) * steps + e) * kHidden;
+    for (int c = threadIdx.x; c < kHidden; c += kRowThreads) {
+        dst[c] = src[c];
+    }
+}
+
+// Batched DFlash 2 selector walk over seqs sequences, each with `steps` (1..7) draft rows.
+// Writes draft_ids [seqs, steps], confidence [seqs, steps], and (if non-null) verify_tokens
+// [seqs, steps + 1] with each sequence's anchor at column 0 and drafts at columns 1..=steps.
+// Grid: (seqs, 1, 1), 512 threads (16 warps).
+extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
+draft_select_batch(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
+                   const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
+                   const int32_t* controls, int32_t steps, float softcap, int32_t* draft_ids,
+                   float* confidence, int32_t* verify_tokens, const race::DraftRace* races) {
+    __shared__ float product[kRank];
+    __shared__ float score[kTopK];
+    __shared__ float noisy[kTopK];
+    __shared__ int32_t chosen;
+    pdl_wait();
+    pdl_trigger();
+    const int seq = blockIdx.x;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int32_t* seq_cand = cand + size_t(seq) * steps * kTopK;
+    const float* seq_unary = unary + size_t(seq) * steps * kTopK;
+    const __nv_bfloat16* seq_hp = hp + size_t(seq) * steps * kRank;
+    const int32_t* ctrl = controls + size_t(seq) * 3;
+    const race::DraftRace* seq_race = races != nullptr ? races + seq : nullptr;
+    int32_t* seq_ids = draft_ids + size_t(seq) * steps;
+    float* seq_conf = confidence + size_t(seq) * steps;
+    int32_t* seq_vtoks = verify_tokens != nullptr ? verify_tokens + size_t(seq) * (steps + 1) : nullptr;
+    const uint4 zero = make_uint4(0, 0, 0, 0);
+    auto row = [&](const __nv_bfloat16* table, int32_t id) {
+        return id >= 0 && id < vocab
+                   ? *reinterpret_cast<const uint4*>(table + size_t(id) * kRank + lane * 8)
+                   : zero;
+    };
+    uint4 succ[kSelectSteps], pred[kSelectSteps];
+#pragma unroll
+    for (int e = 0; e < kSelectSteps; ++e) {
+        succ[e] = e < steps ? row(successor, seq_cand[e * kTopK + warp]) : zero;
+        pred[e] = e == 0     ? (warp == 0 ? row(predecessor, ctrl[2]) : zero)
+                  : e < steps ? row(predecessor, seq_cand[(e - 1) * kTopK + warp])
+                              : zero;
+    }
+    if (threadIdx.x == 0) {
+        chosen = 0;
+        if (seq_vtoks != nullptr) {
+            seq_vtoks[0] = ctrl[2];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int e = 0; e < kSelectSteps; ++e) {
+        if (e >= steps) {
+            break;
+        }
+        if (warp == chosen) {
+            const uint4 h = *reinterpret_cast<const uint4*>(seq_hp + size_t(e) * kRank + lane * 8);
+            const uint32_t hw[4] = {h.x, h.y, h.z, h.w};
+            const uint32_t aw[4] = {pred[e].x, pred[e].y, pred[e].z, pred[e].w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                product[lane * 8 + 2 * k] = round_bf16(__fmul_rn(bf_lo(aw[k]), bf_lo(hw[k])));
+                product[lane * 8 + 2 * k + 1] = round_bf16(__fmul_rn(bf_hi(aw[k]), bf_hi(hw[k])));
+            }
+        }
+        __syncthreads();
+        const uint32_t sw[4] = {succ[e].x, succ[e].y, succ[e].z, succ[e].w};
+        float dot = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            dot = fmaf(product[lane * 8 + 2 * k], bf_lo(sw[k]), dot);
+            dot = fmaf(product[lane * 8 + 2 * k + 1], bf_hi(sw[k]), dot);
+        }
+        dot = warp_sum(dot);
+        const StepRace r = step_race(seq_race, ctrl, e);
+        if (lane == 0) {
+            const int32_t id = seq_cand[e * kTopK + warp];
+            const float s = __fadd_rn(seq_unary[e * kTopK + warp], round_bf16(dot));
+            const bool valid = id >= 0 && id < vocab;
+            score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
+            if (r.on) {
+                noisy[warp] = valid ? r.noisy(score[warp], id) : -INFINITY;
+            }
+        }
+        __syncthreads();
+        if (warp == 0 && r.on) {
+            const float s = lane < kTopK ? score[lane] : -INFINITY;
+            float bv = lane < kTopK ? noisy[lane] : -INFINITY;
+            int32_t bi = lane;
+            float top = s;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+                const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
+                if (better(ov, oi, bv, bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+                top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, offset));
+            }
+            const float sum = warp_sum(
+                lane < kTopK && s != -INFINITY ? expf(s - top) : 0.f);
+            if (lane == 0) {
+                const int32_t picked = seq_cand[e * kTopK + bi];
+                seq_ids[e] = picked;
+                seq_conf[e] = 1.f / sum;
+                if (seq_vtoks != nullptr) {
+                    seq_vtoks[e + 1] = picked;
+                }
+                chosen = bi;
+            }
+        } else if (warp == 0) {
+            const float s = lane < kTopK ? score[lane] : -INFINITY;
+            float bv = s;
+            int32_t bi = lane;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+                const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
+                if (better(ov, oi, bv, bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            const float sum = warp_sum(lane < kTopK && s != -INFINITY ? expf(s - bv) : 0.f);
+            if (lane == 0) {
+                const int32_t picked = seq_cand[e * kTopK + bi];
+                seq_ids[e] = picked;
+                seq_conf[e] = 1.f / sum;
+                if (seq_vtoks != nullptr) {
+                    seq_vtoks[e + 1] = picked;
+                }
                 chosen = bi;
             }
         }

@@ -439,21 +439,44 @@ impl Planner {
                 }
                 None => Vec::new(),
             },
-            // One sequence's rings and its prefix cache entry's copies of them. A ring
-            // whose buffers are not whole pages packs its keys and values together, so an
-            // FP8 ring of two 1 MiB buffers takes one page.
-            rings: 2
+            // Every active stream's rings plus one prefix cache entry's copies of them. A
+            // ring whose buffers are not whole pages packs its keys and values together, so
+            // an FP8 ring of two 1 MiB buffers takes one page.
+            rings: (streams + 1)
                 * sliding_visits
                 * (2 * c.sliding_window_size * ring_row_bytes).next_multiple_of(KV_PAGE_BYTES),
         });
         // The batched step's chunk buffers for one row per stream, its state tables,
-        // positions and tokens, and its rows' taps for the draft.
+        // positions and tokens, and its rows' taps for the draft. With a DFlash 2 drafter,
+        // also count batched verify scratch/backups and per-slot DFlash 2 rings + scratch.
+        let batch_spec = if streams > 1
+            && let Some((d, approx)) = &draft
+            && d.kind == DraftKind::Dflash2
+        {
+            let spec_seqs = streams.min(32);
+            let spec_rows = (spec_seqs * VERIFY_ROWS).min(256);
+            let draft_kv_bytes = if approx.fp8_kv { 1 } else { 2 };
+            let extra_draft_rings =
+                (streams - 1) * d.layers * d.ring_slots * 2 * kv_dims * draft_kv_bytes;
+            let verify_bufs = rows_scratch(c, spec_rows, inputs.sms)
+                + invariant_scratch(c, spec_rows)
+                + spec_rows * taps * hidden * 2
+                + visits.len() * spec_seqs * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
+                + visits.len() * spec_seqs * (c.sconv_kernel_size - 1) * (2 * kv_dims + 2 * hidden) * 4
+                + sliding_visits * spec_seqs * VERIFY_ROWS * 2 * ring_row_bytes;
+            // Batched DFlash 2 activations, split-KV partials, and shortlist/vocab logits.
+            let draft_scratch = 220 << 20;
+            extra_draft_rings + verify_bufs + draft_scratch
+        } else {
+            0
+        };
         let batch = if streams > 1 {
             rows_scratch(c, streams, inputs.sms)
                 + invariant_scratch(c, streams)
                 + visits.len() * streams * 6 * 8
                 + streams * 8
                 + streams * taps * hidden * 2
+                + batch_spec
         } else {
             0
         };

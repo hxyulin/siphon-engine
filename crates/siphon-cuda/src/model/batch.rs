@@ -577,6 +577,34 @@ impl Model {
         })
     }
 
+    /// [`Model::prefill_with_taps`] into slot `slot`, passing each chunk's feature taps to
+    /// `taps` on the model's stream.
+    pub fn prefill_slot_with_taps(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        chunk: usize,
+        taps: super::prefill::TapsCallback<'_>,
+    ) -> anyhow::Result<u32> {
+        self.with_slot(slot, |m| {
+            m.prefill_with_taps(tokens, chunk, PrefillLogits::Last, taps)
+        })
+    }
+
+    /// [`Model::prefill_with_images`] with taps into slot `slot`.
+    pub fn prefill_slot_with_images_and_taps(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        chunk: usize,
+        taps: Option<super::prefill::TapsCallback<'_>>,
+        images: ImageSource<'_>,
+    ) -> anyhow::Result<u32> {
+        self.with_slot(slot, |m| {
+            m.prefill_with_images(tokens, chunk, PrefillLogits::Last, taps, images)
+        })
+    }
+
     /// The token after slot `slot`'s last prefill, picked with `sampling` instead of
     /// [`Model::sampling`]: the token that prefill would have returned had it run with
     /// `sampling`. It reads the last row's logits that the prefill left in the decode
@@ -1013,6 +1041,14 @@ impl Model {
             .context("the batch verify state is missing")?;
         let n = bv.last_seqs * bv.width * self.ctx.config.unpadded_vocab_size;
         Ok(self.ctx.stream.clone_dtoh(&p.head_capped.slice(..n))?)
+    }
+
+    /// Reserves [`Model::verify_batch`] scratch and backup buffers for up to `max_seqs`
+    /// concurrent sequences (capped at `BATCH_VERIFY_MAX_ROWS / VERIFY_ROWS`), so startup
+    /// memory checks observe them immediately.
+    pub fn reserve_batch_verify(&mut self, max_seqs: usize) -> anyhow::Result<()> {
+        let max_seqs = max_seqs.clamp(1, BATCH_VERIFY_MAX_ROWS / VERIFY_ROWS);
+        self.ensure_batch_verify(max_seqs, max_seqs * VERIFY_ROWS)
     }
 
     fn ensure_batch_verify(&mut self, seqs: usize, total_rows: usize) -> anyhow::Result<()> {

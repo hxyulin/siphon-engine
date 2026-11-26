@@ -54,8 +54,11 @@ pub use prefix::PrefixHit;
 
 use crate::{
     draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
-    model::{Accept, ImageSource, Model, PrefillLogits, Sampling, SavedState, VerifyTokens},
-    ops::{linear::Linear, spec::VERIFY_ROWS},
+    model::{
+        Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, ImageSource, Model, PrefillLogits,
+        Sampling, SavedState, Verdict, VerifyTokens,
+    },
+    ops::{draft::MAX_BATCH_SEQS, linear::Linear, spec::VERIFY_ROWS},
     weights::{
         dflash::DflashWeights,
         dflash2::{DFLASH2_WINDOW, Dflash2Weights, is_dflash2},
@@ -470,6 +473,8 @@ pub struct Speculator {
     coupled: bool,
     /// Rows of the prefill chunks [`Self::rebuild`] runs ([`Self::set_prefill_chunk`]).
     prefill_chunk: usize,
+    /// Pre-drafted batched DFlash 2 verify tokens cached per micro-batch `(slots, width)`.
+    batch_drafted: Vec<(Vec<usize>, usize, CudaSlice<i32>)>,
 }
 
 /// What a verify round saw, for [`Speculator::set_round_hook`].
@@ -660,7 +665,238 @@ impl Speculator {
             round_hook: None,
             coupled: true,
             prefill_chunk: crate::model::DEFAULT_PREFILL_CHUNK,
+            batch_drafted: Vec::new(),
         })
+    }
+
+    /// Whether this speculator's drafter supports batched speculation (DFlash 2).
+    #[must_use]
+    pub fn supports_batch_spec(&self) -> bool {
+        self.draft.is_dflash2()
+    }
+
+    /// Maximum sequences one batched speculation call verifies at once.
+    #[must_use]
+    pub fn max_batch_spec_seqs(&self) -> usize {
+        MAX_BATCH_SEQS
+    }
+
+    /// Drops any pre-drafted batched DFlash 2 verify tokens.
+    pub fn invalidate_batch_draft(&mut self) {
+        self.batch_drafted.clear();
+    }
+
+    /// Pre-allocates batched DFlash 2 rings and scratch buffers for up to `max_seqs`
+    /// concurrent sequences and slots `0..=max_slot`.
+    pub fn reserve_batch_spec(
+        &mut self,
+        model: &Model,
+        max_seqs: usize,
+        max_slot: usize,
+    ) -> anyhow::Result<()> {
+        self.draft
+            .ensure_batch_dflash2(model.stream(), max_seqs.min(MAX_BATCH_SEQS), max_slot)
+    }
+
+    /// Synchronizes slot 0's host-tracked DFlash 2 committed position with `model.position()`
+    /// after single-stream speculation stops.
+    pub fn sync_slot0_draft(&mut self, model: &Model) -> anyhow::Result<()> {
+        self.batch_drafted.clear();
+        self.draft.set_slot_committed(0, model.position())
+    }
+
+    /// Returns slot `slot`'s DFlash 2 committed position.
+    #[must_use]
+    pub fn slot_draft_committed(&self, slot: usize) -> usize {
+        self.draft.slot_committed(slot)
+    }
+
+    /// Copies slot `from`'s DFlash 2 rings and committed position into slot `to`.
+    pub fn copy_slot_draft(
+        &mut self,
+        model: &Model,
+        from: usize,
+        to: usize,
+    ) -> anyhow::Result<()> {
+        self.batch_drafted.clear();
+        self.draft.copy_slot_rings(model.stream(), from, to)
+    }
+
+    /// Moves a DFlash 2-ready sequence from slot `from` to slot 0 and prepares it to resume
+    /// single-stream speculation from `anchor` without rebuilding the draft.
+    pub fn resume_dflash2_slot(
+        &mut self,
+        model: &mut Model,
+        from: usize,
+        anchor: u32,
+    ) -> anyhow::Result<()> {
+        self.batch_drafted.clear();
+        let pos = model.slot_position(from)?;
+        ensure!(
+            self.draft.slot_committed(from) == pos,
+            "slot {from}'s DFlash 2 rings are at {}, model is at {pos}",
+            self.draft.slot_committed(from)
+        );
+        self.move_to_slot0(model, from)?;
+        if from != 0 {
+            self.draft.copy_slot_rings(model.stream(), from, 0)?;
+        }
+        model.set_verify_anchor(anchor)
+    }
+
+    /// Prefills `tokens` in `slot` with feature taps and commits them into `slot`'s DFlash 2
+    /// sliding rings. When `reset_draft` is true, resets `slot`'s DFlash 2 committed count
+    /// first.
+    pub fn prefill_slot_batch(
+        &mut self,
+        model: &mut Model,
+        slot: usize,
+        tokens: &[u32],
+        images: Option<ImageSource<'_>>,
+        chunk: usize,
+        reset_draft: bool,
+    ) -> anyhow::Result<u32> {
+        self.batch_drafted.clear();
+        let stream = Arc::clone(model.stream());
+        if reset_draft {
+            self.draft.reset_slot(slot);
+        }
+        // Note a bounded tail of each prompt chunk for shortlist heads without thrashing the
+        // shared context table across many concurrent streams.
+        let latest: Vec<i32> = tokens
+            .iter()
+            .rev()
+            .take(NOTED_PROMPT.min(256))
+            .map(|&t| i32::try_from(t))
+            .collect::<Result<_, _>>()?;
+        if !latest.is_empty() {
+            self.draft
+                .note_tokens(&stream, model.draft_shared(), &latest)?;
+        }
+        let Self { draft, linear, .. } = self;
+        let mut commit = |start: usize, taps: CudaView<'_, bf16>| {
+            draft.commit_slot(&stream, linear, slot, &taps, start)
+        };
+        match images {
+            Some(images) => model.prefill_slot_with_images_and_taps(
+                slot,
+                tokens,
+                chunk,
+                Some(&mut commit),
+                images,
+            ),
+            None => model.prefill_slot_with_taps(slot, tokens, chunk, &mut commit),
+        }
+    }
+
+    /// Runs one batched DFlash 2 speculation round for `slots` (`1..=32`) of `width` rows per
+    /// sequence (`2..=8`, `seqs * width <= 256`), pipelining `Model::start_verify_batch` with
+    /// `Draft::batch_commit_and_draft` under a single host synchronization.
+    pub fn speculate_batch_round(
+        &mut self,
+        model: &mut Model,
+        slots: &[usize],
+        anchors: &[u32],
+        samplings: &[Sampling],
+        width: usize,
+    ) -> anyhow::Result<Vec<Verdict>> {
+        let seqs = slots.len();
+        ensure!(
+            (1..=MAX_BATCH_SEQS).contains(&seqs),
+            "batched speculation takes 1 to {MAX_BATCH_SEQS} sequences, not {seqs}"
+        );
+        ensure!(
+            (2..=VERIFY_ROWS).contains(&width) && seqs * width <= BATCH_VERIFY_MAX_ROWS,
+            "invalid batched verify shape {seqs} x {width}"
+        );
+        ensure!(
+            anchors.len() == seqs && samplings.len() == seqs,
+            "mismatched batched speculation lengths"
+        );
+        let stream = Arc::clone(model.stream());
+        let starts: Vec<usize> = slots
+            .iter()
+            .map(|&s| model.slot_position(s))
+            .collect::<anyhow::Result<_>>()?;
+        let draft_samplings: Vec<Sampling> = if self.coupled && model.sampling_enabled() {
+            samplings.to_vec()
+        } else {
+            vec![Sampling::GREEDY; seqs]
+        };
+        let steps = width - 1;
+        let cached_idx = self
+            .batch_drafted
+            .iter()
+            .position(|(s, w, _)| s.as_slice() == slots && *w == width);
+        let accept = vec![Accept::Greedy; seqs];
+        let pending = if let Some(idx) = cached_idx {
+            let tokens = self.batch_drafted[idx].2.slice(..seqs * width);
+            model.start_verify_batch(
+                slots,
+                BatchVerifyTokens::Device { tokens, width },
+                &accept,
+                samplings,
+            )?
+        } else {
+            self.draft.batch_draft_initial(
+                &stream,
+                model.draft_shared(),
+                slots,
+                anchors,
+                &draft_samplings,
+                steps,
+            )?;
+            let tokens = self.draft.batch_verify_tokens(seqs, width)?;
+            model.start_verify_batch(
+                slots,
+                BatchVerifyTokens::Device { tokens, width },
+                &accept,
+                samplings,
+            )?
+        };
+        // Immediately pipeline commit + next-round draft on the GPU before syncing.
+        self.draft.batch_commit_and_draft(
+            &stream,
+            model.draft_shared(),
+            slots,
+            &starts,
+            &model.batch_verify_taps()?,
+            &model.batch_verify_results()?,
+            &model.batch_verify_anchors()?,
+            &draft_samplings,
+            width,
+            steps,
+        )?;
+        // Save the freshly drafted verify tokens (<= 1 KiB) for this micro-batch.
+        let next_tokens = self.draft.batch_verify_tokens(seqs, width)?;
+        if let Some(idx) = cached_idx {
+            stream.memcpy_dtod(
+                &next_tokens,
+                &mut self.batch_drafted[idx].2.slice_mut(..seqs * width),
+            )?;
+        } else {
+            if self.batch_drafted.len() >= 4 {
+                self.batch_drafted.remove(0);
+            }
+            let mut buf = stream.alloc_zeros::<i32>(seqs * width)?;
+            stream.memcpy_dtod(&next_tokens, &mut buf)?;
+            self.batch_drafted.push((slots.to_vec(), width, buf));
+        }
+        // Single host synchronization for the whole round.
+        let verdicts = model.finish_verify_batch(pending)?;
+        for (&slot, (&start, v)) in slots.iter().zip(starts.iter().zip(&verdicts)) {
+            self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+        }
+        let emitted_ids: Vec<i32> = verdicts
+            .iter()
+            .flat_map(Verdict::emitted)
+            .map(i32::try_from)
+            .collect::<Result<_, _>>()?;
+        if !emitted_ids.is_empty() {
+            self.draft
+                .note_tokens(&stream, model.draft_shared(), &emitted_ids)?;
+        }
+        Ok(verdicts)
     }
 
     /// The rows of the prefill chunks the caller runs, and that [`Self::rebuild`] runs:
@@ -766,6 +1002,7 @@ impl Speculator {
     /// Readies the draft for a new prompt: forgets its committed positions and the
     /// sequence it followed, and notes the prompt's last tokens for a shortlist head.
     fn start_prompt(&mut self, model: &Model, prompt: &[u32]) -> anyhow::Result<()> {
+        self.batch_drafted.clear();
         self.draft.reset();
         self.batched = None;
         self.tail_rows = 0;
@@ -991,6 +1228,7 @@ impl Speculator {
         model.reset_slot(slot)?;
         // The draft's global caches now take another sequence.
         self.draft_sequence += 1;
+        self.batch_drafted.clear();
         self.draft.reset();
         self.tail_rows = 0;
         self.prompt_len = 0;
