@@ -9,15 +9,19 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum = "0.8"
+base64 = "0.22"
 futures-util = { version = "0.3.34", default-features = false }
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+siphon = { path = "../siphon" }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.19", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-siphon = { path = "../siphon" }
+cudarc.workspace = true
+half.workspace = true
 siphon-cuda = { path = "../siphon-cuda" }
 
 [lints]

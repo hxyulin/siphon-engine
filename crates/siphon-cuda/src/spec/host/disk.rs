@@ -17,7 +17,8 @@
 //! - the entry's use order (u64), its tokens (u64), its global cache chunks (u64), whether
 //!   it holds the draft's rings (u64), and per chunk whether it holds the draft's global
 //!   caches (one byte each, then zeros to a multiple of 8);
-//! - the tokens (u32 each, then zeros to a multiple of 8);
+//! - the tokens (u32 each, then zeros to a multiple of 8): the prompt's key, whose image
+//!   placeholders are ids of the images' hashes, above every token id;
 //! - each chunk's target part, followed by its draft part if it holds one;
 //! - the rings and conv states, then the draft's rings if it holds them.
 //!

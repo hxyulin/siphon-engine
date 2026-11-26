@@ -153,13 +153,14 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 ## Features
 
 - **Server.** OpenAI chat completions and completions, with streaming, reasoning (`reasoning_content`), tool calls, `tool_choice`, stop strings, `reasoning_effort`, sampling and several choices per request (`n`) from one prefill. vLLM and TabbyAPI tokenizer routes, and vLLM's `return_token_ids`, `ignore_eos` and `continue_final_message`.
+- **Images.** `--vision` loads the vision tower and takes base64 PNG, JPEG, WebP and GIF images in OpenAI `image_url` parts and Anthropic `image` blocks. The prefix cache keys prompts by their images too ([docs/server.md](docs/server.md#images)).
 - **Scheduling.** Continuous batching of up to 32 requests. Speculation for a request that runs alone, and a prefix cache with an entry per stream, for batched and lone requests.
 - **Sampling.** Temperature, top-k, top-p and min-p on the GPU, applied in vLLM's order, with the checkpoint's `generation_config.json` for the fields a request leaves out (temperature 1). Each draw depends only on the logits, the request's seed and the token's position. `temperature: 0` or `--greedy` decodes greedily.
 - **Speculation.** The bundled DSpark draft by default, or Inco AI's DFlash 2 drafter or a 2DSD DFlash export with `--drafter DIR`. `--fallback` runs plain steps where the draft cannot predict the text. It speeds up free prose, but the output can then differ between runs.
 - **Formats.** FP8 dense weights (`--weights fp8`) and an FP8 global KV cache (`--kv fp8`) by default, BF16 for both on request. Prefill can opt in to quantized expert activations and FP8 dense products, which are faster and fail the quality gate on some texts.
 - **Memory planning.** The server checks the planned GPU memory against what it uses after warmup and after each job.
 
-Not yet: the presence, frequency and repetition penalties (accepted and ignored), speculation for more than one request at a time, prefix cache entries shared by prompts that agree only in their first tokens, and image input.
+Not yet: the presence, frequency and repetition penalties (accepted and ignored), speculation for more than one request at a time, prefix cache entries shared by prompts that agree only in their first tokens, and image URLs that the server fetches itself.
 
 ## Build from source
 
@@ -195,6 +196,7 @@ On macOS, `siphon-cuda` compiles to an empty crate, so the tests run but the ser
 | [`docs/server.md`](docs/server.md) | Server options, routes and request fields |
 | [`docs/engine.md`](docs/engine.md) | How the engine works, how it is tested and measured, and its formats |
 | [`docs/batching.md`](docs/batching.md) | The design of batched decode |
+| [`docs/vision.md`](docs/vision.md) | The reference image preprocessing, vision tower and merge |
 
 ## Acknowledgements
 

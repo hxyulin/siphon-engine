@@ -121,6 +121,26 @@ pub enum DraftChoice<'a> {
     Dflash(&'a Path, DraftApprox),
 }
 
+/// The vision tower of `--vision`, and the largest image a request may send.
+#[derive(Clone, Copy, Debug)]
+pub struct VisionInputs {
+    pub format: VisionFormat,
+    /// Image tokens of the largest image ([`max_image_tokens`]).
+    pub max_image_tokens: usize,
+    /// Native patches per image token: the adapter's merge squared, 4.
+    pub patches_per_token: usize,
+}
+
+/// Image tokens of the largest image the server takes when it shrinks images to at most
+/// `max_pixels` pixels: a square of `max_pixels` covers `ceil(sqrt(max_pixels) / side)`
+/// tokens a side, `side` being the pixels of one token (40), and one more row and column
+/// leave room for the padding of images that are not square. 1,369 for 1920 x 1080.
+#[must_use]
+pub fn max_image_tokens(side: usize, max_pixels: usize) -> usize {
+    let tokens = max_pixels.isqrt().div_ceil(side) + 1;
+    tokens * tokens
+}
+
 /// What a plan depends on.
 #[derive(Clone, Copy, Debug)]
 pub struct PlanInputs<'a> {
@@ -141,6 +161,8 @@ pub struct PlanInputs<'a> {
     /// Streaming multiprocessors of the device. The prefill attention keeps two slots of
     /// split partials per SM.
     pub sms: usize,
+    /// The vision tower, with `--vision`.
+    pub vision: Option<VisionInputs>,
 }
 
 /// Device bytes of one configuration at one capacity, by what holds them.
@@ -170,6 +192,9 @@ pub struct Plan {
     pub draft_kv: usize,
     /// The prefix cache's copies of the rings and conv states.
     pub prefix: usize,
+    /// The vision tower ([`vision_bytes`]) for the largest image, and the rows of the other
+    /// images one prefill chunk overlaps.
+    pub vision: usize,
     /// [`RUNTIME_BYTES`], and [`STREAM_RUNTIME_BYTES`] per stream past the first.
     pub runtime: usize,
 }
@@ -189,6 +214,7 @@ impl Plan {
             + self.draft
             + self.draft_kv
             + self.prefix
+            + self.vision
             + self.runtime
     }
 }
@@ -221,6 +247,7 @@ impl fmt::Display for Plan {
             ("draft", self.draft),
             ("draft KV", self.draft_kv),
             ("prefix", self.prefix),
+            ("vision", self.vision),
             ("runtime", self.runtime),
         ];
         let listed: Vec<String> = parts
@@ -353,6 +380,14 @@ impl Planner {
             Some((d, _)) => inputs.prefix_entries * (slot_rings + draft_ring_bytes(c, d)),
             _ => 0,
         };
+        // Prefill holds the rows of the images that overlap its chunk: the chunk's rows, and
+        // at most one image on each side that runs past it. `vision_bytes` counts one
+        // image's rows, its output.
+        let vision = inputs.vision.map_or(0, |v| {
+            let tokens = v.max_image_tokens;
+            vision_bytes(v.format, tokens * v.patches_per_token)
+                + (inputs.prefill_chunk + tokens) * hidden * 2
+        });
         let fixed = Plan {
             capacity: 0,
             streams,
@@ -369,6 +404,7 @@ impl Planner {
             draft: draft_bytes,
             draft_kv: (DRAFT_STEPS + 1) * draft_kv_per_position,
             prefix,
+            vision,
             runtime: RUNTIME_BYTES + (streams - 1) * STREAM_RUNTIME_BYTES,
         };
         Ok(Self {
@@ -912,6 +948,44 @@ mod tests {
         std::fs::write(&config, r#"{"architectures": ["DFlashDraftModel"]}"#).expect("writing");
         let d = dflash_shape(&dir, hidden).expect("a DFlash shape");
         assert_eq!((d.taps, d.layers, d.global_layers), (5, 2, 2));
+        std::fs::remove_dir_all(dir).expect("cleaning up");
+    }
+
+    #[test]
+    fn vision_adds_the_tower_and_the_rows_of_one_chunk_and_two_images() {
+        assert_eq!(max_image_tokens(40, 1920 * 1080), 37 * 37);
+        assert_eq!(max_image_tokens(40, 1600), 4);
+        let dir = checkpoint("vision", &[("model.llm.norm.weight", Dtype::BF16, &[25])]);
+        let checkpoint = Checkpoint::open(&dir).expect("opening");
+        let c = config();
+        let plan = |vision| {
+            Planner::new(&PlanInputs {
+                config: &c,
+                checkpoint: &checkpoint,
+                weights: WeightFormat::Fp8,
+                kv: KvFormat::Fp8,
+                draft: DraftChoice::None,
+                prefill_chunk: 2048,
+                streams: 1,
+                prefix_entries: 0,
+                sms: 170,
+                vision,
+            })
+            .expect("a plan")
+            .plan(4096)
+        };
+        let off = plan(None);
+        let on = plan(Some(VisionInputs {
+            format: VisionFormat::Bf16,
+            max_image_tokens: 100,
+            patches_per_token: 4,
+        }));
+        assert_eq!(off.vision, 0);
+        assert_eq!(on.total() - off.total(), on.vision);
+        assert_eq!(
+            on.vision,
+            vision_bytes(VisionFormat::Bf16, 400) + (2048 + 100) * 2304 * 2
+        );
         std::fs::remove_dir_all(dir).expect("cleaning up");
     }
 

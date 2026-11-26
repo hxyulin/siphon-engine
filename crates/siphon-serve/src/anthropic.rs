@@ -5,8 +5,9 @@
 //!   as `/v1/chat/completions`.
 //! - `POST /v1/messages/count_tokens`, which renders the same prompt and counts it.
 //!
-//! The model cannot see images or documents, so those blocks become a short text that says
-//! so. Anthropic's server tools are left out of the declared tools. Fields the server has no
+//! Without `--vision` the model sees no images, so image blocks become a short text that
+//! says so; with it, base64 image blocks reach the prompt as images. Documents always
+//! become such a text. Anthropic's server tools are left out of the declared tools. Fields the server has no
 //! use for, such as `metadata`, `cache_control` and `context_management`, are ignored.
 //! Errors on these routes take Anthropic's shape, and a full queue answers 529, which
 //! Anthropic's clients retry.
@@ -36,7 +37,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    chat::{self, Ending, InvalidRequest, Vocab},
+    chat::{self, Ending, InvalidRequest, Rendered, Vocab},
     engine::{Event, Finish},
     openai::{
         self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, Results, blocking, submit,
@@ -138,7 +139,7 @@ pub async fn count_tokens(
 
 /// The body of a `count_tokens` reply: the tokens of the prompt the request would run.
 fn count(vocab: &Vocab, request: &MessagesRequest) -> Result<Value, ApiError> {
-    Ok(json!({"input_tokens": render(vocab, request)?.0.len()}))
+    Ok(json!({"input_tokens": render(vocab, request)?.0.ids.len()}))
 }
 
 fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
@@ -155,10 +156,11 @@ fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
         },
         &app.sampling,
     )?;
-    let (prompt, parser, calls) = render(&app.vocab, request)?;
-    let max_tokens = limit(app.engine.max_context(), prompt.len(), requested)?;
+    let (rendered, parser, calls) = render(&app.vocab, request)?;
+    let max_tokens = limit(app.engine.max_context(), rendered.ids.len(), requested)?;
     Ok(Prepared {
-        prompt,
+        prompt: rendered.ids,
+        images: rendered.images,
         max_tokens,
         delivery: if request.stream.unwrap_or(false) {
             Delivery::Stream {
@@ -193,8 +195,9 @@ fn limit(max_context: usize, prompt_len: usize, requested: u64) -> Result<usize,
 }
 
 /// The prompt of a request, the parser for its output, and the tool calls that end it.
-fn render(vocab: &Vocab, request: &MessagesRequest) -> Result<(Vec<u32>, Parser, Calls), ApiError> {
-    let messages = translate(request.system.as_ref(), &request.messages)?;
+fn render(vocab: &Vocab, request: &MessagesRequest) -> Result<(Rendered, Parser, Calls), ApiError> {
+    let images = vocab.vision().is_some();
+    let messages = translate(request.system.as_ref(), &request.messages, images)?;
     let mut tools = tools(request.tools.as_deref().unwrap_or_default());
     let (choice, parallel) = tool_choice(request.tool_choice.as_ref())?;
     if choice == ToolChoice::None {
@@ -208,7 +211,7 @@ fn render(vocab: &Vocab, request: &MessagesRequest) -> Result<(Vec<u32>, Parser,
     };
     let (ending, calls) = tool_ending(&choice, &tools, parallel, ending)?;
     let effort = effort(request.thinking.as_ref(), request.output_config.as_ref());
-    let prompt = vocab.render_to(&messages, &tools, effort, &ending)?;
+    let prompt = vocab.render_prompt(&messages, &tools, effort, &ending)?;
     Ok((prompt, Parser::new(vocab, &ending), calls))
 }
 
@@ -272,8 +275,13 @@ fn tools(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Anthropic's `system` and `messages` as OpenAI-shaped messages.
-fn translate(system: Option<&Value>, messages: &[Value]) -> Result<Vec<Value>, InvalidRequest> {
+/// Anthropic's `system` and `messages` as OpenAI-shaped messages, with image blocks kept
+/// as images if `images` (`--vision`).
+fn translate(
+    system: Option<&Value>,
+    messages: &[Value],
+    images: bool,
+) -> Result<Vec<Value>, InvalidRequest> {
     let mut out = Vec::new();
     if let Some(system) = system {
         let text = system_text(system)?;
@@ -284,7 +292,7 @@ fn translate(system: Option<&Value>, messages: &[Value]) -> Result<Vec<Value>, I
     for message in messages {
         let content = message.get("content").unwrap_or(&Value::Null);
         match message.get("role").and_then(Value::as_str) {
-            Some("user") => user(content, &mut out)?,
+            Some("user") => user(content, &mut out, images)?,
             Some("assistant") => out.push(assistant(content)?),
             // Claude Code sends these mid-conversation. The template renders a system
             // message where it stands.
@@ -329,13 +337,14 @@ fn blocks(content: &Value) -> Result<Vec<Value>, InvalidRequest> {
     }
 }
 
-/// The text a user block stands for: its text, or a note in place of an image or document.
-/// Other block types are left out.
-fn block_text(block: &Value) -> Option<&str> {
+/// The content part a user block stands for: its text, the image itself if `images`, or a
+/// note in place of an image or document. Other block types are left out.
+fn block_part(block: &Value, images: bool) -> Option<Value> {
     match block.get("type").and_then(Value::as_str) {
-        Some("text") => block.get("text").and_then(Value::as_str),
-        Some("image") => Some(NO_IMAGE),
-        Some("document") => Some(NO_DOCUMENT),
+        Some("text") => block.get("text").and_then(Value::as_str).map(text_part),
+        Some("image") if images => Some(block.clone()),
+        Some("image") => Some(text_part(NO_IMAGE)),
+        Some("document") => Some(text_part(NO_DOCUMENT)),
         _ => None,
     }
 }
@@ -344,9 +353,9 @@ fn text_part(text: &str) -> Value {
     json!({"type": "text", "text": text})
 }
 
-/// Adds a user message: its text blocks as user messages and each `tool_result` as a tool
-/// message, in their order.
-fn user(content: &Value, out: &mut Vec<Value>) -> Result<(), InvalidRequest> {
+/// Adds a user message: its text and image blocks as user messages and each `tool_result`
+/// as a tool message, in their order.
+fn user(content: &Value, out: &mut Vec<Value>, images: bool) -> Result<(), InvalidRequest> {
     let mut parts = Vec::new();
     let flush = |parts: &mut Vec<Value>, out: &mut Vec<Value>| {
         if !parts.is_empty() {
@@ -362,8 +371,7 @@ fn user(content: &Value, out: &mut Vec<Value>) -> Result<(), InvalidRequest> {
                 .unwrap_or("");
             let texts: Vec<Value> = blocks(block.get("content").unwrap_or(&Value::Null))?
                 .iter()
-                .filter_map(block_text)
-                .map(text_part)
+                .filter_map(|b| block_part(b, images))
                 .collect();
             let content = if texts.is_empty() {
                 Value::String(String::new())
@@ -371,8 +379,8 @@ fn user(content: &Value, out: &mut Vec<Value>) -> Result<(), InvalidRequest> {
                 Value::Array(texts)
             };
             out.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
-        } else if let Some(text) = block_text(&block) {
-            parts.push(text_part(text));
+        } else if let Some(part) = block_part(&block, images) {
+            parts.push(part);
         }
     }
     flush(&mut parts, out);
@@ -645,6 +653,7 @@ fn take(
 async fn respond(app: Arc<App>, prepared: Prepared) -> Result<Response, ApiError> {
     let Prepared {
         prompt,
+        images,
         max_tokens,
         delivery,
         samplings,
@@ -656,7 +665,7 @@ async fn respond(app: Arc<App>, prepared: Prepared) -> Result<Response, ApiError
         .first()
         .copied()
         .ok_or_else(|| ApiError::internal("no sampling"))?;
-    let results = submit(&app, &prompt, max_tokens, false, sampling)?;
+    let results = submit(&app, &prompt, images, max_tokens, false, sampling)?;
     if matches!(delivery, Delivery::Whole) {
         // Runs in the handler, so that a client that leaves drops the job.
         let (out, mut rx) = mpsc::channel(1);
@@ -767,7 +776,7 @@ mod tests {
 
     /// The decoded prompt of `request`.
     fn rendered(vocab: &Vocab, request: Value) -> String {
-        vocab.decode(&render(vocab, &parse(request)).unwrap().0)
+        vocab.decode(&render(vocab, &parse(request)).unwrap().0.ids)
     }
 
     /// A request shaped like Claude Code's, with fields the server ignores.
@@ -816,6 +825,50 @@ mod tests {
             "container": null,
             "mcp_servers": [],
         })
+    }
+
+    #[test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    fn image_blocks_reach_the_prompt_with_vision() {
+        let mut vocab = vocab();
+        vocab.set_vision(Some(crate::vision::tests::vision(4)));
+        let mut request = claude_code_request();
+        let png = crate::vision::tests::png_header(80, 40);
+        request["messages"][2]["content"][0]["content"][1]["source"]["data"] = json!(png);
+        request["messages"][5]["content"] = json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+             "data": png}},
+            {"type": "text", "text": "And this one?"},
+        ]);
+        let (rendered, _, _) = render(&vocab, &parse(request)).unwrap();
+        let text = vocab.decode(&rendered.ids);
+        let image = "<|content_image|><|unused_200054|><|unused_200054|><|end_message|>";
+        assert!(
+            text.contains(&format!(
+                "<|message_tool|>Read<|content_text|>PNG, 64x64<|end_message|>\
+                 <|message_tool|>Read{image}<|message_user|><|content_text|>Describe it."
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "<|message_user|>{image}<|message_user|><|content_text|>And this one?"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("image omitted"));
+        assert_eq!(rendered.images.len(), 2);
+        for image in &rendered.images {
+            assert_eq!(
+                rendered.ids[image.positions()],
+                [crate::vision::tests::PLACEHOLDER; 2]
+            );
+        }
+        // An image source by URL is refused rather than fetched.
+        let mut request = claude_code_request();
+        request["messages"][5]["content"] =
+            json!([{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}]);
+        assert!(render(&vocab, &parse(request)).is_err());
     }
 
     #[test]
@@ -886,7 +939,7 @@ mod tests {
             .len();
         assert_eq!(body, json!({"input_tokens": expected}));
         let full = count(&vocab, &parse(claude_code_request())).unwrap();
-        let ids = render(&vocab, &parse(claude_code_request())).unwrap().0;
+        let ids = render(&vocab, &parse(claude_code_request())).unwrap().0.ids;
         assert_eq!(full["input_tokens"], ids.len());
     }
 

@@ -2,7 +2,8 @@
 //! safetensors headers before anything is loaded.
 //!
 //! ```text
-//! siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--print]
+//! siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N]
+//!             [--free GiB] [--context N] [--streams N] [--vision] [--max-image-pixels N] [--print]
 //! ```
 //!
 //! It shows the plan of one configuration as a bar over the whole GPU and a table of its
@@ -26,7 +27,10 @@ use ratatui::{
     layout::Rect,
 };
 
-use siphon::memory;
+use siphon::{
+    VisionFormat,
+    memory::{self, VisionInputs},
+};
 
 use crate::{
     app::{App, Settings},
@@ -34,7 +38,8 @@ use crate::{
 };
 
 const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] \
-                     [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--print]
+                     [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--vision] \
+                     [--max-image-pixels N] [--print]
 --drafter adds a DFlash drafter's plan beside the bundled draft's.
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's
 --memory does.
@@ -47,6 +52,8 @@ nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
 --streams plans N streams, 1 to 32, as siphon-serve's --streams does: N sets of caches of
 the context each, the batched step's buffers and a prefix cache entry per stream.
+--vision adds the vision tower and its buffers for images shrunk to --max-image-pixels
+(default 1920 x 1080), as siphon-serve's flags of the same names do.
 --print prints one frame as text and exits.";
 
 /// Columns of a printed frame.
@@ -61,6 +68,8 @@ struct Args {
     free: Option<usize>,
     context: Option<usize>,
     streams: usize,
+    vision: bool,
+    max_image_pixels: usize,
     print: bool,
 }
 
@@ -87,6 +96,8 @@ fn args() -> anyhow::Result<Args> {
     let mut free = None;
     let mut context = None;
     let mut streams = 1;
+    let mut vision = false;
+    let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
     let mut print = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -116,6 +127,12 @@ fn args() -> anyhow::Result<Args> {
                     memory::BATCH_ROWS
                 );
             }
+            "--vision" => vision = true,
+            "--max-image-pixels" => {
+                max_image_pixels = value()?
+                    .parse()
+                    .context("--max-image-pixels takes a pixel count")?;
+            }
             "--print" => print = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -135,6 +152,8 @@ fn args() -> anyhow::Result<Args> {
         free,
         context,
         streams,
+        vision,
+        max_image_pixels,
         print,
     })
 }
@@ -142,6 +161,16 @@ fn args() -> anyhow::Result<Args> {
 fn main() -> anyhow::Result<()> {
     let args = args()?;
     let device = Device::detect(args.free);
+    let vision = if args.vision {
+        let config = siphon::vision::VisionConfig::load(&args.model)?;
+        Some(VisionInputs {
+            format: VisionFormat::Bf16,
+            max_image_tokens: memory::max_image_tokens(config.token_size(), args.max_image_pixels),
+            patches_per_token: config.merge_size * config.merge_size,
+        })
+    } else {
+        None
+    };
     let mut app = App::new(
         &args.model,
         args.drafter.as_deref(),
@@ -152,6 +181,7 @@ fn main() -> anyhow::Result<()> {
             prefill_chunk: args.prefill_chunk,
             context: args.context,
             streams: args.streams,
+            vision,
         },
     )?;
     if args.print || !io::stdout().is_terminal() {
@@ -175,7 +205,7 @@ fn main() -> anyhow::Result<()> {
 
 /// Renders one frame into a buffer and prints it as plain text.
 fn print_frame(app: &App) -> anyhow::Result<()> {
-    let area = Rect::new(0, 0, PRINT_WIDTH, ui::HEIGHT);
+    let area = Rect::new(0, 0, PRINT_WIDTH, ui::height(app));
     let mut buffer = Buffer::empty(area);
     ui::draw(app, area, &mut buffer);
     let mut out = io::stdout().lock();

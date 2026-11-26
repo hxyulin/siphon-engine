@@ -392,6 +392,7 @@ impl Model {
             start,
             &mut PrefillLogits::Last,
             false,
+            &[],
         )
     }
 }

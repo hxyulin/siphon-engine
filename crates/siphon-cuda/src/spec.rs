@@ -54,7 +54,7 @@ pub use prefix::PrefixHit;
 
 use crate::{
     draft::{CONTEXT_ROWS, Draft, DraftOptions, STEPS, WINDOW},
-    model::{Accept, Model, PrefillLogits, Sampling, SavedState, VerifyTokens},
+    model::{Accept, ImageSource, Model, PrefillLogits, Sampling, SavedState, VerifyTokens},
     ops::{linear::Linear, spec::VERIFY_ROWS},
     weights::{
         dflash::DflashWeights,
@@ -71,6 +71,53 @@ const _: () = assert!(
     DFLASH2_WINDOW >= WINDOW,
     "TAIL covers the bundled draft's rings"
 );
+
+/// A prompt as the speculator prefills it: the tokens the model runs, the key the prefix
+/// cache matches it by, and the rows of its images.
+///
+/// The key has one id per token. For a prompt of text it is the tokens. Two prompts whose
+/// images differ have the same placeholder tokens, so the caller replaces each image's
+/// placeholders in the key with ids that its image's hash decides, above every token id.
+/// The cache saves and compares keys only, so an entry serves a prompt only when every
+/// image below its boundary is the same.
+pub struct Prompt<'a> {
+    pub tokens: &'a [u32],
+    pub key: &'a [u32],
+    /// Gives the image rows of each chunk ([`Model::prefill_with_images`]); `None` for a
+    /// prompt without images.
+    pub images: Option<ImageSource<'a>>,
+}
+
+impl<'a> Prompt<'a> {
+    /// A prompt of text, its tokens as its key.
+    #[must_use]
+    pub fn text(tokens: &'a [u32]) -> Self {
+        Self {
+            tokens,
+            key: tokens,
+            images: None,
+        }
+    }
+
+    /// The image source for one prefill call of several, borrowed for that call.
+    fn images<'b>(images: &'b mut Option<ImageSource<'_>>) -> Option<ImageSource<'b>> {
+        match images {
+            Some(images) => Some(&mut **images),
+            None => None,
+        }
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        ensure!(!self.tokens.is_empty(), "nothing to prefill");
+        ensure!(
+            self.key.len() == self.tokens.len(),
+            "the prompt's key has {} ids for {} tokens",
+            self.key.len(),
+            self.tokens.len()
+        );
+        Ok(())
+    }
+}
 
 /// Prompt positions whose tokens a shortlist head adds to its context rows, the last
 /// ones: at most half of [`CONTEXT_ROWS`], so the tokens that generation emits keep room.
@@ -669,7 +716,7 @@ impl Speculator {
             model.position() == 0,
             "the speculator prefills from position 0"
         );
-        self.prefill_saving(model, prompt, chunk, None)
+        self.prefill_saving(model, Prompt::text(prompt), chunk, None)
     }
 
     /// [`Self::prefill`], which also saves the draft's rings into prefix cache entry
@@ -678,23 +725,26 @@ impl Speculator {
     fn prefill_saving(
         &mut self,
         model: &mut Model,
-        prompt: &[u32],
+        mut prompt: Prompt<'_>,
         chunk: usize,
         entry: Option<usize>,
     ) -> anyhow::Result<u32> {
+        prompt.check()?;
         self.fence_host()?;
         // The draft's global caches now take another sequence.
         self.draft_sequence += 1;
-        self.start_prompt(model, prompt)?;
+        let tokens = prompt.tokens;
+        self.start_prompt(model, tokens)?;
         let mut start = 0;
         if let Some(i) = entry {
             let end = self.entry_len(i);
-            self.prefill_rows(model, &prompt[..end], chunk)?;
+            let images = Prompt::images(&mut prompt.images);
+            self.prefill_rows(model, &tokens[..end], images, chunk)?;
             self.save_entry_rings(model, i)?;
             start = end;
         }
-        let first = self.prefill_rows(model, &prompt[start..], chunk)?;
-        self.end_prompt(model, prompt.len(), first)
+        let first = self.prefill_rows(model, &tokens[start..], prompt.images, chunk)?;
+        self.end_prompt(model, tokens.len(), first)
     }
 
     /// Readies the draft for a new prompt: forgets its committed positions and the
@@ -723,6 +773,7 @@ impl Speculator {
         &mut self,
         model: &mut Model,
         tokens: &[u32],
+        images: Option<ImageSource<'_>>,
         chunk: usize,
     ) -> anyhow::Result<u32> {
         let stream = Arc::clone(model.stream());
@@ -756,7 +807,16 @@ impl Speculator {
             *tail_rows = old + new;
             Ok(())
         };
-        model.prefill_with_taps(tokens, chunk, PrefillLogits::Last, &mut commit)
+        match images {
+            Some(images) => model.prefill_with_images(
+                tokens,
+                chunk,
+                PrefillLogits::Last,
+                Some(&mut commit),
+                images,
+            ),
+            None => model.prefill_with_taps(tokens, chunk, PrefillLogits::Last, &mut commit),
+        }
     }
 
     /// Ends a prompt of `len` tokens whose prefill returned `first`: makes it the anchor.
@@ -882,27 +942,29 @@ impl Speculator {
     /// committed; that changes its drafts, never the target's tokens.
     ///
     /// With a prefix cache, the entry of slot `from`, the slot that holds the sequence,
-    /// also gets the draft's rings when its tokens start `tokens`, so that a later prompt
+    /// also gets the draft's rings when its key starts `tokens`' key, so that a later prompt
     /// that starts with them can speculate from the cache.
     pub fn rebuild(
         &mut self,
         model: &mut Model,
         slot: usize,
         from: usize,
-        tokens: &[u32],
+        tokens: Prompt<'_>,
     ) -> anyhow::Result<()> {
         ensure!(
             slot != from,
             "the draft is rebuilt in another slot than the sequence's"
         );
+        tokens.check()?;
         let chunk = self.prefill_chunk;
+        let len = tokens.tokens.len();
         // Before the slots swap places in `with_slot`.
-        let entry = self.entry_starting(model, from, tokens, chunk);
+        let entry = self.entry_starting(model, from, tokens.key, chunk);
         self.fence_host()?;
         model.reset_slot(slot)?;
         model.with_slot(slot, |m| self.prefill_saving(m, tokens, chunk, entry))?;
         self.batched = Some(Batched {
-            start: tokens.len(),
+            start: len,
             tokens: Vec::new(),
         });
         Ok(())

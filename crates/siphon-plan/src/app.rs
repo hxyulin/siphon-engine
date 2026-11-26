@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use ratatui::crossterm::event::KeyCode;
 use siphon::{
     Checkpoint, KvFormat, TextConfig, WeightFormat,
-    memory::{self, DraftApprox, DraftChoice, Plan, PlanInputs, Planner},
+    memory::{self, DraftApprox, DraftChoice, Plan, PlanInputs, Planner, VisionInputs},
 };
 
 use crate::device::Device;
@@ -60,6 +60,8 @@ pub struct Settings {
     pub context: Option<usize>,
     /// `--streams`.
     pub streams: usize,
+    /// The vision tower, with `--vision`.
+    pub vision: Option<VisionInputs>,
 }
 
 pub struct App {
@@ -82,6 +84,8 @@ pub struct App {
     context: Option<usize>,
     /// Streams, each with caches of the context.
     pub streams: usize,
+    /// Whether the plans hold the vision tower (`--vision`).
+    pub vision: bool,
 }
 
 impl App {
@@ -97,6 +101,7 @@ impl App {
             prefill_chunk,
             context,
             streams,
+            vision,
         } = settings;
         let config = TextConfig::load(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir)?;
@@ -132,6 +137,7 @@ impl App {
                             streams,
                             prefix_entries: streams,
                             sms: device.sms,
+                            vision,
                         })
                         .with_context(|| format!("planning with the {} draft", draft.name()))?;
                         Ok(Config {
@@ -160,6 +166,7 @@ impl App {
             format: 0,
             context,
             streams,
+            vision: vision.is_some(),
         })
     }
 

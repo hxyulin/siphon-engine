@@ -9,6 +9,7 @@ mod parse;
 mod request;
 mod stop;
 mod tokenize;
+mod vision;
 
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -32,7 +33,8 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
-                     [--decode-floor 20] [--greedy]
+                     [--decode-floor 20] [--greedy] [--vision] \
+                     [--max-image-pixels 2073600] [--max-images 16]
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
@@ -75,6 +77,11 @@ seconds it ends what is left with an error. Then it saves --cache-dir and exits.
 --prefill-attention picks prefill's global attention products over an FP8 cache. auto (the
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, and fp8 runs FP8 throughout.
+--vision loads the vision tower and takes images in requests: base64 data: URLs in OpenAI
+image_url parts and base64 image blocks in Anthropic messages. Image URLs are not fetched.
+--max-image-pixels shrinks a larger image to this many pixels, keeping its aspect ratio
+(default 1920 x 1080 = 2,073,600, up to 1,369 image tokens). --max-images refuses a request
+with more images than this (default 16).
 --greedy decodes every request greedily, whatever its sampling fields ask. Without it, a
 request samples with its temperature, top_k, top_p, min_p and seed, and the fields it leaves
 out come from the checkpoint's generation_config.json (temperature 1 for Inkling 2 Mini).
@@ -95,6 +102,8 @@ struct Args {
     engine: engine::Options,
     /// How long a drain waits for the running and queued requests.
     drain_timeout: std::time::Duration,
+    /// `--max-images`, with `--vision`.
+    max_images: usize,
 }
 
 #[expect(clippy::too_many_lines, reason = "one match arm per flag")]
@@ -124,6 +133,9 @@ fn args() -> anyhow::Result<Args> {
     let mut prefill_attention = "auto".to_owned();
     let mut greedy = false;
     let mut decode_floor = DECODE_FLOOR;
+    let mut vision = false;
+    let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
+    let mut max_images = vision::DEFAULT_MAX_IMAGES;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -156,6 +168,20 @@ fn args() -> anyhow::Result<Args> {
             "--drain-timeout" => drain_timeout = value()?.parse()?,
             "--prefill-attention" => prefill_attention = value()?,
             "--greedy" => greedy = true,
+            "--vision" => vision = true,
+            "--max-image-pixels" => {
+                max_image_pixels = value()?
+                    .parse()
+                    .context("--max-image-pixels takes a pixel count")?;
+                ensure!(
+                    max_image_pixels >= 1600,
+                    "--max-image-pixels takes at least 1600"
+                );
+            }
+            "--max-images" => {
+                max_images = value()?.parse().context("--max-images takes a count")?;
+                ensure!(max_images >= 1, "--max-images takes at least 1");
+            }
             "--decode-floor" => {
                 decode_floor = value()?
                     .parse()
@@ -213,7 +239,11 @@ fn args() -> anyhow::Result<Args> {
             prefill_attention,
             greedy,
             decode_floor,
+            vision: vision.then_some(engine::VisionOptions {
+                max_pixels: max_image_pixels,
+            }),
         },
+        max_images,
         model_dir,
         address,
         name,
@@ -324,6 +354,24 @@ fn fp8(format: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// Image preprocessing for `--vision`, shrinking images to `--max-image-pixels`.
+fn load_vision(
+    dir: &std::path::Path,
+    max_pixels: usize,
+    max_images: usize,
+) -> anyhow::Result<vision::Vision> {
+    let mut config = siphon::vision::VisionConfig::load(dir)?;
+    config.max_pixels = max_pixels;
+    let (side, placeholder) = (config.token_size(), config.image_token_id);
+    Ok(vision::Vision::new(
+        Box::new(config),
+        side,
+        placeholder,
+        max_pixels,
+        max_images,
+    ))
+}
+
 fn main() -> ExitCode {
     // Load every kernel's code when its module loads, at startup, rather than at its first
     // launch, which may come in a request after the memory check. Unless the user chose.
@@ -343,7 +391,14 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<()> {
     let args = args()?;
     let api_key = env::var("SIPHON_API_KEY").ok().filter(|k| !k.is_empty());
-    let vocab = chat::Vocab::load(&args.model_dir)?;
+    let mut vocab = chat::Vocab::load(&args.model_dir)?;
+    if let Some(options) = &args.engine.vision {
+        vocab.set_vision(Some(load_vision(
+            &args.model_dir,
+            options.max_pixels,
+            args.max_images,
+        )?));
+    }
     let warmup = vocab
         .render(
             &[json!({"role": "user", "content": WARMUP})],

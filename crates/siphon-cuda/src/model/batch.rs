@@ -25,7 +25,8 @@ use cudarc::driver::{
 use half::bf16;
 
 use super::{
-    Model, PrefillLogits, Sampling, StepGraph, VisitState, prefill::PrefillScratch, zeros,
+    ImageSource, Model, PrefillLogits, Sampling, StepGraph, VisitState, prefill::PrefillScratch,
+    zeros,
 };
 use crate::ops::{
     attention::{HEAD_DIM, KV_HEADS, KvCache, KvData, KvFormat},
@@ -313,6 +314,19 @@ impl Model {
         self.with_slot(slot, |m| m.prefill(tokens, chunk, PrefillLogits::Last))
     }
 
+    /// [`Model::prefill_slot`] for a prompt with images ([`Model::prefill_with_images`]).
+    pub fn prefill_slot_with_images(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        chunk: usize,
+        images: ImageSource<'_>,
+    ) -> anyhow::Result<u32> {
+        self.with_slot(slot, |m| {
+            m.prefill_with_images(tokens, chunk, PrefillLogits::Last, None, images)
+        })
+    }
+
     /// The token after slot `slot`'s last prefill, picked with `sampling` instead of
     /// [`Model::sampling`]: the token that prefill would have returned had it run with
     /// `sampling`. It reads the last row's logits that the prefill left in the decode
@@ -511,6 +525,7 @@ impl Model {
             0,
             &mut PrefillLogits::Last,
             true,
+            &[],
         )
     }
 }

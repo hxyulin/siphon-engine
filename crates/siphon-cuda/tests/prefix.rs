@@ -28,7 +28,7 @@ use siphon_cuda::{
     draft::DraftOptions,
     model::{DEFAULT_PREFILL_CHUNK, Model},
     ops::attention::KvFormat,
-    spec::{DraftSource, Drafts, Speculator, Width, load_draft},
+    spec::{DraftSource, Drafts, Prompt, Speculator, Width, load_draft},
     weights::{WeightFormat, Weights},
 };
 
@@ -90,7 +90,7 @@ fn run(
     cached: bool,
 ) -> anyhow::Result<(Run, usize)> {
     let (first, from_cache) = if cached {
-        spec.prefill_cached(model, prompt, CHUNK)?
+        spec.prefill_cached(model, Prompt::text(prompt), CHUNK)?
     } else {
         model.reset()?;
         (spec.prefill(model, prompt, CHUNK)?, 0)
@@ -247,7 +247,7 @@ fn prefix_cache_matches_prefill(drafter: Option<&std::path::Path>) -> anyhow::Re
     // A draft rebuilt for another sequence keeps only the rings of a draft without global
     // layers, such as DFlash 2.
     check("g again", &mut model, &mut spec, &g, &want_g, 6144)?;
-    spec.rebuild(&mut model, 1, 0, &capture[..700])?;
+    spec.rebuild(&mut model, 1, 0, Prompt::text(&capture[..700]))?;
     let kept = if global_draft(drafter) { 0 } else { 6144 };
     check(
         "g after a rebuild",
@@ -371,7 +371,7 @@ fn serve_alone(
         let logits = hash(&model.logits()?);
         spec.move_to_slot0(model, slot)?;
         let free = spec.idle_slot(model, &[0]).context("no idle slot")?;
-        spec.rebuild(model, free, 0, prompt)?;
+        spec.rebuild(model, free, 0, Prompt::text(prompt))?;
         spec.resume(model, first)?;
         let path = if hit.is_some_and(|h| h.slot.is_none()) {
             "from host memory as a batch of one, rebuild"
@@ -386,7 +386,7 @@ fn serve_alone(
             Some(Some(_)) => "moved to slot 0 with the draft's rings",
             None => "from position 0",
         };
-        let (first, cached) = spec.prefill_cached(model, prompt, CHUNK)?;
+        let (first, cached) = spec.prefill_cached(model, Prompt::text(prompt), CHUNK)?;
         (first, hash(&model.logits()?), cached, path)
     };
     let mut tokens = vec![first];

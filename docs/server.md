@@ -12,7 +12,7 @@ Before loading anything, the server plans the GPU memory from the config and the
 
 It then loads the model, prices each verify width on a short prompt, and serves. After warmup it compares the memory the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the module images and CUDA graphs from the change in free memory. After each job it checks the pool's peak again and warns if the peak went past the plan.
 
-`siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N] [--free GiB] [--context N] [--print]` shows the same plan in a terminal before you start the server, and runs on macOS too. It draws the GPU memory as a bar and a table of what holds it, with the longest context for every combination of formats and drafts. Keys switch the formats and the draft and move the context. It reads the free memory from nvidia-smi, or takes `--free`, or assumes an idle 32 GB RTX 5090.
+`siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--vision] [--print]` shows the same plan in a terminal before you start the server, and runs on macOS too. It draws the GPU memory as a bar and a table of what holds it, with the longest context for every combination of formats and drafts. Keys switch the formats and the draft and move the context. It reads the free memory from nvidia-smi, or takes `--free`, or assumes an idle 32 GB RTX 5090.
 
 ## Options
 
@@ -41,6 +41,9 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--drain-timeout SECONDS` | `600` | How long a drain on SIGTERM waits for the running and queued requests before it ends them. |
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
 | `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
+| `--vision` | off | Loads the vision tower and takes images in requests. See [Images](#images). |
+| `--max-image-pixels N` | `2073600` | Shrinks a larger image to N pixels, keeping its aspect ratio. The default is 1920 x 1080. |
+| `--max-images N` | `16` | Images one request may hold. |
 
 With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` needs `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
@@ -52,7 +55,7 @@ With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` 
 | `POST /v1/completions` | A text prompt or token ids, streaming or not. The text includes any special tokens generated. |
 | `POST /v1/messages` | Anthropic's Messages API, streaming or not, for Claude Code and Anthropic's SDKs. See [Anthropic Messages API](#anthropic-messages-api). |
 | `POST /v1/messages/count_tokens` | `{"input_tokens": n}`: the tokens of the prompt that `/v1/messages` would run for the same body. |
-| `POST /tokenize`, `POST /detokenize` | vLLM's shape, also at `/v1/tokenize` and `/v1/detokenize`: `{"prompt"}` or `{"messages", "tools"}` to `{"tokens", "count", "max_model_len"}`, and `{"tokens"}` to `{"prompt"}`. |
+| `POST /tokenize`, `POST /detokenize` | vLLM's shape, also at `/v1/tokenize` and `/v1/detokenize`: `{"prompt"}` or `{"messages", "tools"}` to `{"tokens", "count", "max_model_len"}`, and `{"tokens"}` to `{"prompt"}`. With `--vision`, the messages' images count as the chat route counts them. |
 | `POST /v1/token/encode`, `POST /v1/token/decode` | TabbyAPI's shape: `{"text"}`, a string or messages, to `{"tokens", "length"}`, and `{"tokens"}` to `{"text"}`. |
 | `GET /v1/models`, `GET /v1/models/{id}` | The served model, with `max_model_len`. |
 | `GET /health`, `GET /version` | No API key needed. |
@@ -83,7 +86,7 @@ The request maps onto the chat route as follows:
 - `system` is a string or text blocks. The blocks are joined with blank lines into one system message. Claude Code's `x-anthropic-billing-header` block is dropped: it changes between requests and would defeat the prefix cache.
 - `messages` take the roles `user`, `assistant` and `system`. The template renders a `system` message mid-conversation where it stands.
 - A user's `tool_result` block becomes a tool message, in its place among the user's text blocks. Its `is_error` is ignored.
-- `image` and `document` blocks, also inside a `tool_result`, become the text `[image omitted: the model cannot see images]` or `[document omitted: the model cannot read documents]`. The model sees no images, and a 400 would end Claude Code's session.
+- With `--vision`, `image` blocks with a `base64` source, also inside a `tool_result`, reach the prompt as images (see [Images](#images)). An image block with a `url` source gets a 400. Without `--vision`, `image` blocks become the text `[image omitted: the model cannot see images]`, since a 400 would end Claude Code's session. `document` blocks always become `[document omitted: the model cannot read documents]`.
 - An assistant's `thinking` blocks become its past reasoning, which the template renders before its text and tool calls. `redacted_thinking` is dropped.
 - A last `assistant` message is a prefill, and the reply continues it.
 - `tools` entries with a `type` other than `custom` are Anthropic's server tools, such as web search, and are left out.
@@ -113,6 +116,27 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS=<context>
 Claude Code sends background requests, such as titles and summaries, to its Haiku model, so that name must point at this server too. It assumes a context of 1,048,576 tokens for a model it does not know. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the server's `--context`, or to the `max_model_len` that `/v1/models` lists, so that it compacts the conversation before the prompt overflows.
 
 With `--streams 1`, the [prefix cache](#prefix-cache) holds one prompt. A background request that does not start with the conversation's tokens then replaces it with its own prompt, and the next turn of the main conversation prefills its whole prompt again. With `--streams 2` or more, the background request's prompt takes another entry, and the conversation keeps its own.
+
+## Images
+
+With `--vision`, the server loads the vision tower beside the model and takes images in the chat and Messages routes:
+
+- `/v1/chat/completions`: content parts `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`, also with `image_url` as a plain string, and `input_image` parts. `detail` is ignored.
+- `/v1/messages`: `image` blocks with `{"type": "base64", "media_type", "data"}` sources, in user messages and inside `tool_result` blocks.
+
+Images must be inline: PNG, JPEG, WebP or GIF (its first frame) in base64. The server does not fetch URLs, so an `http` or `https` image URL gets a 400 that says so. Images are allowed in user and tool messages only, as the chat template allows them.
+
+Each image goes through the reference preprocessing ([vision.md](vision.md)). An image of more than `--max-image-pixels` shrinks to fit with PIL's bicubic filter, keeping its aspect ratio. Its sides are then padded up to multiples of 40 pixels, and each 40 x 40 square becomes one image token: 676 tokens for a 1024 x 1024 image and 1,296 for 1920 x 1080. The prompt holds `<|content_image|>`, one `<|unused_200054|>` placeholder per image token and `<|end_message|>`, after the message's header, where the chat template puts an image. `usage.prompt_tokens` and the tokenizer routes count the placeholders.
+
+A request gets a 400 when it holds more than `--max-images` images, when an image is not one of the four formats or does not decode, or when an image has more than 50 million pixels before shrinking. An image that still needs more image tokens after shrinking than a square of `--max-image-pixels` with one more row and column of tokens, 1,369 by default, gets a 400 too; only very narrow or wide images do. The request body may grow by 20 MiB per image allowed.
+
+The tower runs on the engine thread right before the prefill chunk that first reaches an image, and its time counts as prefill for `--decode-floor`. Prefill writes the image's rows over the placeholders' embeddings after `embed_norm`, as Transformers does, and positions stay sequential. An image that crosses a prefill chunk boundary is encoded once and its rows serve both chunks.
+
+Two prompts with different images have the same tokens, so the [prefix cache](#prefix-cache) does not match prompts by their tokens alone. Its device entries, its host tier and the files in `--cache-dir` hold each prompt's key: its tokens with each image's placeholders replaced by ids above the vocabulary, taken from the SHA-256 of the image file and from `--max-image-pixels`. A prompt whose images differ from an entry's below the entry's boundary does not match it. A follow-up turn of a conversation with images reads every image below its boundary from the cache, and the tower encodes only the images past it.
+
+The speculative draft reads the target's hidden states at every prompt position, image positions included, so it sees what the target sees. Verify decides every token, so images do not change speculation's output either way. Acceptance on replies about images is not measured yet.
+
+`siphon-plan --vision [--max-image-pixels N]` adds the tower's weights, its buffers for the largest image and the image rows of one prefill chunk to the plan. On an idle 32 GB RTX 5090, `--vision` at the defaults takes 0.69 GiB and cuts the longest context with FP8 weights and caches from 648,192 to 608,256 positions, with the default 0.25 GiB margin. Without `--vision` the plan and the server are as before.
 
 ## Sampling
 

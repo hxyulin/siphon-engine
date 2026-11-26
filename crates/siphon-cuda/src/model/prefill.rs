@@ -112,6 +112,31 @@ const _: () = assert!(HEAD_ROWS == siphon::memory::HEAD_ROWS);
 /// Receives each chunk's feature taps and the position of its first row.
 type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
+/// The embedding rows of one image in a prompt. Prefill writes them over the rows of the
+/// image's placeholder tokens after `embed_norm`, as Transformers' Inkling 2 scatters the
+/// vision tower's features into `inputs_embeds`, which hold normed embeddings. Positions
+/// stay sequential through the image.
+#[derive(Clone, Debug)]
+pub struct ImageRows {
+    /// The prompt position of the image's first placeholder.
+    pub position: usize,
+    /// BF16 `[placeholders, hidden]`, written on the model's stream or synchronized with it.
+    pub rows: Arc<CudaSlice<bf16>>,
+}
+
+impl ImageRows {
+    /// Placeholders the image covers.
+    #[must_use]
+    pub fn len(&self, hidden: usize) -> usize {
+        self.rows.len() / hidden
+    }
+}
+
+/// Gives the images whose placeholders overlap prompt positions `start..end`, a chunk that
+/// prefill is about to run. Prefill asks once per chunk, so the caller can encode each image
+/// only when its first chunk comes and drop it after its last.
+pub type ImageSource<'a> = &'a mut dyn FnMut(usize, usize) -> anyhow::Result<Vec<ImageRows>>;
+
 /// Which logits [`Model::prefill`] produces.
 pub enum PrefillLogits<'a> {
     /// The last row's only, which [`Model::logits`] then returns.
@@ -421,7 +446,7 @@ impl Model {
         chunk: usize,
         logits: PrefillLogits<'_>,
     ) -> anyhow::Result<u32> {
-        self.prefill_chunks(tokens, chunk, logits, None)
+        self.prefill_chunks(tokens, chunk, logits, None, None)
     }
 
     /// [`Model::prefill`] that also records every row's feature taps for the draft, BF16
@@ -435,7 +460,51 @@ impl Model {
         logits: PrefillLogits<'_>,
         taps: TapsCallback<'_>,
     ) -> anyhow::Result<u32> {
-        self.prefill_chunks(tokens, chunk, logits, Some(taps))
+        self.prefill_chunks(tokens, chunk, logits, Some(taps), None)
+    }
+
+    /// [`Model::prefill_with_taps`], with taps if `taps` is `Some`, for a prompt with
+    /// images: before each chunk it asks `images` for the images that overlap the chunk's
+    /// positions, and writes their rows over the chunk's normed embeddings. The tokens at
+    /// those positions are the images' placeholders; their own embeddings are discarded.
+    pub fn prefill_with_images(
+        &mut self,
+        tokens: &[u32],
+        chunk: usize,
+        logits: PrefillLogits<'_>,
+        taps: Option<TapsCallback<'_>>,
+        images: ImageSource<'_>,
+    ) -> anyhow::Result<u32> {
+        self.prefill_chunks(tokens, chunk, logits, taps, Some(images))
+    }
+
+    /// The normed embedding rows of `tokens`, BF16 `[tokens, hidden]`: the rows prefill
+    /// starts from. Image rows replace these, so a test can stand an image in for text.
+    pub fn embedding_rows(&self, tokens: &[u32]) -> anyhow::Result<CudaSlice<bf16>> {
+        ensure!(!tokens.is_empty(), "no tokens to embed");
+        let ctx = &self.ctx;
+        let hidden = ctx.hidden();
+        let ids = tokens
+            .iter()
+            .map(|&t| Ok(i32::try_from(t)?))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let ids = ctx.stream.clone_htod(&ids)?;
+        let mut embedded = zeros::<bf16>(&ctx.stream, tokens.len() * hidden)?;
+        let mut normed = zeros::<bf16>(&ctx.stream, tokens.len() * hidden)?;
+        ctx.kernels.elementwise.embedding(
+            &ctx.stream,
+            &ids,
+            ctx.weights.embed.slice(),
+            &mut embedded,
+        )?;
+        ctx.kernels.norm.rms_norm(
+            &ctx.stream,
+            &embedded,
+            &ctx.weights.embed_norm,
+            &mut normed,
+            ctx.eps(),
+        )?;
+        Ok(normed)
     }
 
     /// Allocates the prefill buffers for chunks of `rows` rows now, unless buffers at least
@@ -466,6 +535,7 @@ impl Model {
         chunk: usize,
         mut logits: PrefillLogits<'_>,
         mut taps: Option<TapsCallback<'_>>,
+        mut images: Option<ImageSource<'_>>,
     ) -> anyhow::Result<u32> {
         ensure!(!tokens.is_empty(), "nothing to prefill");
         ensure!(
@@ -499,7 +569,18 @@ impl Model {
         let count = pieces.len();
         for (i, piece) in pieces.enumerate() {
             let start = self.position;
-            self.prefill_chunk(piece, &mut logits, i + 1 == count)?;
+            let runs = match images.as_mut() {
+                Some(images) => images(start, start + piece.len())?,
+                None => Vec::new(),
+            };
+            for run in &runs {
+                ensure!(
+                    !run.rows.is_empty() && run.rows.len().is_multiple_of(hidden),
+                    "image rows hold {} values, not whole rows of {hidden}",
+                    run.rows.len()
+                );
+            }
+            self.prefill_chunk(piece, &mut logits, i + 1 == count, &runs)?;
             if let Some(taps) = taps.as_mut() {
                 let p = self
                     .prefill
@@ -512,12 +593,14 @@ impl Model {
         self.next_token()
     }
 
-    /// Enqueues one chunk. Only the final chunk computes the last row's logits.
+    /// Enqueues one chunk, with the rows of the `images` that overlap it. Only the final
+    /// chunk computes the last row's logits.
     fn prefill_chunk(
         &mut self,
         tokens: &[u32],
         logits: &mut PrefillLogits<'_>,
         final_chunk: bool,
+        images: &[ImageRows],
     ) -> anyhow::Result<()> {
         let m = tokens.len();
         let start = self.position;
@@ -552,6 +635,7 @@ impl Model {
             start,
             logits,
             final_chunk,
+            images,
         )?;
         self.position += m;
         Ok(())
@@ -627,6 +711,9 @@ impl Ctx {
     /// its own sequence, whose caches, conv states and position the batch's state tables
     /// give, and `visits` only gives each visit's cache sizes and formats. It ends with
     /// every row's logits and greedy token. The decode scratch is left alone.
+    ///
+    /// The rows of `images` that fall in the chunk replace its normed embeddings. Only a
+    /// prompt's prefill has images; verify passes and batched steps pass none.
     #[expect(clippy::too_many_arguments, reason = "the parts of Model a chunk uses")]
     #[expect(
         clippy::too_many_lines,
@@ -643,6 +730,7 @@ impl Ctx {
         start: usize,
         logits: &mut PrefillLogits<'_>,
         final_chunk: bool,
+        images: &[ImageRows],
     ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
@@ -718,6 +806,19 @@ impl Ctx {
             &mut rows_mut(&mut p.hidden, m, hidden),
             self.eps(),
         )?;
+        for image in images {
+            let first = image.position.max(start);
+            let end = (image.position + image.len(hidden)).min(start + m);
+            if first < end {
+                let from = (first - image.position) * hidden;
+                let to = (first - start) * hidden;
+                let len = (end - first) * hidden;
+                self.stream.memcpy_dtod(
+                    &image.rows.slice(from..from + len),
+                    &mut p.hidden.slice_mut(to..to + len),
+                )?;
+            }
+        }
 
         let mut blocks = Blocks {
             len: 0,

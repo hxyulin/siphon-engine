@@ -569,6 +569,7 @@ mod linux {
             streams: 1,
             prefix_entries: 0,
             sms: gpu.sms()?,
+            vision: None,
         })?;
         let contexts = args
             .contexts

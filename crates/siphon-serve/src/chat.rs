@@ -12,6 +12,8 @@ use anyhow::Context as _;
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+use crate::vision::{Collector, PromptImage, Vision};
+
 /// A request the server cannot serve, reported to the client as a 400.
 #[derive(Debug)]
 pub struct InvalidRequest(pub String);
@@ -69,6 +71,15 @@ pub struct Vocab {
     pub special: Special,
     /// Every special token's id, sorted.
     specials: Vec<u32>,
+    /// Image input, with `--vision`.
+    vision: Option<Vision>,
+}
+
+/// A rendered prompt and its images, in prompt order.
+#[derive(Debug)]
+pub struct Rendered {
+    pub ids: Vec<u32>,
+    pub images: Vec<PromptImage>,
 }
 
 /// `chat_template.jinja`'s named thinking efforts.
@@ -125,7 +136,17 @@ impl Vocab {
             tokenizer,
             special,
             specials,
+            vision: None,
         })
+    }
+
+    /// Takes image parts with `vision`; without it they are refused.
+    pub fn set_vision(&mut self, vision: Option<Vision>) {
+        self.vision = vision;
+    }
+
+    pub fn vision(&self) -> Option<&Vision> {
+        self.vision.as_ref()
     }
 
     /// The ids of `text`, with any special-token spelling in it encoded as plain text.
@@ -181,7 +202,26 @@ impl Vocab {
         effort: f64,
         ending: &Ending<'_>,
     ) -> Result<Vec<u32>, InvalidRequest> {
+        Ok(self.render_prompt(messages, tools, effort, ending)?.ids)
+    }
+
+    /// [`Vocab::render_to`] that also returns the prompt's images. An image part takes
+    /// its message's header, then the ids image preprocessing gives it, where the chat
+    /// template puts `<|content_image|><|unused_200054|><|end_message|>`. Without
+    /// `--vision`, an image part is refused.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pass over the messages, as the template's loop"
+    )]
+    pub fn render_prompt(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        effort: f64,
+        ending: &Ending<'_>,
+    ) -> Result<Rendered, InvalidRequest> {
         let s = self.special;
+        let mut images = Collector::new(self.vision.as_ref());
         let continuing = matches!(ending, Ending::Continue);
         if continuing
             && messages
@@ -248,15 +288,32 @@ impl Vocab {
             }
             // An assistant's empty text is left out next to its reasoning or tool calls.
             let skip_empty = assistant && (!tool_calls.is_empty() || reasoning.is_some());
-            let mut texts = texts(message, skip_empty)?;
+            let mut parts = parts(message, skip_empty)?;
             if open && !tool_calls.is_empty() {
                 return Err(invalid(
                     "continue_final_message cannot continue a message with tool calls",
                 ));
             }
-            let last = open.then(|| texts.pop().unwrap_or(""));
-            for text in texts {
-                block(&mut ids, &header, s.content_text, text);
+            let has_image = parts.iter().any(|p| matches!(p, Part::Image(_)));
+            if self.vision.is_some() && has_image && role != "user" && role != "tool" {
+                return Err(invalid(
+                    "Image content is only supported for user and tool messages",
+                ));
+            }
+            // An open message is an assistant's, so its parts are text.
+            let last = open.then(|| match parts.pop() {
+                Some(Part::Text(text)) => text,
+                _ => "",
+            });
+            for part in parts {
+                match part {
+                    Part::Text(text) => block(&mut ids, &header, s.content_text, text),
+                    Part::Image(image) => {
+                        ids.extend_from_slice(&header);
+                        let at = ids.len();
+                        ids.extend(images.image(image, at)?);
+                    }
+                }
             }
             if let Some(last) = last {
                 // The last text block stays open: no end marker.
@@ -276,7 +333,10 @@ impl Vocab {
             block(&mut ids, &[s.message_system], s.content_text, &effort_block);
         }
         self.end(&mut ids, tools, ending)?;
-        Ok(ids)
+        Ok(Rendered {
+            ids,
+            images: images.images,
+        })
     }
 }
 
@@ -441,30 +501,34 @@ fn tool_name<'a>(messages: &'a [Value], message: &Value) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-/// The texts of a message's content, a block each; an empty string is left out when
+/// One block of a message's content.
+enum Part<'a> {
+    Text(&'a str),
+    Image(&'a Value),
+}
+
+/// The parts of a message's content, a block each; an empty string is left out when
 /// `skip_empty`.
-fn texts(message: &Value, skip_empty: bool) -> Result<Vec<&str>, InvalidRequest> {
+fn parts(message: &Value, skip_empty: bool) -> Result<Vec<Part<'_>>, InvalidRequest> {
     match message.get("content") {
         Some(Value::String(text)) if text.is_empty() && skip_empty => Ok(Vec::new()),
-        Some(Value::String(text)) => Ok(vec![text.as_str()]),
+        Some(Value::String(text)) => Ok(vec![Part::Text(text.as_str())]),
         Some(Value::Array(parts)) => parts.iter().map(content_part).collect(),
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(_) => Err(invalid("message content must be a string or an array")),
     }
 }
 
-/// The text of one content part; images and audio are refused.
-fn content_part(part: &Value) -> Result<&str, InvalidRequest> {
+/// One content part: text or an image; audio is refused.
+fn content_part(part: &Value) -> Result<Part<'_>, InvalidRequest> {
     if let Value::String(text) = part {
-        return Ok(text);
+        return Ok(Part::Text(text));
     }
     match part.get("type").and_then(Value::as_str) {
-        None | Some("text" | "input_text") => {
-            Ok(part.get("text").and_then(Value::as_str).unwrap_or(""))
-        }
-        Some("image" | "input_image" | "image_url") => {
-            Err(invalid("image input is not supported by this server"))
-        }
+        None | Some("text" | "input_text") => Ok(Part::Text(
+            part.get("text").and_then(Value::as_str).unwrap_or(""),
+        )),
+        Some("image" | "input_image" | "image_url") => Ok(Part::Image(part)),
         Some("audio" | "input_audio" | "audio_url") => {
             Err(invalid("Inkling 2 does not accept audio input"))
         }

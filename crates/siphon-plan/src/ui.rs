@@ -16,7 +16,12 @@ use crate::{
 };
 
 /// Rows a printed frame takes.
-pub const HEIGHT: u16 = 30;
+const HEIGHT: u16 = 30;
+
+/// Rows of a printed frame: one more for the vision tower's part.
+pub fn height(app: &App) -> u16 {
+    HEIGHT + u16::from(app.vision)
+}
 
 const DIM: Color = Color::Rgb(110, 116, 126);
 const ACCENT: Color = Color::Rgb(122, 162, 247);
@@ -99,9 +104,18 @@ fn format_name(weights: WeightFormat, kv: KvFormat) -> String {
     )
 }
 
-/// The GPU's memory by holder, in the order the bar draws it.
-#[expect(clippy::too_many_lines, reason = "one entry per holder")]
+/// The GPU's memory by holder, in the order the bar draws it; the vision tower only with
+/// `--vision`.
 fn parts(app: &App) -> Vec<Part> {
+    let mut parts = all_parts(app);
+    if !app.vision {
+        parts.retain(|p| p.name != "Vision");
+    }
+    parts
+}
+
+#[expect(clippy::too_many_lines, reason = "one entry per holder")]
+fn all_parts(app: &App) -> Vec<Part> {
     let config = app.config();
     let (context, _) = app.context();
     let plan = app.plan();
@@ -188,6 +202,12 @@ fn parts(app: &App) -> Vec<Part> {
             plan.prefix,
             Color::Rgb(148, 226, 213),
             "copies of rings, conv",
+        ),
+        Part::new(
+            "Vision",
+            plan.vision,
+            Color::Rgb(242, 205, 205),
+            "tower, largest image",
         ),
         Part::new(
             "Runtime",

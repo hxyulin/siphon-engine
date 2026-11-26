@@ -183,7 +183,9 @@ fn copy(
 
 /// One prompt's state in host memory.
 struct HostEntry {
-    /// The prompt's tokens below its boundary, a multiple of [`HOST_CHUNK_POSITIONS`].
+    /// The prompt's key ([`super::Prompt::key`]) below its boundary, a multiple of
+    /// [`HOST_CHUNK_POSITIONS`]: its tokens, with image placeholders replaced by ids of the
+    /// images' hashes.
     tokens: Vec<u32>,
     /// The chunks of the global caches, by position.
     kv: Vec<u32>,

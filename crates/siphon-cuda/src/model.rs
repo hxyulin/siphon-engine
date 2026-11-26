@@ -21,8 +21,8 @@ mod verify;
 
 pub use batch::BATCH_ROWS;
 pub use prefill::{
-    DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, FP8_ATTENTION_KEYS, MAX_PREFILL_CHUNK,
-    PrefillAttention, PrefillLogits,
+    DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, FP8_ATTENTION_KEYS, ImageRows, ImageSource,
+    MAX_PREFILL_CHUNK, PrefillAttention, PrefillLogits,
 };
 pub use prefix::{DeviceSpan, GlobalKv, LocalState};
 pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};

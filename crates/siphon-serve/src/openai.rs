@@ -71,6 +71,7 @@ use crate::{
     request::{self, SamplingDefaults, SamplingFields, ToolChoice},
     stop::Stops,
     tokenize::{self, DecodeRequest, EncodeRequest},
+    vision::PromptImage,
 };
 
 pub struct App {
@@ -109,7 +110,11 @@ const BODY_BYTES_PER_POSITION: usize = 32;
 
 pub fn router(app: Arc<App>) -> Router {
     // axum's default limit of 2 MB holds a prompt of only about 400K tokens.
-    let body_limit = (app.engine.max_context() * BODY_BYTES_PER_POSITION).max(2 << 20);
+    let body_limit = (app.engine.max_context() * BODY_BYTES_PER_POSITION).max(2 << 20)
+        + app
+            .vocab
+            .vision()
+            .map_or(0, crate::vision::Vision::body_bytes);
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/models/{*id}", get(model))
@@ -402,6 +407,8 @@ impl Delivery {
 /// A validated request, ready for the engine.
 pub(crate) struct Prepared {
     pub(crate) prompt: Vec<u32>,
+    /// The prompt's images, with `--vision`.
+    pub(crate) images: Vec<PromptImage>,
     pub(crate) max_tokens: usize,
     pub(crate) delivery: Delivery,
     /// vLLM's `return_token_ids`: the prompt's and the completion's ids.
@@ -440,16 +447,17 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
         request.reasoning_effort.as_ref(),
         request.chat_template_kwargs.as_ref(),
     )?;
-    let prompt = app
+    let rendered = app
         .vocab
-        .render_to(&request.messages, &tools, effort, &ending)?;
+        .render_prompt(&request.messages, &tools, effort, &ending)?;
     let max_tokens = max_tokens(
         app.engine.max_context(),
-        prompt.len(),
+        rendered.ids.len(),
         request.max_completion_tokens.or(request.max_tokens),
     )?;
     Ok(Prepared {
-        prompt,
+        prompt: rendered.ids,
+        images: rendered.images,
         max_tokens,
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
@@ -528,21 +536,23 @@ pub(crate) fn max_tokens(
 pub(crate) fn submit(
     app: &App,
     prompt: &[u32],
+    images: Vec<PromptImage>,
     max_tokens: usize,
     ignore_eos: bool,
     sampling: Sampling,
 ) -> Result<Results, ApiError> {
-    let mut results = submit_choices(app, prompt, max_tokens, ignore_eos, &[sampling])?;
+    let mut results = submit_choices(app, prompt, images, max_tokens, ignore_eos, &[sampling])?;
     results
         .pop()
         .ok_or_else(|| ApiError::internal("the engine took no job"))
 }
 
-/// Queues one job per entry of `samplings`, all of the same prompt, and returns their
-/// events in that order. The jobs fit the queue together or not at all.
+/// Queues one job per entry of `samplings`, all of the same prompt and `images`, and
+/// returns their events in that order. The jobs fit the queue together or not at all.
 pub(crate) fn submit_choices(
     app: &App,
     prompt: &[u32],
+    images: Vec<PromptImage>,
     max_tokens: usize,
     ignore_eos: bool,
     samplings: &[Sampling],
@@ -555,11 +565,17 @@ pub(crate) fn submit_choices(
         )));
     }
     let prompt_len = prompt.len();
+    let key = app
+        .vocab
+        .vision()
+        .and_then(|v| v.cache_key(prompt, &images));
+    let images: crate::vision::Images = images.into();
     let (jobs, receivers): (Vec<Job>, Vec<_>) = samplings
         .iter()
         .map(|&sampling| {
             let (events, receiver) = mpsc::unbounded_channel();
-            let job = Job::new(prompt.to_vec(), max_tokens, ignore_eos, sampling, events);
+            let job = Job::new(prompt.to_vec(), max_tokens, ignore_eos, sampling, events)
+                .with_images(std::sync::Arc::clone(&images), key.clone());
             (job, receiver)
         })
         .unzip();
@@ -719,6 +735,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
     let max_tokens = max_tokens(app.engine.max_context(), prompt.len(), request.max_tokens)?;
     Ok(Prepared {
         prompt,
+        images: Vec::new(),
         max_tokens,
         delivery: Delivery::new(request.stream, request.stream_options),
         return_token_ids: request.return_token_ids.unwrap_or(false),
@@ -748,6 +765,7 @@ async fn completions(
 async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Response, ApiError> {
     let Prepared {
         prompt,
+        images,
         max_tokens,
         delivery,
         return_token_ids,
@@ -757,7 +775,7 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
     } = prepared;
     let reply = Reply::new(&app, prompt.len(), kind);
     let outputs = vec![output; samplings.len()];
-    let results = submit_choices(&app, &prompt, max_tokens, ignore_eos, &samplings)?;
+    let results = submit_choices(&app, &prompt, images, max_tokens, ignore_eos, &samplings)?;
     let prompt_ids = return_token_ids.then_some(prompt);
     let fanout = Fanout::new(results);
     if let Delivery::Stream { include_usage } = delivery {

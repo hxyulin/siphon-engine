@@ -18,13 +18,17 @@
 //! With a host tier ([`Speculator::enable_host_cache`], [`super::host`]), every saved entry
 //! is also copied to host memory, global caches included, and a prompt whose entry died
 //! on the device restores from there into the slot it takes.
+//!
+//! Entries, device and host, hold and match a prompt's key ([`Prompt::key`]), not its
+//! tokens: the tokens with each image's placeholders replaced by ids of the image's hash.
+//! Every function here that takes a `prompt: &[u32]` takes that key.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
 
 use super::{
-    Speculator,
+    Prompt, Speculator,
     host::{DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS, HostCache},
 };
 use crate::{
@@ -58,7 +62,7 @@ struct Entry {
     slot: Option<usize>,
     /// [`Model::slot_sequence`] of `slot` when the entry was saved or moved there.
     sequence: u64,
-    /// The prompt's tokens below the boundary.
+    /// The prompt's key ([`Prompt::key`]) below the boundary.
     tokens: Vec<u32>,
     /// The prefill chunk the state was prefilled with.
     chunk: usize,
@@ -365,17 +369,22 @@ impl Speculator {
     pub fn prefill_cached(
         &mut self,
         model: &mut Model,
-        prompt: &[u32],
+        prompt: Prompt<'_>,
         chunk: usize,
     ) -> anyhow::Result<(u32, usize)> {
-        ensure!(!prompt.is_empty(), "nothing to prefill");
+        prompt.check()?;
         let now = Instant::now();
         let Some(cache) = self.prefix.as_ref() else {
             model.reset()?;
-            return Ok((self.prefill(model, prompt, chunk)?, 0));
+            return Ok((self.prefill_saving(model, prompt, chunk, None)?, 0));
         };
+        let Prompt {
+            tokens,
+            key,
+            mut images,
+        } = prompt;
         cache.fence()?;
-        let source = cache.pick(model, prompt, chunk, &[], Some(self.draft_sequence), now);
+        let source = cache.pick(model, key, chunk, &[], Some(self.draft_sequence), now);
         let (mut hit, start) = match source {
             Some(Source::Device(i)) => {
                 let e = &cache.entries[i];
@@ -392,7 +401,7 @@ impl Speculator {
                 (None, 0)
             }
         };
-        self.start_prompt(model, prompt)?;
+        self.start_prompt(model, tokens)?;
         let stream = std::sync::Arc::clone(model.stream());
         let cache = self.prefix.as_mut().context("the cache is on")?;
         match source {
@@ -421,25 +430,26 @@ impl Speculator {
         }
         // The last chunk boundary below the end, so at least one row remains for the
         // logits. `start` is such a boundary of a shorter prompt, so it is at most this.
-        let boundary = (prompt.len() - 1) / chunk * chunk;
+        let boundary = (tokens.len() - 1) / chunk * chunk;
         let from_host = matches!(source, Some(Source::Host(..)));
         if boundary > start || from_host {
             // Prefill splits a chunk only at the end of its tokens, so the chunks match a
             // prefill of the whole prompt.
             if boundary > start {
-                self.prefill_rows(model, &prompt[start..boundary], chunk)?;
+                let images = Prompt::images(&mut images);
+                self.prefill_rows(model, &tokens[start..boundary], images, chunk)?;
             }
             // A state restored from the host goes into a device entry too, so that the
             // next turn finds it there.
             let cache = self.prefix.as_ref().context("the cache is on")?;
             hit = hit.or_else(|| cache.free_entry(model, &[], now));
             if let Some(i) = hit {
-                self.save_entry(model, i, 0, &prompt[..boundary], chunk)?;
+                self.save_entry(model, i, 0, &key[..boundary], chunk)?;
                 self.save_entry_rings(model, i)?;
             }
         }
-        let first = self.prefill_rows(model, &prompt[boundary..], chunk)?;
-        Ok((self.end_prompt(model, prompt.len(), first)?, start))
+        let first = self.prefill_rows(model, &tokens[boundary..], images, chunk)?;
+        Ok((self.end_prompt(model, tokens.len(), first)?, start))
     }
 
     /// Picks a slot outside `busy` for a request that runs batched, and readies it: the

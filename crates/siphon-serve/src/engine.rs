@@ -45,6 +45,8 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::vision::Images;
+
 /// What a request asks the engine for.
 #[cfg_attr(
     not(target_os = "linux"),
@@ -52,6 +54,11 @@ use tokio::sync::mpsc::UnboundedSender;
 )]
 pub struct Job {
     pub prompt: Vec<u32>,
+    /// The prompt's images, in prompt order.
+    pub images: Images,
+    /// The prompt's prefix cache key ([`siphon_cuda::spec::Prompt`]) when it has images;
+    /// a prompt without them is its own key.
+    key: Option<Vec<u32>>,
     /// Tokens to generate at most, the stop token excluded.
     pub max_tokens: usize,
     /// vLLM's `ignore_eos`: generate `max_tokens` tokens, passing the model's end tokens
@@ -77,6 +84,8 @@ impl Job {
     ) -> Self {
         Self {
             prompt,
+            images: Images::from([]),
+            key: None,
             max_tokens,
             ignore_eos,
             sampling,
@@ -85,6 +94,25 @@ impl Job {
             ticket: None,
             control: None,
         }
+    }
+
+    /// The job with the prompt's `images` and its prefix cache `key`.
+    #[must_use]
+    pub fn with_images(self, images: Images, key: Option<Vec<u32>>) -> Self {
+        Self {
+            images,
+            key,
+            ..self
+        }
+    }
+
+    /// The key the prefix cache matches the prompt by.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only the Linux engine runs jobs")
+    )]
+    fn key(&self) -> &[u32] {
+        self.key.as_deref().unwrap_or(&self.prompt)
     }
 
     /// Whether a drain gave up on the job ([`Engine::cancel`]).
@@ -282,6 +310,16 @@ pub struct Options {
     /// Tokens per second that each decoding request gets at least while another prefills,
     /// with `streams` above 1, or 0 for one batched step per prefill chunk.
     pub decode_floor: f64,
+    /// The vision tower, with `--vision`.
+    pub vision: Option<VisionOptions>,
+}
+
+/// `--vision`'s tower, which runs in BF16: its FP8 products drift 3 to 5 times further
+/// from the reference (docs/vision.md).
+#[derive(Clone, Copy, Debug)]
+pub struct VisionOptions {
+    /// `--max-image-pixels`.
+    pub max_pixels: usize,
 }
 
 /// Sends jobs to the engine thread.
@@ -395,24 +433,82 @@ mod cuda {
         time::Instant,
     };
 
+    use std::sync::Arc;
+
     use anyhow::Context as _;
+    use cudarc::driver::CudaSlice;
+    use half::bf16;
     use siphon::{
         Checkpoint, TextConfig,
-        memory::{self, CONTEXT_BYTES, DEFAULT_MARGIN, DraftChoice, PlanInputs, Planner, gib},
+        memory::{
+            self, CONTEXT_BYTES, DEFAULT_MARGIN, DraftChoice, PlanInputs, Planner, VisionInputs,
+            gib,
+        },
+        vision::VisionConfig,
     };
     use siphon_cuda::{
         Gpu, MemoryUse,
         draft::DraftOptions,
-        model::{DEFAULT_PREFILL_CHUNK, Model, Sampling as ModelSampling},
+        model::{DEFAULT_PREFILL_CHUNK, ImageRows, Model, Sampling as ModelSampling},
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
-            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Speculator, Width, WidthPolicy,
-            load_draft, price,
+            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Prompt, Speculator, Width,
+            WidthPolicy, load_draft, price,
         },
+        vision::{VisionFormat, VisionTower},
         weights::{WeightFormat, Weights},
     };
 
     use super::{Control, Engine, Event, Finish, Job, Options};
+    use crate::vision::PromptImage;
+
+    /// The vision tower, with `--vision`.
+    type Tower = Option<VisionTower>;
+
+    /// An image whose rows a prefill chunk encoded and the next chunk needs too: its index
+    /// among the prompt's images, and its rows.
+    type Kept = Option<(usize, Arc<CudaSlice<bf16>>)>;
+
+    /// The rows of the `images` whose placeholders overlap prompt positions `start..end`,
+    /// encoded by the tower as prefill reaches them. An image that runs past `end` stays in
+    /// `kept` for the next chunk, so that each image is encoded once per prefill.
+    fn image_rows(
+        tower: &mut Tower,
+        hidden: usize,
+        images: &[PromptImage],
+        kept: &mut Kept,
+        (start, end): (usize, usize),
+    ) -> anyhow::Result<Vec<ImageRows>> {
+        let mut rows = Vec::new();
+        for (i, image) in images.iter().enumerate() {
+            let positions = image.positions();
+            if positions.end <= start || positions.start >= end {
+                continue;
+            }
+            let encoded = match kept.take() {
+                Some((k, encoded)) if k == i => encoded,
+                _ => {
+                    let tower = tower.as_mut().context("this server has no vision tower")?;
+                    let encoded = tower.encode(&image.image)?;
+                    anyhow::ensure!(
+                        encoded.len() == positions.len() * hidden,
+                        "the vision tower gave {} values for an image of {} tokens",
+                        encoded.len(),
+                        positions.len()
+                    );
+                    Arc::new(encoded)
+                }
+            };
+            if positions.end > end {
+                *kept = Some((i, Arc::clone(&encoded)));
+            }
+            rows.push(ImageRows {
+                position: positions.start,
+                rows: encoded,
+            });
+        }
+        Ok(rows)
+    }
 
     /// Why a job that a drain gave up on failed.
     const CANCELLED: &str = "the server stopped before the request finished";
@@ -436,11 +532,12 @@ mod cuda {
         thread::Builder::new()
             .name("engine".to_owned())
             .spawn(move || match load(&options, &warmup) {
-                Ok((model, speculator, capacity, check)) => {
+                Ok((model, speculator, tower, capacity, check)) => {
                     let _ = ready.send(Ok(capacity));
                     run(
                         model,
                         speculator,
+                        tower,
                         check,
                         &queue,
                         &stop,
@@ -594,10 +691,11 @@ mod cuda {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "startup, step by step")]
     fn load(
         options: &Options,
         warmup: &[u32],
-    ) -> anyhow::Result<(Model, Speculator, usize, MemoryCheck)> {
+    ) -> anyhow::Result<(Model, Speculator, Tower, usize, MemoryCheck)> {
         let started = Instant::now();
         let config = TextConfig::load(&options.model_dir)?;
         let passes = config.loop_config.num_passes;
@@ -622,6 +720,7 @@ mod cuda {
             streams: options.streams,
             prefix_entries: options.prefix_entries,
             sms: gpu.sms()?,
+            vision: vision_inputs(options)?,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
         let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
@@ -639,6 +738,7 @@ mod cuda {
         let draft = load_draft(&mut model, &checkpoint, source, capacity, &draft_options)?;
         let mut speculator = Speculator::with_draft(&model, draft, width)?;
         speculator.set_prefill_chunk(chunk)?;
+        let tower = load_tower(options, &gpu, &checkpoint)?;
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
 
         // Price each width at the warmup prompt, which also captures the graphs.
@@ -699,7 +799,39 @@ mod cuda {
         // prefill would.
         model.reserve_prefill(chunk)?;
         let check = MemoryCheck::new(gpu, planner.plan(capacity).total(), free)?;
-        Ok((model, speculator, capacity, check))
+        Ok((model, speculator, tower, capacity, check))
+    }
+
+    /// Loads the vision tower with `--vision`, on the model's stream, with its buffers for
+    /// the largest image, so that the memory check after warmup sees them.
+    fn load_tower(options: &Options, gpu: &Gpu, checkpoint: &Checkpoint) -> anyhow::Result<Tower> {
+        let Some(v) = vision_inputs(options)? else {
+            return Ok(None);
+        };
+        let mut tower = VisionTower::load(gpu, checkpoint, v.format)?;
+        tower.reserve(v.max_image_tokens * v.patches_per_token)?;
+        eprintln!(
+            "vision tower: {} weights, images shrunk to {} pixels, up to {} image tokens",
+            v.format,
+            options.vision.map_or(0, |o| o.max_pixels),
+            v.max_image_tokens
+        );
+        Ok(Some(tower))
+    }
+
+    /// The plan's vision tower and largest image, with `--vision`.
+    fn vision_inputs(options: &Options) -> anyhow::Result<Option<VisionInputs>> {
+        options
+            .vision
+            .map(|v| {
+                let config = VisionConfig::load(&options.model_dir)?;
+                Ok(VisionInputs {
+                    format: VisionFormat::Bf16,
+                    max_image_tokens: memory::max_image_tokens(config.token_size(), v.max_pixels),
+                    patches_per_token: config.merge_size * config.merge_size,
+                })
+            })
+            .transpose()
     }
 
     /// The weight and KV cache formats `options` ask for.
@@ -883,6 +1015,8 @@ mod cuda {
         /// Tokens emitted by speculation and by batched steps.
         speculated: usize,
         batched: usize,
+        /// The image a batched prefill chunk encoded for the next one.
+        kept: Kept,
     }
 
     impl Request {
@@ -911,6 +1045,7 @@ mod cuda {
                 stay_batched: false,
                 speculated: 0,
                 batched: 0,
+                kept: None,
             };
             if let Some(e) = error {
                 request.fail(&e);
@@ -959,9 +1094,13 @@ mod cuda {
         fn finish(&self, detail: &str) {
             let decode_s = self.started.elapsed().as_secs_f64() - self.prefill_s;
             let events = &self.job.events;
+            let images = match self.job.images.len() {
+                0 => String::new(),
+                n => format!(", {n} images"),
+            };
             eprintln!(
-                "job: {} prompt tokens ({} cached), prefill {:.0} ms{}, {} tokens in {:.2} s \
-                 ({:.1} tok/s, {} speculated, {} batched steps{detail}), {}",
+                "job: {} prompt tokens ({} cached{images}), prefill {:.0} ms{}, {} tokens in \
+                 {:.2} s ({:.1} tok/s, {} speculated, {} batched steps{detail}), {}",
                 self.job.prompt.len(),
                 self.cached,
                 self.prefill_s * 1e3,
@@ -988,9 +1127,15 @@ mod cuda {
         }
     }
 
+    #[expect(clippy::too_many_arguments, reason = "the engine thread's state")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the engine thread's loop, top to bottom"
+    )]
     fn run(
         mut model: Model,
         mut speculator: Speculator,
+        mut tower: Tower,
         mut check: MemoryCheck,
         queue: &Receiver<Vec<Job>>,
         stop: &[u32],
@@ -1036,6 +1181,7 @@ mod cuda {
                         resumed = batched(
                             &mut model,
                             &mut speculator,
+                            &mut tower,
                             Vec::new(),
                             &mut waiting,
                             queue,
@@ -1052,13 +1198,14 @@ mod cuda {
                 // a batch of one rather than whole in slot 0.
                 if streams > 1
                     && speculator
-                        .prefix_lookup(&model, &job.prompt, speculator.prefill_chunk(), &[])
+                        .prefix_lookup(&model, job.key(), speculator.prefill_chunk(), &[])
                         .is_some_and(|hit| !hit.draft)
                 {
                     waiting.push_front(job);
                     resumed = batched(
                         &mut model,
                         &mut speculator,
+                        &mut tower,
                         Vec::new(),
                         &mut waiting,
                         queue,
@@ -1077,13 +1224,21 @@ mod cuda {
                 request
             };
             let interrupt = (streams > 1).then_some((queue, &mut waiting));
-            match alone(&mut model, &mut speculator, &mut request, stop, interrupt) {
+            match alone(
+                &mut model,
+                &mut speculator,
+                &mut tower,
+                &mut request,
+                stop,
+                interrupt,
+            ) {
                 Ok(true) => {
                     speculator.follow(&model);
                     request.followed = true;
                     resumed = batched(
                         &mut model,
                         &mut speculator,
+                        &mut tower,
                         vec![request],
                         &mut waiting,
                         queue,
@@ -1108,6 +1263,7 @@ mod cuda {
     fn alone(
         model: &mut Model,
         speculator: &mut Speculator,
+        tower: &mut Tower,
         request: &mut Request,
         stop: &[u32],
         mut interrupt: Option<(&Receiver<Vec<Job>>, &mut VecDeque<Job>)>,
@@ -1116,11 +1272,23 @@ mod cuda {
         let go_on = if request.next.is_some() {
             true
         } else {
-            let (first, cached) = speculator.prefill_cached(
-                model,
-                &request.job.prompt,
-                speculator.prefill_chunk(),
-            )?;
+            let hidden = model.config().hidden_size;
+            let chunk = speculator.prefill_chunk();
+            let job = &request.job;
+            let mut kept = None;
+            let mut source = |start: usize, end: usize| {
+                image_rows(tower, hidden, &job.images, &mut kept, (start, end))
+            };
+            let prompt = Prompt {
+                tokens: &job.prompt,
+                key: job.key(),
+                images: if job.images.is_empty() {
+                    None
+                } else {
+                    Some(&mut source)
+                },
+            };
+            let (first, cached) = speculator.prefill_cached(model, prompt, chunk)?;
             log_host(speculator);
             request.cached = cached;
             let _ = request.job.events.send(Event::Cached(cached));
@@ -1203,6 +1371,7 @@ mod cuda {
     fn speculate_again(
         model: &mut Model,
         speculator: &mut Speculator,
+        tower: &mut Tower,
         r: &mut Request,
     ) -> anyhow::Result<bool> {
         let started = Instant::now();
@@ -1218,6 +1387,7 @@ mod cuda {
             }
             let fed = &r.output[..r.output.len() - 1];
             let tokens: Vec<u32> = r.job.prompt.iter().chain(fed).copied().collect();
+            let key: Vec<u32> = r.job.key().iter().chain(fed).copied().collect();
             anyhow::ensure!(
                 tokens.len() == position,
                 "{} tokens fed, the slot is at {position}",
@@ -1229,7 +1399,22 @@ mod cuda {
             let free = speculator
                 .idle_slot(model, &[0])
                 .context("no free slot to rebuild the draft in")?;
-            speculator.rebuild(model, free, 0, &tokens)?;
+            let hidden = model.config().hidden_size;
+            let images = &r.job.images;
+            let mut kept = None;
+            let mut source = |start: usize, end: usize| {
+                image_rows(tower, hidden, images, &mut kept, (start, end))
+            };
+            let prompt = Prompt {
+                tokens: &tokens,
+                key: &key,
+                images: if images.is_empty() {
+                    None
+                } else {
+                    Some(&mut source)
+                },
+            };
+            speculator.rebuild(model, free, 0, prompt)?;
             log_host(speculator);
             r.followed = true;
             format!("rebuilt the draft in slot {free}")
@@ -1257,6 +1442,7 @@ mod cuda {
     fn batched(
         model: &mut Model,
         speculator: &mut Speculator,
+        tower: &mut Tower,
         mut active: Vec<Request>,
         waiting: &mut VecDeque<Job>,
         queue: &Receiver<Vec<Job>>,
@@ -1285,9 +1471,8 @@ mod cuda {
                 if request.done {
                     continue;
                 }
-                let prompt = &request.job.prompt;
-                let claimed =
-                    speculator.claim_slot(model, prompt, speculator.prefill_chunk(), &busy);
+                let key = request.job.key();
+                let claimed = speculator.claim_slot(model, key, speculator.prefill_chunk(), &busy);
                 log_host(speculator);
                 match claimed {
                     Ok((slot, cached)) => {
@@ -1303,7 +1488,7 @@ mod cuda {
             if active.is_empty() {
                 return None;
             }
-            let chunked = prefill_chunk(model, speculator, &mut active, stop);
+            let chunked = prefill_chunk(model, speculator, tower, &mut active, stop);
             // Right after its prefill, a lone request speculates before any batched step,
             // as it would have from the start.
             if let [r] = active.as_mut_slice()
@@ -1312,7 +1497,7 @@ mod cuda {
                 && !r.stay_batched
                 && waiting.is_empty()
             {
-                match speculate_again(model, speculator, r) {
+                match speculate_again(model, speculator, tower, r) {
                     Ok(true) => return active.pop(),
                     Ok(false) => {}
                     Err(e) => {
@@ -1372,6 +1557,7 @@ mod cuda {
     fn prefill_chunk(
         model: &mut Model,
         speculator: &mut Speculator,
+        tower: &mut Tower,
         active: &mut [Request],
         stop: &[u32],
     ) -> bool {
@@ -1393,7 +1579,19 @@ mod cuda {
         let end = (r.prefilled + chunk).min(len);
         let boundary = len.saturating_sub(1) / chunk * chunk;
         model.set_sampling(r.sampling);
-        let first = match model.prefill_slot(r.slot, &r.job.prompt[r.prefilled..end], chunk) {
+        let tokens = &r.job.prompt[r.prefilled..end];
+        let prefilled = if r.job.images.is_empty() {
+            model.prefill_slot(r.slot, tokens, chunk)
+        } else {
+            // The tower runs here, inside the chunk, so the decode floor counts it as
+            // prefill.
+            let hidden = model.config().hidden_size;
+            let (images, kept) = (&r.job.images, &mut r.kept);
+            let mut source =
+                |start: usize, end: usize| image_rows(tower, hidden, images, kept, (start, end));
+            model.prefill_slot_with_images(r.slot, tokens, chunk, &mut source)
+        };
+        let first = match prefilled {
             Ok(first) => first,
             Err(e) => {
                 r.fail(&e);
@@ -1403,12 +1601,13 @@ mod cuda {
         r.prefilled = end;
         if end == boundary
             && end > r.cached
-            && let Err(e) = speculator.save_prefix(model, r.slot, &r.job.prompt, chunk, &busy)
+            && let Err(e) = speculator.save_prefix(model, r.slot, r.job.key(), chunk, &busy)
         {
             eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
         }
         log_host(speculator);
         if end == len {
+            r.kept = None;
             r.prefill_s = r.started.elapsed().as_secs_f64();
             r.next = Some(first);
             r.done = r.take(&[first], stop).is_break();
