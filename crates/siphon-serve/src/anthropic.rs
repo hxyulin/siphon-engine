@@ -22,7 +22,7 @@ use std::{
 };
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{State, rejection::JsonRejection},
     http::StatusCode,
     response::{
@@ -40,8 +40,8 @@ use crate::{
     chat::{self, Ending, InvalidRequest, Rendered, Thinking, Vocab},
     engine::{Event, Finish},
     openai::{
-        self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, Results, blocking, submit,
-        tool_ending,
+        self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, Results,
+        blocking, submit, tool_ending,
     },
     parse::{Delta, Parser, ToolCall},
     request::{self, SamplingFields, ToolChoice},
@@ -120,13 +120,14 @@ pub struct MessagesRequest {
 
 pub async fn messages(
     State(app): State<Arc<App>>,
+    Extension(id): Extension<RequestId>,
     request: Result<Json<MessagesRequest>, JsonRejection>,
 ) -> Result<Response, Error> {
     let Json(request) = request.map_err(|e| Error(e.into()))?;
     let prepared = blocking(&app, move |app| prepare(app, &request))
         .await
         .map_err(Error)?;
-    respond(app, prepared).await.map_err(Error)
+    respond(app, prepared, &id).await.map_err(Error)
 }
 
 pub async fn count_tokens(
@@ -654,7 +655,7 @@ fn take(
 }
 
 /// Runs a prepared request and answers it, streaming or not.
-async fn respond(app: Arc<App>, prepared: Prepared) -> Result<Response, ApiError> {
+async fn respond(app: Arc<App>, prepared: Prepared, id: &RequestId) -> Result<Response, ApiError> {
     let Prepared {
         prompt,
         images,
@@ -669,7 +670,8 @@ async fn respond(app: Arc<App>, prepared: Prepared) -> Result<Response, ApiError
         .first()
         .copied()
         .ok_or_else(|| ApiError::internal("no sampling"))?;
-    let results = submit(&app, &prompt, images, max_tokens, false, sampling)?;
+    let label = |_| id.label(&message.id, 0, 1);
+    let results = submit(&app, &prompt, images, max_tokens, false, sampling, &label)?;
     if matches!(delivery, Delivery::Whole) {
         // Runs in the handler, so that a client that leaves drops the job.
         let (out, mut rx) = mpsc::channel(1);

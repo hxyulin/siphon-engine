@@ -66,6 +66,8 @@ pub struct Job {
     pub ignore_eos: bool,
     pub sampling: Sampling,
     pub events: UnboundedSender<Event>,
+    /// The request's id and the response's id, for the job's log lines.
+    pub label: Arc<str>,
     /// The submission the job came in: jobs of one submission share their prompt.
     group: u64,
     /// The job's place in the engine's [`Load`], from [`Engine::submit`].
@@ -87,6 +89,7 @@ impl Job {
         ignore_eos: bool,
         sampling: Sampling,
         events: UnboundedSender<Event>,
+        label: Arc<str>,
     ) -> Self {
         Self {
             prompt,
@@ -96,6 +99,7 @@ impl Job {
             ignore_eos,
             sampling,
             events,
+            label,
             group: 0,
             ticket: None,
             control: None,
@@ -426,6 +430,23 @@ impl Engine {
         receiver
             .recv()
             .unwrap_or_else(|_| "the engine thread had already stopped".to_owned())
+    }
+}
+
+#[cfg(test)]
+impl Engine {
+    /// An engine without a GPU thread: its jobs arrive on the receiver, for tests.
+    pub fn fake(max_context: usize) -> (Self, mpsc::Receiver<Vec<Job>>) {
+        let (jobs, receiver) = mpsc::sync_channel(8);
+        let engine = Self {
+            jobs,
+            max_context,
+            load: Arc::default(),
+            queue: 8,
+            streams: 1,
+            control: Arc::default(),
+        };
+        (engine, receiver)
     }
 }
 
@@ -1247,8 +1268,9 @@ mod cuda {
                 String::new()
             };
             eprintln!(
-                "job: {} prompt tokens ({} cached{images}), prefill {:.0} ms{}, {} tokens in \
-                 {:.2} s ({:.1} tok/s, {} speculated, {} batched steps{parks}{detail}), {}",
+                "job: {}: {} prompt tokens ({} cached{images}), prefill {:.0} ms{}, {} tokens \
+                 in {:.2} s ({:.1} tok/s, {} speculated, {} batched steps{parks}{detail}), {}",
+                self.job.label,
                 self.job.prompt.len(),
                 self.cached,
                 self.prefill_s * 1e3,
@@ -1268,7 +1290,7 @@ mod cuda {
         }
 
         fn fail(&mut self, e: &anyhow::Error) {
-            eprintln!("job failed: {e:#}");
+            eprintln!("job failed: {}: {e:#}", self.job.label);
             let _ = self.job.events.send(Event::Failed(format!("{e:#}")));
             self.done = true;
             self.failed = true;

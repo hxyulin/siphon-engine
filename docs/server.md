@@ -48,6 +48,14 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 
 With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` needs `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
+Each request gets an ID. The server takes the client's `x-request-id`, or else `x-client-request-id`, when it holds 1 to 128 printable ASCII characters without spaces, and otherwise makes one such as `req-5e0c1f7a9b3d2e64`. Every response, errors included, returns the ID in `x-request-id`. The `job:` and `job failed:` log lines start with it and the response's own id, so a proxy's request log matches them:
+
+```text
+job: trace-7f3a chatcmpl-6929a1c4000003: 31204 prompt tokens (30720 cached), prefill 48 ms, ...
+```
+
+A request with `n` choices logs one line per choice, labelled `choice i`.
+
 ## Routes
 
 | Route | Notes |
@@ -232,7 +240,6 @@ Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of
 
 - **Another request in a slot loses its conversation without `--host-cache`.** A device entry keeps only the slot's rings and conv states. The global KV cache stays in the slot, so any other sequence there overwrites it. With `--streams 1`, short side requests caused 6 full prefills of 77,421 to 150,445 tokens, at 5.7 to 12.5 s each. The side requests included the agent's own 539-token request and 21-token tests. The host tier, `--host-cache`, now restores such prompts in well under a second.
 - **A prefill stalled every other stream.** In a test on an RTX PRO 6000 Blackwell with two streams of 1,048,576 positions, the running request delivered 2.2 tok/s while the second request's 325 s prefill ran, one batched step per prefill chunk. `--decode-floor` now runs more steps between the chunks (see [Concurrent requests](#concurrent-requests)).
-- **Job lines carry no request ID.** A `job:` log line cannot be matched to a proxy's request log except by time.
 - **Decode slows past 100,000 tokens.** Agent turns decoded at a median 534 tok/s with prompts of 32,000 to 100,000 tokens, and 417 tok/s above 100,000. Speculation kept a median of 3.09 tokens per round.
 
 ## Building on macOS

@@ -7,6 +7,8 @@ mod metrics;
 mod openai;
 mod parse;
 mod request;
+#[cfg(test)]
+mod server_tests;
 mod stop;
 mod tokenize;
 mod vision;

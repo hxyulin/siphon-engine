@@ -46,7 +46,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -137,6 +137,60 @@ pub fn router(app: Arc<App>) -> Router {
             get(|| async { Json(json!({"version": env!("CARGO_PKG_VERSION")})) }),
         )
         .with_state(app)
+        .layer(middleware::from_fn(request_id))
+}
+
+/// A request's id: the client's `x-request-id` or `x-client-request-id` when valid, else
+/// one the server makes. Job log lines carry it, and the response echoes it.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestId(pub(crate) Arc<str>);
+
+/// The longest client request id the server takes.
+const REQUEST_ID_BYTES: usize = 128;
+
+impl RequestId {
+    /// The client's id from `headers`, if one is valid: 1 to 128 printable ASCII bytes
+    /// without spaces.
+    fn from_client(headers: &HeaderMap) -> Option<Self> {
+        ["x-request-id", "x-client-request-id"]
+            .into_iter()
+            .filter_map(|name| headers.get(name))
+            .map(header::HeaderValue::as_bytes)
+            .find(|id| {
+                (1..=REQUEST_ID_BYTES).contains(&id.len()) && id.iter().all(u8::is_ascii_graphic)
+            })
+            .and_then(|id| std::str::from_utf8(id).ok())
+            .map(|id| Self(id.into()))
+    }
+
+    /// A new id: 64 random bits.
+    fn generate() -> Self {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+        Self(format!("req-{:016x}", hasher.finish()).into())
+    }
+
+    /// The log label of the job of the response `response_id`: choice `choice` of `n`.
+    pub(crate) fn label(&self, response_id: &str, choice: usize, n: usize) -> Arc<str> {
+        if n > 1 {
+            format!("{} {response_id} choice {choice}", self.0).into()
+        } else {
+            format!("{} {response_id}", self.0).into()
+        }
+    }
+}
+
+/// Gives the request its [`RequestId`] and puts it in the response's `x-request-id`.
+async fn request_id(mut request: Request, next: Next) -> Response {
+    let id = RequestId::from_client(request.headers()).unwrap_or_else(RequestId::generate);
+    request.extensions_mut().insert(id.clone());
+    let mut response = next.run(request).await;
+    if let Ok(value) = header::HeaderValue::from_str(&id.0) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
 /// `ok`, or a 503 once the server drains, so that the proxy in front stops sending
@@ -532,7 +586,7 @@ pub(crate) fn max_tokens(
     }
 }
 
-/// Queues a job and returns its events.
+/// Queues a job and returns its events. `label` names it in the log.
 pub(crate) fn submit(
     app: &App,
     prompt: &[u32],
@@ -540,8 +594,17 @@ pub(crate) fn submit(
     max_tokens: usize,
     ignore_eos: bool,
     sampling: Sampling,
+    label: &dyn Fn(usize) -> Arc<str>,
 ) -> Result<Results, ApiError> {
-    let mut results = submit_choices(app, prompt, images, max_tokens, ignore_eos, &[sampling])?;
+    let mut results = submit_choices(
+        app,
+        prompt,
+        images,
+        max_tokens,
+        ignore_eos,
+        &[sampling],
+        label,
+    )?;
     results
         .pop()
         .ok_or_else(|| ApiError::internal("the engine took no job"))
@@ -549,6 +612,7 @@ pub(crate) fn submit(
 
 /// Queues one job per entry of `samplings`, all of the same prompt and `images`, and
 /// returns their events in that order. The jobs fit the queue together or not at all.
+/// `label` names choice `i`'s job in the log.
 pub(crate) fn submit_choices(
     app: &App,
     prompt: &[u32],
@@ -556,6 +620,7 @@ pub(crate) fn submit_choices(
     max_tokens: usize,
     ignore_eos: bool,
     samplings: &[Sampling],
+    label: &dyn Fn(usize) -> Arc<str>,
 ) -> Result<Vec<Results>, ApiError> {
     let most = app.engine.max_jobs();
     if samplings.len() > most {
@@ -572,10 +637,18 @@ pub(crate) fn submit_choices(
     let images: crate::vision::Images = images.into();
     let (jobs, receivers): (Vec<Job>, Vec<_>) = samplings
         .iter()
-        .map(|&sampling| {
+        .enumerate()
+        .map(|(i, &sampling)| {
             let (events, receiver) = mpsc::unbounded_channel();
-            let job = Job::new(prompt.to_vec(), max_tokens, ignore_eos, sampling, events)
-                .with_images(std::sync::Arc::clone(&images), key.clone());
+            let job = Job::new(
+                prompt.to_vec(),
+                max_tokens,
+                ignore_eos,
+                sampling,
+                events,
+                label(i),
+            )
+            .with_images(std::sync::Arc::clone(&images), key.clone());
             (job, receiver)
         })
         .unzip();
@@ -682,11 +755,12 @@ fn reason(finish: Finish) -> Reason {
 
 async fn chat_completions(
     State(app): State<Arc<App>>,
+    Extension(id): Extension<RequestId>,
     request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = request?;
     let prepared = blocking(&app, |app| prepare_chat(app, request)).await?;
-    respond(app, prepared, Kind::Chat).await
+    respond(app, prepared, Kind::Chat, &id).await
 }
 
 #[derive(Deserialize)]
@@ -754,15 +828,21 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
 /// token-id prompt. The text returned includes any special tokens generated.
 async fn completions(
     State(app): State<Arc<App>>,
+    Extension(id): Extension<RequestId>,
     request: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = request?;
     let prepared = blocking(&app, |app| prepare_completion(app, request)).await?;
-    respond(app, prepared, Kind::Text).await
+    respond(app, prepared, Kind::Text, &id).await
 }
 
 /// Runs a prepared request and answers it, streaming or not.
-async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Response, ApiError> {
+async fn respond(
+    app: Arc<App>,
+    prepared: Prepared,
+    kind: Kind,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
     let Prepared {
         prompt,
         images,
@@ -775,7 +855,16 @@ async fn respond(app: Arc<App>, prepared: Prepared, kind: Kind) -> Result<Respon
     } = prepared;
     let reply = Reply::new(&app, prompt.len(), kind);
     let outputs = vec![output; samplings.len()];
-    let results = submit_choices(&app, &prompt, images, max_tokens, ignore_eos, &samplings)?;
+    let n = samplings.len();
+    let results = submit_choices(
+        &app,
+        &prompt,
+        images,
+        max_tokens,
+        ignore_eos,
+        &samplings,
+        &|i| id.label(&reply.id, i, n),
+    )?;
     let prompt_ids = return_token_ids.then_some(prompt);
     let fanout = Fanout::new(results);
     if let Delivery::Stream { include_usage } = delivery {
@@ -1330,6 +1419,37 @@ pub fn started() -> u64 {
 mod tests {
     use super::*;
     use crate::chat::tests::vocab;
+
+    #[test]
+    fn client_request_ids_are_checked() {
+        let id = |pairs: &[(&'static str, &[u8])]| {
+            let mut headers = HeaderMap::new();
+            for &(name, value) in pairs {
+                headers.insert(name, header::HeaderValue::from_bytes(value).unwrap());
+            }
+            RequestId::from_client(&headers).map(|id| id.0.to_string())
+        };
+        assert_eq!(
+            id(&[("x-request-id", b"a-1_B.c")]).as_deref(),
+            Some("a-1_B.c")
+        );
+        assert_eq!(
+            id(&[("x-client-request-id", b"c"), ("x-request-id", b"r")]).as_deref(),
+            Some("r")
+        );
+        // An invalid x-request-id falls back to x-client-request-id.
+        assert_eq!(
+            id(&[("x-request-id", b"a b"), ("x-client-request-id", b"c")]).as_deref(),
+            Some("c")
+        );
+        let long = [b'x'; 129];
+        for bad in [&b"a b"[..], b"a\tb", "é".as_bytes(), b"", &long[..]] {
+            assert_eq!(id(&[("x-request-id", bad)]), None, "{bad:?}");
+        }
+        assert!(id(&[("x-request-id", &long[..128])]).is_some());
+        let (a, b) = (RequestId::generate().0, RequestId::generate().0);
+        assert!(a.starts_with("req-") && a.len() == 20 && a != b, "{a} {b}");
+    }
 
     #[test]
     fn max_tokens_fits_the_context() {

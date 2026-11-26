@@ -1644,6 +1644,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tower",
 ]
 
 [[package]]
