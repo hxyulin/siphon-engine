@@ -160,3 +160,135 @@ extern "C" __global__ void accept_greedy(const int* tokens, const int* argmax, c
     }
     *anchor = argmax[accepted];
 }
+
+// ---------------------------------------------------------------------------------------
+// Batched verify: `seqs` sequences verified in parallel, each with `m` (1..=8) rows, using
+// the visit state table `tables` [visits, max_seqs, 6] (words 0..1 KV caches, 2..5 conv
+// states).
+
+namespace {
+constexpr int kBatchStateWords = 6;
+constexpr int kResultLen = 1 + 2 * kVerifyRows;
+}  // namespace
+
+// Copies every (visit, seq) conv state into backup [visits, max_seqs, 3 * kVisitChannels].
+// Grid: (blocks, 4, visits * seqs).
+extern "C" __global__ void conv_backup_batch(const unsigned long long* tables, int max_seqs, int seqs,
+                                             float* backup) {
+    const int s = blockIdx.y;
+    const int v = blockIdx.z / seqs;
+    const int seq = blockIdx.z % seqs;
+    const int n = kStateRows * stream_dims(s);
+    const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
+    const float* src = reinterpret_cast<const float*>(tables[entry * kBatchStateWords + 2 + s]);
+    float* dst = backup + entry * kStateRows * kVisitChannels + kStateRows * stream_offset(s);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// Rebuilds every (visit, seq) conv state from backup and inputs [visits, max_seqs, 8,
+// kVisitChannels] using results [seqs, kResultLen]. Grid: (blocks, 4, visits * seqs).
+extern "C" __global__ void conv_rollback_batch(const unsigned long long* tables, int max_seqs, int seqs,
+                                               const float* backup, const __nv_bfloat16* inputs,
+                                               const int* results) {
+    const int s = blockIdx.y;
+    const int v = blockIdx.z / seqs;
+    const int seq = blockIdx.z % seqs;
+    const int dims = stream_dims(s);
+    const int offset = stream_offset(s);
+    const int keep = results[size_t(seq) * kResultLen] + 1;
+    const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
+    float* state = reinterpret_cast<float*>(tables[entry * kBatchStateWords + 2 + s]);
+    const float* old = backup + entry * kStateRows * kVisitChannels + kStateRows * offset;
+    const __nv_bfloat16* rows = inputs + entry * kVerifyRows * kVisitChannels + offset;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < dims; c += gridDim.x * blockDim.x) {
+#pragma unroll
+        for (int r = 0; r < kStateRows; ++r) {
+            const int i = keep + r;
+            state[r * dims + c] = i < kStateRows ? old[i * dims + c]
+                                                 : __bfloat162float(rows[(i - kStateRows) * kVisitChannels + c]);
+        }
+    }
+}
+
+// Saves the sliding ring slots that rows 0..gridDim.x-1 of each sequence overwrite:
+// sliding_visits [num_sliding] maps sliding index sv -> visit index v in `tables`.
+// backup is [num_sliding, max_seqs, 8, 2, row_bytes] bytes. Grid: (rows, num_sliding, seqs),
+// 128 threads.
+extern "C" __global__ void __launch_bounds__(128)
+ring_backup_batch(const unsigned long long* tables, const int* sliding_visits, int max_seqs, unsigned slots,
+                  const unsigned* positions, uint8_t* backup, unsigned row_bytes) {
+    const int j = blockIdx.x;
+    const int sv = blockIdx.y;
+    const int seq = blockIdx.z;
+    const int v = sliding_visits[sv];
+    const size_t slot = (positions[seq] + j) % slots;
+    const unsigned byte_off = threadIdx.x * 16u;
+    if (byte_off >= row_bytes) {
+        return;
+    }
+    const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
+    const auto* keys = reinterpret_cast<const uint8_t*>(tables[entry * kBatchStateWords]);
+    const auto* values = reinterpret_cast<const uint8_t*>(tables[entry * kBatchStateWords + 1]);
+    uint8_t* dst =
+        backup + ((size_t(sv) * size_t(max_seqs) + size_t(seq)) * kVerifyRows + j) * 2 * size_t(row_bytes);
+    *reinterpret_cast<uint4*>(dst + byte_off) =
+        *reinterpret_cast<const uint4*>(keys + slot * size_t(row_bytes) + byte_off);
+    *reinterpret_cast<uint4*>(dst + row_bytes + byte_off) =
+        *reinterpret_cast<const uint4*>(values + slot * size_t(row_bytes) + byte_off);
+}
+
+// Restores rejected sliding ring slots j > results[seq * kResultLen] for every sequence.
+// Grid: (rows, num_sliding, seqs), 128 threads.
+extern "C" __global__ void __launch_bounds__(128)
+ring_restore_batch(const unsigned long long* tables, const int* sliding_visits, int max_seqs, unsigned slots,
+                   const unsigned* positions, const uint8_t* backup, const int* results, unsigned row_bytes) {
+    const int j = blockIdx.x;
+    const int seq = blockIdx.z;
+    if (j <= results[size_t(seq) * kResultLen]) {
+        return;
+    }
+    const int sv = blockIdx.y;
+    const int v = sliding_visits[sv];
+    const size_t slot = (positions[seq] + j) % slots;
+    const unsigned byte_off = threadIdx.x * 16u;
+    if (byte_off >= row_bytes) {
+        return;
+    }
+    const size_t entry = size_t(v) * size_t(max_seqs) + size_t(seq);
+    auto* keys = reinterpret_cast<uint8_t*>(tables[entry * kBatchStateWords]);
+    auto* values = reinterpret_cast<uint8_t*>(tables[entry * kBatchStateWords + 1]);
+    const uint8_t* src =
+        backup + ((size_t(sv) * size_t(max_seqs) + size_t(seq)) * kVerifyRows + j) * 2 * size_t(row_bytes);
+    *reinterpret_cast<uint4*>(keys + slot * size_t(row_bytes) + byte_off) =
+        *reinterpret_cast<const uint4*>(src + byte_off);
+    *reinterpret_cast<uint4*>(values + slot * size_t(row_bytes) + byte_off) =
+        *reinterpret_cast<const uint4*>(src + row_bytes + byte_off);
+}
+
+// Greedy acceptance for `seqs` sequences, each of `m` rows. tokens and argmax are [seqs, m];
+// keep is [seqs] (0 for greedy, else exact rows to keep); results is [seqs, kResultLen];
+// anchors is [seqs]. Grid: (seqs, 1, 1), 1 thread.
+extern "C" __global__ void accept_greedy_batch(const int* tokens, const int* argmax, const unsigned* keep,
+                                               int m, int* results, int* anchors) {
+    const int seq = blockIdx.x;
+    const int* seq_tokens = tokens + size_t(seq) * size_t(m);
+    const int* seq_argmax = argmax + size_t(seq) * size_t(m);
+    int* result = results + size_t(seq) * kResultLen;
+    int accepted = 0;
+    const unsigned k = keep[seq];
+    if (k != 0) {
+        accepted = min(int(k), m) - 1;
+    } else {
+        while (accepted + 1 < m && seq_tokens[accepted + 1] == seq_argmax[accepted]) {
+            ++accepted;
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = seq_tokens[i];
+        result[1 + kVerifyRows + i] = seq_argmax[i];
+    }
+    anchors[seq] = seq_argmax[accepted];
+}

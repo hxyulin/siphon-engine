@@ -448,30 +448,30 @@ __device__ __forceinline__ float* batch_state(const unsigned long long* states, 
 
 }  // namespace
 
-// The post-attention short conv and residual add of a batched step, which
-// depth_attention_rows_2304 in routing.cu fuses for a chunk (kPartialConvResidual): row r
-// (blockIdx.y) convolves its own post-attention conv state (word 4 of its state table,
-// [3, 2304] F32, only read) and its attention output proj [rows, 2304], adds `hidden`
-// [rows, 2304] if not null, and writes the F32 sum to residual [rows, 2304]. Every value
-// rounds as in the fused kernel for a chunk of one row. Grid (2304 / 256, rows), 256
-// threads.
+// The post-attention short conv and residual add of a batched step or batched verify,
+// which depth_attention_rows_2304 in routing.cu fuses for a chunk (kPartialConvResidual):
+// row r (blockIdx.y) belongs to sequence seq = r / rows_per_seq at local offset
+// r % rows_per_seq, convolves its sequence's post-attention conv state (word 4 of its
+// state table, [3, 2304] F32, only read) and its sequence's rows of proj [rows, 2304],
+// adds `hidden` [rows, 2304] if not null, and writes the F32 sum to residual
+// [rows, 2304]. Grid (2304 / 256, rows), 256 threads.
 extern "C" __global__ void __launch_bounds__(256)
 conv_residual_batch_2304(const __nv_bfloat16* proj, const __nv_bfloat16* __restrict__ weight,
-                         const unsigned long long* states, const __nv_bfloat16* hidden, float* residual) {
+                         const unsigned long long* states, const __nv_bfloat16* hidden, float* residual,
+                         int rows_per_seq) {
     const int r = blockIdx.y;
+    const int seq = r / rows_per_seq;
+    const int local = r % rows_per_seq;
+    const int first = seq * rows_per_seq;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     float taps[kKernel];
     load_bf16x4(weight + size_t(c) * kKernel, taps);
     pdl_trigger();
     pdl_wait();
-    const float* state = batch_state(states, r, 4);
+    const float* state = batch_state(states, seq, 4);
     const size_t at = size_t(r) * kHidden + c;
     float win[kKernel];
-#pragma unroll
-    for (int k = 0; k < kKernel - 1; ++k) {
-        win[k] = state[size_t(k) * kHidden + c];
-    }
-    win[kKernel - 1] = __bfloat162float(proj[at]);
+    conv_step::load_window(proj + size_t(first) * kHidden, state, c, kHidden, local, win);
     float acc = 0.f;
 #pragma unroll
     for (int k = 0; k < kKernel; ++k) {
@@ -550,6 +550,113 @@ moe_conv_residual_batch_2304(const __nv_bfloat16* experts, const float* weights,
             const size_t kv_at = size_t(r) * kKvDims + c;
             k_state[size_t(k) * kKvDims + c] = k + 1 < kOld ? k_old[k + 1] : __bfloat162float(k_raw[kv_at]);
             v_state[size_t(k) * kKvDims + c] = k + 1 < kOld ? v_old[k + 1] : __bfloat162float(v_raw[kv_at]);
+        }
+    }
+}
+
+// Batched multi-row form of moe_conv_residual_step_rows_2304: sequence seq = blockIdx.y
+// runs `rows` (1..=8) consecutive verify rows starting at row0 = seq * rows, using its own
+// four conv states (words 2..5 of `states[seq]`), optionally recording its conv inputs into
+// `inputs[seq, 0..rows, 6656]`, and shifting all four states. Grid: (2304 / 32, seqs),
+// 32 * rows threads.
+extern "C" __global__ void __launch_bounds__(kStepBlockCols * kMoeConvRows)
+moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* weights,
+                                    const __nv_bfloat16* __restrict__ weight, const float* residual,
+                                    __nv_bfloat16* __restrict__ out, int rows, const __nv_bfloat16* proj,
+                                    const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
+                                    const unsigned long long* states, __nv_bfloat16* inputs) {
+    constexpr int kOld = kKernel - 1;
+    __shared__ float comb[kMoeConvRows + kOld][kStepBlockCols];
+    __shared__ float proj_old[kOld][kStepBlockCols];
+    __shared__ float k_old[kOld][kStepBlockCols];
+    __shared__ float v_old[kOld][kStepBlockCols];
+    const int seq = blockIdx.y;
+    const size_t row0 = size_t(seq) * size_t(rows);
+    const int lane = threadIdx.x % 32;
+    const int r = threadIdx.x / 32;
+    const int c = blockIdx.x * kStepBlockCols + lane;
+    const bool kv = c < kKvDims;
+    float taps[kKernel];
+    load_bf16x4(weight + size_t(c) * kKernel, taps);
+    pdl_trigger();
+    pdl_wait();
+    float* const state = batch_state(states, seq, 5);
+    float* const proj_state = batch_state(states, seq, 4);
+    float* const k_state = batch_state(states, seq, 2);
+    float* const v_state = batch_state(states, seq, 3);
+    const __nv_bfloat16* seq_experts = experts + row0 * kTopK * kHidden;
+    const float* seq_weights = weights + row0 * kTopK;
+    const float* seq_residual = residual + row0 * kHidden;
+    __nv_bfloat16* seq_out = out + row0 * kHidden;
+    const __nv_bfloat16* seq_proj = proj + row0 * kHidden;
+    const __nv_bfloat16* seq_k = k_raw + row0 * kKvDims;
+    const __nv_bfloat16* seq_v = v_raw + row0 * kKvDims;
+    float e[kTopK];
+    float w[kTopK];
+#pragma unroll
+    for (int x = 0; x < kTopK; ++x) {
+        e[x] = __bfloat162float(seq_experts[(size_t(r) * kTopK + x) * kHidden + c]);
+        w[x] = seq_weights[size_t(r) * kTopK + x];
+    }
+    const float res = seq_residual[size_t(r) * kHidden + c];
+    if (r < kOld) {
+        comb[r][lane] = state[size_t(r) * kHidden + c];
+        proj_old[r][lane] = proj_state[size_t(r) * kHidden + c];
+        if (kv) {
+            k_old[r][lane] = k_state[size_t(r) * kKvDims + c];
+            v_old[r][lane] = v_state[size_t(r) * kKvDims + c];
+        }
+    }
+    float total = 0.f;
+#pragma unroll
+    for (int x = 0; x < kTopK; ++x) {
+        total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+    }
+    const float mine = round_bf16(total);
+    comb[r + kOld][lane] = mine;
+    if (rows < kOld && r == 0) {
+#pragma unroll
+        for (int k = 1; k < kOld; ++k) {
+            if (k >= rows) {
+                comb[k][lane] = state[size_t(k) * kHidden + c];
+                proj_old[k][lane] = proj_state[size_t(k) * kHidden + c];
+                if (kv) {
+                    k_old[k][lane] = k_state[size_t(k) * kKvDims + c];
+                    v_old[k][lane] = v_state[size_t(k) * kKvDims + c];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(comb[r + k][lane]), taps[k]));
+    }
+    const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), mine), kShortDivisor));
+    seq_out[size_t(r) * kHidden + c] = __float2bfloat16(__fadd_rn(res, y));
+    if (inputs != nullptr) {
+        __nv_bfloat16* row = inputs + (size_t(seq) * kMoeConvRows + r) * kVisitChannels;
+        row[2 * kKvDims + kHidden + c] = __float2bfloat16(mine);
+        row[2 * kKvDims + c] = seq_proj[size_t(r) * kHidden + c];
+        if (kv) {
+            row[c] = seq_k[size_t(r) * kKvDims + c];
+            row[kKvDims + c] = seq_v[size_t(r) * kKvDims + c];
+        }
+    }
+    for (int k = r; k < kOld; k += rows) {
+        const int i = k + rows;
+        const bool fresh = i >= kOld;
+        const size_t src = size_t(i - kOld);
+        state[size_t(k) * kHidden + c] = comb[i][lane];
+        proj_state[size_t(k) * kHidden + c] =
+            fresh ? __bfloat162float(seq_proj[src * kHidden + c]) : proj_old[min(i, kOld - 1)][lane];
+        if (kv) {
+            k_state[size_t(k) * kKvDims + c] =
+                fresh ? __bfloat162float(seq_k[src * kKvDims + c]) : k_old[min(i, kOld - 1)][lane];
+            v_state[size_t(k) * kKvDims + c] =
+                fresh ? __bfloat162float(seq_v[src * kKvDims + c]) : v_old[min(i, kOld - 1)][lane];
         }
     }
 }

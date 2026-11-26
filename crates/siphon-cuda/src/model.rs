@@ -19,7 +19,7 @@ mod prefill;
 mod prefix;
 mod verify;
 
-pub use batch::BATCH_ROWS;
+pub use batch::{BATCH_ROWS, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, PendingBatchVerify};
 pub use prefill::{
     DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, FP8_ATTENTION_KEYS, ImageRows, ImageSource,
     MAX_PREFILL_CHUNK, PrefillAttention, PrefillLogits,
@@ -29,7 +29,7 @@ pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
 
 pub use crate::ops::sample::Sampling;
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
@@ -424,6 +424,10 @@ pub struct Model {
     batch: Option<prefill::PrefillScratch>,
     /// The captured batched step of each size from 1 to [`BATCH_ROWS`].
     batch_graphs: Vec<Option<StepGraph>>,
+    /// Buffers of [`Model::verify_batch`], allocated on its first call.
+    batch_verify: Option<prefill::PrefillScratch>,
+    /// The captured batched verify pass of each `(seqs, width)` pair.
+    batch_verify_graphs: HashMap<(usize, usize), StepGraph>,
     /// Whether batched steps record each row's taps ([`Model::set_batch_taps`]).
     batch_taps: bool,
     /// How slot 0's next tokens are picked ([`Model::set_sampling`]).
@@ -677,6 +681,8 @@ impl Model {
             slots: Vec::new(),
             batch: None,
             batch_graphs: (0..BATCH_ROWS).map(|_| None).collect(),
+            batch_verify: None,
+            batch_verify_graphs: HashMap::new(),
             batch_taps: false,
             sampling: Sampling::GREEDY,
             sampler: false,
@@ -828,6 +834,8 @@ impl Model {
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
         self.batch = None;
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
+        self.batch_verify = None;
+        self.batch_verify_graphs.clear();
         self.reset()
     }
 
@@ -861,6 +869,8 @@ impl Model {
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
             self.batch = None;
             self.batch_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch_verify = None;
+            self.batch_verify_graphs.clear();
         }
         Ok(())
     }
@@ -977,6 +987,7 @@ impl Model {
         self.tap_graph = None;
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
+        self.batch_verify_graphs.clear();
         Ok(())
     }
 
@@ -1249,9 +1260,13 @@ impl Model {
     pub fn enable_sampling(&mut self) -> anyhow::Result<()> {
         self.sampler = true;
         let stream = Arc::clone(&self.ctx.stream);
-        for p in [self.verify.as_mut(), self.batch.as_mut()]
-            .into_iter()
-            .flatten()
+        for p in [
+            self.verify.as_mut(),
+            self.batch.as_mut(),
+            self.batch_verify.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if p.sample.is_none() {
                 p.sample = Some(SampleBuffers::new(&stream, p.rows)?);
@@ -1259,6 +1274,7 @@ impl Model {
         }
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
+        self.batch_verify_graphs.clear();
         Ok(())
     }
 

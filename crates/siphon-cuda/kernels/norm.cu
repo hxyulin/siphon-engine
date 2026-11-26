@@ -565,9 +565,10 @@ __device__ __forceinline__ float relative_bias_dot(const float (&r)[kRelDim], co
 // Every value rounds as attention_post_row computes it. Inputs that earlier kernels write
 // are not __restrict__, so that no load of them becomes a non-coherent load, which ptxas
 // may move above pdl_wait.
-// For a batched step, `states` (rows x 6 device addresses, see attention_batch in
-// attention.cu) and `positions` ([rows]) are not null: each row is the first row of its
-// own chunk, with its own k and v conv states (words 2 and 3) at its own position.
+// For a batched step or batched verify, `states` (seqs x 6 device addresses, see
+// attention_batch in attention.cu) and `positions` ([seqs]) are not null: each group of
+// `rows_per_seq` rows is its own chunk, with its own k and v conv states (words 2 and 3)
+// starting at `positions[row / rows_per_seq]`.
 extern "C" __global__ void __launch_bounds__(kPostThreads)
 attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                          const __nv_bfloat16* __restrict__ k_weight, const __nv_bfloat16* __restrict__ v_weight,
@@ -579,14 +580,18 @@ attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                          __nv_bfloat16* q, __nv_bfloat16* r, const uint32_t* start, int log_scale, float alpha,
                          float n_floor, float qk_threshold, float rel_threshold, float eps,
                          const __nv_bfloat16* __restrict__ table, __nv_bfloat16* bias, int extent,
-                         const unsigned long long* states, const uint32_t* positions) {
+                         const unsigned long long* states, const uint32_t* positions, int rows_per_seq) {
     const int row = blockIdx.y;
     const int b = blockIdx.x;
+    const int seq = states != nullptr ? row / rows_per_seq : 0;
+    const int local = states != nullptr ? row % rows_per_seq : row;
     if (b >= kQBlock0) {
         pdl_trigger();
         pdl_wait();
         const float tau =
-            log_scale ? log_scale_tau(positions != nullptr ? positions[row] : *start + uint32_t(row), alpha, n_floor)
+            log_scale ? log_scale_tau(positions != nullptr ? positions[seq] + uint32_t(local)
+                                                           : *start + uint32_t(row),
+                                      alpha, n_floor)
                       : 1.f;
         // bf16(x * tau) as log_scale_bf16 does it, or x unchanged.
         const auto scaled = [&](float x) {
@@ -677,11 +682,11 @@ attention_post_rows_bf16(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
     const int lane = threadIdx.x % 32;
     const int c0 = head * kHeadDim + lane * kVec;
     const __nv_bfloat16* x = is_k ? k_raw : v_raw;
-    const float* state = states != nullptr ? reinterpret_cast<const float*>(states[size_t(row) * 6 + (is_k ? 2 : 3)])
+    const float* state = states != nullptr ? reinterpret_cast<const float*>(states[size_t(seq) * 6 + (is_k ? 2 : 3)])
                          : is_k            ? k_state
                                            : v_state;
-    // The row's place in its chunk: a batched row starts its own.
-    const int first = states != nullptr ? row : 0;
+    // The row's place in its chunk: each batched sequence starts at seq * rows_per_seq.
+    const int first = states != nullptr ? seq * rows_per_seq : 0;
     const __nv_bfloat16* dynamic = is_k ? k_dynamic : v_dynamic;
     const bool dyn = dynamic != nullptr;
     // Weights first. Static conv: 4 taps per channel. Dynamic conv: the static weights by

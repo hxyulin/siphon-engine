@@ -15,7 +15,7 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::spec::{BATCH_ROWS, BATCH_STATE_WORDS},
+    ops::spec::{BATCH_ROWS, BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, VERIFY_ROWS, VISIT_CHANNELS},
 };
 
 /// Taps per channel.
@@ -70,6 +70,7 @@ pub struct Conv {
     moe_conv_residual_step_rows_2304: CudaFunction,
     residual_batch_2304: CudaFunction,
     moe_conv_residual_batch_2304: CudaFunction,
+    moe_conv_residual_batch_verify_2304: CudaFunction,
     shift_state_rows: CudaFunction,
 }
 
@@ -121,6 +122,8 @@ impl Conv {
                 .load_function("moe_conv_residual_step_rows_2304")?,
             residual_batch_2304: module.load_function("conv_residual_batch_2304")?,
             moe_conv_residual_batch_2304: module.load_function("moe_conv_residual_batch_2304")?,
+            moe_conv_residual_batch_verify_2304: module
+                .load_function("moe_conv_residual_batch_verify_2304")?,
             shift_state_rows: module.load_function("shift_state_rows")?,
         })
     }
@@ -484,17 +487,23 @@ impl Conv {
         hidden: Option<&CudaView<'_, bf16>>,
         residual: &mut impl DeviceOut<f32>,
         rows: usize,
+        rows_per_seq: usize,
     ) -> anyhow::Result<()> {
         let proj = proj.view();
         let mut residual = residual.view_mut();
         ensure!(
-            (1..=BATCH_ROWS).contains(&rows),
-            "{rows} rows, expected 1 to {BATCH_ROWS}"
+            (1..=BATCH_VERIFY_MAX_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {BATCH_VERIFY_MAX_ROWS}"
         );
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows_per_seq) && rows.is_multiple_of(rows_per_seq),
+            "{rows} rows is not a multiple of rows_per_seq {rows_per_seq}"
+        );
+        let seqs = rows / rows_per_seq;
         check_len("weight", weight.len(), HIDDEN * KERNEL)?;
         check_len("proj", proj.len(), rows * HIDDEN)?;
         check_len("residual", residual.len(), rows * HIDDEN)?;
-        check_len("states", states.len(), rows * BATCH_STATE_WORDS)?;
+        check_len("states", states.len(), seqs * BATCH_STATE_WORDS)?;
         if let Some(hidden) = hidden {
             check_len("hidden", hidden.len(), rows * HIDDEN)?;
         }
@@ -503,12 +512,12 @@ impl Conv {
             .ptr(weight, stream)
             .ptr(states, stream)
             .opt(hidden, stream)
-            .ptr_mut(&mut residual, stream);
+            .ptr_mut(&mut residual, stream)
+            .i32(i32::try_from(rows_per_seq)?);
         // SAFETY: the arguments match `conv_residual_batch_2304(const bf16*, const bf16*,
-        // const unsigned long long*, const bf16*, float*)`. Every buffer holds `rows` rows
-        // as checked above, the grid has one y index per row and 9 blocks of 256 channels,
-        // and the caller keeps each row's post-attention state, word 4 of its state table, a
-        // live `[3, 2304]` F32 buffer. Before `pdl_wait` the kernel reads only the weight.
+        // const unsigned long long*, const bf16*, float*, int)`. Every buffer holds `rows` rows
+        // across `seqs` sequences as checked above, and each sequence's post-attention state
+        // (word 4) is a live `[3, 2304]` F32 buffer.
         unsafe { args.launch_pdl(stream, &self.residual_batch_2304, hidden_rows_config(rows)?) }
     }
 
@@ -569,6 +578,78 @@ impl Conv {
                 hidden_rows_config(rows)?,
             )
         }
+    }
+
+    /// Batched multi-row form of [`Self::moe_conv_residual_step_rows`]: `seqs` sequences
+    /// each running `rows_per_seq` (`1..=8`) verify rows, recording each sequence's conv
+    /// inputs into `inputs` (`[max_seqs, 8, VISIT_CHANNELS]`) if given, and shifting all
+    /// four conv states of every sequence.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn moe_conv_residual_batch_verify(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        residual: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<bf16>,
+        [proj, k_raw, v_raw]: [CudaView<'_, bf16>; 3],
+        states: &CudaView<'_, u64>,
+        mut inputs: Option<CudaViewMut<'_, bf16>>,
+        seqs: usize,
+        rows_per_seq: usize,
+    ) -> anyhow::Result<()> {
+        let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
+        let mut out = out.view_mut();
+        ensure!(
+            seqs > 0
+                && (1..=MOE_CONV_ROWS).contains(&rows_per_seq)
+                && seqs * rows_per_seq <= BATCH_VERIFY_MAX_ROWS,
+            "{seqs} seqs x {rows_per_seq} rows exceeds {BATCH_VERIFY_MAX_ROWS}"
+        );
+        let rows = seqs * rows_per_seq;
+        check_len("weight", weight.len(), HIDDEN * KERNEL)?;
+        check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
+        check_len("weights", weights.len(), rows * TOP_K)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        check_len("out", out.len(), rows * HIDDEN)?;
+        check_len("proj", proj.len(), rows * HIDDEN)?;
+        check_len("k_raw", k_raw.len(), rows * DYNAMIC_DIMS)?;
+        check_len("v_raw", v_raw.len(), rows * DYNAMIC_DIMS)?;
+        check_len("states", states.len(), seqs * BATCH_STATE_WORDS)?;
+        if let Some(inputs) = &inputs {
+            ensure!(
+                inputs.len() >= seqs * VERIFY_ROWS * VISIT_CHANNELS,
+                "inputs has {} elements, need at least {}",
+                inputs.len(),
+                seqs * VERIFY_ROWS * VISIT_CHANNELS
+            );
+        }
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(HIDDEN / STEP_BLOCK_COLS)?,
+                u32::try_from(seqs)?,
+                1,
+            ),
+            block_dim: (u32::try_from(32 * rows_per_seq)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&experts, stream)
+            .ptr(&weights, stream)
+            .ptr(weight, stream)
+            .ptr(&residual, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(rows_per_seq)?)
+            .ptr(&proj, stream)
+            .ptr(&k_raw, stream)
+            .ptr(&v_raw, stream)
+            .ptr(states, stream)
+            .opt_mut(inputs.as_mut(), stream);
+        // SAFETY: matches `moe_conv_residual_batch_verify_2304`; every per-row buffer holds
+        // `seqs * rows_per_seq` rows, every sequence's four conv states in `states` are live
+        // and distinct, and `inputs` (if present) holds at least `seqs * 8 * VISIT_CHANNELS`.
+        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_batch_verify_2304, config) }
     }
 
     /// Shifts the conv inputs `x` (`[rows, dims]`) of a chunk into `state` (`[3, dims]`),

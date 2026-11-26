@@ -35,7 +35,10 @@ use crate::{
             DepthRows, FUSED_MAX_CANDIDATES, NormDest, RouterRowsScratch, RowsBatch, RowsPartial,
         },
         sample::SampleBuffers,
-        spec::{BATCH_ROWS, BatchRows, TapLayout, VERIFY_ROWS, VISIT_CHANNELS},
+        spec::{
+            BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, RESULT_LEN, TapLayout,
+            VERIFY_ROWS, VISIT_CHANNELS,
+        },
     },
     weights::{InputNorms, KvConv, LayerWeights, MessageGateWeights},
 };
@@ -365,7 +368,7 @@ impl PrefillScratch {
                 invariant,
                 rows: attention::RowsAttentionScratch::new(
                     stream,
-                    if invariant { rows.min(BATCH_ROWS) } else { 1 },
+                    if invariant { rows.min(BATCH_VERIFY_MAX_ROWS) } else { 1 },
                 )?,
                 k_raw: zeros(stream, rows * kv_dims)?,
                 v_raw: zeros(stream, rows * kv_dims)?,
@@ -812,6 +815,7 @@ impl Ctx {
                 ..upcoming
             })
         });
+        let num_visits = visits.len();
         let mut visits = visits.iter_mut().enumerate();
         let mut next_visit = || {
             let visit = visits.next().context("fewer visit caches than visits")?;
@@ -829,6 +833,33 @@ impl Ctx {
                 m,
                 &mut v.ring_backup,
                 v.ring_row_bytes,
+            )?;
+        }
+        if let Some(b) = p.batch.as_mut()
+            && let Some(bv) = b.verify.as_mut()
+        {
+            let width = bv.width;
+            let seqs = m / width;
+            self.kernels.spec.conv_backup_batch(
+                &self.stream,
+                &b.tables,
+                num_visits,
+                b.max_seqs,
+                seqs,
+                &mut bv.conv_backup,
+            )?;
+            self.kernels.spec.ring_backup_batch(
+                &self.stream,
+                &b.tables,
+                &bv.sliding_visits,
+                num_visits,
+                b.max_seqs,
+                seqs,
+                bv.ring_slots,
+                &b.positions.slice(..seqs),
+                width,
+                &mut bv.ring_backup,
+                bv.ring_row_bytes,
             )?;
         }
         self.kernels.elementwise.embedding(
@@ -1011,7 +1042,7 @@ impl Ctx {
             return self.verify_head(p, m);
         }
         if p.batch.is_some() {
-            return self.batch_head(p, m);
+            return self.batch_head(p, m, num_visits);
         }
         if skip_logits {
             return Ok(());
@@ -1170,8 +1201,14 @@ impl Ctx {
         )
     }
 
-    /// The end of a batched step of `m` rows: every row's logits and greedy token.
-    fn batch_head(&self, p: &mut PrefillScratch, m: usize) -> anyhow::Result<()> {
+    /// The end of a batched step or batched verify of `m` rows: every row's logits and
+    /// token, plus per-sequence acceptance and rollback for a batched verify.
+    fn batch_head(
+        &self,
+        p: &mut PrefillScratch,
+        m: usize,
+        num_visits: usize,
+    ) -> anyhow::Result<()> {
         let cfg = &self.config;
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
         self.gemm_rows(
@@ -1198,15 +1235,55 @@ impl Ctx {
                 &rows(&p.head_capped, m, vocab),
                 vocab,
                 sample,
-                &mut b.argmax_mut().slice_mut(..m),
-            ),
+                &mut b.argmax.slice_mut(..m),
+            )?,
             None => self.kernels.misc.argmax_f32(
                 &self.stream,
                 &rows(&p.head_capped, m, vocab),
-                &mut b.argmax_mut().slice_mut(..m),
+                &mut b.argmax.slice_mut(..m),
                 vocab,
-            ),
+            )?,
         }
+        if let Some(bv) = b.verify.as_mut() {
+            let width = bv.width;
+            let seqs = m / width;
+            let spec = &self.kernels.spec;
+            spec.accept_greedy_batch(
+                &self.stream,
+                &rows(&p.tokens, m, 1),
+                &b.argmax.slice(..m),
+                &bv.keep.slice(..seqs),
+                seqs,
+                width,
+                &mut bv.results.slice_mut(..seqs * RESULT_LEN),
+                &mut bv.anchors.slice_mut(..seqs),
+            )?;
+            spec.conv_rollback_batch(
+                &self.stream,
+                &b.tables,
+                num_visits,
+                b.max_seqs,
+                seqs,
+                &bv.conv_backup,
+                &bv.inputs,
+                &bv.results.slice(..seqs * RESULT_LEN),
+            )?;
+            spec.ring_restore_batch(
+                &self.stream,
+                &b.tables,
+                &bv.sliding_visits,
+                num_visits,
+                b.max_seqs,
+                seqs,
+                bv.ring_slots,
+                &b.positions.slice(..seqs),
+                width,
+                &bv.ring_backup,
+                &bv.results.slice(..seqs * RESULT_LEN),
+                bv.ring_row_bytes,
+            )?;
+        }
+        Ok(())
     }
 
     /// One decoder-layer visit for a chunk, as [`Ctx::visit`] for one row, from
@@ -1231,8 +1308,8 @@ impl Ctx {
         let mh = m * hidden;
         let batch = p.batch.as_ref().map(|b| b.rows(index, m));
         ensure!(
-            batch.is_none() || m <= BATCH_ROWS,
-            "a batched step takes at most {BATCH_ROWS} rows"
+            batch.is_none() || m <= BATCH_VERIFY_MAX_ROWS,
+            "a batched step takes at most {BATCH_VERIFY_MAX_ROWS} rows"
         );
         if p.record_taps
             && let Some(tap) = p.tap_layout.visits.iter().position(|&v| v == index)
@@ -1367,6 +1444,7 @@ impl Ctx {
                 (!block_start).then(|| rows(&p.hidden, m, hidden)).as_ref(),
                 &mut rows_mut(&mut p.residual, m, hidden),
                 m,
+                batch.rows_per_seq,
             )?;
         }
         let partial = if batch.is_some() {
@@ -1438,22 +1516,48 @@ impl Ctx {
             self.prefetch_rest(layer, messages, after, true, after_window)?;
         }
 
-        if let Some(batch) = &batch {
-            self.kernels.conv.moe_conv_residual_batch(
-                &self.stream,
-                &rows(&p.moe.down, m, 8 * hidden),
-                &rows(&p.moe.weights, m, 8),
-                &w.post_mlp_conv,
-                &rows(&p.residual, m, hidden),
-                &mut rows_mut(&mut p.out, m, hidden),
-                [
-                    rows(&p.attention.proj, m, hidden),
-                    rows(&p.attention.k_raw, m, kv_dims),
-                    rows(&p.attention.v_raw, m, kv_dims),
-                ],
-                &batch.states,
-                m,
-            )?;
+        let _ = batch;
+        if let Some(b) = p.batch.as_mut() {
+            let max_seqs = b.max_seqs;
+            let at = index * max_seqs * BATCH_STATE_WORDS;
+            if let Some(bv) = b.verify.as_mut() {
+                let width = bv.width;
+                let seqs = m / width;
+                let visit_len = max_seqs * VERIFY_ROWS * VISIT_CHANNELS;
+                self.kernels.conv.moe_conv_residual_batch_verify(
+                    &self.stream,
+                    &rows(&p.moe.down, m, 8 * hidden),
+                    &rows(&p.moe.weights, m, 8),
+                    &w.post_mlp_conv,
+                    &rows(&p.residual, m, hidden),
+                    &mut rows_mut(&mut p.out, m, hidden),
+                    [
+                        rows(&p.attention.proj, m, hidden),
+                        rows(&p.attention.k_raw, m, kv_dims),
+                        rows(&p.attention.v_raw, m, kv_dims),
+                    ],
+                    &b.tables.slice(at..at + seqs * BATCH_STATE_WORDS),
+                    Some(bv.inputs.slice_mut(index * visit_len..(index + 1) * visit_len)),
+                    seqs,
+                    width,
+                )?;
+            } else {
+                self.kernels.conv.moe_conv_residual_batch(
+                    &self.stream,
+                    &rows(&p.moe.down, m, 8 * hidden),
+                    &rows(&p.moe.weights, m, 8),
+                    &w.post_mlp_conv,
+                    &rows(&p.residual, m, hidden),
+                    &mut rows_mut(&mut p.out, m, hidden),
+                    [
+                        rows(&p.attention.proj, m, hidden),
+                        rows(&p.attention.k_raw, m, kv_dims),
+                        rows(&p.attention.v_raw, m, kv_dims),
+                    ],
+                    &b.tables.slice(at..at + m * BATCH_STATE_WORDS),
+                    m,
+                )?;
+            }
             std::mem::swap(&mut p.hidden, &mut p.out);
             return Ok(());
         }

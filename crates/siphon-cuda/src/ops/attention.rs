@@ -38,7 +38,7 @@ use crate::{
     ops::{
         Products,
         norm::KvConvWeights,
-        spec::{BATCH_ROWS, BATCH_STATE_WORDS, BatchRows},
+        spec::{BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows},
     },
     vmm::{PagePool, Pooled},
 };
@@ -626,6 +626,8 @@ pub struct Attention {
     rows: Vec<[CudaFunction; 3]>,
     /// `attention_batch_bf16`, `attention_batch_fp8` and `attention_batch_fp4`.
     batch: [CudaFunction; 3],
+    /// `attention_batch_verify_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
+    batch_verify: Vec<[CudaFunction; 3]>,
     kv_round: CudaFunction,
     kv_round_channels: CudaFunction,
 }
@@ -704,11 +706,12 @@ pub struct RowsAttentionScratch {
 
 impl RowsAttentionScratch {
     /// Partials and counters for calls of up to `rows` rows: at least [`ROWS_MAX`] for
-    /// [`Attention::attention_rows`], up to [`BATCH_ROWS`] for [`Attention::attention_batch`].
+    /// [`Attention::attention_rows`], up to [`BATCH_VERIFY_MAX_ROWS`] for
+    /// [`Attention::attention_batch`].
     pub fn new(stream: &Arc<CudaStream>, rows: usize) -> anyhow::Result<Self> {
         ensure!(
-            (1..=BATCH_ROWS).contains(&rows),
-            "{rows} rows, expected 1 to {BATCH_ROWS}"
+            (1..=BATCH_VERIFY_MAX_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {BATCH_VERIFY_MAX_ROWS}"
         );
         let rows = rows.max(ROWS_MAX);
         let queries = rows * HEADS * ROWS_PARTS;
@@ -788,6 +791,24 @@ impl Attention {
                 rows_function("attention_batch_fp8", ROWS_SHARED_BYTES[1])?,
                 rows_function("attention_batch_fp4", ROWS_SHARED_BYTES[2])?,
             ],
+            batch_verify: (1..=ROWS_QUERY_TILES)
+                .map(|nt| {
+                    Ok([
+                        rows_function(
+                            &format!("attention_batch_verify_bf16_{nt}"),
+                            ROWS_SHARED_BYTES[0],
+                        )?,
+                        rows_function(
+                            &format!("attention_batch_verify_fp8_{nt}"),
+                            ROWS_SHARED_BYTES[1],
+                        )?,
+                        rows_function(
+                            &format!("attention_batch_verify_fp4_{nt}"),
+                            ROWS_SHARED_BYTES[2],
+                        )?,
+                    ])
+                })
+                .collect::<anyhow::Result<_>>()?,
             kv_round: module.load_function("kv_round_bf16")?,
             kv_round_channels: module.load_function("kv_round_channels_bf16")?,
         })
@@ -1046,21 +1067,23 @@ impl Attention {
             "{rows} rows, the scratch holds {}",
             scratch.rows
         );
+        let rows_per_seq = batch.rows_per_seq;
+        ensure!(
+            (1..=ROWS_MAX).contains(&rows_per_seq) && rows.is_multiple_of(rows_per_seq),
+            "{rows} rows is not a multiple of rows_per_seq {rows_per_seq} (1..={ROWS_MAX})"
+        );
+        let seqs = rows / rows_per_seq;
         check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
         check_len("k", k.len(), rows * KV_ROW)?;
         check_len("v", v.len(), rows * KV_ROW)?;
         check_len("sinks", sinks.len(), rows * HEADS)?;
         check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
-        check_len("states", batch.states.len(), rows * BATCH_STATE_WORDS)?;
-        check_len("positions", batch.positions.len(), rows)?;
+        check_len("states", batch.states.len(), seqs * BATCH_STATE_WORDS)?;
+        check_len("positions", batch.positions.len(), seqs)?;
         let extent = extent("bias", bias.len(), rows * HEADS)?;
         let slots = u32::try_from(like.slots)?;
         let window = u32::try_from(like.window.unwrap_or(0)).context("window too large")?;
-        let (function, smem) = match *like.data {
-            KvData::Bf16 { .. } => (&self.batch[0], ROWS_SHARED_BYTES[0]),
-            KvData::Fp8 { .. } => (&self.batch[1], ROWS_SHARED_BYTES[1]),
-            KvData::Nvfp4 { .. } => (&self.batch[2], ROWS_SHARED_BYTES[2]),
-        };
+        let split_blocks = slots.div_ceil(ROWS_SPLIT_SLOTS).clamp(1, ROWS_SPLIT_BLOCKS);
         let mut args = KernelArgs::default();
         args.ptr(&q, stream)
             .ptr(&k, stream)
@@ -1074,33 +1097,53 @@ impl Attention {
             .ptr_mut(&mut scratch.counters, stream)
             .ptr_mut(&mut out, stream)
             .opt(gate, stream)
-            .ptr(&batch.positions, stream)
+            .ptr(&batch.positions, stream);
+        if rows_per_seq == 1 {
+            let (function, smem) = match *like.data {
+                KvData::Bf16 { .. } => (&self.batch[0], ROWS_SHARED_BYTES[0]),
+                KvData::Fp8 { .. } => (&self.batch[1], ROWS_SHARED_BYTES[1]),
+                KvData::Nvfp4 { .. } => (&self.batch[2], ROWS_SHARED_BYTES[2]),
+            };
+            args.u32(slots)
+                .u32(window)
+                .u32(extent)
+                .f32(SCALE)
+                .i32(split_blocks.cast_signed());
+            let config = LaunchConfig {
+                grid_dim: (KV_HEADS as u32, split_blocks + 1, u32::try_from(seqs)?),
+                block_dim: (ROWS_THREADS, 1, 1),
+                shared_mem_bytes: smem,
+            };
+            // SAFETY: matches `attention_batch_{bf16,fp8,fp4}`; every buffer and state table
+            // entry is checked above for `seqs == rows`.
+            return unsafe { args.launch_pdl(stream, function, config) };
+        }
+        let entry = &self.batch_verify[(3 * rows_per_seq).div_ceil(8) - 1];
+        let (function, smem) = match *like.data {
+            KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
+            KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
+            KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
+        };
+        let recent_blocks = u32::try_from(rows_per_seq.div_ceil(4))?;
+        args.i32(i32::try_from(rows_per_seq)?)
             .u32(slots)
             .u32(window)
             .u32(extent)
-            .f32(SCALE);
-        // Only the split blocks whose first split can hold a live slot, and the recent block
-        // of row 0: a 1,024-slot ring needs 16 of the 32 split blocks. The rest would write
-        // empty partials, so this changes no result.
-        let split_blocks = slots.div_ceil(ROWS_SPLIT_SLOTS).clamp(1, ROWS_SPLIT_BLOCKS);
-        args.i32(split_blocks.cast_signed());
+            .f32(SCALE)
+            .i32(split_blocks.cast_signed());
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, split_blocks + 1, u32::try_from(rows)?),
+            grid_dim: (
+                KV_HEADS as u32,
+                split_blocks + recent_blocks,
+                u32::try_from(seqs)?,
+            ),
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
-        // SAFETY: the arguments match `attention_batch_bf16(const bf16* q, const bf16* k_new,
-        // const bf16* v_new, const unsigned long long* states, const bf16* bias, const bf16*
-        // sinks, float* partial_out, float* partial_max, float* partial_sum, unsigned*
-        // counters, bf16* out, const bf16* gate, const unsigned* positions, unsigned slots,
-        // unsigned window, unsigned extent, float scale, int split_blocks)`, or
-        // `attention_batch_fp8` or `attention_batch_fp4`. split_blocks covers every slot of the
-        // caches. Grid z index r runs attention_rows' one-row kernel for row r on the caches of
-        // words 0 and 1 of its state table, which the caller keeps live caches of `like`'s
-        // format and slots that hold the row's position; the row takes the scratch's partials
-        // of query rows 24 r .. 24 r + 23 and counters 16 r .. 16 r + 15, within the scratch's
-        // rows. Before `pdl_wait` it reads only the table, the positions and the caches, which
-        // the host writes before the step and no kernel of the step writes before this one.
+        // SAFETY: matches `attention_batch_verify_{bf16,fp8,fp4}_<NT>`; sequence `z` verifies
+        // `rows_per_seq` rows at `positions[z]` in its own cache, uses partials for rows
+        // `z * rows_per_seq .. (z + 1) * rows_per_seq` within `scratch.rows`, and single-block
+        // combine leaves every counter at zero without spin-waiting.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 

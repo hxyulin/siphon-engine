@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg as _,
 };
 use half::bf16;
 
@@ -30,12 +31,14 @@ pub const MAX_TAPS: usize = 8;
 /// cache, value cache, and key, value, post-attention and post-MLP conv states.
 pub const BATCH_STATE_WORDS: usize = 6;
 
-/// Where the rows of a batched step keep their state in one visit: each row's line of the
-/// visit's state table (`[rows, BATCH_STATE_WORDS]` device addresses) and its position
-/// (`[rows]`). Each row is the next token of its own sequence.
+/// Where the rows of a batched step or batched verify keep their state in one visit: each
+/// sequence's line of the visit's state table (`[seqs, BATCH_STATE_WORDS]` device
+/// addresses), its starting position (`[seqs]`), and consecutive rows per sequence (`1`
+/// for `step_batch`, `1..=VERIFY_ROWS` for `verify_batch`).
 pub struct BatchRows<'a> {
     pub states: CudaView<'a, u64>,
     pub positions: CudaView<'a, u32>,
+    pub rows_per_seq: usize,
 }
 
 /// The hidden states a draft reads for each row: the partial block entering each visit of
@@ -80,6 +83,8 @@ const _: () = assert!(VERIFY_ROWS == siphon::memory::VERIFY_ROWS);
 /// Most rows one batched step takes, one per sequence.
 pub const BATCH_ROWS: usize = 64;
 const _: () = assert!(BATCH_ROWS == siphon::memory::BATCH_ROWS);
+/// Most total rows (`seqs * width`) one batched verify takes.
+pub const BATCH_VERIFY_MAX_ROWS: usize = 256;
 /// Conv state rows per stream.
 pub const STATE_ROWS: usize = 3;
 /// Conv streams per visit: keys, values, post-attention and post-MLP.
@@ -108,6 +113,11 @@ pub struct Spec {
     ring_backup: CudaFunction,
     ring_restore: CudaFunction,
     accept_greedy: CudaFunction,
+    conv_backup_batch: CudaFunction,
+    conv_rollback_batch: CudaFunction,
+    ring_backup_batch: CudaFunction,
+    ring_restore_batch: CudaFunction,
+    accept_greedy_batch: CudaFunction,
 }
 
 impl Spec {
@@ -121,6 +131,11 @@ impl Spec {
             ring_backup: f("ring_backup")?,
             ring_restore: f("ring_restore")?,
             accept_greedy: f("accept_greedy")?,
+            conv_backup_batch: f("conv_backup_batch")?,
+            conv_rollback_batch: f("conv_rollback_batch")?,
+            ring_backup_batch: f("ring_backup_batch")?,
+            ring_restore_batch: f("ring_restore_batch")?,
+            accept_greedy_batch: f("accept_greedy_batch")?,
         })
     }
 
@@ -316,6 +331,220 @@ impl Spec {
         unsafe { launch.launch(one_block(1)) }?;
         Ok(())
     }
+
+    /// Batched [`Self::conv_backup`]: saves every `(visit, seq)` conv state referenced by
+    /// `tables` (`[visits, max_seqs, BATCH_STATE_WORDS]`) into `backup`
+    /// (`[visits, max_seqs, 3 * VISIT_CHANNELS]`) for `seqs` active sequences.
+    pub fn conv_backup_batch(
+        &self,
+        stream: &CudaStream,
+        tables: &CudaSlice<u64>,
+        visits: usize,
+        max_seqs: usize,
+        seqs: usize,
+        backup: &mut CudaSlice<f32>,
+    ) -> anyhow::Result<()> {
+        ensure!(visits > 0 && seqs > 0 && seqs <= max_seqs, "invalid batch verify dims");
+        check_len("tables", tables.len(), visits * max_seqs * BATCH_STATE_WORDS)?;
+        check_len(
+            "backup",
+            backup.len(),
+            visits * max_seqs * STATE_ROWS * VISIT_CHANNELS,
+        )?;
+        let max_seqs_arg = i32::try_from(max_seqs)?;
+        let seqs_arg = i32::try_from(seqs)?;
+        let mut launch = stream.launch_builder(&self.conv_backup_batch);
+        launch
+            .arg(tables)
+            .arg(&max_seqs_arg)
+            .arg(&seqs_arg)
+            .arg(backup);
+        // SAFETY: the arguments match `conv_backup_batch(const unsigned long long*, int, int,
+        // float*)`; `tables` holds live conv state addresses for `seqs <= max_seqs` across
+        // `visits`, and `backup` is sized for `[visits, max_seqs, 3 * VISIT_CHANNELS]`.
+        unsafe { launch.launch(state_config(visits * seqs)?) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::conv_rollback`]: rebuilds every `(visit, seq)` conv state from
+    /// `backup` and `inputs` (`[visits, max_seqs, 8, VISIT_CHANNELS]`) using `results`
+    /// (`[seqs, RESULT_LEN]`).
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn conv_rollback_batch(
+        &self,
+        stream: &CudaStream,
+        tables: &CudaSlice<u64>,
+        visits: usize,
+        max_seqs: usize,
+        seqs: usize,
+        backup: &CudaSlice<f32>,
+        inputs: &CudaSlice<bf16>,
+        results: &CudaView<'_, i32>,
+    ) -> anyhow::Result<()> {
+        ensure!(visits > 0 && seqs > 0 && seqs <= max_seqs, "invalid batch verify dims");
+        check_len("tables", tables.len(), visits * max_seqs * BATCH_STATE_WORDS)?;
+        check_len(
+            "backup",
+            backup.len(),
+            visits * max_seqs * STATE_ROWS * VISIT_CHANNELS,
+        )?;
+        check_len(
+            "inputs",
+            inputs.len(),
+            visits * max_seqs * VERIFY_ROWS * VISIT_CHANNELS,
+        )?;
+        check_len("results", results.len(), seqs * RESULT_LEN)?;
+        let max_seqs_arg = i32::try_from(max_seqs)?;
+        let seqs_arg = i32::try_from(seqs)?;
+        let mut launch = stream.launch_builder(&self.conv_rollback_batch);
+        launch
+            .arg(tables)
+            .arg(&max_seqs_arg)
+            .arg(&seqs_arg)
+            .arg(backup)
+            .arg(inputs)
+            .arg(results);
+        // SAFETY: the arguments match `conv_rollback_batch(const unsigned long long*, int, int,
+        // const float*, const bf16*, const int*)`; bounds match `conv_backup_batch` and
+        // `results[seq * RESULT_LEN]` is in `0..VERIFY_ROWS`.
+        unsafe { launch.launch(state_config(visits * seqs)?) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::ring_backup`]: saves the `rows` (`1..=VERIFY_ROWS`) ring slots per
+    /// sequence across `sliding_visits` for `seqs` sequences.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn ring_backup_batch(
+        &self,
+        stream: &CudaStream,
+        tables: &CudaSlice<u64>,
+        sliding_visits: &CudaSlice<i32>,
+        visits: usize,
+        max_seqs: usize,
+        seqs: usize,
+        slots: usize,
+        positions: &CudaView<'_, u32>,
+        rows: usize,
+        backup: &mut CudaSlice<u8>,
+        row_bytes: usize,
+    ) -> anyhow::Result<()> {
+        let (config, max_seqs_arg, slots_arg, row_bytes_arg) = ring_batch_config(
+            tables.len(),
+            sliding_visits.len(),
+            visits,
+            max_seqs,
+            seqs,
+            slots,
+            positions.len(),
+            rows,
+            backup.len(),
+            row_bytes,
+        )?;
+        let mut launch = stream.launch_builder(&self.ring_backup_batch);
+        launch
+            .arg(tables)
+            .arg(sliding_visits)
+            .arg(&max_seqs_arg)
+            .arg(&slots_arg)
+            .arg(positions)
+            .arg(backup)
+            .arg(&row_bytes_arg);
+        // SAFETY: the arguments match `ring_backup_batch(const unsigned long long*, const int*,
+        // int, unsigned, const unsigned*, uint8_t*, unsigned)`. Every sliding visit index in
+        // `sliding_visits` is below `visits` and points to live `[slots, row_bytes]` ring pairs.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::ring_restore`]: puts back rejected ring slots (`j > results[seq, 0]`).
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn ring_restore_batch(
+        &self,
+        stream: &CudaStream,
+        tables: &CudaSlice<u64>,
+        sliding_visits: &CudaSlice<i32>,
+        visits: usize,
+        max_seqs: usize,
+        seqs: usize,
+        slots: usize,
+        positions: &CudaView<'_, u32>,
+        rows: usize,
+        backup: &CudaSlice<u8>,
+        results: &CudaView<'_, i32>,
+        row_bytes: usize,
+    ) -> anyhow::Result<()> {
+        let (config, max_seqs_arg, slots_arg, row_bytes_arg) = ring_batch_config(
+            tables.len(),
+            sliding_visits.len(),
+            visits,
+            max_seqs,
+            seqs,
+            slots,
+            positions.len(),
+            rows,
+            backup.len(),
+            row_bytes,
+        )?;
+        check_len("results", results.len(), seqs * RESULT_LEN)?;
+        let mut launch = stream.launch_builder(&self.ring_restore_batch);
+        launch
+            .arg(tables)
+            .arg(sliding_visits)
+            .arg(&max_seqs_arg)
+            .arg(&slots_arg)
+            .arg(positions)
+            .arg(backup)
+            .arg(results)
+            .arg(&row_bytes_arg);
+        // SAFETY: the arguments match `ring_restore_batch(const unsigned long long*, const
+        // int*, int, unsigned, const unsigned*, const uint8_t*, const int*, unsigned)`.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Batched [`Self::accept_greedy`] for `seqs` sequences, each verifying `rows` tokens.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_greedy_batch(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        keep: &CudaView<'_, u32>,
+        seqs: usize,
+        rows: usize,
+        results: &mut CudaViewMut<'_, i32>,
+        anchors: &mut CudaViewMut<'_, i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax) = (tokens.view(), argmax.view());
+        ensure!(seqs > 0, "no sequences");
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        check_len("tokens", tokens.len(), seqs * rows)?;
+        check_len("argmax", argmax.len(), seqs * rows)?;
+        check_len("keep", keep.len(), seqs)?;
+        check_len("results", results.len(), seqs * RESULT_LEN)?;
+        check_len("anchors", anchors.len(), seqs)?;
+        let rows_arg = i32::try_from(rows)?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(seqs)?, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = stream.launch_builder(&self.accept_greedy_batch);
+        launch
+            .arg(&tokens)
+            .arg(&argmax)
+            .arg(keep)
+            .arg(&rows_arg)
+            .arg(results)
+            .arg(anchors);
+        // SAFETY: the arguments match `accept_greedy_batch(const int*, const int*, const
+        // unsigned*, int, int*, int*)`; block `seq` accesses its own slice of each buffer.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
 }
 
 /// One block of `threads` threads.
@@ -381,6 +610,56 @@ fn ring_config(
     };
     Ok((
         config,
+        u32::try_from(slots).context("too many slots")?,
+        u32::try_from(row_bytes).context("row_bytes too large")?,
+    ))
+}
+
+#[expect(clippy::too_many_arguments, reason = "validates ring_backup_batch args")]
+fn ring_batch_config(
+    tables_len: usize,
+    num_sliding: usize,
+    visits: usize,
+    max_seqs: usize,
+    seqs: usize,
+    slots: usize,
+    positions_len: usize,
+    rows: usize,
+    backup_len: usize,
+    row_bytes: usize,
+) -> anyhow::Result<(LaunchConfig, i32, u32, u32)> {
+    ensure!(
+        visits > 0 && num_sliding > 0 && seqs > 0 && seqs <= max_seqs,
+        "invalid ring batch dims"
+    );
+    check_len("tables", tables_len, visits * max_seqs * BATCH_STATE_WORDS)?;
+    check_len("positions", positions_len, seqs)?;
+    ensure!(
+        (1..=VERIFY_ROWS).contains(&rows),
+        "{rows} rows, expected 1 to {VERIFY_ROWS}"
+    );
+    ensure!(
+        row_bytes == KV_DIMS || row_bytes == 2 * KV_DIMS,
+        "ring row_bytes {row_bytes}, expected {KV_DIMS} or {}",
+        2 * KV_DIMS
+    );
+    check_len(
+        "backup",
+        backup_len,
+        num_sliding * max_seqs * VERIFY_ROWS * 2 * row_bytes,
+    )?;
+    let config = LaunchConfig {
+        grid_dim: (
+            u32::try_from(rows)?,
+            u32::try_from(num_sliding)?,
+            u32::try_from(seqs)?,
+        ),
+        block_dim: (u32::try_from(KV_DIMS / 8)?, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    Ok((
+        config,
+        i32::try_from(max_seqs)?,
         u32::try_from(slots).context("too many slots")?,
         u32::try_from(row_bytes).context("row_bytes too large")?,
     ))

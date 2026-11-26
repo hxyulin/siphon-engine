@@ -34,7 +34,10 @@ use siphon::{Checkpoint, TextConfig};
 use siphon_cuda::{
     Gpu,
     draft::DraftOptions,
-    model::{Accept, DEFAULT_PREFILL_CHUNK, Model, PrefillLogits, Sampling, VerifyTokens},
+    model::{
+        Accept, BatchVerifyTokens, DEFAULT_PREFILL_CHUNK, Model, PrefillLogits, Sampling,
+        VerifyTokens,
+    },
     ops::attention::KvFormat,
     spec::{DraftSource, Drafts, Prompt, Speculator, Width, greedy_by_verify, load_draft},
     weights::{WeightFormat, Weights},
@@ -445,4 +448,211 @@ fn speculation_returns_after_batch_dflash() -> anyhow::Result<()> {
         return Ok(());
     };
     speculation_returns_after_batch(Some(std::path::Path::new(&dir)))
+}
+
+struct RoundPlan {
+    width: usize,
+    corrupt: [Option<usize>; 5],
+    accept: [Accept; 5],
+}
+
+struct RoundExpectation {
+    accepted: usize,
+    emitted: Vec<u32>,
+    hashes: Vec<u64>,
+}
+
+/// Bit-exact parity for `Model::verify_batch`: across multiple sequences spanning the
+/// sliding-window wrap, widths 1, 4 and 8, mixed greedy/sampled acceptance (0 accepts,
+/// partial accepts, full accepts, and forced `Accept::Rows`), every sequence's verdicts,
+/// logit hashes, post-rollback caches and subsequent tokens must equal single-sequence
+/// `Model::verify`.
+#[expect(clippy::too_many_lines, reason = "end-to-end multi-round parity check")]
+fn batch_verify_matches_alone(kv: KvFormat, weights: WeightFormat) -> anyhow::Result<()> {
+    let (_gpu, mut model) = load(kv, weights)?;
+    model.enable_sampling()?;
+    let vocab = model.config().unpadded_vocab_size;
+    let capture = capture_tokens()?;
+    let prompts: Vec<&[u32]> = PROMPTS
+        .iter()
+        .map(|&(first, len)| &capture[first..first + len])
+        .collect();
+    let n = prompts.len();
+    let samplings: Vec<Sampling> = (0..n)
+        .map(|i| {
+            if i % 2 == 0 {
+                Ok(Sampling::GREEDY)
+            } else {
+                Sampling::new(0.8, 0, 0.95, 0.0, 100 + i as u64)
+            }
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // Reference trajectories via single-sequence Model::verify in slot 0:
+    // First collect ground-truth continuation for each sequence so we can construct exact,
+    // partial, and wrong draft blocks.
+    let mut truth: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for (i, prompt) in prompts.iter().enumerate() {
+        model.reset()?;
+        model.set_sampling(samplings[i]);
+        let mut tok = model.prefill(prompt, DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+        let mut seq = vec![tok];
+        for _ in 0..32 {
+            let v = model.verify(VerifyTokens::Host(&[tok]), Accept::Rows(1))?;
+            tok = v.next();
+            seq.push(tok);
+        }
+        truth.push(seq);
+    }
+
+    // Plan of (width, accept_fn, corrupt_index_per_seq):
+    // Round 0: width 8, Greedy — seq 0 all match (7 accepted), seq 1 partial (3 accepted),
+    //          seq 2 0 accepted (full conv+ring rollback), seq 3 partial (1 accepted),
+    //          seq 4 all match (7 accepted, crosses 1024 sliding window!).
+    // Round 1: width 4, mixed Greedy & Accept::Rows(2) to test explicit rollback.
+    // Round 2: width 1, Greedy (verifies width=1 path & post-rollback cache state).
+    // Round 3: width 8, Greedy with partial/full rollbacks again (replays captured graph).
+    let plans = [
+        RoundPlan {
+            width: 8,
+            corrupt: [None, Some(4), Some(1), Some(2), None],
+            accept: [Accept::Greedy; 5],
+        },
+        RoundPlan {
+            width: 4,
+            corrupt: [Some(2), None, Some(3), None, Some(1)],
+            accept: [
+                Accept::Greedy,
+                Accept::Rows(2),
+                Accept::Greedy,
+                Accept::Rows(3),
+                Accept::Greedy,
+            ],
+        },
+        RoundPlan {
+            width: 1,
+            corrupt: [None; 5],
+            accept: [Accept::Greedy; 5],
+        },
+        RoundPlan {
+            width: 8,
+            corrupt: [Some(5), Some(1), None, Some(6), Some(3)],
+            accept: [Accept::Greedy; 5],
+        },
+    ];
+
+    // Run reference single-sequence verifies following the exact same round plans.
+    let mut want_verdicts: Vec<Vec<RoundExpectation>> = (0..n).map(|_| Vec::new()).collect();
+    for (i, prompt) in prompts.iter().enumerate() {
+        model.reset()?;
+        model.set_sampling(samplings[i]);
+        let _first = model.prefill(prompt, DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+        let mut cursor = 0usize;
+        for plan in &plans {
+            let mut toks = truth[i][cursor..cursor + plan.width].to_vec();
+            if let Some(bad) = plan.corrupt[i] {
+                toks[bad] = (toks[bad] + 17) % (vocab as u32);
+            }
+            let v = model.verify(VerifyTokens::Host(&toks), plan.accept[i])?;
+            let logits = model.verify_logits()?;
+            let hashes: Vec<u64> = (0..plan.width)
+                .map(|j| hash(&logits[j * vocab..(j + 1) * vocab]))
+                .collect();
+            cursor += v.accepted + 1;
+            want_verdicts[i].push(RoundExpectation {
+                accepted: v.accepted,
+                emitted: v.emitted(),
+                hashes,
+            });
+        }
+    }
+
+    // Now run all 5 sequences concurrently via Model::verify_batch in shuffled slot order.
+    model.add_slots(n - 1)?;
+    let slot_of = |i: usize| match i {
+        0 => 2,
+        2 => 0,
+        other => other,
+    };
+    let mut cursors = vec![0usize; n];
+    for (i, prompt) in prompts.iter().enumerate() {
+        let slot = slot_of(i);
+        model.reset_slot(slot)?;
+        model.set_sampling(samplings[i]);
+        let _first = model.prefill_slot(slot, prompt, DEFAULT_PREFILL_CHUNK)?;
+    }
+
+    let slots: Vec<usize> = (0..n).map(slot_of).collect();
+    for (r, plan) in plans.iter().enumerate() {
+        let mut buf: Vec<Vec<u32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut toks = truth[i][cursors[i]..cursors[i] + plan.width].to_vec();
+            if let Some(bad) = plan.corrupt[i] {
+                toks[bad] = (toks[bad] + 17) % (vocab as u32);
+            }
+            buf.push(toks);
+        }
+        let slices: Vec<&[u32]> = buf.iter().map(Vec::as_slice).collect();
+        let verdicts = model.verify_batch(
+            &slots,
+            BatchVerifyTokens::Host(&slices),
+            &plan.accept,
+            &samplings,
+        )?;
+        let logits = model.batch_verify_logits()?;
+        for (i, v) in verdicts.iter().enumerate() {
+            let RoundExpectation {
+                accepted: want_acc,
+                emitted: want_emit,
+                hashes: want_hashes,
+            } = &want_verdicts[i][r];
+            let got_hashes: Vec<u64> = (0..plan.width)
+                .map(|j| {
+                    let row = i * plan.width + j;
+                    hash(&logits[row * vocab..(row + 1) * vocab])
+                })
+                .collect();
+            println!(
+                "round {r} (W={}) seq {i} (slot {}): accepted={} (want {}), emitted_match={}, logits_match={}",
+                plan.width,
+                slots[i],
+                v.accepted,
+                want_acc,
+                v.emitted() == *want_emit,
+                got_hashes == *want_hashes,
+            );
+            ensure!(
+                v.accepted == *want_acc,
+                "round {r} seq {i}: accepted {} != {want_acc}",
+                v.accepted
+            );
+            ensure!(
+                v.emitted() == *want_emit,
+                "round {r} seq {i}: emitted {:?} != {want_emit:?}",
+                v.emitted()
+            );
+            ensure!(
+                got_hashes == *want_hashes,
+                "round {r} seq {i}: logits hashes differ from single-sequence verify"
+            );
+            cursors[i] += v.accepted + 1;
+            ensure!(
+                model.slot_position(slots[i])? == prompts[i].len() + cursors[i],
+                "round {r} seq {i}: slot position mismatch"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_verify_matches_alone_fp8() -> anyhow::Result<()> {
+    batch_verify_matches_alone(KvFormat::Fp8, WeightFormat::Fp8)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_verify_matches_alone_nvfp4() -> anyhow::Result<()> {
+    batch_verify_matches_alone(KvFormat::Nvfp4, WeightFormat::Fp8)
 }

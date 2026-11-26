@@ -579,12 +579,19 @@ impl Norm {
             .opt_mut(bias.as_mut(), stream)
             .i32(i32::try_from(extent)?);
         if let Some(batch) = a.batch {
-            check("states", batch.states.len(), rows * BATCH_STATE_WORDS)?;
-            check("positions", batch.positions.len(), rows)?;
+            let rows_per_seq = batch.rows_per_seq;
+            ensure!(
+                rows_per_seq > 0 && rows.is_multiple_of(rows_per_seq),
+                "{rows} rows is not a positive multiple of rows_per_seq {rows_per_seq}"
+            );
+            let seqs = rows / rows_per_seq;
+            check("states", batch.states.len(), seqs * BATCH_STATE_WORDS)?;
+            check("positions", batch.positions.len(), seqs)?;
             args.ptr(&batch.states, stream)
-                .ptr(&batch.positions, stream);
+                .ptr(&batch.positions, stream)
+                .i32(i32::try_from(rows_per_seq)?);
         } else {
-            args.u64(0).u64(0);
+            args.u64(0).u64(0).i32(1);
         }
         // SAFETY: the arguments match `attention_post_rows_bf16`'s signature, which is
         // `attention_post_bf16`'s with `start` for `position`, then the table, the bias, the
