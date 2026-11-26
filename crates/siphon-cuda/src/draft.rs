@@ -45,7 +45,8 @@ use crate::{
             F8_MAX_PRODUCTS, FoldRows, Fp8Product, Fp8Rows, KV_WIDTH, KvCache, LogitBounds,
             RACE_WORDS, Rope, StepRace, TOP_K, TopkScratch, race_words,
         },
-        linear::{Gemm, Linear, MAX_PRODUCTS},
+        linear::{Gemm, Linear, MAX_PRODUCTS, Start},
+        linear_rows::{LinearRows, MAX_PRODUCTS as ROWS_MAX_PRODUCTS, RowsProduct},
         sample::Sampling,
     },
     weights::{
@@ -245,6 +246,7 @@ pub fn rope_inv_freq_theta(theta: f64) -> Vec<f32> {
 /// The draft's weights, its LM-head fold, its cache and its scratch buffers.
 pub struct Draft {
     kernels: DraftKernels,
+    linear_rows: LinearRows,
     arch: Arch,
     /// RoPE frequencies `theta^(-2i/128)`, F32 `[64]`.
     inv_freq: CudaSlice<f32>,
@@ -994,8 +996,10 @@ impl Draft {
         } else {
             None
         };
+        let linear_rows = LinearRows::load(stream.context())?;
         Ok(Self {
             kernels,
+            linear_rows,
             arch,
             inv_freq: stream.clone_htod(&inv_freq)?,
             caches,
@@ -1780,6 +1784,7 @@ impl Draft {
                     let f = self.backbone.as_ref().map(|b| &b[layer]);
                     project(
                         linear,
+                        &self.linear_rows,
                         k,
                         stream,
                         &mixed,
@@ -1826,6 +1831,7 @@ impl Draft {
         // Every row of the 8 runs; the store keeps only the committed ones.
         project(
             linear,
+            &self.linear_rows,
             k,
             stream,
             &self.inputs.taps.slice(..),
@@ -1859,6 +1865,7 @@ impl Draft {
         }
         project(
             linear,
+            &self.linear_rows,
             k,
             stream,
             &dfl.round_normed.slice(..),
@@ -1909,9 +1916,12 @@ impl Draft {
                 s.add_norm(k, stream, Sublayer::Mlp, pending, lw.input_norm, false)?;
             }
             let f = self.backbone.as_ref().map(|b| &b[layer]);
+            let use_rows = f.is_some();
             let (attention_conv, mlp_conv) = lw.convs.unzip();
             let input = sublayer_input(
                 linear,
+                &self.linear_rows,
+                use_rows,
                 k,
                 stream,
                 &s.h,
@@ -1921,6 +1931,7 @@ impl Draft {
             )?;
             project(
                 linear,
+                &self.linear_rows,
                 k,
                 stream,
                 &input,
@@ -1933,6 +1944,7 @@ impl Draft {
             attend(k, stream, arch, s, control, &self.inv_freq, layer, cache)?;
             project(
                 linear,
+                &self.linear_rows,
                 k,
                 stream,
                 &s.attn.slice(..),
@@ -1948,6 +1960,8 @@ impl Draft {
             )?;
             let input = sublayer_input(
                 linear,
+                &self.linear_rows,
+                use_rows,
                 k,
                 stream,
                 &s.h,
@@ -1957,6 +1971,7 @@ impl Draft {
             )?;
             project(
                 linear,
+                &self.linear_rows,
                 k,
                 stream,
                 &input,
@@ -1968,6 +1983,7 @@ impl Draft {
             k.silu_mul(stream, &s.gate, &s.up, &mut s.act)?;
             project(
                 linear,
+                &self.linear_rows,
                 k,
                 stream,
                 &s.act.slice(..),
@@ -2003,6 +2019,7 @@ impl Draft {
         let m_rows = steps.max(2);
         let (rows, ld) = base_logits(
             linear,
+            &self.linear_rows,
             k,
             stream,
             self.head_copy.as_ref().unwrap_or(shared.lm_head),
@@ -2105,6 +2122,7 @@ impl Draft {
         let list = head.and_then(|h| h.shortlist.as_ref());
         let (rows, ld) = base_logits(
             linear,
+            &self.linear_rows,
             k,
             stream,
             self.head_copy.as_ref().unwrap_or(shared.lm_head),
@@ -2181,6 +2199,7 @@ impl Draft {
         let list = head.and_then(|h| h.shortlist.as_ref());
         let (rows, ld) = base_logits(
             linear,
+            &self.linear_rows,
             k,
             stream,
             self.head_copy.as_ref().unwrap_or(shared.lm_head),
@@ -2207,14 +2226,29 @@ impl Draft {
             &mut d2.cand,
         )?;
         // At least two rows for the BF16 GEMM, as in base_logits.
-        let m_rows = steps.max(2);
-        let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
-        let mut hp = d2.hp.slice_mut(..m_rows * RANK);
-        linear.gemm_bf16(
-            stream,
-            &mut [Gemm::new(&weights.selector.hidden_projection, &y, &mut hp)],
-            m_rows,
-        )?;
+        if self.backbone.is_some() {
+            let y = s.y.slice(HIDDEN..(steps + 1) * HIDDEN);
+            let mut hp = d2.hp.slice_mut(..steps * RANK);
+            self.linear_rows.run(
+                stream,
+                &mut [RowsProduct::bf16(
+                    &weights.selector.hidden_projection,
+                    &y,
+                    &mut hp,
+                )],
+                steps,
+                Start::Early,
+            )?;
+        } else {
+            let m_rows = steps.max(2);
+            let y = s.y.slice(HIDDEN..(m_rows + 1) * HIDDEN);
+            let mut hp = d2.hp.slice_mut(..m_rows * RANK);
+            linear.gemm_bf16(
+                stream,
+                &mut [Gemm::new(&weights.selector.hidden_projection, &y, &mut hp)],
+                m_rows,
+            )?;
+        }
         k.select(
             stream,
             &d2.cand,
@@ -2234,8 +2268,11 @@ impl Draft {
 
 /// The input convolution of a DFlash 2 sublayer: `coef = conv.projection · x`, then side 0
 /// of the convolution of `x` into `out`.
+#[expect(clippy::too_many_arguments, reason = "convolution inputs and kernels")]
 fn conv_input(
     linear: &Linear,
+    linear_rows: &LinearRows,
+    use_rows: bool,
     k: &DraftKernels,
     stream: &CudaStream,
     conv: &ConvWeights,
@@ -2243,15 +2280,26 @@ fn conv_input(
     coef: &mut CudaSlice<bf16>,
     out: &mut CudaSlice<bf16>,
 ) -> anyhow::Result<()> {
-    linear.gemm_bf16(
-        stream,
-        &mut [Gemm::new(
-            &conv.projection,
-            &x.slice(..),
-            &mut coef.slice_mut(..),
-        )],
-        BLOCK,
-    )?;
+    if use_rows {
+        let x_view = x.slice(..);
+        let mut coef_out = coef.slice_mut(..);
+        linear_rows.run(
+            stream,
+            &mut [RowsProduct::bf16(&conv.projection, &x_view, &mut coef_out)],
+            BLOCK,
+            Start::Early,
+        )?;
+    } else {
+        linear.gemm_bf16(
+            stream,
+            &mut [Gemm::new(
+                &conv.projection,
+                &x.slice(..),
+                &mut coef.slice_mut(..),
+            )],
+            BLOCK,
+        )?;
+    }
     k.conv(stream, x, coef, 0, &conv.base, out)
 }
 
@@ -2349,8 +2397,11 @@ impl Scratch {
 
 /// A sublayer's input: its normed input `h`, or with `conv` DFlash 2's input convolution
 /// of `h` (see [`conv_input`]) into `d2`'s buffers.
+#[expect(clippy::too_many_arguments, reason = "sublayer input selection")]
 fn sublayer_input<'a>(
     linear: &Linear,
+    linear_rows: &LinearRows,
+    use_rows: bool,
     k: &DraftKernels,
     stream: &CudaStream,
     h: &'a CudaSlice<bf16>,
@@ -2366,7 +2417,17 @@ fn sublayer_input<'a>(
         Sublayer::Attention => &mut d2.coef_attention,
         Sublayer::Mlp => &mut d2.coef_mlp,
     };
-    conv_input(linear, k, stream, conv, h, coef, &mut d2.conv)?;
+    conv_input(
+        linear,
+        linear_rows,
+        use_rows,
+        k,
+        stream,
+        conv,
+        h,
+        coef,
+        &mut d2.conv,
+    )?;
     Ok(d2.conv.slice(..))
 }
 
@@ -2376,6 +2437,7 @@ fn sublayer_input<'a>(
 #[expect(clippy::too_many_arguments, reason = "the head and the buffers")]
 fn base_logits(
     linear: &Linear,
+    linear_rows: &LinearRows,
     k: &DraftKernels,
     stream: &CudaStream,
     lm_head: &CudaSlice<bf16>,
@@ -2408,8 +2470,25 @@ fn base_logits(
         }
         Some(Matrix::Fp8(w)) => {
             let y = s.y.slice(HIDDEN..(steps + 1) * HIDDEN);
-            let base = s.base.slice_mut(..);
-            k.gemm_fp8(stream, &y, steps, &mut [fp8_rows(w, rows, base, ld)])?;
+            if rows == ld && linear_rows.supports(w.k) {
+                let mut base = s.base.slice_mut(..steps * rows);
+                linear_rows.run(
+                    stream,
+                    &mut [RowsProduct::fp8_raw(
+                        w.values.slice(..rows * w.k),
+                        w.scales.slice(..rows),
+                        rows,
+                        w.k,
+                        &y,
+                        &mut base,
+                    )],
+                    steps,
+                    Start::Early,
+                )?;
+            } else {
+                let base = s.base.slice_mut(..);
+                k.gemm_fp8(stream, &y, steps, &mut [fp8_rows(w, rows, base, ld)])?;
+            }
         }
     }
     Ok((rows, ld))
@@ -2647,12 +2726,34 @@ type Projection<'a> = (
 /// which must then all be there. As few launches as the kernels' product limits allow.
 fn project(
     linear: &Linear,
+    linear_rows: &LinearRows,
     kernels: &DraftKernels,
     stream: &CudaStream,
     x: &CudaView<'_, bf16>,
     products: &mut [Projection<'_>],
 ) -> anyhow::Result<()> {
     if products.iter().all(|p| p.1.is_some()) {
+        let width = x.len() / BLOCK;
+        if linear_rows.supports(width) {
+            for chunk in products.chunks_mut(ROWS_MAX_PRODUCTS) {
+                let mut batch: Vec<RowsProduct<'_>> = chunk
+                    .iter_mut()
+                    .map(|p| {
+                        let w = p.1.context("FP8 weight missing")?;
+                        Ok(RowsProduct::fp8_raw(
+                            w.values.slice(..),
+                            w.scales.slice(..),
+                            w.rows(),
+                            w.k,
+                            x,
+                            &mut p.2,
+                        ))
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                linear_rows.run(stream, &mut batch, BLOCK, Start::Early)?;
+            }
+            return Ok(());
+        }
         for chunk in products.chunks_mut(F8_MAX_PRODUCTS) {
             let mut fp8: Vec<Fp8Product<'_>> = chunk
                 .iter_mut()

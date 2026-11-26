@@ -35,7 +35,6 @@ pub const MAX_BATCH_DRAFT_SEQS: usize = MAX_BATCH_SEQS;
 
 /// Per-slot sliding rings and batched intermediates for DFlash 2.
 pub(super) struct BatchDflash2 {
-    linear_rows: LinearRows,
     /// Sliding rings for slots `1..` (slot 0 reuses `Draft::caches`).
     extra_slots: Vec<Vec<KvCache>>,
     /// Committed position of slots `1..` (slot 0 uses `Draft::committed`).
@@ -107,14 +106,12 @@ impl BatchDflash2 {
         fp8_kv: bool,
         max_seqs: usize,
     ) -> anyhow::Result<Self> {
-        let linear_rows = LinearRows::load(stream.context())?;
         let max_rows = max_seqs * BLOCK;
         let max_steps = max_seqs * STEPS;
         let z = |n: usize| stream.alloc_zeros::<bf16>(n);
         let zf = |n: usize| stream.alloc_zeros::<f32>(n);
         let zi = |n: usize| stream.alloc_zeros::<i32>(n);
         Ok(Self {
-            linear_rows,
             extra_slots: Vec::new(),
             extra_committed: Vec::new(),
             fp8_kv,
@@ -681,7 +678,7 @@ impl Draft {
         let k = &self.kernels;
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
         let fp8_kv = b.fp8_kv;
-        let lr = &b.linear_rows;
+        let lr = &self.linear_rows;
         let controls = b.controls.slice(..seqs * CONTROL);
         let cache_table = b.cache_table.slice(..seqs * layers * 2);
 
