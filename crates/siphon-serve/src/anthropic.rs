@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    chat::{self, Ending, InvalidRequest, Rendered, Vocab},
+    chat::{self, Ending, InvalidRequest, Rendered, Thinking, Vocab},
     engine::{Event, Finish},
     openai::{
         self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, Results, blocking, submit,
@@ -209,23 +209,24 @@ fn render(vocab: &Vocab, request: &MessagesRequest) -> Result<(Rendered, Parser,
     } else {
         Ending::Generate
     };
-    let (ending, calls) = tool_ending(&choice, &tools, parallel, ending)?;
-    let effort = effort(request.thinking.as_ref(), request.output_config.as_ref());
-    let prompt = vocab.render_prompt(&messages, &tools, effort, &ending)?;
+    let thinking = thinking(request.thinking.as_ref(), request.output_config.as_ref());
+    let (ending, calls) = tool_ending(&choice, &tools, parallel, thinking.ending(ending, &tools))?;
+    let prompt = vocab.render_prompt(&messages, &tools, thinking.effort(), &ending)?;
     Ok((prompt, Parser::new(vocab, &ending), calls))
 }
 
-/// The thinking effort: 0 when `thinking` is disabled, else `output_config.effort` when it
-/// names one of the template's efforts, else the template's default.
-fn effort(thinking: Option<&Value>, output_config: Option<&Value>) -> f64 {
+/// The request's thinking: off when `thinking` is disabled, else `output_config.effort`
+/// when it names one of the template's efforts, else the template's default.
+fn thinking(thinking: Option<&Value>, output_config: Option<&Value>) -> Thinking {
     if thinking.and_then(|t| t.get("type")).and_then(Value::as_str) == Some("disabled") {
-        return 0.0;
+        return Thinking::Off;
     }
-    output_config
+    let effort = output_config
         .and_then(|c| c.get("effort"))
         .filter(|e| e.is_string())
         .and_then(|e| chat::effort(Some(e)).ok())
-        .unwrap_or(chat::DEFAULT_EFFORT)
+        .unwrap_or(chat::DEFAULT_EFFORT);
+    Thinking::Effort(effort)
 }
 
 /// Anthropic's `tool_choice` as ours, and whether the reply may make several calls.
@@ -902,22 +903,40 @@ mod tests {
             format!("{head}{body}<|message_model|>")
         );
 
-        // A named tool opens its call; disabled thinking is effort 0; `none` drops the tools.
-        request["tool_choice"] = json!({"type": "tool", "name": "Read"});
+        // Disabled thinking is effort 0. With tools, the model thinks briefly anyway, as it
+        // decides on tool calls there.
         request["thinking"] = json!({"type": "disabled"});
+        let head = head.replace("level: 0.7", "level: 0");
+        assert_eq!(
+            rendered(&vocab, request.clone()),
+            format!("{head}{body}<|message_model|>")
+        );
+        // A named tool opens its call.
+        request["tool_choice"] = json!({"type": "tool", "name": "Read"});
         let text = rendered(&vocab, request.clone());
-        assert!(text.contains("Thinking effort level: 0<|end_message|>"));
         assert!(text.ends_with("<|message_model|>Read<|content_invoke_tool_json|>"));
+        // `none` drops the tools, so the prompt ends with the thought that skips thinking.
         request["tool_choice"] = json!({"type": "none"});
-        assert!(!rendered(&vocab, request.clone()).contains("tool_declare"));
+        let text = rendered(&vocab, request.clone());
+        assert!(!text.contains("tool_declare"));
+        assert!(text.ends_with(
+            "<|message_user|><|content_text|>Thanks.<|end_message|><|message_model|>\
+             <|content_thinking|>Respond directly.<|end_message|><|message_model|>"
+        ));
         // A last assistant message is a prefill that the reply continues.
         let prefill = json!({"max_tokens": 8, "messages": [
             {"role": "user", "content": "Name a colour."},
             {"role": "assistant", "content": [{"type": "text", "text": "The colour is"}]}]});
-        assert!(rendered(&vocab, prefill).ends_with(
+        assert!(rendered(&vocab, prefill.clone()).ends_with(
             "<|message_user|><|content_text|>Name a colour.<|end_message|>\
              <|message_model|><|content_text|>The colour is"
         ));
+        // The prefill's open text block is the reply, so disabled thinking adds no block.
+        let mut disabled = prefill;
+        disabled["thinking"] = json!({"type": "disabled"});
+        assert!(
+            rendered(&vocab, disabled).ends_with("<|message_model|><|content_text|>The colour is")
+        );
         // A tool_choice that names a server tool, which is not declared, is refused.
         request["tool_choice"] = json!({"type": "tool", "name": "web_search"});
         assert!(render(&vocab, &parse(request)).is_err());
@@ -944,21 +963,25 @@ mod tests {
     }
 
     #[test]
-    fn effort_tool_choice_and_tools() {
-        assert_eq!(effort(None, None), chat::DEFAULT_EFFORT);
+    fn thinking_tool_choice_and_tools() {
+        let effort = |level| Thinking::Effort(level);
+        assert_eq!(thinking(None, None), effort(chat::DEFAULT_EFFORT));
         let disabled = json!({"type": "disabled"});
         let adaptive = json!({"type": "adaptive"});
         let low = json!({"effort": "low"});
-        assert_eq!(effort(Some(&disabled), Some(&low)), 0.0);
-        assert_eq!(effort(Some(&adaptive), Some(&low)), 0.2);
-        assert_eq!(effort(None, Some(&json!({"effort": "max"}))), 0.99);
+        assert_eq!(thinking(Some(&disabled), Some(&low)), Thinking::Off);
+        assert_eq!(thinking(Some(&adaptive), Some(&low)), effort(0.2));
         assert_eq!(
-            effort(None, Some(&json!({"effort": "ultra"}))),
-            chat::DEFAULT_EFFORT
+            thinking(None, Some(&json!({"effort": "max"}))),
+            effort(0.99)
         );
         assert_eq!(
-            effort(None, Some(&json!({"effort": 0.5}))),
-            chat::DEFAULT_EFFORT
+            thinking(None, Some(&json!({"effort": "ultra"}))),
+            effort(chat::DEFAULT_EFFORT)
+        );
+        assert_eq!(
+            thinking(None, Some(&json!({"effort": 0.5}))),
+            effort(chat::DEFAULT_EFFORT)
         );
 
         let choice = |v: Value| tool_choice(Some(&v)).unwrap();
@@ -1064,6 +1087,19 @@ mod tests {
         events: Vec<Event>,
         stream: bool,
     ) -> Vec<Frame> {
+        let parser = Parser::new(vocab, &Ending::Generate);
+        collect_parsed(vocab, parser, stops, calls, events, stream).await
+    }
+
+    /// [`collect`] with the output parsed by `parser`.
+    async fn collect_parsed(
+        vocab: &Vocab,
+        parser: Parser,
+        stops: &[&str],
+        calls: Calls,
+        events: Vec<Event>,
+        stream: bool,
+    ) -> Vec<Frame> {
         let (sender, receiver) = mpsc::unbounded_channel();
         for event in events {
             sender.send(event).unwrap();
@@ -1073,7 +1109,7 @@ mod tests {
             tracker: Arc::new(Metrics::new("m")).track(10),
         };
         let output = Output::new(
-            Decoder::Chat(Parser::new(vocab, &Ending::Generate)),
+            Decoder::Chat(parser),
             Stops::new(stops.iter().map(|&s| s.to_owned()).collect()),
             Vec::new(),
             calls,
@@ -1211,6 +1247,54 @@ mod tests {
             .filter_map(|(_, data)| data.pointer("/delta/thinking").and_then(Value::as_str))
             .collect();
         assert_eq!(thinking, "Let me look.");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    async fn disabled_thinking_streams_only_text() {
+        let vocab = vocab();
+        let request = parse(json!({"max_tokens": 32, "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "Capital of Australia?"}]}));
+        let (_, parser, calls) = render(&vocab, &request).unwrap();
+        // After the prompt's thinking block, the model opens a text block.
+        let mut ids = text(&vocab, "Canberra.");
+        ids.push(vocab.special.end_message);
+        let n = ids.len();
+        let events = vec![Event::Tokens(ids), Event::Done(Finish::Stop)];
+        let frames = collect_parsed(&vocab, parser.clone(), &[], calls, events, true).await;
+        let names: Vec<&str> = frames.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(
+            frames[1].1,
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}})
+        );
+        assert_eq!(
+            frames[2].1,
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "Canberra."}})
+        );
+
+        let mut ids = text(&vocab, "Canberra.");
+        ids.push(vocab.special.end_message);
+        let events = vec![Event::Tokens(ids), Event::Done(Finish::Stop)];
+        let (_, _, calls) = render(&vocab, &request).unwrap();
+        let frames = collect_parsed(&vocab, parser, &[], calls, events, false).await;
+        assert_eq!(
+            frames[0].1["content"],
+            json!([{"type": "text", "text": "Canberra."}])
+        );
+        assert_eq!(frames[0].1["usage"]["output_tokens"], n);
     }
 
     #[tokio::test]

@@ -53,6 +53,9 @@ pub struct Special {
 pub enum Ending<'a> {
     /// A new model message, `<|message_model|>`, as `add_generation_prompt` adds.
     Generate,
+    /// A thinking block of [`OFF_THOUGHT`], then a new model message, so the model answers
+    /// without thinking. See [`Thinking::Off`].
+    Answer,
     /// No generation prompt, for counting a conversation's tokens.
     Bare,
     /// The final assistant message's last text block left open, as vLLM's
@@ -95,6 +98,43 @@ const EFFORTS: [(&str, f64); 7] = [
 
 /// The thinking effort when a request names none, as in `chat_template.jinja`.
 pub const DEFAULT_EFFORT: f64 = 0.9;
+
+/// The thought a prompt gives the model when thinking is off. The model ends its own short
+/// thinking blocks at effort 0 with these words. An empty thinking block does not work: the
+/// model opens a second one and thinks there.
+pub const OFF_THOUGHT: &str = "Respond directly.";
+
+/// How much a request lets the model think.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Thinking {
+    /// The template's thinking effort in [0, 0.99]. Even effort 0 writes a short thinking
+    /// block.
+    Effort(f64),
+    /// No thinking: effort 0, and a request without tools ends its prompt with a thinking
+    /// block of [`OFF_THOUGHT`], so the model answers at once.
+    Off,
+}
+
+impl Thinking {
+    /// The effort the system block states.
+    pub fn effort(self) -> f64 {
+        match self {
+            Self::Effort(effort) => effort,
+            Self::Off => 0.0,
+        }
+    }
+
+    /// `ending` for a request with `tools`: with thinking off and no tools,
+    /// [`Ending::Generate`] becomes [`Ending::Answer`]. A request with tools keeps effort
+    /// 0's own thinking, because the model decides on a tool call there: after the
+    /// prompt's thought it answers in text instead of calling the tool.
+    pub fn ending<'a>(self, ending: Ending<'a>, tools: &[Value]) -> Ending<'a> {
+        match (self, ending) {
+            (Self::Off, Ending::Generate) if tools.is_empty() => Ending::Answer,
+            (_, ending) => ending,
+        }
+    }
+}
 
 impl Vocab {
     /// Loads `tokenizer.json` from the checkpoint folder `dir`.
@@ -369,6 +409,10 @@ impl Vocab {
         let s = self.special;
         match *ending {
             Ending::Generate => ids.push(s.message_model),
+            Ending::Answer => {
+                self.block(ids, &[s.message_model], s.content_thinking, OFF_THOUGHT);
+                ids.push(s.message_model);
+            }
             Ending::Bare | Ending::Continue => {}
             Ending::Call(name) => {
                 if !tools
@@ -425,14 +469,15 @@ impl Vocab {
     }
 }
 
-/// The thinking effort of a chat request: its `reasoning_effort`, else
-/// `chat_template_kwargs.reasoning_effort`, else effort 0 (no thinking) when
-/// `chat_template_kwargs.enable_thinking` is false, else [`DEFAULT_EFFORT`]. The checkpoint's
-/// template has no `enable_thinking` switch; effort 0 is its no-thinking level.
-pub fn request_effort(
+/// The thinking of a chat request: its `reasoning_effort`, else
+/// `chat_template_kwargs.reasoning_effort`, else off when
+/// `chat_template_kwargs.enable_thinking` is false, else [`DEFAULT_EFFORT`]. The effort
+/// named `none` turns thinking off; a number is the template's effort, so 0 still thinks
+/// briefly.
+pub fn request_thinking(
     reasoning_effort: Option<&Value>,
     chat_template_kwargs: Option<&Value>,
-) -> Result<f64, InvalidRequest> {
+) -> Result<Thinking, InvalidRequest> {
     let kwarg = |key| {
         chat_template_kwargs
             .and_then(|k| k.get(key))
@@ -442,10 +487,11 @@ pub fn request_effort(
         .filter(|v| !v.is_null())
         .or_else(|| kwarg("reasoning_effort"))
     {
-        Some(named) => effort(Some(named)),
+        Some(Value::String(name)) if name.trim() == "none" => Ok(Thinking::Off),
+        Some(named) => effort(Some(named)).map(Thinking::Effort),
         None => match kwarg("enable_thinking") {
-            None | Some(Value::Bool(true)) => Ok(DEFAULT_EFFORT),
-            Some(Value::Bool(false)) => Ok(0.0),
+            None | Some(Value::Bool(true)) => Ok(Thinking::Effort(DEFAULT_EFFORT)),
+            Some(Value::Bool(false)) => Ok(Thinking::Off),
             Some(_) => Err(invalid("enable_thinking must be a boolean")),
         },
     }
@@ -652,24 +698,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn request_effort_and_enable_thinking() {
+    fn request_thinking_and_enable_thinking() {
         let off = json!({"enable_thinking": false});
         let on = json!({"enable_thinking": true});
-        assert_eq!(request_effort(None, None).unwrap(), DEFAULT_EFFORT);
-        assert_eq!(request_effort(None, Some(&off)).unwrap(), 0.0);
-        assert_eq!(request_effort(None, Some(&on)).unwrap(), DEFAULT_EFFORT);
-        assert_eq!(
-            request_effort(Some(&json!("none")), Some(&off)).unwrap(),
-            0.0
-        );
-        assert_eq!(
-            request_effort(Some(&json!("low")), Some(&off)).unwrap(),
-            0.2
-        );
-        assert_eq!(request_effort(Some(&Value::Null), Some(&off)).unwrap(), 0.0);
+        let thinking = |effort: Option<Value>, kwargs: &Value| {
+            request_thinking(effort.as_ref(), Some(kwargs)).unwrap()
+        };
+        let default = Thinking::Effort(DEFAULT_EFFORT);
+        assert_eq!(request_thinking(None, None).unwrap(), default);
+        assert_eq!(thinking(None, &off), Thinking::Off);
+        assert_eq!(thinking(None, &on), default);
+        assert_eq!(thinking(Some(json!("none")), &on), Thinking::Off);
+        assert_eq!(thinking(Some(json!(" none ")), &on), Thinking::Off);
+        assert_eq!(thinking(Some(json!(0)), &off), Thinking::Effort(0.0));
+        assert_eq!(thinking(Some(json!("low")), &off), Thinking::Effort(0.2));
+        assert_eq!(thinking(Some(Value::Null), &off), Thinking::Off);
         let kwarg = json!({"reasoning_effort": "medium", "enable_thinking": false});
-        assert_eq!(request_effort(None, Some(&kwarg)).unwrap(), 0.7);
-        assert!(request_effort(None, Some(&json!({"enable_thinking": "no"}))).is_err());
+        assert_eq!(thinking(None, &kwarg), Thinking::Effort(0.7));
+        let kwarg = json!({"reasoning_effort": "none"});
+        assert_eq!(thinking(None, &kwarg), Thinking::Off);
+        assert!(request_thinking(None, Some(&json!({"enable_thinking": "no"}))).is_err());
+        assert!(request_thinking(Some(&json!("nothing")), None).is_err());
     }
 
     #[test]
@@ -776,6 +825,26 @@ pub(crate) mod tests {
                     <|end_message|><|message_user|><|content_text|>Hi<|end_message|>";
         let alone = std::slice::from_ref(&user);
         assert_eq!(text(alone, Ending::Bare), head);
+        assert_eq!(
+            text(alone, Ending::Answer),
+            format!(
+                "{head}<|message_model|><|content_thinking|>Respond directly.<|end_message|>\
+                 <|message_model|>"
+            )
+        );
+        let generate = |thinking: Thinking, tools: &[Value]| {
+            matches!(thinking.ending(Ending::Generate, tools), Ending::Generate)
+        };
+        assert!(matches!(
+            Thinking::Off.ending(Ending::Generate, &[]),
+            Ending::Answer
+        ));
+        assert!(generate(Thinking::Off, &tools));
+        assert!(generate(Thinking::Effort(0.0), &[]));
+        assert!(matches!(
+            Thinking::Off.ending(Ending::Continue, &[]),
+            Ending::Continue
+        ));
         assert_eq!(
             text(alone, Ending::AnyCall),
             format!("{head}<|message_model|><|content_invoke_tool_json|>")

@@ -59,7 +59,7 @@ impl Parser {
     /// A parser for ids generated after a prompt that ends as `ending` says.
     pub fn new(vocab: &Vocab, ending: &Ending<'_>) -> Self {
         let (state, tool_name) = match ending {
-            Ending::Generate | Ending::Bare => (State::Header, Vec::new()),
+            Ending::Generate | Ending::Answer | Ending::Bare => (State::Header, Vec::new()),
             Ending::AnyCall => (State::Tool, Vec::new()),
             Ending::Continue => (State::Text, Vec::new()),
             Ending::Call(name) => (State::Tool, vocab.encode(name)),

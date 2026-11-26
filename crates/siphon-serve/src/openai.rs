@@ -442,14 +442,14 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
         tools.clear();
     }
     let parallel = request.parallel_tool_calls != Some(false);
-    let (ending, calls) = tool_ending(&choice, &tools, parallel, ending)?;
-    let effort = chat::request_effort(
+    let thinking = chat::request_thinking(
         request.reasoning_effort.as_ref(),
         request.chat_template_kwargs.as_ref(),
     )?;
-    let rendered = app
-        .vocab
-        .render_prompt(&request.messages, &tools, effort, &ending)?;
+    let (ending, calls) = tool_ending(&choice, &tools, parallel, thinking.ending(ending, &tools))?;
+    let rendered =
+        app.vocab
+            .render_prompt(&request.messages, &tools, thinking.effort(), &ending)?;
     let max_tokens = max_tokens(
         app.engine.max_context(),
         rendered.ids.len(),
@@ -500,7 +500,7 @@ pub(crate) fn tool_ending<'a>(
     };
     let ending = match (call, ending) {
         (None, ending) => ending,
-        (Some(call), Ending::Generate) => call,
+        (Some(call), Ending::Generate | Ending::Answer) => call,
         (Some(_), _) => {
             return Err(ApiError::bad_request(
                 "continue_final_message cannot be used with a forced tool call",

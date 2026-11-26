@@ -53,7 +53,7 @@ pub fn encode(vocab: &Vocab, request: EncodeRequest) -> Result<Vec<u32>, Invalid
             ));
         }
     };
-    let effort = chat::request_effort(
+    let thinking = chat::request_thinking(
         request.reasoning_effort.as_ref(),
         request.chat_template_kwargs.as_ref(),
     )?;
@@ -61,11 +61,12 @@ pub fn encode(vocab: &Vocab, request: EncodeRequest) -> Result<Vec<u32>, Invalid
         request.continue_final_message,
         request.add_generation_prompt,
     )?;
+    let tools = request.tools.unwrap_or_default();
     vocab.render_to(
         &messages,
-        &request.tools.unwrap_or_default(),
-        effort,
-        &ending,
+        &tools,
+        thinking.effort(),
+        &thinking.ending(ending, &tools),
     )
 }
 
@@ -103,7 +104,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::chat::tests::vocab;
+    use crate::chat::{Ending, tests::vocab};
 
     fn request(value: Value) -> EncodeRequest {
         serde_json::from_value(value).unwrap()
@@ -134,15 +135,19 @@ mod tests {
 
         let messages = json!([{"role": "user", "content": "Hi"}]);
         let tools = json!([{"type": "function", "function": {"name": "f"}}]);
-        let chat = vocab
-            .render(messages.as_array().unwrap(), tools.as_array().unwrap(), 0.0)
-            .unwrap();
+        let (msgs, tool_list) = (messages.as_array().unwrap(), tools.as_array().unwrap());
+        let chat = vocab.render(msgs, tool_list, 0.0).unwrap();
+        // Thinking off is effort 0 with tools, as on the chat route.
         let body = json!({"messages": messages, "tools": tools,
                           "chat_template_kwargs": {"enable_thinking": false}});
         assert_eq!(encode(&vocab, request(body)).unwrap(), chat);
-        let body = json!({"text": messages, "tools": tools, "reasoning_effort": "none"});
+        let body = json!({"messages": messages, "tools": tools, "reasoning_effort": 0});
         assert_eq!(encode(&vocab, request(body)).unwrap(), chat);
-        let body = json!({"messages": messages, "tools": tools, "reasoning_effort": 0,
+        // Without tools, it ends the prompt with the thought that skips thinking.
+        let off = vocab.render_to(msgs, &[], 0.0, &Ending::Answer).unwrap();
+        let body = json!({"text": messages, "reasoning_effort": "none"});
+        assert_eq!(encode(&vocab, request(body)).unwrap(), off);
+        let body = json!({"messages": messages, "tools": tools, "reasoning_effort": "none",
                           "add_generation_prompt": false});
         assert_eq!(
             encode(&vocab, request(body)).unwrap(),

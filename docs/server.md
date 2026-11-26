@@ -64,7 +64,7 @@ With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` 
 
 ## Chat request fields
 
-- `reasoning_effort`: a name such as `low`, or 0 to 0.99. The default is 0.9. Without it, `chat_template_kwargs.reasoning_effort` counts, and `chat_template_kwargs.enable_thinking: false` means effort 0. The template has no switch that turns thinking off, so at effort 0 the model still writes a short thinking block.
+- `reasoning_effort`: a name such as `low`, or 0 to 0.99. The default is 0.9. Without it, `chat_template_kwargs.reasoning_effort` counts. `none` and `chat_template_kwargs.enable_thinking: false` turn thinking off, and a request without tools then gets no thinking block (see [Thinking off](#thinking-off)). A number is passed to the template as it is, and at effort 0 the model still writes a short thinking block.
 - `tools` and `tool_choice`: `auto`, `none`, `required`, or `{"type": "function", "function": {"name": ...}}`. A named function, or `required` with one tool, ends the prompt with that tool's call opened. `required` with several tools opens a call without a name, and the model names the tool. A forced call skips the thinking block. The reply ends after the named call, or at the first text after the calls `required` forced. `parallel_tool_calls: false` ends the reply after its first call.
 - `stop`: a string or an array of strings. Stop strings match the reply's content, not its thinking or tool calls. While streaming, text that could still begin a stop string is held back. The reply is cut before the match and finishes with `stop`.
 - `max_tokens` or `max_completion_tokens` past the context is cut to the positions left after the prompt, and the reply then finishes with `length`. A client's token count can differ from the server's, so a cap that a client sized to the context can overshoot it. vLLM refuses such a request. A prompt that fills the context alone still gets a 400.
@@ -92,7 +92,7 @@ The request maps onto the chat route as follows:
 - A last `assistant` message is a prefill, and the reply continues it.
 - `tools` entries with a `type` other than `custom` are Anthropic's server tools, such as web search, and are left out.
 - `tool_choice`: `auto`, `any`, `{"type": "tool", "name"}` and `none` work as `auto`, `required`, a named function and `none` do on the chat route. `disable_parallel_tool_use` ends the reply after its first call.
-- `thinking: {"type": "disabled"}` is effort 0. Otherwise `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) sets the effort as `reasoning_effort` does, and the default is 0.9. `budget_tokens` and unknown effort names are ignored.
+- `thinking: {"type": "disabled"}` turns thinking off (see [Thinking off](#thinking-off)). Without tools, the reply then has no `thinking` block. With tools, the model still thinks briefly before it decides on a tool call. Otherwise `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) sets the effort as `reasoning_effort` does, and the default is 0.9. `budget_tokens` and unknown effort names are ignored.
 - `max_tokens` is required. A prompt and `max_tokens` that do not fit the context get a 400 with Anthropic's message, which Claude Code reads to shrink `max_tokens` or to compact.
 - `stop_sequences` are stop strings. `temperature`, `top_p` and `top_k` sample as on the chat route.
 
@@ -158,6 +158,14 @@ A request with `n` choices takes `n` places among the running and queued request
 With `--streams` of 2 or more, the choices run batched, not speculating. The first choice to prefill copies its state into the slots of the others, and each draws its first token from the same logits with its own seed, so the prompt is prefilled once and each choice gets the tokens of its own prefill. Choices that start later, because the slots were full, prefill the prompt themselves. With `--streams 1`, the choices run one after another, and each one after the first reads the prompt up to its last multiple of `--prefill-chunk` tokens from the [prefix cache](#prefix-cache).
 
 With `--streams 8` and the prefix cache off, one request with `n: 4` on a 12,916-token prompt, 256 tokens per choice, took 2.67 s. Four concurrent `n: 1` requests with the same seeds took 5.31 s and returned the same tokens. Streamed, the `n: 4` request's first token came after 0.87 s.
+
+## Thinking off
+
+The chat template has no switch that turns thinking off. At effort 0 the model still writes a thinking block before it answers, and a small `max_tokens` can go entirely to that block. When a request turns thinking off and declares no tools, the server renders effort 0 and ends the prompt with a thinking block of its own, `<|message_model|><|content_thinking|>Respond directly.<|end_message|>`, then the `<|message_model|>` that starts the reply. The model ends its own effort-0 thinking with those words. It then writes its reply at once. An empty thinking block does not work: the model opens a second one and thinks there.
+
+On 37 prompts at temperature 0 (20 short facts, 4 math word problems, 3 small coding tasks with tests, 6 open requests including a multi-turn one), effort 0 thought on every prompt and its text began after a median of 70 tokens, at most 653. With thinking off, no reply had a thinking block, the text began at the first generated token, and the replies took a median of 22 tokens against 93. Both answered all 20 facts, 4 math problems and 3 coding tasks correctly, and finished all 6 open requests. At temperature 1 the results matched, with a median of 22 tokens against 101. Without thinking, the model sometimes works a problem out in its reply text.
+
+A request with tools keeps effort 0's own thinking block, because the model decides on a tool call there. With the server's thought, or with the reply forced to start as text, the model answered 4 tool requests in text and called no tool. At effort 0 it called the right tool with the right arguments in 4 of 4. `tool_choice` `none` removes the tools, so such a request gets the thought. A forced tool call or an assistant prefill already skips the thinking block and gets no thought.
 
 ## Accepted, ignored and refused fields
 
