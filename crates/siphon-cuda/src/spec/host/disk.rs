@@ -34,6 +34,7 @@ use std::{
 
 use anyhow::{Context as _, bail, ensure};
 use serde_json::{Value, json};
+use siphon::prefix_hash::chunk_hashes;
 
 use super::{HOST_CHUNK_POSITIONS, HostCache, HostEntry};
 
@@ -271,21 +272,11 @@ impl HostCache {
         })
     }
 
-    /// Reads one entry file into the pool. Returns the bytes read, or `None` when the
-    /// entry does not fit.
-    fn read_entry(
-        &mut self,
-        path: &Path,
+    /// Reads the header, draft flags, and token ids of an entry file.
+    fn read_entry_header(
+        r: &mut BufReader<File>,
         key: u64,
-        expected: Option<u64>,
-    ) -> anyhow::Result<Option<u64>> {
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        ensure!(
-            expected == Some(size),
-            "{size} bytes, the manifest says {expected:?}"
-        );
-        let mut r = BufReader::with_capacity(1 << 20, file);
+    ) -> anyhow::Result<(u64, bool, Vec<u8>, Vec<u32>)> {
         let mut fixed = [0u8; 56];
         r.read_exact(&mut fixed)?;
         let word = |i: usize| {
@@ -317,7 +308,30 @@ impl HostCache {
             .iter()
             .map(|b| u32::from_le_bytes(*b))
             .collect();
-        if self.entries.iter().any(|e| e.tokens == ids) {
+        Ok((used, rings, drafted, ids))
+    }
+
+    /// Reads one entry file into the pool. Returns the bytes read, or `None` when the
+    /// entry does not fit.
+    fn read_entry(
+        &mut self,
+        path: &Path,
+        key: u64,
+        expected: Option<u64>,
+    ) -> anyhow::Result<Option<u64>> {
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        ensure!(
+            expected == Some(size),
+            "{size} bytes, the manifest says {expected:?}"
+        );
+        let mut r = BufReader::with_capacity(1 << 20, file);
+        let (used, rings, drafted, ids) = Self::read_entry_header(&mut r, key)?;
+        let entry_hashes = chunk_hashes(&ids, HOST_CHUNK_POSITIONS);
+        let full_hash = entry_hashes.last().copied();
+        if self.entries.iter().any(|e| {
+            e.tokens.len() == ids.len() && e.hashes.last().copied() == full_hash && e.tokens == ids
+        }) {
             return Ok(Some(0));
         }
         let Some((kv, local, shared)) = self.allocate(&ids)? else {
@@ -376,6 +390,7 @@ impl HostCache {
         self.tick = self.tick.max(used);
         self.entries.push(HostEntry {
             tokens: ids,
+            hashes: entry_hashes,
             kv,
             local,
             rings,

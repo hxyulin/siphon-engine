@@ -36,6 +36,7 @@ use std::{ffi::c_void, sync::Arc, time::Instant};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{CudaEvent, CudaStream, PinnedHostSlice, sys};
+use siphon::prefix_hash::{PrefixHashes, chunk_hashes};
 
 use crate::{
     draft::{Draft, DraftRings},
@@ -187,6 +188,8 @@ struct HostEntry {
     /// [`HOST_CHUNK_POSITIONS`]: its tokens, with image placeholders replaced by ids of the
     /// images' hashes.
     tokens: Vec<u32>,
+    /// Cumulative hash after each [`HOST_CHUNK_POSITIONS`] chunk of `tokens`.
+    hashes: Vec<u64>,
     /// The chunks of the global caches, by position.
     kv: Vec<u32>,
     /// The chunks of the rings and conv states, then the draft's rings.
@@ -317,19 +320,35 @@ impl HostCache {
         e.rings && (self.draft.caches.is_empty() || e.kv.iter().all(|&c| self.drafted[c as usize]))
     }
 
-    /// The longest entry that `prompt` starts with and goes past, with the draft's state
-    /// if `draft`.
-    pub fn lookup(&self, prompt: &[u32], draft: bool) -> Option<usize> {
+    /// Longest entry strictly shorter than `limit`, or 0 when none.
+    pub fn max_len_below(&self, limit: usize) -> usize {
         self.entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                prompt.len() > e.tokens.len()
-                    && prompt.starts_with(&e.tokens)
-                    && (!draft || self.complete(e))
-            })
-            .max_by_key(|(_, e)| e.tokens.len())
-            .map(|(i, _)| i)
+            .map(|e| e.tokens.len())
+            .filter(|&len| len < limit)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The longest entry that `prompt` starts with and goes past, with the draft's state
+    /// if `draft`.
+    pub fn lookup(&self, prompt: &[u32], draft: bool, hashes: &PrefixHashes) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            let len = e.tokens.len();
+            if len == 0
+                || best.is_some_and(|(_, best_len)| len <= best_len)
+                || prompt.len() <= len
+                || (draft && !self.complete(e))
+            {
+                continue;
+            }
+            if e.hashes.last().copied() == hashes.hash_at_len(len) && prompt.starts_with(&e.tokens)
+            {
+                best = Some((i, len));
+            }
+        }
+        best.map(|(i, _)| i)
     }
 
     /// Tokens of entry `h`.
@@ -388,7 +407,11 @@ impl HostCache {
             .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
         self.copy.wait(&ready)?;
 
-        let existing = self.entries.iter().position(|e| e.tokens == tokens);
+        let entry_hashes = chunk_hashes(tokens, p);
+        let full_hash = entry_hashes.last().copied();
+        let existing = self.entries.iter().position(|e| {
+            e.tokens.len() == tokens.len() && e.hashes.last().copied() == full_hash && e.tokens == tokens
+        });
         let (kv, local_chunks, shared) = if let Some(h) = existing {
             // The same prompt again: only the draft's state may be new.
             self.entries[h].used = self.tick;
@@ -436,6 +459,7 @@ impl HostCache {
         } else {
             self.entries.push(HostEntry {
                 tokens: tokens.to_vec(),
+                hashes: entry_hashes,
                 kv,
                 local: local_chunks,
                 rings: rings.is_some(),
@@ -496,20 +520,27 @@ impl HostCache {
     fn allocate(&mut self, tokens: &[u32]) -> anyhow::Result<Option<(Vec<u32>, Vec<u32>, usize)>> {
         let p = HOST_CHUNK_POSITIONS;
         let n = tokens.len() / p;
+        let prompt_hashes = PrefixHashes::new(tokens, p, n);
         let longest = self
             .entries
             .iter()
-            .map(|e| {
-                let same = e
-                    .tokens
-                    .iter()
-                    .zip(tokens)
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                (same / p).min(e.kv.len())
-            })
             .enumerate()
-            .max_by_key(|&(_, k)| k);
+            .map(|(i, e)| (i, prompt_hashes.shared_chunks(&e.hashes).min(e.kv.len())))
+            .max_by_key(|&(_, k)| k)
+            .map(|(i, k)| {
+                let exact = if k > 0 && self.entries[i].tokens[..k * p] == tokens[..k * p] {
+                    k
+                } else {
+                    self.entries[i]
+                        .tokens
+                        .iter()
+                        .zip(tokens)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                        / p
+                };
+                (i, exact.min(self.entries[i].kv.len()))
+            });
         let mut kv = match longest {
             Some((i, k)) if k > 0 => self.entries[i].kv[..k].to_vec(),
             _ => Vec::new(),
@@ -522,7 +553,11 @@ impl HostCache {
         // its rings, conv states and draft rings.
         let mut i = 0;
         while i < self.entries.len() {
-            if tokens.starts_with(&self.entries[i].tokens) {
+            let e = &self.entries[i];
+            let is_prefix = e.tokens.len() <= tokens.len()
+                && e.hashes.last().copied() == prompt_hashes.hash_at_len(e.tokens.len())
+                && tokens.starts_with(&e.tokens);
+            if is_prefix {
                 let e = self.entries.swap_remove(i);
                 self.release(&e);
             } else {
@@ -670,15 +705,33 @@ impl HostCache {
         self.tick += 1;
         let n = position.div_ceil(p);
         let prefilled = prompt_len.min(position) / p;
+        let prompt_hashes = PrefixHashes::new(key, p, prefilled);
         let longest = self
             .entries
             .iter()
-            .map(|e| {
-                let same = e.tokens.iter().zip(key).take_while(|(a, b)| a == b).count();
-                (same / p).min(e.kv.len()).min(prefilled)
-            })
             .enumerate()
-            .max_by_key(|&(_, k)| k);
+            .map(|(i, e)| {
+                let k = prompt_hashes
+                    .shared_chunks(&e.hashes)
+                    .min(e.kv.len())
+                    .min(prefilled);
+                (i, k)
+            })
+            .max_by_key(|&(_, k)| k)
+            .map(|(i, k)| {
+                let exact = if k > 0 && self.entries[i].tokens[..k * p] == key[..k * p] {
+                    k
+                } else {
+                    self.entries[i]
+                        .tokens
+                        .iter()
+                        .zip(key)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                        / p
+                };
+                (i, exact.min(self.entries[i].kv.len()).min(prefilled))
+            });
         let mut kv = match longest {
             Some((i, k)) if k > 0 => self.entries[i].kv[..k].to_vec(),
             _ => Vec::new(),

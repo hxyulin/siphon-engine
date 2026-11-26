@@ -511,16 +511,39 @@ impl Reply {
             }
             return;
         }
-        let at = json!({"item_id": self.output[index]["id"], "output_index": index,
-                        "delta": text});
+        let item_id = &self.output[index]["id"];
         for &name in deltas {
-            let fields = match name {
-                "response.reasoning_summary_text.delta" => json!({"summary_index": 0}),
-                "response.output_text.delta" => json!({"content_index": 0, "logprobs": []}),
-                "response.function_call_arguments.delta" => json!({}),
-                _ => json!({"content_index": 0}),
+            let payload = match name {
+                "response.reasoning_summary_text.delta" => json!({
+                    "type": name,
+                    "item_id": item_id,
+                    "output_index": index,
+                    "delta": text,
+                    "summary_index": 0,
+                }),
+                "response.output_text.delta" => json!({
+                    "type": name,
+                    "item_id": item_id,
+                    "output_index": index,
+                    "delta": text,
+                    "content_index": 0,
+                    "logprobs": [],
+                }),
+                "response.function_call_arguments.delta" => json!({
+                    "type": name,
+                    "item_id": item_id,
+                    "output_index": index,
+                    "delta": text,
+                }),
+                _ => json!({
+                    "type": name,
+                    "item_id": item_id,
+                    "output_index": index,
+                    "delta": text,
+                    "content_index": 0,
+                }),
             };
-            events.push(event(name, with(at.clone(), fields)));
+            events.push((name, payload));
         }
     }
 

@@ -26,6 +26,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
+use siphon::prefix_hash::{PrefixHashes, prefix_hash};
 
 use super::{
     Prompt, Speculator,
@@ -64,6 +65,8 @@ struct Entry {
     sequence: u64,
     /// The prompt's key ([`Prompt::key`]) below the boundary.
     tokens: Vec<u32>,
+    /// Cumulative hash of `tokens` ([`prefix_hash`]), for O(1) mismatch rejection.
+    hash: u64,
     /// The prefill chunk the state was prefilled with.
     chunk: usize,
     used: Instant,
@@ -104,6 +107,7 @@ impl PrefixCache {
 
     /// The longest live entry outside `busy` slots that `prompt` starts with and goes
     /// past, with the draft's state if `draft` is `Some` (the current draft sequence).
+    #[expect(clippy::too_many_arguments, reason = "prefix cache lookup criteria")]
     fn lookup(
         &self,
         model: &Model,
@@ -112,20 +116,26 @@ impl PrefixCache {
         busy: &[usize],
         draft: Option<u64>,
         now: Instant,
+        hashes: &PrefixHashes,
     ) -> Option<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                self.live(e, model, now)
-                    && e.slot.is_some_and(|s| !busy.contains(&s))
-                    && e.chunk == chunk
-                    && prompt.len() > e.tokens.len()
-                    && prompt.starts_with(&e.tokens)
-                    && draft.is_none_or(|d| self.has_draft(e, d))
-            })
-            .max_by_key(|(_, e)| e.tokens.len())
-            .map(|(i, _)| i)
+        let mut best: Option<(usize, usize)> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            let len = e.tokens.len();
+            if len == 0
+                || best.is_some_and(|(_, best_len)| len <= best_len)
+                || prompt.len() <= len
+                || e.chunk != chunk
+                || !draft.is_none_or(|d| self.has_draft(e, d))
+                || e.slot.is_none_or(|s| busy.contains(&s))
+                || !self.live(e, model, now)
+            {
+                continue;
+            }
+            if hashes.hash_at_len(len) == Some(e.hash) && prompt.starts_with(&e.tokens) {
+                best = Some((i, len));
+            }
+        }
+        best.map(|(i, _)| i)
     }
 
     /// The longest entry outside `busy` slots that `prompt` starts with and goes past: the
@@ -140,14 +150,31 @@ impl PrefixCache {
         draft: Option<u64>,
         now: Instant,
     ) -> Option<Source> {
-        let device = self.lookup(model, prompt, chunk, busy, draft, now);
+        let device_max = self
+            .entries
+            .iter()
+            .filter(|e| e.chunk == chunk && e.tokens.len() < prompt.len())
+            .map(|e| e.tokens.len())
+            .max()
+            .unwrap_or(0);
+        let host_max = self
+            .host
+            .as_ref()
+            .filter(|_| chunk == HOST_CHUNK_POSITIONS)
+            .map_or(0, |h| h.max_len_below(prompt.len()));
+        let max_len = device_max.max(host_max);
+        if max_len == 0 || chunk == 0 {
+            return None;
+        }
+        let hashes = PrefixHashes::new(prompt, chunk, max_len / chunk);
+        let device = self.lookup(model, prompt, chunk, busy, draft, now, &hashes);
         let device_len = device.map_or(0, |i| self.entries[i].tokens.len());
         let host = self
             .host
             .as_ref()
             .filter(|_| chunk == HOST_CHUNK_POSITIONS)
             .and_then(|h| {
-                let j = h.lookup(prompt, draft.is_some())?;
+                let j = h.lookup(prompt, draft.is_some(), &hashes)?;
                 (h.len(j) > device_len).then(|| Source::Host(j, h.len(j)))
             });
         host.or(device.map(Source::Device))
@@ -256,6 +283,7 @@ impl Speculator {
                     slot: None,
                     sequence: 0,
                     tokens: Vec::new(),
+                    hash: 0,
                     chunk: 0,
                     used: now,
                     model: model.local_state()?,
@@ -709,6 +737,7 @@ impl Speculator {
         model.save_local_state(slot, &mut e.model)?;
         e.tokens.clear();
         e.tokens.extend_from_slice(tokens);
+        e.hash = prefix_hash(tokens);
         e.chunk = chunk;
         e.used = Instant::now();
         e.draft_sequence = None;
@@ -1002,17 +1031,33 @@ impl Speculator {
     ) -> Option<usize> {
         let cache = self.prefix.as_ref()?;
         let now = Instant::now();
-        cache
+        let max_len = cache
             .entries
             .iter()
-            .filter(|e| {
-                cache.live(e, model, now)
-                    && e.chunk == chunk
-                    && e.tokens.len() > done
-                    && key.starts_with(&e.tokens)
-            })
+            .filter(|e| e.chunk == chunk && e.tokens.len() > done && e.tokens.len() <= key.len())
             .map(|e| e.tokens.len())
-            .min()
+            .max()
+            .unwrap_or(0);
+        if max_len == 0 || chunk == 0 {
+            return None;
+        }
+        let hashes = PrefixHashes::new(key, chunk, max_len / chunk);
+        let mut best: Option<usize> = None;
+        for e in &cache.entries {
+            let len = e.tokens.len();
+            if len <= done
+                || best.is_some_and(|b| len >= b)
+                || e.chunk != chunk
+                || len > key.len()
+                || !cache.live(e, model, now)
+            {
+                continue;
+            }
+            if hashes.hash_at_len(len) == Some(e.hash) && key.starts_with(&e.tokens) {
+                best = Some(len);
+            }
+        }
+        best
     }
 
     /// The live entries of prefill chunks of [`Self::prefill_chunk`] whose tokens are
@@ -1022,13 +1067,16 @@ impl Speculator {
             return Vec::new();
         };
         let now = Instant::now();
+        let key_hash = prefix_hash(key);
         (0..cache.entries.len())
             .filter(|&i| {
                 let e = &cache.entries[i];
-                cache.live(e, model, now)
+                e.tokens.len() == key.len()
+                    && e.hash == key_hash
                     && e.chunk == self.prefill_chunk
-                    && e.tokens == key
                     && !cache.has_draft(e, self.draft_sequence)
+                    && cache.live(e, model, now)
+                    && e.tokens == key
             })
             .collect()
     }

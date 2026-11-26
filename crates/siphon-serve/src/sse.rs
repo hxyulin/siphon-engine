@@ -121,7 +121,7 @@ pub(crate) async fn respond<R: Reply>(
     let tokens = prompt.len();
     let results = submit(
         &app,
-        &prompt,
+        prompt,
         images,
         max_tokens,
         ignore_eos,
@@ -171,13 +171,21 @@ struct Frames {
 }
 
 impl Frames {
-    /// Sends `frames`; false once the client has left.
-    async fn send(&mut self, frames: Vec<Frame>) -> bool {
-        for frame in frames {
-            if self.out.send(frame).await.is_err() {
+    /// Sends one frame; false once the client has left.
+    async fn send_one(&mut self, frame: Frame) -> bool {
+        if self.out.send(frame).await.is_err() {
+            return false;
+        }
+        self.last = Instant::now();
+        true
+    }
+
+    /// Sends all frames drained from `frames`; false once the client has left.
+    async fn send(&mut self, frames: &mut Vec<Frame>) -> bool {
+        for frame in frames.drain(..) {
+            if !self.send_one(frame).await {
                 return false;
             }
-            self.last = Instant::now();
         }
         true
     }
@@ -205,8 +213,10 @@ pub(crate) async fn run<R: Reply>(
         cached: 0,
     };
     let mut started = false;
+    let mut events = Vec::new();
+    let mut delta = Delta::default();
     let finish = loop {
-        let mut events = Vec::new();
+        events.clear();
         let event = if stream {
             loop {
                 tokio::select! {
@@ -217,7 +227,7 @@ pub(crate) async fn run<R: Reply>(
                         } else {
                             (KEEP_ALIVE, Value::Null)
                         };
-                        if !frames.send(vec![keep_alive]).await {
+                        if !frames.send_one(keep_alive).await {
                             return None;
                         }
                     }
@@ -232,12 +242,23 @@ pub(crate) async fn run<R: Reply>(
                 prompt.cached = n;
                 continue;
             }
+            Event::SmallTokens(buf, len) => {
+                for &id in &buf[..usize::from(len)] {
+                    if output.done {
+                        break;
+                    }
+                    delta.clear();
+                    output.push_into(vocab, &[id], &mut delta);
+                    reply.push(&delta, &mut events);
+                }
+            }
             Event::Tokens(ids) => {
                 for &id in &ids {
                     if output.done {
                         break;
                     }
-                    let delta = output.push(vocab, &[id]);
+                    delta.clear();
+                    output.push_into(vocab, &[id], &mut delta);
                     reply.push(&delta, &mut events);
                 }
             }
@@ -249,7 +270,7 @@ pub(crate) async fn run<R: Reply>(
                     vec![(FAILED, Value::String(e))]
                 };
                 reply.number(&mut frames_out);
-                let _ = frames.send(frames_out).await;
+                let _ = frames.send(&mut frames_out).await;
                 return None;
             }
         }
@@ -258,7 +279,7 @@ pub(crate) async fn run<R: Reply>(
                 events.splice(0..0, reply.start(&prompt));
             }
             reply.number(&mut events);
-            if !frames.send(events).await {
+            if !frames.send(&mut events).await {
                 return None;
             }
         }
@@ -267,17 +288,17 @@ pub(crate) async fn run<R: Reply>(
         }
     };
     let times = results.close(finish);
-    let mut events = Vec::new();
+    events.clear();
     reply.push(&output.finish(vocab, finish), &mut events);
     let timings = Timings::new(&[times], prompt.tokens, prompt.cached, output.tokens);
     if !stream {
         let body = reply.body(&output, finish, &prompt, &timings);
-        return frames.send(vec![(BODY, body)]).await.then_some(timings);
+        return frames.send_one((BODY, body)).await.then_some(timings);
     }
     if !started {
         events.splice(0..0, reply.start(&prompt));
     }
     events.extend(reply.end(&output, finish, &prompt, &timings));
     reply.number(&mut events);
-    frames.send(events).await.then_some(timings)
+    frames.send(&mut events).await.then_some(timings)
 }

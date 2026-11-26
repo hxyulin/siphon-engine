@@ -327,12 +327,18 @@ fn system_text(system: &Value) -> Result<String, InvalidRequest> {
     Ok(texts.join("\n\n"))
 }
 
-/// The blocks of a message's content: a string is one text block.
-fn blocks(content: &Value) -> Result<Vec<Value>, InvalidRequest> {
+/// The blocks of a message's content, borrowed without cloning the block array.
+enum ContentBlocks<'a> {
+    Empty,
+    Text(&'a str),
+    Array(&'a [Value]),
+}
+
+fn content_blocks(content: &Value) -> Result<ContentBlocks<'_>, InvalidRequest> {
     match content {
-        Value::String(text) => Ok(vec![json!({"type": "text", "text": text})]),
-        Value::Array(blocks) => Ok(blocks.clone()),
-        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(ContentBlocks::Text(text.as_str())),
+        Value::Array(blocks) => Ok(ContentBlocks::Array(blocks.as_slice())),
+        Value::Null => Ok(ContentBlocks::Empty),
         _ => Err(invalid(
             "message content must be a string or an array of blocks",
         )),
@@ -358,30 +364,44 @@ fn text_part(text: &str) -> Value {
 /// Adds a user message: its text and image blocks as user messages and each `tool_result`
 /// as a tool message, in their order.
 fn user(content: &Value, out: &mut Vec<Value>, images: bool) -> Result<(), InvalidRequest> {
+    let blocks = match content_blocks(content)? {
+        ContentBlocks::Empty => return Ok(()),
+        ContentBlocks::Text(text) => {
+            out.push(json!({"role": "user", "content": [text_part(text)]}));
+            return Ok(());
+        }
+        ContentBlocks::Array(blocks) => blocks,
+    };
     let mut parts = Vec::new();
     let flush = |parts: &mut Vec<Value>, out: &mut Vec<Value>| {
         if !parts.is_empty() {
             out.push(json!({"role": "user", "content": std::mem::take(parts)}));
         }
     };
-    for block in blocks(content)? {
+    for block in blocks {
         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
             flush(&mut parts, out);
             let id = block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let texts: Vec<Value> = blocks(block.get("content").unwrap_or(&Value::Null))?
-                .iter()
-                .filter_map(|b| block_part(b, images))
-                .collect();
-            let content = if texts.is_empty() {
-                Value::String(String::new())
-            } else {
-                Value::Array(texts)
+            let content = match content_blocks(block.get("content").unwrap_or(&Value::Null))? {
+                ContentBlocks::Empty => Value::String(String::new()),
+                ContentBlocks::Text(text) => Value::Array(vec![text_part(text)]),
+                ContentBlocks::Array(items) => {
+                    let texts: Vec<Value> = items
+                        .iter()
+                        .filter_map(|b| block_part(b, images))
+                        .collect();
+                    if texts.is_empty() {
+                        Value::String(String::new())
+                    } else {
+                        Value::Array(texts)
+                    }
+                }
             };
             out.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
-        } else if let Some(part) = block_part(&block, images) {
+        } else if let Some(part) = block_part(block, images) {
             parts.push(part);
         }
     }
@@ -393,16 +413,23 @@ fn user(content: &Value, out: &mut Vec<Value>, images: bool) -> Result<(), Inval
 /// `tool_use` blocks as tool calls. The template renders a message's thinking first, then its
 /// text, then its calls.
 fn assistant(content: &Value) -> Result<Value, InvalidRequest> {
+    let blocks = match content_blocks(content)? {
+        ContentBlocks::Empty => return Ok(json!({"role": "assistant", "content": []})),
+        ContentBlocks::Text(text) => {
+            return Ok(json!({"role": "assistant", "content": [text_part(text)]}));
+        }
+        ContentBlocks::Array(blocks) => blocks,
+    };
     let mut thinking = Vec::new();
     let mut texts = Vec::new();
     let mut calls = Vec::new();
-    for block in blocks(content)? {
+    for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("thinking") => {
                 if let Some(text) = block.get("thinking").and_then(Value::as_str)
                     && !text.is_empty()
                 {
-                    thinking.push(text.to_owned());
+                    thinking.push(text);
                 }
             }
             Some("text") => {
@@ -411,13 +438,16 @@ fn assistant(content: &Value) -> Result<Value, InvalidRequest> {
                 ));
             }
             Some("tool_use") => {
-                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                let arguments = match block.get("input") {
+                    Some(input) => input.to_string(),
+                    None => "{}".to_owned(),
+                };
                 calls.push(json!({
                     "id": block.get("id").cloned().unwrap_or(Value::Null),
                     "type": "function",
                     "function": {
                         "name": block.get("name").cloned().unwrap_or(Value::Null),
-                        "arguments": input.to_string(),
+                        "arguments": arguments,
                     },
                 }));
             }
@@ -663,10 +693,9 @@ impl Blocks {
         };
         let (field, delta_type) = kind.field();
         let index = self.content.len() - 1;
-        let pointer = format!("/delta/{field}");
         if let Some(("content_block_delta", last)) = events.last_mut()
-            && last["index"] == index
-            && let Some(Value::String(sent)) = last.pointer_mut(&pointer)
+            && last.get("index").and_then(Value::as_u64) == Some(index as u64)
+            && let Some(Value::String(sent)) = last.get_mut("delta").and_then(|d| d.get_mut(field))
         {
             sent.push_str(text);
             return;
@@ -1501,5 +1530,58 @@ mod tests {
             json!({"type": "error", "error": {"type": "api_error",
                                               "message": "the GPU fell over"}})
         );
+    }
+
+    #[test]
+    fn borrowed_translation_and_grow_delta_coalescing() {
+        let translated = translate(
+            Some(&json!([
+                {"type": "text", "text": "x-anthropic-billing-header: ignored"},
+                {"type": "text", "text": "System."},
+            ])),
+            &[
+                json!({"role": "user", "content": "Hello"}),
+                json!({"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Think."},
+                    {"type": "text", "text": "Calling."},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "a.rs"}},
+                ]}),
+                json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                    {"type": "text", "text": "Done?"},
+                ]}),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(translated.len(), 5);
+        assert_eq!(translated[0]["role"], "system");
+        assert_eq!(translated[1]["role"], "user");
+        assert_eq!(translated[2]["reasoning_content"], "Think.");
+        assert_eq!(translated[3]["role"], "tool");
+        assert_eq!(translated[3]["tool_call_id"], "t1");
+        assert_eq!(translated[4]["role"], "user");
+
+        // Verify `Blocks::grow` coalesces consecutive deltas on the same block.
+        let mut blocks = Blocks::new("msg_1");
+        let mut events = Vec::new();
+        blocks.push(
+            &Delta {
+                content: "Hel".to_owned(),
+                ..Delta::default()
+            },
+            &mut events,
+        );
+        blocks.push(
+            &Delta {
+                content: "lo".to_owned(),
+                ..Delta::default()
+            },
+            &mut events,
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "content_block_start");
+        assert_eq!(events[1].0, "content_block_delta");
+        assert_eq!(events[1].1["delta"]["text"], "Hello");
     }
 }

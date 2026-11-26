@@ -252,9 +252,14 @@ pub enum Finish {
     Length,
 }
 
+/// Inline capacity for small token events: covers every single-token batched decode step
+/// and every speculation verify round (`VERIFY_ROWS + 1 = 9`) without heap allocation.
+pub const SMALL_TOKENS_CAP: usize = 9;
+
 /// What the engine reports for a job, in order: `Started`, `Cached` at most once, `Tokens`
-/// any number of times, each after a `Round` when a speculation round delivered them, then
-/// `Done` or `Failed`. A job whose client left while it waited gets none.
+/// or `SmallTokens` any number of times, each after a `Round` when a speculation round
+/// delivered them, then `Done` or `Failed`. A job whose client left while it waited gets
+/// none.
 #[cfg_attr(
     all(not(target_os = "linux"), not(test)),
     expect(dead_code, reason = "only the Linux engine runs jobs")
@@ -268,6 +273,9 @@ pub enum Event {
     /// The next `Tokens` come from one speculation round, or from a plain step under
     /// `--fallback`.
     Round,
+    /// Inline small token batch (`1..=SMALL_TOKENS_CAP`), avoiding per-step heap
+    /// allocation on the GPU engine thread.
+    SmallTokens([u32; SMALL_TOKENS_CAP], u8),
     Tokens(Vec<u32>),
     /// The vision tower's work on the prompt's images, after the prefill of a prompt with
     /// any, before the first tokens.
@@ -278,6 +286,38 @@ pub enum Event {
     Images(ImageStats),
     Done(Finish),
     Failed(String),
+}
+
+impl Event {
+    /// Builds a token event from `ids`, keeping up to [`SMALL_TOKENS_CAP`] tokens inline
+    /// with zero heap allocation.
+    #[cfg_attr(
+        all(not(target_os = "linux"), not(test)),
+        expect(dead_code, reason = "only the Linux engine and tests emit token events")
+    )]
+    #[must_use]
+    pub fn from_tokens(ids: &[u32]) -> Self {
+        if ids.len() <= SMALL_TOKENS_CAP {
+            let mut buf = [0u32; SMALL_TOKENS_CAP];
+            buf[..ids.len()].copy_from_slice(ids);
+            Self::SmallTokens(buf, ids.len() as u8)
+        } else {
+            Self::Tokens(ids.to_vec())
+        }
+    }
+}
+
+/// Whether the concatenation `first ++ second` starts with `prefix`, without allocating.
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "used by the Linux engine and tests")
+)]
+pub(crate) fn starts_with_chained(first: &[u32], second: &[u32], prefix: &[u32]) -> bool {
+    if prefix.len() > first.len() + second.len() {
+        return false;
+    }
+    let split = prefix.len().min(first.len());
+    first[..split] == prefix[..split] && second[..prefix.len() - split] == prefix[split..]
 }
 
 /// How to load the model.
@@ -529,7 +569,7 @@ mod cuda {
         weights::{OutputProjection, WeightFormat, Weights},
     };
 
-    use super::{Control, Engine, Event, Finish, Job, Options};
+    use super::{Control, Engine, Event, Finish, Job, Options, starts_with_chained};
     use crate::vision::{ImageStats, PromptImage};
 
     /// The vision tower, with `--vision`.
@@ -1349,7 +1389,7 @@ mod cuda {
                 if self
                     .job
                     .events
-                    .send(Event::Tokens(ids[..keep].to_vec()))
+                    .send(Event::from_tokens(&ids[..keep]))
                     .is_err()
                 {
                     return ControlFlow::Break(());
@@ -1778,8 +1818,12 @@ mod cuda {
         need: impl Fn(&Model, &[Request]) -> usize,
     ) -> bool {
         loop {
-            let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
             let pages = need(model, active);
+            let free_pages = model.kv_pool().map_or(usize::MAX, PagePool::free_pages);
+            if pages == 0 || free_pages >= pages {
+                return true;
+            }
+            let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
             if make_room(model, speculator, pages, &busy, Reclaim::Draft) {
                 return true;
             }
@@ -1843,6 +1887,9 @@ mod cuda {
         parked: &mut Vec<Request>,
         sched: &Sched,
     ) {
+        if waiting.is_empty() && parked.is_empty() {
+            return;
+        }
         let can_park = speculator.can_park();
         loop {
             waiting.retain(|j| !j.events.is_closed());
@@ -1858,6 +1905,11 @@ mod cuda {
                 }
                 !gone
             });
+            if (waiting.is_empty() && parked.is_empty())
+                || (active.len() >= sched.streams && !can_park)
+            {
+                return;
+            }
             let now = Instant::now();
             let aged = |j: &Job| now.duration_since(j.queued) >= AGE_LIMIT;
             let mut order: Vec<(Pick, bool)> = (0..waiting.len())
@@ -2336,10 +2388,16 @@ mod cuda {
             return false;
         }
         let generated = &r.output[..r.output.len() - 1];
-        let key: Vec<u32> = r.job.key().iter().chain(generated).copied().collect();
-        keep_rebuild(speculator, model, rebuild, &key);
+        let base_key = r.job.key();
+        let key_len = base_key.len() + generated.len();
+        if rebuild.as_ref().is_some_and(|(rb, _)| {
+            !speculator.rebuild_live(model, rb)
+                || !starts_with_chained(base_key, generated, rb.key())
+        }) {
+            *rebuild = None;
+        }
         let done = rebuild.as_ref().map_or(0, |(rb, _)| rb.key().len());
-        if r.rent * RENT_RATIO < key.len() - done {
+        if r.rent * RENT_RATIO < key_len - done {
             return false;
         }
         if rebuild.is_none() {
@@ -2357,14 +2415,22 @@ mod cuda {
                 }
             }
             eprintln!(
-                "rebuilding the draft at position {} of a request in slot {} after {} batched \
-                 steps, in slot {scratch}",
-                key.len(),
+                "rebuilding the draft at position {key_len} of a request in slot {} after {} \
+                 batched steps, in slot {scratch}",
                 r.slot,
                 r.rent
             );
         }
-        let tokens: Vec<u32> = r.job.prompt.iter().chain(generated).copied().collect();
+        let mut tokens = Vec::with_capacity(r.job.prompt.len() + generated.len());
+        tokens.extend_from_slice(&r.job.prompt);
+        tokens.extend_from_slice(generated);
+        let owned_key = r.job.key.as_deref().map(|k| {
+            let mut buf = Vec::with_capacity(k.len() + generated.len());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(generated);
+            buf
+        });
+        let key_slice: &[u32] = owned_key.as_deref().unwrap_or(&tokens);
         let hidden = model.config().hidden_size;
         let images = &r.job.images;
         let mut kept = None;
@@ -2376,7 +2442,7 @@ mod cuda {
         };
         let prompt = Prompt {
             tokens: &tokens,
-            key: &key,
+            key: key_slice,
             images: if images.is_empty() {
                 None
             } else {
@@ -2446,6 +2512,8 @@ mod cuda {
     ) -> Option<Request> {
         // Requests swapped out to the host tier, to return when they fit.
         let mut parked: Vec<Request> = Vec::new();
+        // Reusable buffers for `step_rows`, eliminating per-step Vec allocations.
+        let mut scratch = StepScratch::with_capacity(sched.streams);
         // When the last batched step synced: the decoding requests have waited since then.
         let mut synced = Instant::now();
         loop {
@@ -2490,6 +2558,19 @@ mod cuda {
                 admit(model, speculator, &mut active, waiting, &mut parked, sched);
             }
             let chunked = prefilled_tokens > 0;
+            // Drain newly arrived jobs before deciding we are alone, so a request that
+            // arrived during prefill avoids a wasted `speculate_again` (`move_to_slot0` +
+            // GPU sync) round-trip.
+            if active.len() == 1 && waiting.is_empty() && parked.is_empty() {
+                let mut arrived = false;
+                while let Ok(jobs) = queue.try_recv() {
+                    waiting.extend(jobs);
+                    arrived = true;
+                }
+                if arrived {
+                    admit(model, speculator, &mut active, waiting, &mut parked, sched);
+                }
+            }
             let alone = waiting.is_empty() && parked.is_empty();
             let chunked =
                 chunked || (alone && rebuild_turn(model, speculator, tower, &mut active, rebuild));
@@ -2557,6 +2638,7 @@ mod cuda {
                     &mut active,
                     stop,
                     sched.group_by_confidence,
+                    &mut scratch,
                 );
                 if emitted == 0 {
                     break;
@@ -2618,6 +2700,9 @@ mod cuda {
         parked: &mut Vec<Request>,
         stop: &[u32],
     ) -> usize {
+        if !active.iter().any(|r| r.next.is_none() && !r.done) {
+            return 0;
+        }
         // Priority order: aged requests first (by arrival), then shortest remaining prompt.
         let mut order: Vec<usize> = active
             .iter()
@@ -2625,9 +2710,6 @@ mod cuda {
             .filter(|(_, r)| r.next.is_none() && !r.done)
             .map(|(i, _)| i)
             .collect();
-        if order.is_empty() {
-            return 0;
-        }
         let now = Instant::now();
         order.sort_by_key(|&i| {
             let r = &active[i];
@@ -2727,13 +2809,15 @@ mod cuda {
                     continue;
                 }
                 let extra_pages = want(model, &active[idx]);
-                if make_room(
-                    model,
-                    speculator,
-                    pages_needed + extra_pages,
-                    &busy,
-                    Reclaim::Draft,
-                ) {
+                if extra_pages == 0
+                    || make_room(
+                        model,
+                        speculator,
+                        pages_needed + extra_pages,
+                        &busy,
+                        Reclaim::Draft,
+                    )
+                {
                     pages_needed += extra_pages;
                     packed_rows += rem;
                     packed_slots.push(active[idx].slot);
@@ -2974,52 +3058,113 @@ mod cuda {
         }
     }
 
+    /// Reusable per-step vectors for [`step_rows`], avoiding heap allocations on every
+    /// decode/verify step.
+    struct StepScratch {
+        spec_indices: Vec<usize>,
+        plain_indices: Vec<usize>,
+        slots: Vec<usize>,
+        anchors: Vec<u32>,
+        spec_samplings: Vec<ModelSampling>,
+        rows: Vec<(usize, u32)>,
+        plain_samplings: Vec<ModelSampling>,
+    }
+
+    impl StepScratch {
+        fn with_capacity(streams: usize) -> Self {
+            Self {
+                spec_indices: Vec::with_capacity(streams),
+                plain_indices: Vec::with_capacity(streams),
+                slots: Vec::with_capacity(streams),
+                anchors: Vec::with_capacity(streams),
+                spec_samplings: Vec::with_capacity(streams),
+                rows: Vec::with_capacity(streams),
+                plain_samplings: Vec::with_capacity(streams),
+            }
+        }
+    }
+
     /// Runs one batched decode step or batched DFlash 2 speculation round over the requests
     /// of `active` that have a next token. Returns the minimum number of tokens emitted per
     /// active decoding request (0 when none decoded).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "batched speculation and plain decode step"
+    )]
     fn step_rows(
         model: &mut Model,
         speculator: &mut Speculator,
         active: &mut [Request],
         stop: &[u32],
         group_by_confidence: bool,
+        scratch: &mut StepScratch,
     ) -> usize {
         let batch_spec = speculator.supports_batch_spec();
-        let mut spec_indices = Vec::new();
-        let mut plain_indices = Vec::new();
+        scratch.spec_indices.clear();
+        scratch.plain_indices.clear();
         for (idx, r) in active.iter().enumerate() {
             if r.done || r.next.is_none() {
                 continue;
             }
             if batch_spec && r.draft_ready {
-                spec_indices.push(idx);
+                scratch.spec_indices.push(idx);
             } else {
-                plain_indices.push(idx);
+                scratch.plain_indices.push(idx);
             }
         }
-        if spec_indices.is_empty() && plain_indices.is_empty() {
+        if scratch.spec_indices.is_empty() && scratch.plain_indices.is_empty() {
             return 0;
         }
         let mut min_emitted = usize::MAX;
-        if !spec_indices.is_empty() {
+        if !scratch.spec_indices.is_empty() {
             let max_seqs = speculator.max_batch_spec_seqs();
-            let candidates: Vec<(usize, usize, Option<f32>)> = spec_indices
-                .iter()
-                .map(|&i| {
-                    let slot = active[i].slot;
-                    (i, slot, speculator.batch_slot_confidence(slot))
-                })
-                .collect();
-            for chunk in &super::group_spec_chunks(&candidates, max_seqs, group_by_confidence) {
-                let width = (BATCH_VERIFY_MAX_ROWS / chunk.len()).min(VERIFY_ROWS);
-                let slots: Vec<usize> = chunk.iter().map(|&i| active[i].slot).collect();
-                let anchors: Vec<u32> = chunk
+            let grouped = if group_by_confidence || scratch.spec_indices.len() > max_seqs {
+                let candidates: Vec<(usize, usize, Option<f32>)> = scratch
+                    .spec_indices
                     .iter()
-                    .map(|&i| active[i].next.unwrap_or_default())
+                    .map(|&i| {
+                        let slot = active[i].slot;
+                        (i, slot, speculator.batch_slot_confidence(slot))
+                    })
                     .collect();
-                let samplings: Vec<ModelSampling> =
-                    chunk.iter().map(|&i| active[i].sampling).collect();
-                match speculator.speculate_batch_round(model, &slots, &anchors, &samplings, width) {
+                Some(super::group_spec_chunks(
+                    &candidates,
+                    max_seqs,
+                    group_by_confidence,
+                ))
+            } else {
+                None
+            };
+            let chunks: &[&[usize]] = &[];
+            let single = [scratch.spec_indices.as_slice()];
+            let grouped_slices: Vec<&[usize]> = grouped
+                .as_ref()
+                .map(|g| g.iter().map(Vec::as_slice).collect())
+                .unwrap_or_default();
+            let iter_chunks = if grouped.is_some() {
+                grouped_slices.as_slice()
+            } else if scratch.spec_indices.is_empty() {
+                chunks
+            } else {
+                &single
+            };
+            for &chunk in iter_chunks {
+                let width = (BATCH_VERIFY_MAX_ROWS / chunk.len()).min(VERIFY_ROWS);
+                scratch.slots.clear();
+                scratch.anchors.clear();
+                scratch.spec_samplings.clear();
+                for &i in chunk {
+                    scratch.slots.push(active[i].slot);
+                    scratch.anchors.push(active[i].next.unwrap_or_default());
+                    scratch.spec_samplings.push(active[i].sampling);
+                }
+                match speculator.speculate_batch_round(
+                    model,
+                    &scratch.slots,
+                    &scratch.anchors,
+                    &scratch.spec_samplings,
+                    width,
+                ) {
                     Ok(verdicts) => {
                         for (&idx, verdict) in chunk.iter().zip(verdicts) {
                             let r = &mut active[idx];
@@ -3041,16 +3186,22 @@ mod cuda {
                 }
             }
         }
-        if !plain_indices.is_empty() {
-            let rows: Vec<(usize, u32)> = plain_indices
-                .iter()
-                .map(|&i| (active[i].slot, active[i].next.unwrap_or_default()))
-                .collect();
-            let sampling: Vec<ModelSampling> =
-                plain_indices.iter().map(|&i| active[i].sampling).collect();
-            match model.step_batch_sampled(&rows, &sampling) {
+        if !scratch.plain_indices.is_empty() {
+            scratch.rows.clear();
+            scratch.plain_samplings.clear();
+            for &i in &scratch.plain_indices {
+                scratch
+                    .rows
+                    .push((active[i].slot, active[i].next.unwrap_or_default()));
+                scratch.plain_samplings.push(active[i].sampling);
+            }
+            match model.step_batch_sampled(&scratch.rows, &scratch.plain_samplings) {
                 Ok(next) => {
-                    for (row, (&idx, token)) in plain_indices.iter().zip(next).enumerate() {
+                    let alone_plain =
+                        scratch.rows.len() == 1 && scratch.spec_indices.is_empty();
+                    for (row, (&idx, token)) in
+                        scratch.plain_indices.iter().zip(next).enumerate()
+                    {
                         let r = &mut active[idx];
                         if r.followed
                             && let Err(e) = speculator.keep_batched(model, row, token)
@@ -3060,7 +3211,7 @@ mod cuda {
                             r.followed = false;
                         }
                         r.batched += 1;
-                        if rows.len() == 1 && spec_indices.is_empty() {
+                        if alone_plain {
                             r.rent += 1;
                         }
                         r.next = Some(token);
@@ -3069,7 +3220,7 @@ mod cuda {
                     min_emitted = min_emitted.min(1);
                 }
                 Err(e) => {
-                    for &idx in &plain_indices {
+                    for &idx in &scratch.plain_indices {
                         active[idx].fail(&e);
                     }
                     min_emitted = min_emitted.min(1);
@@ -3213,5 +3364,38 @@ mod tests {
             (2, 1, Some(0.75)),
         ];
         assert_eq!(group_spec_chunks(&homogeneous, 4, true), vec![vec![1, 2, 0]]);
+    }
+
+    #[test]
+    fn small_token_events_stay_inline_up_to_cap() {
+        for len in 1..=SMALL_TOKENS_CAP {
+            let ids: Vec<u32> = (0..len as u32).map(|i| i + 10).collect();
+            match Event::from_tokens(&ids) {
+                Event::SmallTokens(buf, n) => {
+                    assert_eq!(usize::from(n), len);
+                    assert_eq!(&buf[..len], ids.as_slice());
+                }
+                other => panic!("expected SmallTokens for len {len}, got {other:?}"),
+            }
+        }
+        let big: Vec<u32> = (0..SMALL_TOKENS_CAP as u32 + 2).collect();
+        match Event::from_tokens(&big) {
+            Event::Tokens(got) => assert_eq!(got, big),
+            other => panic!("expected Tokens fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn starts_with_chained_matches_concatenation() {
+        let a = [1u32, 2, 3];
+        let b = [4u32, 5, 6];
+        assert!(starts_with_chained(&a, &b, &[]));
+        assert!(starts_with_chained(&a, &b, &[1, 2]));
+        assert!(starts_with_chained(&a, &b, &[1, 2, 3]));
+        assert!(starts_with_chained(&a, &b, &[1, 2, 3, 4]));
+        assert!(starts_with_chained(&a, &b, &[1, 2, 3, 4, 5, 6]));
+        assert!(!starts_with_chained(&a, &b, &[1, 2, 3, 4, 5, 6, 7]));
+        assert!(!starts_with_chained(&a, &b, &[1, 2, 9]));
+        assert!(!starts_with_chained(&a, &b, &[1, 2, 3, 9]));
     }
 }

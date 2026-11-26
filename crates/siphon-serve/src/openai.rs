@@ -622,7 +622,7 @@ pub(crate) fn max_tokens(
 /// Queues a job and returns its events. `label` names it in the log.
 pub(crate) fn submit(
     app: &App,
-    prompt: &[u32],
+    prompt: Vec<u32>,
     images: Vec<PromptImage>,
     max_tokens: usize,
     ignore_eos: bool,
@@ -648,7 +648,7 @@ pub(crate) fn submit(
 /// `label` names choice `i`'s job in the log.
 pub(crate) fn submit_choices(
     app: &App,
-    prompt: &[u32],
+    prompt: Vec<u32>,
     images: Vec<PromptImage>,
     max_tokens: usize,
     ignore_eos: bool,
@@ -663,25 +663,35 @@ pub(crate) fn submit_choices(
         )));
     }
     let prompt_len = prompt.len();
-    let key = app
+    let mut key = app
         .vocab
         .vision()
-        .and_then(|v| v.cache_key(prompt, &images));
+        .and_then(|v| v.cache_key(&prompt, &images));
     let images: crate::vision::Images = images.into();
+    let mut prompt = Some(prompt);
+    let last = samplings.len().saturating_sub(1);
     let (jobs, receivers): (Vec<Job>, Vec<_>) = samplings
         .iter()
         .enumerate()
         .map(|(i, &sampling)| {
             let (events, receiver) = mpsc::unbounded_channel();
+            // Move the prompt and cache key into the last (or only) job to avoid cloning
+            // multi-megabyte prompts on the common `n == 1` path.
+            let job_prompt = if i == last {
+                prompt.take().unwrap_or_default()
+            } else {
+                prompt.as_deref().unwrap_or_default().to_vec()
+            };
+            let job_key = if i == last { key.take() } else { key.clone() };
             let job = Job::new(
-                prompt.to_vec(),
+                job_prompt,
                 max_tokens,
                 ignore_eos,
                 sampling,
                 events,
                 label(i),
             )
-            .with_images(std::sync::Arc::clone(&images), key.clone());
+            .with_images(std::sync::Arc::clone(&images), job_key);
             (job, receiver)
         })
         .unzip();
@@ -725,6 +735,7 @@ impl Results {
             Event::Cached(n) => self.tracker.cached(*n),
             Event::Images(stats) => self.tracker.images(*stats),
             Event::Round => self.tracker.round(),
+            Event::SmallTokens(_, len) => self.tracker.tokens(usize::from(*len)),
             Event::Tokens(ids) => self.tracker.tokens(ids.len()),
             Event::Done(finish) => self.tracker.finish(reason(*finish)),
             Event::Failed(_) => self.tracker.finish(Reason::Error),
@@ -908,16 +919,16 @@ async fn respond(
     let reply = Reply::new(&app, prompt.len(), kind);
     let outputs = vec![output; samplings.len()];
     let n = samplings.len();
+    let prompt_ids = return_token_ids.then(|| prompt.clone());
     let results = submit_choices(
         &app,
-        &prompt,
+        prompt,
         images,
         max_tokens,
         ignore_eos,
         &samplings,
         &|i| id.label(&reply.id, i, n),
     )?;
-    let prompt_ids = return_token_ids.then_some(prompt);
     let fanout = Fanout::new(results);
     let label = id.label(&reply.id, 0, 1);
     if let Delivery::Stream { include_usage } = delivery {
@@ -972,8 +983,15 @@ async fn whole(
                 }
                 continue;
             }
+            Event::SmallTokens(buf, len) => {
+                output.push_into(vocab, &buf[..usize::from(len)], &mut messages[i]);
+                if !output.done {
+                    continue;
+                }
+                Finish::Stop
+            }
             Event::Tokens(ids) => {
-                append(&mut messages[i], output.push(vocab, &ids));
+                output.push_into(vocab, &ids, &mut messages[i]);
                 if !output.done {
                     continue;
                 }
@@ -1084,8 +1102,35 @@ impl Output {
     }
 
     /// Takes generated ids, one at a time so that a stop ends the output at its token.
+    #[cfg_attr(not(test), expect(dead_code, reason = "kept for tests"))]
     pub(crate) fn push(&mut self, vocab: &Vocab, ids: &[u32]) -> Delta {
         let mut out = Delta::default();
+        self.push_into(vocab, ids, &mut out);
+        out
+    }
+
+    /// Takes generated ids, appending directly into `out` to avoid per-token allocations.
+    pub(crate) fn push_into(&mut self, vocab: &Vocab, ids: &[u32], out: &mut Delta) {
+        if self.done || ids.is_empty() {
+            return;
+        }
+        // Fast path: no stop strings, no stop token ids, and no tool-call limit.
+        if self.stop_ids.is_empty() && self.stops.is_empty() && self.limit == Calls::Free {
+            self.ids.extend_from_slice(ids);
+            self.tokens += ids.len();
+            let before_calls = out.tool_calls.len();
+            match &mut self.decoder {
+                Decoder::Chat(parser) => parser.push_into(vocab, ids, out),
+                Decoder::Text(text) => {
+                    for &id in ids {
+                        text.push_into(vocab, id, &mut out.content);
+                    }
+                }
+            }
+            self.calls += out.tool_calls.len() - before_calls;
+            return;
+        }
+        let mut scratch = Delta::default();
         for &id in ids {
             if self.done {
                 break;
@@ -1094,23 +1139,20 @@ impl Output {
             self.tokens += 1;
             if self.stop_ids.contains(&id) {
                 // The token ends the output without its text, as an end token would.
-                self.end(vocab, &mut out);
+                self.end(vocab, out);
                 if !self.done {
                     self.stopped_by = Some(id);
                     self.done = true;
                 }
                 break;
             }
-            let delta = match &mut self.decoder {
-                Decoder::Chat(parser) => parser.push(vocab, &[id]),
-                Decoder::Text(text) => Delta {
-                    content: text.push(vocab, id),
-                    ..Delta::default()
-                },
-            };
-            self.take(delta, &mut out);
+            scratch.clear();
+            match &mut self.decoder {
+                Decoder::Chat(parser) => parser.push_into(vocab, &[id], &mut scratch),
+                Decoder::Text(text) => text.push_into(vocab, id, &mut scratch.content),
+            }
+            self.take(&mut scratch, out);
         }
-        out
     }
 
     /// Ends the output after the job ended with `finish`, or after `done`.
@@ -1129,22 +1171,20 @@ impl Output {
     /// Adds to `out` what the decoder and the stop strings held back, which can still
     /// match a stop string.
     fn end(&mut self, vocab: &Vocab, out: &mut Delta) {
-        let delta = match &mut self.decoder {
-            Decoder::Chat(parser) => parser.finish(vocab),
-            Decoder::Text(text) => Delta {
-                content: text.flush(vocab),
-                ..Delta::default()
-            },
-        };
-        self.take(delta, out);
+        let mut delta = Delta::default();
+        match &mut self.decoder {
+            Decoder::Chat(parser) => parser.finish_into(vocab, &mut delta),
+            Decoder::Text(text) => text.flush_into(vocab, &mut delta.content),
+        }
+        self.take(&mut delta, out);
         if !self.done {
             out.content += &self.stops.flush();
         }
     }
 
     /// Cuts `delta` at a stop string or where `limit` ends the output, and adds it to `out`.
-    fn take(&mut self, mut delta: Delta, out: &mut Delta) {
-        delta.content = self.stops.push(&delta.content);
+    fn take(&mut self, delta: &mut Delta, out: &mut Delta) {
+        self.stops.filter(&mut delta.content);
         if self.stops.matched().is_some() {
             self.done = true;
         }
@@ -1168,7 +1208,12 @@ impl Output {
             }
         }
         self.calls += delta.tool_calls.len();
-        append(out, delta);
+        out.content.push_str(&delta.content);
+        out.reasoning.push_str(&delta.reasoning);
+        out.tool_calls.append(&mut delta.tool_calls);
+        for part in delta.tool_parts.drain(..) {
+            out.tool_part(part);
+        }
     }
 
     pub(crate) fn finish_reason(&self, finish: Finish) -> &'static str {
@@ -1342,6 +1387,107 @@ impl Reply {
             .collect()
     }
 
+    /// Pre-formatted JSON prefix shared by every streamed chunk of this reply, up to the
+    /// choice's `"index":` value.
+    fn chunk_prefix(&self) -> String {
+        let object = match self.kind {
+            Kind::Chat => "chat.completion.chunk",
+            Kind::Text => "text_completion",
+        };
+        let mut buf = Vec::with_capacity(96 + self.id.len() + self.model.len());
+        buf.extend_from_slice(br#"{"id":"#);
+        let _ = serde_json::to_writer(&mut buf, &self.id);
+        buf.extend_from_slice(br#","object":""#);
+        buf.extend_from_slice(object.as_bytes());
+        buf.extend_from_slice(br#"","created":"#);
+        let _ = std::io::Write::write_fmt(&mut buf, format_args!("{}", self.created));
+        buf.extend_from_slice(br#","model":"#);
+        let _ = serde_json::to_writer(&mut buf, &self.model);
+        buf.extend_from_slice(br#","choices":[{"index":"#);
+        String::from_utf8(buf).expect("serde_json emits valid UTF-8")
+    }
+
+    /// Formats `delta`'s streamed SSE JSON chunks directly into `out`, avoiding
+    /// `serde_json::Value` tree construction on every streamed token.
+    fn format_delta_chunks(
+        &self,
+        prefix: &str,
+        index: usize,
+        delta: &Delta,
+        calls: &mut usize,
+        out: &mut Vec<String>,
+    ) {
+        let start_chunk = |extra: usize| {
+            let mut buf = Vec::with_capacity(prefix.len() + 64 + extra);
+            buf.extend_from_slice(prefix.as_bytes());
+            let _ = std::io::Write::write_fmt(
+                &mut buf,
+                format_args!(r#"{index},"logprobs":null,"finish_reason":null,"#),
+            );
+            buf
+        };
+        match self.kind {
+            Kind::Text => {
+                if !delta.content.is_empty() {
+                    let mut buf = start_chunk(delta.content.len() + 16);
+                    buf.extend_from_slice(br#""text":"#);
+                    let _ = serde_json::to_writer(&mut buf, &delta.content);
+                    buf.extend_from_slice(b"}]}");
+                    out.push(String::from_utf8(buf).expect("serde_json emits valid UTF-8"));
+                }
+            }
+            Kind::Chat => {
+                if !delta.reasoning.is_empty() {
+                    let mut buf = start_chunk(delta.reasoning.len() + 36);
+                    buf.extend_from_slice(br#""delta":{"reasoning_content":"#);
+                    let _ = serde_json::to_writer(&mut buf, &delta.reasoning);
+                    buf.extend_from_slice(b"}}]}");
+                    out.push(String::from_utf8(buf).expect("serde_json emits valid UTF-8"));
+                }
+                if !delta.content.is_empty() {
+                    let mut buf = start_chunk(delta.content.len() + 28);
+                    buf.extend_from_slice(br#""delta":{"content":"#);
+                    let _ = serde_json::to_writer(&mut buf, &delta.content);
+                    buf.extend_from_slice(b"}}]}");
+                    out.push(String::from_utf8(buf).expect("serde_json emits valid UTF-8"));
+                }
+                for part in &delta.tool_parts {
+                    match part {
+                        ToolPart::Start(name) => {
+                            *calls += 1;
+                            let call_index = *calls - 1;
+                            let call_id = self.call_id();
+                            let mut buf = start_chunk(name.len() + call_id.len() + 96);
+                            let _ = std::io::Write::write_fmt(
+                                &mut buf,
+                                format_args!(
+                                    r#""delta":{{"tool_calls":[{{"index":{call_index},"id":"{call_id}","type":"function","function":{{"name":"#
+                                ),
+                            );
+                            let _ = serde_json::to_writer(&mut buf, name);
+                            buf.extend_from_slice(br#","arguments":""}}]}}]}"#);
+                            out.push(String::from_utf8(buf).expect("serde_json emits valid UTF-8"));
+                        }
+                        ToolPart::Arguments(piece) => {
+                            let call_index = calls.saturating_sub(1);
+                            let mut buf = start_chunk(piece.len() + 64);
+                            let _ = std::io::Write::write_fmt(
+                                &mut buf,
+                                format_args!(
+                                    r#""delta":{{"tool_calls":[{{"index":{call_index},"function":{{"arguments":"#
+                                ),
+                            );
+                            let _ = serde_json::to_writer(&mut buf, piece);
+                            buf.extend_from_slice(b"}}]}}]}");
+                            out.push(String::from_utf8(buf).expect("serde_json emits valid UTF-8"));
+                        }
+                        ToolPart::End => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn tool_call(&self, call: &ToolCall) -> Value {
         json!({
             "id": self.call_id(),
@@ -1440,6 +1586,7 @@ async fn stream(
 ) {
     let n = outputs.len();
     let token_ids = chunks.prompt_ids.is_some();
+    let prefix = chunks.reply.chunk_prefix();
     // The role chunks wait for the first token, as vLLM's do, so that a client or proxy
     // that times the first chunk measures the prefill. Keep-alive comments hold the
     // connection open meanwhile.
@@ -1448,10 +1595,13 @@ async fn stream(
     let mut calls = vec![0; n];
     let mut sent = vec![0; n];
     let mut open = n;
+    let mut delta = Delta::default();
+    let mut formatted = Vec::new();
     while open > 0 {
         let (i, event) = fanout.next().await;
         let output = &mut outputs[i];
-        let (delta, finish) = match event {
+        delta.clear();
+        let finish = match event {
             Event::Started | Event::Round | Event::Images(_) => continue,
             Event::Cached(cached) => {
                 if i == 0 {
@@ -1459,11 +1609,15 @@ async fn stream(
                 }
                 continue;
             }
-            Event::Tokens(ids) => {
-                let delta = output.push(vocab, &ids);
-                (delta, output.done.then_some(Finish::Stop))
+            Event::SmallTokens(buf, len) => {
+                output.push_into(vocab, &buf[..usize::from(len)], &mut delta);
+                output.done.then_some(Finish::Stop)
             }
-            Event::Done(finish) => (Delta::default(), Some(finish)),
+            Event::Tokens(ids) => {
+                output.push_into(vocab, &ids, &mut delta);
+                output.done.then_some(Finish::Stop)
+            }
+            Event::Done(finish) => Some(finish),
             Event::Failed(message) => {
                 let error = json!({"error": {"message": message, "type": "server_error", "param": null, "code": null}});
                 let _ = chunks.raw(error.to_string()).await;
@@ -1477,6 +1631,20 @@ async fn stream(
             if !chunks.send(roles, None).await {
                 return;
             }
+        }
+        // Fast path: direct JSON serialization for mid-stream deltas without `token_ids`
+        // or pending `prompt_ids`.
+        if finish.is_none() && !token_ids && chunks.prompt_ids.is_none() {
+            formatted.clear();
+            chunks
+                .reply
+                .format_delta_chunks(&prefix, i, &delta, &mut calls[i], &mut formatted);
+            for frame in formatted.drain(..) {
+                if !chunks.raw(frame).await {
+                    return;
+                }
+            }
+            continue;
         }
         let mut choices = chunks.reply.deltas(i, &delta, &mut calls[i]);
         if let Some(finish) = finish {
@@ -2095,5 +2263,148 @@ mod tests {
         );
         let body = text.body(true, vec![choices[0].clone()]);
         assert_eq!(body["object"], "text_completion");
+    }
+
+    #[test]
+    fn fast_sse_chunk_formatting_matches_value_serializer() {
+        let chat = Reply {
+            id: "chatcmpl-1".to_owned(),
+            created: 1_700_000_000,
+            model: "inkling-\"2\"-mini".to_owned(),
+            prompt_tokens: 10,
+            cached_tokens: 0,
+            kind: Kind::Chat,
+        };
+        let prefix = chat.chunk_prefix();
+        let deltas = [
+            Delta {
+                reasoning: "Line 1\n\"quoted\" \\ 🦀".to_owned(),
+                content: "Hello 世界!".to_owned(),
+                ..Delta::default()
+            },
+            Delta {
+                tool_parts: vec![
+                    ToolPart::Start("get_\"weather\"".to_owned()),
+                    ToolPart::Arguments("{\"city\":\"Paris\n\"}".to_owned()),
+                    ToolPart::End,
+                ],
+                ..Delta::default()
+            },
+        ];
+        let mut fast_calls = 0usize;
+        let mut slow_calls = 0usize;
+        let mut fast_frames = Vec::new();
+        for d in &deltas {
+            fast_frames.clear();
+            chat.format_delta_chunks(&prefix, 2, d, &mut fast_calls, &mut fast_frames);
+            let slow_choices = chat.deltas(2, d, &mut slow_calls);
+            assert_eq!(fast_calls, slow_calls);
+            assert_eq!(fast_frames.len(), slow_choices.len());
+            for (raw, choice) in fast_frames.iter().zip(slow_choices) {
+                let mut got: Value = serde_json::from_str(raw).unwrap();
+                let mut want = chat.body(true, vec![choice]);
+                // Normalize generated unique tool call ids before equality check.
+                if let Some(id) = got.pointer_mut("/choices/0/delta/tool_calls/0/id") {
+                    assert!(id.as_str().unwrap().starts_with("call_"));
+                    *id = json!("call_norm");
+                }
+                if let Some(id) = want.pointer_mut("/choices/0/delta/tool_calls/0/id") {
+                    *id = json!("call_norm");
+                }
+                assert_eq!(got, want, "raw={raw}");
+            }
+        }
+
+        // Also check Kind::Text parity.
+        let text_reply = Reply {
+            kind: Kind::Text,
+            ..chat
+        };
+        let text_prefix = text_reply.chunk_prefix();
+        let mut out = Vec::new();
+        let d = Delta {
+            content: "raw\ttext\"ok".to_owned(),
+            ..Delta::default()
+        };
+        text_reply.format_delta_chunks(&text_prefix, 0, &d, &mut 0, &mut out);
+        let want = text_reply.body(true, text_reply.deltas(0, &d, &mut 0));
+        assert_eq!(serde_json::from_str::<Value>(&out[0]).unwrap(), want);
+
+        // Microbenchmark: 10,000 streamed chat content chunks.
+        let chat = Reply {
+            kind: Kind::Chat,
+            ..text_reply
+        };
+        let prefix = chat.chunk_prefix();
+        let delta = Delta {
+            content: " quick".to_owned(),
+            ..Delta::default()
+        };
+        let n = 10_000usize;
+        let t0 = std::time::Instant::now();
+        let mut slow_bytes = 0usize;
+        let mut calls = 0usize;
+        for _ in 0..n {
+            for choice in chat.deltas(0, &delta, &mut calls) {
+                slow_bytes += chat.body(true, vec![choice]).to_string().len();
+            }
+        }
+        let slow_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+        let t1 = std::time::Instant::now();
+        let mut fast_bytes = 0usize;
+        let mut buf = Vec::with_capacity(2);
+        for _ in 0..n {
+            buf.clear();
+            chat.format_delta_chunks(&prefix, 0, &delta, &mut calls, &mut buf);
+            for s in &buf {
+                fast_bytes += s.len();
+            }
+        }
+        let fast_ns = t1.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+        assert_eq!(slow_bytes, fast_bytes);
+        eprintln!(
+            "openai SSE chunk ({n} toks): value={slow_ns:.1} ns/tok, direct={fast_ns:.1} ns/tok ({:.1}x)",
+            slow_ns / fast_ns.max(1e-9)
+        );
+    }
+
+    #[tokio::test]
+    async fn small_token_events_stream_identically() {
+        let vocab = crate::chat::tests::synthetic_vocab();
+        let metrics = Arc::new(Metrics::new("m"));
+        let encoded = vocab.encode("Hello world!");
+        let mut events = vec![Event::Started];
+        for chunk in encoded.chunks(3) {
+            events.push(Event::from_tokens(chunk));
+        }
+        events.push(Event::Done(Finish::Stop));
+        let (fanout, _senders) = fanout(&metrics, 5, vec![events]);
+        let output = Output::new(
+            Decoder::Text(Detokenizer::default()),
+            Stops::default(),
+            Vec::new(),
+            Calls::Free,
+        );
+        let (out, mut rx) = mpsc::channel(128);
+        let chunks = Chunks {
+            out,
+            reply: reply(Kind::Text),
+            prompt_ids: None,
+            label: "small".into(),
+        };
+        stream(&vocab, fanout, vec![output], chunks, false).await;
+        let mut text = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            if frame == "[DONE]" {
+                continue;
+            }
+            let val: Value = serde_json::from_str(&frame).unwrap();
+            if let Some(piece) = val["choices"][0]["text"].as_str() {
+                text.push_str(piece);
+            }
+        }
+        assert_eq!(text, "Hello world!");
     }
 }

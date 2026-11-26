@@ -6,11 +6,11 @@
 //! special tokens disabled and every marker is pushed as its id, so a message that
 //! contains `<|end_message|>` cannot end its block.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::Context as _;
 use serde_json::{Map, Value};
-use tokenizers::Tokenizer;
+use tokenizers::{DecoderWrapper, Tokenizer};
 
 use crate::vision::{Collector, PromptImage, Vision};
 
@@ -68,12 +68,96 @@ pub enum Ending<'a> {
     AnyCall,
 }
 
+/// Flat decoded-byte table for `ByteLevel` decoders: `bytes[offsets[id]..offsets[id + 1]]`
+/// holds the exact raw bytes that `tokenizers`'s `ByteLevel::decode_chain` produces for `id`.
+struct ByteTable {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl ByteTable {
+    fn from_tokenizer(tokenizer: &Tokenizer) -> Option<Self> {
+        if !matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_))) {
+            return None;
+        }
+        let inv = byte_level_inverse();
+        let vocab_len = tokenizer.get_vocab_size(true);
+        let max_added = tokenizer
+            .get_added_tokens_decoder()
+            .keys()
+            .copied()
+            .max()
+            .map_or(0, |id| id as usize + 1);
+        let len = vocab_len.max(max_added);
+        let mut bytes = Vec::with_capacity(len * 6);
+        let mut offsets = Vec::with_capacity(len + 1);
+        let mut scratch = Vec::with_capacity(64);
+        for id in 0..len {
+            offsets.push(u32::try_from(bytes.len()).ok()?);
+            let Ok(id_u32) = u32::try_from(id) else {
+                break;
+            };
+            if let Some(tok) = tokenizer.id_to_token(id_u32) {
+                scratch.clear();
+                let mut all_mapped = true;
+                for c in tok.chars() {
+                    let code = c as usize;
+                    if code < inv.len() && inv[code] != u16::MAX {
+                        scratch.push(inv[code] as u8);
+                    } else {
+                        all_mapped = false;
+                        break;
+                    }
+                }
+                if all_mapped {
+                    bytes.extend_from_slice(&scratch);
+                } else {
+                    bytes.extend_from_slice(tok.as_bytes());
+                }
+            }
+        }
+        offsets.push(u32::try_from(bytes.len()).ok()?);
+        Some(Self { bytes, offsets })
+    }
+
+    #[inline]
+    fn get(&self, id: u32) -> &[u8] {
+        let idx = id as usize;
+        let Some(&end) = self.offsets.get(idx + 1) else {
+            return &[];
+        };
+        let start = self.offsets[idx] as usize;
+        &self.bytes[start..end as usize]
+    }
+}
+
+/// Inverse of GPT-2's `bytes_to_unicode` map, matching `tokenizers`'s `ByteLevel` decoder.
+fn byte_level_inverse() -> [u16; 512] {
+    let mut map = [u16::MAX; 512];
+    for b in (b'!'..=b'~').chain(0xA1..=0xAC).chain(0xAE..=0xFF) {
+        map[usize::from(b)] = u16::from(b);
+    }
+    let mut n = 0usize;
+    for b in 0..=255u8 {
+        if map[usize::from(b)] == u16::MAX {
+            map[256 + n] = u16::from(b);
+            n += 1;
+        }
+    }
+    map
+}
+
 /// The checkpoint's tokenizer and its special tokens.
 pub struct Vocab {
     tokenizer: Tokenizer,
     pub special: Special,
     /// Every special token's id, sorted.
     specials: Vec<u32>,
+    /// Inclusive bounds of `specials`, for O(1) rejection of non-special ids.
+    special_min: u32,
+    special_max: u32,
+    /// Precomputed byte table for O(1) decoding with `ByteLevel` tokenizers.
+    byte_table: Option<ByteTable>,
     /// Image input, with `--vision`.
     vision: Option<Vision>,
 }
@@ -140,9 +224,14 @@ impl Vocab {
     /// Loads `tokenizer.json` from the checkpoint folder `dir`.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         let path = dir.join("tokenizer.json");
-        let mut tokenizer = Tokenizer::from_file(&path)
+        let tokenizer = Tokenizer::from_file(&path)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("loading {}", path.display()))?;
+        Self::from_tokenizer(tokenizer)
+    }
+
+    /// Builds a [`Vocab`] from an already-loaded HuggingFace [`Tokenizer`].
+    pub fn from_tokenizer(mut tokenizer: Tokenizer) -> anyhow::Result<Self> {
         tokenizer.set_encode_special_tokens(true);
         let id = |names: &[&str]| {
             names
@@ -172,10 +261,16 @@ impl Vocab {
             .map(|(id, _)| id)
             .collect();
         specials.sort_unstable();
+        let special_min = specials.first().copied().unwrap_or(u32::MAX);
+        let special_max = specials.last().copied().unwrap_or(0);
+        let byte_table = ByteTable::from_tokenizer(&tokenizer);
         Ok(Self {
             tokenizer,
             special,
             specials,
+            special_min,
+            special_max,
+            byte_table,
             vision: None,
         })
     }
@@ -191,15 +286,50 @@ impl Vocab {
 
     /// The ids of `text`, with any special-token spelling in it encoded as plain text.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        self.tokenizer
+        let mut out = Vec::new();
+        self.encode_into(text, &mut out);
+        out
+    }
+
+    /// Appends the ids of `text` to `out`, avoiding a temporary `Vec` allocation.
+    pub(crate) fn encode_into(&self, text: &str, out: &mut Vec<u32>) {
+        if text.is_empty() {
+            return;
+        }
+        let encoding = self
+            .tokenizer
             .encode_fast(text, false)
-            .expect("byte-level encoding accepts any text")
-            .get_ids()
-            .to_vec()
+            .expect("byte-level encoding accepts any text");
+        out.extend_from_slice(encoding.get_ids());
+    }
+
+    /// Raw bytes for one token id on byte-level tokenizers, or `None` for other decoders.
+    #[inline]
+    pub(crate) fn byte_token(&self, id: u32) -> Option<&[u8]> {
+        self.byte_table.as_ref().map(|table| table.get(id))
     }
 
     /// The text of `ids`, special tokens included.
     pub fn decode(&self, ids: &[u32]) -> String {
+        if let Some(table) = &self.byte_table {
+            let cap: usize = ids.iter().map(|&id| table.get(id).len()).sum();
+            let mut raw = Vec::with_capacity(cap);
+            for &id in ids {
+                raw.extend_from_slice(table.get(id));
+            }
+            return match String::from_utf8(raw) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            };
+        }
+        self.tokenizer
+            .decode(ids, false)
+            .expect("the ids come from this vocabulary")
+    }
+
+    /// Direct HuggingFace tokenizer decode, for tests comparing against the fast byte table.
+    #[cfg(test)]
+    pub(crate) fn decode_hf(&self, ids: &[u32]) -> String {
         self.tokenizer
             .decode(ids, false)
             .expect("the ids come from this vocabulary")
@@ -211,8 +341,11 @@ impl Vocab {
     }
 
     /// Whether `id` is a special token, which carries no text.
+    #[inline]
     pub fn is_special(&self, id: u32) -> bool {
-        self.specials.binary_search(&id).is_ok()
+        id >= self.special_min
+            && id <= self.special_max
+            && self.specials.binary_search(&id).is_ok()
     }
 
     /// The ids that end a turn.
@@ -274,7 +407,10 @@ impl Vocab {
                 "continue_final_message needs an assistant message last",
             ));
         }
-        let mut ids = Vec::new();
+        let mut ids = Vec::with_capacity(messages.len().saturating_mul(32).max(64));
+        let mut header = Vec::with_capacity(8);
+        // Lazily indexed tool_call_id -> function name map, avoiding O(messages^2) scans.
+        let mut tool_names: HashMap<&str, &str> = HashMap::new();
         let block = |ids: &mut Vec<u32>, header: &[u32], kind: u32, text: &str| {
             self.block(ids, header, kind, text);
         };
@@ -302,16 +438,23 @@ impl Vocab {
                 block(&mut ids, &[s.message_system], s.content_text, &effort_block);
                 effort_done = true;
             }
-            let mut header = vec![role_token];
+            header.clear();
+            header.push(role_token);
             let name = if role == "tool" {
-                non_empty(message, "name").or_else(|| tool_name(messages, message))
+                non_empty(message, "name").or_else(|| {
+                    let id = non_empty(message, "tool_call_id")?;
+                    tool_names
+                        .get(id)
+                        .copied()
+                        .or_else(|| tool_name(&messages[i + 1..], id))
+                })
             } else if assistant {
                 non_empty(message, "name")
             } else {
                 None
             };
             if let Some(name) = name {
-                header.extend(self.encode(name));
+                self.encode_into(name, &mut header);
             }
             let reasoning = if assistant {
                 non_empty(message, "reasoning_content").or_else(|| non_empty(message, "reasoning"))
@@ -323,6 +466,16 @@ impl Vocab {
                 None | Some(Value::Null) => &[],
                 Some(_) => return Err(invalid("tool_calls must be an array on an assistant")),
             };
+            for call in tool_calls {
+                if let Some(call_id) = non_empty(call, "id")
+                    && let Some(func_name) = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                {
+                    tool_names.entry(call_id).or_insert(func_name);
+                }
+            }
             if let Some(reasoning) = reasoning {
                 block(&mut ids, &header, s.content_thinking, reasoning);
             }
@@ -359,7 +512,7 @@ impl Vocab {
                 // The last text block stays open: no end marker.
                 ids.extend_from_slice(&header);
                 ids.push(s.content_text);
-                ids.extend(self.encode(last));
+                self.encode_into(last, &mut ids);
                 continue;
             }
             for call in tool_calls {
@@ -385,7 +538,7 @@ impl Vocab {
     fn block(&self, ids: &mut Vec<u32>, header: &[u32], kind: u32, text: &str) {
         ids.extend_from_slice(header);
         ids.push(kind);
-        ids.extend(self.encode(text));
+        self.encode_into(text, ids);
         ids.push(self.special.end_message);
     }
 
@@ -393,7 +546,7 @@ impl Vocab {
     fn declare_tools(&self, ids: &mut Vec<u32>, tools: &[Value]) -> Result<(), InvalidRequest> {
         let specs: Vec<Value> = tools.iter().map(tool_spec).collect::<Result<_, _>>()?;
         let mut header = vec![self.special.message_system];
-        header.extend(self.encode("tool_declare"));
+        self.encode_into("tool_declare", &mut header);
         let specs = canonical_json(&Value::Array(specs));
         self.block(ids, &header, self.special.content_xml, &specs);
         Ok(())
@@ -424,7 +577,7 @@ impl Vocab {
                     )));
                 }
                 ids.push(s.message_model);
-                ids.extend(self.encode(name));
+                self.encode_into(name, ids);
                 ids.push(s.content_invoke_tool_json);
             }
             Ending::AnyCall => {
@@ -453,12 +606,14 @@ impl Vocab {
             )));
         }
         let mut header = vec![self.special.message_model];
-        header.extend(self.encode(name));
-        let payload = format!(
-            "{{\"name\":{},\"args\":{}}}",
-            canonical_json(&Value::String(name.to_owned())),
-            canonical_json(&Value::Object(args))
-        );
+        self.encode_into(name, &mut header);
+        let mut payload = Vec::with_capacity(64);
+        payload.extend_from_slice(br#"{"name":"#);
+        let _ = serde_json::to_writer(&mut payload, name);
+        payload.extend_from_slice(br#","args":"#);
+        write_canonical_map(&args, &mut payload);
+        payload.push(b'}');
+        let payload = String::from_utf8(payload).expect("serde_json emits valid UTF-8");
         self.block(
             ids,
             &header,
@@ -534,16 +689,16 @@ fn non_empty<'a>(message: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The function name of the assistant tool call that a tool message answers.
-fn tool_name<'a>(messages: &'a [Value], message: &Value) -> Option<&'a str> {
-    let id = non_empty(message, "tool_call_id")?;
+/// Fallback scan for a tool call id that appeared after its tool message.
+fn tool_name<'a>(messages: &'a [Value], id: &str) -> Option<&'a str> {
     messages
         .iter()
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
         .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
         .flatten()
         .find(|call| call.get("id").and_then(Value::as_str) == Some(id))
-        .and_then(|call| call.pointer("/function/name"))
+        .and_then(|call| call.get("function"))
+        .and_then(|func| func.get("name"))
         .and_then(Value::as_str)
 }
 
@@ -653,24 +808,70 @@ fn tool_call(call: &Value) -> Result<(&str, Map<String, Value>), InvalidRequest>
 }
 
 /// Compact JSON with every object's keys sorted, as the template's
-/// `tojson(sort_keys=true, separators=(",", ":"))` writes it.
+/// `tojson(sort_keys=true, separators=(",", ":"))` writes it, streaming directly into a
+/// byte buffer without cloning the JSON tree.
 pub fn canonical_json(value: &Value) -> String {
-    fn sorted(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                Value::Object(
-                    keys.into_iter()
-                        .map(|k| (k.clone(), sorted(&map[k])))
-                        .collect(),
-                )
+    let mut out = Vec::with_capacity(128);
+    write_canonical(value, &mut out);
+    String::from_utf8(out).expect("serde_json emits valid UTF-8")
+}
+
+fn write_canonical(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Object(map) => write_canonical_map(map, out),
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_canonical(item, out);
             }
-            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
-            other => other.clone(),
+            out.push(b']');
+        }
+        other => {
+            let _ = serde_json::to_writer(out, other);
         }
     }
-    sorted(value).to_string()
+}
+
+fn write_canonical_map(map: &Map<String, Value>, out: &mut Vec<u8>) {
+    out.push(b'{');
+    // Check whether keys are already in sorted order (always true when `serde_json` uses
+    // `BTreeMap`, i.e., without `preserve_order`), avoiding even a temporary ref slice.
+    let mut sorted = true;
+    let mut prev: Option<&str> = None;
+    for k in map.keys() {
+        if let Some(p) = prev
+            && k.as_str() < p
+        {
+            sorted = false;
+            break;
+        }
+        prev = Some(k.as_str());
+    }
+    if sorted {
+        for (i, (k, v)) in map.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            let _ = serde_json::to_writer(&mut *out, k);
+            out.push(b':');
+            write_canonical(v, out);
+        }
+    } else {
+        let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (i, (k, v)) in entries.into_iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            let _ = serde_json::to_writer(&mut *out, k);
+            out.push(b':');
+            write_canonical(v, out);
+        }
+    }
+    out.push(b'}');
 }
 
 #[cfg(test)]
@@ -683,6 +884,200 @@ pub(crate) mod tests {
     pub(crate) fn vocab() -> Vocab {
         let dir = std::env::var_os("SIPHON_MODEL").expect("set SIPHON_MODEL to the checkpoint");
         Vocab::load(Path::new(&dir)).unwrap()
+    }
+
+    /// An in-memory byte-level BPE [`Vocab`] with Inkling's special tokens, usable in unit
+    /// tests and microbenchmarks without needing `SIPHON_MODEL`.
+    pub(crate) fn synthetic_vocab() -> Vocab {
+        use tokenizers::{
+            AddedToken, Tokenizer,
+            models::bpe::{BPE, Vocab as BpeVocab},
+            pre_tokenizers::byte_level::ByteLevel,
+        };
+
+        let inv = byte_level_inverse();
+        let mut byte_to_char = ['\0'; 256];
+        for (code, &byte) in inv.iter().enumerate() {
+            if byte != u16::MAX {
+                byte_to_char[usize::from(byte)] = char::from_u32(code as u32).unwrap();
+            }
+        }
+        let mut map = BpeVocab::default();
+        for b in 0..=255u8 {
+            map.insert(byte_to_char[usize::from(b)].to_string(), u32::from(b));
+        }
+        let extra = [
+            "Hello", "Ġworld", "Ġthe", "Ġquick", "Ġbrown", "Ġfox", "Ġjumps", "Ġover", "Ġlazy",
+            "Ġdog", "get_weather", "Paris", "name", "args", "city", "Plan", "Think",
+        ];
+        for (i, tok) in extra.iter().enumerate() {
+            map.insert((*tok).to_owned(), 256 + i as u32);
+        }
+        let bpe = BPE::builder()
+            .vocab_and_merges(map, Vec::new())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(bpe);
+        let bl = ByteLevel::default().add_prefix_space(false);
+        tokenizer.with_pre_tokenizer(Some(bl));
+        tokenizer.with_decoder(Some(bl));
+        let specials = [
+            "<|endoftext|>",
+            "<|message_user|>",
+            "<|message_model|>",
+            "<|message_system|>",
+            "<|message_tool|>",
+            "<|content_text|>",
+            "<|content_thinking|>",
+            "<|content_xml|>",
+            "<|content_invoke_tool_json|>",
+            "<|content_invoke_tool_text|>",
+            "<|content_tool_error|>",
+            "<|content_model_end_sampling|>",
+            "<|end_message|>",
+        ];
+        let added: Vec<AddedToken> = specials
+            .iter()
+            .map(|&s| AddedToken::from(s, true))
+            .collect();
+        let _ = tokenizer.add_special_tokens(added);
+        Vocab::from_tokenizer(tokenizer).unwrap()
+    }
+
+    #[test]
+    fn byte_table_matches_hf_tokenizer_decode() {
+        let vocab = synthetic_vocab();
+        assert!(vocab.byte_table.is_some());
+        let samples = [
+            "Hello, 世界 🦀! Line 1\nLine 2\t\"quoted\" \\slash\\",
+            "café naïve résumé 日本語 한국어 🚀🔥",
+            "",
+            "   \n\r\t  ",
+        ];
+        for sample in samples {
+            let ids = vocab.encode(sample);
+            let fast = vocab.decode(&ids);
+            let hf = vocab.tokenizer.decode(&ids, false).unwrap();
+            assert_eq!(fast, hf);
+            assert_eq!(fast, sample);
+        }
+        // Special tokens and invalid raw UTF-8 byte sequences also match HF decode.
+        let s = vocab.special;
+        let mixed = [
+            s.message_model,
+            s.content_text,
+            u32::from(b'A'),
+            0xFF,
+            u32::from(b'B'),
+            0xF0,
+            0x9F,
+            0xA6,
+            0x80,
+            s.end_message,
+            999_999, // unknown id
+        ];
+        assert_eq!(
+            vocab.decode(&mixed),
+            vocab.tokenizer.decode(&mixed, false).unwrap()
+        );
+        assert!(vocab.is_special(s.message_model));
+        assert!(vocab.is_special(s.end_message));
+        assert!(!vocab.is_special(u32::from(b'A')));
+        assert!(!vocab.is_special(999_999));
+    }
+
+    #[test]
+    fn render_prompt_indexes_many_tool_calls() {
+        let vocab = synthetic_vocab();
+        let mut messages = vec![json!({"role": "user", "content": "Run 100 tools."})];
+        for i in 0..100 {
+            let id = format!("call_{i}");
+            messages.push(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                }]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": "sunny"
+            }));
+        }
+        let ids = vocab.render(&messages, &[], 0.0).unwrap();
+        let decoded = vocab.decode(&ids);
+        assert_eq!(
+            decoded.matches("<|message_tool|>get_weather<|content_text|>sunny").count(),
+            100
+        );
+    }
+
+    #[test]
+    fn benchmark_canonical_json_vs_deep_clone() {
+        fn old_canonical(value: &Value) -> String {
+            fn sorted(value: &Value) -> Value {
+                match value {
+                    Value::Object(map) => {
+                        let mut keys: Vec<&String> = map.keys().collect();
+                        keys.sort();
+                        Value::Object(
+                            keys.into_iter()
+                                .map(|k| (k.clone(), sorted(&map[k])))
+                                .collect(),
+                        )
+                    }
+                    Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+                    other => other.clone(),
+                }
+            }
+            sorted(value).to_string()
+        }
+
+        let tools: Value = Value::Array(
+            (0..20)
+                .map(|i| {
+                    json!({
+                        "type": "function",
+                        "name": format!("tool_{i}"),
+                        "description": "Reads or writes files in the workspace with validation.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path"},
+                                "limit": {"type": "integer", "default": 200},
+                                "flags": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["path"]
+                        }
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(canonical_json(&tools), old_canonical(&tools));
+
+        let iters = 500u32;
+        let t0 = std::time::Instant::now();
+        let mut old_bytes = 0usize;
+        for _ in 0..iters {
+            old_bytes += old_canonical(&tools).len();
+        }
+        let old_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+        let t1 = std::time::Instant::now();
+        let mut new_bytes = 0usize;
+        for _ in 0..iters {
+            new_bytes += canonical_json(&tools).len();
+        }
+        let new_us = t1.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+        assert_eq!(old_bytes, new_bytes);
+        eprintln!(
+            "canonical_json (20 tools): old={old_us:.1} us, new={new_us:.1} us ({:.2}x)",
+            old_us / new_us.max(1e-9)
+        );
     }
 
     #[test]

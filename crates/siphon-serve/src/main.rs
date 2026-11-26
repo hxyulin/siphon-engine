@@ -19,6 +19,7 @@ mod vision;
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Context as _, bail, ensure};
+use axum::serve::ListenerExt as _;
 use serde_json::json;
 
 /// Requests that may run at once: up to the rows of a batched step.
@@ -540,6 +541,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// Wraps `listener` so every accepted TCP connection enables `TCP_NODELAY`, avoiding up to
+/// 40 ms of Nagle + delayed-ACK jitter on small SSE chunks.
+fn nodelay_listener(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr> {
+    listener.tap_io(|stream| {
+        let _ = stream.set_nodelay(true);
+    })
+}
+
 fn run() -> anyhow::Result<()> {
     let args = args()?;
     let api_key = env::var("SIPHON_API_KEY").ok().filter(|k| !k.is_empty());
@@ -585,7 +596,7 @@ fn run() -> anyhow::Result<()> {
             .with_context(|| format!("binding {}", args.address))?;
         eprintln!("serving {} on http://{}", app.name, args.address);
         let engine = app.engine.clone();
-        axum::serve(listener, openai::router(app))
+        axum::serve(nodelay_listener(listener), openai::router(app))
             .with_graceful_shutdown(async move {
                 stop_signal().await;
                 drain(engine, args.drain_timeout).await;
@@ -593,4 +604,22 @@ fn run() -> anyhow::Result<()> {
             .await
             .context("serving")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::serve::Listener as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_connections_set_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut wrapped = nodelay_listener(listener);
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (server_stream, _) = wrapped.accept().await;
+        assert!(server_stream.nodelay().unwrap());
+        let _ = client.await.unwrap().unwrap();
+    }
 }

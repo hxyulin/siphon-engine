@@ -60,7 +60,7 @@ impl Reason {
 }
 
 /// A cumulative histogram with fixed upper edges.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Histogram {
     edges: &'static [f64],
     /// Observations per bucket, the last past every edge.
@@ -102,7 +102,7 @@ impl Histogram {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct State {
     prompt_tokens: u64,
     generation_tokens: u64,
@@ -171,9 +171,10 @@ impl Metrics {
 
     /// The Prometheus text exposition of every metric.
     pub fn render(&self) -> String {
-        let s = self.state();
+        // Snapshot under lock so Prometheus formatting never stalls concurrent token tracking.
+        let s = self.state().clone();
         let labels = &self.labels;
-        let mut out = String::new();
+        let mut out = String::with_capacity(4096);
         let counters = [
             (
                 "vllm:prompt_tokens_total",
