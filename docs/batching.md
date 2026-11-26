@@ -93,7 +93,22 @@ Each batch size B from 1 to 32 gets its own graph, captured on first use, as the
 
 ## New requests join
 
-A new request takes a free slot and is prefilled into it in chunks of 2,048 rows, one chunk per engine iteration, between the batch's decode steps. Each chunk pauses the others for about 0.1 s. Smaller chunks would pause them less but change the prompt's KV state, since the prefill kernels are not row-invariant, and so break exactness. A request whose prefill finishes joins the next batched step with its first token.
+A new request takes a free slot and is prefilled into it in chunks of 2,048 rows, one chunk per engine iteration, between the batch's decode steps. On an RTX 5090 the others wait 0.13 s for a chunk at the start of a prompt and 0.19 s at 100,000 tokens. Smaller chunks would pause them less but change the prompt's KV state, since the prefill kernels are not row-invariant, and so break exactness. They would also move the prefix cache's entries, which sit at multiples of the chunk. A request whose prefill finishes joins the next batched step with its first token.
+
+### Decode floor
+
+With one step per chunk, a decoding request gets one token per chunk, 6 tok/s while another request prefills 100,000 tokens on an RTX 5090. After each chunk the engine therefore runs as many batched steps as give each decoding request `--decode-floor` tokens per second, 20 by default, of the time since the last step ended. That time covers the chunk, any admissions and the steps themselves, since a chunk does not wait for the GPU on its own. The steps stop at the floor, or once they took as long as everything before them, so the prefill keeps at least half the time even where a step is too slow for the floor. Each chunk ends with a whole step, so the rate came out 1 to 2.5 tok/s above the floor. The steps change only when each sequence runs, not what it computes, so every sequence gets the same tokens at any floor.
+
+Each extra step delays the prefill by one step's time s, so a floor R costs the prefilling request about R × s / (1 - R × s) of its prefill time. A one-row step took 4.5 ms with 100,000 positions and 6.4 ms with 300,000. Measured on an RTX 5090 with two streams of 335,872 positions: request A decodes, and request B, a 100,000-token prompt sent as token ids, arrives. A's rate counts its tokens from 0.1 s after B's arrival to B's first token. Repeated runs agreed within 0.01 s.
+
+| Floor (tok/s) | A's rate, A at 100K | B's first token, A at 100K | A's rate, A at 300K | B's first token, A at 300K |
+| --- | --- | --- | --- | --- |
+| 0 | 6.1 tok/s | 7.94 s | 6.0 tok/s | 8.06 s |
+| 10 | 11.9 tok/s | 8.17 s (+3%) | | |
+| 20 | 22.4 tok/s | 8.60 s (+8%) | 22.3 tok/s | 9.04 s (+12%) |
+| 40 | 41.6 tok/s | 9.48 s (+19%) | 41.2 tok/s | 10.49 s (+30%) |
+
+The default of 20 gives a decoding request 3.7 times the rate of one step per chunk for 8 to 12% of the prefill time. A floor of 40 more than doubles that cost for a rate that only an agent waiting on a long reply would notice. A side request that fits in one chunk gains nothing from the floor: a 2,000-token prompt got its first token after 0.14 s at every floor, and A waited 0.13 s for that chunk.
 
 Prefill into slot k runs the existing prefill code on that slot's caches. Prefill launches its kernels directly, not through a graph, so it can take any slot's caches.
 

@@ -24,17 +24,24 @@ const PREFILL_CHUNK: std::ops::RangeInclusive<usize> = 1..=2048;
 #[cfg(target_os = "linux")]
 const _: () = assert!(*PREFILL_CHUNK.end() == siphon::memory::MAX_PREFILL_CHUNK);
 
+/// Tokens per second each decoding request gets at least while another prefills.
+const DECODE_FLOOR: f64 = 20.0;
+
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] [--kv fp8|bf16] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
-                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] [--greedy]
+                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
+                     [--decode-floor 20] [--greedy]
 --context sets the positions of the KV cache: the prompt and the generated tokens. Without it
 the server takes the most that fit in GPU memory, up to the model's limit of 1,048,576. Either
 way it plans the memory before loading the weights and stops if the plan does not fit.
 --streams runs up to N requests at once (1 to 32), each with its own KV cache of --context
 positions. A request alone speculates; once another arrives, all run batched plain decode.
 Either way a request gets the same tokens. Up to --queue more requests wait.
+--decode-floor gives each decoding request at least that many tokens per second while
+another request's prompt prefills, by running more batched steps between its chunks of
+--prefill-chunk tokens. The prefill keeps at least half of the time. 0 runs one step per chunk.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
 plan may use the free memory at startup less --margin, 0.25 GiB by default.
 --prefill-chunk runs prompts in chunks of N rows, 1 to 2048. Its buffers grow with N: 0.85 GiB
@@ -116,6 +123,7 @@ fn args() -> anyhow::Result<Args> {
     let mut drain_timeout = 600;
     let mut prefill_attention = "auto".to_owned();
     let mut greedy = false;
+    let mut decode_floor = DECODE_FLOOR;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -148,6 +156,15 @@ fn args() -> anyhow::Result<Args> {
             "--drain-timeout" => drain_timeout = value()?.parse()?,
             "--prefill-attention" => prefill_attention = value()?,
             "--greedy" => greedy = true,
+            "--decode-floor" => {
+                decode_floor = value()?
+                    .parse()
+                    .context("--decode-floor takes tokens per second")?;
+                ensure!(
+                    decode_floor >= 0.0,
+                    "--decode-floor takes 0 or more tokens per second"
+                );
+            }
             "--widths" => {
                 widths = value()?
                     .split(',')
@@ -195,6 +212,7 @@ fn args() -> anyhow::Result<Args> {
             cache_dir,
             prefill_attention,
             greedy,
+            decode_floor,
         },
         model_dir,
         address,

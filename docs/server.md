@@ -28,6 +28,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--kv fp8\|bf16` | `fp8` | Global KV cache format. |
 | `--streams N` | `1` | Requests that run at once, 1 to 32, each with its own KV cache. |
 | `--queue N` | `8` | Requests that wait beyond the running ones. |
+| `--decode-floor R` | `20` | Tokens per second each decoding request gets at least while another prefills. 0 runs one batched step per prefill chunk. |
 | `--widths` | `1,2,...,8` | Verify widths speculation picks from. |
 | `--drafter DIR` | bundled DSpark | Runs Inco AI's DFlash 2 drafter or a 2DSD DFlash export instead. |
 | `--draft` | `fast` | The draft's approximations: `fast`, `fp8`, `exact`, or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold` and `shortlist`. |
@@ -163,7 +164,7 @@ With `--streams N`, up to N requests run at once and up to `--queue` more wait. 
 
 More streams serve more in total and less per stream. On an RTX PRO 6000 Blackwell Max-Q, 32 streams at 10,674 tokens of context ran 1,138 tok/s in all against 661 for 8 ([batching.md](batching.md#16-and-32-streams-on-an-rtx-pro-6000-blackwell-max-q)). With `--streams 32 --context 16384`, 32 concurrent requests of 512 tokens came back at 1,198 tok/s in all.
 
-A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of `--prefill-chunk` tokens (2,048 by default) between the batch's steps. Either way each request gets the same tokens it would get alone, greedy or sampled with a seed. [batching.md](batching.md) has the design.
+A request that arrives at an idle server speculates. When another arrives, the first stops speculating after its round, and every running request decodes in a batched step of one row each. When one request is left and nothing waits, it speculates again. A new request's prompt prefills in chunks of `--prefill-chunk` tokens (2,048 by default) between the batch's steps. After each chunk the others run as many steps as give each at least `--decode-floor` tokens per second: with the default of 20, a 100,000-token prefill on an RTX 5090 took 8% longer and the decoding request got 22.4 tok/s instead of 6.1 ([batching.md](batching.md#decode-floor)). Either way each request gets the same tokens it would get alone, greedy or sampled with a seed. [batching.md](batching.md) has the design.
 
 ## Prefix cache
 
@@ -195,7 +196,7 @@ On an RTX PRO 6000 Blackwell Workstation Edition with `--host-cache 12`, two con
 Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of 41,281 tokens (largest 153,426) and a median reply of 151 tokens. The prefix cache served 90% of the tokens of prompts over 4,096.
 
 - **Another request in a slot loses its conversation without `--host-cache`.** A device entry keeps only the slot's rings and conv states. The global KV cache stays in the slot, so any other sequence there overwrites it. With `--streams 1`, short side requests caused 6 full prefills of 77,421 to 150,445 tokens, at 5.7 to 12.5 s each. The side requests included the agent's own 539-token request and 21-token tests. The host tier, `--host-cache`, now restores such prompts in well under a second.
-- **A prefill stalls every other stream.** Prefill runs whole, between decode steps. In a test on an RTX PRO 6000 Blackwell with two streams of 1,048,576 positions, the running request delivered 2.2 tok/s while the second request's 325 s prefill ran. Chunked prefill with decode steps between the chunks would bound the stall.
+- **A prefill stalled every other stream.** In a test on an RTX PRO 6000 Blackwell with two streams of 1,048,576 positions, the running request delivered 2.2 tok/s while the second request's 325 s prefill ran, one batched step per prefill chunk. `--decode-floor` now runs more steps between the chunks (see [Concurrent requests](#concurrent-requests)).
 - **Job lines carry no request ID.** A `job:` log line cannot be matched to a proxy's request log except by time.
 - **Decode slows past 100,000 tokens.** Agent turns decoded at a median 534 tok/s with prompts of 32,000 to 100,000 tokens, and 417 tok/s above 100,000. Speculation kept a median of 3.09 tokens per round.
 

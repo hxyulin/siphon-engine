@@ -5,7 +5,8 @@
 //! With `streams` above 1, a request that arrives meanwhile stops the speculation after its
 //! round, and from then on every request runs batched plain decode in its own slot, up to
 //! `streams` at once, until the server is idle again. A new request's prompt prefills in
-//! chunks between the batch's steps. Batched steps and speculation give each sequence the
+//! chunks between the batch's steps, with enough steps after each chunk to keep every
+//! decoding request at `Options::decode_floor` tokens per second. Batched steps and speculation give each sequence the
 //! same tokens, so a request's output does not depend on what else runs (see
 //! `docs/batching.md`).
 //!
@@ -278,6 +279,9 @@ pub struct Options {
     pub prefill_attention: String,
     /// Whether every request decodes greedily, whatever it asks.
     pub greedy: bool,
+    /// Tokens per second that each decoding request gets at least while another prefills,
+    /// with `streams` above 1, or 0 for one batched step per prefill chunk.
+    pub decode_floor: f64,
 }
 
 /// Sends jobs to the engine thread.
@@ -1038,6 +1042,7 @@ mod cuda {
                             stop,
                             streams,
                             greedy,
+                            options.decode_floor,
                         );
                         check.after_job();
                         continue;
@@ -1060,6 +1065,7 @@ mod cuda {
                         stop,
                         streams,
                         greedy,
+                        options.decode_floor,
                     );
                     check.after_job();
                     continue;
@@ -1084,6 +1090,7 @@ mod cuda {
                         stop,
                         streams,
                         greedy,
+                        options.decode_floor,
                     );
                 }
                 Ok(false) => {}
@@ -1241,9 +1248,10 @@ mod cuda {
 
     /// Runs `active` and the jobs that arrive while any runs, up to `streams` at once, each
     /// in its own slot, until none is left or one is left alone. Each turn prefills one
-    /// chunk of the oldest request still prefilling, then runs one batched step of the
-    /// others. A request left alone with nothing waiting returns, in slot 0, to continue
-    /// with speculation (`speculate_again`). Each request takes its slot from the prefix
+    /// chunk of the oldest request still prefilling, then runs batched steps of the others:
+    /// one, or after a chunk as many as give each decoding request `floor` tokens per
+    /// second of the time since the last step (`floor_steps`). A request left alone with
+    /// nothing waiting returns, in slot 0, to continue with speculation (`speculate_again`). Each request takes its slot from the prefix
     /// cache (`Speculator::claim_slot`), and prefills from where its entry ends.
     #[expect(clippy::too_many_arguments, reason = "the scheduler's state")]
     fn batched(
@@ -1255,7 +1263,10 @@ mod cuda {
         stop: &[u32],
         streams: usize,
         greedy: bool,
+        floor: f64,
     ) -> Option<Request> {
+        // When the last batched step synced: the decoding requests have waited since then.
+        let mut synced = Instant::now();
         loop {
             while active.len() < streams {
                 if waiting.is_empty()
@@ -1292,7 +1303,7 @@ mod cuda {
             if active.is_empty() {
                 return None;
             }
-            prefill_chunk(model, speculator, &mut active, stop);
+            let chunked = prefill_chunk(model, speculator, &mut active, stop);
             // Right after its prefill, a lone request speculates before any batched step,
             // as it would have from the start.
             if let [r] = active.as_mut_slice()
@@ -1312,41 +1323,70 @@ mod cuda {
                     }
                 }
             }
-            step_rows(model, speculator, &mut active, stop);
-            active.retain(|r| {
-                if r.done {
-                    if r.followed {
-                        speculator.forget();
-                    }
-                    if !r.failed && r.next.is_some() {
-                        r.finish("");
-                    }
+            let first_step = Instant::now();
+            let mut steps = 0;
+            while step_rows(model, speculator, &mut active, stop) {
+                retire(speculator, &mut active);
+                steps += 1;
+                if !chunked || !floor_steps(floor, steps, synced, first_step) {
+                    break;
                 }
-                !r.done
-            });
+            }
+            retire(speculator, &mut active);
+            synced = Instant::now();
         }
+    }
+
+    /// Whether to run another batched step after a prefill chunk: while the `steps` since
+    /// the step that ended at `synced` give a decoding request fewer than `floor` tokens
+    /// per second of the time since then. The steps stop once they took as long as what
+    /// ran before them, the chunk and the admissions, so the prefill keeps at least half
+    /// of the time even when `floor` asks for more than a batched step can give.
+    fn floor_steps(floor: f64, steps: usize, synced: Instant, first_step: Instant) -> bool {
+        let waited = first_step.duration_since(synced).as_secs_f64();
+        let stepped = first_step.elapsed().as_secs_f64();
+        #[expect(clippy::cast_precision_loss, reason = "a few steps")]
+        let behind = (steps as f64) < floor * (waited + stepped);
+        behind && stepped < waited
+    }
+
+    /// Drops the requests of `active` that are done, and finishes those that ended without
+    /// a failure.
+    fn retire(speculator: &mut Speculator, active: &mut Vec<Request>) {
+        active.retain(|r| {
+            if r.done {
+                if r.followed {
+                    speculator.forget();
+                }
+                if !r.failed && r.next.is_some() {
+                    r.finish("");
+                }
+            }
+            !r.done
+        });
     }
 
     /// Prefills one chunk of the oldest request of `active` still prefilling, in its slot,
     /// and keeps the prompt's state in the prefix cache when the chunk ends at the prompt's
-    /// last multiple of the chunk.
+    /// last multiple of the chunk. Returns whether it ran one.
     fn prefill_chunk(
         model: &mut Model,
         speculator: &mut Speculator,
         active: &mut [Request],
         stop: &[u32],
-    ) {
+    ) -> bool {
         let Some(i) = active.iter().position(|r| r.next.is_none()) else {
-            return;
+            return false;
         };
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
         let r = &mut active[i];
         if r.job.events.is_closed() {
             r.done = true;
-            return;
+            return false;
         }
         if r.job.cancelled() {
-            return r.fail(&anyhow::anyhow!(CANCELLED));
+            r.fail(&anyhow::anyhow!(CANCELLED));
+            return false;
         }
         let len = r.job.prompt.len();
         let chunk = speculator.prefill_chunk();
@@ -1355,7 +1395,10 @@ mod cuda {
         model.set_sampling(r.sampling);
         let first = match model.prefill_slot(r.slot, &r.job.prompt[r.prefilled..end], chunk) {
             Ok(first) => first,
-            Err(e) => return r.fail(&e),
+            Err(e) => {
+                r.fail(&e);
+                return true;
+            }
         };
         r.prefilled = end;
         if end == boundary
@@ -1371,6 +1414,7 @@ mod cuda {
             r.done = r.take(&[first], stop).is_break();
             share_prefill(model, active, i, stop);
         }
+        true
     }
 
     /// Gives the prompt state that `active[from]` has just prefilled to its siblings, the
@@ -1414,13 +1458,13 @@ mod cuda {
     }
 
     /// Runs one batched step of the requests of `active` that have a next token, and keeps
-    /// the taps of the one the draft follows.
+    /// the taps of the one the draft follows. Returns false when none has one.
     fn step_rows(
         model: &mut Model,
         speculator: &mut Speculator,
         active: &mut [Request],
         stop: &[u32],
-    ) {
+    ) -> bool {
         let stepped: Vec<&Request> = active
             .iter()
             .filter(|r| !r.done && r.next.is_some())
@@ -1431,7 +1475,7 @@ mod cuda {
             .collect();
         let sampling: Vec<ModelSampling> = stepped.iter().map(|r| r.sampling).collect();
         if rows.is_empty() {
-            return;
+            return false;
         }
         match model.step_batch_sampled(&rows, &sampling) {
             Ok(next) => {
@@ -1457,6 +1501,7 @@ mod cuda {
                 }
             }
         }
+        true
     }
 }
 
