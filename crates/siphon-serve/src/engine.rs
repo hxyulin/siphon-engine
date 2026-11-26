@@ -694,7 +694,6 @@ mod cuda {
         }
     }
 
-    #[expect(clippy::too_many_lines, reason = "startup, step by step")]
     fn load(
         options: &Options,
         warmup: &[u32],
