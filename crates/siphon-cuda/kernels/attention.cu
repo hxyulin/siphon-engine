@@ -2099,8 +2099,14 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 const __nv_bfloat16* row = q + head * kHeadDim + (lane % 4) * 2;
 #pragma unroll
                 for (int s = 0; s < kHeadDim / 16; ++s) {
-                    qa[s][i] = valid ? *reinterpret_cast<const uint32_t*>(row + 16 * s) : 0;
-                    qa[s][2 + i] = valid ? *reinterpret_cast<const uint32_t*>(row + 16 * s + 8) : 0;
+                    uint32_t lo = valid ? *reinterpret_cast<const uint32_t*>(row + 16 * s) : 0;
+                    uint32_t hi = valid ? *reinterpret_cast<const uint32_t*>(row + 16 * s + 8) : 0;
+                    if constexpr (F::kFp4) {
+                        lo = bf16x2_to_f16x2(lo);
+                        hi = bf16x2_to_f16x2(hi);
+                    }
+                    qa[s][i] = lo;
+                    qa[s][2 + i] = hi;
                 }
             }
         }
@@ -2270,7 +2276,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 }
                 __syncthreads();
             } else if constexpr (F::kFp4) {
-                // Each group of 16 elements becomes two BF16 key chunks and two F16 value chunks.
+                // Each group of 16 elements decodes directly to two F16 chunks for both K and V.
                 constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
                 for (int i = threadIdx.x; i < kPrefillKeys * kFp4HeadScales; i += kThreads) {
                     const int row = i / kFp4HeadScales;
@@ -2290,21 +2296,10 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                             h[w] = hmul2_bits(lo[w], sc);
                             h[4 + w] = hmul2_bits(hi[w], sc);
                         }
-                        if (kv == 0) {
-                            // Keys go to BF16, exactly: at most 6 significant bits, within range.
-#pragma unroll
-                            for (int w = 0; w < 8; ++w) {
-                                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h[w]));
-                                h[w] = pack_bf16x2(f.x, f.y);
-                            }
-                            *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * group)]) = make_uint4(h[0], h[1], h[2], h[3]);
-                            *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * group + 1)]) =
-                                make_uint4(h[4], h[5], h[6], h[7]);
-                        } else {
-                            *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * group)]) = make_uint4(h[0], h[1], h[2], h[3]);
-                            *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * group + 1)]) =
-                                make_uint4(h[4], h[5], h[6], h[7]);
-                        }
+                        __nv_bfloat16* dst = kv == 0 ? sm.k[0] : sm.v[0];
+                        *reinterpret_cast<uint4*>(&dst[swizzle(row, 2 * group)]) = make_uint4(h[0], h[1], h[2], h[3]);
+                        *reinterpret_cast<uint4*>(&dst[swizzle(row, 2 * group + 1)]) =
+                            make_uint4(h[4], h[5], h[6], h[7]);
                     }
                 }
                 __syncthreads();
@@ -2350,8 +2345,13 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                 for (int np = 0; np < kPrefillKeys / 16; ++np) {
                     uint32_t b[4];
                     ldmatrix_x4(b, keys + swizzle(np * 16 + (lane >> 4) * 8 + (lane & 7), 2 * ks + ((lane >> 3) & 1)));
-                    mma_bf16(s[2 * np], qa[ks], b[0], b[1]);
-                    mma_bf16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                    if constexpr (F::kFp4) {
+                        mma_f16(s[2 * np], qa[ks], b[0], b[1]);
+                        mma_f16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                    } else {
+                        mma_bf16(s[2 * np], qa[ks], b[0], b[1]);
+                        mma_bf16(s[2 * np + 1], qa[ks], b[2], b[3]);
+                    }
                 }
             }
             // The queries are spent after the segment's last Q K^T; start
