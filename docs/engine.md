@@ -1142,6 +1142,106 @@ The runs below read the FP8 copy of the output projection, now `--output-project
 
 Stepping runs the GEMVs, not `mma.sync`, and gives the same numbers on both GPUs, so its failure on `regex-readme` comes from the FP8 path itself, not from Ada.
 
+Decode and prefill with `bench`, no other process on the GPU:
+
+| Context | FP8 weights and cache | BF16 weights and cache |
+| ---: | ---: | ---: |
+| 0 | 204.4 tok/s | 148.9 tok/s |
+| 4,096 | 196.5 tok/s | |
+| 32,768 | 165.8 tok/s | 113.4 tok/s |
+
+Prefill with the FP8 cache ran 9,672 tok/s at 8,192 tokens and 8,950 at 32,768.
+
+### Stepping on `regex-readme`
+
+The failing range is the one after the window wraps, positions 1,024 to 2,797. Its mean \|log-prob difference\| when stepping, against MLX's chunked capture:
+
+| Dense weights | KV cache | Before the wrap | After the wrap |
+| --- | --- | ---: | ---: |
+| BF16 | BF16 | 0.0237 | 0.0306 |
+| BF16 | FP8 | 0.0283 | 0.0339 |
+| FP8 | BF16 | 0.0309 | 0.0412 |
+| FP8 | FP8 | 0.0334 | 0.0451 |
+
+MLX's chunked and token-by-token captures differ by 0.0293 on this range, the most of the three texts. Against the F32 capture, FP8 stepping is 0.0456 away on this range and MLX's chunked path 0.0303. So the engine drifts from the model there; the limit is not just tight for this capture.
+
+The FP8 copies of the attention projections cause most of it. Without them, keeping the LM head's and the message gates' copies, the range comes to 0.0355. Without the LM head's copy alone it is 0.0448, and without the gates' 0.0456. Rounding chosen BF16 matrices in place to their E4M3 values (scale per row), with BF16 weights and the FP8 cache, so 0.0339 with none rounded, splits the projections:
+
+| Rounded | After the wrap |
+| --- | ---: |
+| Output projection | 0.0395 |
+| Value projection | 0.0372 |
+| Query and key projections | 0.0345 |
+| Relative, gate and sink projections | 0.0334 |
+| The global layers' conv projections | 0.0340 |
+| Every input projection | 0.0363 |
+| Every projection | 0.0413 |
+
+The excess over BF16 weights is spread over the text. The 100 positions with the largest excess hold 90% of it, and tokens to which MLX gives a log-probability below -1 hold 79%. Small logit noise moves unlikely tokens' log-probabilities most, so this is the rounding of the weights, not a fault at a few positions. The end of the MoE block that the expert kernel runs only with FP8 weights gives the same bits as the separate kernel: 0.0451 either way.
+
+Scales per 32 columns instead of per row, rounded the same way, take the output projection's 0.0395 to 0.0355. With every projection rounded they take the range after the wrap from 0.0413 to 0.0389 but the range before it from 0.0294 to 0.0340, so this one text shows no clear gain. Scales per 128 columns give 0.0410.
+
+Two fixes would pass the gate without loosening it: decode could read the output projection's BF16 weights (rounding every input projection but not the output projection gives 0.0363), or its FP8 copy could take scales per 32 columns. `--weights fp8` now does the first ([The output projection](#the-output-projection)). The FP8 hashes above are its values, and the BF16 hashes did not change.
+
+### Longest context on the RTX 4090
+
+`siphon-serve --prefill-chunk 1024` without `--context` took 244,736 positions with FP8 weights and cache and the bundled draft. One chat request filled it: 243,975 tokens of Python standard library source with a one-line note about 500 tokens in, then a question about the note, greedy, at effort 0. The first token came after 48.5 s, 5,030 tok/s over the prompt. The reply used 329 tokens, 244,304 positions in all, and decoded at 161 tok/s. It gave the note's code, which was right. The memory check reported a peak of 23,392 MiB against a plan of 23,414 MiB. At the default effort of 0.9 the same request spent all of its 512 tokens thinking, at 167 tok/s.
+
+With DFlash 2, which keeps no global caches, the longest FP8 context is 239,616 positions at the default chunk and 265,216 at chunks of 1024, against 222,208 and 244,736 with the bundled draft.
+
+### Quickbench on the RTX 4090
+
+`quickbench run` with the items, seeds and sampling (temperature 1) of an RTX 5090 baseline at commit `1ab0b44`. The RTX 4090 cannot hold 8 streams of 40,960 positions (8 streams get 11,264 each), so its first server ran 4 streams of 40,960 and took the same 8 requests at a time. The second server ran 1 stream of 135,168 positions on both GPUs. Items passed:
+
+| Source | Items | RTX 5090 | RTX 4090 |
+| --- | ---: | ---: | ---: |
+| AIME 2025 | 1 | 0 | 1 |
+| HumanEval+ | 6 | 3 | 4 |
+| GPQA Diamond | 8 | 6 | 3 |
+| Retrieval | 5 | 2 | 3 |
+| Tool calls | 3 | 3 | 3 |
+| All | 23 | 14, 5 cut off | 14, 4 cut off |
+
+The Ada build's logits differ, so its sampled replies differ, and 1 attempt per item resolves only tens of points.
+
+One stream, median decode tok/s and tokens per round over 6 seeds:
+
+| Prompt | RTX 5090 | RTX 4090 | RTX 4090, DFlash 2 |
+| --- | --- | --- | --- |
+| Chat | 373, 1.93 | 219, 1.86 | 251, 2.32 |
+| Code | 570, 3.44 | 327, 3.37 | 374, 4.17 |
+| Story | 345, 1.75 | 210, 1.73 | 236, 2.15 |
+| Agent request with tools | 610, 3.96 | 377, 4.26 | 378, 4.55 |
+| 33,164-token prompt | 679, 4.98 | 369, 4.53 | 332, 4.17 |
+
+The 33,164-token prompt's first token came after 2.24 s on the RTX 5090 and 3.83 s on the RTX 4090, and after 59 and 101 ms when the request repeated. The 24 requests taken 8 at a time ran 759 tok/s in all on 8 streams of the RTX 5090 and 353 tok/s on 4 streams of the RTX 4090.
+
+The fidelity track, mean KL and mean \|log-prob difference\| against MLX:
+
+| Text | Config | RTX 5090 | RTX 4090 |
+| --- | --- | --- | --- |
+| 4K | `--prefill 2048 --kv fp8` | 4.29e-3, 0.0510 | 2.82e-3, 0.0492 |
+| | `--verify 8 --kv fp8 --weights fp8` | 5.80e-3, 0.0680 | 6.00e-3, 0.0691 |
+| 32K | `--prefill 2048 --kv fp8` | 2.51e-3, 0.0478 | 2.70e-3, 0.0476 |
+| | `--verify 8 --kv fp8 --weights fp8` | 5.42e-3, 0.0673 | 5.02e-3, 0.0675 |
+| 128K | `--prefill 2048 --kv fp8` | 2.57e-3, 0.0451 | 2.26e-3, 0.0440 |
+| | `--verify 8 --kv fp8 --weights fp8` | 4.20e-3, 0.0627 | 4.32e-3, 0.0628 |
+
+### DFlash 2 on the RTX 4090
+
+`bench --spec auto`, 256 tokens after each text, FP8 weights and cache, tok/s and tokens per round:
+
+| Text, context | Plain decode | Bundled draft | DFlash 2 |
+| --- | ---: | --- | --- |
+| `anyhow`, 10,674 | 190 | 504, 6.53 | 460, 6.19 |
+| `anyhow`, 32,768 | 166 | 465, 6.34 | 441, 6.19 |
+| `half`, 2,273 | 201 | 435, 5.25 | 365, 4.49 |
+| `half`, 32,768 | 166 | 351, 4.57 | 343, 4.67 |
+| `regex-readme`, 2,286 | 200 | 295, 2.88 | 299, 3.25 |
+| `regex-readme`, 32,768 | 166 | 304, 3.66 | 341, 4.48 |
+
+A DFlash 2 round's draft took 1.08 to 1.10 ms, against 0.76 to 0.94 ms for the bundled draft. As on the RTX 5090, DFlash 2 is faster on `regex-readme` and on quickbench's chat, code and story prompts, ties on the agent request, and is slower on `anyhow`, `half` and the 33,164-token prompt.
+
 ## References
 
 Targets the official checkpoint at revision [`b85c3cfa`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/b85c3cfa615fc413cc9af3379f491b963f3b586a), with its NVFP4/MXFP8 experts, BF16 dense weights and bundled DSpark draft.
