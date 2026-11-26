@@ -251,9 +251,33 @@ At 1920 x 1080 the encoder does about 3.0 TFLOP of products and 2.5 TFLOP of att
 
 An FP8 format quantized every linear layer but the patch embedding to E4M3 with one F32 scale per row and multiplied it on sm_120's block-scaled FP8 tensor cores (`LinearFp8::gemm`), with each product's input quantized to MXFP8 (E4M3 with one power-of-two scale per 32 values). It halved the weights to 0.300 GiB and took 22.5 instead of 30.9 ms at 1920 x 1080, but its embeddings landed 10 to 19% (relative RMS) from F32, three to five times mlx-vlm's BF16, and it changed the model's answers: the `FP8 (removed)` columns above. It was removed. FP8 weights with BF16 activations would need a new GEMM and were not tried.
 
-### Other GPUs
+### RTX 4090
 
-`vision.cu` uses only `mma.sync`, `ldmatrix` and `cp.async`, which sm_80 and later have, so it builds for sm_89. One dependency does not: `Linear::load` requires thread-block clusters, which the BF16 GEMM uses to split k when its tiles cannot fill the GPU. The tower runs on sm_89 once that GEMM runs without clusters.
+`vision.cu` uses only `mma.sync`, `ldmatrix` and `cp.async`, which sm_80 and later have, so it builds for sm_89. The BF16 GEMM splits k over thread-block clusters when its tiles cannot fill the GPU, and the `sm_89` build splits it over plain blocks that meet in global memory instead ([engine.md](engine.md#rtx-4090-sm_89)). So the tower runs on an RTX 4090 with no code of its own for it, and the `sm_120a` build's kernels keep the same code: every cubin is the same bytes but for one symbol name in `sample.cu`'s string table.
+
+On an RTX 4090, `attention_matches_f64` passes with a largest error of 4.8e-3, and `tower_matches_transformers` passes on all six images. Ada's `mma.sync` rounds F32 sums differently from sm_120's, so the errors differ from the RTX 5090's:
+
+| Image | RTX 4090 | lowest row | RTX 5090 | lowest row | mlx-vlm BF16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `tiny` | 0.8% | 1.0000 | 1.2% | 0.9999 | 1.9% |
+| `alpha` | 3.0% | 0.993 | 2.6% | 0.995 | 3.9% |
+| `tall` | 2.9% | 0.974 | 2.5% | 0.993 | 4.5% |
+| `square` | 3.1% | 0.988 | 3.3% | 0.986 | 4.5% |
+| `screenshot` | 4.8% | 0.885 | 4.9% | 0.889 | 6.3% |
+| `huge` | 3.2% | 0.943 | 2.9% | 0.942 | 3.9% |
+
+The tower stays closer to F32 than mlx-vlm on every image. Its weights and buffers take the same bytes as the plan, as on the RTX 5090.
+
+Speed with `vision` as above, with no other compute process; two runs agreed within 0.2%:
+
+| Image | RTX 4090 | RTX 5090 | Ratio |
+| --- | ---: | ---: | ---: |
+| 512 x 512 | 5.61 ms | 4.27 ms | 1.31 |
+| 1024 x 1024 | 18.72 ms | 15.12 ms | 1.24 |
+| 1920 x 1080 | 43.21 ms | 30.86 ms | 1.40 |
+| 2048 x 2048 | 127.82 ms | 90.74 ms | 1.41 |
+
+At 1920 x 1080 that is about 127 TFLOP/s against the RTX 5090's 180. The two largest images, where attention does 45% and 65% of the work, take 1.4 times as long as on the RTX 5090.
 
 ## Open questions
 
