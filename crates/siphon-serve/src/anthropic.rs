@@ -27,13 +27,13 @@ use axum::{
     http::StatusCode,
     response::{
         IntoResponse, Response,
-        sse::{Event as SseEvent, KeepAlive, Sse},
+        sse::{Event as SseEvent, Sse},
     },
 };
 use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
@@ -53,9 +53,12 @@ pub fn serves(path: &str) -> bool {
     path == "/v1/messages" || path.starts_with("/v1/messages/")
 }
 
-/// The time without bytes after which a stream sends a `ping` event, as during the prefill
-/// of a long prompt. Claude Code drops a stream that stays silent for too long.
+/// The time without bytes after which a stream sends a `ping` event, or a comment before
+/// `message_start`, as during the prefill of a long prompt. Claude Code drops a stream
+/// that stays silent for too long.
 const PING: Duration = Duration::from_secs(5);
+/// The name of a frame that goes out as an SSE comment.
+const KEEP_ALIVE: &str = "";
 
 /// The text that stands in for an image block.
 const NO_IMAGE: &str = "[image omitted: the model cannot see images]";
@@ -675,15 +678,17 @@ async fn respond(app: Arc<App>, prepared: Prepared) -> Result<Response, ApiError
     }
     let (out, rx) = mpsc::channel(64);
     tokio::spawn(async move { run(&app.vocab, results, output, message, out, true).await });
-    let events = ReceiverStream::new(rx).map(|(name, data): Frame| {
-        Ok::<_, Infallible>(SseEvent::default().event(name).data(data.to_string()))
-    });
-    let ping = SseEvent::default()
-        .event("ping")
-        .data(json!({"type": "ping"}).to_string());
-    Ok(Sse::new(events)
-        .keep_alive(KeepAlive::new().interval(PING).event(ping))
-        .into_response())
+    let events = ReceiverStream::new(rx).map(|frame| Ok::<_, Infallible>(sse(frame)));
+    Ok(Sse::new(events).into_response())
+}
+
+/// The server-sent event of `frame`: a comment for [`KEEP_ALIVE`].
+fn sse((name, data): Frame) -> SseEvent {
+    if name == KEEP_ALIVE {
+        SseEvent::default().comment("")
+    } else {
+        SseEvent::default().event(name).data(data.to_string())
+    }
 }
 
 /// The body of a reply that is not streamed: the one frame [`run`] sent, a message or an
@@ -696,9 +701,33 @@ fn whole(frame: Option<Frame>) -> Response {
     }
 }
 
+/// Sends one reply's frames and remembers when it last sent one, for the keep-alives.
+struct Frames {
+    out: mpsc::Sender<Frame>,
+    last: Instant,
+}
+
+impl Frames {
+    /// Sends `frames`; false once the client has left.
+    async fn send(&mut self, frames: Vec<Frame>) -> bool {
+        for frame in frames {
+            if self.out.send(frame).await.is_err() {
+                return false;
+            }
+            self.last = Instant::now();
+        }
+        true
+    }
+}
+
 /// Turns the engine's events for one request into Anthropic's stream events, or, unless
 /// `stream`, into one `message` frame with the whole body. Returning drops `results`, which
 /// cancels the job: when the client has left or a stop ended the output.
+///
+/// `message_start` goes out with the first content block, so that a client or proxy that
+/// times the first event measures the prefill, and its usage then holds the cached tokens.
+/// Before it, a stream quiet for [`PING`] sends a comment, since Anthropic's protocol puts
+/// `message_start` first; after it, a `ping` event.
 async fn run(
     vocab: &Vocab,
     mut results: Results,
@@ -707,24 +736,34 @@ async fn run(
     out: mpsc::Sender<Frame>,
     stream: bool,
 ) {
-    let send = async |frames: Vec<Frame>| {
-        for frame in frames {
-            if out.send(frame).await.is_err() {
-                return false;
-            }
-        }
-        true
+    let mut frames = Frames {
+        out,
+        last: Instant::now(),
     };
     let mut blocks = Blocks::new(&message.id);
-    if stream {
-        let start = json!({"type": "message_start", "message": message.body(&[], None, 0)});
-        if !send(vec![("message_start", start)]).await {
-            return;
-        }
-    }
+    let mut started = false;
     let finish = loop {
         let mut events = Vec::new();
-        match results.next().await {
+        let event = if stream {
+            loop {
+                tokio::select! {
+                    event = results.next() => break event,
+                    () = tokio::time::sleep_until(frames.last + PING) => {
+                        let keep_alive = if started {
+                            ("ping", json!({"type": "ping"}))
+                        } else {
+                            (KEEP_ALIVE, Value::Null)
+                        };
+                        if !frames.send(vec![keep_alive]).await {
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            results.next().await
+        };
+        match event {
             Event::Started => continue,
             Event::Cached(n) => {
                 message.cached_tokens = n;
@@ -733,12 +772,19 @@ async fn run(
             Event::Tokens(ids) => take(vocab, &mut output, &mut blocks, &ids, &mut events),
             Event::Done(finish) => break finish,
             Event::Failed(e) => {
-                let _ = send(vec![("error", error_body("api_error", &e))]).await;
+                let _ = frames
+                    .send(vec![("error", error_body("api_error", &e))])
+                    .await;
                 return;
             }
         }
-        if stream && !send(events).await {
-            return;
+        if stream && !events.is_empty() {
+            if !std::mem::replace(&mut started, true) {
+                events.insert(0, message_start(&message));
+            }
+            if !frames.send(events).await {
+                return;
+            }
         }
         if output.done {
             break Finish::Stop;
@@ -751,8 +797,11 @@ async fn run(
     let stop = stop_reason(&output, finish);
     if !stream {
         let body = message.body(&blocks.content, Some(stop), output.tokens);
-        let _ = send(vec![("message", body)]).await;
+        let _ = frames.send(vec![("message", body)]).await;
         return;
+    }
+    if !started {
+        events.insert(0, message_start(&message));
     }
     events.push((
         "message_delta",
@@ -761,7 +810,15 @@ async fn run(
                "usage": message.usage(output.tokens)}),
     ));
     events.push(("message_stop", json!({"type": "message_stop"})));
-    let _ = send(events).await;
+    let _ = frames.send(events).await;
+}
+
+/// The `message_start` event of `message`, before any content.
+fn message_start(message: &Message) -> Frame {
+    (
+        "message_start",
+        json!({"type": "message_start", "message": message.body(&[], None, 0)}),
+    )
 }
 
 #[cfg(test)]
@@ -1190,8 +1247,8 @@ mod tests {
                 json!({"type": "message_start", "message": {
                 "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
                 "content": [], "stop_reason": null, "stop_sequence": null,
-                "usage": {"input_tokens": 10, "cache_creation_input_tokens": 0,
-                          "cache_read_input_tokens": 0, "output_tokens": 0}}}),
+                "usage": {"input_tokens": 6, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 4, "output_tokens": 0}}}),
             ),
             start(
                 0,
@@ -1374,6 +1431,121 @@ mod tests {
             .filter(|b| b["type"] == "tool_use")
             .count();
         assert_eq!(calls, 1);
+    }
+
+    /// The names of `frames`, with `:` for a comment.
+    fn names(frames: &[Frame]) -> Vec<&'static str> {
+        frames
+            .iter()
+            .map(|(name, _)| if *name == KEEP_ALIVE { ":" } else { *name })
+            .collect()
+    }
+
+    /// Runs a stream whose events arrive after `delays` seconds each, on a paused clock.
+    async fn timed(vocab: &Vocab, events: Vec<(u64, Event)>) -> Vec<Frame> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let results = Results {
+            receiver,
+            tracker: Arc::new(Metrics::new("m")).track(10),
+        };
+        let output = Output::new(
+            Decoder::Chat(Parser::new(vocab, &Ending::Generate)),
+            Stops::new(Vec::new()),
+            Vec::new(),
+            Calls::Free,
+        );
+        let message = Message {
+            id: "msg_1".to_owned(),
+            model: "m".to_owned(),
+            prompt_tokens: 10,
+            cached_tokens: 0,
+        };
+        let (out, mut rx) = mpsc::channel(1024);
+        let engine = async move {
+            for (delay, event) in events {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                sender.send(event).unwrap();
+            }
+        };
+        tokio::join!(run(vocab, results, output, message, out, true), engine);
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+    async fn message_start_waits_for_the_first_token() {
+        let vocab = vocab();
+        let s = vocab.special;
+        // A 12 s prefill, then a thinking marker that adds no block, then text, then 7 s
+        // without bytes in the reply.
+        let events = vec![
+            (0, Event::Started),
+            (0, Event::Cached(4)),
+            (12, Event::Tokens(vec![s.content_thinking])),
+            (0, Event::Tokens(vocab.encode("Plan."))),
+            (7, Event::Tokens(vec![s.end_message])),
+            (0, Event::Done(Finish::Stop)),
+        ];
+        let frames = timed(&vocab, events).await;
+        assert_eq!(
+            names(&frames)[..5],
+            [
+                ":",
+                ":",
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        // The prefix cache's tokens reached message_start's usage.
+        assert_eq!(
+            frames[2].1["message"]["usage"]["cache_read_input_tokens"],
+            4
+        );
+        assert_eq!(frames[2].1["message"]["usage"]["input_tokens"], 6);
+        assert_eq!(frames[4].1["delta"]["thinking"], "Plan.");
+        // After message_start, a quiet stream pings.
+        assert_eq!(names(&frames)[5], "ping");
+        assert_eq!(*names(&frames).last().unwrap(), "message_stop");
+
+        // An error before the first token is an error event alone.
+        let events = vec![
+            (0, Event::Started),
+            (6, Event::Failed("the KV pool is full".to_owned())),
+        ];
+        let frames = timed(&vocab, events).await;
+        assert_eq!(names(&frames), [":", "error"]);
+        assert_eq!(
+            frames[1].1,
+            json!({"type": "error", "error": {"type": "api_error",
+                                              "message": "the KV pool is full"}})
+        );
+
+        // A reply without content still starts with message_start.
+        let events = vec![(0, Event::Started), (1, Event::Done(Finish::Length))];
+        let frames = timed(&vocab, events).await;
+        assert_eq!(
+            names(&frames),
+            ["message_start", "message_delta", "message_stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alives_are_comments() {
+        let frames = [(KEEP_ALIVE, Value::Null), ("ping", json!({"type": "ping"}))];
+        let events = futures_util::stream::iter(frames.map(|f| Ok::<_, Infallible>(sse(f))));
+        let response = Sse::new(events).into_response();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            ": \n\nevent: ping\ndata: {\"type\":\"ping\"}\n\n"
+        );
     }
 
     #[tokio::test]

@@ -98,9 +98,9 @@ The request maps onto the chat route as follows:
 
 The server ignores `metadata`, `cache_control` anywhere, `context_management`, `service_tier`, `output_config.format`, `container`, `mcp_servers`, the `anthropic-beta` and `anthropic-version` headers, and unknown fields.
 
-The reply holds `thinking` blocks with an empty `signature`, then `text` and `tool_use` blocks in the order the model wrote them. `stop_reason` is `end_turn`, `max_tokens`, `stop_sequence` (with `stop_sequence` set) or `tool_use`. In `usage`, `input_tokens` leaves out the prompt tokens read from the prefix cache, which `cache_read_input_tokens` counts, and `cache_creation_input_tokens` is 0. A stream sends Anthropic's events, from `message_start` to `message_stop`, and a `ping` event after 5 seconds without bytes, such as during a long prefill. A tool call arrives whole, in one `input_json_delta`.
+The reply holds `thinking` blocks with an empty `signature`, then `text` and `tool_use` blocks in the order the model wrote them. `stop_reason` is `end_turn`, `max_tokens`, `stop_sequence` (with `stop_sequence` set) or `tool_use`. In `usage`, `input_tokens` leaves out the prompt tokens read from the prefix cache, which `cache_read_input_tokens` counts, and `cache_creation_input_tokens` is 0. A stream sends Anthropic's events, from `message_start` to `message_stop`. `message_start` waits for the reply's first content block, as the chat route's role chunk waits for the first token, so a proxy that times the first event measures the prefill. Before it, a stream sends an SSE comment after 5 seconds without bytes, such as during a long prefill, because Anthropic's protocol puts `message_start` first. After it, the stream sends a `ping` event instead. A tool call arrives whole, in one `input_json_delta`.
 
-Errors on these routes take Anthropic's shape, `{"type": "error", "error": {"type", "message"}}`. A full queue answers 529 with `overloaded_error`, which Claude Code retries. A failure during a stream sends an `error` event.
+Errors on these routes take Anthropic's shape, `{"type": "error", "error": {"type", "message"}}`. A full queue answers 529 with `overloaded_error`, which Claude Code retries. A failure during a stream sends an `error` event, also before `message_start`.
 
 ### Claude Code
 
