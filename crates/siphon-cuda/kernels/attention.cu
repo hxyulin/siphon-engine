@@ -2987,13 +2987,15 @@ struct RowsRaw4<Fp4Format> {
 // 4 l .. 4 l + 3 over d = 0 .. 7 in order. Writes partial kRowsBlocks of each query row.
 // Every load goes out first, from both places a key or value may come from (row 0 or slot 0
 // where one does not apply), so that the block waits for memory once.
-template <class F>
+template <class F, bool kDirectCombine = false>
 __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_bfloat16* k_new,
                                             const __nv_bfloat16* v_new, const typename F::Elem* k_cache,
                                             const typename F::Elem* v_cache, const __nv_bfloat16* bias,
                                             const __nv_bfloat16* sinks, float* partial_out, float* partial_max,
                                             float* partial_sum, unsigned start, int rows, unsigned slots,
-                                            unsigned window, unsigned extent, float scale, int recent_block) {
+                                            unsigned window, unsigned extent, float scale, int recent_block,
+                                            const RowsMerge* mg = nullptr, __nv_bfloat16* out = nullptr,
+                                            const __nv_bfloat16* gate = nullptr) {
     using Raw4 = typename RowsRaw4<F>::Type;
     constexpr int kElems = F::kChunkElems;
     const int kv_head = blockIdx.x;
@@ -3153,14 +3155,52 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
             }
         }
     }
+    if constexpr (kDirectCombine) {
 #pragma unroll
-    for (int h = 0; h < kGroup; ++h) {
-        const size_t query = size_t(j) * kHeads + head0 + h;
-        *reinterpret_cast<float4*>(partial_out + (query * kRowsParts + kRowsBlocks) * kHeadDim + 4 * lane) =
-            make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
-        if (lane == 0) {
-            partial_max[query * kRowsParts + kRowsBlocks] = row_max[h];
-            partial_sum[query * kRowsParts + kRowsBlocks] = row_sum[h];
+        for (int h = 0; h < kGroup; ++h) {
+            const int qi = j * kGroup + h;
+            const float recent_m = __shfl_sync(0xffffffffu, row_max[h], 0);
+            const float recent_l = __shfl_sync(0xffffffffu, row_sum[h], 0);
+            const size_t query = size_t(j) * kHeads + head0 + h;
+            const size_t at_base = query * kHeadDim + 4 * lane;
+            if (mg != nullptr) {
+                const float split_m = mg->m[0][qi];
+                const float split_l = mg->l[0][qi];
+                const float largest = fmaxf(split_m, recent_m);
+                const float split_factor = exp2_ftz((split_m - largest) * kLog2e);
+                const float recent_factor = exp2_ftz((recent_m - largest) * kLog2e);
+                const float total = fmaf(recent_factor, recent_l, fmaf(split_factor, split_l, 0.f));
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float split_v = mg->o[0][qi][rows_merge_column(4 * lane + e)];
+                    const float value = fmaf(recent_factor, o[h][e], fmaf(split_factor, split_v, 0.f));
+                    const __nv_bfloat16 attn = __float2bfloat16(value / total);
+                    const size_t at = at_base + e;
+                    out[at] = gate != nullptr
+                                  ? to_bf16_ftz(fmul(__bfloat162float(attn), mlx_sigmoid(__bfloat162float(gate[at]))))
+                                  : attn;
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const __nv_bfloat16 attn = __float2bfloat16(o[h][e] / recent_l);
+                    const size_t at = at_base + e;
+                    out[at] = gate != nullptr
+                                  ? to_bf16_ftz(fmul(__bfloat162float(attn), mlx_sigmoid(__bfloat162float(gate[at]))))
+                                  : attn;
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+            const size_t query = size_t(j) * kHeads + head0 + h;
+            *reinterpret_cast<float4*>(partial_out + (query * kRowsParts + kRowsBlocks) * kHeadDim + 4 * lane) =
+                make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+            if (lane == 0) {
+                partial_max[query * kRowsParts + kRowsBlocks] = row_max[h];
+                partial_sum[query * kRowsParts + kRowsBlocks] = row_sum[h];
+            }
         }
     }
 }
@@ -3300,13 +3340,17 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
 }
 
 // A split block: see the section comment. NT is the number of 8-column tiles of query
-// rows, ceil(3 m / 8). Writes the block's partials of every query row.
-template <class F, int NT>
+// rows, ceil(3 m / 8). Strides splits by `split_stride` (1..=kRowsBlocks). With
+// kWritePartials = true, writes the block's partials of every query row; with
+// kWritePartials = false (single-block no-split fast path), leaves the merged output, max
+// and sum in `RowsMerge::o[0]`, `m[0]` and `l[0]` in shared memory.
+template <class F, int NT, bool kWritePartials = true>
 __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typename F::Elem* k_cache,
                                            const typename F::Elem* v_cache, const __nv_bfloat16* bias,
                                            float* partial_out, float* partial_max, float* partial_sum,
                                            unsigned start, int rows, unsigned slots, unsigned window,
-                                           unsigned extent, float scale, unsigned live, int block, char* smem) {
+                                           unsigned extent, float scale, unsigned live, int block, int split_stride,
+                                           char* smem) {
     constexpr bool kFp8 = sizeof(typename F::Elem) == 1;
     constexpr int kStages = RowsStages<F>::kValue;
     auto& sm = *reinterpret_cast<RowsShared<F>*>(smem);
@@ -3320,7 +3364,7 @@ __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typenam
 
     // Chunk k of this warp starts at slot chunk_first(k); it has chunks below `live`.
     const auto chunk_first = [&](int k) {
-        return unsigned(block + k * kRowsBlocks) * kRowsSplitSlots + unsigned(warp * kRowsChunk);
+        return unsigned(block + k * split_stride) * kRowsSplitSlots + unsigned(warp * kRowsChunk);
     };
     int chunks = 0;
     while (chunk_first(chunks) < live) {
@@ -3747,25 +3791,46 @@ __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typenam
     __syncthreads();
     const int d = threadIdx.x;
     const int column = rows_merge_column(d);
-    for (int qi = 0; qi < queries; ++qi) {
-        const size_t query = size_t(qi / kGroup) * kHeads + head0 + qi % kGroup;
-        partial_out[(query * kRowsParts + block) * kHeadDim + d] = mg.o[0][qi][column] + mg.o[1][qi][column];
-    }
-    if (threadIdx.x < queries) {
-        const int qi = threadIdx.x;
-        float most = mg.m[0][qi];
-#pragma unroll
-        for (int w = 1; w < kRowsWarps; ++w) {
-            most = fmaxf(most, mg.m[w][qi]);
+    if constexpr (kWritePartials) {
+        for (int qi = 0; qi < queries; ++qi) {
+            const size_t query = size_t(qi / kGroup) * kHeads + head0 + qi % kGroup;
+            partial_out[(query * kRowsParts + block) * kHeadDim + d] = mg.o[0][qi][column] + mg.o[1][qi][column];
         }
-        float total = 0.f;
+        if (threadIdx.x < queries) {
+            const int qi = threadIdx.x;
+            float most = mg.m[0][qi];
 #pragma unroll
-        for (int w = 0; w < kRowsWarps; ++w) {
-            total = fmaf(exp2_ftz((mg.m[w][qi] - most) * kLog2e), mg.l[w][qi], total);
+            for (int w = 1; w < kRowsWarps; ++w) {
+                most = fmaxf(most, mg.m[w][qi]);
+            }
+            float total = 0.f;
+#pragma unroll
+            for (int w = 0; w < kRowsWarps; ++w) {
+                total = fmaf(exp2_ftz((mg.m[w][qi] - most) * kLog2e), mg.l[w][qi], total);
+            }
+            const size_t query = size_t(qi / kGroup) * kHeads + head0 + qi % kGroup;
+            partial_max[query * kRowsParts + block] = most;
+            partial_sum[query * kRowsParts + block] = total;
         }
-        const size_t query = size_t(qi / kGroup) * kHeads + head0 + qi % kGroup;
-        partial_max[query * kRowsParts + block] = most;
-        partial_sum[query * kRowsParts + block] = total;
+    } else {
+        for (int qi = 0; qi < queries; ++qi) {
+            mg.o[0][qi][column] += mg.o[1][qi][column];
+        }
+        if (threadIdx.x < queries) {
+            const int qi = threadIdx.x;
+            float most = mg.m[0][qi];
+#pragma unroll
+            for (int w = 1; w < kRowsWarps; ++w) {
+                most = fmaxf(most, mg.m[w][qi]);
+            }
+            float total = 0.f;
+#pragma unroll
+            for (int w = 0; w < kRowsWarps; ++w) {
+                total = fmaf(exp2_ftz((mg.m[w][qi] - most) * kLog2e), mg.l[w][qi], total);
+            }
+            mg.m[0][qi] = most;
+            mg.l[0][qi] = total;
+        }
     }
 }
 
@@ -3780,9 +3845,8 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
                                                int split_blocks, char* smem) {
     const int kv_head = blockIdx.x;
     // The grid launches split blocks 0 .. split_blocks - 1, then recent blocks from 0: block
-    // index kRowsBlocks + r is recent block r. Split blocks past split_blocks would hold no
-    // keys (the caller launches every split block whose first split can be live), so leaving
-    // them out changes no partial.
+    // index kRowsBlocks + r is recent block r. Each split block strides cache splits by
+    // `split_blocks` (1..=kRowsBlocks), so every live slot is covered exactly once.
     const int y = int(blockIdx.y);
     const int block = y < split_blocks ? y : kRowsBlocks + (y - split_blocks);
     const int queries = kGroup * rows;
@@ -3791,14 +3855,14 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
     // Live slots of the last row: no row reads past them.
     const unsigned live = min(start + unsigned(rows), slots);
     // Split blocks with any key: those whose first split starts below the live slots.
-    const int used = min(kRowsBlocks, int((live + kRowsSplitSlots - 1) / kRowsSplitSlots));
+    const int used = min(split_blocks, int((live + kRowsSplitSlots - 1) / kRowsSplitSlots));
     if (block >= kRowsBlocks) {
         pdl_wait();
         rows_recent<F>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, start,
                        rows, slots, window, extent, scale, block - kRowsBlocks);
     } else if (block < used) {
-        rows_split<F, NT>(q, k_cache, v_cache, bias, partial_out, partial_max, partial_sum, start, rows, slots,
-                          window, extent, scale, live, block, smem);
+        rows_split<F, NT, true>(q, k_cache, v_cache, bias, partial_out, partial_max, partial_sum, start, rows, slots,
+                                window, extent, scale, live, block, split_blocks, smem);
     } else {
         pdl_wait();
     }
@@ -3853,6 +3917,71 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
     if (threadIdx.x == 0 && atomic_add_acq_rel(&counters[kKvHeads + kv_head], 1u) == unsigned(combiners - 1)) {
         counters[kv_head] = 0;
         counters[kKvHeads + kv_head] = 0;
+    }
+}
+
+// Fused single-block no-split attention for large batches (when `seqs * kKvHeads` already
+// saturates the GPU's SMs): one block per (kv_head, seq) streams all cache slots (stride 1),
+// keeps the merged split result in shared memory (`RowsMerge`), runs `rows_recent` in
+// registers with direct combine into `out`, and appends `k_new` and `v_new` to the caches.
+// Zero partial-buffer traffic, zero atomic counters, zero spin-waiting.
+template <class F, int NT>
+__device__ __forceinline__ void attention_rows_nosplit(
+    const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new, typename F::Elem* k_cache,
+    typename F::Elem* v_cache, const __nv_bfloat16* bias, const __nv_bfloat16* sinks, __nv_bfloat16* out,
+    const __nv_bfloat16* gate, const unsigned* start_ptr, int rows, unsigned slots, unsigned window,
+    unsigned extent, float scale, char* smem) {
+    const int kv_head = blockIdx.x;
+    pdl_trigger();
+    const unsigned start = *start_ptr;
+    const unsigned live = min(start + unsigned(rows), slots);
+    // Any row has a key at distance >= kRowsRecent iff the last row's position >= kRowsRecent.
+    const bool has_far = start + unsigned(rows - 1) >= unsigned(kRowsRecent);
+    auto& mg = *reinterpret_cast<RowsMerge*>(smem);
+    if (has_far) {
+        rows_split<F, NT, false>(q, k_cache, v_cache, bias, nullptr, nullptr, nullptr, start, rows, slots, window,
+                                 extent, scale, live, 0, 1, smem);
+        __syncthreads();
+    } else {
+        pdl_wait();
+    }
+    const int recent_blocks = (rows + kRowsWarps - 1) / kRowsWarps;
+    for (int rb = 0; rb < recent_blocks; ++rb) {
+        rows_recent<F, true>(q, k_new, v_new, k_cache, v_cache, bias, sinks, nullptr, nullptr, nullptr, start, rows,
+                             slots, window, extent, scale, rb, has_far ? &mg : nullptr, out, gate);
+    }
+    // Wait until every warp finishes reading the caches before appending the rows' new keys
+    // and values (a sliding ring's new slot may be read by another row of the same call).
+    __syncthreads();
+    if (k_cache != nullptr) {
+        const int d = threadIdx.x;
+        const size_t channel = size_t(kv_head) * kHeadDim + d;
+        for (int row = 0; row < rows; ++row) {
+            if constexpr (F::kFp4) {
+                // Thread 16 i rounds group i of the head, as kv_append_rows_fp4 does.
+                if (d % 16 == 0) {
+                    const unsigned slot_idx = (start + unsigned(row)) % slots;
+#pragma unroll
+                    for (int kv = 0; kv < 2; ++kv) {
+                        const __nv_bfloat16* x = (kv == 0 ? k_new : v_new) + size_t(row) * kKvRow + channel;
+                        float vals[16];
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            vals[i] = __bfloat162float(x[i]);
+                        }
+                        uint8_t sc;
+                        const uint2 data = fp4_group(vals, sc);
+                        typename F::Elem* cache = kv == 0 ? k_cache : v_cache;
+                        *reinterpret_cast<uint2*>(cache + fp4_data(slot_idx, kv_head) + d / 2) = data;
+                        cache[fp4_scales(slot_idx, kv_head) + d / 16] = sc;
+                    }
+                }
+            } else {
+                const size_t dst = size_t((start + unsigned(row)) % slots) * kKvRow + channel;
+                F::store1(k_cache + dst, k_new[size_t(row) * kKvRow + channel]);
+                F::store1(v_cache + dst, v_new[size_t(row) * kKvRow + channel]);
+            }
+        }
     }
 }
 
@@ -3921,16 +4050,12 @@ constexpr int kBatchStateWords = 6;
 // attention_rows does for one row, and appends its key and value there. states: the
 // rows' state tables, [rows, kBatchStateWords] addresses; positions: [rows]. q, k_new,
 // v_new, bias, sinks, gate and out are [rows, ...] as in attention_rows; each row takes
-// its own 24 query rows of the partials and its own 16 counters ([rows, 16]). A one-row
-// instance has 3 combiners, so at most 2 blocks per KV head and instance wait, for blocks
-// of their own instance. The GPU starts blocks in index order, z last, so a waiting block
-// whose instance has a block not yet started is in the instance being started: at most
-// 16 blocks wait for blocks that have no SM yet, far fewer than the GPU holds at once
-// (376 on 188 SMs), and every other waiting block waits for blocks that are running.
-// Each instance launches only the blocks that can hold its keys: split_blocks split blocks,
-// enough for the cache's slots (16 for a 1,024-slot ring), and the first recent block, the
-// one that takes row 0. The others would leave their partials empty, so the results are the
-// same bit for bit as with all 34 blocks.
+// its own 24 query rows of the partials and its own 16 counters ([rows, 16]).
+// Each instance launches `split_blocks` split blocks (1..=kRowsBlocks, striding cache splits
+// by `split_blocks`) and the first recent block (row 0), using single-block combine
+// (`kSingleCombiner = true`) so zero blocks ever spin-wait and any `split_blocks >= 1` is
+// valid. With `split_blocks == slots.div_ceil(64).clamp(1, 32)`, results are bit-identical
+// to `attention_rows`.
 // Grid (8, split_blocks + 1, rows), 128 threads, sizeof(RowsShared<F>) bytes of dynamic
 // shared memory.
 template <class F>
@@ -3947,11 +4072,11 @@ __device__ __forceinline__ void attention_batch(const __nv_bfloat16* q, const __
     const size_t query0 = z * kHeads * kRowsParts;
     auto* const k_cache = reinterpret_cast<typename F::Elem*>(states[z * kBatchStateWords]);
     auto* const v_cache = reinterpret_cast<typename F::Elem*>(states[z * kBatchStateWords + 1]);
-    attention_rows<F, 1>(q + q_at, k_new + kv_at, v_new + kv_at, k_cache, v_cache, bias + z * kHeads * extent,
-                         sinks + z * kHeads, partial_out + query0 * kHeadDim, partial_max + query0,
-                         partial_sum + query0, counters + z * 2 * kKvHeads, out + q_at,
-                         gate != nullptr ? gate + q_at : nullptr, positions + z, 1, slots, window, extent, scale,
-                         split_blocks, smem);
+    attention_rows<F, 1, true>(q + q_at, k_new + kv_at, v_new + kv_at, k_cache, v_cache,
+                               bias + z * kHeads * extent, sinks + z * kHeads, partial_out + query0 * kHeadDim,
+                               partial_max + query0, partial_sum + query0, counters + z * 2 * kKvHeads, out + q_at,
+                               gate != nullptr ? gate + q_at : nullptr, positions + z, 1, slots, window, extent,
+                               scale, split_blocks, smem);
 }
 
 extern "C" __global__ void __launch_bounds__(kRowsThreads, 2)
@@ -4056,11 +4181,68 @@ ATTENTION_BATCH_VERIFY(1)
 ATTENTION_BATCH_VERIFY(2)
 ATTENTION_BATCH_VERIFY(3)
 
+// Fused single-block no-split batched attention (both decode `rows == 1` and verify
+// `rows == 1..=8`): one CTA per `(kv_head, seq)` reads all cache slots + recent keys,
+// combines in shared memory/registers, writes `out` (with optional `gate`), and appends
+// `k_new, v_new`. Zero partial-buffer traffic and zero atomic counters.
+// Grid (8, 1, seqs), 128 threads, sizeof(RowsShared<F>) smem.
+template <class F, int NT>
+__device__ __forceinline__ void attention_batch_nosplit(
+    const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+    const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+    __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, int rows, unsigned slots,
+    unsigned window, unsigned extent, float scale, char* smem) {
+    const size_t z = blockIdx.z;
+    const size_t row0 = z * size_t(rows);
+    const size_t q_at = row0 * kHeads * kHeadDim;
+    const size_t kv_at = row0 * kKvRow;
+    auto* const k_cache = reinterpret_cast<typename F::Elem*>(states[z * kBatchStateWords]);
+    auto* const v_cache = reinterpret_cast<typename F::Elem*>(states[z * kBatchStateWords + 1]);
+    attention_rows_nosplit<F, NT>(q + q_at, k_new + kv_at, v_new + kv_at, k_cache, v_cache,
+                                  bias + row0 * kHeads * extent, sinks + row0 * kHeads, out + q_at,
+                                  gate != nullptr ? gate + q_at : nullptr, positions + z, rows, slots, window,
+                                  extent, scale, smem);
+}
+
+#define ATTENTION_BATCH_NOSPLIT(NT)                                                                             \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_batch_nosplit_bf16_##NT(            \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,                         \
+        const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,                \
+        __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, int rows, unsigned slots,     \
+        unsigned window, unsigned extent, float scale) {                                                        \
+        extern __shared__ __align__(16) char rows_smem[];                                                       \
+        attention_batch_nosplit<Bf16Format, NT>(q, k_new, v_new, states, bias, sinks, out, gate, positions,     \
+                                                rows, slots, window, extent, scale, rows_smem);                 \
+    }                                                                                                           \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_batch_nosplit_fp8_##NT(             \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,                         \
+        const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,                \
+        __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, int rows, unsigned slots,     \
+        unsigned window, unsigned extent, float scale) {                                                        \
+        extern __shared__ __align__(16) char rows_smem[];                                                       \
+        attention_batch_nosplit<Fp8Format, NT>(q, k_new, v_new, states, bias, sinks, out, gate, positions,      \
+                                               rows, slots, window, extent, scale, rows_smem);                  \
+    }                                                                                                           \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_batch_nosplit_fp4_##NT(             \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,                         \
+        const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,                \
+        __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, int rows, unsigned slots,     \
+        unsigned window, unsigned extent, float scale) {                                                        \
+        extern __shared__ __align__(16) char rows_smem[];                                                       \
+        attention_batch_nosplit<Fp4Format, NT>(q, k_new, v_new, states, bias, sinks, out, gate, positions,      \
+                                               rows, slots, window, extent, scale, rows_smem);                  \
+    }
+
+ATTENTION_BATCH_NOSPLIT(1)
+ATTENTION_BATCH_NOSPLIT(2)
+ATTENTION_BATCH_NOSPLIT(3)
+
 // The launcher passes these as the dynamic shared memory of the three kernels.
 static_assert(sizeof(RowsShared<Bf16Format>) == 32768);
 static_assert(sizeof(RowsShared<Fp8Format>) == 49152);
 static_assert(sizeof(RowsShared<Fp4Format>) == 27648);
 static_assert(sizeof(RowsMerge) <= sizeof(RowsShared<Fp4Format>));
+static_assert(sizeof(RowsCombine) <= sizeof(RowsShared<Fp4Format>));
 
 // Rounds a global cache's keys and values through a 4-bit format and back, in place,
 // to measure what a 4-bit cache would cost in quality (`KvQuant` on the host). The

@@ -75,6 +75,8 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
        for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
     # A batched step's state tables and positions: the host writes them before the step.
     **{f"attention_batch_{f}": {"states", "positions"} for f in ("bf16", "fp8", "fp4")},
+    **{f"attention_batch_nosplit_{f}_{nt}": {"states", "positions"}
+       for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
     "attention_post_rows_bf16": {"states", "positions"},
 }
 
@@ -83,7 +85,9 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
 # copies its first cache tiles before the wait, from each row's caches in its state table,
 # as attention_rows does from k_cache and v_cache.
 ADDRESS_TABLES: dict[str, set[str]] = {
-    f"attention_batch_{f}": {"states"} for f in ("bf16", "fp8", "fp4")
+    **{f"attention_batch_{f}": {"states"} for f in ("bf16", "fp8", "fp4")},
+    **{f"attention_batch_nosplit_{f}_{nt}": {"states"}
+       for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
 }
 
 # Pointer fields of struct parameters, by (kernel file, type name): the stride of the

@@ -104,9 +104,68 @@ const ROWS_THREADS: u32 = 128;
 /// Dynamic shared memory of `attention_rows_bf16`, `attention_rows_fp8` and
 /// `attention_rows_fp4`, the sizes of `RowsShared` in the kernel.
 const ROWS_SHARED_BYTES: [u32; 3] = [32_768, 49_152, 27_648];
+/// Minimum batch sequence count at which [`BatchSplitMode::Auto`] switches from exact
+/// full split-K (bit-identical to single-sequence [`Attention::attention_rows`]) to
+/// adaptive SM-aware split-K. Keeps small batches (`seqs < 8`, including `B = 1..5`
+/// bit-exact parity tests) bit-identical while avoiding over-splitting at `B >= 8`.
+pub const BATCH_ADAPTIVE_MIN_SEQS: usize = 8;
 /// Bytes of one slot of an NVFP4 key or value buffer: 8 heads of 64 bytes of E2M1 values,
 /// then 8 heads of 8 E4M3 scales (`kFp4Row` in the kernel).
 pub const FP4_ROW: usize = 576;
+
+/// Split-K policy for [`Attention::attention_batch`] and
+/// [`Attention::attention_batch_with_mode`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BatchSplitMode {
+    /// Exact full split-K for `seqs < BATCH_ADAPTIVE_MIN_SEQS` (preserving bit-exact
+    /// parity with [`Attention::attention_rows`] for small batches) and SM-aware adaptive
+    /// split-K (with the fused single-block no-split fast path when `split_blocks == 1`)
+    /// for `seqs >= BATCH_ADAPTIVE_MIN_SEQS`.
+    ///
+    /// [`Attention::load`] defaults to [`Self::Exact`] instead when
+    /// `SIPHON_EXACT_BATCH_ATTN=1` is set in the environment.
+    #[default]
+    Auto,
+    /// Always uses `slots.div_ceil(64).clamp(1, 32)` split blocks, matching
+    /// [`Attention::attention_rows`] bit for bit at any batch size.
+    Exact,
+    /// Always uses SM-aware adaptive split-K `(2 * sms / (seqs * 8)).clamp(1, max_splits)`,
+    /// dispatching to the fused single-block no-split kernel when `split_blocks == 1`.
+    Adaptive,
+    /// Forces a specific split count in `1..=32` (clamped to `1..=max_splits`), using the
+    /// fused single-block no-split kernel when the resulting split count is `1`.
+    Fixed(u32),
+}
+
+/// Split blocks per KV head for a batched attention launch on a GPU with `sms` SMs.
+///
+/// Returns `1` when the fused single-block no-split kernel should run, or `2..=32` for
+/// parameterized split-K.
+#[must_use]
+pub fn batch_split_blocks(sms: u32, seqs: usize, slots: usize, mode: BatchSplitMode) -> u32 {
+    let slots = u32::try_from(slots).unwrap_or(u32::MAX);
+    let max_splits = slots.div_ceil(ROWS_SPLIT_SLOTS).clamp(1, ROWS_SPLIT_BLOCKS);
+    let adaptive = || {
+        let kv_heads = u32::try_from(seqs.saturating_mul(KV_HEADS)).unwrap_or(u32::MAX);
+        // Target 2 blocks/SM occupancy (matching `__launch_bounds__(128, 2)` and FP8's
+        // 48 KiB SMEM per block). Floor division prevents tail-wave overflow past
+        // `2 * sms` and transitions cleanly to `1` (fused single-block no-split) once
+        // `seqs * 8 > sms`.
+        ((2 * sms) / kv_heads.max(1)).clamp(1, max_splits)
+    };
+    match mode {
+        BatchSplitMode::Auto => {
+            if seqs < BATCH_ADAPTIVE_MIN_SEQS {
+                max_splits
+            } else {
+                adaptive()
+            }
+        }
+        BatchSplitMode::Exact => max_splits,
+        BatchSplitMode::Adaptive => adaptive(),
+        BatchSplitMode::Fixed(n) => n.clamp(1, max_splits),
+    }
+}
 
 pub use siphon::{KvFormat, KvQuant};
 
@@ -674,6 +733,12 @@ pub struct Attention {
     batch: [CudaFunction; 3],
     /// `attention_batch_verify_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
     batch_verify: Vec<[CudaFunction; 3]>,
+    /// `attention_batch_nosplit_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
+    batch_nosplit: Vec<[CudaFunction; 3]>,
+    /// Device streaming multiprocessor count, used to size adaptive split-K grids.
+    sms: u32,
+    /// Default split-K policy used by [`Attention::attention_batch`].
+    batch_split_mode: BatchSplitMode,
     kv_round: CudaFunction,
     kv_round_channels: CudaFunction,
 }
@@ -806,6 +871,13 @@ impl Attention {
                 PREFILL_SHARED_BYTES.cast_signed(),
             )?;
         }
+        let sms = u32::try_from(
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )?;
+        let batch_split_mode = match std::env::var("SIPHON_EXACT_BATCH_ATTN").as_deref() {
+            Ok("1" | "true" | "TRUE" | "yes" | "YES") => BatchSplitMode::Exact,
+            _ => BatchSplitMode::Auto,
+        };
         Ok(Self {
             relative_bias: module.load_function("relative_bias_bf16")?,
             relative_bias_rows: module.load_function("relative_bias_rows_bf16")?,
@@ -855,9 +927,46 @@ impl Attention {
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
+            batch_nosplit: (1..=ROWS_QUERY_TILES)
+                .map(|nt| {
+                    Ok([
+                        rows_function(
+                            &format!("attention_batch_nosplit_bf16_{nt}"),
+                            ROWS_SHARED_BYTES[0],
+                        )?,
+                        rows_function(
+                            &format!("attention_batch_nosplit_fp8_{nt}"),
+                            ROWS_SHARED_BYTES[1],
+                        )?,
+                        rows_function(
+                            &format!("attention_batch_nosplit_fp4_{nt}"),
+                            ROWS_SHARED_BYTES[2],
+                        )?,
+                    ])
+                })
+                .collect::<anyhow::Result<_>>()?,
+            sms,
+            batch_split_mode,
             kv_round: module.load_function("kv_round_bf16")?,
             kv_round_channels: module.load_function("kv_round_channels_bf16")?,
         })
+    }
+
+    /// Streaming multiprocessor count of the context this [`Attention`] loaded on.
+    #[must_use]
+    pub fn sms(&self) -> u32 {
+        self.sms
+    }
+
+    /// Default split-K policy used by [`Attention::attention_batch`].
+    #[must_use]
+    pub fn batch_split_mode(&self) -> BatchSplitMode {
+        self.batch_split_mode
+    }
+
+    /// Overrides the default split-K policy used by [`Attention::attention_batch`].
+    pub fn set_batch_split_mode(&mut self, mode: BatchSplitMode) {
+        self.batch_split_mode = mode;
     }
 
     /// Rounds `rows` rows of keys `k` and values `v` (`[rows, 8, 128]`) as `rounding` writes
@@ -1080,13 +1189,15 @@ impl Attention {
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
-    /// [`Attention::attention_rows`] for the rows of a batched step, 1 to [`BATCH_ROWS`],
-    /// each the next token of its own sequence: row `r` attends from its query into its own
-    /// cache at its own position, as a call with that one row on that cache would, bit for
-    /// bit, and its key and value go to that cache. `batch` names each row's caches and
-    /// position; `like` is any of the rows' caches for this visit, whose format, slots and
-    /// window every row's cache shares. Every per-row buffer is `[rows, ...]` as in
+    /// [`Attention::attention_rows`] for the rows of a batched step or batched verify, each
+    /// sequence attending from its queries into its own cache at its own position and
+    /// appending its keys and values there. `batch` names each sequence's caches and
+    /// position; `like` is any of the sequences' caches for this visit, whose format, slots
+    /// and window every sequence's cache shares. Every per-row buffer is `[rows, ...]` as in
     /// [`Attention::attention_rows`].
+    ///
+    /// Uses [`Attention::batch_split_mode`] ([`BatchSplitMode::Auto`] by default, or
+    /// [`BatchSplitMode::Exact`] when `SIPHON_EXACT_BATCH_ATTN=1` is set).
     #[expect(clippy::too_many_arguments, reason = "mirrors attention_rows")]
     pub fn attention_batch(
         &self,
@@ -1102,6 +1213,46 @@ impl Attention {
         gate: Option<&CudaView<'_, bf16>>,
         scratch: &mut RowsAttentionScratch,
         out: &mut impl DeviceOut<bf16>,
+    ) -> anyhow::Result<()> {
+        self.attention_batch_with_mode(
+            stream,
+            q,
+            k,
+            v,
+            like,
+            batch,
+            rows,
+            bias,
+            sinks,
+            gate,
+            scratch,
+            out,
+            self.batch_split_mode,
+        )
+    }
+
+    /// [`Attention::attention_batch`] with an explicit [`BatchSplitMode`].
+    ///
+    /// When [`batch_split_blocks`] selects `1`, dispatches to the fused single-block
+    /// no-split kernel (`attention_batch_nosplit_*`), avoiding all partial-buffer reads,
+    /// writes, and atomic counters. Otherwise launches parameterized split-K with
+    /// `split_blocks` split CTAs per `(seq, kv_head)` and single-block combine.
+    #[expect(clippy::too_many_arguments, reason = "mirrors attention_rows")]
+    pub fn attention_batch_with_mode(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        like: &KvCache,
+        batch: &BatchRows<'_>,
+        rows: usize,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
+        gate: Option<&CudaView<'_, bf16>>,
+        scratch: &mut RowsAttentionScratch,
+        out: &mut impl DeviceOut<bf16>,
+        mode: BatchSplitMode,
     ) -> anyhow::Result<()> {
         let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
         let mut out = out.view_mut();
@@ -1129,7 +1280,34 @@ impl Attention {
         let extent = extent("bias", bias.len(), rows * HEADS)?;
         let slots = u32::try_from(like.slots)?;
         let window = u32::try_from(like.window.unwrap_or(0)).context("window too large")?;
-        let split_blocks = slots.div_ceil(ROWS_SPLIT_SLOTS).clamp(1, ROWS_SPLIT_BLOCKS);
+        let split_blocks = batch_split_blocks(self.sms, seqs, like.slots, mode);
+        let format_idx = match *like.data {
+            KvData::Bf16 { .. } => 0,
+            KvData::Fp8 { .. } => 1,
+            KvData::Nvfp4 { .. } => 2,
+        };
+        let smem = ROWS_SHARED_BYTES[format_idx];
+        let nt_idx = (3 * rows_per_seq).div_ceil(8) - 1;
+        if split_blocks == 1 {
+            return self.launch_batch_nosplit(
+                stream,
+                nt_idx,
+                format_idx,
+                &q,
+                &k,
+                &v,
+                batch,
+                &bias,
+                &sinks,
+                &mut out,
+                gate,
+                seqs,
+                rows_per_seq,
+                slots,
+                window,
+                extent,
+            );
+        }
         let mut args = KernelArgs::default();
         args.ptr(&q, stream)
             .ptr(&k, stream)
@@ -1144,52 +1322,82 @@ impl Attention {
             .ptr_mut(&mut out, stream)
             .opt(gate, stream)
             .ptr(&batch.positions, stream);
-        if rows_per_seq == 1 {
-            let (function, smem) = match *like.data {
-                KvData::Bf16 { .. } => (&self.batch[0], ROWS_SHARED_BYTES[0]),
-                KvData::Fp8 { .. } => (&self.batch[1], ROWS_SHARED_BYTES[1]),
-                KvData::Nvfp4 { .. } => (&self.batch[2], ROWS_SHARED_BYTES[2]),
-            };
+        let (function, grid_y) = if rows_per_seq == 1 {
             args.u32(slots)
                 .u32(window)
                 .u32(extent)
                 .f32(SCALE)
                 .i32(split_blocks.cast_signed());
-            let config = LaunchConfig {
-                grid_dim: (KV_HEADS as u32, split_blocks + 1, u32::try_from(seqs)?),
-                block_dim: (ROWS_THREADS, 1, 1),
-                shared_mem_bytes: smem,
-            };
-            // SAFETY: matches `attention_batch_{bf16,fp8,fp4}`; every buffer and state table
-            // entry is checked above for `seqs == rows`.
-            return unsafe { args.launch_pdl(stream, function, config) };
-        }
-        let entry = &self.batch_verify[(3 * rows_per_seq).div_ceil(8) - 1];
-        let (function, smem) = match *like.data {
-            KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
-            KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
-            KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
+            (&self.batch[format_idx], split_blocks + 1)
+        } else {
+            args.i32(i32::try_from(rows_per_seq)?)
+                .u32(slots)
+                .u32(window)
+                .u32(extent)
+                .f32(SCALE)
+                .i32(split_blocks.cast_signed());
+            let recent_blocks = u32::try_from(rows_per_seq.div_ceil(4))?;
+            (&self.batch_verify[nt_idx][format_idx], split_blocks + recent_blocks)
         };
-        let recent_blocks = u32::try_from(rows_per_seq.div_ceil(4))?;
-        args.i32(i32::try_from(rows_per_seq)?)
-            .u32(slots)
-            .u32(window)
-            .u32(extent)
-            .f32(SCALE)
-            .i32(split_blocks.cast_signed());
         let config = LaunchConfig {
-            grid_dim: (
-                KV_HEADS as u32,
-                split_blocks + recent_blocks,
-                u32::try_from(seqs)?,
-            ),
+            grid_dim: (KV_HEADS as u32, grid_y, u32::try_from(seqs)?),
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
-        // SAFETY: matches `attention_batch_verify_{bf16,fp8,fp4}_<NT>`; sequence `z` verifies
-        // `rows_per_seq` rows at `positions[z]` in its own cache, uses partials for rows
-        // `z * rows_per_seq .. (z + 1) * rows_per_seq` within `scratch.rows`, and single-block
-        // combine leaves every counter at zero without spin-waiting.
+        // SAFETY: matches `attention_batch_{bf16,fp8,fp4}` (when `rows_per_seq == 1`) or
+        // `attention_batch_verify_{bf16,fp8,fp4}_<NT>`; sequence `z` attends over
+        // `rows_per_seq` rows at `positions[z]` in its own cache, uses partials within
+        // `scratch.rows`, and single-block combine leaves every counter at zero without
+        // spin-waiting.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "mirrors attention_batch_nosplit parameters")]
+    fn launch_batch_nosplit(
+        &self,
+        stream: &CudaStream,
+        nt_idx: usize,
+        format_idx: usize,
+        q: &CudaView<'_, bf16>,
+        k: &CudaView<'_, bf16>,
+        v: &CudaView<'_, bf16>,
+        batch: &BatchRows<'_>,
+        bias: &CudaView<'_, bf16>,
+        sinks: &CudaView<'_, bf16>,
+        out: &mut cudarc::driver::CudaViewMut<'_, bf16>,
+        gate: Option<&CudaView<'_, bf16>>,
+        seqs: usize,
+        rows_per_seq: usize,
+        slots: u32,
+        window: u32,
+        extent: u32,
+    ) -> anyhow::Result<()> {
+        let function = &self.batch_nosplit[nt_idx][format_idx];
+        let smem = ROWS_SHARED_BYTES[format_idx];
+        let mut args = KernelArgs::default();
+        args.ptr(q, stream)
+            .ptr(k, stream)
+            .ptr(v, stream)
+            .ptr(&batch.states, stream)
+            .ptr(bias, stream)
+            .ptr(sinks, stream)
+            .ptr_mut(out, stream)
+            .opt(gate, stream)
+            .ptr(&batch.positions, stream)
+            .i32(i32::try_from(rows_per_seq)?)
+            .u32(slots)
+            .u32(window)
+            .u32(extent)
+            .f32(SCALE);
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, 1, u32::try_from(seqs)?),
+            block_dim: (ROWS_THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        // SAFETY: matches `attention_batch_nosplit_{bf16,fp8,fp4}_<NT>`; each CTA owns
+        // one `(kv_head, seq)` pair exclusively, reads all cache slots and recent keys,
+        // combines in shared memory/registers without touching `scratch`, writes `out`,
+        // and appends `k`/`v` after synchronizing its warps.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
