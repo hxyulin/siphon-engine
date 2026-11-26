@@ -166,6 +166,17 @@ Each entry belongs to a stream's KV cache, so a request that hits one runs in th
 
 A request that runs alone speculates. When its entry was saved by a batched request, it lacks the draft's state: the request then prefills from the entry and decodes batched, and rebuilds the draft's state, a prefill of its whole prompt, only when its `max_tokens` leaves more than 1/16 of the position to generate (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context.
 
+## Known gaps
+
+Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of 41,281 tokens (largest 153,426) and a median reply of 151 tokens. The prefix cache served 90% of the tokens of prompts over 4,096.
+
+- **Another request in a slot loses its conversation.** An entry keeps only the slot's rings and conv states. The global KV cache stays in the slot, so any other sequence there overwrites it. With `--streams 1`, short side requests caused 6 full prefills of 77,421 to 150,445 tokens, at 5.7 to 12.5 s each. The side requests included the agent's own 539-token request and 21-token tests. A host-memory tier for entries would restore those prompts in well under a second.
+- **`max_tokens` past the context is refused, not clamped.** 2 of 144 requests failed this way. One client asked for 16,384 tokens after a 57,008-token prompt in a 71,680-position context. Another asked for 509,531 after a 16,082-token prompt in 524,288 positions; its token count differed from the server's by 1,334. An agent with a fixed output limit fails once its prompt passes the context less that limit. vLLM refuses as well.
+- **A prefill stalls every other stream.** Prefill runs whole, between decode steps. In a test on an RTX PRO 6000 Blackwell with two streams of 1,048,576 positions, the running request delivered 2.2 tok/s while the second request's 325 s prefill ran. Chunked prefill with decode steps between the chunks would bound the stall.
+- **A proxy's time to first token is wrong.** The role chunk streams before the prefill, so a proxy recorded 0.09 s for a prompt that prefilled for 12.5 s. `vllm:time_to_first_token_seconds` measures the first generated token.
+- **Job lines carry no request ID.** A `job:` log line cannot be matched to a proxy's request log except by time.
+- **Decode slows past 100,000 tokens.** Agent turns decoded at a median 534 tok/s with prompts of 32,000 to 100,000 tokens, and 417 tok/s above 100,000. Speculation kept a median of 3.09 tokens per round.
+
 ## Building on macOS
 
 On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds without its engine, so its tests run but it cannot serve. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH` to target another GPU.
