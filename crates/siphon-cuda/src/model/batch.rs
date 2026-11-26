@@ -448,23 +448,19 @@ impl Model {
         let position = self.slot_position(from)?;
         let mut moved = Vec::new();
         for v in slot_visits(self, from).iter_mut() {
-            let pages = match v.kv.pooled_mut() {
-                Some([keys, values]) => {
-                    let pages = [keys.pages().to_vec(), values.pages().to_vec()];
-                    keys.unmap_from(0)?;
-                    values.unmap_from(0)?;
-                    Some(pages)
-                }
-                None => None,
-            };
+            // Each reservation's pages: the keys' and the values', or a packed ring's.
+            let mut pages = Vec::new();
+            for b in v.kv.pooled_mut().into_iter().flatten() {
+                pages.push(b.pages().to_vec());
+                b.unmap_from(0)?;
+            }
             moved.push(pages);
         }
         for (v, pages) in slot_visits(self, to).iter_mut().zip(&moved) {
-            if let (Some([keys, values]), Some([k, x])) = (v.kv.pooled_mut(), pages) {
-                keys.unmap_from(0)?;
-                values.unmap_from(0)?;
-                keys.map_shared(k)?;
-                values.map_shared(x)?;
+            // The slots' caches have the same shapes, so their reservations pair up.
+            for (b, p) in v.kv.pooled_mut().into_iter().flatten().zip(pages) {
+                b.unmap_from(0)?;
+                b.map_shared(p)?;
             }
         }
         // Pooled rings moved with their pages; rings of fixed memory and the conv states

@@ -747,13 +747,12 @@ impl Model {
         self.visits
             .iter()
             .map(|v| {
-                let Some(p) = v.kv.pooled() else { return 0 };
                 let held = if v.kv.window().is_some() {
                     v.kv.slots()
                 } else {
-                    end.min(v.kv.slots())
+                    end
                 };
-                2 * (held * v.kv.row_bytes()).div_ceil(p[0].page_bytes())
+                v.kv.pages_for(held)
             })
             .sum()
     }

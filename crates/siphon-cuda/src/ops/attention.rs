@@ -145,9 +145,10 @@ pub struct KvCache {
     data: ManuallyDrop<KvData>,
     slots: usize,
     window: Option<usize>,
-    /// For a global cache in pooled memory, the keys' and values' reservations, of which
-    /// the positions below [`KvCache::mapped`] are backed.
-    pooled: Option<[Pooled; 2]>,
+    /// For a cache in pooled memory, the reservations, of which the positions below
+    /// [`KvCache::mapped`] are backed: the keys' and the values', or for a packed ring one
+    /// that holds the keys and then the values ([`KvCache::sliding_pooled_with_format`]).
+    pooled: Option<Vec<Pooled>>,
 }
 
 impl Drop for KvCache {
@@ -222,6 +223,19 @@ impl KvCache {
         format: KvFormat,
         pool: &PagePool,
     ) -> anyhow::Result<Self> {
+        Self::new_pooled(stream, capacity, None, format, pool)
+    }
+
+    /// A pooled cache of `capacity` slots. A ring whose key buffer is not a whole number
+    /// of pages keeps its keys and values in one reservation, so that an FP8 ring of 1 MiB
+    /// buffers takes one 2 MiB page, not two.
+    fn new_pooled(
+        stream: &Arc<CudaStream>,
+        capacity: usize,
+        window: Option<usize>,
+        format: KvFormat,
+        pool: &PagePool,
+    ) -> anyhow::Result<Self> {
         ensure!(capacity > 0, "a KV cache needs at least one slot");
         u32::try_from(capacity).context("too many KV cache slots")?;
         let (len, bytes) = match format {
@@ -230,24 +244,33 @@ impl KvCache {
             KvFormat::Nvfp4 => (capacity * FP4_ROW, capacity * FP4_ROW),
             KvFormat::Mixed => anyhow::bail!("a mixed layout gives each cache FP8 or NVFP4"),
         };
-        let keys = Pooled::reserve(pool, bytes)?;
-        let values = Pooled::reserve(pool, bytes)?;
-        // SAFETY: each address is a reservation of at least `len` elements that lives as
-        // long as the cache; `Drop` leaks the slices, so cudarc never frees them. Kernels
-        // touch only positions below `mapped`, which `map` backs first.
+        let packed = window.is_some() && !bytes.is_multiple_of(pool.page_bytes());
+        let (pooled, keys, values) = if packed {
+            let both = Pooled::reserve(pool, 2 * bytes)?;
+            let (keys, values) = (both.ptr(), both.ptr() + bytes as u64);
+            (vec![both], keys, values)
+        } else {
+            let keys = Pooled::reserve(pool, bytes)?;
+            let values = Pooled::reserve(pool, bytes)?;
+            let ptrs = (keys.ptr(), values.ptr());
+            (vec![keys, values], ptrs.0, ptrs.1)
+        };
+        // SAFETY: each address starts `len` elements of a reservation that lives as long
+        // as the cache; `Drop` leaks the slices, so cudarc never frees them. Kernels touch
+        // only positions below `mapped`, which `map` backs first.
         let data = unsafe {
             match format {
                 KvFormat::Bf16 => KvData::Bf16 {
-                    keys: stream.upgrade_device_ptr(keys.ptr(), len),
-                    values: stream.upgrade_device_ptr(values.ptr(), len),
+                    keys: stream.upgrade_device_ptr(keys, len),
+                    values: stream.upgrade_device_ptr(values, len),
                 },
                 KvFormat::Fp8 => KvData::Fp8 {
-                    keys: stream.upgrade_device_ptr(keys.ptr(), len),
-                    values: stream.upgrade_device_ptr(values.ptr(), len),
+                    keys: stream.upgrade_device_ptr(keys, len),
+                    values: stream.upgrade_device_ptr(values, len),
                 },
                 KvFormat::Nvfp4 => KvData::Nvfp4 {
-                    keys: stream.upgrade_device_ptr(keys.ptr(), len),
-                    values: stream.upgrade_device_ptr(values.ptr(), len),
+                    keys: stream.upgrade_device_ptr(keys, len),
+                    values: stream.upgrade_device_ptr(values, len),
                 },
                 KvFormat::Mixed => unreachable!("refused above"),
             }
@@ -255,14 +278,14 @@ impl KvCache {
         Ok(Self {
             data: ManuallyDrop::new(data),
             slots: capacity,
-            window: None,
-            pooled: Some([keys, values]),
+            window,
+            pooled: Some(pooled),
         })
     }
 
     /// [`KvCache::sliding_ring`] at addresses reserved for the ring, backed by pages of
     /// `pool` only while [`KvCache::map`] keeps it mapped: a slot without a sequence holds
-    /// none.
+    /// none. A ring maps whole or not at all.
     pub fn sliding_pooled(
         stream: &Arc<CudaStream>,
         window: usize,
@@ -272,7 +295,8 @@ impl KvCache {
         Self::sliding_pooled_with_format(stream, window, slots, KvFormat::Bf16, pool)
     }
 
-    /// [`KvCache::sliding_pooled`] storing `format` (`Bf16` or `Fp8`) elements.
+    /// [`KvCache::sliding_pooled`] storing `format` (`Bf16` or `Fp8`) elements. An FP8
+    /// ring's keys and values share pages: one reservation holds the keys, then the values.
     pub fn sliding_pooled_with_format(
         stream: &Arc<CudaStream>,
         window: usize,
@@ -288,9 +312,17 @@ impl KvCache {
             matches!(format, KvFormat::Bf16 | KvFormat::Fp8),
             "sliding caches are BF16 or FP8"
         );
-        let mut cache = Self::global_pooled(stream, slots, format, pool)?;
-        cache.window = Some(window);
-        Ok(cache)
+        Self::new_pooled(stream, slots, Some(window), format, pool)
+    }
+
+    /// Bytes of each reservation that back the positions below `positions`: of a packed
+    /// ring's one reservation, both buffers whole, since its values follow its keys.
+    fn pooled_bytes(&self, positions: usize) -> usize {
+        let bytes = positions.min(self.slots) * self.row_bytes();
+        match self.pooled.as_deref() {
+            Some([_]) if bytes > 0 => 2 * self.slots * self.row_bytes(),
+            _ => bytes,
+        }
     }
 
     /// Whether the cache's memory comes from a page pool.
@@ -302,16 +334,18 @@ impl KvCache {
     /// Positions whose memory is backed: every slot unless pooled.
     #[must_use]
     pub fn mapped(&self) -> usize {
-        match &self.pooled {
-            Some([keys, _]) => (keys.mapped_bytes() / self.row_bytes()).min(self.slots),
-            None => self.slots,
+        match self.pooled.as_deref() {
+            Some([both]) if both.mapped_bytes() >= self.pooled_bytes(self.slots) => self.slots,
+            Some([_]) => 0,
+            Some([keys, ..]) => (keys.mapped_bytes() / self.row_bytes()).min(self.slots),
+            Some([]) | None => self.slots,
         }
     }
 
     /// Pages more that [`KvCache::map`] of `positions` would take from the pool.
     #[must_use]
     pub fn pages_to(&self, positions: usize) -> usize {
-        let bytes = positions.min(self.slots) * self.row_bytes();
+        let bytes = self.pooled_bytes(positions);
         self.pooled
             .as_ref()
             .map_or(0, |p| p.iter().map(|b| b.pages_to(bytes)).sum())
@@ -320,7 +354,7 @@ impl KvCache {
     /// Backs the positions below `positions` (at most the capacity) with pages, zeroed on
     /// `stream`. Does nothing for a cache that is not pooled.
     pub fn map(&mut self, positions: usize, stream: &CudaStream) -> anyhow::Result<()> {
-        let bytes = positions.min(self.slots) * self.row_bytes();
+        let bytes = self.pooled_bytes(positions);
         if let Some(pooled) = &mut self.pooled {
             let more: usize = pooled.iter().map(|b| b.pages_to(bytes)).sum();
             let free = pooled[0].pool().free_pages();
@@ -339,7 +373,7 @@ impl KvCache {
     /// Returns the pages past the first `positions` to the pool. Queued work must not
     /// touch those positions any more. Does nothing for a cache that is not pooled.
     pub fn unmap_from(&mut self, positions: usize) -> anyhow::Result<()> {
-        let bytes = positions.min(self.slots) * self.row_bytes();
+        let bytes = self.pooled_bytes(positions);
         if let Some(pooled) = &mut self.pooled {
             for b in pooled {
                 b.unmap_from(bytes)?;
@@ -348,15 +382,27 @@ impl KvCache {
         Ok(())
     }
 
-    /// The pooled keys' and values' reservations.
+    /// The pooled reservations: the keys' and the values', or a packed ring's one.
     #[must_use]
-    pub fn pooled(&self) -> Option<&[Pooled; 2]> {
-        self.pooled.as_ref()
+    pub fn pooled(&self) -> Option<&[Pooled]> {
+        self.pooled.as_deref()
     }
 
-    /// The pooled keys' and values' reservations, to map shared pages into.
-    pub fn pooled_mut(&mut self) -> Option<&mut [Pooled; 2]> {
-        self.pooled.as_mut()
+    /// The pooled reservations, to map shared pages into.
+    pub fn pooled_mut(&mut self) -> Option<&mut [Pooled]> {
+        self.pooled.as_deref_mut()
+    }
+
+    /// Pages of the pool that the cache takes while it holds the positions below
+    /// `positions`, 0 unless pooled.
+    #[must_use]
+    pub fn pages_for(&self, positions: usize) -> usize {
+        let bytes = self.pooled_bytes(positions);
+        self.pooled.as_ref().map_or(0, |p| {
+            p.iter()
+                .map(|b| bytes.min(b.reserved_bytes()).div_ceil(b.page_bytes()))
+                .sum()
+        })
     }
 
     fn new(

@@ -439,11 +439,12 @@ impl Planner {
                 }
                 None => Vec::new(),
             },
-            // One sequence's rings and its prefix cache entry's copies of them.
+            // One sequence's rings and its prefix cache entry's copies of them. A ring
+            // whose buffers are not whole pages packs its keys and values together, so an
+            // FP8 ring of two 1 MiB buffers takes one page.
             rings: 2
-                * 2
                 * sliding_visits
-                * (c.sliding_window_size * ring_row_bytes).next_multiple_of(KV_PAGE_BYTES),
+                * (2 * c.sliding_window_size * ring_row_bytes).next_multiple_of(KV_PAGE_BYTES),
         });
         // The batched step's chunk buffers for one row per stream, its state tables,
         // positions and tokens, and its rows' taps for the draft.
@@ -1175,9 +1176,11 @@ mod tests {
         };
         let mib = 1 << 20;
         // 8 global caches of keys and values, then one sequence's rings and its entry's
-        // copies of them, 320 MiB.
+        // copies of them: 40 FP8 rings of 1 MiB keys and 1 MiB values, which share a
+        // page, twice, and BF16 rings of a page per buffer.
         let rings = pool(KvFormat::Fp8).plan(0).kv;
-        assert_eq!(rings, 320 * mib);
+        assert_eq!(rings, 160 * mib);
+        assert_eq!(pool(KvFormat::Bf16).plan(0).kv, 320 * mib);
         // FP8: 1,024 bytes per position, 2 MiB per buffer and chunk of 2,048 positions.
         assert_eq!(pool(KvFormat::Fp8).plan(4096).kv - rings, 16 * 4 * mib);
         // NVFP4: 576 bytes per position and buffer; 4,096 positions take 2.25 MiB, 2 pages

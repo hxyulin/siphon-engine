@@ -266,7 +266,7 @@ job: trace-7f3a chatcmpl-6929a1c4000003: timings {"cache_n":30720,"predicted_ms"
 
 ## Concurrent requests
 
-With `--streams N`, up to N requests run at once and up to `--queue` more wait. Their global KV caches and sliding rings share one pool of 2 MiB pages, which each takes as its sequence grows and keeps after it ends until the pool needs them, so one long conversation and several short requests run together, and one request alone may fill the pool. `--streams` costs little past the first: on a 32 GB card with FP8 weights and caches, with 30.45 GiB free and the default margin, the largest single request takes 653,312 positions with `--streams 1`, 645,120 with 4 and 641,024 with 8. Before the pool, `--streams 1` took 657,408 and 4 streams 161,792 each. [batching.md](batching.md#memory-one-pool-of-pages) has the design.
+With `--streams N`, up to N requests run at once and up to `--queue` more wait. Their global KV caches and sliding rings share one pool of 2 MiB pages, which each takes as its sequence grows and keeps after it ends until the pool needs them, so one long conversation and several short requests run together, and one request alone may fill the pool. `--streams` costs little past the first: on a 32 GB card with FP8 weights and caches, with 30.45 GiB free and the default margin, the largest single request takes 661,504 positions with `--streams 1`, 655,360 with 4 and 651,264 with 8. Before the pool, `--streams 1` took 657,408 and 4 streams 161,792 each. [batching.md](batching.md#memory-one-pool-of-pages) has the design.
 
 A request starts when the pool has room for its prompt and 2,048 positions more. A request that runs alone then takes pages as its reply grows, 2,048 positions at a time, from the prompts that the prefix cache keeps for idle streams if it must; its token limit only sets where it stops. The shortest prompts start first, unless a request has waited 20 s. When the running requests outgrow the pool, prompts that the prefix cache keeps for idle streams go first. With `--host-cache`, requests that still do not fit then take turns: one is swapped out to host memory, the others run, and it comes back, each running at least nine times as long as its swap takes. A request with images that is swapped out mid-prefill encodes the image its next chunk needs again when it returns. Without `--host-cache`, a request that starts beside others starts only when the pool holds every position it may reach.
 
@@ -280,7 +280,7 @@ Chat clients and agents resend the whole conversation each turn. The server keep
 
 Each entry belongs to a stream's KV cache, so a request that hits one runs in that stream. A new prompt takes a stream without an entry, else the one whose entry was used least recently, and an entry unused for `--prefix-cache-ttl` seconds is dropped. An entry keeps its stream's pages until the pool needs them for a running request. So up to `--streams` conversations, such as an agent and its parallel subagents, each keep their own history cached between turns. Prompts that share only a beginning, such as two conversations with the same system prompt, do not share an entry.
 
-A request that runs alone speculates. When its entry was saved by a batched request, or another request that speculated took the draft since, it lacks the draft's state: the request then prefills from the entry and decodes batched. A rebuild gives the draft its state back by prefilling the request's tokens again in a free stream, one chunk of `--prefill-chunk` positions at a time between batched steps, so a request that arrives meanwhile waits for one chunk at most. The rebuild starts once the request's batched steps have taken about as long as the rebuild will, whatever its `max_tokens`: agents send caps of 16,384 tokens and more and reply with a few hundred. With two or more streams, once the server has been idle for half a second, the same rebuild runs for the longest cached prompt that lacks the draft's state, so that its conversation's next turn speculates from its first token (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context, of which the 160 MiB of copies of the rings come from the pool while the entry lives.
+A request that runs alone speculates. When its entry was saved by a batched request, or another request that speculated took the draft since, it lacks the draft's state: the request then prefills from the entry and decodes batched. A rebuild gives the draft its state back by prefilling the request's tokens again in a free stream, one chunk of `--prefill-chunk` positions at a time between batched steps, so a request that arrives meanwhile waits for one chunk at most. The rebuild starts once the request's batched steps have taken about as long as the rebuild will, whatever its `max_tokens`: agents send caps of 16,384 tokens and more and reply with a few hundred. With two or more streams, once the server has been idle for half a second, the same rebuild runs for the longest cached prompt that lacks the draft's state, so that its conversation's next turn speculates from its first token (see [engine.md](engine.md#prefix-cache)). Each entry takes 172 MiB with the bundled draft and 204 MiB with DFlash 2, whatever the context, of which the copies of the rings come from the pool while the entry lives: 80 MiB with a quantized cache, 160 MiB with `--kv bf16`.
 
 With `--host-cache GiB`, every entry is also copied to page-locked host memory with its whole KV cache, and a request whose entry left the GPU restores it from there into the stream it takes, then prefills only the rest, with the same tokens and logits. A conversation that a subagent or another session pushed off the GPU then comes back in 0.135 s instead of 2.1 s at 32K tokens, and in 0.81 s instead of 39 s at 330K, on an RTX PRO 6000 Blackwell Workstation Edition. The memory is allocated at startup (9.7 s for 12 GiB). An entry takes 18 KiB per token with FP8 caches and the bundled draft (16 KiB with DFlash 2, 34 KiB with BF16 caches) plus about 0.2 GiB, conversations that share a start share its memory, and the least recently used entries go when it is full. The log reports each save and restore. On a two-socket host, run the server on the GPU's socket (`taskset` or `numactl`), or restores run at about half speed. [engine.md](engine.md#host-tier) has the design and the measurements.
 
@@ -309,7 +309,7 @@ For one user, such as a coding agent:
 siphon-serve <model-dir> --streams 2 --kv mixed --host-cache 12 --cache-dir <dir>
 ```
 
-Two streams let the agent's background requests run beside its conversation instead of taking its only prefix cache entry, for 4,096 positions less than one stream. The mixed cache plans 314,368 positions at about FP8's quality. The host cache restores a conversation that another request pushed off the GPU, and `--cache-dir` keeps it across restarts.
+Two streams let the agent's background requests run beside its conversation instead of taking its only prefix cache entry, for 6,144 positions less than one stream. The mixed cache plans 325,632 positions at about FP8's quality. The host cache restores a conversation that another request pushed off the GPU, and `--cache-dir` keeps it across restarts.
 
 For the most context in one stream, at NVFP4's lower quality and without the host cache, which needs chunks of 2048:
 
@@ -323,27 +323,29 @@ For 2 to 4 users:
 siphon-serve <model-dir> --streams 4 --kv mixed --host-cache 12
 ```
 
-The four streams share a pool of 311,296 positions.
+The four streams share a pool of 323,584 positions.
 
 The longest context of one stream, planned and filled with one prompt:
 
 | Configuration | Positions planned | Prompt | First token | Decode | Peak / planned |
 | --- | ---: | ---: | ---: | ---: | --- |
-| FP8 cache | 227,328 | 225,901 | 41.2 s | 184 tok/s | 23,330 / 23,419 MiB |
-| Mixed cache | 319,488 | 316,494 | 69.3 s | 158 tok/s | 23,318 / 23,407 MiB |
-| NVFP4 cache | 370,688 | 367,616 | 87.9 s | 156 tok/s | 23,322 / 23,411 MiB |
-| NVFP4, DFlash 2, chunks of 1024, margin 0.1 | 497,664 | 478,195 | 138.5 s | 207 tok/s | 23,490 / 23,564 MiB |
+| FP8 cache | 235,520 | 225,901 | 41.2 s | 184 tok/s | 23,330 / 23,419 MiB |
+| Mixed cache | 331,776 | 316,494 | 69.3 s | 158 tok/s | 23,318 / 23,407 MiB |
+| NVFP4 cache | 385,024 | 367,616 | 87.9 s | 156 tok/s | 23,322 / 23,411 MiB |
+| NVFP4, DFlash 2, chunks of 1024, margin 0.1 | 516,096 | 478,195 | 138.5 s | 207 tok/s | 23,490 / 23,564 MiB |
 
-Each option's effect on the planned positions with the NVFP4 cache, against 370,688 for the bundled draft:
+The prompts, times and peaks were measured before the FP8 sliding rings of a quantized cache shared pages, on plans 8,192 to 18,432 positions shorter. The positions planned now have not been filled.
+
+Each option's effect on the planned positions with the NVFP4 cache, against 385,024 for the bundled draft:
 
 | Option | Bundled draft | DFlash 2 | Cost |
 | --- | ---: | ---: | --- |
-| none | 370,688 | 436,224 | |
-| `--prefill-chunk 1024` | 407,552 | 479,232 | First token 8 to 11% later; no `--host-cache` |
-| `--margin 0.1` | 385,024 | 450,560 | 0.15 GiB less headroom; the peak stayed 74 MiB under the plan |
-| both | 421,888 | 497,664 | |
-| `--output-projection fp8` | 356,352 | 417,792 | Adds an FP8 copy of the output projections |
-| `--weights bf16` | 374,784 | 440,320 | Plain decode about 27% slower |
+| none | 385,024 | 450,560 | |
+| `--prefill-chunk 1024` | 421,888 | 497,664 | First token 8 to 11% later; no `--host-cache` |
+| `--margin 0.1` | 399,360 | 468,992 | 0.15 GiB less headroom; the peak stayed 74 MiB under the plan |
+| both | 436,224 | 516,096 | |
+| `--output-projection fp8` | 370,688 | 432,128 | Adds an FP8 copy of the output projections |
+| `--weights bf16` | 389,120 | 458,752 | Plain decode about 27% slower |
 
 Time to first token on one stream: 0.94 s at 8,221 tokens, 3.77 s at 32,483 and 14.5 s at 103,597 with the FP8 cache, within 2% of that with the NVFP4 cache; 1.03, 4.17 and 15.8 s with chunks of 1024. A prefix cache hit at 155,648 tokens answered in 0.49 s, a restore from the host cache in 0.72 s (2,907 MiB in 157 ms) and a restore after a restart in 1.09 s, against 25.5 s cold.
 
