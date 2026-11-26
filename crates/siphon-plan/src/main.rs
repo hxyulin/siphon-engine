@@ -26,6 +26,8 @@ use ratatui::{
     layout::Rect,
 };
 
+use siphon::memory;
+
 use crate::{app::App, device::Device};
 
 const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--free GiB] \
@@ -36,8 +38,8 @@ const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory Gi
 --free sets the free memory right after creating the CUDA context instead of asking
 nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
---streams plans N sequence slots of the context each, with a prefix cache entry per slot, as
-siphon-serve --streams does (default 1).
+--streams plans N streams, 1 to 32, as siphon-serve's --streams does: N sets of caches of
+the context each, the batched step's buffers and a prefix cache entry per stream.
 --print prints one frame as text and exits.";
 
 /// Columns of a printed frame.
@@ -76,7 +78,14 @@ fn args() -> anyhow::Result<Args> {
             "--memory" => memory = Some(gib_arg(&value()?, "--memory")?),
             "--free" => free = Some(gib_arg(&value()?, "--free")?),
             "--context" => context = Some(value()?.parse().context("--context takes positions")?),
-            "--streams" => streams = value()?.parse().context("--streams takes a count")?,
+            "--streams" => {
+                streams = value()?.parse().context("--streams takes a count")?;
+                ensure!(
+                    (1..=memory::BATCH_ROWS).contains(&streams),
+                    "--streams takes 1 to {}",
+                    memory::BATCH_ROWS
+                );
+            }
             "--print" => print = true,
             "-h" | "--help" => {
                 println!("{USAGE}");

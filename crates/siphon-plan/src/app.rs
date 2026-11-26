@@ -64,6 +64,8 @@ pub struct App {
     pub format: usize,
     /// Positions on screen; `None` follows the most that fit.
     context: Option<usize>,
+    /// Streams, each with caches of the context.
+    pub streams: usize,
 }
 
 impl App {
@@ -134,6 +136,7 @@ impl App {
             draft: 0,
             format: 0,
             context,
+            streams,
         })
     }
 

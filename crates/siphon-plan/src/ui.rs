@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Rows a printed frame takes.
-pub const HEIGHT: u16 = 29;
+pub const HEIGHT: u16 = 30;
 
 const DIM: Color = Color::Rgb(110, 116, 126);
 const ACCENT: Color = Color::Rgb(122, 162, 247);
@@ -103,6 +103,7 @@ fn format_name(weights: WeightFormat, kv: KvFormat) -> String {
 }
 
 /// The GPU's memory by holder, in the order the bar draws it.
+#[expect(clippy::too_many_lines, reason = "one entry per holder")]
 fn parts(app: &App) -> Vec<Part> {
     let config = app.config();
     let (context, _) = app.context();
@@ -172,6 +173,12 @@ fn parts(app: &App) -> Vec<Part> {
             plan.verify,
             Color::Rgb(250, 150, 90),
             "8 rows, speculator",
+        ),
+        Part::new(
+            "Batched step",
+            plan.batch,
+            Color::Rgb(235, 160, 172),
+            format!("{} rows", app.streams),
         ),
         Part::new(
             "Rings, conv",
