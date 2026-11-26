@@ -29,7 +29,7 @@ use super::{
     zeros,
 };
 use crate::ops::{
-    attention::{HEAD_DIM, KV_HEADS, KvCache, KvData, KvFormat},
+    attention::{KvCache, KvData, KvFormat},
     sample::SampleBuffers,
     spec::{BATCH_STATE_WORDS, BatchRows},
 };
@@ -98,6 +98,9 @@ fn empty_like(stream: &Arc<CudaStream>, v: &VisitState) -> anyhow::Result<VisitS
         (None, KvData::Fp8 { .. }) => {
             KvCache::global_with_format(stream, v.kv.slots(), KvFormat::Fp8)?
         }
+        (None, KvData::Nvfp4 { .. }) => {
+            KvCache::global_with_format(stream, v.kv.slots(), KvFormat::Nvfp4)?
+        }
     };
     Ok(VisitState {
         kv,
@@ -107,6 +110,7 @@ fn empty_like(stream: &Arc<CudaStream>, v: &VisitState) -> anyhow::Result<VisitS
             stream.alloc_zeros(v.conv[2].len())?,
             stream.alloc_zeros(v.conv[3].len())?,
         ],
+        round: v.round,
     })
 }
 
@@ -114,7 +118,9 @@ fn empty_like(stream: &Arc<CudaStream>, v: &VisitState) -> anyhow::Result<VisitS
 fn state_words(stream: &CudaStream, v: &VisitState) -> [u64; BATCH_STATE_WORDS] {
     let (keys, values) = match v.kv.data() {
         KvData::Bf16 { keys, values } => (keys.device_ptr(stream).0, values.device_ptr(stream).0),
-        KvData::Fp8 { keys, values } => (keys.device_ptr(stream).0, values.device_ptr(stream).0),
+        KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+            (keys.device_ptr(stream).0, values.device_ptr(stream).0)
+        }
     };
     let [k, v_state, proj, moe] = &v.conv;
     [
@@ -235,13 +241,14 @@ impl Model {
             } else {
                 position.min(s.kv.slots())
             };
-            let len = slots * KV_HEADS * HEAD_DIM;
+            let len = slots * s.kv.row_len();
             match (s.kv.data(), d.kv.data_mut()) {
                 (KvData::Bf16 { keys, values }, KvData::Bf16 { keys: k, values: v }) => {
                     stream.memcpy_dtod(&keys.slice(..len), &mut k.slice_mut(..len))?;
                     stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
                 }
-                (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: v }) => {
+                (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: v })
+                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: v }) => {
                     stream.memcpy_dtod(&keys.slice(..len), &mut k.slice_mut(..len))?;
                     stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
                 }

@@ -161,6 +161,12 @@ fn fp8_prefill_matches_stepping() -> anyhow::Result<()> {
     prefill_matches_stepping_with(KvFormat::Fp8, WeightFormat::Fp8, true)
 }
 
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL) and about 20 GB of GPU memory"]
+fn nvfp4_prefill_matches_stepping() -> anyhow::Result<()> {
+    prefill_matches_stepping_with(KvFormat::Nvfp4, WeightFormat::Bf16, false)
+}
+
 /// The checkpoint's model with the given cache and weight formats, and with
 /// `fp8_products` every FP8 prefill product on.
 fn load(

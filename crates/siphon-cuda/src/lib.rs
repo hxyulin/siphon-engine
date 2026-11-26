@@ -7,6 +7,7 @@
 
 pub mod draft;
 mod gpu;
+pub mod kv_options;
 pub mod model;
 pub mod ops;
 pub mod spec;

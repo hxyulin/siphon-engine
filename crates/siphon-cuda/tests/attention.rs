@@ -294,6 +294,9 @@ fn stored(format: KvFormat, x: bf16) -> f32 {
     match format {
         KvFormat::Bf16 => x.to_f32(),
         KvFormat::Fp8 => e4m3_value(e4m3_from_f32(x.to_f32())),
+        KvFormat::Nvfp4 | KvFormat::Mixed => {
+            unimplemented!("NVFP4 rounds groups, not single values")
+        }
     }
 }
 
@@ -610,6 +613,7 @@ fn check_random(cache: KvCache, tokens: usize, checks: &[usize], seed: u64) -> a
         (Some(_), _) => "sliding",
         (None, KvFormat::Bf16) => "global",
         (None, KvFormat::Fp8) => "fp8 global",
+        (None, KvFormat::Nvfp4 | KvFormat::Mixed) => "nvfp4 global",
     };
     run_decode(
         &gpu,
@@ -813,6 +817,7 @@ fn cache_row(
                 .clone_dtoh(&x.slice(row.clone()))
                 .map(|v| v.iter().map(|&b| u16::from(b)).collect())
         }),
+        KvData::Nvfp4 { .. } => anyhow::bail!("NVFP4 rows are not elements"),
     };
     Ok([k?, v?])
 }
@@ -1129,6 +1134,7 @@ fn check_prefill_with(
         (None, KvFormat::Bf16) => "global",
         (None, KvFormat::Fp8) if fp8_products => "fp8 global, fp8 products",
         (None, KvFormat::Fp8) => "fp8 global",
+        (None, KvFormat::Nvfp4 | KvFormat::Mixed) => "nvfp4 global",
     };
 
     let tokens: usize = chunks.iter().map(|c| c.rows).sum();
@@ -1562,8 +1568,8 @@ fn prefill_attention_timing() -> anyhow::Result<()> {
             None => (start + rows).min(WINDOW + rows - 1),
             Some(_) => start + rows,
         };
-        let element = format.map_or(2, KvFormat::element_bytes);
-        let bytes = (distinct * ROW * 2 * element) as f64;
+        let row_bytes = format.map_or(2 * ROW, |f| f.row_bytes(ROW));
+        let bytes = (distinct * 2 * row_bytes) as f64;
         eprintln!(
             "| {name} | {rows} | {start} | {:.1} | {:.1} | {:.0}% | {:.0} | {:.0}% |",
             seconds * 1e6,

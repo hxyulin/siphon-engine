@@ -97,11 +97,14 @@ const ROWS_BLOCKS: u32 = 34;
 const ROWS_QUERY_TILES: usize = 3;
 /// Threads per block of `attention_rows_*`.
 const ROWS_THREADS: u32 = 128;
-/// Dynamic shared memory of `attention_rows_bf16` and `attention_rows_fp8`, the sizes of
-/// `RowsShared` in the kernel.
-const ROWS_SHARED_BYTES: [u32; 2] = [32_768, 49_152];
+/// Dynamic shared memory of `attention_rows_bf16`, `attention_rows_fp8` and
+/// `attention_rows_fp4`, the sizes of `RowsShared` in the kernel.
+const ROWS_SHARED_BYTES: [u32; 3] = [32_768, 49_152, 27_648];
+/// Bytes of one slot of an NVFP4 key or value buffer: 8 heads of 64 bytes of E2M1 values,
+/// then 8 heads of 8 E4M3 scales (`kFp4Row` in the kernel).
+pub const FP4_ROW: usize = 576;
 
-pub use siphon::KvFormat;
+pub use siphon::{KvFormat, KvQuant};
 
 /// The key and value buffers of a [`KvCache`], each of shape `[slots, 8, 128]`.
 #[derive(Debug)]
@@ -112,6 +115,11 @@ pub enum KvData {
     },
     /// E4M3 bytes.
     Fp8 {
+        keys: CudaSlice<u8>,
+        values: CudaSlice<u8>,
+    },
+    /// NVFP4, [`FP4_ROW`] bytes per slot (see `KvFormat::Nvfp4`).
+    Nvfp4 {
         keys: CudaSlice<u8>,
         values: CudaSlice<u8>,
     },
@@ -176,6 +184,10 @@ impl KvCache {
     ) -> anyhow::Result<Self> {
         ensure!(slots > 0, "a KV cache needs at least one slot");
         u32::try_from(slots).context("too many KV cache slots")?;
+        ensure!(
+            window.is_none() || format == KvFormat::Bf16,
+            "sliding caches are BF16"
+        );
         let len = slots * KV_ROW;
         let data = match format {
             KvFormat::Bf16 => KvData::Bf16 {
@@ -186,6 +198,11 @@ impl KvCache {
                 keys: stream.alloc_zeros(len)?,
                 values: stream.alloc_zeros(len)?,
             },
+            KvFormat::Nvfp4 => KvData::Nvfp4 {
+                keys: stream.alloc_zeros(slots * FP4_ROW)?,
+                values: stream.alloc_zeros(slots * FP4_ROW)?,
+            },
+            KvFormat::Mixed => anyhow::bail!("a mixed layout gives each cache FP8 or NVFP4"),
         };
         Ok(Self {
             data,
@@ -218,7 +235,7 @@ impl KvCache {
                 values.device_ptr(stream).0,
                 size_of::<bf16>(),
             ),
-            KvData::Fp8 { keys, values } => {
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 (keys.device_ptr(stream).0, values.device_ptr(stream).0, 1)
             }
         };
@@ -237,6 +254,27 @@ impl KvCache {
         match self.data {
             KvData::Bf16 { .. } => KvFormat::Bf16,
             KvData::Fp8 { .. } => KvFormat::Fp8,
+            KvData::Nvfp4 { .. } => KvFormat::Nvfp4,
+        }
+    }
+
+    /// Bytes of one slot in each of the key and value buffers.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        match self.data {
+            KvData::Bf16 { .. } => KV_ROW * size_of::<bf16>(),
+            KvData::Fp8 { .. } => KV_ROW,
+            KvData::Nvfp4 { .. } => FP4_ROW,
+        }
+    }
+
+    /// Elements of one slot in each of the key and value buffers: 1,024 values, or for
+    /// NVFP4 [`FP4_ROW`] bytes.
+    #[must_use]
+    pub fn row_len(&self) -> usize {
+        match self.data {
+            KvData::Nvfp4 { .. } => FP4_ROW,
+            _ => KV_ROW,
         }
     }
 
@@ -257,7 +295,7 @@ impl KvCache {
                 stream.memset_zeros(keys)?;
                 stream.memset_zeros(values)?;
             }
-            KvData::Fp8 { keys, values } => {
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                 stream.memset_zeros(keys)?;
                 stream.memset_zeros(values)?;
             }
@@ -390,14 +428,78 @@ pub struct Attention {
     decode_fp8: CudaFunction,
     decode_step: CudaFunction,
     decode_step_fp8: CudaFunction,
+    decode_step_fp4: CudaFunction,
+    kv_append_rows_fp4: CudaFunction,
+    prefill_fp4: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
     /// `prefill_attention_fp8_mma`, for [`Products::Fp8`].
     prefill_fp8_mma: CudaFunction,
-    /// `attention_rows_bf16_<NT>` and `attention_rows_fp8_<NT>` for NT = 1 to 3.
-    rows: Vec<[CudaFunction; 2]>,
-    /// `attention_batch_bf16` and `attention_batch_fp8`.
-    batch: [CudaFunction; 2],
+    /// `attention_rows_bf16_<NT>`, `attention_rows_fp8_<NT>` and `attention_rows_fp4_<NT>`
+    /// for NT = 1 to 3.
+    rows: Vec<[CudaFunction; 3]>,
+    /// `attention_batch_bf16`, `attention_batch_fp8` and `attention_batch_fp4`.
+    batch: [CudaFunction; 3],
+    kv_round: CudaFunction,
+    kv_round_channels: CudaFunction,
+}
+
+/// A 4-bit rounding of the global caches' keys and values, applied before they are stored,
+/// to measure its cost in quality. The caches stay BF16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvRounding {
+    pub quant: KvQuant,
+    /// Rounds each head in the Hadamard basis (see `kv_round_bf16`).
+    pub rotate: bool,
+    /// The visits whose writes are rounded, one bit per visit index.
+    pub visits: u64,
+    /// Keeps the newest positions, at least this many, rounded to E4M3 only and rounds them
+    /// to 4 bits as they age, before each prefill chunk (prefill only; 0 for none).
+    pub recent: usize,
+    /// Rounds aged keys with one scale per channel and group of positions, as KIVI does,
+    /// instead of per token. Needs `recent`.
+    pub keys_per_channel: bool,
+}
+
+impl Default for KvRounding {
+    fn default() -> Self {
+        Self {
+            quant: KvQuant::None,
+            rotate: false,
+            visits: u64::MAX,
+            recent: 0,
+            keys_per_channel: false,
+        }
+    }
+}
+
+impl KvRounding {
+    /// Whether visit `visit`'s keys and values are rounded.
+    #[must_use]
+    pub fn applies(&self, visit: usize) -> bool {
+        self.quant != KvQuant::None && visit < 64 && (self.visits >> visit) & 1 == 1
+    }
+
+    /// The kernel's mode for aged rows: the 4-bit format.
+    fn mode(self) -> i32 {
+        match self.quant {
+            KvQuant::None => 0,
+            KvQuant::Nvfp4 => 1,
+            KvQuant::Q4_0 => 2,
+        }
+    }
+
+    /// The kernel's mode for rows as they are written: E4M3 while they are recent, the
+    /// 4-bit format otherwise.
+    fn write_mode(self) -> i32 {
+        if self.recent > 0 { 3 } else { self.mode() }
+    }
+
+    /// Rows per group of [`Self::keys_per_channel`].
+    #[must_use]
+    pub fn channel_rows(self) -> usize {
+        if self.quant == KvQuant::Nvfp4 { 16 } else { 32 }
+    }
 }
 
 /// The partials of [`Attention::attention_rows`] and [`Attention::attention_batch`]: per
@@ -462,7 +564,8 @@ impl Attention {
         let prefill = module.load_function("prefill_attention_bf16")?;
         let prefill_fp8 = module.load_function("prefill_attention_fp8")?;
         let prefill_fp8_mma = module.load_function("prefill_attention_fp8_mma")?;
-        for function in [&prefill, &prefill_fp8, &prefill_fp8_mma] {
+        let prefill_fp4 = module.load_function("prefill_attention_fp4")?;
+        for function in [&prefill, &prefill_fp8, &prefill_fp8_mma, &prefill_fp4] {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 PREFILL_SHARED_BYTES.cast_signed(),
@@ -479,6 +582,9 @@ impl Attention {
             decode_fp8: module.load_function("decode_attention_fp8")?,
             decode_step: module.load_function("decode_step_bf16")?,
             decode_step_fp8: module.load_function("decode_step_fp8")?,
+            decode_step_fp4: module.load_function("decode_step_fp4")?,
+            kv_append_rows_fp4: module.load_function("kv_append_rows_fp4")?,
+            prefill_fp4,
             prefill,
             prefill_fp8,
             prefill_fp8_mma,
@@ -487,14 +593,134 @@ impl Attention {
                     Ok([
                         rows_function(&format!("attention_rows_bf16_{nt}"), ROWS_SHARED_BYTES[0])?,
                         rows_function(&format!("attention_rows_fp8_{nt}"), ROWS_SHARED_BYTES[1])?,
+                        rows_function(&format!("attention_rows_fp4_{nt}"), ROWS_SHARED_BYTES[2])?,
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
             batch: [
                 rows_function("attention_batch_bf16", ROWS_SHARED_BYTES[0])?,
                 rows_function("attention_batch_fp8", ROWS_SHARED_BYTES[1])?,
+                rows_function("attention_batch_fp4", ROWS_SHARED_BYTES[2])?,
             ],
+            kv_round: module.load_function("kv_round_bf16")?,
+            kv_round_channels: module.load_function("kv_round_channels_bf16")?,
         })
+    }
+
+    /// Rounds `rows` rows of keys `k` and values `v` (`[rows, 8, 128]`) as `rounding` writes
+    /// them, in place.
+    pub fn round_rows(
+        &self,
+        stream: &CudaStream,
+        k: &mut impl DeviceOut<bf16>,
+        v: &mut impl DeviceOut<bf16>,
+        rows: usize,
+        rounding: KvRounding,
+    ) -> anyhow::Result<()> {
+        let (mut k, mut v) = (k.view_mut(), v.view_mut());
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        let mut args = KernelArgs::default();
+        args.ptr_mut(&mut k, stream)
+            .ptr_mut(&mut v, stream)
+            .u64(0)
+            .u32(0)
+            .i32(rounding.write_mode())
+            .i32(i32::from(rounding.rotate))
+            .i32(3);
+        self.launch_round(stream, &args, rows)
+    }
+
+    /// Rounds the row of `cache` at the position in the device word `position` as
+    /// `rounding` writes it, in place: what a decode step appended.
+    pub fn round_cache_row(
+        &self,
+        stream: &CudaStream,
+        cache: &mut KvCache,
+        position: u64,
+        rounding: KvRounding,
+    ) -> anyhow::Result<()> {
+        ensure!(cache.window.is_none(), "only global caches are rounded");
+        let KvData::Bf16 { keys, values } = &mut cache.data else {
+            anyhow::bail!("4-bit rounding needs a BF16 cache");
+        };
+        let mut args = KernelArgs::default();
+        args.ptr_mut(keys, stream)
+            .ptr_mut(values, stream)
+            .u64(position)
+            .u32(0)
+            .i32(rounding.write_mode())
+            .i32(i32::from(rounding.rotate))
+            .i32(3);
+        self.launch_round(stream, &args, 1)
+    }
+
+    /// Rounds rows `first .. first + rows` of `cache` to `rounding`'s 4-bit format as they
+    /// age out of its recent window: values per token, keys per token or, with
+    /// [`KvRounding::keys_per_channel`], per channel over groups of
+    /// [`KvRounding::channel_rows`] (`first` and `rows` multiples of it).
+    pub fn age_rows(
+        &self,
+        stream: &CudaStream,
+        cache: &mut KvCache,
+        first: usize,
+        rows: usize,
+        rounding: KvRounding,
+    ) -> anyhow::Result<()> {
+        ensure!(first + rows <= cache.slots, "rows past the cache");
+        let KvData::Bf16 { keys, values } = &mut cache.data else {
+            anyhow::bail!("4-bit rounding needs a BF16 cache");
+        };
+        let mut args = KernelArgs::default();
+        args.ptr_mut(keys, stream)
+            .ptr_mut(values, stream)
+            .u64(0)
+            .u32(u32::try_from(first)?)
+            .i32(rounding.mode())
+            .i32(i32::from(rounding.rotate))
+            .i32(if rounding.keys_per_channel { 2 } else { 3 });
+        self.launch_round(stream, &args, rows)?;
+        if rounding.keys_per_channel {
+            let group = rounding.channel_rows();
+            ensure!(
+                first.is_multiple_of(group) && rows.is_multiple_of(group),
+                "per-channel rows come in groups of {group}"
+            );
+            let groups = rows / group;
+            let mut args = KernelArgs::default();
+            args.ptr_mut(keys, stream)
+                .u32(u32::try_from(first)?)
+                .u32(u32::try_from(groups)?)
+                .i32(rounding.mode());
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from((groups * KV_ROW).div_ceil(256))?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the arguments match `kv_round_channels_bf16(bf16*, unsigned, unsigned,
+            // int)`; the groups lie inside the cache (checked above), and the kernel waits
+            // for earlier kernels before reading.
+            unsafe { args.launch_pdl(stream, &self.kv_round_channels, config) }?;
+        }
+        Ok(())
+    }
+
+    fn launch_round(
+        &self,
+        stream: &CudaStream,
+        args: &KernelArgs,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows)?, 2, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `kv_round_bf16(bf16*, bf16*, const unsigned*, unsigned,
+        // int, int, int)`; every row the grid names lies inside k and v (the caller checks the
+        // cache holds the position), and the kernel calls `pdl_wait()` before its first read
+        // and never triggers its successor early.
+        unsafe { args.launch_pdl(stream, &self.kv_round, config) }
     }
 
     /// The attention of the `rows` rows of a step, 1 to [`ROWS_MAX`], such as a speculative
@@ -555,12 +781,15 @@ impl Attention {
         let (function, smem) = match cache.data {
             KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
             KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
+            KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
         };
         let mut args = KernelArgs::default();
         args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
         match &mut cache.data {
             KvData::Bf16 { keys, values } => args.ptr_mut(keys, stream).ptr_mut(values, stream),
-            KvData::Fp8 { keys, values } => args.ptr_mut(keys, stream).ptr_mut(values, stream),
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream)
+            }
         };
         args.ptr(&bias, stream)
             .ptr(&sinks, stream)
@@ -644,6 +873,7 @@ impl Attention {
         let (function, smem) = match like.data {
             KvData::Bf16 { .. } => (&self.batch[0], ROWS_SHARED_BYTES[0]),
             KvData::Fp8 { .. } => (&self.batch[1], ROWS_SHARED_BYTES[1]),
+            KvData::Nvfp4 { .. } => (&self.batch[2], ROWS_SHARED_BYTES[2]),
         };
         let mut args = KernelArgs::default();
         args.ptr(&q, stream)
@@ -789,12 +1019,17 @@ impl Attention {
         let function = match cache.data {
             KvData::Bf16 { .. } => &self.kv_append,
             KvData::Fp8 { .. } => &self.kv_append_fp8,
+            KvData::Nvfp4 { .. } => {
+                anyhow::bail!("NVFP4 caches append through the fused decode step")
+            }
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&k).arg(&v);
         match &mut cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                launch.arg(keys).arg(values)
+            }
         };
         launch.arg(&position).arg(&slots);
         // SAFETY: the arguments match `kv_append_bf16(const bf16*, const bf16*, bf16*, bf16*,
@@ -846,12 +1081,17 @@ impl Attention {
         let function = match cache.data {
             KvData::Bf16 { .. } => &self.decode,
             KvData::Fp8 { .. } => &self.decode_fp8,
+            KvData::Nvfp4 { .. } => {
+                anyhow::bail!("NVFP4 caches attend through the fused decode step")
+            }
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&q);
         match &cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                launch.arg(keys).arg(values)
+            }
         };
         launch
             .arg(&bias)
@@ -898,6 +1138,7 @@ impl Attention {
         clippy::needless_pass_by_value,
         reason = "the struct only bundles borrows for this call"
     )]
+    #[expect(clippy::too_many_lines, reason = "one argument per kernel parameter")]
     pub fn decode_step(
         &self,
         stream: &CudaStream,
@@ -977,6 +1218,10 @@ impl Attention {
                 args.ptr_mut(keys, stream).ptr_mut(values, stream);
                 &self.decode_step_fp8
             }
+            KvData::Nvfp4 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream);
+                &self.decode_step_fp4
+            }
         };
         let (log_scale, alpha, n_floor) = match s.log_scale {
             Some((alpha, n_floor)) => (1, alpha, n_floor),
@@ -1028,24 +1273,34 @@ impl Attention {
         v: &CudaView<'_, bf16>,
     ) -> anyhow::Result<()> {
         let slots = u32::try_from(cache.slots)?;
+        // One thread per 8 values, or for NVFP4 per group of 16.
+        let threads = if cache.format() == KvFormat::Nvfp4 {
+            KV_ROW / 16
+        } else {
+            KV_ROW / 8
+        };
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows)?, 1, 1),
-            block_dim: ((KV_ROW / 8) as u32, 1, 1),
+            block_dim: (threads as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         let function = match cache.data {
             KvData::Bf16 { .. } => &self.kv_append_rows,
             KvData::Fp8 { .. } => &self.kv_append_rows_fp8,
+            KvData::Nvfp4 { .. } => &self.kv_append_rows_fp4,
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(k).arg(v);
         match &mut cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                launch.arg(keys).arg(values)
+            }
         };
         launch.arg(start).arg(&slots);
         // SAFETY: the arguments match `kv_append_rows_bf16(const bf16*, const bf16*, bf16*,
-        // bf16*, const unsigned*, unsigned)`, or `kv_append_rows_fp8` with `uint8_t*` caches.
+        // bf16*, const unsigned*, unsigned)`, or `kv_append_rows_fp8` and `kv_append_rows_fp4`
+        // with `uint8_t*` caches.
         // The caller checked that `k` and `v` hold `rows` rows of 1024 and `start` one value;
         // block `i` reads row `i` and writes slot `(start + i) % slots` of the caches, or
         // nothing when `i + slots < rows`, so no two blocks write the same slot.
@@ -1114,7 +1369,7 @@ impl Attention {
             extent.is_multiple_of(8),
             "prefill needs a bias extent that is a multiple of 8, not {extent}"
         );
-        if rows == 1 {
+        if rows == 1 && cache.format() != KvFormat::Nvfp4 {
             // Decode attention streams the cache faster than a block of 128 rows with 3
             // used ones, and computes the same thing.
             self.append(stream, cache, start, &k, &v)?;
@@ -1146,12 +1401,15 @@ impl Attention {
             (KvData::Bf16 { .. }, _) => &self.prefill,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
             (KvData::Fp8 { .. }, Products::Fp8) => &self.prefill_fp8_mma,
+            (KvData::Nvfp4 { .. }, _) => &self.prefill_fp4,
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(&q).arg(&k).arg(&v);
         match &cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                launch.arg(keys).arg(values)
+            }
         };
         launch
             .arg(&bias)
@@ -1175,8 +1433,8 @@ impl Attention {
         // const bf16* v_in, const bf16* k_cache, const bf16* v_cache, const bf16* bias, const
         // bf16* sinks, float* partials, unsigned* counters, bf16* out, const unsigned* start,
         // unsigned rows, unsigned slots, unsigned window, unsigned extent, unsigned
-        // input_keys, float scale)`, or `prefill_attention_fp8` and
-        // `prefill_attention_fp8_mma` with `uint8_t*` caches. The
+        // input_keys, float scale)`, or `prefill_attention_fp8`, `prefill_attention_fp8_mma`
+        // and `prefill_attention_fp4` with `uint8_t*` caches. The
         // checks above size `q`, `k`, `v`, `bias`, `sinks` and `out` for `rows` rows. The
         // kernel reads input rows below `rows`, cache slots below `slots` and bias columns
         // below `extent`. Its `scratch.blocks`

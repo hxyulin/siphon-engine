@@ -284,7 +284,8 @@ pub struct Options {
     /// Whether decode reads an FP8 copy of the attention output projection with FP8
     /// weights, instead of its BF16 weights.
     pub fp8_output: bool,
-    pub fp8_kv: bool,
+    /// The global KV cache format, as `KvFormat` parses it.
+    pub kv: String,
     /// Verify widths the adaptive policy chooses among.
     pub widths: Vec<usize>,
     /// Jobs that wait while `streams` run.
@@ -315,6 +316,8 @@ pub struct Options {
     pub decode_floor: f64,
     /// The vision tower, with `--vision`.
     pub vision: Option<VisionOptions>,
+    /// The KV options of `siphon_cuda::kv_options` as given on the command line.
+    pub kv_args: Vec<String>,
 }
 
 /// `--vision`'s tower, which runs in BF16: its FP8 products drift 3 to 5 times further
@@ -452,6 +455,7 @@ mod cuda {
     use siphon_cuda::{
         Gpu, MemoryUse,
         draft::DraftOptions,
+        kv_options::KvOptions,
         model::{DEFAULT_PREFILL_CHUNK, ImageRows, Model, Sampling as ModelSampling},
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
@@ -704,9 +708,10 @@ mod cuda {
         let gpu = Gpu::new(0)?;
         let (free, _) = gpu.context().mem_get_info()?;
         let checkpoint = Checkpoint::open(&options.model_dir)?;
-        let (weight_format, kv) = formats(options);
+        let (weight_format, kv) = formats(options)?;
         let draft_options = DraftOptions::parse(&options.draft, None)?;
         let chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK);
+        let kv_options = kv_options(options)?;
         let planner = Planner::new(&PlanInputs {
             config: &config,
             checkpoint: &checkpoint,
@@ -730,6 +735,7 @@ mod cuda {
         weights.output = output_projection(options);
         let mut model =
             Model::with_formats(&gpu, config, weights, passes, capacity, kv, weight_format)?;
+        kv_options.apply(&mut model)?;
         model.set_prefill_attention(options.prefill_attention.parse()?);
         if !options.greedy {
             model.enable_sampling()?;
@@ -847,19 +853,27 @@ mod cuda {
         }
     }
 
+    /// The KV options of `siphon_cuda::kv_options` that `options` carries.
+    fn kv_options(options: &Options) -> anyhow::Result<KvOptions> {
+        let mut kv_options = KvOptions::default();
+        let mut kv_args = options.kv_args.iter().cloned();
+        while let Some(arg) = kv_args.next() {
+            anyhow::ensure!(
+                kv_options.parse(&arg, &mut kv_args)?,
+                "unknown KV option {arg}"
+            );
+        }
+        Ok(kv_options)
+    }
+
     /// The weight and KV cache formats `options` ask for.
-    fn formats(options: &Options) -> (WeightFormat, KvFormat) {
+    fn formats(options: &Options) -> anyhow::Result<(WeightFormat, KvFormat)> {
         let weights = if options.fp8_weights {
             WeightFormat::Fp8
         } else {
             WeightFormat::Bf16
         };
-        let kv = if options.fp8_kv {
-            KvFormat::Fp8
-        } else {
-            KvFormat::Bf16
-        };
-        (weights, kv)
+        Ok((weights, options.kv.parse()?))
     }
 
     /// Adds the prefix cache's host tier of `--host-cache` bytes, if any, and logs how long
@@ -927,7 +941,7 @@ mod cuda {
         Ok(serde_json::json!({
             "checkpoint": weights_hash(&options.model_dir)?,
             "drafter": options.drafter.as_deref().map(weights_hash).transpose()?,
-            "kv": if options.fp8_kv { "fp8" } else { "bf16" },
+            "kv": options.kv,
             "weights": if options.fp8_weights { "fp8" } else { "bf16" },
             "draft": options.draft,
             "prefill_attention": options.prefill_attention,

@@ -56,6 +56,7 @@ fn fill(stream: &Arc<CudaStream>, cache: &mut KvCache, seed: u32) -> anyhow::Res
             stream.memcpy_htod(&common::pseudo_random_bf16(n, seed, 1.0, 0.0), keys)?;
             stream.memcpy_htod(&common::pseudo_random_bf16(n, seed + 1, 1.0, 0.0), values)?;
         }
+        KvData::Nvfp4 { .. } => anyhow::bail!("no NVFP4 fill"),
         KvData::Fp8 { keys, values } => {
             let n = keys.len();
             // E4M3 values up to about 1.5, never NaN.

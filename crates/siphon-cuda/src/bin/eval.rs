@@ -4,7 +4,8 @@
 //! usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8]
 //!        [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] [--verify WIDTH]
 //!        [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8]
-//!        [--prefill-dense bf16|fp8]
+//!        [--prefill-dense bf16|fp8] [--kv-quant none|nvfp4|q4_0] [--kv-rotate]
+//!        [--kv-quant-visits V,V,...]
 //!
 //! The capture comes from `reference/capture_eval.py capture`. Every step feeds the
 //! text's next token, so a wrong prediction does not change later inputs. With
@@ -48,6 +49,7 @@ mod linux {
     use siphon::{Checkpoint, TextConfig};
     use siphon_cuda::{
         Gpu,
+        kv_options::KvOptions,
         model::{
             Accept, DEFAULT_PREFILL_ATTENTION, MAX_PREFILL_CHUNK, Model, PrefillAttention,
             PrefillLogits, VerifyTokens,
@@ -89,6 +91,7 @@ mod linux {
         expert_activations: ExpertActivations,
         prefill_attention: PrefillAttention,
         prefill_dense: Products,
+        kv_options: KvOptions,
     }
 
     fn args() -> anyhow::Result<Args> {
@@ -103,9 +106,11 @@ mod linux {
         let mut expert_activations = ExpertActivations::Bf16;
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         let mut prefill_dense = Products::Bf16;
+        let mut kv_options = KvOptions::default();
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
-            if arg == "--passes" {
+            if kv_options.parse(&arg, &mut it)? {
+            } else if arg == "--passes" {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
             } else if arg == "--kv" {
                 kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
@@ -156,7 +161,7 @@ mod linux {
              [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] \
              [--verify WIDTH] [--dump FILE] \
              [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8] \
-             [--prefill-dense bf16|fp8]",
+             [--prefill-dense bf16|fp8] [kv options]",
         )?;
         ensure!(
             prefill.is_none() || verify.is_none(),
@@ -175,6 +180,7 @@ mod linux {
             expert_activations,
             prefill_attention,
             prefill_dense,
+            kv_options,
         })
     }
 
@@ -409,6 +415,7 @@ mod linux {
             args.kv,
             args.weights,
         )?;
+        args.kv_options.apply(&mut model)?;
         model.set_expert_activations(args.expert_activations)?;
         model.set_prefill_attention(args.prefill_attention);
         model.set_prefill_dense(args.prefill_dense)?;
@@ -517,8 +524,8 @@ mod linux {
             (None, None) => "token by token".to_owned(),
         };
         println!(
-            "{n} tokens; MLX capture mode: {}; engine: {engine_mode}",
-            capture.mode
+            "{n} tokens; MLX capture mode: {}; engine: {engine_mode}; {}",
+            capture.mode, args.kv_options
         );
         println!(
             "{:<20} {:>13} {:>7} {:>8} {:>12}  perplexity engine / MLX",

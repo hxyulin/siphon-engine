@@ -7,6 +7,8 @@
 //!
 //! ```sh
 //! SIPHON_MODEL=<model-dir> cargo test --release -p siphon-serve --test drain -- --ignored --nocapture
+//!
+//! `SIPHON_KV` passes its value as the server's `--kv`, to run the test with another cache format.
 //! ```
 
 #![cfg(target_os = "linux")]
@@ -73,6 +75,12 @@ impl Server {
             ])
             .args(["--host-cache", "2", "--cache-dir"])
             .arg(cache)
+            .args(
+                env::var("SIPHON_KV")
+                    .map(|kv| ["--kv".to_owned(), kv])
+                    .into_iter()
+                    .flatten(),
+            )
             .stderr(Stdio::piped())
             .spawn()?;
         let log = Arc::new(Mutex::new(Vec::new()));

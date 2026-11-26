@@ -198,6 +198,24 @@ fn batch_matches_alone_fp8() -> anyhow::Result<()> {
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_nvfp4() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Nvfp4, WeightFormat::Fp8, PROMPTS.len())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_16_nvfp4() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Nvfp4, WeightFormat::Fp8, 16)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn batch_matches_alone_mixed() -> anyhow::Result<()> {
+    batch_matches_alone(KvFormat::Mixed, WeightFormat::Fp8, PROMPTS.len())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
 fn batch_matches_alone_bf16() -> anyhow::Result<()> {
     batch_matches_alone(KvFormat::Bf16, WeightFormat::Bf16, PROMPTS.len())
 }

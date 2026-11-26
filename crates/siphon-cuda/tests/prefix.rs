@@ -154,6 +154,7 @@ fn check(
 fn load(
     drafter: Option<&std::path::Path>,
     slots: usize,
+    kv: KvFormat,
 ) -> anyhow::Result<(Gpu, Model, Speculator)> {
     let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
     let gpu = Gpu::new(0)?;
@@ -167,7 +168,7 @@ fn load(
         weights,
         passes,
         CAPACITY,
-        KvFormat::Fp8,
+        kv,
         WeightFormat::Fp8,
     )?;
     model.add_slots(slots - 1)?;
@@ -183,8 +184,14 @@ fn load(
     Ok((gpu, model, spec))
 }
 
-fn prefix_cache_matches_prefill(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (_gpu, mut model, mut spec) = load(drafter, 2)?;
+/// The served cache.
+const SERVED: KvFormat = KvFormat::Fp8;
+
+fn prefix_cache_matches_prefill(
+    drafter: Option<&std::path::Path>,
+    kv: KvFormat,
+) -> anyhow::Result<()> {
+    let (_gpu, mut model, mut spec) = load(drafter, 2, kv)?;
 
     let capture = capture_tokens()?;
     ensure!(
@@ -432,8 +439,8 @@ fn same<T: PartialEq + std::fmt::Debug>(
 /// between three conversations and each hit their own entry, batched hits, eviction, the
 /// time to live, and a slot that another conversation takes.
 #[expect(clippy::too_many_lines, reason = "one scenario, step by step")]
-fn prefix_cache_entries(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (_gpu, mut model, mut spec) = load(drafter, 4)?;
+fn prefix_cache_entries(drafter: Option<&std::path::Path>, kv: KvFormat) -> anyhow::Result<()> {
+    let (_gpu, mut model, mut spec) = load(drafter, 4, kv)?;
     let capture = capture_tokens()?;
     ensure!(
         capture.len() >= 9000,
@@ -596,8 +603,11 @@ const HOST: &str = "from host memory with the draft's state";
     clippy::too_many_lines,
     reason = "one scenario, step by step, over the turns of named conversations"
 )]
-fn host_cache_matches_prefill(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (_gpu, mut model, mut spec) = load(drafter, 2)?;
+fn host_cache_matches_prefill(
+    drafter: Option<&std::path::Path>,
+    kv: KvFormat,
+) -> anyhow::Result<()> {
+    let (_gpu, mut model, mut spec) = load(drafter, 2, kv)?;
     let capture = capture_tokens()?;
     ensure!(
         capture.len() >= 9000,
@@ -732,10 +742,10 @@ fn host_cache_matches_prefill(drafter: Option<&std::path::Path>) -> anyhow::Resu
 /// prefill from position 0 would, with 804 and 904 tokens past their boundaries. A
 /// manifest of another identity is discarded with its files, and a directory without a
 /// manifest, as a save that stopped midway leaves it, loads nothing.
-fn host_cache_round_trips(drafter: Option<&std::path::Path>) -> anyhow::Result<()> {
+fn host_cache_round_trips(drafter: Option<&std::path::Path>, kv: KvFormat) -> anyhow::Result<()> {
     use siphon_cuda::spec::DiskLoaded;
 
-    let (_gpu, mut model, mut spec) = load(drafter, 2)?;
+    let (_gpu, mut model, mut spec) = load(drafter, 2, kv)?;
     let capture = capture_tokens()?;
     let (a, a1) = (&capture[..4500], &capture[..4900]);
     let (b, b1) = (&capture[1000..5600], &capture[1000..6000]);
@@ -800,7 +810,7 @@ fn host_cache_round_trips(drafter: Option<&std::path::Path>) -> anyhow::Result<(
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn host_cache_round_trips_bundled() -> anyhow::Result<()> {
-    host_cache_round_trips(None)
+    host_cache_round_trips(None, SERVED)
 }
 
 #[test]
@@ -810,13 +820,13 @@ fn host_cache_round_trips_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    host_cache_round_trips(Some(std::path::Path::new(&dir)))
+    host_cache_round_trips(Some(std::path::Path::new(&dir)), SERVED)
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn host_cache_matches_prefill_bundled() -> anyhow::Result<()> {
-    host_cache_matches_prefill(None)
+    host_cache_matches_prefill(None, SERVED)
 }
 
 #[test]
@@ -826,13 +836,13 @@ fn host_cache_matches_prefill_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    host_cache_matches_prefill(Some(std::path::Path::new(&dir)))
+    host_cache_matches_prefill(Some(std::path::Path::new(&dir)), SERVED)
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn prefix_cache_entries_bundled() -> anyhow::Result<()> {
-    prefix_cache_entries(None)
+    prefix_cache_entries(None, SERVED)
 }
 
 #[test]
@@ -842,7 +852,7 @@ fn prefix_cache_entries_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    prefix_cache_entries(Some(std::path::Path::new(&dir)))
+    prefix_cache_entries(Some(std::path::Path::new(&dir)), SERVED)
 }
 
 #[test]
@@ -852,13 +862,13 @@ fn prefix_cache_matches_prefill_dflash2() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH2 is not set; skipped");
         return Ok(());
     };
-    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)))
+    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)), SERVED)
 }
 
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
 fn prefix_cache_matches_prefill_bundled() -> anyhow::Result<()> {
-    prefix_cache_matches_prefill(None)
+    prefix_cache_matches_prefill(None, SERVED)
 }
 
 #[test]
@@ -868,5 +878,41 @@ fn prefix_cache_matches_prefill_dflash() -> anyhow::Result<()> {
         println!("SIPHON_DFLASH is not set; skipped");
         return Ok(());
     };
-    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)))
+    prefix_cache_matches_prefill(Some(std::path::Path::new(&dir)), SERVED)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn prefix_cache_entries_nvfp4() -> anyhow::Result<()> {
+    prefix_cache_entries(None, KvFormat::Nvfp4)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn prefix_cache_entries_mixed() -> anyhow::Result<()> {
+    prefix_cache_entries(None, KvFormat::Mixed)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_matches_prefill_nvfp4() -> anyhow::Result<()> {
+    host_cache_matches_prefill(None, KvFormat::Nvfp4)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_matches_prefill_mixed() -> anyhow::Result<()> {
+    host_cache_matches_prefill(None, KvFormat::Mixed)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_round_trips_nvfp4() -> anyhow::Result<()> {
+    host_cache_round_trips(None, KvFormat::Nvfp4)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn host_cache_round_trips_mixed() -> anyhow::Result<()> {
+    host_cache_round_trips(None, KvFormat::Mixed)
 }

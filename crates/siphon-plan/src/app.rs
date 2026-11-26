@@ -15,12 +15,16 @@ use crate::device::Device;
 const SMALL_STEP: usize = 8 * 1024;
 const LARGE_STEP: usize = 64 * 1024;
 
-/// The weight and KV formats, in the order the keys cycle through them.
-pub const FORMATS: [(WeightFormat, KvFormat); 4] = [
+/// The weight and KV formats: the first four in the order the keys cycle through them,
+/// then the NVFP4 and mixed caches, which only the table of longest contexts shows.
+pub const FORMATS: [(WeightFormat, KvFormat); 7] = [
     (WeightFormat::Fp8, KvFormat::Fp8),
     (WeightFormat::Fp8, KvFormat::Bf16),
     (WeightFormat::Bf16, KvFormat::Fp8),
     (WeightFormat::Bf16, KvFormat::Bf16),
+    (WeightFormat::Fp8, KvFormat::Nvfp4),
+    (WeightFormat::Bf16, KvFormat::Nvfp4),
+    (WeightFormat::Fp8, KvFormat::Mixed),
 ];
 
 /// A draft the server can run, as siphon-serve's `--drafter` picks it.

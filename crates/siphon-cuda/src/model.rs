@@ -38,14 +38,14 @@ use cudarc::driver::{
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
-use siphon::TextConfig;
+use siphon::{KvQuant, TextConfig};
 
 use crate::{
     DeviceIn, Gpu,
     ops::{
         Products,
         attention::{
-            self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat,
+            self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat, KvRounding,
             MIN_SPLIT_SLOTS, ONE_TILE_SPLIT_SLOTS,
         },
         conv::Conv,
@@ -93,6 +93,8 @@ struct VisitState {
     /// Short-conv input history, F32 `[kernel - 1, dims]`: keys, values, post-attention
     /// and post-MLP, as in MLX-LM's `ArraysCache(4)`.
     conv: [CudaSlice<f32>; 4],
+    /// Whether the visit rounds the keys and values it writes ([`Model::set_kv_rounding`]).
+    round: bool,
 }
 
 /// One visit's caches from [`Model::cache_snapshot`].
@@ -123,6 +125,28 @@ fn e4m3_to_f32(b: u8) -> f32 {
         (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
     };
     sign * magnitude
+}
+
+/// The values of NVFP4 cache slots (`[slots, FP4_ROW]` bytes), as `[slots, 8, 128]`.
+fn fp4_to_f32(bytes: &[u8]) -> Vec<f32> {
+    const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let heads = attention::KV_HEADS;
+    let dims = attention::HEAD_DIM;
+    let mut out = Vec::with_capacity(bytes.len() / attention::FP4_ROW * heads * dims);
+    for slot in bytes.as_chunks::<{ attention::FP4_ROW }>().0 {
+        let (data, scales) = slot.split_at(heads * dims / 2);
+        for i in 0..heads * dims {
+            let nibble = (data[i / 2] >> (4 * (i % 2))) & 0xf;
+            let magnitude = E2M1[usize::from(nibble & 7)];
+            let value = if nibble & 8 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            };
+            out.push(value * e4m3_to_f32(scales[i / 16]));
+        }
+    }
+    out
 }
 
 /// A device copy of everything a sequence keeps across tokens, from [`Model::save_state`]:
@@ -315,6 +339,9 @@ unsafe impl Send for StepGraph {}
 pub struct Model {
     ctx: Ctx,
     passes: usize,
+    /// Slot 0's global cache rows below this have aged out of the rounding's recent window
+    /// and been rounded to 4 bits ([`KvRounding::recent`]).
+    rounded_below: usize,
     visits: Vec<VisitState>,
     scratch: Scratch,
     /// Rows of `scratch.blocks` a step can fill.
@@ -372,6 +399,8 @@ struct Ctx {
     chunk_attention: Products,
     /// How prefill's dense products multiply.
     prefill_dense: Products,
+    /// The 4-bit rounding of the global caches' writes, for the visits with `round` set.
+    kv_rounding: KvRounding,
 }
 
 impl std::fmt::Debug for Model {
@@ -427,6 +456,10 @@ impl Model {
     /// [`Model::with_kv_format`] with decode reading the attention projections and the LM
     /// head in `weight_format`. [`WeightFormat::Fp8`] quantizes them first, keeping the
     /// BF16 weights for prefill.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the kernels, caches and buffers in order"
+    )]
     pub fn with_formats(
         gpu: &Gpu,
         config: TextConfig,
@@ -459,26 +492,30 @@ impl Model {
         let history = config.sconv_kernel_size - 1;
         let kv_dims = config.num_key_value_heads * config.head_dim;
         let hidden = config.hidden_size;
-        let visits = config
-            .visit_layers(passes)
-            .into_iter()
-            .map(|layer| {
-                let kv = if config.is_sliding(layer) {
-                    KvCache::sliding(&stream, config.sliding_window_size)?
-                } else {
-                    KvCache::global_with_format(&stream, capacity, kv_format)?
-                };
-                Ok(VisitState {
-                    kv,
-                    conv: [
-                        stream.alloc_zeros(history * kv_dims)?,
-                        stream.alloc_zeros(history * kv_dims)?,
-                        stream.alloc_zeros(history * hidden)?,
-                        stream.alloc_zeros(history * hidden)?,
-                    ],
-                })
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let formats = config.cache_formats(passes, kv_format);
+        let mut visits: Vec<VisitState> = Vec::new();
+        for (v, layer) in config.visit_layers(passes).into_iter().enumerate() {
+            let kv = if config.is_sliding(layer) {
+                KvCache::sliding(&stream, config.sliding_window_size)?
+            } else {
+                KvCache::global_with_format(
+                    &stream,
+                    capacity,
+                    formats[v].context("a global visit has a format")?,
+                )?
+            };
+            visits.push(VisitState {
+                kv,
+                conv: [
+                    stream.alloc_zeros(history * kv_dims)?,
+                    stream.alloc_zeros(history * kv_dims)?,
+                    stream.alloc_zeros(history * hidden)?,
+                    stream.alloc_zeros(history * hidden)?,
+                ],
+                // NVFP4 caches take rows already rounded to their values (`kv_round_bf16`).
+                round: formats[v] == Some(KvFormat::Nvfp4),
+            });
+        }
         let loops = config.loop_config;
         // Each pass starts again from the prelude's block states.
         let max_blocks = block_starts(&config, 0..loops.core_start)
@@ -508,8 +545,17 @@ impl Model {
                 prefill_attention: DEFAULT_PREFILL_ATTENTION,
                 chunk_attention: Products::Bf16,
                 prefill_dense: Products::Bf16,
+                kv_rounding: if formats.contains(&Some(KvFormat::Nvfp4)) {
+                    KvRounding {
+                        quant: KvQuant::Nvfp4,
+                        ..KvRounding::default()
+                    }
+                } else {
+                    KvRounding::default()
+                },
             },
             passes,
+            rounded_below: 0,
             visits,
             scratch,
             max_blocks,
@@ -657,6 +703,38 @@ impl Model {
         Ok(())
     }
 
+    /// Rounds the keys and values that the global visits in `rounding.visits` write through
+    /// a 4-bit format before they are stored, in every slot, to measure what a 4-bit cache
+    /// costs in quality. Needs BF16 global caches. Prefill, verify and batched steps round
+    /// the rows before their attention reads them; a decode step rounds the row it
+    /// appended after its attention, so only its own key and value reach that attention
+    /// unrounded. Drops the captured graphs.
+    pub fn set_kv_rounding(&mut self, rounding: KvRounding) -> anyhow::Result<()> {
+        let on = rounding.quant != KvQuant::None;
+        ensure!(
+            self.visits.iter().all(|v| v.kv.format() != KvFormat::Nvfp4),
+            "NVFP4 caches store 4-bit values already; the rounding is for BF16 caches"
+        );
+        let layers = self.ctx.config.visit_layers(self.passes);
+        let mut slots: Vec<&mut Vec<VisitState>> = vec![&mut self.visits];
+        slots.extend(self.slots.iter_mut().map(|s| &mut s.visits));
+        for visits in slots {
+            for (v, state) in visits.iter_mut().enumerate() {
+                state.round = on && !self.ctx.config.is_sliding(layers[v]) && rounding.applies(v);
+                ensure!(
+                    !state.round || state.kv.format() == KvFormat::Bf16,
+                    "4-bit rounding needs BF16 global caches"
+                );
+            }
+        }
+        self.ctx.kv_rounding = rounding;
+        self.graph = None;
+        self.tap_graph = None;
+        self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.batch_graphs.iter_mut().for_each(|g| *g = None);
+        Ok(())
+    }
+
     pub fn reset(&mut self) -> anyhow::Result<()> {
         for visit in &mut self.visits {
             visit.kv.clear(&self.ctx.stream)?;
@@ -665,6 +743,7 @@ impl Model {
             }
         }
         self.position = 0;
+        self.rounded_below = 0;
         self.sequence = self.new_sequence();
         Ok(())
     }
@@ -698,6 +777,10 @@ impl Model {
                             .into_iter()
                             .map(e4m3_to_f32)
                             .collect(),
+                    ),
+                    KvData::Nvfp4 { keys, values } => (
+                        fp4_to_f32(&stream.clone_dtoh(keys)?),
+                        fp4_to_f32(&stream.clone_dtoh(values)?),
                     ),
                 };
                 Ok(VisitSnapshot {
@@ -745,6 +828,13 @@ impl Model {
                             values: stream.clone_dtod(&values.slice(..len))?,
                         }
                     }
+                    KvData::Nvfp4 { keys, values } => {
+                        let len = keys.len() / v.kv.slots() * slots;
+                        KvData::Nvfp4 {
+                            keys: stream.clone_dtod(&keys.slice(..len))?,
+                            values: stream.clone_dtod(&values.slice(..len))?,
+                        }
+                    }
                 };
                 let conv = v
                     .conv
@@ -780,7 +870,8 @@ impl Model {
                     stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
                     stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
                 }
-                (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: x }) => {
+                (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: x })
+                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: x }) => {
                     ensure!(fits(k.len(), keys.len()), "the cache sizes differ");
                     stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
                     stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
@@ -1858,6 +1949,15 @@ impl Ctx {
                 },
             },
         )?;
+        // The NVFP4 decode step rounds its own row.
+        if state.round && state.kv.format() == KvFormat::Bf16 {
+            self.kernels.attention.round_cache_row(
+                &self.stream,
+                &mut state.kv,
+                position.device_ptr(&self.stream).0,
+                self.kv_rounding,
+            )?;
+        }
         // decode_step triggers early, and no prefetch starts here.
         if let Some(o) = w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
             self.kernels.linear_fp8.gemv(

@@ -387,11 +387,10 @@ impl HostCache {
         };
         let copied = n - shared;
         let mut bytes = 0;
-        let pb = self.target.position_bytes;
         for (j, &c) in kv.iter().enumerate().skip(n - copied) {
-            for (i, &cache) in target.caches.iter().enumerate() {
+            for (cache, pb, before) in target.layout() {
                 let at = (j * p) as u64 * pb as u64;
-                let host = self.pool.address(c) + i * p * pb;
+                let host = self.pool.address(c) + p * before;
                 copy(&self.copy, Direction::ToHost, host, cache + at, p * pb)?;
                 bytes += p * pb;
             }
@@ -442,16 +441,15 @@ impl HostCache {
         rings: &DraftRings,
     ) -> anyhow::Result<usize> {
         let p = HOST_CHUNK_POSITIONS;
-        let dpb = self.draft.position_bytes;
         let base = p * self.target.bytes_per_position();
         let mut bytes = 0;
         for (j, &c) in kv.iter().enumerate() {
             if self.drafted[c as usize] {
                 continue;
             }
-            for (i, &cache) in draft_kv.caches.iter().enumerate() {
+            for (cache, dpb, before) in draft_kv.layout() {
                 let at = (j * p) as u64 * dpb as u64;
-                let host = self.pool.address(c) + base + i * p * dpb;
+                let host = self.pool.address(c) + base + p * before;
                 copy(&self.copy, Direction::ToHost, host, cache + at, p * dpb)?;
                 bytes += p * dpb;
             }
@@ -548,15 +546,15 @@ impl HostCache {
         let p = HOST_CHUNK_POSITIONS;
         let target = model.global_kv(slot)?;
         let e = &self.entries[h];
-        let pb = self.target.position_bytes;
         ensure!(
-            target.caches.len() == self.target.caches.len() && target.position_bytes == pb,
+            target.caches.len() == self.target.caches.len()
+                && target.position_bytes == self.target.position_bytes,
             "the slot's global caches differ from the host cache's"
         );
         for (j, &c) in e.kv.iter().enumerate() {
-            for (i, &cache) in target.caches.iter().enumerate() {
+            for (cache, pb, before) in target.layout() {
                 let at = (j * p) as u64 * pb as u64;
-                let host = self.pool.address(c) + i * p * pb;
+                let host = self.pool.address(c) + p * before;
                 copy(&self.main, Direction::ToDevice, host, cache + at, p * pb)?;
             }
         }
@@ -578,12 +576,11 @@ impl HostCache {
         let p = HOST_CHUNK_POSITIONS;
         let e = &self.entries[h];
         let draft_kv = draft.global_kv(&self.main);
-        let dpb = self.draft.position_bytes;
         let base = p * self.target.bytes_per_position();
         for (j, &c) in e.kv.iter().enumerate() {
-            for (i, &cache) in draft_kv.caches.iter().enumerate() {
+            for (cache, dpb, before) in draft_kv.layout() {
                 let at = (j * p) as u64 * dpb as u64;
-                let host = self.pool.address(c) + base + i * p * dpb;
+                let host = self.pool.address(c) + base + p * before;
                 copy(&self.main, Direction::ToDevice, host, cache + at, p * dpb)?;
             }
         }

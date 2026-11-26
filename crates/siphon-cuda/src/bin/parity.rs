@@ -30,6 +30,7 @@ mod linux {
     use siphon::{Checkpoint, TextConfig};
     use siphon_cuda::{
         Gpu,
+        kv_options::KvOptions,
         model::{Model, Trace},
         ops::attention::KvFormat,
         weights::{WeightFormat, Weights},
@@ -45,6 +46,7 @@ mod linux {
         detail: Option<String>,
         kv: KvFormat,
         weights: WeightFormat,
+        kv_options: KvOptions,
     }
 
     fn args() -> anyhow::Result<Args> {
@@ -53,9 +55,11 @@ mod linux {
         let mut detail = None;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut kv_options = KvOptions::default();
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
-            if arg == "--passes" {
+            if kv_options.parse(&arg, &mut it)? {
+            } else if arg == "--passes" {
                 passes = Some(it.next().context("--passes needs a value")?.parse()?);
             } else if arg == "--detail" {
                 detail = Some(it.next().context("--detail needs a step name")?);
@@ -69,7 +73,7 @@ mod linux {
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: parity <model-dir> <capture.safetensors> [--passes N] [--detail STEP] \
-             [--kv bf16|fp8] [--weights bf16|fp8]",
+             [--kv bf16|fp8] [--weights bf16|fp8] [kv options]",
         )?;
         Ok(Args {
             model,
@@ -78,6 +82,7 @@ mod linux {
             detail,
             kv,
             weights,
+            kv_options,
         })
     }
 
@@ -168,6 +173,7 @@ mod linux {
             args.kv,
             args.weights,
         )?;
+        args.kv_options.apply(&mut model)?;
 
         let mut trace = Trace::default();
         let mut matches = 0;

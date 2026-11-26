@@ -80,15 +80,39 @@ pub enum KvFormat {
     /// the bytes attention reads. Keys are L2-clipped to norm `sqrt(512)` and values are
     /// RMS-normed, so every element lies far inside E4M3's range of +-448.
     Fp8,
+    /// NVFP4: E2M1 values with one E4M3 scale per 16 elements, the scale `amax / 6`
+    /// rounded to nearest, 4.5 bits per element. Each slot of a cache holds a head's 64
+    /// bytes of values per KV head, then their 8 scales per KV head.
+    Nvfp4,
+    /// FP8 for the first [`MIXED_FP8_VISITS`] global visits and NVFP4 for the rest. Layer 5
+    /// and the first pass of layer 11 are the visits whose rounding to 4 bits costs the
+    /// most (see engine.md, "KV cache reduction").
+    Mixed,
 }
 
+/// Global visits, in visit order, that [`KvFormat::Mixed`] keeps in FP8.
+pub const MIXED_FP8_VISITS: usize = 2;
+
 impl KvFormat {
-    /// Bytes of one stored key or value element.
+    /// The format of the cache of global visit `global` (its index among the global
+    /// visits, in visit order): this format, or for [`KvFormat::Mixed`] FP8 or NVFP4.
     #[must_use]
-    pub fn element_bytes(self) -> usize {
+    pub fn cache_format(self, global: usize) -> Self {
         match self {
-            Self::Bf16 => 2,
-            Self::Fp8 => 1,
+            Self::Mixed if global < MIXED_FP8_VISITS => Self::Fp8,
+            Self::Mixed => Self::Nvfp4,
+            f => f,
+        }
+    }
+
+    /// Bytes one position takes in a key or a value buffer of `dims` elements of a cache of
+    /// this format; for [`KvFormat::Mixed`], of an NVFP4 cache.
+    #[must_use]
+    pub fn row_bytes(self, dims: usize) -> usize {
+        match self {
+            Self::Bf16 => 2 * dims,
+            Self::Fp8 => dims,
+            Self::Nvfp4 | Self::Mixed => dims / 2 + dims / 16,
         }
     }
 }
@@ -100,7 +124,9 @@ impl FromStr for KvFormat {
         match s {
             "bf16" => Ok(Self::Bf16),
             "fp8" => Ok(Self::Fp8),
-            _ => bail!("unknown KV cache format {s:?}; expected bf16 or fp8"),
+            "nvfp4" => Ok(Self::Nvfp4),
+            "mixed" => Ok(Self::Mixed),
+            _ => bail!("unknown KV cache format {s:?}; expected bf16, fp8, nvfp4 or mixed"),
         }
     }
 }
@@ -110,6 +136,47 @@ impl fmt::Display for KvFormat {
         f.write_str(match self {
             Self::Bf16 => "bf16",
             Self::Fp8 => "fp8",
+            Self::Nvfp4 => "nvfp4",
+            Self::Mixed => "mixed",
+        })
+    }
+}
+
+/// A 4-bit rounding the global caches' keys and values go through before they are stored,
+/// to measure what a 4-bit cache would cost in quality. The storage stays in its
+/// [`KvFormat`], so memory and speed do not change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvQuant {
+    /// The values as computed.
+    #[default]
+    None,
+    /// NVFP4: E2M1 values with one E4M3 scale per 16 elements, the scale `amax / 6`
+    /// rounded to nearest.
+    Nvfp4,
+    /// llama.cpp's `q4_0`: 4-bit integers with one F16 scale per 32 elements, the scale the
+    /// signed element of largest magnitude over -8.
+    Q4_0,
+}
+
+impl FromStr for KvQuant {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "none" => Ok(Self::None),
+            "nvfp4" => Ok(Self::Nvfp4),
+            "q4_0" => Ok(Self::Q4_0),
+            _ => bail!("unknown KV rounding {s:?}; expected none, nvfp4 or q4_0"),
+        }
+    }
+}
+
+impl fmt::Display for KvQuant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Nvfp4 => "nvfp4",
+            Self::Q4_0 => "q4_0",
         })
     }
 }

@@ -144,6 +144,11 @@ pub enum PrefillLogits<'a> {
     /// Also every row's F32 logits after the softcap (`[unpadded_vocab]`), passed with the
     /// row's position in order. [`Model::logits`] returns the last row's afterwards.
     All(&'a mut dyn FnMut(usize, &[f32]) -> anyhow::Result<()>),
+    /// [`PrefillLogits::All`] for the rows whose position is a multiple of the count only.
+    Every(
+        usize,
+        &'a mut dyn FnMut(usize, &[f32]) -> anyhow::Result<()>,
+    ),
 }
 
 /// Intermediates of the message gates for a chunk.
@@ -611,8 +616,29 @@ impl Model {
             scratch,
             max_blocks,
             prefill,
+            rounded_below,
             ..
         } = self;
+        let rounding = ctx.kv_rounding;
+        if rounding.recent > 0 {
+            // Rows that left the recent window since the last chunk take the 4-bit format.
+            let mut end = start.saturating_sub(rounding.recent);
+            if rounding.keys_per_channel {
+                end -= end % rounding.channel_rows();
+            }
+            if end > *rounded_below {
+                for v in visits.iter_mut().filter(|v| v.round) {
+                    ctx.kernels.attention.age_rows(
+                        &ctx.stream,
+                        &mut v.kv,
+                        *rounded_below,
+                        end - *rounded_below,
+                        rounding,
+                    )?;
+                }
+                *rounded_below = end;
+            }
+        }
         let p = prefill
             .as_mut()
             .context("the prefill buffers are missing")?;
@@ -1007,9 +1033,12 @@ impl Ctx {
             cfg.unpadded_vocab_size,
         )?;
 
-        let PrefillLogits::All(callback) = logits else {
-            return Ok(());
+        let (every, callback) = match logits {
+            PrefillLogits::Last => return Ok(()),
+            PrefillLogits::All(callback) => (1, callback),
+            PrefillLogits::Every(every, callback) => (*every, callback),
         };
+        ensure!(every > 0, "logits every 0 rows");
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
         let step = if fp8.is_some() {
             linear_rows::MAX_ROWS
@@ -1018,6 +1047,10 @@ impl Ctx {
         };
         for first in (0..m).step_by(step) {
             let n = step.min(m - first);
+            let wanted = (first..first + n).filter(|&i| (start + i).is_multiple_of(every));
+            if wanted.clone().next().is_none() {
+                continue;
+            }
             self.gemm_rows(
                 &mut [RowProduct {
                     weight: self.weights.lm_head.slice(),
@@ -1035,11 +1068,21 @@ impl Ctx {
                 &mut rows_mut(&mut p.head_capped, n, vocab),
                 cfg.final_logit_softcapping,
             )?;
-            let host = &mut p.head_host[..n * vocab];
-            self.stream
-                .memcpy_dtoh(&rows(&p.head_capped, n, vocab), host)?;
-            for (i, row) in host.chunks_exact(vocab).enumerate() {
-                callback(start + first + i, row)?;
+            if every == 1 {
+                let host = &mut p.head_host[..n * vocab];
+                self.stream
+                    .memcpy_dtoh(&rows(&p.head_capped, n, vocab), host)?;
+                for (i, row) in host.chunks_exact(vocab).enumerate() {
+                    callback(start + first + i, row)?;
+                }
+            } else {
+                for i in wanted {
+                    let row = i - first;
+                    let host = &mut p.head_host[..vocab];
+                    self.stream
+                        .memcpy_dtoh(&p.head_capped.slice(row * vocab..(row + 1) * vocab), host)?;
+                    callback(start + i, host)?;
+                }
             }
         }
         Ok(())
@@ -1709,6 +1752,15 @@ impl Ctx {
             )?;
         }
 
+        if state.round {
+            self.kernels.attention.round_rows(
+                &self.stream,
+                &mut rows_mut(&mut t.k, m, kv_dims),
+                &mut rows_mut(&mut t.v, m, kv_dims),
+                m,
+                self.kv_rounding,
+            )?;
+        }
         if let Some(batch) = batch {
             ensure!(invariant, "a batched step runs the invariant kernels");
             self.kernels.attention.attention_batch(

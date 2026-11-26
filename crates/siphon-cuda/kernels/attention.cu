@@ -158,8 +158,12 @@ __device__ __forceinline__ uint32_t pack_e4m3x4(float a, float b, float c, float
 // decodes 16 bytes and `unpack4` the 4 elements at `p`.
 struct Bf16Format {
     using Elem = __nv_bfloat16;
+    static constexpr bool kFp4 = false;
     static constexpr int kTile = 32;
     static constexpr int kChunkElems = 8;
+    // Elems of one head's row, and of the 16-byte chunk at which chunk c starts.
+    static constexpr int kRowElems = kHeadDim;
+    static constexpr int kChunkStride = 8;
     __device__ static void unpack_chunk(uint4 raw, float (&v)[kChunkElems]) { unpack_bf16x8(raw, v); }
     __device__ static void unpack4(const Elem* p, float (&v)[4]) {
         unpack_bf16x4(*reinterpret_cast<const uint2*>(p), v);
@@ -177,8 +181,11 @@ struct Bf16Format {
 
 struct Fp8Format {
     using Elem = uint8_t;
+    static constexpr bool kFp4 = false;
     static constexpr int kTile = 64;
     static constexpr int kChunkElems = 16;
+    static constexpr int kRowElems = kHeadDim;
+    static constexpr int kChunkStride = 16;
     __device__ static void unpack_chunk(uint4 raw, float (&v)[kChunkElems]) { unpack_e4m3x16(raw, v); }
     __device__ static void unpack4(const Elem* p, float (&v)[4]) {
         unpack_e4m3x4(*reinterpret_cast<const uint32_t*>(p), v);
@@ -205,6 +212,124 @@ template <>
 struct IsFp8Mma<Fp8MmaFormat> {
     static constexpr bool value = true;
 };
+
+// NVFP4 global caches (`KvFormat::Nvfp4`). Each slot holds kFp4Row = 576 bytes per
+// buffer: the 8 heads' E2M1 values, 64 bytes each with element 2i in the low nibble of
+// byte i, then the 8 heads' E4M3 scales, 8 each, one per 16 elements. An element is its
+// E2M1 value times its group's scale. The appends round each group as kv_round_bf16's
+// NVFP4 mode does: scale E4M3(amax / 6) to nearest, values E2M1(x / scale) to nearest
+// even, saturated at 6. Rounding an already rounded group again gives the same bytes
+// (its largest element is 6 times the scale), so the verify and prefill paths round
+// their rows to NVFP4 values in BF16 first (kv_round_bf16) and every reader sees one
+// value per element. Attention decodes exactly: an E2M1 value times an E4M3 scale has
+// at most 6 significant bits and lies in F16's normal range.
+constexpr int kFp4HeadBytes = kHeadDim / 2;
+constexpr int kFp4HeadScales = kHeadDim / 16;
+constexpr int kFp4Data = kKvHeads * kFp4HeadBytes;
+constexpr int kFp4Row = kKvHeads * (kFp4HeadBytes + kFp4HeadScales);
+
+__device__ __forceinline__ size_t fp4_data(unsigned slot, int head) {
+    return size_t(slot) * kFp4Row + head * kFp4HeadBytes;
+}
+
+__device__ __forceinline__ size_t fp4_scales(unsigned slot, int head) {
+    return size_t(slot) * kFp4Row + kFp4Data + head * kFp4HeadScales;
+}
+
+// Four bytes of E2M1 pairs as four F16 pairs, byte i's low nibble in the low half of
+// word i.
+__device__ __forceinline__ void e2m1x8_to_f16x8(uint32_t raw, uint32_t (&h)[4]) {
+    asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\ncvt.rn.f16x2.e2m1x2 %3, b3;\n}"
+        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
+        : "r"(raw));
+}
+
+// Eight values, already divided by their scale, as four bytes of E2M1 pairs.
+__device__ __forceinline__ uint32_t pack_e2m1x8(const float (&x)[8]) {
+    uint32_t r;
+    asm("{\n.reg .b8 b0, b1, b2, b3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\ncvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\ncvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n"
+        "mov.b32 %0, {b0, b1, b2, b3};\n}"
+        : "=r"(r)
+        : "f"(x[0]), "f"(x[1]), "f"(x[2]), "f"(x[3]), "f"(x[4]), "f"(x[5]), "f"(x[6]), "f"(x[7]));
+    return r;
+}
+
+__device__ __forceinline__ uint8_t fp4_scale_of(float amax) {
+    return __nv_cvt_float_to_fp8(amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+}
+
+__device__ __forceinline__ float e4m3_value(uint8_t s) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(s, __NV_E4M3)));
+}
+
+__device__ __forceinline__ __half2 e4m3_half2(uint8_t s) {
+    const __half h = __half(__nv_cvt_fp8_to_halfraw(s, __NV_E4M3));
+    return __halves2half2(h, h);
+}
+
+__device__ __forceinline__ uint32_t hmul2_bits(uint32_t x, __half2 s) {
+    const __half2 r = __hmul2(*reinterpret_cast<const __half2*>(&x), s);
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
+
+// A group of 16 values, x[i] the value of element i, as 8 bytes of E2M1 pairs and its
+// scale byte.
+__device__ __forceinline__ uint2 fp4_group(const float (&x)[16], uint8_t& scale) {
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+    scale = fp4_scale_of(amax);
+    const float s = e4m3_value(scale);
+    float q[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        q[i] = s == 0.f ? 0.f : __fdiv_rn(x[i], s);
+    }
+    const float lo[8] = {q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]};
+    const float hi[8] = {q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]};
+    return make_uint2(pack_e2m1x8(lo), pack_e2m1x8(hi));
+}
+
+// The 32 elements of a 16-byte chunk times their two groups' scales, as F32.
+__device__ __forceinline__ void unpack_fp4x32(uint4 raw, uint8_t s0, uint8_t s1, float (&v)[32]) {
+    const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        uint32_t h[4];
+        e2m1x8_to_f16x8(words[w], h);
+        const float s = e4m3_value(w < 2 ? s0 : s1);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h[i]));
+            v[8 * w + 2 * i] = f.x * s;
+            v[8 * w + 2 * i + 1] = f.y * s;
+        }
+    }
+}
+
+// The NVFP4 cache format of decode attention, prefill and the rows kernels. Tiles hold
+// the raw bytes, kRowElems per head row, and the scales beside them.
+struct Fp4Format {
+    using Elem = uint8_t;
+    static constexpr bool kFp4 = true;
+    static constexpr int kTile = 64;
+    static constexpr int kChunkElems = 32;
+    static constexpr int kRowElems = kFp4HeadBytes;
+    static constexpr int kChunkStride = 16;
+};
+
+// Copies 8 bytes from global to shared memory without blocking, or writes 8 zero bytes
+// when `valid` is false.
+__device__ __forceinline__ void copy_async8(void* dst, const void* src, bool valid) {
+    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(shared), "l"(src), "r"(valid ? 8 : 0));
+}
 
 // atomicAdd with acquire and release semantics at GPU scope.
 __device__ __forceinline__ unsigned atomic_add_acq_rel(unsigned* p, unsigned v) {
@@ -237,8 +362,12 @@ struct alignas(16) DecodeShared {
     // swizzled: logical chunk c of row r sits at chunk c ^ (r % kChunks), so
     // that the lanes of a quarter warp, reading the same logical chunk of
     // consecutive rows, hit distinct banks.
-    typename F::Elem k[2][kTile * kHeadDim];
-    typename F::Elem v[2][kTile * kHeadDim];
+    typename F::Elem k[2][kTile * F::kRowElems];
+    typename F::Elem v[2][kTile * F::kRowElems];
+    // NVFP4: each tile row's 8 scale bytes (stubs otherwise).
+    static constexpr int kScaleTile = F::kFp4 ? kTile * kFp4HeadScales : 16;
+    uint8_t ks[2][kScaleTile];
+    uint8_t vs[2][kScaleTile];
     // Per-warp partial scores over each warp's quarter of the dims.
     float scores[kWarps][kGroup][kTile];
     // Softmax weights of the tile's keys for the 3 heads, padded to 4.
@@ -251,8 +380,10 @@ struct alignas(16) DecodeShared {
     // new key and value of the block's KV head in the cache format.
     float q[kGroup][kHeadDim];
     float rel[kGroup][kRelDim];
-    alignas(16) typename F::Elem new_k[kHeadDim];
-    alignas(16) typename F::Elem new_v[kHeadDim];
+    alignas(16) typename F::Elem new_k[F::kRowElems];
+    alignas(16) typename F::Elem new_v[F::kRowElems];
+    alignas(8) uint8_t new_ks[kFp4HeadScales];
+    alignas(8) uint8_t new_vs[kFp4HeadScales];
     bool last;
 };
 
@@ -264,7 +395,8 @@ __device__ __forceinline__ void load_tile(DecodeShared<F>& sm, int stage, const 
                                           unsigned end) {
     constexpr int kTile = F::kTile;
     constexpr int kChunks = DecodeShared<F>::kChunks;
-    constexpr int kElems = F::kChunkElems;
+    constexpr int kElems = F::kChunkStride;
+    constexpr int kRow = F::kRowElems;
 #pragma unroll
     for (int k = 0; k < kTile * kChunks / kThreads; ++k) {
         const int i = threadIdx.x + k * kThreads;
@@ -272,9 +404,23 @@ __device__ __forceinline__ void load_tile(DecodeShared<F>& sm, int stage, const 
         const int chunk = i % kChunks;
         const unsigned slot = first + row;
         const bool valid = slot < end;
-        const size_t offset = size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * kElems;
-        copy_async16(&sm.k[stage][row * kHeadDim + (chunk ^ (row % kChunks)) * kElems], k_cache + offset, valid);
-        copy_async16(&sm.v[stage][row * kHeadDim + chunk * kElems], v_cache + offset, valid);
+        const size_t offset = F::kFp4 ? fp4_data(valid ? slot : 0, kv_head) + chunk * kElems
+                                      : size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * kElems;
+        copy_async16(&sm.k[stage][row * kRow + (chunk ^ (row % kChunks)) * kElems], k_cache + offset, valid);
+        copy_async16(&sm.v[stage][row * kRow + chunk * kElems], v_cache + offset, valid);
+    }
+    if constexpr (F::kFp4) {
+        // Thread t < kTile copies row t's key scales, thread kTile + t its value scales.
+        static_assert(2 * kTile <= kThreads);
+        const int row = threadIdx.x % kTile;
+        const unsigned slot = first + row;
+        const bool valid = slot < end;
+        const size_t offset = fp4_scales(valid ? slot : 0, kv_head);
+        if (threadIdx.x < kTile) {
+            copy_async8(&sm.ks[stage][row * kFp4HeadScales], k_cache + offset, valid);
+        } else if (threadIdx.x < 2 * kTile) {
+            copy_async8(&sm.vs[stage][row * kFp4HeadScales], v_cache + offset, valid);
+        }
     }
     copy_async_commit();
 }
@@ -563,16 +709,27 @@ __device__ __forceinline__ void load_columns(unsigned short (&columns)[kLaneKeys
 template <class F>
 __device__ __forceinline__ void patch_tile(DecodeShared<F>& sm, int stage, int row) {
     constexpr int kChunks = DecodeShared<F>::kChunks;
-    constexpr int kElems = F::kChunkElems;
+    constexpr int kElems = F::kChunkStride;
+    constexpr int kRow = F::kRowElems;
 #pragma unroll
     for (int k = 0; k < F::kTile * kChunks / kThreads; ++k) {
         const int i = threadIdx.x + k * kThreads;
         if (i / kChunks == row) {
             const int chunk = i % kChunks;
-            *reinterpret_cast<uint4*>(&sm.k[stage][row * kHeadDim + (chunk ^ (row % kChunks)) * kElems]) =
+            *reinterpret_cast<uint4*>(&sm.k[stage][row * kRow + (chunk ^ (row % kChunks)) * kElems]) =
                 *reinterpret_cast<const uint4*>(&sm.new_k[chunk * kElems]);
-            *reinterpret_cast<uint4*>(&sm.v[stage][row * kHeadDim + chunk * kElems]) =
+            *reinterpret_cast<uint4*>(&sm.v[stage][row * kRow + chunk * kElems]) =
                 *reinterpret_cast<const uint4*>(&sm.new_v[chunk * kElems]);
+        }
+    }
+    if constexpr (F::kFp4) {
+        // The threads that copied row `row`'s scales in load_tile.
+        if (threadIdx.x == row) {
+            *reinterpret_cast<uint2*>(&sm.ks[stage][row * kFp4HeadScales]) =
+                *reinterpret_cast<const uint2*>(sm.new_ks);
+        } else if (threadIdx.x == F::kTile + row) {
+            *reinterpret_cast<uint2*>(&sm.vs[stage][row * kFp4HeadScales]) =
+                *reinterpret_cast<const uint2*>(sm.new_vs);
         }
     }
 }
@@ -850,11 +1007,36 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                 y[0][i] = conv_step::round_bf16(__fmul_rn(y[0][i], factor));
                 y[1][i] = conv_step::round_bf16(y[1][i] * norm);
             }
-            const size_t row = size_t(newest) * kKvRow + c0;
-            F::store4(step.k_cache + row, y[0]);
-            F::store4(step.v_cache + row, y[1]);
-            F::store4(sm.new_k + lane * 4, y[0]);
-            F::store4(sm.new_v + lane * 4, y[1]);
+            if constexpr (F::kFp4) {
+                // Lanes 4i .. 4i + 3 hold group i of the head's 8.
+#pragma unroll
+                for (int kv = 0; kv < 2; ++kv) {
+                    float amax = fmaxf(fmaxf(fabsf(y[kv][0]), fabsf(y[kv][1])), fmaxf(fabsf(y[kv][2]), fabsf(y[kv][3])));
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                    const uint8_t s8 = fp4_scale_of(amax);
+                    const float sc = e4m3_value(s8);
+                    float x[8] = {};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        x[i] = sc == 0.f ? 0.f : __fdiv_rn(y[kv][i], sc);
+                    }
+                    const auto code = uint16_t(pack_e2m1x8(x) & 0xffffu);
+                    uint8_t* cache = kv == 0 ? step.k_cache : step.v_cache;
+                    *reinterpret_cast<uint16_t*>(cache + fp4_data(newest, kv_head) + 2 * lane) = code;
+                    *reinterpret_cast<uint16_t*>((kv == 0 ? sm.new_k : sm.new_v) + 2 * lane) = code;
+                    if (lane % 4 == 0) {
+                        cache[fp4_scales(newest, kv_head) + lane / 4] = s8;
+                        (kv == 0 ? sm.new_ks : sm.new_vs)[lane / 4] = s8;
+                    }
+                }
+            } else {
+                const size_t row = size_t(newest) * kKvRow + c0;
+                F::store4(step.k_cache + row, y[0]);
+                F::store4(step.v_cache + row, y[1]);
+                F::store4(sm.new_k + lane * 4, y[0]);
+                F::store4(sm.new_v + lane * 4, y[1]);
+            }
             // Shift the raw inputs into the conv states.
 #pragma unroll
             for (int kv = 0; kv < 2; ++kv) {
@@ -926,14 +1108,31 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
 #pragma unroll
         for (int j = 0; j < kLaneKeys; ++j) {
             const int row = lane + 32 * j;
-            const typename F::Elem* keys = sm.k[stage] + row * kHeadDim;
+            const typename F::Elem* keys = sm.k[stage] + row * F::kRowElems;
             float acc[kGroup] = {};
+            if constexpr (F::kFp4) {
+                // Chunk `warp` holds this warp's 32 dims, with scales 2 warp and 2 warp + 1.
+                const uint4 raw = *reinterpret_cast<const uint4*>(keys + (warp ^ (row % kChunks)) * 16);
+                const uint8_t* sc = &sm.ks[stage][row * kFp4HeadScales + 2 * warp];
+                float kv[32];
+                unpack_fp4x32(raw, sc[0], sc[1], kv);
 #pragma unroll
-            for (int c = 0; c < kWarpDims / kElems; ++c) {
+                for (int i = 0; i < 32; ++i) {
+#pragma unroll
+                    for (int h = 0; h < kGroup; ++h) {
+                        acc[h] = fmaf(qs[h][i], kv[i], acc[h]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < (F::kFp4 ? 0 : kWarpDims / kElems); ++c) {
                 const int chunk_index = warp * (kWarpDims / kElems) + c;
-                const uint4 raw = *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (row % kChunks)) * kElems);
+                const uint4 raw =
+                    *reinterpret_cast<const uint4*>(keys + (chunk_index ^ (row % kChunks)) * F::kChunkStride);
                 float kv[kElems];
-                F::unpack_chunk(raw, kv);
+                if constexpr (!F::kFp4) {
+                    F::unpack_chunk(raw, kv);
+                }
 #pragma unroll
                 for (int i = 0; i < kElems; ++i) {
 #pragma unroll
@@ -1018,7 +1217,19 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
 #pragma unroll
         for (int r = warp * kWarpKeys; r < (warp + 1) * kWarpKeys; ++r) {
             float v[4];
-            F::unpack4(values + r * kHeadDim + lane * 4, v);
+            if constexpr (F::kFp4) {
+                uint32_t h[4];
+                e2m1x8_to_f16x8(*reinterpret_cast<const uint16_t*>(values + r * kFp4HeadBytes + 2 * lane), h);
+                const float sc = e4m3_value(sm.vs[stage][r * kFp4HeadScales + lane / 4]);
+                const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+                const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+                v[0] = a.x * sc;
+                v[1] = a.y * sc;
+                v[2] = b.x * sc;
+                v[3] = b.y * sc;
+            } else {
+                F::unpack4(values + r * kHeadDim + lane * 4, v);
+            }
             const float4 w = sm.weights[r];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -1031,8 +1242,8 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
 
     // Sum the 4 warps' accumulators and write this split's partials.
     __syncthreads();
-    static_assert(sizeof(sm.k[0]) >= kWarps * kGroup * kHeadDim * sizeof(float));
-    auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(sm.k[0]);
+    static_assert(sizeof(sm.k) >= kWarps * kGroup * kHeadDim * sizeof(float));
+    auto* reduce = reinterpret_cast<float(*)[kGroup][kHeadDim]>(&sm.k[0][0]);
 #pragma unroll
     for (int h = 0; h < kGroup; ++h) {
 #pragma unroll
@@ -1252,6 +1463,23 @@ decode_step_fp8(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __
                 const unsigned* position, unsigned slots, unsigned window, unsigned extent, int log_scale,
                 float alpha, float n_floor, float qk_threshold, float rel_threshold, float eps, float scale) {
     decode_step<Fp8Format>(k_raw, v_raw, k_weight, v_weight, k_dynamic, v_dynamic, k_static, v_static, k_state,
+                           v_state, q_raw, q_scale, r_raw, r_scale, table, sinks, gate, k_cache, v_cache,
+                           partial_out, partial_max, partial_sum, counters, out, position, slots, window, extent,
+                           log_scale, alpha, n_floor, qk_threshold, rel_threshold, eps, scale);
+}
+
+// `decode_step_bf16` with an NVFP4 cache, appending each group as kv_append_rows_fp4.
+extern "C" __global__ void __launch_bounds__(kThreads)
+decode_step_fp4(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __nv_bfloat16* k_weight,
+                const __nv_bfloat16* v_weight, const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
+                const float* k_static, const float* v_static, float* k_state, float* v_state,
+                const __nv_bfloat16* q_raw, const __nv_bfloat16* q_scale, const __nv_bfloat16* r_raw,
+                const __nv_bfloat16* r_scale, const __nv_bfloat16* table, const __nv_bfloat16* sinks,
+                const __nv_bfloat16* gate, uint8_t* k_cache, uint8_t* v_cache, float* partial_out,
+                float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out,
+                const unsigned* position, unsigned slots, unsigned window, unsigned extent, int log_scale,
+                float alpha, float n_floor, float qk_threshold, float rel_threshold, float eps, float scale) {
+    decode_step<Fp4Format>(k_raw, v_raw, k_weight, v_weight, k_dynamic, v_dynamic, k_static, v_static, k_state,
                            v_state, q_raw, q_scale, r_raw, r_scale, table, sinks, gate, k_cache, v_cache,
                            partial_out, partial_max, partial_sum, counters, out, position, slots, window, extent,
                            log_scale, alpha, n_floor, qk_threshold, rel_threshold, eps, scale);
@@ -1663,7 +1891,28 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         // once.
         const unsigned first = tile.input ? tile.p0 - start : tile.p0 % slots;
         const unsigned wrap = tile.input ? 0xffffffffu : slots;
-        if constexpr (kFp8) {
+        if constexpr (F::kFp4) {
+            // 4 chunks of 32 E2M1 values per row, unswizzled, then the row's 8 scales after
+            // the tile's data.
+            constexpr int kChunks = kFp4HeadBytes / 16;
+            const int chunk = threadIdx.x % kChunks;
+#pragma unroll
+            for (int row = threadIdx.x / kChunks; row < kPrefillKeys; row += kThreads / kChunks) {
+                const bool valid = tile.p0 + row < tile.end;
+                unsigned source = first + row;
+                source = source >= wrap ? source - wrap : source;
+                const unsigned slot = valid ? source : 0;
+                const size_t offset = fp4_data(slot, g.kv_head) + chunk * 16;
+                copy_async16(&sm.k8[stage][row * kFp4HeadBytes + chunk * 16], k_cache + offset, valid);
+                copy_async16(&sm.v8[stage][row * kFp4HeadBytes + chunk * 16], v_cache + offset, valid);
+                if (chunk == 0) {
+                    const size_t scales = fp4_scales(slot, g.kv_head);
+                    constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+                    copy_async8(&sm.k8[stage][kScalesAt + row * kFp4HeadScales], k_cache + scales, valid);
+                    copy_async8(&sm.v8[stage][kScalesAt + row * kFp4HeadScales], v_cache + scales, valid);
+                }
+            }
+        } else if constexpr (kFp8) {
             // 8 chunks of 16 E4M3 values per row.
             constexpr int kChunks = kHeadDim / 16;
             const int chunk = threadIdx.x % kChunks;
@@ -1937,6 +2186,45 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                         const int dim = 4 * quad + d;
                         *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(sm.k[0]) + vt_offset(dim, position / 16) +
                                                      position % 16) = out4[d];
+                    }
+                }
+                __syncthreads();
+            } else if constexpr (F::kFp4) {
+                // Each group of 16 elements becomes two BF16 key chunks and two F16 value chunks.
+                constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
+                for (int i = threadIdx.x; i < kPrefillKeys * kFp4HeadScales; i += kThreads) {
+                    const int row = i / kFp4HeadScales;
+                    const int group = i % kFp4HeadScales;
+#pragma unroll
+                    for (int kv = 0; kv < 2; ++kv) {
+                        const uint8_t* staged = kv == 0 ? sm.k8[stage] : sm.v8[stage];
+                        const uint2 raw = *reinterpret_cast<const uint2*>(&staged[row * kFp4HeadBytes + group * 8]);
+                        const __half2 sc = e4m3_half2(staged[kScalesAt + row * kFp4HeadScales + group]);
+                        uint32_t h[8];
+                        uint32_t lo[4];
+                        uint32_t hi[4];
+                        e2m1x8_to_f16x8(raw.x, lo);
+                        e2m1x8_to_f16x8(raw.y, hi);
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) {
+                            h[w] = hmul2_bits(lo[w], sc);
+                            h[4 + w] = hmul2_bits(hi[w], sc);
+                        }
+                        if (kv == 0) {
+                            // Keys go to BF16, exactly: at most 6 significant bits, within range.
+#pragma unroll
+                            for (int w = 0; w < 8; ++w) {
+                                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h[w]));
+                                h[w] = pack_bf16x2(f.x, f.y);
+                            }
+                            *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * group)]) = make_uint4(h[0], h[1], h[2], h[3]);
+                            *reinterpret_cast<uint4*>(&sm.k[0][swizzle(row, 2 * group + 1)]) =
+                                make_uint4(h[4], h[5], h[6], h[7]);
+                        } else {
+                            *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * group)]) = make_uint4(h[0], h[1], h[2], h[3]);
+                            *reinterpret_cast<uint4*>(&sm.v[0][swizzle(row, 2 * group + 1)]) =
+                                make_uint4(h[4], h[5], h[6], h[7]);
+                        }
                     }
                 }
                 __syncthreads();
@@ -2283,6 +2571,52 @@ kv_append_rows_fp8(const __nv_bfloat16* k, const __nv_bfloat16* v, uint8_t* k_ca
         make_uint2(pack_e4m3x4(x[0], x[1], x[2], x[3]), pack_e4m3x4(x[4], x[5], x[6], x[7]));
 }
 
+// The NVFP4 variant of `kv_append_rows_bf16`: thread i of a row's 64 rounds group i
+// (16 elements of head i / 8) of its key and value as kv_round_bf16's NVFP4 mode does.
+extern "C" __global__ void __launch_bounds__(64)
+kv_append_rows_fp4(const __nv_bfloat16* k, const __nv_bfloat16* v, uint8_t* k_cache, uint8_t* v_cache,
+                   const unsigned* start, unsigned slots) {
+    if (blockIdx.x + slots < gridDim.x) {
+        return;
+    }
+    const int head = threadIdx.x / kFp4HeadScales;
+    const int group = threadIdx.x % kFp4HeadScales;
+    const size_t src = size_t(blockIdx.x) * kKvRow + threadIdx.x * 16;
+    const unsigned slot = (*start + blockIdx.x) % slots;
+#pragma unroll
+    for (int kv = 0; kv < 2; ++kv) {
+        const __nv_bfloat16* x = kv == 0 ? k : v;
+        float lo[8];
+        float hi[8];
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(x + src), lo);
+        unpack_bf16x8(*reinterpret_cast<const uint4*>(x + src + 8), hi);
+        float vals[16];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            vals[i] = lo[i];
+            vals[8 + i] = hi[i];
+        }
+        uint8_t scale;
+        const uint2 data = fp4_group(vals, scale);
+        uint8_t* cache = kv == 0 ? k_cache : v_cache;
+        *reinterpret_cast<uint2*>(cache + fp4_data(slot, head) + group * 8) = data;
+        cache[fp4_scales(slot, head) + group] = scale;
+    }
+}
+
+// `prefill_attention_bf16` over NVFP4 caches. Every key comes from the cache
+// (input_keys must be 0).
+extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
+prefill_attention_fp4(const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
+                      const uint8_t* k_cache, const uint8_t* v_cache, const __nv_bfloat16* bias,
+                      const __nv_bfloat16* sinks, float* partials, unsigned* counters, __nv_bfloat16* out,
+                      const unsigned* start, unsigned rows, unsigned slots, unsigned window, unsigned extent,
+                      unsigned input_keys, float scale) {
+    prefill_attention<Fp4Format, kPrefillWarps>(q, k_in, v_in, k_cache, v_cache, bias, sinks, partials,
+                                                counters, out, start, rows, slots, window, extent, input_keys,
+                                                scale);
+}
+
 extern "C" __global__ void __launch_bounds__(kPrefillWarps * 32)
 prefill_attention_bf16(const __nv_bfloat16* q, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
                        const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const __nv_bfloat16* bias,
@@ -2323,6 +2657,8 @@ prefill_attention_fp8_mma(const __nv_bfloat16* q, const __nv_bfloat16* k_in, con
 static_assert(sizeof(PrefillShared<Bf16Format, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp8Format, kPrefillWarps>) <= 84240);
 static_assert(sizeof(PrefillShared<Fp8MmaFormat, kPrefillWarps>) <= 84240);
+static_assert(sizeof(PrefillShared<Fp4Format, kPrefillWarps>) <= 84240);
+static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <= PrefillShared<Fp4Format, kPrefillWarps>::kStaged);
 
 
 // ---------------------------------------------------------------------------
@@ -2395,14 +2731,23 @@ template <>
 struct RowsStages<Fp8Format> {
     static constexpr int kValue = 3;
 };
+template <>
+struct RowsStages<Fp4Format> {
+    static constexpr int kValue = 3;
+};
 
 template <class F>
 struct alignas(16) RowsShared {
     static constexpr int kStages = RowsStages<F>::kValue;
-    // Each warp's key and value chunks, [16, 128], 16-byte chunk c of row r at c ^ (r & 7).
-    typename F::Elem k[kRowsWarps][kStages][kRowsChunk * kHeadDim];
-    typename F::Elem v[kRowsWarps][kStages][kRowsChunk * kHeadDim];
+    // Each warp's key and value chunks, [16, 128], 16-byte chunk c of row r at c ^ (r & 7);
+    // NVFP4: [16, 64] bytes, chunk c of row r at c ^ (r & 3), then [16, 8] scales.
+    static constexpr int kTileElems =
+        F::kFp4 ? kRowsChunk * (kFp4HeadBytes + kFp4HeadScales) : kRowsChunk * kHeadDim;
+    typename F::Elem k[kRowsWarps][kStages][kTileElems];
+    typename F::Elem v[kRowsWarps][kStages][kTileElems];
 };
+// Where a warp's NVFP4 tile keeps its scales.
+constexpr int kRowsFp4Scales = kRowsChunk * kFp4HeadBytes;
 
 // What a split block keeps in the chunks' place once its warps are done: two sums of
 // scaled warp outputs, and each warp's max and sum per query row.
@@ -2444,6 +2789,13 @@ __device__ __forceinline__ float rows_cache_value<Bf16Format>(float x) {
     return x;
 }
 
+// The verify pass rounds the rows to NVFP4 values before this kernel (kv_round_bf16),
+// which the append keeps exactly.
+template <>
+__device__ __forceinline__ float rows_cache_value<Fp4Format>(float x) {
+    return x;
+}
+
 template <>
 __device__ __forceinline__ float rows_cache_value<Fp8Format>(float x) {
     float v[4];
@@ -2466,6 +2818,9 @@ __device__ __forceinline__ uint32_t movmatrix_trans(uint32_t x) {
 // Byte offset of 16-byte chunk `chunk` of row `row` in a warp's [16, 128] chunk tile.
 template <class F>
 __device__ __forceinline__ int rows_offset(int row, int chunk) {
+    if constexpr (F::kFp4) {
+        return row * kFp4HeadBytes + ((chunk ^ (row & 3)) << 4);
+    }
     constexpr int kRowBytes = kHeadDim * int(sizeof(typename F::Elem));
     return row * kRowBytes + ((chunk ^ (row & 7)) << 4);
 }
@@ -2475,6 +2830,27 @@ __device__ __forceinline__ int rows_offset(int row, int chunk) {
 template <class F>
 __device__ __forceinline__ void rows_copy_chunk(typename F::Elem* dst, const typename F::Elem* cache, int kv_head,
                                                 unsigned first, unsigned end, int lane) {
+    if constexpr (F::kFp4) {
+        // 4 data chunks per row, two per lane, and lanes 0 .. 15 copy row lane's scales.
+        constexpr int kChunks = kFp4HeadBytes / 16;
+#pragma unroll
+        for (int k = 0; k < kRowsChunk * kChunks / 32; ++k) {
+            const int i = lane + 32 * k;
+            const int row = i / kChunks;
+            const int chunk = i % kChunks;
+            const unsigned slot = first + row;
+            const bool valid = slot < end;
+            copy_async16(reinterpret_cast<char*>(dst) + rows_offset<F>(row, chunk),
+                         cache + fp4_data(valid ? slot : 0, kv_head) + chunk * 16, valid);
+        }
+        if (lane < kRowsChunk) {
+            const unsigned slot = first + lane;
+            const bool valid = slot < end;
+            copy_async8(reinterpret_cast<char*>(dst) + kRowsFp4Scales + lane * kFp4HeadScales,
+                        cache + fp4_scales(valid ? slot : 0, kv_head), valid);
+        }
+        return;
+    }
     constexpr int kChunks = kHeadDim * int(sizeof(typename F::Elem)) / 16;
     constexpr int kElems = 16 / int(sizeof(typename F::Elem));
 #pragma unroll
@@ -2506,6 +2882,22 @@ template <>
 struct RowsRaw4<Fp8Format> {
     using Type = uint32_t;
     __device__ static void unpack(uint32_t raw, float (&v)[4]) { unpack_e4m3x4(raw, v); }
+};
+template <>
+struct RowsRaw4<Fp4Format> {
+    using Type = uint32_t;
+    // Two bytes of E2M1 pairs, then the scale.
+    __device__ static void unpack(uint32_t raw, float (&v)[4]) {
+        uint32_t h[4];
+        e2m1x8_to_f16x8(raw & 0xffffu, h);
+        const float sc = e4m3_value(uint8_t(raw >> 16));
+        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+        const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+        v[0] = a.x * sc;
+        v[1] = a.y * sc;
+        v[2] = b.x * sc;
+        v[3] = b.y * sc;
+    }
 };
 
 // A recent block: each row's keys at distances 0 .. 7 and its sink. Warp w of recent block
@@ -2544,6 +2936,7 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
 
     uint4 key_new[4];
     uint4 key_old[32 / kElems];
+    uint16_t key_old_scales = 0;
     uint4 q_raw[kGroup][4];
     unsigned short bias_raw[kGroup];
     unsigned short sink_raw[kGroup];
@@ -2555,10 +2948,15 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
         for (int c = 0; c < 4; ++c) {
             key_new[c] = *reinterpret_cast<const uint4*>(src + 8 * c);
         }
-        const typename F::Elem* old = k_cache + size_t(old_slot(d)) * kKvRow + kv_head * kHeadDim + 32 * part;
+        if constexpr (F::kFp4) {
+            key_old[0] = *reinterpret_cast<const uint4*>(k_cache + fp4_data(old_slot(d), kv_head) + 16 * part);
+            key_old_scales = *reinterpret_cast<const uint16_t*>(k_cache + fp4_scales(old_slot(d), kv_head) + 2 * part);
+        } else {
+            const typename F::Elem* old = k_cache + size_t(old_slot(d)) * kKvRow + kv_head * kHeadDim + 32 * part;
 #pragma unroll
-        for (int c = 0; c < 32 / kElems; ++c) {
-            key_old[c] = *reinterpret_cast<const uint4*>(old + kElems * c);
+            for (int c = 0; c < 32 / kElems; ++c) {
+                key_old[c] = *reinterpret_cast<const uint4*>(old + kElems * c);
+            }
         }
     }
 #pragma unroll
@@ -2575,8 +2973,15 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
     for (int key_d = 0; key_d < kRowsRecent; ++key_d) {
         value_new[key_d] = *reinterpret_cast<const uint2*>(
             v_new + (size_t(key_d <= j ? j - key_d : 0) * kKvHeads + kv_head) * kHeadDim + 4 * lane);
-        value_old[key_d] = *reinterpret_cast<const Raw4*>(v_cache + size_t(old_slot(key_d)) * kKvRow +
-                                                          kv_head * kHeadDim + 4 * lane);
+        if constexpr (F::kFp4) {
+            // Two data bytes in the low half, the group's scale above them.
+            value_old[key_d] =
+                Raw4(*reinterpret_cast<const uint16_t*>(v_cache + fp4_data(old_slot(key_d), kv_head) + 2 * lane)) |
+                Raw4(v_cache[fp4_scales(old_slot(key_d), kv_head) + lane / 4]) << 16;
+        } else {
+            value_old[key_d] = *reinterpret_cast<const Raw4*>(v_cache + size_t(old_slot(key_d)) * kKvRow +
+                                                              kv_head * kHeadDim + 4 * lane);
+        }
     }
 
     // Key d of this row, dims 32 part .. 32 part + 31, as attention reads it.
@@ -2591,13 +2996,17 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
         }
     }
     if (d > j) {
+        if constexpr (F::kFp4) {
+            unpack_fp4x32(key_old[0], uint8_t(key_old_scales & 0xffu), uint8_t(key_old_scales >> 8), key);
+        } else {
 #pragma unroll
-        for (int c = 0; c < 32 / kElems; ++c) {
-            float v[kElems];
-            F::unpack_chunk(key_old[c], v);
+            for (int c = 0; c < 32 / kElems; ++c) {
+                float v[kElems];
+                F::unpack_chunk(key_old[c], v);
 #pragma unroll
-            for (int e = 0; e < kElems; ++e) {
-                key[kElems * c + e] = v[e];
+                for (int e = 0; e < kElems; ++e) {
+                    key[kElems * c + e] = v[e];
+                }
             }
         }
     }
@@ -2772,9 +3181,30 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
         if (k_cache != nullptr && qi % kGroup == 0) {
             const size_t row = qi / kGroup;
             const size_t channel = size_t(kv_head) * kHeadDim + d;
-            const size_t dst = size_t((start + unsigned(row)) % slots) * kKvRow + channel;
-            F::store1(k_cache + dst, k_new[row * kKvRow + channel]);
-            F::store1(v_cache + dst, v_new[row * kKvRow + channel]);
+            if constexpr (F::kFp4) {
+                // Thread 16 i rounds group i of the head, as kv_append_rows_fp4 does.
+                if (d % 16 == 0) {
+                    const unsigned slot = (start + unsigned(row)) % slots;
+#pragma unroll
+                    for (int kv = 0; kv < 2; ++kv) {
+                        const __nv_bfloat16* x = (kv == 0 ? k_new : v_new) + row * kKvRow + channel;
+                        float vals[16];
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            vals[i] = __bfloat162float(x[i]);
+                        }
+                        uint8_t sc;
+                        const uint2 data = fp4_group(vals, sc);
+                        typename F::Elem* cache = kv == 0 ? k_cache : v_cache;
+                        *reinterpret_cast<uint2*>(cache + fp4_data(slot, kv_head) + d / 2) = data;
+                        cache[fp4_scales(slot, kv_head) + d / 16] = sc;
+                    }
+                }
+            } else {
+                const size_t dst = size_t((start + unsigned(row)) % slots) * kKvRow + channel;
+                F::store1(k_cache + dst, k_new[row * kKvRow + channel]);
+                F::store1(v_cache + dst, v_new[row * kKvRow + channel]);
+            }
         }
     }
 }
@@ -2939,7 +3369,38 @@ __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typenam
                 s[j][r] = 0.f;
             }
         }
-        if constexpr (kFp8) {
+        if constexpr (F::kFp4) {
+            // Rows g and g + 8, dims 32 t .. 32 t + 31: chunk t and scales 2 t, 2 t + 1. K-step
+            // ks takes dims 32 t + 4 ks .. + 3, as in the E4M3 layout: bytes 2 ks and 2 ks + 1.
+            const char* tile = reinterpret_cast<const char*>(sm.k[warp][stage]);
+            const uint4 ra = *reinterpret_cast<const uint4*>(tile + rows_offset<F>(g, t));
+            const uint4 rb = *reinterpret_cast<const uint4*>(tile + rows_offset<F>(g + 8, t));
+            const uint8_t* sc = reinterpret_cast<const uint8_t*>(tile) + kRowsFp4Scales;
+            const __half2 sa[2] = {e4m3_half2(sc[g * kFp4HeadScales + 2 * t]),
+                                   e4m3_half2(sc[g * kFp4HeadScales + 2 * t + 1])};
+            const __half2 sb[2] = {e4m3_half2(sc[(g + 8) * kFp4HeadScales + 2 * t]),
+                                   e4m3_half2(sc[(g + 8) * kFp4HeadScales + 2 * t + 1])};
+            const uint32_t wa[4] = {ra.x, ra.y, ra.z, ra.w};
+            const uint32_t wb[4] = {rb.x, rb.y, rb.z, rb.w};
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                uint32_t ha[4];
+                uint32_t hb[4];
+                e2m1x8_to_f16x8(wa[w], ha);
+                e2m1x8_to_f16x8(wb[w], hb);
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int ks = 2 * w + half;
+                    const uint32_t a[4] = {hmul2_bits(ha[2 * half], sa[w / 2]), hmul2_bits(hb[2 * half], sb[w / 2]),
+                                           hmul2_bits(ha[2 * half + 1], sa[w / 2]),
+                                           hmul2_bits(hb[2 * half + 1], sb[w / 2])};
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        mma_f16(s[j], a, qf[j][ks][0], qf[j][ks][1]);
+                    }
+                }
+            }
+        } else if constexpr (kFp8) {
             const char* tile = reinterpret_cast<const char*>(sm.k[warp][stage]);
             const uint4 a0 = *reinterpret_cast<const uint4*>(tile + rows_offset<F>(g, 2 * t));
             const uint4 a1 = *reinterpret_cast<const uint4*>(tile + rows_offset<F>(g, 2 * t + 1));
@@ -3036,7 +3497,42 @@ __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typenam
 
         copy_async_wait<2 * kStages - 1>();
         __syncwarp();
-        if constexpr (kFp8) {
+        if constexpr (F::kFp4) {
+            // As the E4M3 layout: m-tile i holds dims 16 g + i and 16 g + 8 + i, here group g of
+            // keys 2 t, 2 t + 1, 2 t + 8 and 2 t + 9, 8 bytes in half g % 2 of chunk g / 2.
+            const char* tile = reinterpret_cast<const char*>(sm.v[warp][stage]);
+            const uint8_t* sc = reinterpret_cast<const uint8_t*>(tile) + kRowsFp4Scales;
+            const int keys[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+            // vals[k][w]: F16 pairs of dims 16 g + 2 w, + 1 of key k, scaled.
+            uint32_t vals[4][8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint2 raw =
+                    *reinterpret_cast<const uint2*>(tile + rows_offset<F>(keys[k], g / 2) + 8 * (g % 2));
+                const __half2 scale2 = e4m3_half2(sc[keys[k] * kFp4HeadScales + g]);
+                uint32_t lo[4];
+                uint32_t hi[4];
+                e2m1x8_to_f16x8(raw.x, lo);
+                e2m1x8_to_f16x8(raw.y, hi);
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    vals[k][w] = hmul2_bits(lo[w], scale2);
+                    vals[k][4 + w] = hmul2_bits(hi[w], scale2);
+                }
+            }
+            // F16 pair of dim 16 g + d of keys k and k + 1, the first key in the low half.
+            const auto pair = [&](int k, int dim) {
+                return __byte_perm(vals[k][dim / 2], vals[k + 1][dim / 2], dim % 2 ? 0x7632u : 0x5410u);
+            };
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t a[4] = {pair(0, i), pair(0, 8 + i), pair(2, i), pair(2, 8 + i)};
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    mma_f16(o[j][i], a, pb[j][0], pb[j][1]);
+                }
+            }
+        } else if constexpr (kFp8) {
             // A fragments of V^T: m-tile i holds dims 16 g + i and 16 g + 8 + i of row g, from
             // chunk g of keys 2 t, 2 t + 1, 2 t + 8 and 2 t + 9.
             const char* tile = reinterpret_cast<const char*>(sm.v[warp][stage]);
@@ -3286,6 +3782,24 @@ ATTENTION_ROWS(1)
 ATTENTION_ROWS(2)
 ATTENTION_ROWS(3)
 
+// The NVFP4 variant of attention_rows, `attention_rows_fp4_<NT>`.
+#define ATTENTION_ROWS_FP4(NT)                                                                                \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_rows_fp4_##NT(                   \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new, uint8_t* k_cache,      \
+        uint8_t* v_cache, const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out,             \
+        float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out,                         \
+        const __nv_bfloat16* gate, const unsigned* start, int rows, unsigned slots, unsigned window,            \
+        unsigned extent, float scale) {                                                                          \
+        extern __shared__ __align__(16) char rows_smem[];                                                        \
+        attention_rows<Fp4Format, NT>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out,               \
+                                      partial_max, partial_sum, counters, out, gate, start, rows, slots,         \
+                                      window, extent, scale, rows_smem);                                         \
+    }
+
+ATTENTION_ROWS_FP4(1)
+ATTENTION_ROWS_FP4(2)
+ATTENTION_ROWS_FP4(3)
+
 // Words per row of a batched step's state table (see `BATCH_STATE_WORDS` in ops/spec.rs):
 // the device addresses of the row's key cache, value cache, and key, value,
 // post-attention and post-MLP conv states.
@@ -3347,6 +3861,199 @@ attention_batch_fp8(const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __
                                counters, out, gate, positions, slots, window, extent, scale, rows_smem);
 }
 
-// The launcher passes these as the dynamic shared memory of the two kernels.
+extern "C" __global__ void __launch_bounds__(kRowsThreads, 2)
+attention_batch_fp4(const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+                    const unsigned long long* states, const __nv_bfloat16* bias, const __nv_bfloat16* sinks,
+                    float* partial_out, float* partial_max, float* partial_sum, unsigned* counters,
+                    __nv_bfloat16* out, const __nv_bfloat16* gate, const unsigned* positions, unsigned slots,
+                    unsigned window, unsigned extent, float scale) {
+    extern __shared__ __align__(16) char rows_smem[];
+    attention_batch<Fp4Format>(q, k_new, v_new, states, bias, sinks, partial_out, partial_max, partial_sum,
+                               counters, out, gate, positions, slots, window, extent, scale, rows_smem);
+}
+
+// The launcher passes these as the dynamic shared memory of the three kernels.
 static_assert(sizeof(RowsShared<Bf16Format>) == 32768);
 static_assert(sizeof(RowsShared<Fp8Format>) == 49152);
+static_assert(sizeof(RowsShared<Fp4Format>) == 27648);
+static_assert(sizeof(RowsMerge) <= sizeof(RowsShared<Fp4Format>));
+
+// Rounds a global cache's keys and values through a 4-bit format and back, in place,
+// to measure what a 4-bit cache would cost in quality (`KvQuant` on the host). The
+// storage stays BF16, which holds every rounded value exactly for NVFP4 and to 8
+// significant bits for q4_0. Row r is row *start + r of k and v, or row r without
+// start; each row is [8 heads, 128]. One warp per head of one row of k (blockIdx.y
+// 0) or v (1); lane l holds elements 4l .. 4l + 3.
+//
+// mode 1, NVFP4: per 16 elements, scale s = E4M3(amax / 6) rounded to nearest, each
+// element E2M1(x / s) rounded to nearest, ties to even, saturated to +-6.
+// mode 2, q4_0 as llama.cpp's quantize_row_q4_0: per 32 elements, d = m / -8 for the
+// signed element m of largest magnitude, q = min(15, floor(x / d + 8.5)), value
+// (q - 8) * F16(d).
+// With rotate, each head goes through the orthonormal 128-point Hadamard transform
+// before rounding and back after, as if queries and outputs were rotated the same way
+// and the cache stored rotated keys and values.
+namespace {
+
+__device__ __forceinline__ float e2m1_round(float y) {
+    const float a = fabsf(y);
+    float r;
+    if (a <= 0.25f) {
+        r = 0.f;
+    } else if (a < 0.75f) {
+        r = 0.5f;
+    } else if (a <= 1.25f) {
+        r = 1.f;
+    } else if (a < 1.75f) {
+        r = 1.5f;
+    } else if (a <= 2.5f) {
+        r = 2.f;
+    } else if (a < 3.5f) {
+        r = 3.f;
+    } else if (a <= 5.f) {
+        r = 4.f;
+    } else {
+        r = 6.f;
+    }
+    return copysignf(r, y);
+}
+
+// The orthonormal Hadamard transform (Sylvester order) of the warp's 128 elements;
+// its own inverse.
+__device__ __forceinline__ void hadamard128(float (&x)[4]) {
+    const float a0 = x[0] + x[1], a1 = x[0] - x[1], a2 = x[2] + x[3], a3 = x[2] - x[3];
+    x[0] = a0 + a2;
+    x[2] = a0 - a2;
+    x[1] = a1 + a3;
+    x[3] = a1 - a3;
+    const unsigned lane = threadIdx.x & 31u;
+#pragma unroll
+    for (unsigned m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float o = __shfl_xor_sync(0xffffffffu, x[j], m);
+            x[j] = (lane & m) ? o - x[j] : x[j] + o;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        x[j] *= 0.08838834764831845f;
+    }
+}
+
+__device__ __forceinline__ void round_nvfp4(float (&x)[4]) {
+    float amax = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+    const float s = __half2float(__half(__nv_cvt_fp8_to_halfraw(s8, __NV_E4M3)));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        x[j] = s == 0.f ? 0.f : e2m1_round(__fdiv_rn(x[j], s)) * s;
+    }
+}
+
+__device__ __forceinline__ void round_q4_0(float (&x)[4]) {
+    float m = x[0];
+#pragma unroll
+    for (int j = 1; j < 4; ++j) {
+        if (fabsf(x[j]) > fabsf(m)) {
+            m = x[j];
+        }
+    }
+#pragma unroll
+    for (unsigned o = 1; o < 8; o <<= 1) {
+        const float other = __shfl_xor_sync(0xffffffffu, m, o);
+        // Ties keep the earlier element, as llama.cpp's scan does.
+        const bool lower = (threadIdx.x & o) != 0;
+        if (fabsf(other) > fabsf(m) || (fabsf(other) == fabsf(m) && lower)) {
+            m = other;
+        }
+    }
+    const float d = m / -8.f;
+    const float id = d != 0.f ? 1.f / d : 0.f;
+    const float dh = __half2float(__float2half_rn(d));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q = min(15, int(x[j] * id + 8.5f));
+        x[j] = float(q - 8) * dh;
+    }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+kv_round_bf16(__nv_bfloat16* k, __nv_bfloat16* v, const unsigned* start, unsigned first, int mode, int rotate,
+              int which) {
+    // Everything this kernel reads comes from earlier kernels. It never triggers early, so
+    // the next kernel starts after it ends.
+    pdl_wait();
+    if (!(which & (1 << blockIdx.y))) {
+        return;
+    }
+    const unsigned row = blockIdx.x + first + (start ? *start : 0u);
+    __nv_bfloat16* base = (blockIdx.y == 0 ? k : v) + size_t(row) * kKvRow + (threadIdx.x / 32) * kHeadDim +
+                          (threadIdx.x & 31u) * 4;
+    float x[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        x[j] = __bfloat162float(base[j]);
+    }
+    if (rotate) {
+        hadamard128(x);
+    }
+    if (mode == 1) {
+        round_nvfp4(x);
+    } else if (mode == 2) {
+        round_q4_0(x);
+    } else {
+        unpack_e4m3x4(pack_e4m3x4(x[0], x[1], x[2], x[3]), x);
+    }
+    if (rotate) {
+        hadamard128(x);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        base[j] = __float2bfloat16_rn(x[j]);
+    }
+}
+
+// Rounds keys per channel instead of per token, as KIVI quantizes them: each group of
+// 16 (mode 1, NVFP4) or 32 (mode 2, q4_0) consecutive rows from row `first` shares one
+// scale per channel. One thread per group and channel of k ([rows, 1024]).
+extern "C" __global__ void __launch_bounds__(256)
+kv_round_channels_bf16(__nv_bfloat16* k, unsigned first, unsigned groups, int mode) {
+    pdl_wait();
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= groups * kKvRow) {
+        return;
+    }
+    const int rows = mode == 1 ? 16 : 32;
+    __nv_bfloat16* base = k + (size_t(first) + size_t(i / kKvRow) * rows) * kKvRow + i % kKvRow;
+    float x[32];
+    float amax = 0.f, m = 0.f;
+    for (int r = 0; r < rows; ++r) {
+        x[r] = __bfloat162float(base[size_t(r) * kKvRow]);
+        if (fabsf(x[r]) > fabsf(m)) {
+            m = x[r];
+        }
+        amax = fmaxf(amax, fabsf(x[r]));
+    }
+    if (mode == 1) {
+        const __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+        const float sc = __half2float(__half(__nv_cvt_fp8_to_halfraw(s8, __NV_E4M3)));
+        for (int r = 0; r < rows; ++r) {
+            x[r] = sc == 0.f ? 0.f : e2m1_round(__fdiv_rn(x[r], sc)) * sc;
+        }
+    } else {
+        const float d = m / -8.f;
+        const float id = d != 0.f ? 1.f / d : 0.f;
+        const float dh = __half2float(__float2half_rn(d));
+        for (int r = 0; r < rows; ++r) {
+            x[r] = float(min(15, int(x[r] * id + 8.5f)) - 8) * dh;
+        }
+    }
+    for (int r = 0; r < rows; ++r) {
+        base[size_t(r) * kKvRow] = __float2bfloat16_rn(x[r]);
+    }
+}

@@ -64,6 +64,7 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     # The host uploads the position before the step; no kernel writes it.
     "decode_step_bf16": {"position"},
     "decode_step_fp8": {"position"},
+    "decode_step_fp4": {"position"},
     "attention_post_bf16": {"position"},
     # The embedding norm and the first layer's input norm.
     "decode_prologue_2304": {"embed_norm", "input_norm"},
@@ -71,9 +72,9 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     # uploads the start before the pass, and only the kernel's own combining blocks
     # append to the cache, after the wait.
     **{f"attention_rows_{f}_{nt}": {"k_cache", "v_cache", "start"}
-       for f in ("bf16", "fp8") for nt in (1, 2, 3)},
+       for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
     # A batched step's state tables and positions: the host writes them before the step.
-    **{f"attention_batch_{f}": {"states", "positions"} for f in ("bf16", "fp8")},
+    **{f"attention_batch_{f}": {"states", "positions"} for f in ("bf16", "fp8", "fp4")},
     "attention_post_rows_bf16": {"states", "positions"},
 }
 
@@ -82,7 +83,7 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
 # copies its first cache tiles before the wait, from each row's caches in its state table,
 # as attention_rows does from k_cache and v_cache.
 ADDRESS_TABLES: dict[str, set[str]] = {
-    f"attention_batch_{f}": {"states"} for f in ("bf16", "fp8")
+    f"attention_batch_{f}": {"states"} for f in ("bf16", "fp8", "fp4")
 }
 
 # Pointer fields of struct parameters, by (kernel file, type name): the stride of the

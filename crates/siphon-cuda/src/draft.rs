@@ -1098,8 +1098,9 @@ impl Draft {
                 })
                 .collect(),
             position_bytes: globals
-                .first()
-                .map_or(0, |c| KV_WIDTH * if c.fp8 { 1 } else { 2 }),
+                .iter()
+                .flat_map(|c| [KV_WIDTH * if c.fp8 { 1 } else { 2 }; 2])
+                .collect(),
             capacity: self.capacity,
         }
     }

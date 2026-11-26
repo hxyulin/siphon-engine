@@ -92,6 +92,38 @@ impl TextConfig {
             .collect()
     }
 
+    /// For each visit, the format of its global cache under `kv` (see
+    /// [`crate::KvFormat::cache_format`]), or `None` for a sliding visit.
+    #[must_use]
+    pub fn cache_formats(
+        &self,
+        passes: usize,
+        kv: crate::KvFormat,
+    ) -> Vec<Option<crate::KvFormat>> {
+        let mut global = 0;
+        self.visit_layers(passes)
+            .into_iter()
+            .map(|layer| {
+                if self.is_sliding(layer) {
+                    return None;
+                }
+                global += 1;
+                Some(kv.cache_format(global - 1))
+            })
+            .collect()
+    }
+
+    /// Bytes one position takes in one sequence's global caches, keys and values.
+    #[must_use]
+    pub fn global_cache_bytes(&self, passes: usize, kv: crate::KvFormat) -> usize {
+        let dims = self.num_key_value_heads * self.head_dim;
+        self.cache_formats(passes, kv)
+            .into_iter()
+            .flatten()
+            .map(|f| 2 * f.row_bytes(dims))
+            .sum()
+    }
+
     /// Whether `layer` uses sliding-window attention.
     #[must_use]
     pub fn is_sliding(&self, layer: usize) -> bool {

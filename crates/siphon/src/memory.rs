@@ -366,7 +366,7 @@ impl Planner {
                 )
             }
         };
-        let kv_per_position = streams * global_visits * 2 * kv_dims * inputs.kv.element_bytes();
+        let kv_per_position = streams * c.global_cache_bytes(c.loop_config.num_passes, inputs.kv);
         // The batched step's chunk buffers for one row per stream, its state tables,
         // positions and tokens, and its rows' taps for the draft.
         let batch = if streams > 1 {
@@ -843,14 +843,23 @@ mod tests {
         let global = visits.iter().filter(|&&l| !c.is_sliding(l)).count();
         assert_eq!(global, 8);
         let kv_dims = c.num_key_value_heads * c.head_dim;
+        assert_eq!(global * 2 * KvFormat::Bf16.row_bytes(kv_dims), 32 << 10);
+        assert_eq!(global * 2 * KvFormat::Fp8.row_bytes(kv_dims), 16 << 10);
+        // NVFP4: 576 bytes per buffer and position, 9 KiB per position over 8 caches.
+        assert_eq!(KvFormat::Nvfp4.row_bytes(kv_dims), 576);
+        let passes = c.loop_config.num_passes;
+        assert_eq!(c.global_cache_bytes(passes, KvFormat::Fp8), 16 << 10);
+        assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4), 9 << 10);
+        // Mixed: visits 5 and 11 in FP8, 2 KiB each, the other 6 in NVFP4.
         assert_eq!(
-            global * 2 * kv_dims * KvFormat::Bf16.element_bytes(),
-            32 << 10
+            c.global_cache_bytes(passes, KvFormat::Mixed),
+            2 * 2048 + 6 * 1152
         );
-        assert_eq!(
-            global * 2 * kv_dims * KvFormat::Fp8.element_bytes(),
-            16 << 10
-        );
+        let formats = c.cache_formats(passes, KvFormat::Mixed);
+        assert_eq!(formats[5], Some(KvFormat::Fp8));
+        assert_eq!(formats[11], Some(KvFormat::Fp8));
+        assert_eq!(formats[17], Some(KvFormat::Nvfp4));
+        assert_eq!(formats[47], Some(KvFormat::Nvfp4));
     }
 
     #[test]

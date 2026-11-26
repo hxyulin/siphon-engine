@@ -100,6 +100,7 @@ mod linux {
     use siphon_cuda::{
         Gpu,
         draft::DraftOptions,
+        kv_options::KvOptions,
         model::{
             Accept, BATCH_ROWS, DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK,
             MAX_PREFILL_CHUNK, Model, PrefillAttention, PrefillLogits, VerifyTokens,
@@ -125,7 +126,9 @@ mod linux {
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--expert-activations bf16|quantized|fp8] \
-                         [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]";
+                         [--prefill-attention auto|bf16|fp8] [--prefill-dense bf16|fp8] [--json]\n       \
+                         every mode also takes [--kv-quant none|nvfp4|q4_0] [--kv-rotate] \
+                         [--kv-quant-visits V,V,...]";
 
     #[expect(clippy::struct_excessive_bools, reason = "command-line flags")]
     struct Args {
@@ -168,6 +171,7 @@ mod linux {
         batch: Option<Vec<usize>>,
         /// Whether the draft follows row 0 of the batched steps.
         follow: bool,
+        kv_options: KvOptions,
     }
 
     fn token_counts(arg: &str, value: &str) -> anyhow::Result<Vec<usize>> {
@@ -208,8 +212,12 @@ mod linux {
         let mut seeds = 6;
         let mut batch = None;
         let mut follow = false;
+        let mut kv_options = KvOptions::default();
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
+            if kv_options.parse(&arg, &mut it)? {
+                continue;
+            }
             let mut value = || it.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
                 "--contexts" => contexts = Some(token_counts(&arg, &value()?)?),
@@ -291,6 +299,7 @@ mod linux {
             seeds,
             batch,
             follow,
+            kv_options,
         })
     }
 
@@ -428,6 +437,7 @@ mod linux {
             args.kv,
             args.weights,
         )?;
+        args.kv_options.apply(&mut model)?;
         model.set_expert_activations(args.expert_activations)?;
         model.set_prefill_attention(args.prefill_attention);
         model.set_prefill_dense(args.prefill_dense)?;
@@ -549,17 +559,14 @@ mod linux {
         }
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
-        let global_visits = config
-            .visit_layers(passes)
-            .into_iter()
-            .filter(|&layer| !config.is_sliding(layer))
-            .count();
-        // Keys and values in every global visit.
-        let kv_bytes_per_token = global_visits
-            * 2
-            * args.kv.element_bytes()
-            * config.num_key_value_heads
-            * config.head_dim;
+        // Keys and values every global visit reads per position.
+        let kv_dims = config.num_key_value_heads * config.head_dim;
+        let kv_bytes_per_token: usize = config
+            .cache_formats(passes, args.kv)
+            .iter()
+            .flatten()
+            .map(|f| 2 * f.row_bytes(kv_dims))
+            .sum();
         let tail = args.warmup + args.steps;
 
         let gpu = Gpu::new(0)?;
@@ -596,6 +603,7 @@ mod linux {
             args.kv,
             args.weights,
         )?;
+        args.kv_options.apply(&mut model)?;
         let weight_bytes = match args.weights {
             WeightFormat::Bf16 => WEIGHT_BYTES_PER_TOKEN,
             WeightFormat::Fp8 => WEIGHT_BYTES_PER_TOKEN - FP8_SAVED_BYTES_PER_TOKEN,
@@ -700,6 +708,7 @@ mod linux {
             args.kv,
             args.weights,
         )?;
+        args.kv_options.apply(&mut model)?;
         model.add_slots(largest - 1)?;
         let mut speculator = if args.follow {
             let draft = load_draft(
@@ -1001,6 +1010,7 @@ mod linux {
                 args.kv,
                 args.weights,
             )?;
+            args.kv_options.apply(&mut model)?;
             println!(
                 "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
                  before load: {}",

@@ -96,12 +96,18 @@ fn thousands(n: usize) -> String {
 }
 
 fn format_name(weights: WeightFormat, kv: KvFormat) -> String {
-    let name = |fp8: bool| if fp8 { "FP8" } else { "BF16" };
-    format!(
-        "{} / {}",
-        name(weights == WeightFormat::Fp8),
-        name(kv == KvFormat::Fp8)
-    )
+    let weights = if weights == WeightFormat::Fp8 {
+        "FP8"
+    } else {
+        "BF16"
+    };
+    let kv = match kv {
+        KvFormat::Fp8 => "FP8",
+        KvFormat::Bf16 => "BF16",
+        KvFormat::Nvfp4 => "NVFP4",
+        KvFormat::Mixed => "mixed",
+    };
+    format!("{weights} / {kv}")
 }
 
 /// The GPU's memory by holder, in the order the bar draws it; the vision tower only with

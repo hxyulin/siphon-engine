@@ -11,7 +11,7 @@ use anyhow::ensure;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _};
 
 use super::{Model, VisitState};
-use crate::ops::attention::{HEAD_DIM, KV_HEADS, KvData};
+use crate::ops::attention::KvData;
 
 /// A device buffer's address and length in bytes, for copies to and from host memory
 /// (the prefix cache's host tier, `spec::HostCache`).
@@ -31,13 +31,14 @@ impl DeviceSpan {
 }
 
 /// The global KV caches of a slot or of the draft, from [`Model::global_kv`]: position `p`
-/// of cache `c` takes the `position_bytes` bytes at `caches[c] + p * position_bytes`.
+/// of cache `c` takes the `position_bytes[c]` bytes at `caches[c] + p * position_bytes[c]`.
+/// The caches of a mixed layout differ in size (FP8 and NVFP4).
 #[derive(Clone, Debug)]
 pub struct GlobalKv {
     /// Each global cache's keys, then its values, by visit or layer.
     pub caches: Vec<u64>,
-    /// Bytes of one position in one cache.
-    pub position_bytes: usize,
+    /// Bytes of one position in each cache.
+    pub position_bytes: Vec<usize>,
     /// Positions each cache holds.
     pub capacity: usize,
 }
@@ -46,7 +47,21 @@ impl GlobalKv {
     /// Bytes of one position over every cache.
     #[must_use]
     pub fn bytes_per_position(&self) -> usize {
-        self.caches.len() * self.position_bytes
+        self.position_bytes.iter().sum()
+    }
+
+    /// Each cache's address, bytes per position, and the bytes per position of the caches
+    /// before it: a block of `n` positions of every cache, one cache after another, holds
+    /// cache `c` from `n` times that last number on.
+    pub fn layout(&self) -> impl Iterator<Item = (u64, usize, usize)> + '_ {
+        let mut before = 0;
+        self.caches
+            .iter()
+            .zip(&self.position_bytes)
+            .map(move |(&cache, &bytes)| {
+                before += bytes;
+                (cache, bytes, before - bytes)
+            })
     }
 }
 
@@ -60,7 +75,7 @@ fn visit_spans(visits: &[VisitState], stream: &CudaStream) -> Vec<DeviceSpan> {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
-                KvData::Fp8 { keys, values } => {
+                KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
@@ -98,7 +113,7 @@ impl LocalState {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
-                Some(KvData::Fp8 { keys, values }) => {
+                Some(KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values }) => {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
@@ -117,7 +132,9 @@ impl LocalState {
             .map(|(ring, conv)| {
                 let ring = match ring {
                     Some(KvData::Bf16 { keys, values }) => (keys.len() + values.len()) * 2,
-                    Some(KvData::Fp8 { keys, values }) => keys.len() + values.len(),
+                    Some(KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values }) => {
+                        keys.len() + values.len()
+                    }
                     None => 0,
                 };
                 ring + conv.iter().map(|c| c.len() * 4).sum::<usize>()
@@ -136,22 +153,19 @@ impl Model {
             &self.slot_state(slot)?.visits
         };
         let mut caches = Vec::new();
-        let (mut position_bytes, mut capacity) = (0, 0);
+        let mut position_bytes = Vec::new();
+        let mut capacity = 0;
         for v in visits.iter().filter(|v| v.kv.window().is_none()) {
-            let (keys, values, elem) = match v.kv.data() {
-                KvData::Bf16 { keys, values } => (
-                    DeviceSpan::of(keys, stream),
-                    DeviceSpan::of(values, stream),
-                    2,
-                ),
-                KvData::Fp8 { keys, values } => (
-                    DeviceSpan::of(keys, stream),
-                    DeviceSpan::of(values, stream),
-                    1,
-                ),
+            let (keys, values) = match v.kv.data() {
+                KvData::Bf16 { keys, values } => {
+                    (DeviceSpan::of(keys, stream), DeviceSpan::of(values, stream))
+                }
+                KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                    (DeviceSpan::of(keys, stream), DeviceSpan::of(values, stream))
+                }
             };
             caches.extend([keys.ptr, values.ptr]);
-            position_bytes = KV_HEADS * HEAD_DIM * elem;
+            position_bytes.extend([v.kv.row_bytes(); 2]);
             capacity = v.kv.slots();
         }
         Ok(GlobalKv {
@@ -205,10 +219,9 @@ impl Model {
                         keys: stream.alloc_zeros(keys.len())?,
                         values: stream.alloc_zeros(values.len())?,
                     }),
-                    (Some(_), KvData::Fp8 { keys, values }) => Some(KvData::Fp8 {
-                        keys: stream.alloc_zeros(keys.len())?,
-                        values: stream.alloc_zeros(values.len())?,
-                    }),
+                    (Some(_), KvData::Fp8 { .. } | KvData::Nvfp4 { .. }) => {
+                        anyhow::bail!("sliding rings are BF16")
+                    }
                 };
                 let conv = v
                     .conv

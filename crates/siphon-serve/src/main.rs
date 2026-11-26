@@ -30,7 +30,7 @@ const DECODE_FLOOR: f64 = 20.0;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] \
-                     [--output-projection bf16|fp8] [--kv fp8|bf16] [--streams 1] \
+                     [--output-projection bf16|fp8] [--kv fp8|bf16|nvfp4|mixed] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8] \
@@ -86,6 +86,13 @@ image_url parts and base64 image blocks in Anthropic messages. Image URLs are no
 --max-image-pixels shrinks a larger image to this many pixels, keeping its aspect ratio
 (default 1920 x 1080 = 2,073,600, up to 1,369 image tokens). --max-images refuses a request
 with more images than this (default 16).
+--kv nvfp4 stores the global KV caches as NVFP4 (E2M1 values, one E4M3 scale per 16): 9 KiB
+per position instead of 16 with fp8, at about twice FP8's divergence from a BF16 cache.
+--kv mixed keeps the first two global visits in FP8 and the other six in NVFP4: 10.75 KiB per
+position, at about FP8's divergence.
+--kv-quant nvfp4|q4_0 [--kv-rotate] [--kv-quant-visits V,...]
+rounds the global keys and values through a 4-bit format with a BF16 cache (--kv bf16), to
+measure the quality of a 4-bit cache; it saves no memory.
 --greedy decodes every request greedily, whatever its sampling fields ask. Without it, a
 request samples with its temperature, top_k, top_p, min_p and seed, and the fields it leaves
 out come from the checkpoint's generation_config.json (temperature 1 for Inkling 2 Mini).
@@ -122,7 +129,7 @@ fn args() -> anyhow::Result<Args> {
     let mut prefill_chunk = None;
     let mut fp8_weights = true;
     let mut fp8_output = false;
-    let mut fp8_kv = true;
+    let mut kv = "fp8".to_owned();
     let mut queue = 8;
     let mut streams = 1;
     let mut widths: Vec<usize> = (1..=8).collect();
@@ -141,6 +148,7 @@ fn args() -> anyhow::Result<Args> {
     let mut vision = false;
     let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
     let mut max_images = vision::DEFAULT_MAX_IMAGES;
+    let mut kv_args = Vec::new();
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -157,7 +165,13 @@ fn args() -> anyhow::Result<Args> {
             "--prefill-chunk" => prefill_chunk = Some(chunk_rows(&value()?)?),
             "--weights" => fp8_weights = fp8(&value()?)?,
             "--output-projection" => fp8_output = fp8(&value()?)?,
-            "--kv" => fp8_kv = fp8(&value()?)?,
+            "--kv" => {
+                kv = value()?;
+                ensure!(
+                    ["fp8", "bf16", "nvfp4", "mixed"].contains(&kv.as_str()),
+                    "--kv takes fp8, bf16, nvfp4 or mixed"
+                );
+            }
             "--queue" => queue = value()?.parse()?,
             "--streams" => {
                 streams = value()?.parse()?;
@@ -197,6 +211,11 @@ fn args() -> anyhow::Result<Args> {
                     "--decode-floor takes 0 or more tokens per second"
                 );
             }
+            "--kv-quant" | "--kv-quant-visits" => {
+                let v = value()?;
+                kv_args.extend([arg, v]);
+            }
+            "--kv-rotate" => kv_args.push(arg),
             "--widths" => {
                 widths = value()?
                     .split(',')
@@ -228,7 +247,7 @@ fn args() -> anyhow::Result<Args> {
             prefill_chunk,
             fp8_weights,
             fp8_output,
-            fp8_kv,
+            kv,
             widths,
             queue,
             streams,
@@ -249,6 +268,7 @@ fn args() -> anyhow::Result<Args> {
             vision: vision.then_some(engine::VisionOptions {
                 max_pixels: max_image_pixels,
             }),
+            kv_args,
         },
         max_images,
         model_dir,
