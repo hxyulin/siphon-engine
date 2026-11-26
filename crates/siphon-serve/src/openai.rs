@@ -9,6 +9,7 @@
 //!   `return_token_ids`.
 //! - Anthropic's `POST /v1/messages` and `POST /v1/messages/count_tokens`
 //!   ([`crate::anthropic`]), which share the chat route's prompt rendering and output.
+//! - OpenAI's `POST /v1/responses` ([`crate::responses`]), which shares them too.
 //! - `GET /metrics`, which needs no API key: Prometheus metrics ([`crate::metrics`]).
 //! - `GET /v1/models` and `GET /v1/models/{id}`, with `max_model_len`.
 //! - The tokenizer routes of [`crate::tokenize`].
@@ -70,6 +71,7 @@ use crate::{
     metrics::{Metrics, Reason, Times, Tracker},
     parse::{Delta, Detokenizer, Parser, ToolCall},
     request::{self, SamplingDefaults, SamplingFields, ToolChoice},
+    responses,
     stop::Stops,
     timings::Timings,
     tokenize::{self, DecodeRequest, EncodeRequest},
@@ -136,6 +138,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/token/decode", post(token_decode))
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        .route("/v1/responses", post(responses::responses))
         .layer(DefaultBodyLimit::max(body_limit))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&app), authorize))
         .route("/health", get(health))
@@ -219,6 +222,8 @@ pub(crate) struct ApiError {
     pub(crate) message: String,
     /// Seconds for a `Retry-After` header.
     pub(crate) retry_after: Option<u32>,
+    /// OpenAI's error `code`, when it is one clients act on.
+    pub(crate) code: Option<&'static str>,
 }
 
 /// Seconds a client waits before it retries a request that a draining server refused. The
@@ -231,6 +236,16 @@ impl ApiError {
             status,
             message: message.into(),
             retry_after: None,
+            code: None,
+        }
+    }
+
+    /// A 400 for a prompt that fills the context, with OpenAI's code for it, which Codex
+    /// reads to compact the conversation.
+    pub(crate) fn context_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: Some("context_length_exceeded"),
+            ..Self::bad_request(message)
         }
     }
 
@@ -291,6 +306,7 @@ impl IntoResponse for ApiError {
             StatusCode::UNAUTHORIZED => ("authentication_error", Value::Null),
             _ => ("server_error", Value::Null),
         };
+        let code = self.code.map_or(code, Value::from);
         let body =
             json!({"error": {"message": self.message, "type": kind, "param": null, "code": code}});
         self.with_retry_after((self.status, Json(body)).into_response())
@@ -592,7 +608,7 @@ pub(crate) fn max_tokens(
 ) -> Result<usize, ApiError> {
     let room = max_context.saturating_sub(prompt_len);
     if room == 0 {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::context_exceeded(format!(
             "the prompt has {prompt_len} tokens, and this server holds {max_context} in all"
         )));
     }
@@ -1167,7 +1183,8 @@ impl Output {
         }
     }
 
-    fn reasoning_tokens(&self) -> usize {
+    /// Generated ids inside thinking blocks.
+    pub(crate) fn reasoning_tokens(&self) -> usize {
         match &self.decoder {
             Decoder::Chat(parser) => parser.reasoning_tokens(),
             Decoder::Text(_) => 0,

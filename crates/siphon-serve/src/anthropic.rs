@@ -13,7 +13,6 @@
 //! Anthropic's clients retry.
 
 use std::{
-    convert::Infallible,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -25,26 +24,21 @@ use axum::{
     Extension, Json,
     extract::{State, rejection::JsonRejection},
     http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event as SseEvent, Sse},
-    },
+    response::{IntoResponse, Response},
 };
-use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::{sync::mpsc, time::Instant};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     chat::{self, Ending, InvalidRequest, Rendered, Thinking, Vocab},
-    engine::{Event, Finish},
+    engine::Finish,
     openai::{
-        self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, Results,
-        blocking, submit, tool_ending,
+        self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, blocking,
+        tool_ending,
     },
     parse::{Delta, Parser, ToolCall},
     request::{self, SamplingFields, ToolChoice},
+    sse::{self, Frame, Prompt},
     stop::Stops,
     timings::Timings,
 };
@@ -58,13 +52,11 @@ pub fn serves(path: &str) -> bool {
 /// `message_start`, as during the prefill of a long prompt. Claude Code drops a stream
 /// that stays silent for too long.
 const PING: Duration = Duration::from_secs(5);
-/// The name of a frame that goes out as an SSE comment.
-const KEEP_ALIVE: &str = "";
 
 /// The text that stands in for an image block.
-const NO_IMAGE: &str = "[image omitted: the model cannot see images]";
+pub(crate) const NO_IMAGE: &str = "[image omitted: the model cannot see images]";
 /// The text that stands in for a document block.
-const NO_DOCUMENT: &str = "[document omitted: the model cannot read documents]";
+pub(crate) const NO_DOCUMENT: &str = "[document omitted: the model cannot read documents]";
 /// Claude Code's first system block starts with this. It is metadata for Anthropic's API,
 /// and its value changes between requests, which would defeat the prefix cache.
 const BILLING_HEADER: &str = "x-anthropic-billing-header:";
@@ -129,7 +121,10 @@ pub async fn messages(
     let prepared = blocking(&app, move |app| prepare(app, &request))
         .await
         .map_err(Error)?;
-    respond(app, prepared, &id).await.map_err(Error)
+    let message = Message::new(&app);
+    sse::respond(app, prepared, message, &id)
+        .await
+        .map_err(Error)
 }
 
 pub async fn count_tokens(
@@ -440,39 +435,43 @@ fn assistant(content: &Value) -> Result<Value, InvalidRequest> {
     Ok(message)
 }
 
-/// The fields of one reply that its body and events share.
+/// One reply: the fields its body and events share, and its content blocks.
 struct Message {
     id: String,
     model: String,
-    prompt_tokens: usize,
-    /// Prompt tokens whose state came from the prefix cache.
-    cached_tokens: usize,
+    blocks: Blocks,
 }
 
 impl Message {
-    fn new(app: &App, prompt_tokens: usize) -> Self {
+    fn new(app: &App) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let id = format!("msg_{:x}{n:06x}", openai::now());
         Self {
-            id: format!("msg_{:x}{n:06x}", openai::now()),
+            blocks: Blocks::new(&id),
+            id,
             model: app.name.clone(),
-            prompt_tokens,
-            cached_tokens: 0,
         }
     }
 
     /// Anthropic's usage: `input_tokens` leaves out the tokens read from the cache.
-    fn usage(&self, output_tokens: usize) -> Value {
+    fn usage(prompt: &Prompt, output_tokens: usize) -> Value {
         json!({
-            "input_tokens": self.prompt_tokens.saturating_sub(self.cached_tokens),
+            "input_tokens": prompt.tokens.saturating_sub(prompt.cached),
             "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": self.cached_tokens,
+            "cache_read_input_tokens": prompt.cached,
             "output_tokens": output_tokens,
         })
     }
 
-    /// The message, with no stop reason while it runs.
-    fn body(&self, content: &[Value], stop: Option<(&str, Value)>, output_tokens: usize) -> Value {
+    /// The message with `content`, with no stop reason while it runs.
+    fn message(
+        &self,
+        content: &[Value],
+        stop: Option<(&str, Value)>,
+        prompt: &Prompt,
+        output_tokens: usize,
+    ) -> Value {
         let (reason, sequence) = stop.unzip();
         json!({
             "id": self.id,
@@ -482,8 +481,80 @@ impl Message {
             "content": content,
             "stop_reason": reason,
             "stop_sequence": sequence,
-            "usage": self.usage(output_tokens),
+            "usage": Self::usage(prompt, output_tokens),
         })
+    }
+}
+
+/// `message_start` goes out with the first content block, and its usage then holds the
+/// cached tokens. Before it, a quiet stream sends a comment, since Anthropic's protocol
+/// puts `message_start` first; after it, a `ping` event.
+impl sse::Reply for Message {
+    const QUIET: Duration = PING;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn start(&mut self, prompt: &Prompt) -> Vec<Frame> {
+        vec![(
+            "message_start",
+            json!({"type": "message_start", "message": self.message(&[], None, prompt, 0)}),
+        )]
+    }
+
+    fn keep_alive(&mut self) -> Frame {
+        ("ping", json!({"type": "ping"}))
+    }
+
+    fn push(&mut self, delta: &Delta, events: &mut Vec<Frame>) {
+        self.blocks.push(delta, events);
+    }
+
+    fn end(
+        &mut self,
+        output: &Output,
+        finish: Finish,
+        prompt: &Prompt,
+        timings: &Timings,
+    ) -> Vec<Frame> {
+        let mut events = Vec::new();
+        self.blocks.close(&mut events);
+        let stop = stop_reason(output, finish);
+        events.push((
+            "message_delta",
+            json!({"type": "message_delta",
+                   "delta": {"stop_reason": stop.0, "stop_sequence": stop.1},
+                   "usage": Self::usage(prompt, output.tokens), "timings": timings.json()}),
+        ));
+        events.push(("message_stop", json!({"type": "message_stop"})));
+        events
+    }
+
+    fn body(
+        &mut self,
+        output: &Output,
+        finish: Finish,
+        prompt: &Prompt,
+        timings: &Timings,
+    ) -> Value {
+        let stop = stop_reason(output, finish);
+        let mut body = self.message(&self.blocks.content, Some(stop), prompt, output.tokens);
+        body["timings"] = timings.json();
+        body
+    }
+
+    /// An error event, before `message_start` too.
+    fn failure(&mut self, message: &str, _: &Prompt, _: bool) -> Vec<Frame> {
+        vec![("error", error_body("api_error", message))]
+    }
+
+    fn failed_response(message: &str) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(error_body("api_error", message)),
+        )
+            .into_response()
     }
 }
 
@@ -499,9 +570,6 @@ fn stop_reason(output: &Output, finish: Finish) -> (&'static str, Value) {
     };
     (reason, Value::Null)
 }
-
-/// One server-sent event: its type and its data.
-type Frame = (&'static str, Value);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Open {
@@ -638,223 +706,30 @@ impl Blocks {
     }
 }
 
-/// Feeds `ids` to `output` one at a time, so that the blocks keep the order the model wrote
-/// thinking and text in.
-fn take(
-    vocab: &Vocab,
-    output: &mut Output,
-    blocks: &mut Blocks,
-    ids: &[u32],
-    events: &mut Vec<Frame>,
-) {
-    for &id in ids {
-        if output.done {
-            break;
-        }
-        let delta = output.push(vocab, &[id]);
-        blocks.push(&delta, events);
-    }
-}
-
-/// Runs a prepared request and answers it, streaming or not.
-async fn respond(app: Arc<App>, prepared: Prepared, id: &RequestId) -> Result<Response, ApiError> {
-    let Prepared {
-        prompt,
-        images,
-        max_tokens,
-        delivery,
-        samplings,
-        output,
-        ..
-    } = prepared;
-    let message = Message::new(&app, prompt.len());
-    let sampling = samplings
-        .first()
-        .copied()
-        .ok_or_else(|| ApiError::internal("no sampling"))?;
-    let label = id.label(&message.id, 0, 1);
-    let results = submit(&app, &prompt, images, max_tokens, false, sampling, &|_| {
-        Arc::clone(&label)
-    })?;
-    if matches!(delivery, Delivery::Whole) {
-        // Runs in the handler, so that a client that leaves drops the job.
-        let (out, mut rx) = mpsc::channel(1);
-        let timings = run(&app.vocab, results, output, message, out, false).await;
-        if let Some(timings) = &timings {
-            timings.log(&label);
-        }
-        let response = whole(rx.recv().await);
-        return Ok(match &timings {
-            Some(timings) => openai::with_server_timing(response, timings),
-            None => response,
-        });
-    }
-    let (out, rx) = mpsc::channel(64);
-    tokio::spawn(async move {
-        if let Some(timings) = run(&app.vocab, results, output, message, out, true).await {
-            timings.log(&label);
-        }
-    });
-    let events = ReceiverStream::new(rx).map(|frame| Ok::<_, Infallible>(sse(frame)));
-    Ok(Sse::new(events).into_response())
-}
-
-/// The server-sent event of `frame`: a comment for [`KEEP_ALIVE`].
-fn sse((name, data): Frame) -> SseEvent {
-    if name == KEEP_ALIVE {
-        SseEvent::default().comment("")
-    } else {
-        SseEvent::default().event(name).data(data.to_string())
-    }
-}
-
-/// The body of a reply that is not streamed: the one frame [`run`] sent, a message or an
-/// error.
-fn whole(frame: Option<Frame>) -> Response {
-    match frame {
-        Some(("message", body)) => Json(body).into_response(),
-        Some((_, error)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response(),
-        None => Error(ApiError::internal("the reply ended early")).into_response(),
-    }
-}
-
-/// Sends one reply's frames and remembers when it last sent one, for the keep-alives.
-struct Frames {
-    out: mpsc::Sender<Frame>,
-    last: Instant,
-}
-
-impl Frames {
-    /// Sends `frames`; false once the client has left.
-    async fn send(&mut self, frames: Vec<Frame>) -> bool {
-        for frame in frames {
-            if self.out.send(frame).await.is_err() {
-                return false;
-            }
-            self.last = Instant::now();
-        }
-        true
-    }
-}
-
-/// Turns the engine's events for one request into Anthropic's stream events, or, unless
-/// `stream`, into one `message` frame with the whole body, and returns the request's
-/// timings, which the body or the `message_delta` event holds, unless the job failed or
-/// the client left. Returning drops `results`, which cancels the job: when the client has
-/// left or a stop ended the output.
-///
-/// `message_start` goes out with the first content block, so that a client or proxy that
-/// times the first event measures the prefill, and its usage then holds the cached tokens.
-/// Before it, a stream quiet for [`PING`] sends a comment, since Anthropic's protocol puts
-/// `message_start` first; after it, a `ping` event.
-async fn run(
-    vocab: &Vocab,
-    mut results: Results,
-    mut output: Output,
-    mut message: Message,
-    out: mpsc::Sender<Frame>,
-    stream: bool,
-) -> Option<Timings> {
-    let mut frames = Frames {
-        out,
-        last: Instant::now(),
-    };
-    let mut blocks = Blocks::new(&message.id);
-    let mut started = false;
-    let finish = loop {
-        let mut events = Vec::new();
-        let event = if stream {
-            loop {
-                tokio::select! {
-                    event = results.next() => break event,
-                    () = tokio::time::sleep_until(frames.last + PING) => {
-                        let keep_alive = if started {
-                            ("ping", json!({"type": "ping"}))
-                        } else {
-                            (KEEP_ALIVE, Value::Null)
-                        };
-                        if !frames.send(vec![keep_alive]).await {
-                            return None;
-                        }
-                    }
-                }
-            }
-        } else {
-            results.next().await
-        };
-        match event {
-            Event::Started | Event::Round => continue,
-            Event::Cached(n) => {
-                message.cached_tokens = n;
-                continue;
-            }
-            Event::Tokens(ids) => take(vocab, &mut output, &mut blocks, &ids, &mut events),
-            Event::Done(finish) => break finish,
-            Event::Failed(e) => {
-                let _ = frames
-                    .send(vec![("error", error_body("api_error", &e))])
-                    .await;
-                return None;
-            }
-        }
-        if stream && !events.is_empty() {
-            if !std::mem::replace(&mut started, true) {
-                events.insert(0, message_start(&message));
-            }
-            if !frames.send(events).await {
-                return None;
-            }
-        }
-        if output.done {
-            break Finish::Stop;
-        }
-    };
-    let times = results.close(finish);
-    let mut events = Vec::new();
-    blocks.push(&output.finish(vocab, finish), &mut events);
-    blocks.close(&mut events);
-    let stop = stop_reason(&output, finish);
-    let timings = Timings::new(
-        &[times],
-        message.prompt_tokens,
-        message.cached_tokens,
-        output.tokens,
-    );
-    if !stream {
-        let mut body = message.body(&blocks.content, Some(stop), output.tokens);
-        body["timings"] = timings.json();
-        return frames
-            .send(vec![("message", body)])
-            .await
-            .then_some(timings);
-    }
-    if !started {
-        events.insert(0, message_start(&message));
-    }
-    events.push((
-        "message_delta",
-        json!({"type": "message_delta",
-               "delta": {"stop_reason": stop.0, "stop_sequence": stop.1},
-               "usage": message.usage(output.tokens), "timings": timings.json()}),
-    ));
-    events.push(("message_stop", json!({"type": "message_stop"})));
-    frames.send(events).await.then_some(timings)
-}
-
-/// The `message_start` event of `message`, before any content.
-fn message_start(message: &Message) -> Frame {
-    (
-        "message_start",
-        json!({"type": "message_start", "message": message.body(&[], None, 0)}),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use axum::{body, http::HeaderMap};
+    use std::convert::Infallible;
+
+    use axum::{body, http::HeaderMap, response::sse::Sse};
+    use tokio::sync::mpsc;
 
     use super::*;
-    use crate::{chat::tests::vocab, metrics::Metrics};
+    use crate::{
+        chat::tests::vocab,
+        engine::Event,
+        metrics::Metrics,
+        openai::Results,
+        sse::{KEEP_ALIVE, run},
+    };
+
+    /// A reply with the id `msg_1` from the model `m`.
+    fn message() -> Message {
+        Message {
+            id: "msg_1".to_owned(),
+            model: "m".to_owned(),
+            blocks: Blocks::new("msg_1"),
+        }
+    }
 
     fn parse(request: Value) -> MessagesRequest {
         serde_json::from_value(request).unwrap()
@@ -1199,14 +1074,8 @@ mod tests {
             Vec::new(),
             calls,
         );
-        let message = Message {
-            id: "msg_1".to_owned(),
-            model: "m".to_owned(),
-            prompt_tokens: 10,
-            cached_tokens: 0,
-        };
         let (out, mut rx) = mpsc::channel(1024);
-        run(vocab, results, output, message, out, stream).await;
+        run(vocab, results, output, message(), 10, out, stream).await;
         let mut frames = Vec::new();
         while let Ok(frame) = rx.try_recv() {
             frames.push(frame);
@@ -1412,7 +1281,7 @@ mod tests {
         assert_eq!(
             frames,
             [(
-                "message",
+                "body",
                 json!({
                     "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
                     "content": [
@@ -1499,12 +1368,6 @@ mod tests {
             Vec::new(),
             Calls::Free,
         );
-        let message = Message {
-            id: "msg_1".to_owned(),
-            model: "m".to_owned(),
-            prompt_tokens: 10,
-            cached_tokens: 0,
-        };
         let (out, mut rx) = mpsc::channel(1024);
         let engine = async move {
             for (delay, event) in events {
@@ -1512,7 +1375,10 @@ mod tests {
                 sender.send(event).unwrap();
             }
         };
-        tokio::join!(run(vocab, results, output, message, out, true), engine);
+        tokio::join!(
+            run(vocab, results, output, message(), 10, out, true),
+            engine
+        );
         let mut frames = Vec::new();
         while let Ok(frame) = rx.try_recv() {
             frames.push(frame);
@@ -1582,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn keep_alives_are_comments() {
         let frames = [(KEEP_ALIVE, Value::Null), ("ping", json!({"type": "ping"}))];
-        let events = futures_util::stream::iter(frames.map(|f| Ok::<_, Infallible>(sse(f))));
+        let events = futures_util::stream::iter(frames.map(|f| Ok::<_, Infallible>(sse::sse(f))));
         let response = Sse::new(events).into_response();
         let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await

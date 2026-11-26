@@ -66,6 +66,7 @@ A request body may be compressed with `Content-Encoding: gzip` or `zstd`; other 
 | `POST /v1/completions` | A text prompt or token ids, streaming or not. The text includes any special tokens generated. |
 | `POST /v1/messages` | Anthropic's Messages API, streaming or not, for Claude Code and Anthropic's SDKs. See [Anthropic Messages API](#anthropic-messages-api). |
 | `POST /v1/messages/count_tokens` | `{"input_tokens": n}`: the tokens of the prompt that `/v1/messages` would run for the same body. |
+| `POST /v1/responses` | OpenAI's Responses API, streaming or not, for the Codex CLI and OpenAI's SDKs. It stores nothing. See [Responses API](#responses-api). |
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape, also at `/v1/tokenize` and `/v1/detokenize`: `{"prompt"}` or `{"messages", "tools"}` to `{"tokens", "count", "max_model_len"}`, and `{"tokens"}` to `{"prompt"}`. With `--vision`, the messages' images count as the chat route counts them. |
 | `POST /v1/token/encode`, `POST /v1/token/decode` | TabbyAPI's shape: `{"text"}`, a string or messages, to `{"tokens", "length"}`, and `{"tokens"}` to `{"text"}`. |
 | `GET /v1/models`, `GET /v1/models/{id}` | The served model, with `max_model_len`. |
@@ -77,7 +78,7 @@ A request body may be compressed with `Content-Encoding: gzip` or `zstd`; other 
 - `reasoning_effort`: a name such as `low`, or 0 to 0.99. The default is 0.9. Without it, `chat_template_kwargs.reasoning_effort` counts. `none` and `chat_template_kwargs.enable_thinking: false` turn thinking off, and a request without tools then gets no thinking block (see [Thinking off](#thinking-off)). A number is passed to the template as it is, and at effort 0 the model still writes a short thinking block.
 - `tools` and `tool_choice`: `auto`, `none`, `required`, or `{"type": "function", "function": {"name": ...}}`. A named function, or `required` with one tool, ends the prompt with that tool's call opened. `required` with several tools opens a call without a name, and the model names the tool. A forced call skips the thinking block. The reply ends after the named call, or at the first text after the calls `required` forced. `parallel_tool_calls: false` ends the reply after its first call.
 - `stop`: a string or an array of strings. Stop strings match the reply's content, not its thinking or tool calls. While streaming, text that could still begin a stop string is held back. The reply is cut before the match and finishes with `stop`.
-- `max_tokens` or `max_completion_tokens` past the context is cut to the positions left after the prompt, and the reply then finishes with `length`. A client's token count can differ from the server's, so a cap that a client sized to the context can overshoot it. vLLM refuses such a request. A prompt that fills the context alone still gets a 400.
+- `max_tokens` or `max_completion_tokens` past the context is cut to the positions left after the prompt, and the reply then finishes with `length`. A client's token count can differ from the server's, so a cap that a client sized to the context can overshoot it. vLLM refuses such a request. A prompt that fills the context alone still gets a 400, with the error code `context_length_exceeded`.
 - A stream sends each choice's role chunk with the first token, as vLLM does, so a proxy that times the first chunk measures the prefill. During a long prefill, a keep-alive comment every 15 seconds holds the connection open.
 - vLLM's extensions:
   - `return_token_ids` adds `prompt_token_ids` and each choice's `token_ids`, streaming or not. The ids end with `<|content_model_end_sampling|>` when the model ended its turn.
@@ -128,12 +129,68 @@ Claude Code sends background requests, such as titles and summaries, to its Haik
 
 With `--streams 1`, a background request waits for the conversation's reply, and the [prefix cache](#prefix-cache) holds one prompt: the background request then replaces it with its own, and the next turn of the main conversation prefills its whole prompt again. With `--streams 4`, the background request starts beside the conversation's reply, in the same pool of KV cache pages, and takes another entry, so the conversation keeps its own.
 
+## Responses API
+
+`POST /v1/responses` takes OpenAI's Responses request and answers in its shape. The server renders the request with the same chat template as `/v1/chat/completions`, and runs it on the same engine.
+
+The server stores no responses. A request carries the whole conversation in `input`, as Codex sends it with `store: false`. `store` is ignored. `previous_response_id`, `conversation`, `item_reference` input items and `background: true` get a 400.
+
+The request maps onto the chat route as follows:
+
+- `instructions` becomes the first system message.
+- `input` is a string, which becomes a user message, or a list of items:
+  - `message` items, also without a `type`, with the roles `user`, `system`, `developer` and `assistant`. Their content is a string or a list of parts: `input_text` and `output_text` parts are text. With `--vision`, `input_image` parts with a `data:` URL reach the prompt as images (see [Images](#images)). Without it, an image becomes `[image omitted: the model cannot see images]`, since a 400 would end a Codex session. An `input_file` part always becomes `[document omitted: the model cannot read documents]`.
+  - `reasoning`, `function_call` and assistant `message` items that follow each other become one assistant message, as the model wrote them in one turn: the reasoning as its past thinking, then its text, then its tool calls. A reasoning item's thinking comes from its `reasoning_text` content, else from `encrypted_content`, else from its summary.
+  - A `function_call_output` becomes a tool message. Its `output` is a string or a list of parts, as above.
+  - Other items, such as hosted tool calls and their outputs, are left out.
+- `tools`: `function` tools in the flat Responses shape. Tools of other types, such as `web_search`, `local_shell`, custom tools and Codex's `namespace` tools, are left out.
+- `tool_choice` (`auto`, `none`, `required` or `{"type": "function", "name": ...}`) and `parallel_tool_calls` work as on the chat route.
+- `reasoning.effort` sets the effort as `reasoning_effort` does, and `none` turns thinking off (see [Thinking off](#thinking-off)).
+- `max_output_tokens`, `temperature`, `top_p` and `stop` work as `max_tokens`, `temperature`, `top_p` and `stop` do on the chat route. `top_k`, `min_p` and `seed` work too.
+- `text.format` other than `text` gets a 400, as `response_format` does.
+
+The server ignores `store`, `prompt_cache_key`, `client_metadata`, `metadata`, `truncation`, `service_tier`, `user`, `text.verbosity`, `include` values other than `reasoning.encrypted_content`, and unknown fields.
+
+The response has `output` items in the order the model wrote them: `reasoning`, `message` with one `output_text` part, and `function_call` with `call_id`, `name` and `arguments`. `status` is `completed`, or `incomplete` with `incomplete_details.reason` `max_output_tokens` when the reply ran out of tokens. In `usage`, `input_tokens` counts the whole prompt and `input_tokens_details.cached_tokens` the tokens read from the prefix cache. `output_tokens_details.reasoning_tokens` counts the thinking.
+
+The thinking is public. Each reasoning item holds the whole text in `content`, as one `reasoning_text` part, the way open-weight servers return it. When the request sets `reasoning.summary`, as Codex does, the item's `summary` holds the same text, since Codex shows summaries by default. With `include: ["reasoning.encrypted_content"]`, `encrypted_content` holds the text in plain base64: it is not encrypted, and any client can decode it. A reasoning item sent back on the next turn renders as the thinking the model wrote, so the prompt matches what the chat route renders for the same conversation.
+
+A stream sends OpenAI's typed events, each with `sequence_number`: `response.created` and `response.in_progress`, then for each item `response.output_item.added`, its content's events and `response.output_item.done`, then `response.completed`, `response.incomplete` or `response.failed`. A reasoning item streams `response.reasoning_text.delta` and `.done`, and with a summary also `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta`, `.done` and `response.reasoning_summary_part.done`. A message streams `response.content_part.added`, `response.output_text.delta`, `.done` and `response.content_part.done`. A tool call arrives whole, in one `response.function_call_arguments.delta`. `response.created` waits for the reply's first item, as the chat route's role chunk waits for the first token, so a proxy that times the first event measures the prefill. Before it and after it, a stream quiet for 15 seconds sends an SSE comment.
+
+Errors take OpenAI's shape. A full queue answers 503, as on the chat route. A failure during a stream sends `response.failed` with `error.code` `server_error`, after `response.created` and `response.in_progress` if the stream had not started.
+
+### Codex
+
+Point the Codex CLI at the server with a custom provider in `config.toml` (`~/.codex/config.toml`, or `$CODEX_HOME/config.toml`):
+
+```toml
+model = "inkling-2-mini"            # the server's --name
+model_provider = "siphon"
+model_context_window = 131072       # the server's --context, or max_model_len from /v1/models
+
+[model_providers.siphon]
+name = "Siphon"
+base_url = "http://<host>:8000/v1"
+wire_api = "responses"
+env_key = "SIPHON_API_KEY"          # the variable Codex reads the key from
+```
+
+```sh
+export SIPHON_API_KEY=<key>          # any text when the server runs without SIPHON_API_KEY
+codex
+```
+
+Codex sends plain HTTP requests with server-sent events to a custom provider, since `supports_websockets` is off by default. Codex warns that it has no metadata for the model and uses defaults: function tools such as `exec_command` and `write_stdin`, and no `apply_patch` grammar tool. Set `model_context_window` so that Codex compacts the conversation before the prompt overflows; a prompt that still overflows gets a 400 with the code `context_length_exceeded`, which Codex reads to compact. `model_reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high` or `xhigh`) reaches the server as `reasoning.effort`. Codex sends no `max_output_tokens`, so with `--streams 1` its turns miss the prefix cache for now (see [Known gaps](#known-gaps)).
+
+Codex shows the thinking as each reasoning item's summary. Leave `show_raw_agent_reasoning` off: the summary already holds the whole text, and with the setting on, Codex's TUI shows it twice.
+
 ## Images
 
-With `--vision`, the server loads the vision tower beside the model and takes images in the chat and Messages routes:
+With `--vision`, the server loads the vision tower beside the model and takes images in the chat, Messages and Responses routes:
 
 - `/v1/chat/completions`: content parts `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`, also with `image_url` as a plain string, and `input_image` parts. `detail` is ignored.
 - `/v1/messages`: `image` blocks with `{"type": "base64", "media_type", "data"}` sources, in user messages and inside `tool_result` blocks.
+- `/v1/responses`: `input_image` parts with a `data:` URL in `image_url`, in user messages and in `function_call_output` parts.
 
 Images must be inline: PNG, JPEG, WebP or GIF (its first frame) in base64. The server does not fetch URLs, so an `http` or `https` image URL gets a 400 that says so. Images are allowed in user and tool messages only, as the chat template allows them.
 
@@ -203,7 +260,7 @@ Each choice of a request with `n` choices counts as a request in the request cou
 
 ### Request timings
 
-Each completion, chat and Messages response carries a `timings` object with the field names of llama.cpp's server, so tools written for llama.cpp read them. Siphon adds its queue time, time to first token and speculation:
+Each completion, chat, Messages and Responses response carries a `timings` object with the field names of llama.cpp's server, so tools written for llama.cpp read them. Siphon adds its queue time, time to first token and speculation:
 
 | Field | Value |
 | --- | --- |
@@ -218,7 +275,7 @@ Each completion, chat and Messages response carries a `timings` object with the 
 
 The times are taken when the engine's events reach the HTTP layer. The queue starts once the server has parsed and tokenized the request, so parsing does not count as prefill. The prompt time includes any prefix cache restore and image encoding. A request with `n` choices counts from its earliest start and first token to its last end, and sums the choices' tokens and rounds.
 
-A response that is not streamed has `timings` at the top level and a `Server-Timing` header, `queue;dur=…, prefill;dur=…, decode;dur=…` in milliseconds. A stream has sent its headers before the times are known, so its last chunk holds `timings`: in a chat or completion stream, the chunk with the last `finish_reason`, or the usage chunk when `stream_options.include_usage` asks for one, and in a Messages stream, the `message_delta` event. OpenAI's and Anthropic's SDKs ignore fields they do not know.
+A response that is not streamed has `timings` at the top level and a `Server-Timing` header, `queue;dur=…, prefill;dur=…, decode;dur=…` in milliseconds. A stream has sent its headers before the times are known, so its last chunk holds `timings`: in a chat or completion stream, the chunk with the last `finish_reason`, or the usage chunk when `stream_options.include_usage` asks for one, in a Messages stream, the `message_delta` event, and in a Responses stream, the response of its last event. OpenAI's and Anthropic's SDKs ignore fields they do not know.
 
 The log repeats the numbers in the request's last `job:` line:
 
@@ -267,6 +324,7 @@ Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of
 
 - **Another request in a slot loses its conversation without `--host-cache`.** A device entry keeps only the slot's rings and conv states. The global KV cache stays in the slot, so any other sequence there overwrites it. With `--streams 1`, short side requests caused 6 full prefills of 77,421 to 150,445 tokens, at 5.7 to 12.5 s each. The side requests included the agent's own 539-token request and 21-token tests. The host tier, `--host-cache`, now restores such prompts in well under a second.
 - **A prefill stalled every other stream.** In a test on an RTX PRO 6000 Blackwell with two streams of 1,048,576 positions, the running request delivered 2.2 tok/s while the second request's 325 s prefill ran, one batched step per prefill chunk. `--decode-floor` now runs more steps between the chunks (see [Concurrent requests](#concurrent-requests)).
+- **A request without a token cap misses the prefix cache with `--streams 1`.** It may reach every position of the context, so it reserves the whole pool, and the cached prompt is not used. With `--context 131072`, a prompt of 8,024 tokens that repeated a cached one was prefilled whole without `max_tokens` or `max_output_tokens`, and read 6,144 tokens from the cache with a cap of 256, on the chat and Responses routes alike. Codex sends no `max_output_tokens`, so each turn of a 5-turn Codex session prefilled its whole prompt of 8,495 to 11,002 tokens, in 0.56 to 0.71 s.
 - **Decode slows past 100,000 tokens.** Agent turns decoded at a median 534 tok/s with prompts of 32,000 to 100,000 tokens, and 417 tok/s above 100,000. Speculation kept a median of 3.09 tokens per round.
 
 ## Building on macOS

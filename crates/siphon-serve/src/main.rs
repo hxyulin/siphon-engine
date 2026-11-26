@@ -7,8 +7,10 @@ mod metrics;
 mod openai;
 mod parse;
 mod request;
+mod responses;
 #[cfg(test)]
 mod server_tests;
+mod sse;
 mod stop;
 mod timings;
 mod tokenize;
