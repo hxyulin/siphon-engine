@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
+    CudaEvent, CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
@@ -37,6 +37,7 @@ use siphon::TextConfig;
 
 use crate::{
     DeviceIn,
+    gpu::{PinnedBuf, sync_event},
     model::{DeviceSpan, GlobalKv},
     ops::spec::TapLayout,
     ops::{
@@ -696,29 +697,40 @@ struct Head {
 }
 
 /// The tokens of a shortlist head: rows `0..ranked` are the ranked and special tokens in
-/// ascending id order, then up to `context_cap` context tokens.
+/// ascending id order, then up to `context_cap` context tokens up to fixed `capacity`.
+/// Keeping the base-logit GEMM row count fixed at `capacity` (while `draft_topk_partial`
+/// and `markov_fold_*` mask via device `*count`) guarantees that `Draft::note_tokens` and
+/// `Draft::reset` never invalidate captured single-stream or batched draft CUDA graphs.
 struct Shortlist {
     ranked: usize,
     context_cap: usize,
     used: usize,
+    capacity: usize,
     member: Vec<bool>,
     context: Vec<i32>,
-    /// Row to token id, I32 `[ranked + context_cap]`.
+    /// Row to token id, I32 `[capacity]`.
     map: CudaSlice<i32>,
     /// Rows in use, I32 `[1]`.
     count: CudaSlice<i32>,
+    /// Monotonic page-locked staging buffer for context tokens `ranked..capacity`, so
+    /// back-to-back `note_tokens` calls issue async pinned DMA without racing on earlier
+    /// ranges until `Draft::reset` synchronizes `h2d_done`.
+    pinned_context: PinnedBuf<i32>,
+    /// Recorded on the stream after each async pinned H2D into `map`.
+    h2d_done: CudaEvent,
     /// Whether `count` lags `used`.
     stale: bool,
 }
 
 impl Shortlist {
     fn capacity(&self) -> usize {
-        self.ranked + self.context_cap
+        self.capacity
     }
+}
 
-    /// Rows the base logits cover.
-    fn bucket(&self) -> usize {
-        self.used.next_multiple_of(HEAD_BUCKET).min(self.capacity())
+impl Drop for Shortlist {
+    fn drop(&mut self) {
+        let _ = self.h2d_done.synchronize();
     }
 }
 
@@ -1175,13 +1187,14 @@ impl Draft {
     }
 
     /// Forgets every committed position and the shortlist's context tokens, for a new
-    /// sequence.
+    /// sequence. Does not invalidate captured draft CUDA graphs because the shortlist's
+    /// GEMM row count stays fixed at its capacity.
     pub fn reset(&mut self) {
         self.committed = 0;
         let Some(list) = self.head.as_mut().and_then(|h| h.shortlist.as_mut()) else {
             return;
         };
-        let bucket = list.bucket();
+        let _ = list.h2d_done.synchronize();
         for &t in &list.context {
             if let Ok(t) = usize::try_from(t) {
                 list.member[t] = false;
@@ -1190,12 +1203,15 @@ impl Draft {
         list.context.clear();
         list.used = list.ranked;
         list.stale = true;
-        if list.bucket() != bucket {
-            self.graphs = Default::default();
-            if let Some(b) = self.batch.as_mut() {
-                b.clear_graphs();
-            }
-        }
+    }
+
+    /// Number of captured `(single_stream, batched)` CUDA graphs currently cached on this
+    /// draft.
+    #[must_use]
+    pub fn cached_graph_counts(&self) -> (usize, usize) {
+        let single = self.graphs.iter().filter(|g| g.is_some()).count();
+        let batch = self.batch.as_ref().map_or(0, batch::BatchDflash2::graph_count);
+        (single, batch)
     }
 
     /// Whether the draft has global layers, whose caches hold every committed position of
@@ -1340,7 +1356,7 @@ impl Draft {
 
     /// Adds the tokens of the context (prompt and generated) that a shortlist head lacks to
     /// it, up to [`Self::context_capacity`] since the last [`Self::reset`], so the draft can
-    /// propose them. Does nothing without a shortlist.
+    /// propose them. Does nothing without a shortlist, and never invalidates captured CUDA graphs.
     pub fn note_tokens(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -1353,40 +1369,43 @@ impl Draft {
         let Some(list) = head.shortlist.as_mut() else {
             return Ok(());
         };
-        let bucket = list.bucket();
         let first = list.used;
-        let mut ids = Vec::new();
-        for &t in tokens {
-            let Ok(i) = usize::try_from(t) else { continue };
-            if i < self.vocab && !list.member[i] && first + ids.len() < list.capacity() {
-                list.member[i] = true;
-                list.context.push(t);
-                ids.push(t);
+        let capacity = list.capacity();
+        let ctx_start = first - list.ranked;
+        let mut added = 0usize;
+        {
+            let staging = list.pinned_context.as_mut_slice();
+            for &t in tokens {
+                let Ok(i) = usize::try_from(t) else { continue };
+                if i < self.vocab && !list.member[i] && first + added < capacity {
+                    list.member[i] = true;
+                    list.context.push(t);
+                    staging[ctx_start + added] = t;
+                    added += 1;
+                }
             }
         }
-        if ids.is_empty() {
+        if added == 0 {
             return Ok(());
         }
-        list.used += ids.len();
-        stream.memcpy_htod(&ids, &mut list.map.slice_mut(first..list.used))?;
-        stream.memcpy_htod(&[i32::try_from(list.used)?], &mut list.count)?;
+        list.used += added;
+        let new_used = list.used;
+        list.pinned_context.copy_range_to_device(
+            stream,
+            ctx_start..ctx_start + added,
+            &mut list.map.slice_mut(first..new_used),
+        )?;
+        list.h2d_done.record(stream)?;
+        self.kernels
+            .set_i32(stream, &mut list.count, i32::try_from(new_used)?)?;
         list.stale = false;
-        let changed = list.bucket() != bucket;
-        let ids = stream.clone_htod(&ids)?;
-        head.gather(
+        head.gather_shortlist_range(
             stream,
             &self.kernels,
             shared,
             self.arch.fold_rows(),
-            &ids.slice(..),
-            first,
+            first..new_used,
         )?;
-        if changed {
-            self.graphs = Default::default();
-            if let Some(b) = self.batch.as_mut() {
-                b.clear_graphs();
-            }
-        }
         Ok(())
     }
 
@@ -2524,9 +2543,10 @@ fn base_logits(
     // At least two rows for the BF16 GEMMs: a single row would run as a GEMV, which sums
     // in another order.
     let m_rows = steps.max(2);
-    // Rows of the base logits, each `ld` elements.
+    // Rows of the base logits, each `ld` elements. A shortlist keeps its row count fixed at
+    // `capacity` while `draft_topk_partial` and `markov_fold_*` mask via device `*count`.
     let (rows, ld) = match list {
-        Some(list) => (list.bucket(), list.bucket()),
+        Some(list) => (list.capacity(), list.capacity()),
         None => (vocab, padded_vocab),
     };
     match head.and_then(|h| h.lm.as_ref()) {
@@ -2731,10 +2751,12 @@ impl Head {
             .map(i32::try_from)
             .collect::<Result<_, _>>()?;
         let ranked = ids.len();
-        let capacity = ranked + context_cap;
+        let capacity = (ranked + context_cap).min(vocab);
         let mut map = stream.alloc_zeros::<i32>(capacity)?;
         stream.memcpy_htod(&ids, &mut map.slice_mut(..ranked))?;
         let count = stream.clone_htod(&[i32::try_from(ranked)?])?;
+        let pinned_context = PinnedBuf::zeros(stream, capacity - ranked)?;
+        let h2d_done = sync_event(stream)?;
         let mut head = Self {
             lm: Some(if options.fp8_head {
                 Matrix::Fp8(Fp8Rows::new(stream, capacity, HIDDEN)?)
@@ -2751,33 +2773,37 @@ impl Head {
                 ranked,
                 context_cap,
                 used: ranked,
+                capacity,
                 member,
                 context: Vec::new(),
                 map,
                 count,
+                pinned_context,
+                h2d_done,
                 stale: false,
             }),
         };
-        let ids = stream.clone_htod(&ids)?;
-        head.gather(stream, kernels, shared, fold, &ids.slice(..), 0)?;
+        head.gather_shortlist_range(stream, kernels, shared, fold, 0..ranked)?;
         Ok(Some(head))
     }
 
-    /// Copies the head rows of the tokens in `ids`, and with `fold` the fold and fold-bias
-    /// rows, into rows `first..` of the shortlist's tables.
-    fn gather(
+    /// Copies the head rows of the tokens in `shortlist.map[range]`, and with `fold` the
+    /// fold and fold-bias rows, into rows `range` of the shortlist's tables.
+    fn gather_shortlist_range(
         &mut self,
         stream: &CudaStream,
         kernels: &DraftKernels,
         shared: SharedWeights<'_>,
         fold: Option<(&CudaSlice<bf16>, &CudaSlice<bf16>)>,
-        ids: &CudaView<'_, i32>,
-        first: usize,
+        range: std::ops::Range<usize>,
     ) -> anyhow::Result<()> {
+        let list = self.shortlist.as_ref().context("shortlist missing")?;
+        let first = range.start;
+        let ids = list.map.slice(range);
         let rows = ids.len();
         let copy = |src: &CudaSlice<bf16>, k: usize, dst: &mut Matrix| match dst {
-            Matrix::Bf16(dst) => kernels.gather_rows(stream, src, k, ids, first, dst),
-            Matrix::Fp8(dst) => kernels.quantize_rows(stream, src, Some(ids), rows, first, dst),
+            Matrix::Bf16(dst) => kernels.gather_rows(stream, src, k, &ids, first, dst),
+            Matrix::Fp8(dst) => kernels.quantize_rows(stream, src, Some(&ids), rows, first, dst),
         };
         if let Some(lm) = self.lm.as_mut() {
             copy(shared.lm_head, HIDDEN, lm)?;
@@ -2789,7 +2815,7 @@ impl Head {
             copy(fold_weight, RANK, fold)?;
         }
         if let Some(bias) = self.fold_bias.as_mut() {
-            kernels.gather_rows(stream, fold_bias, 1, ids, first, bias)?;
+            kernels.gather_rows(stream, fold_bias, 1, &ids, first, bias)?;
         }
         Ok(())
     }

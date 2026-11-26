@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
+    CudaEvent, CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
@@ -14,6 +14,7 @@ use half::bf16;
 use super::{Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, STEPS};
 use crate::{
     DeviceIn,
+    gpu::{PinnedBuf, sync_event},
     model::Sampling,
     ops::{
         draft::{
@@ -83,7 +84,7 @@ pub(super) struct BatchDflash2 {
     fp8_kv: bool,
     /// Maximum sequences the scratch buffers hold (`<= MAX_BATCH_SEQS`).
     max_seqs: usize,
-    /// Elements per row of `base` logits (`bucket` with shortlist, else `vocab`).
+    /// Elements per row of `base` logits (`capacity` with shortlist, else `vocab`).
     base_ld: usize,
     /// Per-sequence `[start, commit_rows, anchor]` controls, `[max_seqs * 3]`.
     controls: CudaSlice<i32>,
@@ -97,6 +98,13 @@ pub(super) struct BatchDflash2 {
     members: Vec<usize>,
     /// `[max_seqs, layers, 2]` device addresses `(cache_k, cache_v)`.
     cache_table: CudaSlice<u64>,
+    /// Persistent page-locked staging buffers for async H2D metadata uploads.
+    host_controls: PinnedBuf<i32>,
+    host_starts: PinnedBuf<i32>,
+    host_races: PinnedBuf<u32>,
+    host_cache_table: PinnedBuf<u64>,
+    /// Recorded on the stream after each async pinned H2D upload.
+    h2d_done: CudaEvent,
     /// Commit intermediates.
     ctx_raw: CudaSlice<bf16>,
     ctx_normed: CudaSlice<bf16>,
@@ -161,6 +169,11 @@ impl BatchDflash2 {
             last_races: vec![0; max_seqs * RACE_WORDS],
             members: Vec::new(),
             cache_table: stream.alloc_zeros(max_seqs * layers * 2)?,
+            host_controls: PinnedBuf::zeros(stream, max_seqs * CONTROL)?,
+            host_starts: PinnedBuf::zeros(stream, max_seqs)?,
+            host_races: PinnedBuf::zeros(stream, max_seqs * RACE_WORDS)?,
+            host_cache_table: PinnedBuf::zeros(stream, max_seqs * layers * 2)?,
+            h2d_done: sync_event(stream)?,
             ctx_raw: z(max_rows * HIDDEN)?,
             ctx_normed: z(max_rows * HIDDEN)?,
             ctx_k: z(layers * max_rows * KV_WIDTH)?,
@@ -194,8 +207,8 @@ impl BatchDflash2 {
         })
     }
 
-    pub(super) fn clear_graphs(&mut self) {
-        self.graphs.clear();
+    pub(super) fn graph_count(&self) -> usize {
+        self.graphs.len()
     }
 
     fn ensure_slot(&mut self, stream: &Arc<CudaStream>, layers: usize, slot: usize) -> anyhow::Result<()> {
@@ -207,6 +220,12 @@ impl BatchDflash2 {
             self.extra_committed.push(0);
         }
         Ok(())
+    }
+}
+
+impl Drop for BatchDflash2 {
+    fn drop(&mut self) {
+        let _ = self.h2d_done.synchronize();
     }
 }
 
@@ -298,9 +317,9 @@ impl Draft {
                 fp8_kv,
                 max_seqs,
             )?;
-            if let Some(prev) = prev_extra {
-                b.extra_slots = prev.extra_slots;
-                b.extra_committed = prev.extra_committed;
+            if let Some(mut prev) = prev_extra {
+                b.extra_slots = std::mem::take(&mut prev.extra_slots);
+                b.extra_committed = std::mem::take(&mut prev.extra_committed);
             }
             self.batch = Some(b);
         }
@@ -520,20 +539,27 @@ impl Draft {
         self.ensure_batch_dflash2(stream, seqs, max_slot)?;
         self.sync_shortlist(stream)?;
         self.upload_batch_meta(stream, slots, samplings)?;
-        let mut controls = [0i32; MAX_BATCH_SEQS * CONTROL];
-        for (i, (&slot, &anchor)) in slots.iter().zip(anchors).enumerate() {
-            let pos = self.slot_committed(slot);
-            ensure!(pos > 0, "slot {slot} has no committed DFlash 2 context");
-            let base = i * CONTROL;
-            controls[base] = i32::try_from(pos)?;
-            controls[base + 1] = 0;
-            controls[base + 2] = i32::try_from(anchor)?;
-        }
+        let committed_positions: Vec<i32> = slots
+            .iter()
+            .map(|&slot| {
+                let pos = self.slot_committed(slot);
+                ensure!(pos > 0, "slot {slot} has no committed DFlash 2 context");
+                Ok(i32::try_from(pos)?)
+            })
+            .collect::<anyhow::Result<_>>()?;
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
-        stream.memcpy_htod(
-            &controls[..seqs * CONTROL],
+        let controls = b.host_controls.as_mut_slice();
+        for (i, (&pos, &anchor)) in committed_positions.iter().zip(anchors).enumerate() {
+            controls[i * CONTROL] = pos;
+            controls[i * CONTROL + 1] = 0;
+            controls[i * CONTROL + 2] = i32::try_from(anchor)?;
+        }
+        b.host_controls.copy_to_device(
+            stream,
+            seqs * CONTROL,
             &mut b.controls.slice_mut(..seqs * CONTROL),
         )?;
+        b.h2d_done.record(stream)?;
         self.launch_batch_graph(stream, shared, seqs, None, steps)
     }
 
@@ -595,7 +621,10 @@ impl Draft {
         self.sync_shortlist(stream)?;
         self.upload_batch_meta(stream, slots, samplings)?;
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
-        stream.memcpy_htod(&starts_i32[..seqs], &mut b.starts.slice_mut(..seqs))?;
+        b.host_starts.as_mut_slice()[..seqs].copy_from_slice(&starts_i32[..seqs]);
+        b.host_starts
+            .copy_to_device(stream, seqs, &mut b.starts.slice_mut(..seqs))?;
+        b.h2d_done.record(stream)?;
         let commit = BatchCommitInputs {
             taps: taps.view(),
             results: results.view(),
@@ -615,6 +644,19 @@ impl Draft {
         Ok(b.verify_tokens.slice(..seqs * width))
     }
 
+    /// Confidences `[seqs * steps]` of the last batched DFlash 2 round on the device.
+    pub fn batch_confidences_device(
+        &self,
+        seqs: usize,
+        steps: usize,
+    ) -> anyhow::Result<CudaView<'_, f32>> {
+        let b = self
+            .batch
+            .as_ref()
+            .context("no batched DFlash 2 round has run")?;
+        Ok(b.confidence.slice(..seqs * steps))
+    }
+
     /// Confidences `[seqs * steps]` of the last batched DFlash 2 round, read to host.
     pub fn batch_confidences(
         &self,
@@ -630,7 +672,9 @@ impl Draft {
     }
 
     /// Uploads `cache_table` (when `slots` changed) and `races` (when `samplings` changed)
-    /// into stable device buffers before launching the captured CUDA graph.
+    /// into stable device buffers using persistent page-locked staging buffers. Synchronizes
+    /// `h2d_done` first so the caller's subsequent pinned H2D (`controls` or `starts`) may
+    /// overwrite its staging buffer safely too.
     fn upload_batch_meta(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -640,8 +684,11 @@ impl Draft {
         let seqs = slots.len();
         let layers = self.arch.layers();
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
+        b.h2d_done.synchronize()?;
         if b.members.as_slice() != slots {
-            let mut table = Vec::with_capacity(seqs * layers * 2);
+            let table_len = seqs * layers * 2;
+            let table = b.host_cache_table.as_mut_slice();
+            let mut idx = 0;
             for &slot in slots {
                 let caches: &[KvCache] = if slot == 0 {
                     &self.caches
@@ -649,26 +696,31 @@ impl Draft {
                     &b.extra_slots[slot - 1]
                 };
                 for c in caches {
-                    table.push(c.k.device_ptr(stream).0);
-                    table.push(c.v.device_ptr(stream).0);
+                    table[idx] = c.k.device_ptr(stream).0;
+                    table[idx + 1] = c.v.device_ptr(stream).0;
+                    idx += 2;
                 }
             }
-            stream.memcpy_htod(&table, &mut b.cache_table.slice_mut(..table.len()))?;
+            b.host_cache_table
+                .copy_to_device(stream, table_len, &mut b.cache_table.slice_mut(..table_len))?;
             b.members = slots.to_vec();
         }
-        let mut races = [0u32; MAX_BATCH_SEQS * RACE_WORDS];
         let race_len = seqs * RACE_WORDS;
-        for (i, &s) in samplings.iter().enumerate() {
-            let words = if s.is_greedy() {
-                race_words(0.0, 0)
-            } else {
-                race_words(s.temperature, s.seed)
-            };
-            races[i * RACE_WORDS..(i + 1) * RACE_WORDS].copy_from_slice(&words);
+        {
+            let races = b.host_races.as_mut_slice();
+            for (i, &s) in samplings.iter().enumerate() {
+                let words = if s.is_greedy() {
+                    race_words(0.0, 0)
+                } else {
+                    race_words(s.temperature, s.seed)
+                };
+                races[i * RACE_WORDS..(i + 1) * RACE_WORDS].copy_from_slice(&words);
+            }
         }
-        if b.last_races[..race_len] != races[..race_len] {
-            stream.memcpy_htod(&races[..race_len], &mut b.races.slice_mut(..race_len))?;
-            b.last_races[..race_len].copy_from_slice(&races[..race_len]);
+        if b.last_races[..race_len] != b.host_races.as_slice()[..race_len] {
+            b.host_races
+                .copy_to_device(stream, race_len, &mut b.races.slice_mut(..race_len))?;
+            b.last_races[..race_len].copy_from_slice(&b.host_races.as_slice()[..race_len]);
         }
         Ok(())
     }
@@ -1070,7 +1122,7 @@ impl Draft {
         let head = self.head.as_ref();
         let list = head.and_then(|h| h.shortlist.as_ref());
         let rows = match list {
-            Some(list) => list.bucket(),
+            Some(list) => list.capacity(),
             None => self.vocab,
         };
         let ld = rows;

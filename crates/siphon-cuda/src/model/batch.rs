@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaSlice, CudaStream, CudaView, DevicePtr as _,
+    CudaEvent, CudaSlice, CudaStream, CudaView, DevicePtr as _,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
@@ -28,15 +28,18 @@ use super::{
     Accept, ImageSource, Model, PrefillLogits, Sampling, StepGraph, Verdict, VisitState,
     prefill::PrefillScratch, zeros,
 };
-use crate::ops::{
-    attention::{KvCache, KvData},
-    sample::SampleBuffers,
-    spec::{
-        BATCH_STATE_WORDS, BatchRows, RESULT_LEN, STATE_ROWS, STREAM_DIMS, VERIFY_ROWS,
-        VISIT_CHANNELS,
+use crate::{
+    gpu::{PinnedBuf, sync_event},
+    ops::{
+        attention::{KvCache, KvData},
+        sample::SampleBuffers,
+        spec::{
+            BATCH_STATE_WORDS, BatchRows, RESULT_LEN, STATE_ROWS, STREAM_DIMS, VERIFY_ROWS,
+            VISIT_CHANNELS,
+        },
     },
+    vmm::PagePool,
 };
-use crate::vmm::PagePool;
 
 /// Most sequences one batched step runs.
 pub use crate::ops::spec::{BATCH_ROWS, BATCH_VERIFY_MAX_ROWS};
@@ -80,6 +83,9 @@ pub(super) struct BatchVerifyState {
     pub(super) results: CudaSlice<i32>,
     /// Next anchor per sequence, `[max_seqs]`.
     pub(super) anchors: CudaSlice<i32>,
+    /// Persistent page-locked host staging buffers for `keep` (H2D) and `results` (D2H).
+    pub(super) host_keep: PinnedBuf<u32>,
+    pub(super) host_results: PinnedBuf<i32>,
     /// Rows per sequence of the active or last pass (`1..=VERIFY_ROWS`).
     pub(super) width: usize,
     /// Sequences of the active or last pass.
@@ -140,6 +146,8 @@ impl BatchVerifyState {
             keep: zeros(stream, max_seqs)?,
             results: zeros(stream, max_seqs * RESULT_LEN)?,
             anchors: zeros(stream, max_seqs)?,
+            host_keep: PinnedBuf::zeros(stream, max_seqs)?,
+            host_results: PinnedBuf::zeros(stream, max_seqs * RESULT_LEN)?,
             width: 1,
             last_seqs: 0,
             pending: false,
@@ -170,8 +178,20 @@ pub(super) struct BatchBuffers {
     pub(super) argmax: CudaSlice<i32>,
     /// The slots whose addresses `tables` holds, by sequence index.
     members: Vec<usize>,
+    /// Persistent page-locked host staging buffers for async H2D uploads.
+    host_tables: PinnedBuf<u64>,
+    host_positions: PinnedBuf<u32>,
+    host_tokens: PinnedBuf<i32>,
+    /// Recorded on the stream after each async pinned H2D upload.
+    h2d_done: CudaEvent,
     /// Present for [`Model::verify_batch`]; `None` for [`Model::step_batch`].
     pub(super) verify: Option<BatchVerifyState>,
+}
+
+impl Drop for BatchBuffers {
+    fn drop(&mut self) {
+        let _ = self.h2d_done.synchronize();
+    }
 }
 
 impl BatchBuffers {
@@ -188,6 +208,10 @@ impl BatchBuffers {
             positions: zeros(stream, max_seqs)?,
             argmax: zeros(stream, max_rows)?,
             members: Vec::new(),
+            host_tables: PinnedBuf::zeros(stream, visits * max_seqs * BATCH_STATE_WORDS)?,
+            host_positions: PinnedBuf::zeros(stream, max_seqs)?,
+            host_tokens: PinnedBuf::zeros(stream, max_rows)?,
+            h2d_done: sync_event(stream)?,
             verify,
         })
     }
@@ -876,40 +900,59 @@ impl Model {
             .as_mut()
             .context("the batch verify state is missing")?;
         ensure!(!bv.pending, "the last batched verify's verdicts were not read");
+        b.h2d_done.synchronize()?;
 
         if b.members.as_slice() != slots {
-            let mut table = vec![0u64; self.visits.len() * b.max_seqs * BATCH_STATE_WORDS];
-            for (r, &slot) in slots.iter().enumerate() {
-                let visits = if slot == 0 {
-                    &self.visits
-                } else {
-                    &self.slots[slot - 1].visits
-                };
-                for (i, v) in visits.iter().enumerate() {
-                    let at = (i * b.max_seqs + r) * BATCH_STATE_WORDS;
-                    table[at..at + BATCH_STATE_WORDS].copy_from_slice(&state_words(&stream, v));
+            let table_len = self.visits.len() * b.max_seqs * BATCH_STATE_WORDS;
+            {
+                let table = b.host_tables.as_mut_slice();
+                table[..table_len].fill(0);
+                for (r, &slot) in slots.iter().enumerate() {
+                    let visits = if slot == 0 {
+                        &self.visits
+                    } else {
+                        &self.slots[slot - 1].visits
+                    };
+                    for (i, v) in visits.iter().enumerate() {
+                        let at = (i * b.max_seqs + r) * BATCH_STATE_WORDS;
+                        table[at..at + BATCH_STATE_WORDS].copy_from_slice(&state_words(&stream, v));
+                    }
                 }
             }
-            stream.memcpy_htod(&table, &mut b.tables)?;
+            b.host_tables
+                .copy_to_device(&stream, table_len, &mut b.tables)?;
             b.members = slots.to_vec();
         }
 
-        stream.memcpy_htod(&positions, &mut b.positions.slice_mut(..seqs))?;
-        stream.memcpy_htod(&keeps, &mut bv.keep.slice_mut(..seqs))?;
+        b.host_positions.as_mut_slice()[..seqs].copy_from_slice(&positions);
+        b.host_positions
+            .copy_to_device(&stream, seqs, &mut b.positions.slice_mut(..seqs))?;
+        bv.host_keep.as_mut_slice()[..seqs].copy_from_slice(&keeps);
+        bv.host_keep
+            .copy_to_device(&stream, seqs, &mut bv.keep.slice_mut(..seqs))?;
         match tokens {
             BatchVerifyTokens::Host(rows) => {
-                let mut ids = Vec::with_capacity(total_rows);
-                for row in rows {
-                    for &tok in *row {
-                        ids.push(i32::try_from(tok)?);
+                {
+                    let ids = b.host_tokens.as_mut_slice();
+                    let mut idx = 0;
+                    for row in rows {
+                        for &tok in *row {
+                            ids[idx] = i32::try_from(tok)?;
+                            idx += 1;
+                        }
                     }
                 }
-                stream.memcpy_htod(&ids, &mut p.tokens.slice_mut(..total_rows))?;
+                b.host_tokens.copy_to_device(
+                    &stream,
+                    total_rows,
+                    &mut p.tokens.slice_mut(..total_rows),
+                )?;
             }
             BatchVerifyTokens::Device { tokens: d, .. } => {
                 stream.memcpy_dtod(&d, &mut p.tokens.slice_mut(..total_rows))?;
             }
         }
+        b.h2d_done.record(&stream)?;
         if let Some(sample) = p.sample.as_mut() {
             let mut settings = Vec::with_capacity(total_rows);
             for (seq, &pos) in positions.iter().enumerate() {
@@ -940,15 +983,57 @@ impl Model {
         &mut self,
         pending: PendingBatchVerify,
     ) -> anyhow::Result<Vec<Verdict>> {
-        let PendingBatchVerify { slots, width } = pending;
-        let seqs = slots.len();
-        for &(slot, start) in &slots {
+        let seqs = pending.slots.len();
+        let width = pending.width;
+        for &(slot, start) in &pending.slots {
             ensure!(
                 self.slot_position(slot)? == start,
                 "slot {slot}'s position moved before finish_verify_batch"
             );
         }
         let stream = Arc::clone(&self.ctx.stream);
+        let raw = {
+            let bv = self
+                .batch_verify
+                .as_mut()
+                .and_then(|p| p.batch.as_mut())
+                .and_then(|b| b.verify.as_mut())
+                .context("the batch verify state is missing")?;
+            ensure!(
+                bv.pending && bv.last_seqs == seqs && bv.width == width,
+                "the verdicts belong to another batched verify"
+            );
+            let n = seqs * RESULT_LEN;
+            bv.host_results
+                .copy_from_device(&stream, &bv.results.slice(..n))?;
+            stream.synchronize()?;
+            bv.host_results.as_slice()[..n].to_vec()
+        };
+        self.complete_verify_batch(pending, &raw)
+    }
+
+    /// Completes `pending` from batched verify result words (`[seqs * RESULT_LEN]`) that the
+    /// caller already copied to the host asynchronously (for example on a copy stream
+    /// overlapped with draft execution), advancing each slot's position past its kept rows.
+    pub fn complete_verify_batch(
+        &mut self,
+        pending: PendingBatchVerify,
+        raw: &[i32],
+    ) -> anyhow::Result<Vec<Verdict>> {
+        let PendingBatchVerify { slots, width } = pending;
+        let seqs = slots.len();
+        ensure!(
+            raw.len() >= seqs * RESULT_LEN,
+            "batched verify results have {} elements, expected at least {}",
+            raw.len(),
+            seqs * RESULT_LEN
+        );
+        for &(slot, start) in &slots {
+            ensure!(
+                self.slot_position(slot)? == start,
+                "slot {slot}'s position moved before complete_verify_batch"
+            );
+        }
         let bv = self
             .batch_verify
             .as_mut()
@@ -960,7 +1045,6 @@ impl Model {
             "the verdicts belong to another batched verify"
         );
         bv.pending = false;
-        let raw = stream.clone_dtoh(&bv.results.slice(..seqs * RESULT_LEN))?;
         let ids = |r: &[i32]| -> anyhow::Result<Vec<u32>> {
             r.iter()
                 .map(|&t| u32::try_from(t).context("a negative token id"))

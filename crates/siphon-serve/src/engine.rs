@@ -959,8 +959,12 @@ mod cuda {
                 let spec_seqs = options.streams.min(speculator.max_batch_spec_seqs());
                 model.reserve_batch_verify(spec_seqs)?;
                 speculator.reserve_batch_spec(&model, spec_seqs, options.streams - 1)?;
+                let warmup_started = Instant::now();
+                let captured = speculator.warmup_batch_spec(&mut model, spec_seqs, warmup[0])?;
                 eprintln!(
-                    "batched DFlash 2 speculation enabled (up to {spec_seqs} sequences per verify)"
+                    "batched DFlash 2 speculation enabled (up to {spec_seqs} sequences per verify, \
+                     pre-captured {captured} verify+draft graph pairs in {:.2} s)",
+                    warmup_started.elapsed().as_secs_f64()
                 );
             }
             eprintln!("serving up to {} requests at once", options.streams);

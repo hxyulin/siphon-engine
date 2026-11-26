@@ -61,6 +61,56 @@ pub const POOL_RUNTIME_BYTES: usize = 64 << 20;
 pub const VERIFY_ROWS: usize = 8;
 /// Rows of the largest batched step: one per stream.
 pub const BATCH_ROWS: usize = 64;
+/// Most total rows (`seqs * width`) one batched verify takes.
+pub const BATCH_VERIFY_MAX_ROWS: usize = 256;
+/// Most sequences one batched DFlash 2 speculation round verifies at once.
+pub const MAX_BATCH_SPEC_SEQS: usize = 32;
+/// Adaptive verify widths considered by batched speculation.
+pub const BATCH_SPEC_WIDTHS: [usize; 4] = [2, 4, 6, 8];
+
+/// Hot batch sizes (`seqs`) to pre-capture during batched speculation warmup, bounded by
+/// `max_seqs` (`<= MAX_BATCH_SPEC_SEQS`): every size up to 8 plus key multiples up to
+/// `max_seqs`, so live requests avoid first-use CUDA graph capture stalls without
+/// exploding startup time.
+#[must_use]
+pub fn hot_batch_spec_seqs(max_seqs: usize) -> Vec<usize> {
+    let max_seqs = max_seqs.min(MAX_BATCH_SPEC_SEQS);
+    if max_seqs == 0 {
+        return Vec::new();
+    }
+    let mut seqs: Vec<usize> = (1..=max_seqs.min(8)).collect();
+    for s in [12usize, 16, 24, 32] {
+        if s <= max_seqs {
+            seqs.push(s);
+        }
+    }
+    if *seqs.last().unwrap_or(&0) != max_seqs {
+        seqs.push(max_seqs);
+    }
+    seqs
+}
+
+/// Hot `(seqs, width)` verify+draft graph pairs to pre-capture during warmup for up to
+/// `max_seqs` concurrent sequences.
+#[must_use]
+pub fn hot_batch_spec_shapes(max_seqs: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for seqs in hot_batch_spec_seqs(max_seqs) {
+        let max_w = (BATCH_VERIFY_MAX_ROWS / seqs).min(VERIFY_ROWS);
+        for w in BATCH_SPEC_WIDTHS {
+            if w <= max_w {
+                out.push((seqs, w));
+            }
+        }
+    }
+    out
+}
+
+/// Fixed shortlist head capacity for `ranked` base+special tokens and `vocab` total tokens.
+#[must_use]
+pub fn shortlist_capacity(ranked: usize, vocab: usize) -> usize {
+    (ranked + SHORTLIST_CONTEXT_ROWS).min(vocab)
+}
 /// Draft tokens per round; a draft's capacity is the target's plus this and the anchor.
 pub const DRAFT_STEPS: usize = 7;
 /// Slots of the bundled draft's sliding rings: a window of 1024 and a block of 8.
@@ -1275,5 +1325,42 @@ mod tests {
             invariant_rows_scratch(&c, 256, 170) - rows_scratch_core(&c, 256, 170),
             invariant_scratch(&c, 256)
         );
+    }
+
+    #[test]
+    fn hot_batch_spec_shapes_are_bounded_and_valid() {
+        assert_eq!(hot_batch_spec_seqs(0), Vec::<usize>::new());
+        assert_eq!(hot_batch_spec_shapes(0), Vec::<(usize, usize)>::new());
+
+        for max_seqs in [1, 2, 4, 8, 12, 16, 20, 32, 64] {
+            let seqs = hot_batch_spec_seqs(max_seqs);
+            let cap = max_seqs.min(MAX_BATCH_SPEC_SEQS);
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+            assert_eq!(seqs.first().copied(), Some(1));
+            assert_eq!(seqs.last().copied(), Some(cap));
+            for s in 1..=cap.min(8) {
+                assert!(seqs.contains(&s), "missing hot batch size {s} in {seqs:?}");
+            }
+
+            let shapes = hot_batch_spec_shapes(max_seqs);
+            assert!(shapes.len() <= 48, "warmup shapes unbounded: {}", shapes.len());
+            for &(s, w) in &shapes {
+                assert!((1..=cap).contains(&s));
+                assert!(BATCH_SPEC_WIDTHS.contains(&w));
+                assert!(s * w <= BATCH_VERIFY_MAX_ROWS);
+            }
+        }
+    }
+
+    #[test]
+    fn shortlist_capacity_is_stable_and_capped() {
+        let vocab = 200_000;
+        let ranked = SHORTLIST_ROWS + (vocab - FIRST_SPECIAL);
+        let cap = shortlist_capacity(ranked, vocab);
+        assert_eq!(cap, ranked + SHORTLIST_CONTEXT_ROWS);
+        assert!(cap < vocab);
+        // Small vocabularies clamp cleanly to `vocab`.
+        assert_eq!(shortlist_capacity(100, 128), 128);
+        assert_eq!(shortlist_capacity(128, 128), 128);
     }
 }

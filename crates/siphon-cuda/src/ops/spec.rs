@@ -123,6 +123,7 @@ pub struct Spec {
     ring_restore_batch: CudaFunction,
     accept_greedy_batch: CudaFunction,
     accept_margin_batch: CudaFunction,
+    pack_verify_tokens_batch: CudaFunction,
 }
 
 impl Spec {
@@ -141,6 +142,7 @@ impl Spec {
             ring_restore_batch: f("ring_restore_batch")?,
             accept_greedy_batch: f("accept_greedy_batch")?,
             accept_margin_batch: f("accept_margin_batch")?,
+            pack_verify_tokens_batch: f("pack_verify_tokens_batch")?,
         })
     }
 
@@ -601,6 +603,48 @@ impl Spec {
         // float*, int, const unsigned*, int, float, int*, int*)`; block `seq` accesses its
         // own slice of each buffer and bounds-checks token indices against `vocab`.
         unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Packs `[seqs, VERIFY_ROWS]` drafted verify tokens in `src` into contiguous
+    /// `[seqs, width]` rows in `dst` on the device using a single PDL block.
+    pub fn pack_verify_tokens_batch(
+        &self,
+        stream: &CudaStream,
+        src: &impl DeviceIn<i32>,
+        dst: &mut impl DeviceOut<i32>,
+        seqs: usize,
+        width: usize,
+    ) -> anyhow::Result<()> {
+        let (src, mut dst) = (src.view(), dst.view_mut());
+        ensure!(seqs > 0, "no sequences");
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&width),
+            "{width} width, expected 1 to {VERIFY_ROWS}"
+        );
+        ensure!(
+            src.len() >= seqs * VERIFY_ROWS,
+            "src has {} elements, expected at least {}",
+            src.len(),
+            seqs * VERIFY_ROWS
+        );
+        ensure!(
+            dst.len() >= seqs * width,
+            "dst has {} elements, expected at least {}",
+            dst.len(),
+            seqs * width
+        );
+        let seqs_arg = i32::try_from(seqs)?;
+        let width_arg = i32::try_from(width)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&src, stream)
+            .ptr_mut(&mut dst, stream)
+            .i32(seqs_arg)
+            .i32(width_arg);
+        // SAFETY: the arguments match `pack_verify_tokens_batch(const int*, int*, int, int)`.
+        // The kernel reads only indices below `seqs * VERIFY_ROWS` in `src` and writes only
+        // indices below `seqs * width` in `dst`, after `pdl_wait()`.
+        unsafe { args.launch_pdl(stream, &self.pack_verify_tokens_batch, one_block(256)) }?;
         Ok(())
     }
 }

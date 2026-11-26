@@ -19,9 +19,9 @@
 //   since keep = a + 1 >= 1, keep + r > r for all r in {0, 1, 2}, and for a >= 2 no old
 //   state row is even read.
 //
-// Every kernel below uses programmatic dependent launch (pdl.cuh), issuing pdl_trigger()
-// and pdl_wait() before any global load and avoiding __restrict__ on pointers written by
-// earlier kernels.
+// Every kernel below (except opt-in accept_margin / accept_margin_batch) uses
+// programmatic dependent launch (pdl.cuh), issuing pdl_trigger() and pdl_wait() before
+// any global load and avoiding __restrict__ on pointers written by earlier kernels.
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -405,4 +405,18 @@ extern "C" __global__ void accept_margin_batch(const int* tokens, const int* arg
         result[1 + kVerifyRows + i] = seq_argmax[i];
     }
     anchors[seq] = seq_argmax[accepted];
+}
+
+// Packs [seqs, kVerifyRows] drafted verify tokens into contiguous [seqs, width] rows for
+// batched verify. One block of 256 threads (seqs * width <= 256). Launched with PDL.
+extern "C" __global__ void __launch_bounds__(256)
+pack_verify_tokens_batch(const int* src, int* dst, int seqs, int width) {
+    pdl_wait();
+    pdl_trigger();
+    const int total = seqs * width;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int seq = idx / width;
+        const int col = idx % width;
+        dst[idx] = src[size_t(seq) * kVerifyRows + col];
+    }
 }

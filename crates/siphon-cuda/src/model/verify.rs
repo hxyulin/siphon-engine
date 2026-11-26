@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaSlice, CudaStream, CudaView, DevicePtr as _,
+    CudaEvent, CudaSlice, CudaStream, CudaView, DevicePtr as _,
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
@@ -29,10 +29,13 @@ use half::bf16;
 use super::{
     Model, PrefillLogits, Sampling, StepGraph, VisitState, prefill::PrefillScratch, zeros,
 };
-use crate::ops::{
-    attention::KvData,
-    sample::SampleBuffers,
-    spec::{RESULT_LEN, STATE_ROWS, STREAM_DIMS, STREAMS, VERIFY_ROWS, VISIT_CHANNELS},
+use crate::{
+    gpu::{PinnedBuf, sync_event},
+    ops::{
+        attention::KvData,
+        sample::SampleBuffers,
+        spec::{RESULT_LEN, STATE_ROWS, STREAM_DIMS, STREAMS, VERIFY_ROWS, VISIT_CHANNELS},
+    },
 };
 
 /// Where the tokens of a verify come from.
@@ -113,8 +116,22 @@ pub(super) struct VerifyBuffers {
     pub result: CudaSlice<i32>,
     /// The next anchor, `argmax[accepted]`.
     pub anchor: CudaSlice<i32>,
+    /// Persistent page-locked host staging buffers for async H2D/D2H transfers.
+    pub host_tokens: PinnedBuf<i32>,
+    pub host_start: PinnedBuf<u32>,
+    pub host_keep: PinnedBuf<u32>,
+    pub host_anchor: PinnedBuf<i32>,
+    pub host_result: PinnedBuf<i32>,
+    /// Recorded on the stream after each async pinned H2D upload.
+    pub h2d_done: CudaEvent,
     /// Whether a pass was launched and its verdict not read yet.
     pub pending: bool,
+}
+
+impl Drop for VerifyBuffers {
+    fn drop(&mut self) {
+        let _ = self.h2d_done.synchronize();
+    }
 }
 
 impl VerifyBuffers {
@@ -174,6 +191,12 @@ impl VerifyBuffers {
             keep: zeros(stream, 1)?,
             result: zeros(stream, RESULT_LEN)?,
             anchor: zeros(stream, 1)?,
+            host_tokens: PinnedBuf::zeros(stream, VERIFY_ROWS)?,
+            host_start: PinnedBuf::zeros(stream, 1)?,
+            host_keep: PinnedBuf::zeros(stream, 1)?,
+            host_anchor: PinnedBuf::zeros(stream, 1)?,
+            host_result: PinnedBuf::zeros(stream, RESULT_LEN)?,
+            h2d_done: sync_event(stream)?,
             pending: false,
         })
     }
@@ -232,13 +255,17 @@ impl Model {
             .as_mut()
             .context("the verify buffers are missing")?;
         ensure!(!v.pending, "the last verify's verdict was not read");
+        v.h2d_done.synchronize()?;
         match tokens {
             VerifyTokens::Host(t) => {
-                let ids = t
-                    .iter()
-                    .map(|&t| Ok(i32::try_from(t)?))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                stream.memcpy_htod(&ids, &mut p.tokens.slice_mut(..m))?;
+                {
+                    let dst = v.host_tokens.as_mut_slice();
+                    for (slot, &tok) in dst[..m].iter_mut().zip(t) {
+                        *slot = i32::try_from(tok)?;
+                    }
+                }
+                v.host_tokens
+                    .copy_to_device(&stream, m, &mut p.tokens.slice_mut(..m))?;
             }
             VerifyTokens::Drafts(d) => {
                 stream.memcpy_dtod(&v.anchor, &mut p.tokens.slice_mut(..1))?;
@@ -247,11 +274,12 @@ impl Model {
                 }
             }
         }
-        stream.memcpy_htod(
-            &[u32::try_from(start).context("position does not fit the kernels")?],
-            &mut p.start,
-        )?;
-        stream.memcpy_htod(&[keep], &mut v.keep)?;
+        v.host_start.as_mut_slice()[0] =
+            u32::try_from(start).context("position does not fit the kernels")?;
+        v.host_start.copy_to_device(&stream, 1, &mut p.start)?;
+        v.host_keep.as_mut_slice()[0] = keep;
+        v.host_keep.copy_to_device(&stream, 1, &mut v.keep)?;
+        v.h2d_done.record(&stream)?;
         if let Some(sample) = p.sample.as_mut() {
             // Row j picks the token at position start + j + 1.
             let settings: Vec<(Sampling, usize)> =
@@ -277,9 +305,41 @@ impl Model {
             "the verdict belongs to another pass"
         );
         let stream = Arc::clone(&self.ctx.stream);
+        let raw = {
+            let v = self.verify_buffers_mut()?;
+            v.host_result.copy_from_device(&stream, &v.result)?;
+            stream.synchronize()?;
+            let mut raw = [0i32; RESULT_LEN];
+            raw.copy_from_slice(v.host_result.as_slice());
+            raw
+        };
+        self.complete_verify(PendingVerify { rows: m, start }, &raw)
+    }
+
+    /// Completes `pending` from verify result words (`[RESULT_LEN]`) that the caller already
+    /// copied to the host asynchronously (for example on a copy stream overlapped with draft
+    /// execution), advancing the model's position past the kept rows.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the pass by value reads each verdict once"
+    )]
+    pub fn complete_verify(
+        &mut self,
+        pending: PendingVerify,
+        result: &[i32],
+    ) -> anyhow::Result<Verdict> {
+        let PendingVerify { rows: m, start } = pending;
+        ensure!(
+            self.position == start && self.verify_rows == m,
+            "the verdict belongs to another pass"
+        );
+        ensure!(
+            result.len() >= RESULT_LEN,
+            "verify result has {} elements, expected at least {RESULT_LEN}",
+            result.len()
+        );
         let v = self.verify_buffers_mut()?;
         v.pending = false;
-        let result = stream.clone_dtoh(&v.result)?;
         let accepted = usize::try_from(result[0])?;
         ensure!(accepted < m, "accepted {accepted} of {} drafts", m - 1);
         let ids = |r: &[i32]| -> anyhow::Result<Vec<u32>> {
@@ -305,8 +365,20 @@ impl Model {
             .as_mut()
             .and_then(|p| p.verify.as_mut())
             .context("the verify buffers are missing")?;
-        stream.memcpy_htod(&[i32::try_from(token)?], &mut v.anchor)?;
+        v.h2d_done.synchronize()?;
+        v.host_anchor.as_mut_slice()[0] = i32::try_from(token)?;
+        v.host_anchor.copy_to_device(&stream, 1, &mut v.anchor)?;
+        v.h2d_done.record(&stream)?;
         Ok(())
+    }
+
+    /// The acceptance result buffer of the last verify on the device, `[RESULT_LEN]`.
+    pub fn verify_result_device(&self) -> anyhow::Result<CudaView<'_, i32>> {
+        self.verify
+            .as_ref()
+            .and_then(|p| p.verify.as_ref())
+            .map(|v| v.result.slice(..))
+            .context("no verify has run")
     }
 
     /// The number of drafts the last verify kept, on the device, one I32.

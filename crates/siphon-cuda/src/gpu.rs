@@ -3,8 +3,9 @@ use std::{ffi::c_void, mem::ManuallyDrop, ptr, sync::Arc};
 use anyhow::{Context as _, ensure};
 use cudarc::{
     driver::{
-        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
-        DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PinnedHostSlice, ValidAsZeroBits, sys,
+        CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView,
+        CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PinnedHostSlice,
+        ValidAsZeroBits, sys,
     },
     nvrtc::Ptx,
 };
@@ -175,6 +176,156 @@ impl<T> Drop for HostMapped<T> {
         // Kernels that read the buffer may still be queued.
         let _ = stream.synchronize();
     }
+}
+
+/// Reusable page-locked host buffer for true async H2D/D2H DMA without pageable staging
+/// stalls. Uses cacheable pinned memory (`flags = 0`) so both host writes (H2D) and host
+/// reads (D2H) are fast.
+///
+/// Because [`Gpu`] turns off cudarc's per-buffer event tracking, callers explicitly order
+/// host accesses against GPU streams using CUDA events before reusing or reading a buffer,
+/// and synchronize any stream referencing the buffer before dropping it.
+#[derive(Debug)]
+pub(crate) struct PinnedBuf<T> {
+    host: PinnedHostSlice<T>,
+    ptr: *mut T,
+    len: usize,
+}
+
+// SAFETY: `PinnedHostSlice<T>` owns the page-locked allocation and is `Send`; `ptr` points
+// into that allocation and is only accessed through `&self` / `&mut self`.
+unsafe impl<T: Send> Send for PinnedBuf<T> {}
+// SAFETY: shared references only expose `&[T]` (read-only access to the pinned memory).
+unsafe impl<T: Sync> Sync for PinnedBuf<T> {}
+
+impl<T: DeviceRepr + ValidAsZeroBits + Copy> PinnedBuf<T> {
+    /// Allocates a zero-initialized cacheable page-locked host buffer of `len` elements.
+    pub fn zeros(stream: &Arc<CudaStream>, len: usize) -> anyhow::Result<Self> {
+        let alloc_len = len.max(1);
+        // SAFETY: zero bits are valid for `T` (`ValidAsZeroBits`) and written immediately below.
+        let mut host = unsafe { stream.context().alloc_pinned_with_flags::<T>(alloc_len, 0) }
+            .context("allocating pinned host buffer")?;
+        let ptr = host.as_mut_ptr()?;
+        // SAFETY: `ptr` points to `alloc_len` writable elements of `T`.
+        unsafe { ptr::write_bytes(ptr, 0, alloc_len) };
+        Ok(Self { host, ptr, len })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: `self.ptr` is valid for `self.len` initialized elements for `&self`.
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            // SAFETY: `self.ptr` is valid for `self.len` initialized elements and exclusively
+            // borrowed by `&mut self`.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
+
+    /// Asynchronously copies `self[..count]` to the first `count` elements of `dst` on `stream`.
+    pub fn copy_to_device(
+        &self,
+        stream: &CudaStream,
+        count: usize,
+        dst: &mut impl DeviceOut<T>,
+    ) -> anyhow::Result<()> {
+        self.copy_range_to_device(stream, 0..count, dst)
+    }
+
+    /// Asynchronously copies `self[range]` to the start of `dst` on `stream`.
+    pub fn copy_range_to_device(
+        &self,
+        stream: &CudaStream,
+        range: std::ops::Range<usize>,
+        dst: &mut impl DeviceOut<T>,
+    ) -> anyhow::Result<()> {
+        let count = range.len();
+        if count == 0 {
+            return Ok(());
+        }
+        ensure!(
+            range.end <= self.len,
+            "pinned H2D range {:?} exceeds buffer length {}",
+            range,
+            self.len
+        );
+        let mut dst = dst.view_mut();
+        ensure!(
+            dst.len() >= count,
+            "device destination has {} elements, expected at least {count}",
+            dst.len()
+        );
+        stream.context().bind_to_thread()?;
+        let (dptr, _guard) = dst.device_ptr_mut(stream);
+        let bytes = count * std::mem::size_of::<T>();
+        // SAFETY: `self.ptr.add(range.start)` lies within the live pinned allocation for
+        // `count` elements, and `dptr` holds at least `count` elements.
+        unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                dptr,
+                self.ptr.add(range.start).cast::<c_void>(),
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .result()
+        .context("async pinned H2D copy")?;
+        let _ = &self.host;
+        Ok(())
+    }
+
+    /// Asynchronously copies all elements of `src` into `self[..src.len()]` on `stream`.
+    pub fn copy_from_device(
+        &mut self,
+        stream: &CudaStream,
+        src: &impl DeviceIn<T>,
+    ) -> anyhow::Result<()> {
+        let src = src.view();
+        let count = src.len();
+        if count == 0 {
+            return Ok(());
+        }
+        ensure!(
+            count <= self.len,
+            "pinned D2H count {count} exceeds buffer length {}",
+            self.len
+        );
+        stream.context().bind_to_thread()?;
+        let (dptr, _guard) = src.device_ptr(stream);
+        let bytes = count * std::mem::size_of::<T>();
+        // SAFETY: `self.ptr` points to `count <= self.len` writable elements in the live
+        // pinned allocation, and `dptr` holds `count` elements.
+        unsafe {
+            sys::cuMemcpyDtoHAsync_v2(
+                self.ptr.cast::<c_void>(),
+                dptr,
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .result()
+        .context("async pinned D2H copy")?;
+        let _ = &self.host;
+        Ok(())
+    }
+}
+
+/// Creates a lightweight synchronization event (timing disabled) on `stream`'s context.
+pub(crate) fn sync_event(stream: &CudaStream) -> anyhow::Result<CudaEvent> {
+    stream
+        .context()
+        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+        .context("creating a synchronization event")
 }
 
 /// Device memory as [`Gpu::memory`] reads it, in bytes.

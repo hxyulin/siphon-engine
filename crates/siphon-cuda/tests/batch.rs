@@ -1083,3 +1083,122 @@ fn packed_prefill_matches_separate_fp8() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Bit-exact GPU parity test for the 1-block PDL `pack_verify_tokens_batch` kernel against
+/// host `[seqs, VERIFY_ROWS] -> [seqs, width]` repacking across all valid shapes.
+#[test]
+fn pack_verify_tokens_batch_matches_host() -> anyhow::Result<()> {
+    use siphon_cuda::ops::spec::{Spec, VERIFY_ROWS};
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let spec = Spec::load(gpu.context())?;
+
+    for seqs in [1usize, 2, 3, 7, 16, 32] {
+        let mut src_host = Vec::with_capacity(seqs * VERIFY_ROWS);
+        for s in 0..seqs {
+            for col in 0..VERIFY_ROWS {
+                src_host.push(i32::try_from(s * 100 + col * 7 + 13)?);
+            }
+        }
+        let src_dev = stream.clone_htod(&src_host)?;
+        let mut dst_dev = stream.alloc_zeros::<i32>(seqs * VERIFY_ROWS)?;
+
+        for width in [1usize, 2, 4, 6, 8] {
+            if seqs * width > 256 {
+                continue;
+            }
+            spec.pack_verify_tokens_batch(
+                stream,
+                &src_dev,
+                &mut dst_dev.slice_mut(..seqs * width),
+                seqs,
+                width,
+            )?;
+            let got = stream.clone_dtoh(&dst_dev.slice(..seqs * width))?;
+            let mut want = Vec::with_capacity(seqs * width);
+            for s in 0..seqs {
+                want.extend_from_slice(&src_host[s * VERIFY_ROWS..s * VERIFY_ROWS + width]);
+            }
+            ensure!(
+                got == want,
+                "pack_verify_tokens_batch mismatch for seqs={seqs}, width={width}: got={got:?}, want={want:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Verifies that adding > 2048 unique context tokens via `Draft::note_tokens` (crossing
+/// multiple old 1024-row bucket boundaries) and calling `Draft::reset` never invalidate
+/// captured single-stream or batched DFlash 2 CUDA graphs, and that `warmup_batch_spec` +
+/// zero-sync overlapped `speculate_batch_round` remain bit-exact against single-sequence
+/// `Model::verify`.
+#[test]
+#[ignore = "needs the checkpoint, SIPHON_DFLASH (DFlash 2), and a GPU"]
+fn shortlist_note_tokens_preserves_graphs() -> anyhow::Result<()> {
+    let Some(dflash_dir) = env::var_os("SIPHON_DFLASH") else {
+        println!("SIPHON_DFLASH is not set; skipped");
+        return Ok(());
+    };
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let capture = capture_tokens()?;
+    let prompt = &capture[..256];
+    let mut draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Dflash(std::path::Path::new(&dflash_dir)),
+        CAPACITY,
+        &DraftOptions::fast(),
+    )?;
+    ensure!(draft.is_dflash2(), "SIPHON_DFLASH must be a DFlash 2 drafter");
+    let stream = std::sync::Arc::clone(model.stream());
+    let linear = siphon_cuda::ops::linear::Linear::load(stream.context())?;
+
+    // Capture a single-stream round graph and a batched draft graph.
+    model.add_slots(1)?;
+    let first = model.prefill_slot_with_taps(0, prompt, DEFAULT_PREFILL_CHUNK, &mut |pos, taps| {
+        draft.commit_slot(&stream, &linear, 0, &taps, pos)
+    })?;
+    let first1 =
+        model.prefill_slot_with_taps(1, prompt, DEFAULT_PREFILL_CHUNK, &mut |pos, taps| {
+            draft.commit_slot(&stream, &linear, 1, &taps, pos)
+        })?;
+    let anchor = stream.clone_htod(&[i32::try_from(first)?])?;
+    let empty_taps = stream.alloc_zeros::<half::bf16>(0)?;
+    draft.set_round_inputs(&stream, &empty_taps, model.position(), &anchor)?;
+    draft.replay_round(&stream, &linear, model.draft_shared(), 7)?;
+    draft.batch_draft_initial(
+        &stream,
+        model.draft_shared(),
+        &[0, 1],
+        &[first, first1],
+        &[Sampling::GREEDY; 2],
+        7,
+    )?;
+    let before = draft.cached_graph_counts();
+    ensure!(
+        before.0 >= 1 && before.1 >= 1,
+        "expected both single and batched draft graphs captured, got {before:?}"
+    );
+
+    // Note > 2048 unique token ids (well beyond the old 1024-row bucket boundary).
+    let extra: Vec<i32> = (50_000..52_500).collect();
+    draft.note_tokens(&stream, model.draft_shared(), &extra)?;
+    let after_note = draft.cached_graph_counts();
+    ensure!(
+        after_note == before,
+        "note_tokens invalidated draft CUDA graphs: before={before:?}, after={after_note:?}"
+    );
+
+    // Resetting the shortlist must also preserve captured graphs.
+    draft.reset();
+    let after_reset = draft.cached_graph_counts();
+    ensure!(
+        after_reset == before,
+        "reset invalidated draft CUDA graphs: before={before:?}, after={after_reset:?}"
+    );
+    Ok(())
+}

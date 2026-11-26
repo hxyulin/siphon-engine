@@ -501,7 +501,7 @@ impl Speculator {
         chunk: usize,
         busy: &[usize],
     ) -> anyhow::Result<(usize, usize)> {
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         let now = Instant::now();
         let Some(cache) = self.prefix.as_mut() else {
             let slot = (1..model.slots())

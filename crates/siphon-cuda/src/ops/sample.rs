@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg as _,
 };
 use half::bf16;
 
-use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module};
+use crate::gpu::{DeviceIn, DeviceOut, KernelArgs, PinnedBuf, cubin, load_module, sync_event};
 
 /// Threads of `sample_prepare`'s blocks, and its blocks per row, one cluster:
 /// `kPrepareThreads` and `kCluster` in the kernel. Ada has no clusters, so the `sm_89`
@@ -114,6 +114,8 @@ impl Default for Sampling {
 pub struct SampleBuffers {
     rows: usize,
     params: CudaSlice<u32>,
+    host_params: PinnedBuf<u32>,
+    upload_done: CudaEvent,
     state: CudaSlice<u32>,
     scores: CudaSlice<f32>,
     idxs: CudaSlice<i32>,
@@ -121,11 +123,19 @@ pub struct SampleBuffers {
     counters: CudaSlice<u32>,
 }
 
+impl Drop for SampleBuffers {
+    fn drop(&mut self) {
+        let _ = self.upload_done.synchronize();
+    }
+}
+
 impl SampleBuffers {
     pub fn new(stream: &Arc<CudaStream>, rows: usize) -> anyhow::Result<Self> {
         Ok(Self {
             rows,
             params: stream.alloc_zeros(rows * PARAM_WORDS)?,
+            host_params: PinnedBuf::zeros(stream, rows * PARAM_WORDS)?,
+            upload_done: sync_event(stream)?,
             state: stream.alloc_zeros(rows * STATE_WORDS)?,
             scores: stream.alloc_zeros(rows * RACE_BLOCKS)?,
             idxs: stream.alloc_zeros(rows * RACE_BLOCKS)?,
@@ -134,7 +144,7 @@ impl SampleBuffers {
     }
 
     /// Uploads the settings of the first rows: each row's sampling and the position its
-    /// token takes.
+    /// token takes, using a persistent page-locked staging buffer.
     pub fn upload(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -146,13 +156,21 @@ impl SampleBuffers {
             rows.len(),
             self.rows
         );
-        let mut words = Vec::with_capacity(rows.len() * PARAM_WORDS);
-        for (sampling, position) in rows {
-            words.extend(sampling.words(*position)?);
+        if rows.is_empty() {
+            return Ok(());
         }
-        if !words.is_empty() {
-            stream.memcpy_htod(&words, &mut self.params.slice_mut(..words.len()))?;
+        self.upload_done.synchronize()?;
+        let n = rows.len() * PARAM_WORDS;
+        {
+            let host = self.host_params.as_mut_slice();
+            for (i, (sampling, position)) in rows.iter().enumerate() {
+                let words = sampling.words(*position)?;
+                host[i * PARAM_WORDS..(i + 1) * PARAM_WORDS].copy_from_slice(&words);
+            }
         }
+        self.host_params
+            .copy_to_device(stream, n, &mut self.params.slice_mut(..n))?;
+        self.upload_done.record(stream)?;
         Ok(())
     }
 }

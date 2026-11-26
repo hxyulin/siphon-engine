@@ -54,11 +54,16 @@ pub use prefix::PrefixHit;
 
 use crate::{
     draft::{Draft, DraftOptions, STEPS, WINDOW},
+    gpu::{PinnedBuf, sync_event},
     model::{
         Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, ImageSource, Model, PackedPrefill,
         PrefillLogits, Sampling, SavedState, Verdict, VerifyTokens,
     },
-    ops::{draft::MAX_BATCH_SEQS, linear::Linear, spec::VERIFY_ROWS},
+    ops::{
+        draft::MAX_BATCH_SEQS,
+        linear::Linear,
+        spec::{RESULT_LEN, Spec, VERIFY_ROWS},
+    },
     weights::{
         dflash::DflashWeights,
         dflash2::{DFLASH2_WINDOW, Dflash2Weights, is_dflash2},
@@ -456,7 +461,31 @@ pub struct SweepRow {
 pub struct Speculator {
     draft: Draft,
     linear: Linear,
+    spec: Spec,
     width: Width,
+    /// Dedicated copy stream for overlapping verify D2H transfers with draft execution.
+    copy_stream: Arc<CudaStream>,
+    /// Two ping-pong sets of reusable `[before, verified, drafted]` timing events for
+    /// single-stream verify rounds, eliminating per-round CUDA event allocations.
+    round_events: [[CudaEvent; 3]; 2],
+    round_event_pending: [bool; 2],
+    round_event_slot: usize,
+    /// Reusable `[before, after]` timing events for plain-step probes.
+    probe_events: [CudaEvent; 2],
+    probe_event_pending: bool,
+    /// Lightweight synchronization events (timing disabled) for cross-stream overlap.
+    sync_verified: CudaEvent,
+    sync_drafted: CudaEvent,
+    results_copied: CudaEvent,
+    conf_copied: CudaEvent,
+    /// Whether `copy_stream` has an in-flight async D2H of single-stream draft confidences.
+    conf_in_flight: bool,
+    /// Persistent page-locked host buffers for single-stream verify results, draft
+    /// confidences, and random drafts.
+    pinned_verify_result: PinnedBuf<i32>,
+    pinned_conf: PinnedBuf<f32>,
+    pinned_random: PinnedBuf<i32>,
+    random_h2d_done: CudaEvent,
     /// Random drafts of [`Drafts::Random`], uploaded each round.
     random: CudaSlice<i32>,
     /// The taps of the prompt's last rows, up to [`TAIL`] of them, oldest first, for
@@ -484,18 +513,94 @@ pub struct Speculator {
     coupled: bool,
     /// Rows of the prefill chunks [`Self::rebuild`] runs ([`Self::set_prefill_chunk`]).
     prefill_chunk: usize,
-    /// Pre-drafted batched DFlash 2 verify tokens cached per micro-batch.
-    batch_drafted: Vec<BatchDrafted>,
+    /// Pre-allocated batched speculation buffers (packed token cache slots + pinned D2H).
+    batch_spec: Option<BatchSpecBuffers>,
     /// Running per-confidence-bin acceptance calibration for batched DFlash 2 width choice.
     batch_calibration: Calibration,
 }
 
-/// Pre-drafted tokens and confidences for one active micro-batch of batched DFlash 2.
-struct BatchDrafted {
+impl Drop for Speculator {
+    fn drop(&mut self) {
+        let _ = self.copy_stream.synchronize();
+        let _ = self.random_h2d_done.synchronize();
+    }
+}
+
+/// Number of pre-allocated packed-token cache slots for active batched micro-batches.
+const BATCH_DRAFT_CACHE_SLOTS: usize = 4;
+
+/// One pre-allocated packed verify-token slot for batched DFlash 2.
+struct BatchDraftedSlot {
     slots: Vec<usize>,
     width: usize,
+    /// Pre-allocated device scratch (`BATCH_VERIFY_MAX_ROWS` ints) reused across cache misses.
     tokens: CudaSlice<i32>,
     confidences: Vec<f32>,
+    valid: bool,
+    tick: u64,
+}
+
+/// In-flight batched draft whose confidences are copying to `pinned_conf` on `copy_stream`
+/// while the host processes the current round's verdicts and returns them to the scheduler.
+struct PendingBatchDraft {
+    slots: Vec<usize>,
+    max_width: usize,
+    slot_idx: usize,
+}
+
+/// Pre-allocated device and pinned-host buffers for zero-sync batched speculation.
+struct BatchSpecBuffers {
+    cache: [BatchDraftedSlot; BATCH_DRAFT_CACHE_SLOTS],
+    tick: u64,
+    /// Persistent page-locked buffer for batched verify results `[MAX_BATCH_SEQS * RESULT_LEN]`.
+    pinned_results: PinnedBuf<i32>,
+    /// Persistent page-locked buffer for batched draft confidences `[MAX_BATCH_SEQS * STEPS]`.
+    pinned_conf: PinnedBuf<f32>,
+    /// Pending async draft from the previous `speculate_batch_round`.
+    pending: Option<PendingBatchDraft>,
+}
+
+impl BatchSpecBuffers {
+    fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let mut slots_vec = Vec::with_capacity(BATCH_DRAFT_CACHE_SLOTS);
+        for _ in 0..BATCH_DRAFT_CACHE_SLOTS {
+            slots_vec.push(BatchDraftedSlot {
+                slots: Vec::new(),
+                width: 0,
+                tokens: stream.alloc_zeros(BATCH_VERIFY_MAX_ROWS)?,
+                confidences: Vec::new(),
+                valid: false,
+                tick: 0,
+            });
+        }
+        let cache: [BatchDraftedSlot; BATCH_DRAFT_CACHE_SLOTS] = slots_vec
+            .try_into()
+            .ok()
+            .context("exact batch draft cache slot count")?;
+        Ok(Self {
+            cache,
+            tick: 0,
+            pinned_results: PinnedBuf::zeros(stream, MAX_BATCH_SEQS * RESULT_LEN)?,
+            pinned_conf: PinnedBuf::zeros(stream, MAX_BATCH_SEQS * STEPS)?,
+            pending: None,
+        })
+    }
+
+    fn alloc_slot(&mut self) -> usize {
+        if let Some(i) = self.cache.iter().position(|s| !s.valid) {
+            return i;
+        }
+        self.cache
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.tick)
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
 }
 
 /// Relative round time model for batched DFlash 2 (`seqs` sequences x `width` verify rows),
@@ -673,10 +778,40 @@ impl Speculator {
         );
         let stream = model.stream();
         let row_len = draft.tap_layout().len() * HIDDEN;
+        let copy_stream = stream.context().new_stream()?;
+        let round_events = [
+            [
+                timing_event(stream)?,
+                timing_event(stream)?,
+                timing_event(stream)?,
+            ],
+            [
+                timing_event(stream)?,
+                timing_event(stream)?,
+                timing_event(stream)?,
+            ],
+        ];
+        let probe_events = [timing_event(stream)?, timing_event(stream)?];
         Ok(Self {
             draft,
             linear: Linear::load(stream.context())?,
+            spec: Spec::load(stream.context())?,
             width,
+            copy_stream,
+            round_events,
+            round_event_pending: [false; 2],
+            round_event_slot: 0,
+            probe_events,
+            probe_event_pending: false,
+            sync_verified: sync_event(stream)?,
+            sync_drafted: sync_event(stream)?,
+            results_copied: sync_event(stream)?,
+            conf_copied: sync_event(stream)?,
+            conf_in_flight: false,
+            pinned_verify_result: PinnedBuf::zeros(stream, RESULT_LEN)?,
+            pinned_conf: PinnedBuf::zeros(stream, STEPS)?,
+            pinned_random: PinnedBuf::zeros(stream, STEPS)?,
+            random_h2d_done: sync_event(stream)?,
             random: stream.alloc_zeros(STEPS)?,
             tail: stream.alloc_zeros(TAIL * row_len)?,
             spare: stream.alloc_zeros(TAIL * row_len)?,
@@ -692,7 +827,7 @@ impl Speculator {
             round_hook: None,
             coupled: true,
             prefill_chunk: crate::model::DEFAULT_PREFILL_CHUNK,
-            batch_drafted: Vec::new(),
+            batch_spec: None,
             batch_calibration: Calibration::default(),
         })
     }
@@ -709,9 +844,25 @@ impl Speculator {
         MAX_BATCH_SEQS
     }
 
-    /// Drops any pre-drafted batched DFlash 2 verify tokens.
+    /// Ensures the pre-allocated batched speculation scratch and pinned host buffers exist.
+    fn ensure_batch_spec(&mut self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        if self.batch_spec.is_none() {
+            self.batch_spec = Some(BatchSpecBuffers::new(stream)?);
+        }
+        Ok(())
+    }
+
+    /// Drops any pre-drafted batched DFlash 2 verify tokens without freeing their
+    /// pre-allocated device buffers, waiting for any in-flight async confidence D2H first.
     pub fn invalidate_batch_draft(&mut self) {
-        self.batch_drafted.clear();
+        if let Some(bs) = self.batch_spec.as_mut() {
+            if bs.pending.take().is_some() {
+                let _ = self.conf_copied.synchronize();
+            }
+            for slot in &mut bs.cache {
+                slot.valid = false;
+            }
+        }
     }
 
     /// Returns the mean calibrated draft confidence of `slot` from the most recent
@@ -719,36 +870,167 @@ impl Speculator {
     /// confidences yet.
     #[must_use]
     pub fn batch_slot_confidence(&self, slot: usize) -> Option<f32> {
-        for entry in self.batch_drafted.iter().rev() {
+        let bs = self.batch_spec.as_ref()?;
+        let mut best: Option<(u64, &[f32])> = None;
+        for entry in &bs.cache {
+            if !entry.valid {
+                continue;
+            }
             if let Some(pos) = entry.slots.iter().position(|&s| s == slot) {
                 let start = pos * STEPS;
                 let end = start + STEPS;
-                if let Some(row) = entry.confidences.get(start..end) {
-                    let cal = self.batch_calibration.apply(row);
-                    let sum: f32 = cal.iter().copied().sum();
-                    return Some(sum / STEPS as f32);
+                if let Some(row) = entry.confidences.get(start..end)
+                    && best.is_none_or(|(tick, _)| entry.tick >= tick)
+                {
+                    best = Some((entry.tick, row));
                 }
             }
         }
-        None
+        let (_, row) = best?;
+        let cal = self.batch_calibration.apply(row);
+        let sum: f32 = cal.iter().copied().sum();
+        Some(sum / STEPS as f32)
     }
 
-    /// Pre-allocates batched DFlash 2 rings and scratch buffers for up to `max_seqs`
-    /// concurrent sequences and slots `0..=max_slot`.
+    /// Pre-allocates batched DFlash 2 rings, packed verify-token scratch slots, and
+    /// page-locked host buffers for up to `max_seqs` concurrent sequences and slots
+    /// `0..=max_slot`.
     pub fn reserve_batch_spec(
         &mut self,
         model: &Model,
         max_seqs: usize,
         max_slot: usize,
     ) -> anyhow::Result<()> {
+        self.ensure_batch_spec(model.stream())?;
         self.draft
             .ensure_batch_dflash2(model.stream(), max_seqs.min(MAX_BATCH_SEQS), max_slot)
+    }
+
+    /// Pre-captures hot `(seqs, width)` target verify and DFlash 2 draft CUDA graph pairs
+    /// during startup warmup (bounded by `max_seqs`) so live requests avoid first-use
+    /// graph capture stalls. Returns the number of `(seqs, width)` pairs captured.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "pre-captures hot batched verify + draft graph pairs"
+    )]
+    pub fn warmup_batch_spec(
+        &mut self,
+        model: &mut Model,
+        max_seqs: usize,
+        token: u32,
+    ) -> anyhow::Result<usize> {
+        ensure!(
+            self.supports_batch_spec(),
+            "batched speculation warmup needs a DFlash 2 drafter"
+        );
+        let max_seqs = max_seqs
+            .clamp(1, self.max_batch_spec_seqs())
+            .min(model.slots());
+        let stream = Arc::clone(model.stream());
+        self.ensure_batch_spec(&stream)?;
+        self.invalidate_batch_draft();
+        for slot in 0..max_seqs {
+            model.reset_slot(slot)?;
+            self.draft.reset_slot(slot);
+        }
+        // Populate 1 committed position per slot in one packed forward pass so every
+        // `batch_draft_initial` / `verify_batch` shape has valid non-empty context.
+        let tok_slice = [token];
+        let slices: Vec<PackedPrefill<'_>> = (0..max_seqs)
+            .map(|slot| PackedPrefill {
+                slot,
+                tokens: &tok_slice,
+                images: Vec::new(),
+                need_first_token: false,
+                sampling: Sampling::GREEDY,
+            })
+            .collect();
+        let flags = vec![true; max_seqs];
+        self.prefill_packed_batch(model, &slices, &flags, &flags, max_seqs)?;
+
+        let mut captured = 0usize;
+        for seqs in siphon::memory::hot_batch_spec_seqs(max_seqs) {
+            let slots: Vec<usize> = (0..seqs).collect();
+            let anchors = vec![token; seqs];
+            let samplings = vec![Sampling::GREEDY; seqs];
+            let accept = vec![Accept::Rows(1); seqs];
+            self.draft.batch_draft_initial(
+                &stream,
+                model.draft_shared(),
+                &slots,
+                &anchors,
+                &samplings,
+                STEPS,
+            )?;
+            let max_w = (BATCH_VERIFY_MAX_ROWS / seqs).min(VERIFY_ROWS);
+            for w in siphon::memory::BATCH_SPEC_WIDTHS {
+                if w > max_w {
+                    continue;
+                }
+                let starts: Vec<usize> = slots
+                    .iter()
+                    .map(|&s| model.slot_position(s))
+                    .collect::<anyhow::Result<_>>()?;
+                {
+                    let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+                    let bs = self
+                        .batch_spec
+                        .as_mut()
+                        .context("batch spec buffers missing")?;
+                    self.spec.pack_verify_tokens_batch(
+                        &stream,
+                        &src,
+                        &mut bs.cache[0].tokens.slice_mut(..seqs * w),
+                        seqs,
+                        w,
+                    )?;
+                }
+                let pending = {
+                    let bs = self
+                        .batch_spec
+                        .as_ref()
+                        .context("batch spec buffers missing")?;
+                    let tokens = bs.cache[0].tokens.slice(..seqs * w);
+                    model.start_verify_batch(
+                        &slots,
+                        BatchVerifyTokens::Device { tokens, width: w },
+                        &accept,
+                        &samplings,
+                    )?
+                };
+                self.draft.batch_commit_and_draft(
+                    &stream,
+                    model.draft_shared(),
+                    &slots,
+                    &starts,
+                    &model.batch_verify_taps()?,
+                    &model.batch_verify_results()?,
+                    &model.batch_verify_anchors()?,
+                    &samplings,
+                    w,
+                    STEPS,
+                )?;
+                let verdicts = model.finish_verify_batch(pending)?;
+                for (&slot, (&start, v)) in slots.iter().zip(starts.iter().zip(&verdicts)) {
+                    self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+                }
+                captured += 1;
+            }
+        }
+        stream.synchronize()?;
+        for slot in 0..max_seqs {
+            model.reset_slot(slot)?;
+            self.draft.reset_slot(slot);
+        }
+        self.draft.reset();
+        self.invalidate_batch_draft();
+        Ok(captured)
     }
 
     /// Synchronizes slot 0's host-tracked DFlash 2 committed position with `model.position()`
     /// after single-stream speculation stops.
     pub fn sync_slot0_draft(&mut self, model: &Model) -> anyhow::Result<()> {
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         self.draft.set_slot_committed(0, model.position())
     }
 
@@ -765,7 +1047,7 @@ impl Speculator {
         from: usize,
         to: usize,
     ) -> anyhow::Result<()> {
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         self.draft.copy_slot_rings(model.stream(), from, to)
     }
 
@@ -777,7 +1059,7 @@ impl Speculator {
         from: usize,
         anchor: u32,
     ) -> anyhow::Result<()> {
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         let pos = model.slot_position(from)?;
         ensure!(
             self.draft.slot_committed(from) == pos,
@@ -803,7 +1085,7 @@ impl Speculator {
         chunk: usize,
         reset_draft: bool,
     ) -> anyhow::Result<u32> {
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         let stream = Arc::clone(model.stream());
         if reset_draft {
             self.draft.reset_slot(slot);
@@ -851,7 +1133,7 @@ impl Speculator {
             commit_draft.len() == slices.len() && reset_draft.len() == slices.len(),
             "mismatched packed prefill draft flags"
         );
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         let stream = Arc::clone(model.stream());
         let any_draft = commit_draft.iter().any(|&c| c);
         if any_draft {
@@ -924,32 +1206,65 @@ impl Speculator {
         best_w
     }
 
-    /// Packs `[seqs, VERIFY_ROWS]` drafted verify tokens on the already-synchronized stream
-    /// into `[seqs, width]` in `dst`.
-    fn pack_batch_verify_tokens(
+    /// Finishes any in-flight batched draft from the previous round: waits for `conf_copied`
+    /// on `copy_stream`, chooses the next verify width from the pinned confidences, and packs
+    /// `[seqs, VERIFY_ROWS]` drafted tokens into `[seqs, next_w]` on the device via
+    /// `pack_verify_tokens_batch`.
+    fn resolve_pending_batch_draft(
+        &mut self,
         stream: &Arc<CudaStream>,
-        src: &CudaView<'_, i32>,
-        seqs: usize,
-        width: usize,
-        dst: &mut CudaSlice<i32>,
+        next_slots: &[usize],
+        next_max_width: usize,
     ) -> anyhow::Result<()> {
-        if width == VERIFY_ROWS {
-            stream.memcpy_dtod(src, &mut dst.slice_mut(..seqs * VERIFY_ROWS))?;
+        let Some(pending) = self
+            .batch_spec
+            .as_mut()
+            .and_then(|bs| bs.pending.take())
+        else {
+            return Ok(());
+        };
+        let seqs = pending.slots.len();
+        self.conf_copied.synchronize()?;
+        let next_conf = {
+            let bs = self
+                .batch_spec
+                .as_ref()
+                .context("batch spec buffers missing")?;
+            bs.pinned_conf.as_slice()[..seqs * STEPS].to_vec()
+        };
+        let eff_max = if pending.slots.as_slice() == next_slots {
+            pending.max_width.min(next_max_width)
         } else {
-            let raw = stream.clone_dtoh(src)?;
-            let mut packed = Vec::with_capacity(seqs * width);
-            for s in 0..seqs {
-                packed.extend_from_slice(&raw[s * VERIFY_ROWS..s * VERIFY_ROWS + width]);
-            }
-            stream.memcpy_htod(&packed, &mut dst.slice_mut(..seqs * width))?;
-        }
+            pending.max_width
+        };
+        let next_w = self.choose_batch_width(seqs, &next_conf, eff_max);
+        let next_tokens = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+        let bs = self
+            .batch_spec
+            .as_mut()
+            .context("batch spec buffers missing")?;
+        let tick = bs.next_tick();
+        let entry = &mut bs.cache[pending.slot_idx];
+        self.spec.pack_verify_tokens_batch(
+            stream,
+            &next_tokens,
+            &mut entry.tokens.slice_mut(..seqs * next_w),
+            seqs,
+            next_w,
+        )?;
+        entry.slots = pending.slots;
+        entry.width = next_w;
+        entry.confidences = next_conf;
+        entry.valid = true;
+        entry.tick = tick;
         Ok(())
     }
 
     /// Runs one batched DFlash 2 speculation round for `slots` (`1..=32`) of up to `max_width`
     /// rows per sequence (`2..=8`, `seqs * max_width <= 256`), adapting the verify width from
     /// calibrated per-position confidences and pipelining `Model::start_verify_batch` with
-    /// `Draft::batch_commit_and_draft` under a single host synchronization.
+    /// `Draft::batch_commit_and_draft`, while overlapping verify D2H and host verdict/scheduler
+    /// work with draft execution on a dedicated copy stream.
     #[expect(clippy::too_many_lines, reason = "pipelined adaptive batch verify + draft")]
     pub fn speculate_batch_round(
         &mut self,
@@ -973,6 +1288,8 @@ impl Speculator {
             "mismatched batched speculation lengths"
         );
         let stream = Arc::clone(model.stream());
+        self.ensure_batch_spec(&stream)?;
+        self.resolve_pending_batch_draft(&stream, slots, max_width)?;
         let starts: Vec<usize> = slots
             .iter()
             .map(|&s| model.slot_position(s))
@@ -983,14 +1300,23 @@ impl Speculator {
             vec![Sampling::GREEDY; seqs]
         };
         let cached_idx = self
-            .batch_drafted
-            .iter()
-            .position(|e| e.slots.as_slice() == slots && e.width <= max_width);
+            .batch_spec
+            .as_ref()
+            .and_then(|bs| {
+                bs.cache
+                    .iter()
+                    .position(|e| e.valid && e.slots.as_slice() == slots && e.width <= max_width)
+            });
         let accept = vec![Accept::Greedy; seqs];
         let (verify_w, used_conf, slot_idx) = if let Some(idx) = cached_idx {
-            let w = self.batch_drafted[idx].width;
-            let conf = self.batch_drafted[idx].confidences.clone();
-            (w, conf, idx)
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            let tick = bs.next_tick();
+            let entry = &mut bs.cache[idx];
+            entry.tick = tick;
+            (entry.width, entry.confidences.clone(), idx)
         } else {
             self.draft.batch_draft_initial(
                 &stream,
@@ -1000,24 +1326,56 @@ impl Speculator {
                 &draft_samplings,
                 STEPS,
             )?;
-            let init_conf = self.draft.batch_confidences(&stream, seqs, STEPS)?;
-            let w = self.choose_batch_width(seqs, &init_conf, max_width);
-            let mut buf = stream.alloc_zeros::<i32>(seqs * VERIFY_ROWS)?;
-            let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
-            Self::pack_batch_verify_tokens(&stream, &src, seqs, w, &mut buf)?;
-            if self.batch_drafted.len() >= 4 {
-                self.batch_drafted.remove(0);
+            self.sync_drafted.record(&stream)?;
+            self.copy_stream.wait(&self.sync_drafted)?;
+            {
+                let bs = self
+                    .batch_spec
+                    .as_mut()
+                    .context("batch spec buffers missing")?;
+                bs.pinned_conf.copy_from_device(
+                    &self.copy_stream,
+                    &self.draft.batch_confidences_device(seqs, STEPS)?,
+                )?;
             }
-            self.batch_drafted.push(BatchDrafted {
-                slots: slots.to_vec(),
-                width: w,
-                tokens: buf,
-                confidences: init_conf.clone(),
-            });
-            (w, init_conf, self.batch_drafted.len() - 1)
+            self.conf_copied.record(&self.copy_stream)?;
+            self.conf_copied.synchronize()?;
+            let init_conf = {
+                let bs = self
+                    .batch_spec
+                    .as_ref()
+                    .context("batch spec buffers missing")?;
+                bs.pinned_conf.as_slice()[..seqs * STEPS].to_vec()
+            };
+            let w = self.choose_batch_width(seqs, &init_conf, max_width);
+            let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            let idx = bs.alloc_slot();
+            let tick = bs.next_tick();
+            let entry = &mut bs.cache[idx];
+            self.spec.pack_verify_tokens_batch(
+                &stream,
+                &src,
+                &mut entry.tokens.slice_mut(..seqs * w),
+                seqs,
+                w,
+            )?;
+            entry.slots = slots.to_vec();
+            entry.width = w;
+            entry.confidences.clone_from(&init_conf);
+            entry.valid = true;
+            entry.tick = tick;
+            (w, init_conf, idx)
         };
         let pending = {
-            let tokens = self.batch_drafted[slot_idx].tokens.slice(..seqs * verify_w);
+            let bs = self
+                .batch_spec
+                .as_ref()
+                .context("batch spec buffers missing")?;
+            let tokens = bs.cache[slot_idx].tokens.slice(..seqs * verify_w);
             model.start_verify_batch(
                 slots,
                 BatchVerifyTokens::Device {
@@ -1028,7 +1386,20 @@ impl Speculator {
                 samplings,
             )?
         };
-        // Immediately pipeline commit + next-round draft (always 7 drafts) on the GPU before syncing.
+        // Record `sync_verified` right after verify_batch and kick off async pinned D2H of
+        // verify results on `copy_stream` before launching the draft graph.
+        self.sync_verified.record(&stream)?;
+        self.copy_stream.wait(&self.sync_verified)?;
+        {
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            bs.pinned_results
+                .copy_from_device(&self.copy_stream, &model.batch_verify_results()?)?;
+        }
+        self.results_copied.record(&self.copy_stream)?;
+        // Immediately pipeline commit + next-round draft (always 7 drafts) on the main stream.
         self.draft.batch_commit_and_draft(
             &stream,
             model.draft_shared(),
@@ -1041,8 +1412,30 @@ impl Speculator {
             verify_w,
             STEPS,
         )?;
-        // Single host synchronization for the whole round.
-        let verdicts = model.finish_verify_batch(pending)?;
+        // Queue async pinned D2H of next round's confidences on `copy_stream` right after draft.
+        self.sync_drafted.record(&stream)?;
+        self.copy_stream.wait(&self.sync_drafted)?;
+        {
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            bs.pinned_conf.copy_from_device(
+                &self.copy_stream,
+                &self.draft.batch_confidences_device(seqs, STEPS)?,
+            )?;
+        }
+        self.conf_copied.record(&self.copy_stream)?;
+        // Wait only for verify results (not draft!), so host verdict parsing, calibration,
+        // `note_tokens` enqueue, and engine token streaming overlap with the draft graph.
+        self.results_copied.synchronize()?;
+        let verdicts = {
+            let bs = self
+                .batch_spec
+                .as_ref()
+                .context("batch spec buffers missing")?;
+            model.complete_verify_batch(pending, &bs.pinned_results.as_slice()[..seqs * RESULT_LEN])?
+        };
         for (s, (&slot, (&start, v))) in slots
             .iter()
             .zip(starts.iter().zip(&verdicts))
@@ -1055,20 +1448,6 @@ impl Speculator {
                 v.accepted,
             );
         }
-        // Stream is already synchronized: read next round's confidences (~3 us), pick next
-        // verify width, and pack its verify tokens (~2 us).
-        let next_conf = self.draft.batch_confidences(&stream, seqs, STEPS)?;
-        let next_w = self.choose_batch_width(seqs, &next_conf, max_width);
-        let next_tokens = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
-        Self::pack_batch_verify_tokens(
-            &stream,
-            &next_tokens,
-            seqs,
-            next_w,
-            &mut self.batch_drafted[slot_idx].tokens,
-        )?;
-        self.batch_drafted[slot_idx].width = next_w;
-        self.batch_drafted[slot_idx].confidences = next_conf;
         let emitted_ids: Vec<i32> = verdicts
             .iter()
             .flat_map(Verdict::emitted)
@@ -1077,6 +1456,14 @@ impl Speculator {
         if !emitted_ids.is_empty() {
             self.draft
                 .note_tokens(&stream, model.draft_shared(), &emitted_ids)?;
+        }
+        if let Some(bs) = self.batch_spec.as_mut() {
+            bs.cache[slot_idx].valid = false;
+            bs.pending = Some(PendingBatchDraft {
+                slots: slots.to_vec(),
+                max_width,
+                slot_idx,
+            });
         }
         Ok(verdicts)
     }
@@ -1184,7 +1571,7 @@ impl Speculator {
     /// Readies the draft for a new prompt: forgets its committed positions and the
     /// sequence it followed, and notes the prompt's last tokens for a shortlist head.
     fn start_prompt(&mut self, model: &Model, prompt: &[u32]) -> anyhow::Result<()> {
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         self.draft.reset();
         self.batched = None;
         self.tail_rows = 0;
@@ -1414,7 +1801,7 @@ impl Speculator {
         model.reset_slot(slot)?;
         // The draft's global caches now take another sequence.
         self.draft_sequence += 1;
-        self.batch_drafted.clear();
+        self.invalidate_batch_draft();
         self.draft.reset();
         self.tail_rows = 0;
         self.prompt_len = 0;
@@ -1594,8 +1981,13 @@ impl Speculator {
         if !room(model, self, model.position() + 1) {
             return Ok(Vec::new());
         }
-        let mut timings: Vec<[CudaEvent; 3]> = Vec::new();
-        let mut probes: Vec<[CudaEvent; 2]> = Vec::new();
+        if self.conf_in_flight {
+            self.conf_copied.synchronize()?;
+            self.conf_in_flight = false;
+        }
+        self.round_event_pending = [false; 2];
+        self.round_event_slot = 0;
+        self.probe_event_pending = false;
         let started = Instant::now();
         let mut out = Vec::with_capacity(n + STEPS + 1);
         let mut run = FIRST_PLAIN_RUN;
@@ -1639,7 +2031,7 @@ impl Speculator {
                     anchor = Some(token);
                     let done = stop || out.len() >= n;
                     if drafts == Drafts::Dspark {
-                        probes.push(self.probe(model, start, &out[first_step..], !done)?);
+                        self.probe(model, start, &out[first_step..], !done)?;
                     }
                     if done {
                         break;
@@ -1654,8 +2046,7 @@ impl Speculator {
                     continue;
                 }
             };
-            let (emitted, events) = self.verify_round(model, width, drafts, &mut rng)?;
-            timings.push(events);
+            let emitted = self.verify_round(model, width, drafts, &mut rng)?;
             anchor = emitted.last().copied();
             let stop = on_round(&emitted).is_break();
             out.extend(emitted);
@@ -1667,45 +2058,76 @@ impl Speculator {
                 Drafts::Random(_) => self.next_blind(self.stats.rounds),
             };
         }
+        if self.conf_in_flight {
+            self.conf_copied.synchronize()?;
+            self.conf_in_flight = false;
+        }
         stream.synchronize()?;
         self.stats.wall = started.elapsed();
         self.stats.emitted = out.len();
-        for [before, verified, drafted] in &timings {
-            self.stats.verify += ms(before.elapsed_ms(verified)?);
-            self.stats.draft += ms(verified.elapsed_ms(drafted)?);
-        }
-        for [before, after] in &probes {
-            self.stats.draft += ms(before.elapsed_ms(after)?);
-        }
+        self.flush_round_event(0)?;
+        self.flush_round_event(1)?;
+        self.flush_probe_event()?;
         Ok(out)
     }
 
+    fn flush_round_event(&mut self, slot: usize) -> anyhow::Result<()> {
+        if self.round_event_pending[slot] {
+            let [before, verified, drafted] = &self.round_events[slot];
+            self.stats.verify += ms(before.elapsed_ms(verified)?);
+            self.stats.draft += ms(verified.elapsed_ms(drafted)?);
+            self.round_event_pending[slot] = false;
+        }
+        Ok(())
+    }
+
+    fn flush_probe_event(&mut self) -> anyhow::Result<()> {
+        if self.probe_event_pending {
+            let [before, after] = &self.probe_events;
+            self.stats.draft += ms(before.elapsed_ms(after)?);
+            self.probe_event_pending = false;
+        }
+        Ok(())
+    }
+
     /// Runs a verify round of `width` rows: the verify, then the draft's next round when
-    /// `drafts` is the draft's. Returns the round's tokens and timing events around the
-    /// verify and the draft. `rng` makes random drafts.
+    /// `drafts` is the draft's, overlapping verify D2H and host verdict/callback work with
+    /// the GPU draft graph via `copy_stream`. Reuses pre-allocated ping-pong timing events.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "overlapped verify, draft, and pinned D2H round"
+    )]
     fn verify_round(
         &mut self,
         model: &mut Model,
         width: usize,
         drafts: Drafts,
         rng: &mut u64,
-    ) -> anyhow::Result<(Vec<u32>, [CudaEvent; 3])> {
+    ) -> anyhow::Result<Vec<u32>> {
         let stream = Arc::clone(model.stream());
         let vocab = model.config().unpadded_vocab_size as u64;
         let proposals = self.width.drafts();
-        let before = timing_event(&stream)?;
-        let verified = timing_event(&stream)?;
-        let drafted = timing_event(&stream)?;
-        before.record(&stream)?;
+        let slot = self.round_event_slot;
+        self.flush_round_event(slot)?;
+        self.round_events[slot][0].record(&stream)?;
         let start = model.position();
         let tokens = match drafts {
             Drafts::Dspark => self.draft.draft_ids().slice(..width - 1),
             Drafts::Random(_) => {
-                let ids: Vec<i32> = (1..width)
-                    .map(|_| i32::try_from(splitmix64(rng) % vocab))
-                    .collect::<Result<_, _>>()?;
-                if !ids.is_empty() {
-                    stream.memcpy_htod(&ids, &mut self.random.slice_mut(..ids.len()))?;
+                if width > 1 {
+                    self.random_h2d_done.synchronize()?;
+                    {
+                        let dst = self.pinned_random.as_mut_slice();
+                        for slot_id in &mut dst[..width - 1] {
+                            *slot_id = i32::try_from(splitmix64(rng) % vocab)?;
+                        }
+                    }
+                    self.pinned_random.copy_to_device(
+                        &stream,
+                        width - 1,
+                        &mut self.random.slice_mut(..width - 1),
+                    )?;
+                    self.random_h2d_done.record(&stream)?;
                 }
                 self.random.slice(..width - 1)
             }
@@ -1733,7 +2155,13 @@ impl Speculator {
             None
         };
         let pending = model.start_verify(VerifyTokens::Drafts(tokens), Accept::Greedy)?;
-        verified.record(&stream)?;
+        self.round_events[slot][1].record(&stream)?;
+        // Immediately copy verify result to pinned host memory on `copy_stream` while the
+        // main stream runs the draft graph.
+        self.copy_stream.wait(&self.round_events[slot][1])?;
+        self.pinned_verify_result
+            .copy_from_device(&self.copy_stream, &model.verify_result_device()?)?;
+        self.results_copied.record(&self.copy_stream)?;
         if drafts == Drafts::Dspark {
             self.draft.set_round_inputs_kept(
                 &stream,
@@ -1745,8 +2173,22 @@ impl Speculator {
             self.draft
                 .replay_round(&stream, &self.linear, model.draft_shared(), proposals)?;
         }
-        drafted.record(&stream)?;
-        let verdict = model.finish_verify(pending)?;
+        self.round_events[slot][2].record(&stream)?;
+        self.round_event_pending[slot] = true;
+        self.round_event_slot ^= 1;
+        if drafts == Drafts::Dspark && matches!(self.width, Width::Adaptive(_)) {
+            self.copy_stream.wait(&self.round_events[slot][2])?;
+            self.pinned_conf.copy_from_device(
+                &self.copy_stream,
+                &self.draft.confidences().slice(..proposals),
+            )?;
+            self.conf_copied.record(&self.copy_stream)?;
+            self.conf_in_flight = true;
+        }
+        // Wait only for verify results (not draft!), overlapping verdict processing,
+        // `note_tokens`, and the caller's `on_round` callback with the GPU draft graph.
+        self.results_copied.synchronize()?;
+        let verdict = model.complete_verify(pending, self.pinned_verify_result.as_slice())?;
         let a = verdict.accepted;
         if let (Some((ids, draft_logits)), Some(hook)) = (observed, self.round_hook.as_mut()) {
             let drafts: Vec<u32> = ids
@@ -1777,7 +2219,7 @@ impl Speculator {
             self.draft
                 .note_tokens(&stream, model.draft_shared(), &ids)?;
         }
-        Ok((emitted, [before, verified, drafted]))
+        Ok(emitted)
     }
 
     /// Runs `steps` plain steps from `token`, the anchor, appends their tokens to `out`
@@ -1818,18 +2260,17 @@ impl Speculator {
 
     /// After plain steps from `start` that emitted `tokens`: commits their taps to the
     /// draft and notes the tokens, then, if `draft`, runs the draft's round from the new
-    /// anchor. Returns timing events around the work.
+    /// anchor. Records timing in the reusable `probe_events`.
     fn probe(
         &mut self,
         model: &Model,
         start: usize,
         tokens: &[u32],
         draft: bool,
-    ) -> anyhow::Result<[CudaEvent; 2]> {
+    ) -> anyhow::Result<()> {
         let stream = Arc::clone(model.stream());
-        let before = timing_event(&stream)?;
-        let after = timing_event(&stream)?;
-        before.record(&stream)?;
+        self.flush_probe_event()?;
+        self.probe_events[0].record(&stream)?;
         self.commit_plain(&stream, model, start, tokens)?;
         if draft {
             self.draft.set_round_inputs(
@@ -1845,8 +2286,9 @@ impl Speculator {
                 self.width.drafts(),
             )?;
         }
-        after.record(&stream)?;
-        Ok([before, after])
+        self.probe_events[1].record(&stream)?;
+        self.probe_event_pending = true;
+        Ok(())
     }
 
     /// Commits the taps of the plain steps from `start` to the draft, which emitted
@@ -1886,12 +2328,26 @@ impl Speculator {
         round: usize,
         run: &mut usize,
     ) -> anyhow::Result<Next> {
-        let Width::Adaptive(policy) = &self.width else {
-            return Ok(self.next_blind(round));
+        let count = match &self.width {
+            Width::Adaptive(policy) => policy.widest() - 1,
+            Width::Fixed(_) => return Ok(self.next_blind(round)),
         };
-        let confidence =
-            stream.clone_dtoh(&self.draft.confidences().slice(..policy.widest() - 1))?;
+        if self.conf_in_flight {
+            self.conf_copied.synchronize()?;
+            self.conf_in_flight = false;
+        } else {
+            self.sync_drafted.record(stream)?;
+            self.copy_stream.wait(&self.sync_drafted)?;
+            self.pinned_conf
+                .copy_from_device(&self.copy_stream, &self.draft.confidences().slice(..count))?;
+            self.conf_copied.record(&self.copy_stream)?;
+            self.conf_copied.synchronize()?;
+        }
+        let confidence = self.pinned_conf.as_slice()[..count].to_vec();
         let calibrated = self.calibration.apply(&confidence);
+        let Width::Adaptive(policy) = &self.width else {
+            unreachable!("checked above");
+        };
         Ok(match policy.decide(&confidence, &calibrated, *run) {
             None => {
                 let steps = *run;
