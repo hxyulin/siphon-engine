@@ -465,8 +465,10 @@ pub(crate) fn tool_ending<'a>(
     Ok((ending, calls))
 }
 
-/// The tokens a request may generate: `requested`, or all that fit after a prompt of
-/// `prompt_len` tokens in a context of `max_context`.
+/// The tokens a request may generate: `requested`, capped at the positions left after a
+/// prompt of `prompt_len` tokens in a context of `max_context`, or all of them. A cap past
+/// the context is cut to fit, as a client's token count can differ from the server's, so
+/// the reply finishes with `length` there.
 pub(crate) fn max_tokens(
     max_context: usize,
     prompt_len: usize,
@@ -481,16 +483,7 @@ pub(crate) fn max_tokens(
     match requested {
         None => Ok(room),
         Some(0) => Err(ApiError::bad_request("max_tokens must be at least 1")),
-        Some(n) => {
-            let n = usize::try_from(n).unwrap_or(usize::MAX);
-            if n > room {
-                return Err(ApiError::bad_request(format!(
-                    "the prompt has {prompt_len} tokens and max_tokens is {n}, more than the \
-                     {max_context} this server holds"
-                )));
-            }
-            Ok(n)
-        }
+        Some(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX).min(room)),
     }
 }
 
@@ -1198,14 +1191,10 @@ async fn stream(
 ) {
     let n = outputs.len();
     let token_ids = chunks.prompt_ids.is_some();
-    if chunks.reply.kind == Kind::Chat {
-        let roles = (0..n)
-            .map(|i| Reply::streamed(i, json!({"delta": {"role": "assistant", "content": ""}})))
-            .collect();
-        if !chunks.send(roles).await {
-            return;
-        }
-    }
+    // The role chunks wait for the first token, as vLLM's do, so that a client or proxy
+    // that times the first chunk measures the prefill. Keep-alive comments hold the
+    // connection open meanwhile.
+    let mut roles = chunks.reply.kind == Kind::Chat;
     // Each choice's tool calls sent, and its ids already sent as `token_ids`.
     let mut calls = vec![0; n];
     let mut sent = vec![0; n];
@@ -1232,6 +1221,14 @@ async fn stream(
                 return;
             }
         };
+        if std::mem::take(&mut roles) {
+            let roles = (0..n)
+                .map(|i| Reply::streamed(i, json!({"delta": {"role": "assistant", "content": ""}})))
+                .collect();
+            if !chunks.send(roles).await {
+                return;
+            }
+        }
         let mut choices = chunks.reply.deltas(i, &delta, &mut calls[i]);
         if let Some(finish) = finish {
             // Ends the job if a stop ended the output first.
@@ -1282,7 +1279,8 @@ mod tests {
     fn max_tokens_fits_the_context() {
         assert_eq!(max_tokens(100, 40, None).ok(), Some(60));
         assert_eq!(max_tokens(100, 40, Some(60)).ok(), Some(60));
-        assert!(max_tokens(100, 40, Some(61)).is_err());
+        assert_eq!(max_tokens(100, 40, Some(61)).ok(), Some(60));
+        assert_eq!(max_tokens(100, 40, Some(u64::MAX)).ok(), Some(60));
         assert!(max_tokens(100, 40, Some(0)).is_err());
         assert!(max_tokens(100, 100, None).is_err());
     }
