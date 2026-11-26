@@ -1562,7 +1562,12 @@ const LM_HEAD_PREFETCH_BYTES: usize = 32 << 20;
 /// 2.857, 3.374 and 4.356; 1.3 took 2.816, 3.329 and 4.312; 1.4 took 2.795, 3.318 and 4.303;
 /// 1.5 took 2.780, 3.315 and 4.298; 1.6 took 2.780, 3.327 and 4.315; 1.7 took 2.810, 3.370
 /// and 4.356.
-const PREFETCH_TB_PER_S: f32 = 1.5;
+///
+/// The RTX 4090 reads DRAM at 1.0 TB/s. Measured there while its expert kernels still
+/// decoded E2M1 through CUDA's software fallback, ms per step at contexts 0 and 32K: 1.5
+/// took 9.09 and 10.47; 1.1 took 9.12 and 10.51; 0.9 took 8.79 and 10.41; 0.7 took 8.78
+/// and 10.32; no prefetch took 9.21 and 10.41.
+const PREFETCH_TB_PER_S: f32 = if cfg!(sm89) { 0.8 } else { 1.5 };
 
 /// The first bytes of a buffer to prefetch, at most its whole length.
 struct PrefetchStart<'a>(&'a dyn Prefetch, usize);

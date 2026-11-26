@@ -25,6 +25,7 @@
 
 #include "conv_step.cuh"
 #include "mlx_ops.cuh"
+#include "arch.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -74,7 +75,15 @@ __device__ __forceinline__ float bf16_hi(uint32_t pair) { return __uint_as_float
 // Two E2M1 values, low nibble first, decoded by the hardware converter. Every E2M1 value is
 // exact in half precision.
 __device__ __forceinline__ float2 e2m1x2(uint32_t bits) {
+#if SIPHON_SM89
+    __half2_raw h;
+    const uint32_t v = e2m1x2_to_f16x2_sm89(bits);
+    h.x = uint16_t(v);
+    h.y = uint16_t(v >> 16);
+    return __half22float2(__half2(h));
+#else
     return __half22float2(__half2(__nv_cvt_fp4x2_to_halfraw2(uint8_t(bits), __NV_E2M1)));
+#endif
 }
 
 // Two E4M3 values, low byte first.

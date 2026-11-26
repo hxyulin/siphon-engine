@@ -107,7 +107,15 @@ __device__ uint32_t pack_bf16x2(float2 v) {
 // The product is exact in half precision: at most 6 significant bits, and
 // magnitudes between 2^-10 and 2688.
 __device__ uint32_t decode_e2m1x2(uint32_t byte, __half2 scale) {
+#if SIPHON_SM89
+    __half2_raw raw;
+    const uint32_t v = e2m1x2_to_f16x2_sm89(byte);
+    raw.x = uint16_t(v);
+    raw.y = uint16_t(v >> 16);
+    const __half2 w = __half2(raw);
+#else
     const __half2 w = __half2(__nv_cvt_fp4x2_to_halfraw2(uint8_t(byte), __NV_E2M1));
+#endif
     return pack_bf16x2(__half22float2(__hmul2(w, scale)));
 }
 

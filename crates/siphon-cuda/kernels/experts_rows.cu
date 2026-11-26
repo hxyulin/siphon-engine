@@ -49,6 +49,7 @@
 #include <cstdint>
 
 #include "mlx_ops.cuh"
+#include "arch.cuh"
 #include "pdl.cuh"
 
 namespace {
@@ -162,8 +163,12 @@ __device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a, uint32_t b) {
 
 // Two E2M1 values (one byte, low nibble first) as F16, exactly.
 __device__ __forceinline__ uint32_t e2m1x2_to_f16x2(uint32_t byte) {
+#if SIPHON_SM89
+    return e2m1x2_to_f16x2_sm89(byte);
+#else
     const __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(uint8_t(byte), __NV_E2M1);
     return uint32_t(h.x) | (uint32_t(h.y) << 16);
+#endif
 }
 
 // Two E4M3 values (low byte first) as F16, exactly.
