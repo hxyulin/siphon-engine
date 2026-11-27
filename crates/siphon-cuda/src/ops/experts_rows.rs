@@ -31,7 +31,7 @@ pub const MAX_ROWS: usize = 256;
 /// Most rows the 8-pair single-group inline kernel takes (`kSingleMaxRows` in the kernel).
 const SINGLE_MAX_ROWS: usize = 8;
 /// Most rows the single-kernel shared-memory path takes (`kMaxRows` in the kernel).
-const INLINE_MAX_ROWS: usize = 32;
+const INLINE_MAX_ROWS: usize = 8;
 /// `u32` words of `ExpertRowsMeta`'s fixed header (`offsetof(ExpertRowsMeta, pair_list) / 4`).
 const META_HEADER_U32: usize = 2056 / 4;
 /// Pairs per chunk for the BF16 wide path.

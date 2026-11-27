@@ -962,8 +962,8 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
             + 2 * c.num_key_value_heads * 4);
     // BF16 `head_logits` when sampling is enabled (0 bytes of F32 `head_capped`!).
     let head_logits = rows * c.vocab_size * 2;
-    // Above 32 rows, `ExpertsRows::sync_len` adds grouped routing metadata (`ExpertRowsMeta`).
-    let extra_sync = if rows > 32 {
+    // Above 8 rows, `ExpertsRows::sync_len` adds grouped routing metadata (`ExpertRowsMeta`).
+    let extra_sync = if rows > 8 {
         let base = 1 + rows * (c.num_experts_per_tok + 1);
         let pairs = rows * c.num_experts_per_tok;
         let groups = pairs.min(c.n_routed_experts) + rows;
