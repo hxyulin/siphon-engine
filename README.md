@@ -2,10 +2,27 @@
 
 Siphon serves [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) through an OpenAI-compatible API on Linux with CUDA and on Apple Silicon with MLX.
 
+[![License MIT or Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![CUDA 13.5](https://img.shields.io/badge/CUDA-13.5-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
+[![GPU RTX 5090 · RTX PRO 6000 · RTX 4090](https://img.shields.io/badge/GPU-RTX%205090%20%C2%B7%20RTX%20PRO%206000%20%C2%B7%20RTX%204090-76B900?logo=nvidia)](#cuda-performance)
+[![Model Inkling 2 Mini](https://img.shields.io/badge/model-Inkling%202%20Mini-FFD21E?logo=huggingface)](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+[![Image build](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml/badge.svg)](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml)
+
 | Platform | Backend |
 | --- | --- |
 | Linux with RTX 5090, RTX PRO 6000 Blackwell, or RTX 4090 | CUDA with speculative decoding, batching, prefix caching, and image inputs |
 | Apple Silicon macOS | MLX-LM baseline for one text request at a time |
+
+## CUDA performance
+
+| GPU | Speculative code<br>Greedy / sampled | Prefill<br>4K prompt | Batched decode<br>32 streams | Single-stream context<br>NVFP4 KV |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 5090 | 885 / 715 tok/s | 34,316 tok/s | 2,145 tok/s | 1,048,576 |
+| RTX PRO 6000 Blackwell | 883 / 706 tok/s | 36,053 tok/s | 2,176 tok/s | 1,048,576 |
+| RTX 4090 | 479 / 375 tok/s | 14,457 tok/s | 1,208 tok/s | 606,208 |
+
+Sampled decode uses temperature 0.8 and lossless speculation. Batched decode reports aggregate throughput. Configurations and longer-context results are in the [CUDA benchmarks](docs/performance.md#supported-gpus).
 
 ## Quick start
 
