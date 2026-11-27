@@ -1824,8 +1824,8 @@ static_assert(kClusterRouterThreads == 2 * kExperts, "two threads per expert ran
 static_assert(kClusterRouterBlocks == 16, "cluster_rank on sm_89");
 
 #if SIPHON_SM89
-// Every block's static shared memory, for up to 4 clusters (32 rows).
-__device__ sm89::Mailboxes<4 * kClusterRouterBlocks, 8192> router_mail;
+// Every block's static shared memory, for up to 32 clusters (256 rows, matching STEP_ROUTER_ROWS).
+__device__ sm89::Mailboxes<32 * kClusterRouterBlocks, 8192> router_mail;
 #endif
 
 }  // namespace
