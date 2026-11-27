@@ -46,11 +46,11 @@ const MATVEC_KERNELS: [&str; 4] = [
     "expert_matvec_mxfp8_2304",
     "expert_matvec_mxfp8_1152",
 ];
-/// `expert_mlp`: the input widths of `w13` and `w2`, and the blocks it runs per SM for
-/// NVFP4 and MXFP8, the fastest measured on an RTX 5090.
+/// `expert_mlp`: the input widths of `w13` and `w2`, and the resident block ceiling per SM
+/// for NVFP4 and MXFP8 (`__launch_bounds__(128, 5)`, 92-96 registers, zero spills).
 const MLP_K13: usize = 2304;
 const MLP_K2: usize = 1152;
-const MLP_BLOCKS_PER_SM: [usize; 2] = [4, 7];
+const MLP_BLOCKS_PER_SM: [usize; 2] = [5, 5];
 /// `expert_matmul`: output columns per block, pairs per tile, input values per pipeline stage,
 /// and threads per block.
 const GEMM_COLUMNS: usize = 128;
@@ -782,7 +782,9 @@ impl Experts {
         if pairs == 0 {
             return Ok(());
         }
-        let tasks = pairs * (w13.n / w13.format.matvec_block_rows(MLP_K13) + w2.n / block_rows2);
+        let tiles13 = w13.n / w13.format.matvec_block_rows(MLP_K13);
+        let tiles2 = w2.n / block_rows2;
+        let blocks = mlp_grid_blocks(pairs, tiles13, tiles2, self.mlp_blocks[w13.format.index()]);
         let mut args = KernelArgs::default();
         args.ptr(&x, stream)
             .ptr(&indices, stream)
@@ -808,7 +810,6 @@ impl Experts {
                 .ptr_mut(end.hidden, stream),
             None => args.u64(0).u64(0).u64(0).u64(0).u64(0),
         };
-        let blocks = tasks.min(self.mlp_blocks[w13.format.index()]);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(blocks)?, 1, 1),
             block_dim: (u32::try_from(MATVEC_WARPS * 32)?, 1, 1),
@@ -1312,6 +1313,35 @@ impl Experts {
             }
         }
     }
+}
+
+/// Picks the largest grid size `<= max_blocks` that divides `tasks = pairs * (tiles13 + tiles2)`
+/// into exact waves with no intra-wave `w13 -> w2` dependency for any pair: every pair's last
+/// `w13` task finishes in an earlier wave than its first `w2` task. For single-row decode
+/// (`pairs = 8, n2 = 2304`) on a 188-SM Blackwell GPU (`max_blocks = 940`), this selects 576
+/// blocks (3 exact waves) for NVFP4 and 864 blocks (4 exact waves) for MXFP8.
+fn mlp_grid_blocks(pairs: usize, tiles13: usize, tiles2: usize, max_blocks: usize) -> usize {
+    let tasks13 = pairs * tiles13;
+    let tasks = tasks13 + pairs * tiles2;
+    if tasks <= max_blocks {
+        return tasks;
+    }
+    let min_waves = tasks.div_ceil(max_blocks);
+    for waves in min_waves..=tasks {
+        if !tasks.is_multiple_of(waves) {
+            continue;
+        }
+        let blocks = tasks / waves;
+        if blocks < max_blocks / 2 {
+            break;
+        }
+        let no_intra_wave_wait = (0..pairs)
+            .all(|p| ((p + 1) * tiles13 - 1) / blocks < (tasks13 + p * tiles2) / blocks);
+        if no_intra_wave_wait {
+            return blocks;
+        }
+    }
+    max_blocks
 }
 
 /// The blocks an `expert_mlp` kernel runs: `per_sm` per SM, and never more than fit on the

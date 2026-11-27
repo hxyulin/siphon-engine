@@ -137,6 +137,8 @@ struct Geometry {
     static constexpr int kRowBytes = kFp4 ? kK / 2 : kK;
     static constexpr int kRowScales = kK / kGroup;
     static_assert(kRows * kRowChunks == 32 * kChunks, "a warp covers whole rows");
+    static_assert(kFp4 ? kRowScales == 2 * kRowChunks : 2 * kRowScales == kRowChunks,
+                  "chunk scales are contiguous across rows");
 };
 
 // One warp's `kRows` weight rows of one expert: chunk `lane + 32 * i` is row
@@ -169,8 +171,7 @@ struct WarpRows {
 
     __device__ __forceinline__ void load(int i, int lane) {
         const int chunk = lane + 32 * i;
-        const int p = chunk % G::kRowChunks;
-        const uint8_t* sp = sr + chunk / G::kRowChunks * G::kRowScales + (kFp4 ? 2 * p : p / 2);
+        const uint8_t* sp = sr + (kFp4 ? 2 * chunk : chunk / 2);
         w[i] = known ? load_stream(wr + 16 * chunk, policy) : make_uint4(0, 0, 0, 0);
         s[i] = !known ? 0 : kFp4 ? load_stream_u16(sp, policy) : load_stream_u8(sp, policy);
     }
@@ -236,6 +237,12 @@ __device__ __forceinline__ uint32_t load_relaxed(const uint32_t* p) {
     uint32_t v;
     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
     return v;
+}
+
+__device__ __forceinline__ uint32_t atom_inc_acq_rel(uint32_t* p) {
+    uint32_t old;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(p) : "memory");
+    return old;
 }
 
 constexpr float kNan = __builtin_nanf("");
@@ -370,7 +377,6 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
     const unsigned tasks = tasks13 + unsigned(pairs) * tiles2;
 
     pdl_wait();
-    pdl_trigger();
     for (unsigned task = blockIdx.x; task < tasks; task += gridDim.x) {
         if (task < tasks13) {
             const unsigned pair = task / kTiles13;
@@ -404,13 +410,14 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             }
         } else {
             const unsigned pair = (task - tasks13) / tiles2;
-            const int row0 = (task - tasks13) % tiles2 * G2::kBlockRows + warp * G2::kRows;
+            const unsigned tile = (task - tasks13) % tiles2;
+            const int row0 = int(tile) * G2::kBlockRows + warp * G2::kRows;
             const int expert = indices[pair];
             const bool known = expert >= 0 && expert < experts;
             if (known) {
                 if (threadIdx.x == 0) {
                     while (load_relaxed(&sync[1 + pair]) < kTiles13) {
-                        __nanosleep(64);
+                        __nanosleep(32);
                     }
                     // With the barrier below, orders the block's activation loads after the
                     // count, and so after the stores the count covers.
@@ -436,7 +443,6 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
                 // The last pair's task of each row tile finishes the tile's channels once
                 // the other pairs' tasks, all earlier in task order, have counted in. Its
                 // other inputs load first, so only the expert outputs wait for the count.
-                const unsigned tile = (task - tasks13) % tiles2;
                 uint32_t* count = sync + 1 + pairs + tile;
                 const bool finisher = pair + 1 == unsigned(pairs);
                 const int channel = int(tile) * G2::kBlockRows + threadIdx.x;
@@ -465,12 +471,20 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             }
         }
     }
-    if (threadIdx.x == 0 && atomicAdd(&sync[0], 1u) == gridDim.x - 1) {
-        // Every block has finished with the counts.
-        for (int p = 0; p < pairs; ++p) {
-            sync[1 + p] = 0;
+    // Release the next PDL kernel only after the task loop so it does not compete for SM
+    // slots or DRAM bandwidth while expert weights stream, while still overlapping with
+    // counter cleanup and CTA teardown.
+    pdl_trigger();
+    if (warp == 0) {
+        uint32_t last = 0;
+        if (lane == 0) {
+            last = (atom_inc_acq_rel(&sync[0]) == gridDim.x - 1) ? 1u : 0u;
         }
-        sync[0] = 0;
+        if (__shfl_sync(0xffffffffu, last, 0)) {
+            for (int p = lane; p <= pairs; p += 32) {
+                sync[p] = 0;
+            }
+        }
     }
 }
 
@@ -512,8 +526,8 @@ EXPERT_MATVEC(expert_matvec_mxfp8_1152, false, 1152)
 // Blocks have `kWarps` warps. The grid may have any size up to the number of tasks,
 // `pairs * (2304 / kBlockRows of w13 + n2 / kBlockRows of w2)`, but all its blocks must
 // fit on the GPU at once.
-#define EXPERT_MLP(name, fp4)                                                                      \
-    extern "C" __global__ void __launch_bounds__(kWarps * 32, 7)                                    \
+#define EXPERT_MLP(name, fp4, min_blocks)                                                          \
+    extern "C" __global__ void __launch_bounds__(kWarps * 32, min_blocks)                          \
         name(const __nv_bfloat16* x, const int32_t* indices, const uint8_t* w13,                   \
              const uint8_t* s13, const float* g13, const uint8_t* w2, const uint8_t* s2,           \
              const float* g2, __nv_bfloat16* act, __nv_bfloat16* out, int n2, int pairs,           \
@@ -525,5 +539,5 @@ EXPERT_MATVEC(expert_matvec_mxfp8_1152, false, 1152)
                                     experts, gate_softcap, up_softcap, sync, conv);                \
     }
 
-EXPERT_MLP(expert_mlp_nvfp4, true)
-EXPERT_MLP(expert_mlp_mxfp8, false)
+EXPERT_MLP(expert_mlp_nvfp4, true, 5)
+EXPERT_MLP(expert_mlp_mxfp8, false, 5)
