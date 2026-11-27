@@ -31,13 +31,19 @@ const DYNAMIC_DIMS: usize = 1024;
 const DYNAMIC_HEADS: usize = 8;
 /// Threads per block; each thread owns one channel.
 const BLOCK: u32 = 256;
-/// Rows per block of `moe_conv_residual_rows_2304`, and its threads and columns per block.
+/// Rows per block of `moe_conv_residual_rows_packed_2304`, and its threads and columns.
 pub const MOE_CONV_ROWS: usize = 8;
 /// Maximum 8-row tiles across `BATCH_ROWS` packed slices totaling at most `MAX_PREFILL_CHUNK`
 /// rows (`2048 / 8 + 64 = 320`).
 pub const MOE_PACKED_MAX_TILES: usize = 320;
 const MOE_CONV_THREADS: u32 = 192;
 const MOE_CONV_BLOCK_COLS: usize = 768;
+/// Tile of `moe_conv_residual_rows_2304`: 29 output rows x 128 cols, 128 threads.
+const MOE_CONV_WIDE_ROWS: usize = 29;
+const MOE_CONV_WIDE_THREADS: u32 = 128;
+const MOE_CONV_WIDE_BLOCK_COLS: usize = 128;
+/// Max rows of `moe_conv_residual_step_rows_2304` and `moe_conv_residual_batch_verify_2304`.
+const STEP_MAX_ROWS: usize = 8;
 /// Channels per block of `moe_conv_residual_step_rows_2304`, `kStepBlockCols` in the
 /// kernel; each row takes a warp of the block.
 const STEP_BLOCK_COLS: usize = 32;
@@ -378,11 +384,11 @@ impl Conv {
         }
         let config = LaunchConfig {
             grid_dim: (
-                u32::try_from(HIDDEN / MOE_CONV_BLOCK_COLS)?,
-                u32::try_from(rows.div_ceil(MOE_CONV_ROWS)).context("too many rows")?,
+                u32::try_from(HIDDEN / MOE_CONV_WIDE_BLOCK_COLS)?,
+                u32::try_from(rows.div_ceil(MOE_CONV_WIDE_ROWS)).context("too many rows")?,
                 1,
             ),
-            block_dim: (MOE_CONV_THREADS, 1, 1),
+            block_dim: (MOE_CONV_WIDE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut args = KernelArgs::default();
@@ -396,8 +402,8 @@ impl Conv {
             .i32(i32::try_from(rows).context("too many rows")?);
         // SAFETY: the arguments match `moe_conv_residual_rows_2304(const bf16*, const float*,
         // const bf16*, const float*, const float*, bf16*, bf16*, int)`, the buffers hold
-        // `rows` rows as checked above, and the grid covers the row in 3 blocks of 768
-        // columns and the rows in tiles of 16 (the kernel stops at `rows`).
+        // `rows` rows as checked above, and the grid covers the row in 18 blocks of 128
+        // columns and the rows in tiles of 29 (the kernel stops at `rows`).
         unsafe { args.launch_pdl(stream, &self.moe_conv_residual_rows_2304, config) }?;
         self.shift_state(stream, &combined.slice(..), state, HIDDEN, rows)
     }
@@ -426,8 +432,8 @@ impl Conv {
         let mut out = out.view_mut();
         check_hidden_conv(weight, state)?;
         ensure!(
-            (1..=MOE_CONV_ROWS).contains(&rows),
-            "{rows} rows, expected 1 to {MOE_CONV_ROWS}"
+            (1..=STEP_MAX_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {STEP_MAX_ROWS}"
         );
         check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
         check_len("weights", weights.len(), rows * TOP_K)?;
@@ -448,7 +454,7 @@ impl Conv {
             check_len(
                 "inputs",
                 inputs.len(),
-                MOE_CONV_ROWS * (2 * DYNAMIC_DIMS + 2 * HIDDEN),
+                STEP_MAX_ROWS * (2 * DYNAMIC_DIMS + 2 * HIDDEN),
             )?;
         }
         let config = LaunchConfig {
@@ -623,7 +629,7 @@ impl Conv {
         let mut out = out.view_mut();
         ensure!(
             seqs > 0
-                && (1..=MOE_CONV_ROWS).contains(&rows_per_seq)
+                && (1..=STEP_MAX_ROWS).contains(&rows_per_seq)
                 && seqs * rows_per_seq <= BATCH_VERIFY_MAX_ROWS,
             "{seqs} seqs x {rows_per_seq} rows exceeds {BATCH_VERIFY_MAX_ROWS}"
         );

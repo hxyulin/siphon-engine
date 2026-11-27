@@ -674,8 +674,9 @@ __device__ __forceinline__ void gate_expect(uint32_t barrier, uint32_t bytes) {
 // warp calls it, or of the block with kBlock. Only sm_89 uses the template arguments and
 // `target`, and kRows picks gate_rows_mail there.
 template <bool kBlock, bool kRows>
-__device__ __forceinline__ void gate_wait(uint32_t barrier, void* target, uint32_t bytes) {
+__device__ __forceinline__ void gate_wait(uint32_t barrier, void* target, uint32_t bytes, uint32_t parity = 0) {
 #if SIPHON_SM89
+    (void)parity;
     if constexpr (kRows) {
         gate_rows_mail.wait<kBlock>(kGateCluster, barrier, target, bytes);
     } else {
@@ -683,8 +684,9 @@ __device__ __forceinline__ void gate_wait(uint32_t barrier, void* target, uint32
     }
 #else
     asm volatile(
-        "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
-        " @!p bra wait;\n}" ::"r"(barrier)
+        "{\n .reg .pred p;\n wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n"
+        " @!p bra wait;\n}" ::"r"(barrier),
+        "r"(parity)
         : "memory");
 #endif
 }
@@ -1522,9 +1524,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
     const int gq = lane / 4;
     const int tq = lane % 4;
     const uint32_t rank = gate_cluster_rank();
-    // This cluster's rows: row0 .. row0 + rows - 1 of the launch.
-    const int row0 = int(blockIdx.z) * kMaxRows;
-    const int rows = min(a.rows - row0, kMaxRows);
+    const int total_groups = (a.rows + kMaxRows - 1) / kMaxRows;
     const uint32_t parts_barrier = gate_smem_addr(&arrived[0]);
     const uint32_t down_barrier = gate_smem_addr(&arrived[1]);
 #if !SIPHON_SM89
@@ -1589,231 +1589,254 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
             own_scale = a.g[gate].down_scale[int(rank) * kOwnedRows + lane / kMaxRows];
         }
     }
-    // The norm weights of row `rank`, for blocks below `rows`.
+    pdl_trigger();
+    // A branch keeps ptxas from placing the wait before the copies (see pdl.cuh).
+    if (a.rows > 0) {
+        pdl_wait();
+    }
+#if !SIPHON_SM89
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
+    // The norm weights of row `rank`, for blocks below `kMaxRows` (reused across all groups;
+    // loaded after pdl_wait so the `a.g[gate].normed != nullptr` guard stays PDL-clean).
     const __nv_bfloat16* norm_weight = a.g[gate].norm_weight;
     const bool norm = a.g[gate].normed != nullptr;
     const int ca = 4 * t;
     const int cb = 4 * (t + kGateThreads);
     uint2 wpa = make_uint2(0, 0);
     uint2 wpb = make_uint2(0, 0);
-    if (norm && int(rank) < rows) {
+    if (norm && int(rank) < kMaxRows) {
         wpa = *reinterpret_cast<const uint2*>(norm_weight + ca);
         wpb = *reinterpret_cast<const uint2*>(norm_weight + cb);
     }
-    pdl_trigger();
-    // A branch keeps ptxas from placing the wait before the copies (see pdl.cuh).
-    if (rows > 0) {
-        pdl_wait();
-    }
-#if !SIPHON_SM89
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-#endif
 
-    if (warp < kUnitsPerBlock) {
-        // Every stage's inputs, then the products in rows_product's order. Stages below
-        // kS / 2 cover the state, the rest the message.
-        static_assert(kS % 2 == 0, "no stage spans both halves");
-        const uint4* xs =
-            reinterpret_cast<const uint4*>(a.g[gate].x_state + size_t(row0 + gq) * a.x_state_stride);
-        const uint4* xm =
-            reinterpret_cast<const uint4*>(a.g[gate].x_message + size_t(row0 + gq) * a.x_message_stride);
-        const bool live = gq < rows;
-        uint4 xv[kMS][kXVecs];
-#pragma unroll
-        for (int i = 0; i < kMS; ++i) {
-            if (i < stages) {
-                const int stage = split + i * kSplits;
-                const bool message = stage >= kS / 2;
-                const uint4* x = message ? xm : xs;
-                const int k0 = (message ? stage - kS / 2 : stage) * kKPerStage;
-#pragma unroll
-                for (int j = 0; j < kChunks / 4; ++j) {
-                    const int c = 4 * j + tq;
-#pragma unroll
-                    for (int hh = 0; hh < kXVecs / (kChunks / 4); ++hh) {
-                        const int xi = (k0 + c * (kFp8 ? 16 : 8)) / 8 + hh;
-                        xv[i][j * (kXVecs / (kChunks / 4)) + hh] = live ? x[xi] : make_uint4(0, 0, 0, 0);
-                    }
-                }
-            }
-        }
-        wait_copies<1>();
-        __syncwarp();
-        float acc[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-        for (int i = 0; i < kMS; ++i) {
-            if (i < stages) {
-                const uint4* slot = buf + i * kSlotVecs;
-#pragma unroll
-                for (int j = 0; j < kChunks / 4; ++j) {
-                    const int c = 4 * j + tq;
-                    const uint4 w0 = slot[slot_index(gq, c)];
-                    const uint4 w8 = slot[slot_index(gq + 8, c)];
-                    if constexpr (kFp8) {
-                        const uint4 x0 = xv[i][2 * j];
-                        const uint4 x1 = xv[i][2 * j + 1];
-                        const uint32_t aw[4] = {w0.x, w0.y, w0.z, w0.w};
-                        const uint32_t bw[4] = {w8.x, w8.y, w8.z, w8.w};
-                        const uint32_t xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-#pragma unroll
-                        for (int q = 0; q < 4; ++q) {
-                            const uint32_t af[4] = {e4m3x2_to_bf16x2(aw[q] & 0xffffu),
-                                                    e4m3x2_to_bf16x2(bw[q] & 0xffffu), e4m3x2_to_bf16x2(aw[q] >> 16),
-                                                    e4m3x2_to_bf16x2(bw[q] >> 16)};
-                            gate_mma(acc, af, xw[2 * q], xw[2 * q + 1]);
-                        }
-                    } else {
-                        const uint4 xx = xv[i][j];
-                        const uint32_t a0[4] = {w0.x, w8.x, w0.y, w8.y};
-                        const uint32_t a1[4] = {w0.z, w8.z, w0.w, w8.w};
-                        gate_mma(acc, a0, xx.x, xx.y);
-                        gate_mma(acc, a1, xx.z, xx.w);
-                    }
-                }
-            }
-        }
-        // acc[0], acc[1]: tile row gq, rows 2 tq and 2 tq + 1; acc[2], acc[3]: tile row gq + 8.
-        const int r_lo = tile * kTileRows + gq;
-        const int r_hi = r_lo + 8;
-        send_v2(gate_smem_addr(&parts[split][r_lo % kOwnedRows][2 * tq]), parts_barrier,
-                uint32_t(r_lo / kOwnedRows), acc[0], acc[1]);
-        send_v2(gate_smem_addr(&parts[split][r_hi % kOwnedRows][2 * tq]), parts_barrier,
-                uint32_t(r_hi / kOwnedRows), acc[2], acc[3]);
-    } else if (warp == kOwnerWarp) {
-        gate_wait<false, true>(parts_barrier, parts, sizeof(parts));
-        // Lane l: down row 4 rank + l / 8 of row l % 8, added over the splits in order.
-        const int i = lane / kMaxRows;
-        const int j = lane % kMaxRows;
-        float acc = parts[0][i][j];
-#pragma unroll
-        for (int u = 1; u < kSplits; ++u) {
-            acc += parts[u][i][j];
-        }
-        owned[i][j] = __float2bfloat16_rn(kFp8 ? own_scale * acc : acc);
-        __syncwarp();
-        // Lane l sends owned rows 2 (l % 2) and 2 (l % 2) + 1 to block l / 2.
-        const uint32_t dst = uint32_t(lane / 2);
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const int r = 2 * (lane % 2) + k;
-            send_v4(gate_smem_addr(&down_t[int(rank) * kOwnedRows + r][0]), down_barrier, dst,
-                    *reinterpret_cast<const uint4*>(&owned[r][0]));
-        }
-    }
-    wait_copies<0>();
-    __syncthreads();
-    gate_wait<true, true>(down_barrier, down_t, sizeof(down_t));
-
-    // The gate products: warp w takes columns 16 w .. 16 w + 15 of the block as two groups
-    // of 8, A holding the down projection's rows (rows 8 .. 15 zero).
-    float acc_f[2][4] = {};
-    float acc_g[2][4] = {};
-#pragma unroll
-    for (int k = 0; k < kGateRank / 16; ++k) {
-        const uint32_t af[4] = {pack_bf16(down_t[16 * k + 2 * tq][gq], down_t[16 * k + 2 * tq + 1][gq]), 0u,
-                                pack_bf16(down_t[16 * k + 8 + 2 * tq][gq], down_t[16 * k + 9 + 2 * tq][gq]), 0u};
-        const int n = 16 * warp + lane % 8 + 8 * (lane / 16);
-        const int chunk = 2 * k + (lane / 8) % 2;
-        uint32_t bf[4];
-        uint32_t bg[4];
-        gate_ldmatrix_x4(bf, &fs[gate_swizzle(n, chunk)]);
-        gate_ldmatrix_x4(bg, &gs[gate_swizzle(n, chunk)]);
-        gate_mma(acc_f[0], af, bf[0], bf[1]);
-        gate_mma(acc_f[1], af, bf[2], bf[3]);
-        gate_mma(acc_g[0], af, bg[0], bg[1]);
-        gate_mma(acc_g[1], af, bg[2], bg[3]);
-    }
-    if (gq < rows) {
-        const int row = row0 + gq;
-        const float* pw = a.g[gate].probs + size_t(row) * a.probs_stride;
-        const int nb = a.nb;
-        float wi[kGtMaxBlocks];
-#pragma unroll
-        for (int i = 0; i < kGtMaxBlocks; ++i) {
-            wi[i] = i < nb ? pw[i] : 0.f;
-        }
-        const float wp = pw[nb];
-        const float* h = a.g[gate].h + size_t(row) * a.h_stride;
-        const float* m = a.m + size_t(row) * a.m_stride;
-        float* out = a.g[gate].out + size_t(row) * kHidden;
-#pragma unroll
-        for (int n = 0; n < 2; ++n) {
-            const int d = col0 + 16 * warp + 8 * n + 2 * tq;
-            const float2 hv = *reinterpret_cast<const float2*>(h + d);
-            float2 mv = *reinterpret_cast<const float2*>(m + d);
-            float2 b[kGtMaxBlocks];
-#pragma unroll
-            for (int i = 0; i < kGtMaxBlocks; ++i) {
-                if (i < nb) {
-                    b[i] = *reinterpret_cast<const float2*>(a.blocks + size_t(i) * a.block_stride +
-                                                            size_t(row) * kHidden + d);
-                }
-            }
-            float2 acc = {};
-#pragma unroll
-            for (int i = 0; i < kGtMaxBlocks; ++i) {
-                if (i < nb) {
-                    acc.x = fmaf(wi[i], b[i].x, acc.x);
-                    acc.y = fmaf(wi[i], b[i].y, acc.y);
-                }
-            }
-            mv.x = fmaf(wp, mv.x, acc.x);
-            mv.y = fmaf(wp, mv.y, acc.y);
-            const float o0 =
-                fadd(fmul(fsub(1.f, tanhf(acc_f[n][0])), hv.x), fmul(tanhf(acc_g[n][0]), mv.x));
-            const float o1 =
-                fadd(fmul(fsub(1.f, tanhf(acc_f[n][1])), hv.y), fmul(tanhf(acc_g[n][1]), mv.y));
-            *reinterpret_cast<float2*>(out + d) = make_float2(o0, o1);
-        }
-    }
-    if (!norm) {
-        return;
-    }
-    // Every block's outputs are visible to the cluster after the barrier.
+    // Persistent-cluster loop over 8-row groups so down, forget, gain and norm weights
+    // stay resident in shared memory and registers across groups (4x-10.7x less weight traffic).
+    for (int iter = 0, group = int(blockIdx.z); group < total_groups; ++iter, group += int(gridDim.z)) {
+        const int row0 = group * kMaxRows;
+        const int rows = min(a.rows - row0, kMaxRows);
+        const uint32_t parity = uint32_t(iter & 1);
+        if (iter > 0) {
+            __syncthreads();
 #if SIPHON_SM89
-    sm89::barrier(gate_rows_barriers, 12, kGateCluster);
+            sm89::barrier(gate_rows_barriers, 12, kGateCluster);
 #else
-    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+            if (t == 0) {
+                gate_expect(parts_barrier, sizeof(parts));
+                gate_expect(down_barrier, sizeof(down_t));
+            }
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 #endif
-    if (int(rank) >= rows) {
-        return;
-    }
-    // message_gate_norm_rows_2304 for row `rank` of the cluster's rows.
-    const size_t at = size_t(row0 + int(rank)) * kHidden;
-    const float4 av = __ldcg(reinterpret_cast<const float4*>(a.g[gate].out + at + ca));
-    const float4 bv = __ldcg(reinterpret_cast<const float4*>(a.g[gate].out + at + cb));
-    const float va[4] = {av.x, av.y, av.z, av.w};
-    const float vb[4] = {bv.x, bv.y, bv.z, bv.w};
-    const auto* wa = reinterpret_cast<const __nv_bfloat16*>(&wpa);
-    const auto* wb = reinterpret_cast<const __nv_bfloat16*>(&wpb);
-    float pa = 0.f;
-    float pb = 0.f;
+        }
+
+        if (warp < kUnitsPerBlock) {
+            // Every stage's inputs, then the products in rows_product's order. Stages below
+            // kS / 2 cover the state, the rest the message.
+            static_assert(kS % 2 == 0, "no stage spans both halves");
+            const uint4* xs =
+                reinterpret_cast<const uint4*>(a.g[gate].x_state + size_t(row0 + gq) * a.x_state_stride);
+            const uint4* xm =
+                reinterpret_cast<const uint4*>(a.g[gate].x_message + size_t(row0 + gq) * a.x_message_stride);
+            const bool live = gq < rows;
+            uint4 xv[kMS][kXVecs];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        pa = fmaf(va[i], va[i], pa);
-        pb = fmaf(vb[i], vb[i], pb);
-    }
-    pa = warp_sum(pa);
-    pb = warp_sum(pb);
-    if (lane == 0) {
-        vw[warp] = pa;
-        vw[warp + kGateWarps] = pb;
-    }
-    __syncthreads();
-    const float ss = warp_sum(lane < kNormVirtualWarps ? vw[lane] : 0.f);
-    const float inv = 1.f / sqrtf(ss / static_cast<float>(kHidden) + a.eps);
-    uint2 na;
-    uint2 nbv;
-    auto* oa = reinterpret_cast<__nv_bfloat16*>(&na);
-    auto* ob = reinterpret_cast<__nv_bfloat16*>(&nbv);
+            for (int i = 0; i < kMS; ++i) {
+                if (i < stages) {
+                    const int stage = split + i * kSplits;
+                    const bool message = stage >= kS / 2;
+                    const uint4* x = message ? xm : xs;
+                    const int k0 = (message ? stage - kS / 2 : stage) * kKPerStage;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        oa[i] = __float2bfloat16((va[i] * inv) * __bfloat162float(wa[i]));
-        ob[i] = __float2bfloat16((vb[i] * inv) * __bfloat162float(wb[i]));
+                    for (int j = 0; j < kChunks / 4; ++j) {
+                        const int c = 4 * j + tq;
+#pragma unroll
+                        for (int hh = 0; hh < kXVecs / (kChunks / 4); ++hh) {
+                            const int xi = (k0 + c * (kFp8 ? 16 : 8)) / 8 + hh;
+                            xv[i][j * (kXVecs / (kChunks / 4)) + hh] = live ? x[xi] : make_uint4(0, 0, 0, 0);
+                        }
+                    }
+                }
+            }
+            if (iter == 0) {
+                wait_copies<1>();
+            }
+            __syncwarp();
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int i = 0; i < kMS; ++i) {
+                if (i < stages) {
+                    const uint4* slot = buf + i * kSlotVecs;
+#pragma unroll
+                    for (int j = 0; j < kChunks / 4; ++j) {
+                        const int c = 4 * j + tq;
+                        const uint4 w0 = slot[slot_index(gq, c)];
+                        const uint4 w8 = slot[slot_index(gq + 8, c)];
+                        if constexpr (kFp8) {
+                            const uint4 x0 = xv[i][2 * j];
+                            const uint4 x1 = xv[i][2 * j + 1];
+                            const uint32_t aw[4] = {w0.x, w0.y, w0.z, w0.w};
+                            const uint32_t bw[4] = {w8.x, w8.y, w8.z, w8.w};
+                            const uint32_t xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+                            for (int q = 0; q < 4; ++q) {
+                                const uint32_t af[4] = {e4m3x2_to_bf16x2(aw[q] & 0xffffu),
+                                                        e4m3x2_to_bf16x2(bw[q] & 0xffffu), e4m3x2_to_bf16x2(aw[q] >> 16),
+                                                        e4m3x2_to_bf16x2(bw[q] >> 16)};
+                                gate_mma(acc, af, xw[2 * q], xw[2 * q + 1]);
+                            }
+                        } else {
+                            const uint4 xx = xv[i][j];
+                            const uint32_t a0[4] = {w0.x, w8.x, w0.y, w8.y};
+                            const uint32_t a1[4] = {w0.z, w8.z, w0.w, w8.w};
+                            gate_mma(acc, a0, xx.x, xx.y);
+                            gate_mma(acc, a1, xx.z, xx.w);
+                        }
+                    }
+                }
+            }
+            // acc[0], acc[1]: tile row gq, rows 2 tq and 2 tq + 1; acc[2], acc[3]: tile row gq + 8.
+            const int r_lo = tile * kTileRows + gq;
+            const int r_hi = r_lo + 8;
+            send_v2(gate_smem_addr(&parts[split][r_lo % kOwnedRows][2 * tq]), parts_barrier,
+                    uint32_t(r_lo / kOwnedRows), acc[0], acc[1]);
+            send_v2(gate_smem_addr(&parts[split][r_hi % kOwnedRows][2 * tq]), parts_barrier,
+                    uint32_t(r_hi / kOwnedRows), acc[2], acc[3]);
+        } else if (warp == kOwnerWarp) {
+            gate_wait<false, true>(parts_barrier, parts, sizeof(parts), parity);
+            // Lane l: down row 4 rank + l / 8 of row l % 8, added over the splits in order.
+            const int i = lane / kMaxRows;
+            const int j = lane % kMaxRows;
+            float acc = parts[0][i][j];
+#pragma unroll
+            for (int u = 1; u < kSplits; ++u) {
+                acc += parts[u][i][j];
+            }
+            owned[i][j] = __float2bfloat16_rn(kFp8 ? own_scale * acc : acc);
+            __syncwarp();
+            // Lane l sends owned rows 2 (l % 2) and 2 (l % 2) + 1 to block l / 2.
+            const uint32_t dst = uint32_t(lane / 2);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int r = 2 * (lane % 2) + k;
+                send_v4(gate_smem_addr(&down_t[int(rank) * kOwnedRows + r][0]), down_barrier, dst,
+                        *reinterpret_cast<const uint4*>(&owned[r][0]));
+            }
+        }
+        if (iter == 0) {
+            wait_copies<0>();
+        }
+        __syncthreads();
+        gate_wait<true, true>(down_barrier, down_t, sizeof(down_t), parity);
+
+        // The gate products: warp w takes columns 16 w .. 16 w + 15 of the block as two groups
+        // of 8, A holding the down projection's rows (rows 8 .. 15 zero).
+        float acc_f[2][4] = {};
+        float acc_g[2][4] = {};
+#pragma unroll
+        for (int k = 0; k < kGateRank / 16; ++k) {
+            const uint32_t af[4] = {pack_bf16(down_t[16 * k + 2 * tq][gq], down_t[16 * k + 2 * tq + 1][gq]), 0u,
+                                    pack_bf16(down_t[16 * k + 8 + 2 * tq][gq], down_t[16 * k + 9 + 2 * tq][gq]), 0u};
+            const int n = 16 * warp + lane % 8 + 8 * (lane / 16);
+            const int chunk = 2 * k + (lane / 8) % 2;
+            uint32_t bf[4];
+            uint32_t bg[4];
+            gate_ldmatrix_x4(bf, &fs[gate_swizzle(n, chunk)]);
+            gate_ldmatrix_x4(bg, &gs[gate_swizzle(n, chunk)]);
+            gate_mma(acc_f[0], af, bf[0], bf[1]);
+            gate_mma(acc_f[1], af, bf[2], bf[3]);
+            gate_mma(acc_g[0], af, bg[0], bg[1]);
+            gate_mma(acc_g[1], af, bg[2], bg[3]);
+        }
+        if (gq < rows) {
+            const int row = row0 + gq;
+            const float* pw = a.g[gate].probs + size_t(row) * a.probs_stride;
+            const int nb = a.nb;
+            float wi[kGtMaxBlocks];
+#pragma unroll
+            for (int i = 0; i < kGtMaxBlocks; ++i) {
+                wi[i] = i < nb ? pw[i] : 0.f;
+            }
+            const float wp = pw[nb];
+            const float* h = a.g[gate].h + size_t(row) * a.h_stride;
+            const float* m = a.m + size_t(row) * a.m_stride;
+            float* out = a.g[gate].out + size_t(row) * kHidden;
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                const int d = col0 + 16 * warp + 8 * n + 2 * tq;
+                const float2 hv = *reinterpret_cast<const float2*>(h + d);
+                float2 mv = *reinterpret_cast<const float2*>(m + d);
+                float2 b[kGtMaxBlocks];
+#pragma unroll
+                for (int i = 0; i < kGtMaxBlocks; ++i) {
+                    if (i < nb) {
+                        b[i] = *reinterpret_cast<const float2*>(a.blocks + size_t(i) * a.block_stride +
+                                                                size_t(row) * kHidden + d);
+                    }
+                }
+                float2 acc = {};
+#pragma unroll
+                for (int i = 0; i < kGtMaxBlocks; ++i) {
+                    if (i < nb) {
+                        acc.x = fmaf(wi[i], b[i].x, acc.x);
+                        acc.y = fmaf(wi[i], b[i].y, acc.y);
+                    }
+                }
+                mv.x = fmaf(wp, mv.x, acc.x);
+                mv.y = fmaf(wp, mv.y, acc.y);
+                const float o0 =
+                    fadd(fmul(fsub(1.f, tanhf(acc_f[n][0])), hv.x), fmul(tanhf(acc_g[n][0]), mv.x));
+                const float o1 =
+                    fadd(fmul(fsub(1.f, tanhf(acc_f[n][1])), hv.y), fmul(tanhf(acc_g[n][1]), mv.y));
+                *reinterpret_cast<float2*>(out + d) = make_float2(o0, o1);
+            }
+        }
+        if (norm) {
+            // Every block's outputs are visible to the cluster after the barrier.
+#if SIPHON_SM89
+            sm89::barrier(gate_rows_barriers, 12, kGateCluster);
+#else
+            asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
+            if (int(rank) < rows) {
+                // message_gate_norm_rows_2304 for row `rank` of the cluster's rows.
+                const size_t at = size_t(row0 + int(rank)) * kHidden;
+                const float4 av = __ldcg(reinterpret_cast<const float4*>(a.g[gate].out + at + ca));
+                const float4 bv = __ldcg(reinterpret_cast<const float4*>(a.g[gate].out + at + cb));
+                const float va[4] = {av.x, av.y, av.z, av.w};
+                const float vb[4] = {bv.x, bv.y, bv.z, bv.w};
+                const auto* wa = reinterpret_cast<const __nv_bfloat16*>(&wpa);
+                const auto* wb = reinterpret_cast<const __nv_bfloat16*>(&wpb);
+                float pa = 0.f;
+                float pb = 0.f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    pa = fmaf(va[i], va[i], pa);
+                    pb = fmaf(vb[i], vb[i], pb);
+                }
+                pa = warp_sum(pa);
+                pb = warp_sum(pb);
+                if (lane == 0) {
+                    vw[warp] = pa;
+                    vw[warp + kGateWarps] = pb;
+                }
+                __syncthreads();
+                const float ss = warp_sum(lane < kNormVirtualWarps ? vw[lane] : 0.f);
+                const float inv = 1.f / sqrtf(ss / static_cast<float>(kHidden) + a.eps);
+                uint2 na;
+                uint2 nbv;
+                auto* oa = reinterpret_cast<__nv_bfloat16*>(&na);
+                auto* ob = reinterpret_cast<__nv_bfloat16*>(&nbv);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    oa[i] = __float2bfloat16((va[i] * inv) * __bfloat162float(wa[i]));
+                    ob[i] = __float2bfloat16((vb[i] * inv) * __bfloat162float(wb[i]));
+                }
+                __nv_bfloat16* normed = a.g[gate].normed;
+                *reinterpret_cast<uint2*>(normed + at + ca) = na;
+                *reinterpret_cast<uint2*>(normed + at + cb) = nbv;
+            }
+        }
     }
-    __nv_bfloat16* normed = a.g[gate].normed;
-    *reinterpret_cast<uint2*>(normed + at + ca) = na;
-    *reinterpret_cast<uint2*>(normed + at + cb) = nbv;
 }
 
 }  // namespace gate_rows

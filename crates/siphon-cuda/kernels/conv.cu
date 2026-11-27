@@ -211,12 +211,26 @@ extern "C" __global__ void short_conv_residual_rows_2304(const __nv_bfloat16* x,
 
 namespace {
 
-// Rows per block of moe_conv_residual_rows_2304, and columns per thread and block.
+// Rows per block of moe_conv_residual_rows_packed_2304 (and step max rows).
 constexpr int kMoeConvRows = 8;
 constexpr int kMoeConvCols = 4;
 constexpr int kMoeConvThreads = 192;
 constexpr int kMoeConvBlockCols = kMoeConvThreads * kMoeConvCols;
+// Tile of moe_conv_residual_rows_2304: 29 output rows + 3 halo rows = 32 rows (4 full
+// steps of 8 half-warps). Each half-warp (16 threads x 8 BF16s = 128 cols) handles one
+// row with 16-byte uint4 loads/stores, reducing halo expert reads from 37.5% to 10.3%.
+constexpr int kMoeConvWideRows = 29;
+constexpr int kMoeConvWideCols = 8;
+constexpr int kMoeConvWideColThreads = 16;
+constexpr int kMoeConvWideRowGroups = 8;
+constexpr int kMoeConvWideThreads = kMoeConvWideColThreads * kMoeConvWideRowGroups;
+constexpr int kMoeConvWideBlockCols = kMoeConvWideColThreads * kMoeConvWideCols;
+constexpr int kMoeConvWideWindow = kMoeConvWideRows + kKernel - 1;
+// Max rows of moe_conv_residual_step_rows_2304 and moe_conv_residual_batch_verify_2304.
+constexpr int kStepMaxRows = 8;
 static_assert(kHidden % kMoeConvBlockCols == 0, "blocks cover the row");
+static_assert(kHidden % kMoeConvWideBlockCols == 0, "wide blocks cover the row");
+static_assert(kMoeConvWideWindow % kMoeConvWideRowGroups == 0, "window fills whole steps");
 
 __device__ __forceinline__ void load_bf16x4(const __nv_bfloat16* p, float (&v)[4]) {
     const uint2 packed = *reinterpret_cast<const uint2*>(p);
@@ -227,91 +241,141 @@ __device__ __forceinline__ void load_bf16x4(const __nv_bfloat16* p, float (&v)[4
     }
 }
 
+__device__ __forceinline__ void unpack_bf16x8(uint4 packed, float (&v)[8]) {
+    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = __bfloat162float(vals[i]);
+    }
+}
+
 }  // namespace
 
 // moe_conv_residual_2304 for the rows of a chunk: the MoE combine of each row's 8 expert
 // outputs (experts [rows, 8, 2304], weights [rows, 8]), the post-MLP conv and
-// out = bf16(residual + conv) ([rows, 2304]). A block takes 16 rows and 768 columns
-// (4 per thread) and walks its rows in order, recombining the 3 rows before its first
-// for the conv window; rows before the chunk come from the state, which it only reads.
-// The combines of the chunk's last 3 rows go to `combined` for shift_state_rows. Every
-// row rounds as the single-row kernel does. Grid: (3, ceil(rows / 16)), 192 threads.
-extern "C" __global__ void __launch_bounds__(kMoeConvThreads)
+// out = bf16(residual + conv) ([rows, 2304]). A block takes 29 output rows and 128 columns
+// (16 threads x 8 BF16s per row, 8 rows in parallel across 4 warps), walking the 32-row
+// window (3 halo rows + 29 output rows) in 4 full 8-row steps through shared memory.
+// Rows before the chunk come from `state`, which it only reads. The combines of the
+// chunk's last 3 rows go to `combined` for shift_state_rows. Every row rounds as the
+// single-row kernel does, bit for bit. Grid: (18, ceil(rows / 29)), 128 threads.
+extern "C" __global__ void __launch_bounds__(kMoeConvWideThreads)
 moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
                             const __nv_bfloat16* __restrict__ weight, const float* state,
                             const float* residual, __nv_bfloat16* __restrict__ combined,
                             __nv_bfloat16* __restrict__ out, int rows) {
-    const int c0 = blockIdx.x * kMoeConvBlockCols + threadIdx.x * kMoeConvCols;
-    const int r0 = blockIdx.y * kMoeConvRows;
-    const int r_end = min(r0 + kMoeConvRows, rows);
-    // The conv taps of this thread's 4 channels.
-    float taps[kMoeConvCols][kKernel];
+    __shared__ __align__(16) __nv_bfloat16 comb_s[kMoeConvWideWindow][kMoeConvWideBlockCols];
+    __shared__ float taps_s[kKernel][kMoeConvWideCols][kMoeConvWideColThreads];
+    const int tid = threadIdx.x;
+    const int c_block = int(blockIdx.x) * kMoeConvWideBlockCols;
+    const int g = tid / kMoeConvWideColThreads;
+    const int lane16 = tid % kMoeConvWideColThreads;
+    const int c_local = lane16 * kMoeConvWideCols;
+    const int c0 = c_block + c_local;
+    const int r0 = int(blockIdx.y) * kMoeConvWideRows;
+    const int r_end = min(r0 + kMoeConvWideRows, rows);
+
+    // Load the 128 channels' conv taps before pdl_wait() (weight is read-only).
+    {
+        float w_taps[kKernel];
+        load_bf16x4(weight + size_t(c_block + tid) * kKernel, w_taps);
+        const int tap_lane = tid / kMoeConvWideCols;
+        const int tap_j = tid % kMoeConvWideCols;
 #pragma unroll
-    for (int j = 0; j < kMoeConvCols; ++j) {
-        load_bf16x4(weight + size_t(c0 + j) * kKernel, taps[j]);
+        for (int k = 0; k < kKernel; ++k) {
+            taps_s[k][tap_j][tap_lane] = w_taps[k];
+        }
     }
     pdl_trigger();
-    pdl_wait();
-    // comb[i] holds the combine of row r0 - 3 + i: every load of the block's rows is
-    // issued before any conv.
-    constexpr int kWindowRows = kMoeConvRows + kKernel - 1;
-    float comb[kWindowRows][kMoeConvCols];
-#pragma unroll
-    for (int i = 0; i < kWindowRows; ++i) {
-        const int r = r0 - (kKernel - 1) + i;
+    if (rows > 0) {
+        pdl_wait();
+    }
+
+    constexpr int kSteps = kMoeConvWideWindow / kMoeConvWideRowGroups;
+#pragma unroll 1
+    for (int step = 0; step < kSteps; ++step) {
+        const int base_r = r0 - (kKernel - 1) + step * kMoeConvWideRowGroups;
+        if (base_r >= r_end) {
+            break;
+        }
+        const int idx = step * kMoeConvWideRowGroups + g;
+        const int r = base_r + g;
         if (r < 0) {
-            const float4 v = *reinterpret_cast<const float4*>(state + size_t(kKernel - 1 + r) * kHidden + c0);
-            comb[i][0] = v.x;
-            comb[i][1] = v.y;
-            comb[i][2] = v.z;
-            comb[i][3] = v.w;
+            const float* sp = state + size_t(kKernel - 1 + r) * kHidden + c0;
+            const float4 s0 = *reinterpret_cast<const float4*>(sp);
+            const float4 s1 = *reinterpret_cast<const float4*>(sp + 4);
+            __nv_bfloat16 cb[kMoeConvWideCols] = {
+                __float2bfloat16(s0.x), __float2bfloat16(s0.y), __float2bfloat16(s0.z), __float2bfloat16(s0.w),
+                __float2bfloat16(s1.x), __float2bfloat16(s1.y), __float2bfloat16(s1.z), __float2bfloat16(s1.w),
+            };
+            *reinterpret_cast<uint4*>(&comb_s[idx][c_local]) = *reinterpret_cast<const uint4*>(cb);
         } else if (r < r_end) {
+            const float* w_ptr = weights + size_t(r) * kTopK;
+            const float4 w0 = *reinterpret_cast<const float4*>(w_ptr);
+            const float4 w1 = *reinterpret_cast<const float4*>(w_ptr + 4);
+            const float wv[kTopK] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
             const __nv_bfloat16* e = experts + size_t(r) * kTopK * kHidden + c0;
-            const float* w = weights + size_t(r) * kTopK;
-            float total[kMoeConvCols] = {};
+            float total[kMoeConvWideCols] = {};
 #pragma unroll
-            for (int x = 0; x < kTopK; ++x) {
-                const float wx = w[x];
-                if (wx != 0.f) {
-                    float v[kMoeConvCols];
-                    load_bf16x4(e + size_t(x) * kHidden, v);
+            for (int x = 0; x < kTopK; x += 2) {
+                const float wx0 = wv[x];
+                const float wx1 = wv[x + 1];
+                const uint4 raw0 = wx0 != 0.f ? *reinterpret_cast<const uint4*>(e + size_t(x) * kHidden)
+                                              : make_uint4(0u, 0u, 0u, 0u);
+                const uint4 raw1 = wx1 != 0.f ? *reinterpret_cast<const uint4*>(e + size_t(x + 1) * kHidden)
+                                              : make_uint4(0u, 0u, 0u, 0u);
+                if (wx0 != 0.f) {
+                    float v0[kMoeConvWideCols];
+                    unpack_bf16x8(raw0, v0);
 #pragma unroll
-                    for (int j = 0; j < kMoeConvCols; ++j) {
-                        total[j] = __fadd_rn(total[j], __fmul_rn(v[j], wx));
+                    for (int j = 0; j < kMoeConvWideCols; ++j) {
+                        total[j] = __fadd_rn(total[j], __fmul_rn(v0[j], wx0));
+                    }
+                }
+                if (wx1 != 0.f) {
+                    float v1[kMoeConvWideCols];
+                    unpack_bf16x8(raw1, v1);
+#pragma unroll
+                    for (int j = 0; j < kMoeConvWideCols; ++j) {
+                        total[j] = __fadd_rn(total[j], __fmul_rn(v1[j], wx1));
                     }
                 }
             }
+            __nv_bfloat16 cb[kMoeConvWideCols];
 #pragma unroll
-            for (int j = 0; j < kMoeConvCols; ++j) {
-                comb[i][j] = round_bf16(total[j]);
+            for (int j = 0; j < kMoeConvWideCols; ++j) {
+                cb[j] = __float2bfloat16(total[j]);
             }
+            *reinterpret_cast<uint4*>(&comb_s[idx][c_local]) = *reinterpret_cast<const uint4*>(cb);
         }
-    }
-#pragma unroll
-    for (int i = kKernel - 1; i < kWindowRows; ++i) {
-        const int r = r0 - (kKernel - 1) + i;
-        if (r >= r_end) {
-            break;
-        }
-        const float4 res = *reinterpret_cast<const float4*>(residual + size_t(r) * kHidden + c0);
-        const float rv[kMoeConvCols] = {res.x, res.y, res.z, res.w};
-        __nv_bfloat16 o[kMoeConvCols];
-        __nv_bfloat16 cb[kMoeConvCols];
-#pragma unroll
-        for (int j = 0; j < kMoeConvCols; ++j) {
-            cb[j] = __float2bfloat16(comb[i][j]);
-            // short_conv_window in conv_step.cuh, over rows r - 3 .. r.
-            float acc = 0.f;
+        __syncthreads();
+        if (idx >= kKernel - 1 && r < r_end) {
+            const float* rp = residual + size_t(r) * kHidden + c0;
+            const float4 r_lo = *reinterpret_cast<const float4*>(rp);
+            const float4 r_hi = *reinterpret_cast<const float4*>(rp + 4);
+            const float rv[kMoeConvWideCols] = {r_lo.x, r_lo.y, r_lo.z, r_lo.w, r_hi.x, r_hi.y, r_hi.z, r_hi.w};
+            float win[kKernel][kMoeConvWideCols];
 #pragma unroll
             for (int k = 0; k < kKernel; ++k) {
-                acc = __fadd_rn(acc, __fmul_rn(round_bf16(comb[i - (kKernel - 1) + k][j]), taps[j][k]));
+                unpack_bf16x8(*reinterpret_cast<const uint4*>(&comb_s[idx - (kKernel - 1) + k][c_local]), win[k]);
             }
-            const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), comb[i][j]), kShortDivisor));
-            o[j] = __float2bfloat16(__fadd_rn(rv[j], y));
-        }
-        *reinterpret_cast<uint2*>(out + size_t(r) * kHidden + c0) = *reinterpret_cast<const uint2*>(o);
-        if (r >= rows - (kKernel - 1)) {
-            *reinterpret_cast<uint2*>(combined + size_t(r) * kHidden + c0) = *reinterpret_cast<const uint2*>(cb);
+            __nv_bfloat16 o[kMoeConvWideCols];
+#pragma unroll
+            for (int j = 0; j < kMoeConvWideCols; ++j) {
+                // short_conv_window in conv_step.cuh, over rows r - 3 .. r.
+                float acc = 0.f;
+#pragma unroll
+                for (int k = 0; k < kKernel; ++k) {
+                    acc = __fadd_rn(acc, __fmul_rn(win[k][j], taps_s[k][j][lane16]));
+                }
+                const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), win[kKernel - 1][j]), kShortDivisor));
+                o[j] = __float2bfloat16(__fadd_rn(rv[j], y));
+            }
+            *reinterpret_cast<uint4*>(out + size_t(r) * kHidden + c0) = *reinterpret_cast<const uint4*>(o);
+            if (r >= rows - (kKernel - 1)) {
+                *reinterpret_cast<uint4*>(combined + size_t(r) * kHidden + c0) =
+                    *reinterpret_cast<const uint4*>(&comb_s[idx][c_local]);
+            }
         }
     }
 }
@@ -346,7 +410,7 @@ constexpr int kVisitChannels = 2 * kKvDims + 2 * kHidden;
 // shares in shared memory (the old state for rows before the step), and writes the row's
 // outputs and recorded inputs (or shifted states). Grid: 2304 / 32 blocks of 32 * rows
 // threads.
-extern "C" __global__ void __launch_bounds__(kStepBlockCols * kMoeConvRows)
+extern "C" __global__ void __launch_bounds__(kStepBlockCols * kStepMaxRows)
 moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weights,
                                  const __nv_bfloat16* __restrict__ weight, float* state,
                                  const float* residual, __nv_bfloat16* __restrict__ out, int rows,
@@ -355,7 +419,7 @@ moe_conv_residual_step_rows_2304(const __nv_bfloat16* experts, const float* weig
                                  float* k_state, float* v_state, __nv_bfloat16* inputs) {
     constexpr int kOld = kKernel - 1;
     // comb[i] holds the combine of row i - 3, or old state row i for i < 3.
-    __shared__ float comb[kMoeConvRows + kOld][kStepBlockCols];
+    __shared__ float comb[kStepMaxRows + kOld][kStepBlockCols];
     __shared__ float proj_old[kOld][kStepBlockCols];
     __shared__ float k_old[kOld][kStepBlockCols];
     __shared__ float v_old[kOld][kStepBlockCols];
@@ -572,14 +636,14 @@ moe_conv_residual_batch_2304(const __nv_bfloat16* experts, const float* weights,
 // conv inputs into `inputs[seq, 0..rows, 6656]` and leaves all four conv states untouched
 // for in-place `conv_rollback_batch`; with a null `inputs`, it shifts all four states.
 // Grid: (2304 / 32, seqs), 32 * rows threads.
-extern "C" __global__ void __launch_bounds__(kStepBlockCols * kMoeConvRows)
+extern "C" __global__ void __launch_bounds__(kStepBlockCols * kStepMaxRows)
 moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* weights,
                                     const __nv_bfloat16* __restrict__ weight, const float* residual,
                                     __nv_bfloat16* __restrict__ out, int rows, const __nv_bfloat16* proj,
                                     const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
                                     const unsigned long long* states, __nv_bfloat16* inputs) {
     constexpr int kOld = kKernel - 1;
-    __shared__ float comb[kMoeConvRows + kOld][kStepBlockCols];
+    __shared__ float comb[kStepMaxRows + kOld][kStepBlockCols];
     __shared__ float proj_old[kOld][kStepBlockCols];
     __shared__ float k_old[kOld][kStepBlockCols];
     __shared__ float v_old[kOld][kStepBlockCols];
@@ -650,7 +714,7 @@ moe_conv_residual_batch_verify_2304(const __nv_bfloat16* experts, const float* w
     const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), mine), kShortDivisor));
     seq_out[size_t(r) * kHidden + c] = __float2bfloat16(__fadd_rn(res, y));
     if (record_only) {
-        __nv_bfloat16* row = inputs + (size_t(seq) * kMoeConvRows + r) * kVisitChannels;
+        __nv_bfloat16* row = inputs + (size_t(seq) * kStepMaxRows + r) * kVisitChannels;
         row[2 * kKvDims + kHidden + c] = __float2bfloat16(mine);
         row[2 * kKvDims + c] = seq_proj[size_t(r) * kHidden + c];
         if (kv) {

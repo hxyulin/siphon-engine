@@ -881,11 +881,16 @@ impl Misc {
         } else {
             (&self.message_gate_rows_2304, GATE_ROWS_SMEM_BF16)
         };
+        let total_groups = rows.div_ceil(GATE_CLUSTER_ROWS);
+        // Cap concurrent clusters to <= 9 so every launch fits one Blackwell wave (170-188 SMs)
+        // and sm_89's 12-cluster mailbox table while reusing down/forget/gain weights in smem.
+        let max_z = if n == 3 { 3 } else { 8 / n };
+        let grid_z = total_groups.min(max_z);
         let config = LaunchConfig {
             grid_dim: (
                 GATE_CLUSTER,
                 u32::try_from(n)?,
-                u32::try_from(rows.div_ceil(GATE_CLUSTER_ROWS))?,
+                u32::try_from(grid_z)?,
             ),
             block_dim: (GATE_OUT_THREADS, 1, 1),
             shared_mem_bytes: smem,
