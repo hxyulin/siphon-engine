@@ -1,4 +1,4 @@
-//! A deploy through `siphon-serve`'s drain and `--cache-dir`: on SIGTERM the server finishes
+//! A deploy through the server's drain and `--cache-dir`: on SIGTERM the server finishes
 //! the running request, answers a new one and `/health` with 503 and `Retry-After`, saves
 //! its host cache and exits; the next server loads the cache, and the same request then
 //! reads its prompt from it and gets the same reply.
@@ -6,7 +6,7 @@
 //! Needs the checkpoint and a GPU, so it is ignored by default:
 //!
 //! ```sh
-//! SIPHON_MODEL=<model-dir> cargo test --release -p siphon-serve --test drain -- --ignored --nocapture
+//! SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cli --test drain -- --ignored --nocapture
 //!
 //! `SIPHON_KV` passes its value as the server's `--kv`, to run the test with another cache format.
 //! ```

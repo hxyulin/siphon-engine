@@ -11,16 +11,31 @@ use ratatui::{
 use siphon::{KvFormat, WeightFormat, memory::gib};
 
 use crate::{
-    app::{App, FORMATS},
+    app::{self, App, Draft},
     device::Source,
 };
 
-/// Rows a printed frame takes.
-const HEIGHT: u16 = 31;
+const HEADER_HEIGHT: u16 = 4;
+const BAR_HEIGHT: u16 = 7;
+const BREAKDOWN_HEIGHT: u16 = 19;
+const CONFIG_HEIGHT: u16 = 8;
+const CONTEXTS_HEIGHT: u16 = 13;
+pub const SIDE_BY_SIDE_WIDTH: u16 = 104;
 
-/// Rows of a printed frame: one more for the vision tower's part.
-pub fn height(app: &App) -> u16 {
-    HEIGHT + u16::from(app.vision)
+/// Rows a printed frame needs at the given width.
+pub fn height(app: &App, width: u16) -> u16 {
+    let breakdown = breakdown_height(app);
+    let side = CONFIG_HEIGHT + CONTEXTS_HEIGHT;
+    let middle = if width < SIDE_BY_SIDE_WIDTH {
+        breakdown + side
+    } else {
+        breakdown.max(side)
+    };
+    HEADER_HEIGHT + BAR_HEIGHT + middle
+}
+
+fn breakdown_height(app: &App) -> u16 {
+    BREAKDOWN_HEIGHT + u16::from(app.vision)
 }
 
 const DIM: Color = Color::Rgb(110, 116, 126);
@@ -53,26 +68,47 @@ impl Part {
     }
 }
 
-pub fn draw(app: &App, area: Rect, buf: &mut Buffer) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Interactive,
+    Color,
+    Ascii,
+}
+
+pub fn draw(app: &App, area: Rect, buf: &mut Buffer, mode: Mode) {
+    let interactive = mode == Mode::Interactive;
     let [header, bar, middle, footer] = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Length(7),
+        Constraint::Length(HEADER_HEIGHT),
+        Constraint::Length(BAR_HEIGHT),
         Constraint::Min(16),
-        Constraint::Length(1),
+        Constraint::Length(u16::from(interactive)),
     ])
     .areas(area);
-    let [table, side] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(middle);
-    let [config, contexts] =
-        Layout::vertical([Constraint::Length(8), Constraint::Min(8)]).areas(side);
+    let [table, config, contexts] = if !interactive && area.width < SIDE_BY_SIDE_WIDTH {
+        Layout::vertical([
+            Constraint::Length(breakdown_height(app)),
+            Constraint::Length(CONFIG_HEIGHT),
+            Constraint::Min(CONTEXTS_HEIGHT),
+        ])
+        .areas(middle)
+    } else {
+        let [table, side] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(middle);
+        let [config, contexts] =
+            Layout::vertical([Constraint::Length(CONFIG_HEIGHT), Constraint::Min(8)]).areas(side);
+        [table, config, contexts]
+    };
 
-    let parts = parts(app);
+    let parts = parts(app, mode);
     draw_header(app, header, buf);
     draw_bar(app, &parts, bar, buf);
     draw_table(app, &parts, table, buf);
     draw_config(app, config, buf);
     draw_contexts(app, contexts, buf);
-    draw_footer(footer, buf);
+    if interactive {
+        draw_footer(footer, buf);
+    }
 }
 
 fn block(title: &str) -> Block<'_> {
@@ -101,20 +137,36 @@ fn format_name(weights: WeightFormat, kv: KvFormat) -> String {
     } else {
         "BF16"
     };
-    let kv = match kv {
+    format!("{weights}/{}", kv_name(kv))
+}
+
+fn kv_name(kv: KvFormat) -> &'static str {
+    match kv {
         KvFormat::Fp8 => "FP8",
         KvFormat::Bf16 => "BF16",
         KvFormat::Nvfp4 => "NVFP4",
         KvFormat::Nvfp4All => "NVFP4-all",
         KvFormat::Mixed => "mixed",
-    };
-    format!("{weights} / {kv}")
+    }
 }
 
 /// The GPU's memory by holder, in the order the bar draws it; the vision tower only with
 /// `--vision`.
-fn parts(app: &App) -> Vec<Part> {
+fn parts(app: &App, mode: Mode) -> Vec<Part> {
     let mut parts = all_parts(app);
+    if mode == Mode::Ascii {
+        let keys = [
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "~", ".",
+        ];
+        assert_eq!(
+            parts.len(),
+            keys.len(),
+            "each memory part needs its own ASCII key"
+        );
+        for (part, key) in parts.iter_mut().zip(keys) {
+            part.symbol = key;
+        }
+    }
     if !app.vision {
         parts.retain(|p| p.name != "Vision");
     }
@@ -363,20 +415,18 @@ fn draw_bar(app: &App, parts: &[Part], area: Rect, buf: &mut Buffer) {
         .collect();
     let total: usize = parts.iter().map(|p| p.bytes).sum();
     let mut ruler = vec![' '; inner_width];
-    let mut gib_mark = 0;
-    while gib_mark << 30 <= total {
-        let x = (gib_mark << 30) * inner_width / total;
-        let label = if gib_mark == 0 {
-            "0".to_owned()
-        } else {
-            gib_mark.to_string()
-        };
+    let total_gib = total >> 30;
+    let spacing = (total_gib / (inner_width / 8).max(1))
+        .next_multiple_of(8)
+        .max(8);
+    for gib_mark in (0..=total_gib).step_by(spacing) {
+        let x = (((gib_mark as u128) << 30) * inner_width as u128 / total.max(1) as u128) as usize;
+        let label = gib_mark.to_string();
         if x + label.len() <= inner_width {
             for (i, c) in label.chars().enumerate() {
                 ruler[x + i] = c;
             }
         }
-        gib_mark += 8;
     }
     let unit = " GiB";
     if let Some(end) = ruler.iter().rposition(|c| *c != ' ')
@@ -452,49 +502,42 @@ fn draw_table(app: &App, parts: &[Part], area: Rect, buf: &mut Buffer) {
 }
 
 /// A row of choices with the chosen one highlighted.
-fn choices<'a>(label: &'a str, options: &[String], chosen: usize, key: &'a str) -> Line<'a> {
+fn choices(label: &str, options: &[&str], chosen: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(format!("{label:<10}")).fg(DIM)];
     for (i, option) in options.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let span = Span::raw(format!(" {option} "));
         spans.push(if i == chosen {
-            span.bold().fg(Color::Black).bg(ACCENT)
+            Span::raw(format!("[{option}]"))
+                .bold()
+                .fg(Color::Black)
+                .bg(ACCENT)
         } else {
-            span.fg(DIM)
+            Span::raw(format!(" {option} ")).fg(DIM)
         });
     }
-    spans.push(Span::raw(format!("  {key}")).fg(DIM));
     Line::from(spans)
 }
 
 fn draw_config(app: &App, area: Rect, buf: &mut Buffer) {
     let config = app.config();
     let fp8 = |b: bool| usize::from(!b);
-    let pair = |a: &str, b: &str| vec![a.to_owned(), b.to_owned()];
-    let drafts: Vec<String> = app.drafts.iter().map(|d| d.name().to_owned()).collect();
+    let drafts: Vec<&str> = app.selectable_drafts().iter().map(Draft::name).collect();
     let (context, most) = app.context();
     let per_position = config.planner.bytes_per_position();
     let lines = vec![
         choices(
             "Weights",
-            &pair("FP8", "BF16"),
+            &["FP8", "BF16"],
             fp8(config.weights == WeightFormat::Fp8),
-            "w",
         ),
-        choices(
-            "KV cache",
-            &pair("FP8", "BF16"),
-            fp8(config.kv == KvFormat::Fp8),
-            "k",
-        ),
-        choices("Draft", &drafts, app.draft, "d"),
+        choices("KV cache", &[kv_name(config.kv)], 0),
+        choices("Draft", &drafts, app.draft),
         Line::from(vec![
             Span::raw(format!("{:<10}", "Context")).fg(DIM),
             Span::raw(thousands(context)).bold(),
             Span::raw(if most { "  most that fit" } else { "" }).fg(DIM),
-            Span::raw("  ←→ ↑↓ m").fg(DIM),
         ]),
         Line::from(vec![
             Span::raw(format!("{:<10}", "Position")).fg(DIM),
@@ -525,17 +568,16 @@ fn draw_contexts(app: &App, area: Rect, buf: &mut Buffer) {
         )
         .collect::<Row>()
         .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = FORMATS
-        .iter()
+    let rows: Vec<Row> = app::formats()
         .enumerate()
-        .map(|(f, &(weights, kv))| {
+        .map(|(f, (weights, kv))| {
             std::iter::once(Cell::from(format_name(weights, kv)))
                 .chain(app.configs.iter().enumerate().map(|(d, configs)| {
                     let text = app
                         .max_context(&configs[f])
                         .map_or_else(|| "none".to_owned(), thousands);
                     let line = Line::from(text).right_aligned();
-                    if d == app.draft && f == app.format {
+                    if d == app.draft && f == app.format_index() {
                         Cell::from(line.bold().fg(Color::Black).bg(ACCENT))
                     } else {
                         Cell::from(line)
@@ -562,7 +604,8 @@ fn draw_footer(area: Rect, buf: &mut Buffer) {
         ("←→", "±8K"),
         ("↑↓", "±64K"),
         ("m", "most that fit"),
-        ("q", "quit"),
+        ("q", "print command"),
+        ("Ctrl-C", "cancel"),
     ];
     let spans: Vec<Span> = keys
         .iter()

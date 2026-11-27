@@ -46,7 +46,7 @@ The model maps what each step, prefill chunk, verify pass and batched step write
 
 A decoding sequence maps a chunk every 2,048 tokens, 1.7 ms against about 8 s of steps. `bench` decodes as fast with pooled caches as with allocated ones: 2.788 against 2.789 ms per step at 0 positions, 3.272 against 3.276 at 32,768, 4.283 against 4.291 at 131,072 and 5.959 against 5.968 at 300,000, within 0.15% (two alternating runs each in one hold). `smallm verify --hash 1` gives the same logits hashes at widths 1, 3 and 8 for the build before this change, this build with allocated caches and this build pooled.
 
-The planner counts the weights, the fixed buffers and each slot's conv states, then gives the rest to the pool. `--context` is the positions the pool holds over every running request together, up to `--streams` times the model's 1,048,576 per-request limit (each individual request remains capped at 1,048,576). The pool also holds one request's rings and its prefix cache entry's copies of them. `--streams` is the most requests that run at once; past the first, each costs its conv states, batch rows, graph and prefix cache entry's conv copies, about 20 MiB. The pool's page tables and copies take 64 MiB more (`POOL_RUNTIME_BYTES`). With FP8 weights and caches, 30.45 GiB free on a 32 GB card and the default 0.25 GiB margin, `siphon-plan` gives one request 661,504 positions with `--streams 1`, 655,360 with 4, 651,264 with 8, 641,024 with 16 and 622,592 with 32. With a fixed cache per stream, `--streams 1` gave 657,408 and 4 streams 161,792 each. `--vision` adds the tower and its buffers outside the pool ([server.md](server.md#images)): 622,592 positions with `--streams 1`. With `--kv mixed` the pool holds 933,888 positions with `--streams 1` and 923,648 with 4, against 927,744 and 4 streams of 237,568 with fixed caches; `--kv nvfp4` reaches the model's 1,048,576 at `--streams 1` either way.
+The planner counts the weights, the fixed buffers and each slot's conv states, then gives the rest to the pool. `--context` is the positions the pool holds over every running request together, up to `--streams` times the model's 1,048,576 per-request limit (each individual request remains capped at 1,048,576). The pool also holds one request's rings and its prefix cache entry's copies of them. `--streams` is the most requests that run at once; past the first, each costs its conv states, batch rows, graph and prefix cache entry's conv copies, about 20 MiB. The pool's page tables and copies take 64 MiB more (`POOL_RUNTIME_BYTES`). With FP8 weights and caches, 30.45 GiB free on a 32 GB card and the default 0.25 GiB margin, `siphon plan` gives one request 661,504 positions with `--streams 1`, 655,360 with 4, 651,264 with 8, 641,024 with 16 and 622,592 with 32. With a fixed cache per stream, `--streams 1` gave 657,408 and 4 streams 161,792 each. `--vision` adds the tower and its buffers outside the pool ([server.md](server.md#images)): 622,592 positions with `--streams 1`. With `--kv mixed` the pool holds 933,888 positions with `--streams 1` and 923,648 with 4, against 927,744 and 4 streams of 237,568 with fixed caches; `--kv nvfp4` reaches the model's 1,048,576 at `--streams 1` either way.
 
 The server's scheduler (`crates/siphon-serve/src/engine.rs`) goes by pages:
 
@@ -60,7 +60,7 @@ A swapped-out sequence keeps its global caches below its position and its rings 
 
 ### Measured on an RTX 5090
 
-`siphon-serve` with FP8 weights and caches and the bundled draft, on an idle RTX 5090, under the GPU lock. A conversation of 300,010 tokens is in the prefix cache and decodes a reply of 4,000 tokens; once it streams, a request of 2,010 tokens arrives, then after it one of 40,010 tokens, each for 256 tokens. Today's main with `--streams 1` against the pool with `--streams 4 --host-cache 12`:
+`siphon serve` with FP8 weights and caches and the bundled draft, on an idle RTX 5090, under the GPU lock. A conversation of 300,010 tokens is in the prefix cache and decodes a reply of 4,000 tokens; once it streams, a request of 2,010 tokens arrives, then after it one of 40,010 tokens, each for 256 tokens. Today's main with `--streams 1` against the pool with `--streams 4 --host-cache 12`:
 
 | | `--streams 1` | Pool, `--streams 4` |
 | --- | ---: | ---: |
@@ -259,7 +259,7 @@ A kernel trace at context 0, each kernel counted from the previous one's end, us
 
 At the card's 1,645 GB/s, the expert kernel's time is what streaming about 48 distinct experts per visit takes at 8 rows, and about 99 at 32, of 4.5 MB each. Attention at context 0 grows with its 272 blocks per row, most of which find no keys.
 
-Over HTTP, `siphon-serve --streams 32 --context 16384` answered 32 concurrent chat requests of 512 tokens each in 13.6 s, 1,198 and 1,207 tok/s in all over two rounds, prompts and their prefill included.
+Over HTTP, `siphon serve --streams 32 --context 16384` answered 32 concurrent chat requests of 512 tokens each in 13.6 s, 1,198 and 1,207 tok/s in all over two rounds, prompts and their prefill included.
 
 ## Against vLLM and SGLang on an RTX PRO 6000 Workstation Edition
 
@@ -278,7 +278,7 @@ Measured on an RTX PRO 6000 Blackwell Workstation Edition (188 SMs, 96 GB, 1.79 
 | Speculation | bundled draft, for a request alone | DSpark, 7 drafts | DSpark, block of 8 |
 | Batched rows | equal one-row verifies bit for bit | no such property | no such property |
 
-vLLM ran with `--kv-cache-dtype fp8 --max-num-seqs 32 --max-model-len 40960`. SGLang's FA4 attention on SM120 rejects an E4M3 cache (query BF16, key E4M3), so it ran with `--kv-cache-dtype mxfp8`, and with `--disable-prefill-cuda-graph`, since capturing its 58 prefill graph shapes took 9 minutes for the first. Siphon ran `siphon-serve --streams 32 --context 40960`.
+vLLM ran with `--kv-cache-dtype fp8 --max-num-seqs 32 --max-model-len 40960`. SGLang's FA4 attention on SM120 rejects an E4M3 cache (query BF16, key E4M3), so it ran with `--kv-cache-dtype mxfp8`, and with `--disable-prefill-cuda-graph`, since capturing its 58 prefill graph shapes took 9 minutes for the first. Siphon ran `siphon serve --streams 32 --context 40960`.
 
 The checkpoint's quantization config asks for NVFP4 activations on the NVFP4 experts and MXFP8 activations on the MXFP8 ones. Siphon keeps BF16 activations because NVFP4 activations double KL against the F32 captures ([engine.md](engine.md)); its prefill can run the checkpoint's formats with `--expert-activations quantized`.
 
@@ -385,7 +385,7 @@ Two changes, each leaving every result bit for bit as before (`smallm verify --h
 
 At 8 rows the three builds are within 0.05 ms. At 32 rows the two changes take 1.8 to 2.3% off a step.
 
-Over HTTP, `siphon-serve --streams 32` before and after, alternating, one run each per round: at 32 streams chat went from 1,586 and 1,594 tok/s in all to 1,604 and 1,612, and book completions from 1,657 and 1,667 to 1,679 and 1,688, 1.1 to 1.3%. At 8 streams the two builds were within 0.7%. Prefill, which the changes do not touch, takes part of each run.
+Over HTTP, `siphon serve --streams 32` before and after, alternating, one run each per round: at 32 streams chat went from 1,586 and 1,594 tok/s in all to 1,604 and 1,612, and book completions from 1,657 and 1,667 to 1,679 and 1,688, 1.1 to 1.3%. At 8 streams the two builds were within 0.7%. Prefill, which the changes do not touch, takes part of each run.
 
 Tried and dropped: letting each launched attention block run 2 or 4 split blocks in turn, which keeps every partial. With 4 sliding splits per block a 32-row step took 0.1 to 0.2 ms less at context 0 and the same or more at 10,674 and 32,768; grouping the global attention's splits made it slower.
 

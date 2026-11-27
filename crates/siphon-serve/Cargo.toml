@@ -10,6 +10,7 @@ license.workspace = true
 anyhow.workspace = true
 axum = "0.8"
 base64 = "0.22"
+clap.workspace = true
 futures-util = { version = "0.3.34", default-features = false }
 http-body = "1.0.1"
 image.workspace = true

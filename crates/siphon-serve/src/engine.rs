@@ -403,7 +403,7 @@ pub struct Options {
     /// with `streams` above 1, or 0 for one batched step per prefill chunk.
     pub decode_floor: f64,
     /// Max prefill tokens piggybacked onto one active decode/verify forward pass, or `None`
-    /// when `--piggyback-prefill` is off.
+    /// when piggybacking is disabled.
     pub piggyback_budget: Option<usize>,
     /// The vision tower, with `--vision`.
     pub vision: Option<VisionOptions>,
@@ -2688,7 +2688,7 @@ mod cuda {
                 }
                 continue;
             }
-            // When `--piggyback-prefill` is enabled and both decoders and prefillers are
+            // When piggybacking is enabled and both decoders and prefillers are
             // active, carve a bounded prefill chunk to ride along with the active decode or
             // batched-verify forward pass instead of stalling active streams behind an
             // exclusive prefill step.

@@ -5,7 +5,7 @@
 //! Needs the checkpoint and a GPU, so it is ignored by default:
 //!
 //! ```sh
-//! SIPHON_MODEL=<model-dir> cargo test --release -p siphon-serve --test uncapped -- --ignored --nocapture
+//! SIPHON_MODEL=<model-dir> cargo test --release -p siphon-cli --test uncapped -- --ignored --nocapture
 //! ```
 //!
 //! `SIPHON_KV` passes its value as the server's `--kv`, to run the test with another cache

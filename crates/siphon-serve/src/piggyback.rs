@@ -1,6 +1,6 @@
 //! Hybrid chunked-prefill + decode/verify piggybacking planner.
 //!
-//! When `--piggyback-prefill` is enabled and at least one request is already decoding or
+//! When `--piggyback-budget` is positive and at least one request is already decoding or
 //! verifying, arriving prompts carve bounded chunks (up to `--piggyback-budget` tokens)
 //! that ride along inside the active decode/verify forward pass instead of running an
 //! exclusive prefill step that stalls active streams' inter-token latency (ITL).
@@ -8,10 +8,6 @@
 //! This module holds the platform-independent scheduling policy and row-packing layout
 //! validation so both the Linux CUDA engine and macOS host unit tests share one source
 //! of truth.
-
-/// Default max prefill tokens piggybacked onto one active decode/verify forward pass when
-/// `--piggyback-prefill` is enabled without `--piggyback-budget`.
-pub const DEFAULT_PIGGYBACK_BUDGET: usize = 256;
 
 /// Snapshot of one active request's scheduling metadata for piggyback planning.
 #[cfg_attr(

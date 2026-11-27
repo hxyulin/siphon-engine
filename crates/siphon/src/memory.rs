@@ -61,6 +61,23 @@ pub const POOL_RUNTIME_BYTES: usize = 64 << 20;
 
 /// Rows of the largest verify pass.
 pub const VERIFY_ROWS: usize = 8;
+
+/// Validates the candidate widths for adaptive speculative verification.
+///
+/// # Errors
+///
+/// Returns an error unless the widths are strictly ascending, fit a verify pass,
+/// and include a width of at least two.
+pub fn validate_verify_widths(widths: &[usize]) -> anyhow::Result<()> {
+    ensure!(
+        widths.windows(2).all(|w| w[0] < w[1])
+            && widths.iter().all(|w| (1..=VERIFY_ROWS).contains(w))
+            && widths.last().is_some_and(|&w| w >= 2),
+        "expected strictly ascending widths from 1 to {VERIFY_ROWS}, with at least one width of 2 or more"
+    );
+    Ok(())
+}
+
 /// Rows of the largest batched step: one per stream.
 pub const BATCH_ROWS: usize = 64;
 /// Most total rows (`seqs * width`) one batched verify takes.
@@ -409,6 +426,22 @@ pub fn budget(free: usize, limit: Option<usize>, margin: usize) -> usize {
 #[must_use]
 pub fn gib(bytes: usize) -> String {
     format!("{:.2}", bytes as f64 / f64::from(1u32 << 30))
+}
+
+/// Parses a non-negative GiB value into whole bytes, discarding fractional bytes.
+///
+/// # Errors
+///
+/// Returns an error if the value is invalid, negative, or too large to represent.
+pub fn parse_gib(value: &str) -> anyhow::Result<usize> {
+    let gib: f64 = value.parse().context("expected a number in GiB")?;
+    let bytes = gib * f64::from(1u32 << 30);
+    ensure!(
+        bytes >= 0.0 && bytes < usize::MAX as f64,
+        "GiB value is out of range"
+    );
+    #[expect(clippy::cast_sign_loss, reason = "bytes is non-negative")]
+    Ok(bytes as usize)
 }
 
 impl fmt::Display for Plan {

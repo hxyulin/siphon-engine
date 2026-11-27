@@ -13,7 +13,7 @@ from . import client, fetch, fidelity, quality, report, serve, speed, suite
 
 HERE = Path(__file__).resolve().parent.parent
 CACHE = Path.home() / ".cache" / "quickbench"
-# siphon-serve contexts: 8 streams for everything up to 32K-token prompts, then a second
+# siphon serve contexts: 8 streams for everything up to 32K-token prompts, then a second
 # server for the 128K-token prompts: 1 stream in the build check, and 2 streams in the
 # suite, whose 32K caps also move the 30K-token prompts there. 2 x 163,840 positions are
 # as many as 8 x 40,960.
@@ -46,7 +46,7 @@ def commit() -> str | None:
 
 
 def effort(value: str):
-    """`--effort` as siphon-serve takes it: a number, or a name such as high."""
+    """`--effort` as siphon serve takes it: a number, or a name such as high."""
     try:
         return float(value)
     except ValueError:
@@ -85,7 +85,7 @@ def run(args) -> None:
     sampling = ({"temperature": args.temperature} | ({"top_p": args.top_p} if args.top_p else {})
                 | ({"reasoning_effort": effort(args.effort)} if args.effort else {}))
     extra = shlex.split(args.serve_args)
-    target = (f"siphon-serve {args.serve_args}".strip() if args.serve else args.url)
+    target = (f"siphon serve {args.serve_args}".strip() if args.serve else args.url)
     result = {"meta": {"name": name, "mode": args.mode, "target": target,
                        "commit": args.commit or commit(),
                        "started": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -180,7 +180,7 @@ def load(path: str) -> dict:
 
 def quality_options(p, items: Path, attempts: int, first_attempt: int, first_help: str) -> None:
     p.add_argument("--model", help="checkpoint directory, for --serve and --eval")
-    p.add_argument("--serve-args", default="", help="extra siphon-serve options, such as '--kv bf16'")
+    p.add_argument("--serve-args", default="", help="extra siphon serve options, such as '--kv bf16'")
     p.add_argument("--items", default=str(items))
     p.add_argument("--attempts", type=int, default=attempts)
     p.add_argument("--first-attempt", type=int, default=first_attempt, help=first_help)
@@ -206,7 +206,7 @@ def main() -> None:
     r = sub.add_parser("run", help="the build check: speed, quality and fidelity of one build")
     target = r.add_mutually_exclusive_group(required=True)
     target.add_argument("--url", help="an OpenAI-compatible base URL, such as http://host:8000/v1")
-    target.add_argument("--serve", help="a siphon-serve binary to start (needs --model)")
+    target.add_argument("--serve", help="a siphon binary to run with serve (needs --model)")
     target.add_argument("--eval-only", action="store_true", help="run only the fidelity track")
     # Attempts 0 to 3 picked the items, so their sampled replies are biased towards
     # failing. Scoring starts after them.
@@ -224,7 +224,7 @@ def main() -> None:
     s = sub.add_parser("suite", help="the quality suite, for choosing how to run the model")
     target = s.add_mutually_exclusive_group()
     target.add_argument("--url", help="an OpenAI-compatible base URL, such as http://host:8000/v1")
-    target.add_argument("--serve", help="a siphon-serve binary to start (needs --model)")
+    target.add_argument("--serve", help="a siphon binary to run with serve (needs --model)")
     quality_options(s, HERE / "suite.json", 1, 0, "number the attempts from here")
     s.add_argument("--dry-run", action="store_true",
                    help="print the items and the estimated tokens and wall time, then stop")

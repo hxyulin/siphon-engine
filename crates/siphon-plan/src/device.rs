@@ -75,7 +75,7 @@ pub struct Device {
 impl Device {
     /// The first GPU nvidia-smi lists, or with `free` given, that much free memory on a
     /// device of the same size.
-    pub fn detect(free: Option<usize>) -> Self {
+    pub fn detect(free: Option<usize>) -> anyhow::Result<Self> {
         let device = query().unwrap_or_else(|| Self {
             name: "RTX 5090".to_owned(),
             total: RTX_5090_TOTAL,
@@ -86,15 +86,19 @@ impl Device {
             block_scaled_mma: true,
             source: Source::Assumed,
         });
-        match free {
+        Ok(match free {
             Some(free) => Self {
-                others: device.total.saturating_sub(free + device.context),
+                others: device.total.saturating_sub(
+                    free.checked_add(device.context).ok_or_else(|| {
+                        anyhow::anyhow!("--free plus the CUDA context is too large")
+                    })?,
+                ),
                 free,
                 source: Source::Given,
                 ..device
             },
             None => device,
-        }
+        })
     }
 }
 

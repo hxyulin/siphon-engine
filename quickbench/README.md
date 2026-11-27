@@ -27,24 +27,24 @@ done
 
 The texts are public-domain books from Project Gutenberg. On an M5 Max the three captures take about 4 minutes. `eval`'s pass and fail thresholds come from MLX's own noise on the code texts in `reference/prompts`. On these prose texts the BF16 cache already sits at the mean |dlogprob| limit of 0.045 (0.040 to 0.045 on 2026-11-25), so `eval` can print FAIL by a few percent. Compare configurations by their KL and |dlogprob| side by side, not by the verdict.
 
-Build the binaries with `cargo build --release -p siphon-serve -p siphon-cuda --bin siphon-serve --bin eval`.
+Build the binaries with `cargo build --release -p siphon-cli -p siphon-cuda --bin siphon --bin eval`.
 
 ## Build check
 
 ```sh
-uv run python -m quickbench run --serve ../target/release/siphon-serve \
+uv run python -m quickbench run --serve ../target/release/siphon \
     --eval ../target/release/eval --model <model-dir> --name main-abc1234
 ```
 
 It runs three tracks:
 
-- **Speed**: 4 fixed prompts (chat, code, the lighthouse story, an agent request with tools) at temperature 1, the model's default, with 6 seeds each, at 1 stream and at 8 streams. A fifth prompt of about 32,000 tokens of generated locker records decodes 512 tokens at 1 stream. Each seed's long prompt differs from its first line, so its first request misses siphon-serve's one-entry prefix cache and gives the cold time to first token. The same request again gives the warm one. The report gives median decode tok/s, time to first token and, for siphon-serve, tokens per speculation round. `--speed-sampling t0.8-p0.95` adds temperature 0.8 with top-p 0.95.
+- **Speed**: 4 fixed prompts (chat, code, the lighthouse story, an agent request with tools) at temperature 1, the model's default, with 6 seeds each, at 1 stream and at 8 streams. A fifth prompt of about 32,000 tokens of generated locker records decodes 512 tokens at 1 stream. Each seed's long prompt differs from its first line, so its first request misses `siphon serve`'s one-entry prefix cache and gives the cold time to first token. The same request again gives the warm one. The report gives median decode tok/s, time to first token and, for `siphon serve`, tokens per speculation round. `--speed-sampling t0.8-p0.95` adds temperature 0.8 with top-p 0.95.
 - **Quality**: 1 attempt of each of the 23 items in `items.json`, with thinking on: GPQA Diamond, AIME 2025, HumanEval+, generated retrieval at about 30K and 125K tokens, and tool calls. The report gives pass rates, cut-offs at the output cap, looping replies, tokens and seconds per reply.
 - **Fidelity** (Siphon only): Siphon's `eval` binary over MLX captures of 4K, 32K and 128K-token texts, through the served prefill (chunks of 2,048 rows) and the served verify pass (8 rows, FP8 weights and KV cache). It reports KL divergence, top-1 agreement and perplexity against MLX. `eval --prefill` keeps BF16 weights whatever `--weights` says, so only the verify config measures the FP8 weight copies decode reads.
 
 Wall time, estimated from the runs of 2026-11-25: server starts 0.2 minutes, speed 1.8, quality 3 to 4.5, fidelity 6. `--tracks quality,speed` skips fidelity and takes about 6 minutes.
 
-The bench starts siphon-serve twice: with 8 streams of 40,960 positions for the speed track and most quality items, then with 1 stream of 135,168 positions for the 125K-token retrieval items. `--serve-args '--kv bf16'` passes options to both servers. Leave out `--context` and `--streams`, which the bench sets.
+The bench starts `siphon serve` twice: with 8 streams of 40,960 positions for the speed track and most quality items, then with 1 stream of 135,168 positions for the 125K-token retrieval items. `--serve-args '--kv bf16'` passes options to both servers. Leave out `--context` and `--streams`, which the bench sets.
 
 ### What the build check detects
 
@@ -61,8 +61,8 @@ The build check's pass rates carry no verdict. The 23 items were picked because 
 ## Quality suite
 
 ```sh
-uv run python -m quickbench suite --serve ../target/release/siphon-serve --model <model-dir> --name s-t1
-uv run python -m quickbench suite --serve ../target/release/siphon-serve --model <model-dir> \
+uv run python -m quickbench suite --serve ../target/release/siphon --model <model-dir> --name s-t1
+uv run python -m quickbench suite --serve ../target/release/siphon --model <model-dir> \
     --serve-args=--greedy --name s-greedy
 uv run python -m quickbench compare ~/.cache/quickbench/runs/s-t1 ~/.cache/quickbench/runs/s-greedy
 ```
@@ -79,9 +79,9 @@ Against another server, pass `--url http://host:8000/v1` instead of `--serve`. S
 | Retrieval | 8 at about 30K and 8 at about 125K tokens, seeds the build check does not use |
 | Tool calls | the 3 checks |
 
-Every source gets a 32,768-token output cap (`--cap gpqa=16384` changes one). Other options: `--effort` (sent as `reasoning_effort`: a number in [0, 0.99] or a name such as `high`; siphon-serve defaults to 0.9), `--temperature` (default 1), `--top-p`, `--attempts` (default 1) and `--first-attempt` (default 0). One attempt per item over more items estimates the population without bias and pairs at item level.
+Every source gets a 32,768-token output cap (`--cap gpqa=16384` changes one). Other options: `--effort` (sent as `reasoning_effort`: a number in [0, 0.99] or a name such as `high`; `siphon serve` defaults to 0.9), `--temperature` (default 1), `--top-p`, `--attempts` (default 1) and `--first-attempt` (default 0). One attempt per item over more items estimates the population without bias and pairs at item level.
 
-With `--serve`, the suite starts siphon-serve with 8 streams of 40,960 positions for GPQA, AIME, code and tools, then with 2 streams of 163,840 positions for the retrieval items.
+With `--serve`, the suite starts `siphon serve` with 8 streams of 40,960 positions for GPQA, AIME, code and tools, then with 2 streams of 163,840 positions for the retrieval items.
 
 The report gives, per source and overall: the pass rate with a 95% Wilson interval, the cut-off and loop rates, mean and median tokens per reply, mean seconds per reply, and seconds and tokens per correct answer (totals over passes). The Wilson interval assumes independent replies, which holds at 1 attempt per item.
 

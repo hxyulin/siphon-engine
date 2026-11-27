@@ -1,9 +1,9 @@
-# siphon-serve
+# siphon serve
 
-`siphon-serve` is an OpenAI-compatible HTTP server for Inkling 2 Mini. This page lists its options, routes and request fields. [engine.md](engine.md) covers how the engine works, and [clients.md](clients.md) sets up coding agents against the server.
+`siphon serve` is an OpenAI-compatible HTTP server for Inkling 2 Mini. This page lists its options, routes and request fields. [engine.md](engine.md) covers how the engine works, and [clients.md](clients.md) sets up coding agents against the server.
 
 ```sh
-SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
+SIPHON_API_KEY=<key> target/release/siphon serve <model-dir> --port 8000
 ```
 
 ## Startup
@@ -12,7 +12,9 @@ Before loading anything, the server plans the GPU memory from the config and the
 
 It then loads the model, prices each verify width on a short prompt, and serves. After warmup it compares the memory the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the module images and CUDA graphs from the change in free memory. After each job it checks the pool's peak again and warns if the peak went past the plan.
 
-`siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] [--prefill-chunk N] [--free GiB] [--context N] [--streams N] [--vision] [--print]` shows the same plan in a terminal before you start the server, and runs on macOS too. It draws the GPU memory as a bar and a table of what holds it, with the longest context for every combination of formats and drafts. Keys switch the formats and the draft and move the context. It reads the free memory from nvidia-smi, or takes `--free`, or assumes an idle 32 GB RTX 5090.
+`siphon plan <model-dir>` prints a GPU memory breakdown and compares the longest contexts across formats and drafts. It runs on macOS too. It reads the free memory from nvidia-smi, takes a `--free` override, or assumes an idle 32 GB RTX 5090.
+
+Set `--weights` and `--kv` to plan for the formats you intend to serve. Both default to `fp8`. In `--interactive` mode, press `w` to toggle weight precision, `k` to cycle through the KV formats, and `d` to switch between the bundled draft and the directory supplied with `--drafter`. The arrow keys move the context in steps of 8K or 64K positions. Press `m` to return to the largest context that fits. Press `q` or Esc to print a `siphon serve` command and exit. Press Ctrl-C to cancel.
 
 ## Options
 
@@ -179,7 +181,7 @@ Two prompts with different images have the same tokens, so the [prefix cache](#p
 
 The speculative draft reads the target's hidden states at every prompt position, image positions included, so it sees what the target sees. Verify decides every token, so images do not change speculation's output either way. Acceptance on replies about images is not measured yet.
 
-`siphon-plan --vision [--max-image-pixels N]` adds the tower's weights, its buffers for the largest image and the image rows of one prefill chunk to the plan. On an idle 32 GB RTX 5090, `--vision` at the defaults takes 0.69 GiB and cuts the longest context with FP8 weights and caches from 657,408 to 617,472 positions, with the default 0.25 GiB margin. Without `--vision` the plan and the server are as before.
+`siphon plan --vision [--max-image-pixels N]` adds the tower's weights, its buffers for the largest image and the image rows of one prefill chunk to the plan. On an idle 32 GB RTX 5090, `--vision` at the defaults takes 0.69 GiB and cuts the longest context with FP8 weights and caches from 657,408 to 617,472 positions, with the default 0.25 GiB margin. Without `--vision` the plan and the server are as before.
 
 ## Sampling
 
@@ -271,7 +273,7 @@ The server logs to stderr, one line per event, each after a UTC timestamp to the
 2026-11-27T10:14:58.204Z siphon-serve 0.1.0 (commit 060d897a1b2c) starting with /home/u/models/inkling-2-mini
 ```
 
-Each HTTP request ends with one `request` line of `key=value` fields, quoted when they hold a space. It comes after the response's last byte and after the request's jobs have ended, so rejected requests, unknown routes and clients that leave get one too. Successful `GET /health` and `GET /metrics` requests are left out, since a proxy and a scraper poll them.
+Each HTTP request ends with one `request` line of `key=value` fields, quoted when they hold a space. It comes after the response's last byte and after the request's jobs have ended, so rejected requests, unknown routes and clients that leave get one too. Successful `GET /health`, `GET /metrics` and `GET /v1/models` requests are left out, since proxies, scrapers and gateways poll them.
 
 ```text
 2026-11-27T10:15:02.412Z request id=req-5fc02f989d827497 route="POST /v1/chat/completions" status=200 ms=412 reply=chatcmpl-6b095471000000 stream=true effort=0.9 finish=stop prompt=31204 cached=30720 cache=slot queue_ms=0 prefill_ms=48 output=215 tok_s=634.3 per_round=3.79 engine="216 speculated, 0 batched steps, last speculated 214 tokens in 0.34 s (631.4 tok/s, 3.79 tokens per round, ...)"
@@ -356,7 +358,7 @@ Measured with the `sm_89` build ([engine.md](engine.md#rtx-4090-sm_89)), the Ink
 For one user, such as a coding agent:
 
 ```sh
-siphon-serve <model-dir> --streams 2 --kv mixed --host-cache 12 --cache-dir <dir>
+siphon serve <model-dir> --streams 2 --kv mixed --host-cache 12 --cache-dir <dir>
 ```
 
 Two streams let the agent's background requests run beside its conversation instead of taking its only prefix cache entry, for 6,144 positions less than one stream. The mixed cache plans 325,632 positions at about FP8's quality. The host cache restores a conversation that another request pushed off the GPU, and `--cache-dir` keeps it across restarts.
@@ -364,13 +366,13 @@ Two streams let the agent's background requests run beside its conversation inst
 For the most context in one stream, at NVFP4's lower quality and without the host cache, which needs chunks of 2048:
 
 ```sh
-siphon-serve <model-dir> --kv nvfp4 --drafter <dflash2-dir> --prefill-chunk 1024 --margin 0.1
+siphon serve <model-dir> --kv nvfp4 --drafter <dflash2-dir> --prefill-chunk 1024 --margin 0.1
 ```
 
 For 2 to 4 users:
 
 ```sh
-siphon-serve <model-dir> --streams 4 --kv mixed --host-cache 12
+siphon serve <model-dir> --streams 4 --kv mixed --host-cache 12
 ```
 
 The four streams share a pool of 323,584 positions.
@@ -426,4 +428,4 @@ Found serving a coding agent from one RTX 5090: 144 requests, a median prompt of
 
 ## Building on macOS
 
-On macOS, `siphon-cuda` compiles to an empty crate and `siphon-serve` builds without its engine, so its tests run but it cannot serve. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH=sm_89` to build for an RTX 4090 (see [engine.md](engine.md#rtx-4090-sm_89)).
+On macOS, `siphon-cuda` compiles to an empty crate and `siphon serve` builds without its engine, so its tests run but it cannot serve. From a Mac, `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command in its pixi environment. Set `NVCC` or `CUDA_HOME` to use another toolkit, and `SIPHON_CUDA_ARCH=sm_89` to build for an RTX 4090 (see [engine.md](engine.md#rtx-4090-sm_89)).

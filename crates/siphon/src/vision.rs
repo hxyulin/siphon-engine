@@ -18,6 +18,9 @@ use sha2::{Digest as _, Sha256};
 /// size and costs 1,296 tokens.
 pub const DEFAULT_MAX_PIXELS: usize = 1920 * 1080;
 
+/// Minimum image pixel budget accepted by the planner and server.
+pub const MIN_IMAGE_PIXELS: usize = 1600;
+
 /// Values in one patch: 20 x 20 pixels x 3 channels.
 const CHANNELS: usize = 3;
 

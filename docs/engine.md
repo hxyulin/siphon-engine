@@ -52,7 +52,7 @@ Round times at position 2790 (one committed position plus the round, graph repla
 
 At position 32768, where layer 1 attends over every position, the same steps take 2.169, 1.420, 1.354, 1.288 and 1.277 ms for 3 drafts, and 2.169, 1.660, 1.593, 1.450 and 1.419 ms for 7.
 
-`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond or frees memory without lowering them. `DraftOptions::fast` turns on all five and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon-serve`); `DraftOptions::fp8` leaves out the shortlist, and `DraftOptions::default` stays exact:
+`DraftOptions` switches on approximations. A draft token only changes how often the target accepts, never the target's output, so each one is kept only if it raises accepted tokens per millisecond or frees memory without lowering them. `DraftOptions::fast` turns on all five and is the draft speculation uses (`Speculator::new`, `bench --spec`, `siphon serve`); `DraftOptions::fp8` leaves out the shortlist, and `DraftOptions::default` stays exact:
 
 - `fp8_backbone`: E4M3 copies of the block's and the round commit's projections, through a multi-row FP8 product (`draft_gemm_fp8`). The draft then frees the BF16 query, output, gate, up and down projections, which only the block reads; the prefill's commit (`Draft::commit`, up to 512 rows) still reads the BF16 keys, values and context projections.
 - `fp8_head`: base logits from an E4M3 copy of the LM head.
@@ -73,7 +73,7 @@ With the shortlist in id order:
 | `half`, 2,273 | 683, 5.67 | 689, 5.43 | 585, 4.90 | 597, 4.90 |
 | `anyhow`, 10,674 | 761, 6.76 | 793, 6.68 | 759, 6.83 | 779, 6.83 |
 
-The counted ranking keeps both. `scripts/shortlist/generate.py` sent 1,783 open-perfectblend prompts (`scripts/shortlist/download.py` and `prompts.py`, efforts none, low and medium in turn, at most 1,024 tokens) to `siphon-serve` with `return_token_ids` and stored the token ids: 1.0 million generated tokens in 40 minutes. `scripts/shortlist/rank.py` ranks output tokens by count, then prompt tokens by count, then the rest by id. Share of generated tokens in the first 32,768 ranked ids or the special tokens:
+The counted ranking keeps both. `scripts/shortlist/generate.py` sent 1,783 open-perfectblend prompts (`scripts/shortlist/download.py` and `prompts.py`, efforts none, low and medium in turn, at most 1,024 tokens) to `siphon serve` with `return_token_ids` and stored the token ids: 1.0 million generated tokens in 40 minutes. `scripts/shortlist/rank.py` ranks output tokens by count, then prompt tokens by count, then the rest by id. Share of generated tokens in the first 32,768 ranked ids or the special tokens:
 
 | Ranking | Held-out prompts (107) | Chat | Coding | Instruction | Math | 2DSD core prompts (20,515 tokens) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -141,7 +141,7 @@ SIPHON_MODEL=<model-dir> SIPHON_DSPARK_REF=reference/out cargo test --release -p
 - A confidence head, `sigmoid(proj · [y_j; w1[t]] + bias)`, which `WidthPolicy` reads as each draft's acceptance chance.
 - A learned mask vector in `mask_embedding.pt`, a pickle. Convert it once in a trusted Python environment with `torch.load(path, weights_only=True)` and save its `embedding` as BF16 `mask_embedding` in `mask_embedding.safetensors` beside `model.safetensors`.
 
-RoPE reads its cosine and sine rounded to BF16, as the runner's table and Transformers' rotary embedding in training hold them. Everything else reuses the bundled draft's kernels, approximations (`DraftOptions`) and CUDA graphs. `bench`, `siphon-serve` and `tests/spec.rs` take the export directory (`--drafter DIR`, `SIPHON_DFLASH`).
+RoPE reads its cosine and sine rounded to BF16, as the runner's table and Transformers' rotary embedding in training hold them. Everything else reuses the bundled draft's kernels, approximations (`DraftOptions`) and CUDA graphs. `bench`, `siphon serve` and `tests/spec.rs` take the export directory (`--drafter DIR`, `SIPHON_DFLASH`).
 
 `tests/dflash.rs` compares the drafts with the runner's (`vllm/v1/spec_decode/looped_dflash_context.py` of the 2DSD vLLM fork) given the same taps, at each of 1,891 anchors of one core prompt and its greedy continuation on the research checkpoint. The exact draft gives the runner's 7 drafts in 1,827 rounds. In the other 64 the first different draft falls on a near-tie, a top-2 gap of at most 0.25, and the confidences differ by at most 0.011. The runner's own BF16 and F32 paths agree in 94.5% of rounds, the engine and the F32 path in 95.5%, and the engine's decoder output is as far from the F32 path (median relative error 0.0080) as the runner's BF16 output is (0.0087).
 
@@ -197,7 +197,7 @@ The block forward shares the other drafts' code. The block attention takes 3 or 
 
 `tests/spec.rs` (`dflash_speculation_is_exact`) checks exactness with the drafter: speculation at k = 1, 3, 7 and adaptive widths returns all 1024 greedy tokens after each of the three texts. The `anyhow` prompt of 10,674 tokens runs every round past the window.
 
-Chat prompts through `siphon-serve` with the bundled chat template, FP8 weights and KV, adaptive widths: two math problems, two coding tasks, a travel-planning conversation and a logic puzzle at effort `xhigh`, 10,338 tokens in all. Every run emitted the same tokens. Without a shortlist, both drafts keep their FP8 backbone and head:
+Chat prompts through `siphon serve` with the bundled chat template, FP8 weights and KV, adaptive widths: two math problems, two coding tasks, a travel-planning conversation and a logic puzzle at effort `xhigh`, 10,338 tokens in all. Every run emitted the same tokens. Without a shortlist, both drafts keep their FP8 backbone and head:
 
 | Draft | Variant | tok/s | Tokens per round | Acceptance, drafts 1 to 7 | Draft per round |
 | --- | --- | ---: | ---: | --- | ---: |
@@ -379,7 +379,7 @@ The context of 32,768 puts arbitrary token ids before the text. The greedy conti
 
 ### Falling back to plain steps
 
-On free prose the draft is wrong too often for any width to pay: a round of one row takes 4.6 ms for one token, against 2.8 ms for a plain step. `price` also times a plain step and the draft round that follows a run of them, and the policy then falls back to plain steps (`WidthPolicy::with_plain`). It is off by default; `bench --spec auto --fallback` and `siphon-serve --fallback` turn it on (see below for why):
+On free prose the draft is wrong too often for any width to pay: a round of one row takes 4.6 ms for one token, against 2.8 ms for a plain step. `price` also times a plain step and the draft round that follows a run of them, and the policy then falls back to plain steps (`WidthPolicy::with_plain`). It is off by default; `bench --spec auto --fallback` and `siphon serve --fallback` turn it on (see below for why):
 
 1. `Model::step_with_taps` runs a step that also copies the draft's taps of its row, through its own CUDA graph. The copies are four `copy_tap` launches of one row each. A step takes 2.941 ms with them against 2.935 ms without at context 2,273, and 3.318 against 3.317 ms at 32,768.
 2. The speculator keeps each step's taps. After a run of steps the draft commits all of them at once (`Draft::commit`), notes the tokens for its shortlist, and runs its round from the new anchor. That probe costs a draft round: 0.55 ms with the bundled draft and 0.86 ms with DFlash 2 at short context.
@@ -416,7 +416,7 @@ The geometric mean over the 16 runs is 2.2% above the base. Where a run took few
 | Chat question, bundled | 348 | 439 (3.02) | 402 (2.94) | 298, 172 |
 | Essay, bundled | 347 | 357 (2.07) | 397 (3.22) | 1,063, 189 |
 
-Through `siphon-serve` (FP8 weights and cache, `--context 16384`), a request for a 1,200-word essay at reasoning effort low, job log lines:
+Through `siphon serve` (FP8 weights and cache, `--context 16384`), a request for a 1,200-word essay at reasoning effort low, job log lines:
 
 | Draft | Base | Fallback |
 | --- | --- | --- |
@@ -617,7 +617,7 @@ The prompt and cached columns are the 8-stream run's medians; the 4-stream run's
 
 ### Host tier
 
-A device entry leaves the global KV caches in its slot, so it dies as soon as the slot starts another sequence. Conversations that outnumber the slots, such as several coding agents and their subagents on one GPU, then keep evicting each other, and each turn back prefills its whole history again: 2.1 s at 32K tokens and 39 s at 330K on an RTX PRO 6000 Blackwell Workstation Edition. `siphon-serve --host-cache GiB` adds a tier in page-locked host memory (`crates/siphon-cuda/src/spec/host.rs`) that copies all of an entry's state, global caches included, and returns it over PCIe.
+A device entry leaves the global KV caches in its slot, so it dies as soon as the slot starts another sequence. Conversations that outnumber the slots, such as several coding agents and their subagents on one GPU, then keep evicting each other, and each turn back prefills its whole history again: 2.1 s at 32K tokens and 39 s at 330K on an RTX PRO 6000 Blackwell Workstation Edition. `siphon serve --host-cache GiB` adds a tier in page-locked host memory (`crates/siphon-cuda/src/spec/host.rs`) that copies all of an entry's state, global caches included, and returns it over PCIe.
 
 The memory is one pool, page-locked at startup in slabs of up to 1 GiB (12 GiB took 9.7 s), and split into chunks of one size so that entries of any length use it without fragmenting it. A chunk holds 2,048 positions of every global cache of the target, then the same positions of the draft's global caches: 32 MiB plus 4 MiB for the bundled draft with FP8 caches, 32 MiB for DFlash 2, and 64 MiB plus 4 MiB with BF16 caches. 2,048 positions is the prefill chunk at whose multiples the prefix cache saves, so an entry's global caches fill whole chunks, and a chunk depends on the prompt's tokens up to its own end and on nothing after. An entry's rings and conv states (164 MiB) and the draft's rings (8 MiB bundled, 40 MiB DFlash 2) take a run of chunks of their own, 5 to 7 of them. An entry is its tokens, its global cache chunks and its local chunks.
 
@@ -641,7 +641,7 @@ Restores ran at 26.5 to 27.4 GB/s. The rest of the time with the cache is the pr
 
 Pinned host pages land on the NUMA node of the thread that first touches them. On a two-socket host whose GPU hangs off one socket, restores from memory on the other socket ran at 15 GB/s against 26 GB/s. These runs pinned both servers to the GPU's node with `taskset`; a one-socket host needs nothing.
 
-`siphon-serve --cache-dir` writes the host entries to files when the server stops and reads them back at startup (`crates/siphon-cuda/src/spec/host/disk.rs`, [server.md](server.md#restarts)). Each file holds one entry whole: its tokens, each global cache chunk's target part and, when the chunk holds it, its draft part, then the rings and conv states and the draft's rings, with a header that says which chunks hold the draft's caches. Chunks shared in memory are written into each entry's file; loading shares them again with the same rule as saving, and skips the bytes of chunks already in memory. A file says everything needed to read it into any pool of the same layout, so a disk tier that keeps entries past their time in memory could use the same files.
+`siphon serve --cache-dir` writes the host entries to files when the server stops and reads them back at startup (`crates/siphon-cuda/src/spec/host/disk.rs`, [server.md](server.md#restarts)). Each file holds one entry whole: its tokens, each global cache chunk's target part and, when the chunk holds it, its draft part, then the rings and conv states and the draft's rings, with a header that says which chunks hold the draft's caches. Chunks shared in memory are written into each entry's file; loading shares them again with the same rule as saving, and skips the bytes of chunks already in memory. A file says everything needed to read it into any pool of the same layout, so a disk tier that keeps entries past their time in memory could use the same files.
 
 The server's round robin ([batching.md](batching.md#memory-one-pool-of-pages)) swaps running sequences out to the same pool (`HostCache::park`, `unpark`). A swapped-out sequence holds chunks of its global caches up to its position, the last one partly filled, and a run of chunks for its rings and conv states at that position. Only the whole chunks of its prompt can come from a prefill, so only they are shared with entries; the chunks with generated tokens hold the batched steps' values and are its own. LRU eviction drops entries, never swapped-out sequences, and their shared chunks stay counted. A sequence that does not fit stays on the GPU.
 
@@ -666,7 +666,7 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 
 ## Memory planning
 
-`siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk, the number of streams and the capacity. With `PlanInputs::pooled`, as `siphon-serve` and `siphon-plan` plan, the global caches of every stream and of the draft, the rings and the prefix cache entries' copies of the rings share one pool of 2 MiB pages, and the capacity is the positions the pool holds over every stream ([batching.md](batching.md#memory-one-pool-of-pages)): the pool holds the capacity's chunks of 2,048 positions of the target's caches, the draft's caches for one sequence of that length, and one sequence's rings and its entry's copies of them. Otherwise each stream gets its own global caches of the capacity, rings and conv states, as `bench` and the tests allocate. More than one stream adds the batched step's buffers. It counts:
+`siphon::memory` works out the device memory a configuration needs before any weight is loaded, from the config, the safetensors headers (`Checkpoint::open` maps the files and reads only the headers), the weight and KV formats, the draft, the prefill chunk, the number of streams and the capacity. With `PlanInputs::pooled`, as `siphon serve` and `siphon plan` plan, the global caches of every stream and of the draft, the rings and the prefix cache entries' copies of the rings share one pool of 2 MiB pages, and the capacity is the positions the pool holds over every stream ([batching.md](batching.md#memory-one-pool-of-pages)): the pool holds the capacity's chunks of 2,048 positions of the target's caches, the draft's caches for one sequence of that length, and one sequence's rings and its entry's copies of them. Otherwise each stream gets its own global caches of the capacity, rings and conv states, as `bench` and the tests allocate. More than one stream adds the batched step's buffers. It counts:
 
 - the target's `model.llm.*` tensors as uploaded, with the router, the depth-attention queries and the static conv weights widened to F32, less the tensors in host memory (see [Tensors in host memory](#tensors-in-host-memory)): the embedding table, and with `--weights fp8` the BF16 LM head. The vision tower's `model.visual.*` tensors count only with `--vision`, below. The bundled draft's `mtp.safetensors` is loaded only with the bundled draft;
 - the FP8 copies of `--weights fp8`, 0.97 GB, or 1.14 GB with `--output-projection fp8`;
@@ -677,11 +677,11 @@ target/release/bench <model-dir> --prefill 512,4096,32768 [--chunk 512] [--kv bf
 - the draft's global caches, 4 KiB per position and layer, or 2 KiB with `fp8_kv` (the default): one layer of the bundled draft, every layer of a 2DSD DFlash draft, none of DFlash 2, which keeps rings of 2,056 slots;
 - the prefix cache's copies of one slot's rings and conv states and of the draft's rings (see [Prefix cache](#prefix-cache)), 171 MiB with the bundled draft and 203 MiB with DFlash 2;
 - with `--vision`, the vision tower (`vision_bytes`: its weights and its buffers for the largest image, that image's rows included) and the other image rows prefill holds: those of one chunk and of at most one more image that runs past it, 2,304 BF16 values each. The largest image has `(ceil(sqrt(max_pixels) / 40) + 1)^2` tokens, 1,369 at the default 1920 x 1080;
-- `RUNTIME_BYTES`, 128 MiB for the module images, the CUDA graphs, the small buffers and the allocator's rounding. It was measured with a thread that sampled `cuMemGetInfo` every millisecond while `siphon-serve` loaded, prefilled more than a chunk and generated speculatively; the uncounted part came to 69 to 87 MiB. Each stream past the first adds `STREAM_RUNTIME_BYTES`, 4 MiB, for one more batch size's CUDA graph and the allocator's rounding of its caches: on an RTX PRO 6000 Blackwell Max-Q at 16,384 positions, the modules and graphs took 0.03 GiB at 1 stream and 0.11 GiB at 32, and without it the peak came 11 to 43 MiB past the plan at 32 streams.
+- `RUNTIME_BYTES`, 128 MiB for the module images, the CUDA graphs, the small buffers and the allocator's rounding. It was measured with a thread that sampled `cuMemGetInfo` every millisecond while `siphon serve` loaded, prefilled more than a chunk and generated speculatively; the uncounted part came to 69 to 87 MiB. Each stream past the first adds `STREAM_RUNTIME_BYTES`, 4 MiB, for one more batch size's CUDA graph and the allocator's rounding of its caches: on an RTX PRO 6000 Blackwell Max-Q at 16,384 positions, the modules and graphs took 0.03 GiB at 1 stream and 0.11 GiB at 32, and without it the peak came 11 to 43 MiB past the plan at 32 streams.
 
-The CUDA context itself takes 507 MiB, or 392 MiB on an RTX 4090. `siphon-serve` reads the free memory right after creating it, so the plan must fit that free memory less `--margin`, 0.25 GiB by default (0.5 GiB before). `siphon-serve` sets `CUDA_MODULE_LOADING=EAGER` unless the environment sets it, so every kernel's code loads with its module at startup, before the memory check, rather than at its first launch. On an RTX 4090 the modules took 16 MiB eagerly against 10 MiB lazily, and a filled context peaked at the same bytes either way.
+The CUDA context itself takes 507 MiB, or 392 MiB on an RTX 4090. `siphon serve` reads the free memory right after creating it, so the plan must fit that free memory less `--margin`, 0.25 GiB by default (0.5 GiB before). `siphon serve` sets `CUDA_MODULE_LOADING=EAGER` unless the environment sets it, so every kernel's code loads with its module at startup, before the memory check, rather than at its first launch. On an RTX 4090 the modules took 16 MiB eagerly against 10 MiB lazily, and a filled context peaked at the same bytes either way.
 
-`--prefill-chunk N` (`siphon-serve` and `siphon-plan`) sets the rows of each prefill chunk, 2048 by default. The prefill buffers take 0.85 GiB at 2048 rows and 0.45 GiB at 1024, and the planner sizes them from the chunk. Prefix cache entries fall on its multiples. Chunks of 1024 cost 6 to 7% of prefill speed: on an RTX 4090, 8,939 against 9,570 tok/s at 8,192 tokens and 8,291 against 8,841 at 32,768; on an RTX 5090, 32,768 tokens took 2.55 s against 2.39 s.
+`--prefill-chunk N` (`siphon serve` and `siphon plan`) sets the rows of each prefill chunk, 2048 by default. The prefill buffers take 0.85 GiB at 2048 rows and 0.45 GiB at 1024, and the planner sizes them from the chunk. Prefix cache entries fall on its multiples. Chunks of 1024 cost 6 to 7% of prefill speed: on an RTX 4090, 8,939 against 9,570 tok/s at 8,192 tokens and 8,291 against 8,841 at 32,768; on an RTX 5090, 32,768 tokens took 2.55 s against 2.39 s.
 
 Planned against measured, FP8 weights and cache, the bundled draft, the most that fit the free memory (23.13 GiB on an RTX 4090, 30.46 GiB on an RTX 5090), each filled by one prompt and 256 generated tokens:
 
@@ -700,11 +700,11 @@ Planned against measured, FP8 weights and cache, the bundled draft, the most tha
 
 The planned and peak bytes here include the context. The peak came at most 4 MiB past the plan on the 4090, where the `sm_89` build's 10 MB of module globals take part of `RUNTIME_BYTES`, and stayed 44 to 65 MiB under it on the 5090. Either way at least 252 MiB of the 0.25 GiB margin stayed free. `Model::save_state` copies only the filled slots of the global caches, so pricing the verify widths at startup does not double the cache.
 
-`siphon-serve` also checks the plan against what it uses. It allocates the full prefill chunk's buffers at startup (`Model::reserve_prefill`), so every buffer the plan counts exists once the warmup has run. Every buffer comes from the device's memory pool, because cudarc allocates with `cuMemAllocAsync`. `Gpu::memory` reads the pool's reserved bytes and their peak (`cuMemPoolGetAttribute`) along with the device's free memory. The bytes outside the pool, the module images and the CUDA graphs, are the drop in free memory since the context was created less the pool's bytes, measured once after warmup. The check prints the pool's peak plus those bytes against the plan, prints the peak again after a job whenever it rises, and warns once if a job takes it past the plan.
+`siphon serve` also checks the plan against what it uses. It allocates the full prefill chunk's buffers at startup (`Model::reserve_prefill`), so every buffer the plan counts exists once the warmup has run. Every buffer comes from the device's memory pool, because cudarc allocates with `cuMemAllocAsync`. `Gpu::memory` reads the pool's reserved bytes and their peak (`cuMemPoolGetAttribute`) along with the device's free memory. The bytes outside the pool, the module images and the CUDA graphs, are the drop in free memory since the context was created less the pool's bytes, measured once after warmup. The check prints the pool's peak plus those bytes against the plan, prints the peak again after a job whenever it rises, and warns once if a job takes it past the plan.
 
-`siphon-plan` draws the plan in the terminal. It plans every combination of weight format, KV format and draft (the bundled draft, a `--drafter`, none) with `siphon::memory`. It takes the free memory after the context from nvidia-smi's free memory less the context, 507 MiB or the RTX 4090's 392 MiB, which is how the context was measured. `--margin` and `--prefill-chunk` plan as `siphon-serve`'s do. `--streams N` plans N streams as `siphon-serve --streams N` does.
+`siphon plan` draws the plan in the terminal. It plans every combination of weight format, KV format and draft (the bundled draft, a `--drafter`, none) with `siphon::memory`. It takes the free memory after the context from nvidia-smi's free memory less the context, 507 MiB or the RTX 4090's 392 MiB, which is how the context was measured. `--margin` and `--prefill-chunk` plan as `siphon serve`'s do. `--streams N` plans N streams as `siphon serve --streams N` does.
 
-Planned against measured, as the memory check of `siphon-serve` reports it after a request: the pool's peak plus the bytes outside the pool. At 65,536 positions the request had a 3,820-token prompt and 256 speculative tokens. At the largest capacity, the most that fit 30.46 GiB of free memory, its prompt and 512 speculative tokens left 399 to 436 positions of the cache unused:
+Planned against measured, as the memory check of `siphon serve` reports it after a request: the pool's peak plus the bytes outside the pool. At 65,536 positions the request had a 3,820-token prompt and 256 speculative tokens. At the largest capacity, the most that fit 30.46 GiB of free memory, its prompt and 512 speculative tokens left 399 to 436 positions of the cache unused:
 
 | Weights, KV cache | Draft | Capacity | Planned GiB | Measured GiB | Over, MiB |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -856,7 +856,7 @@ Speed on the RTX 5090, FP8 weights, the same hold for each row's configurations.
 
 A second run of the decode rows in the same hold agreed within 0.1%. These runs predate the BF16 output projection that `--weights fp8` now keeps (`--output-projection`), so their absolute times include the FP8 copy; the comparisons between caches hold, since all read the same weights. NVFP4 reads 44% fewer cache bytes: decode is 4% faster at 32K, 13% at 128K and 34% at 512K. Its prefill is 6% slower at 32K and 22% at 128K, because past 16,384 keys the FP8 cache's prefill runs attention on FP8 tensor cores and NVFP4 has no such variant; at 508K tokens through siphon-serve the prefill took 98.9 s against 67.0 s.
 
-Memory: the planner's longest context (`siphon-plan --print`, default 0.25 GiB margin) with the bundled draft and FP8 weights, the prefix cache's entry per stream included (the RTX PRO 6000 Blackwell Workstation Edition with 95.1 GiB free, the RTX 5090 with 30.46 GiB):
+Memory: the planner's longest context (`siphon plan <model-dir>`, default 0.25 GiB margin) with the bundled draft and FP8 weights, the prefix cache's entry per stream included (the RTX PRO 6000 Blackwell Workstation Edition with 95.1 GiB free, the RTX 5090 with 30.46 GiB):
 
 | Configuration | 5090, 1 stream | 2 | 4 | 8 | PRO 6000, 8 streams |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -885,7 +885,7 @@ Two BF16 tensors of 0.86 GiB each are read only a few rows at a time: the embedd
 
 `Weights::quantize_fp8` moves the BF16 LM head to host memory after making its FP8 copy. Decode and verify passes read the FP8 copy already. The prefill's last row, which gives the first token of a reply, and `PrefillLogits::All` now run the verify pass's multi-row FP8 product too, so the first token is the one a one-row verify at that position would pick. The bundled draft builds its fold from the host copy at load and gathers its shortlist rows from it. A draft without an FP8 or shortlist head keeps its own device copy for its base logits, as before.
 
-Over 212 prompts (200 open-perfectblend chat prompts as `siphon-serve` renders them and the 12 prompts of the server check), the first token's logits from the FP8 head against the BF16 head, both after the same FP8 prefill: mean KL 6.8e-9, largest 5.8e-7, the same top-1 token in 212 of 212, largest logit difference 0.75. With `--weights bf16` nothing changes. `siphon-serve --greedy` gave the same tokens as before on 12 chat prompts (stories, code, explanations, a sonnet, a word problem) of 529 to 3,000 generated tokens.
+Over 212 prompts (200 open-perfectblend chat prompts as `siphon serve` renders them and the 12 prompts of the server check), the first token's logits from the FP8 head against the BF16 head, both after the same FP8 prefill: mean KL 6.8e-9, largest 5.8e-7, the same top-1 token in 212 of 212, largest logit difference 0.75. With `--weights bf16` nothing changes. `siphon serve --greedy` gave the same tokens as before on 12 chat prompts (stories, code, explanations, a sonnet, a word problem) of 529 to 3,000 generated tokens.
 
 Times against the build before, FP8 weights and caches, `anyhow` prompt, minimum over 5 to 10 runs alternating builds in one hold of the GPU (prefill with BF16 weights and cache, whose head did not change):
 
@@ -902,7 +902,7 @@ Times against the build before, FP8 weights and caches, `anyhow` prompt, minimum
 | Prefill of 2,048 tokens | 0 | 123.6 | 123.6 | 0.0% |
 | Prefill of 16,384 tokens | 0 | 1,055.8 | 1,057.2 | +0.1% |
 
-The medians moved by at most +0.3%. The draft round in `siphon-serve` went from 0.515 to 0.520 ms. `dspark time`, which keeps the embedding table on the device, shows no change in the round, so the 5 us are most likely the PCIe read of the anchor's row.
+The medians moved by at most +0.3%. The draft round in `siphon serve` went from 0.515 to 0.520 ms. `dspark time`, which keeps the embedding table on the device, shows no change in the round, so the 5 us are most likely the PCIe read of the anchor's row.
 
 ## Dense weight format
 
@@ -1026,7 +1026,7 @@ The NVFP4 activations cause the difference: quantizing only the MXFP8 layers sta
 
 ## Prefill on FP8 tensor cores
 
-Three prefill options run products on the block-scaled FP8 MMA (`mma.sync ... kind::mxf8f6f4.block_scale`, m16n8k32). With F32 accumulators it runs at 1,015 TFLOP/s on the RTX 5090, against 254 for BF16; without block scales the same MMA runs at 509. Each option rounds activations to E4M3, so each went through the quality gate. Decode never uses them. `bench` and `eval` take the flags (`siphon-serve` takes `--prefill-attention`), and the `Model` setters take the same choices:
+Three prefill options run products on the block-scaled FP8 MMA (`mma.sync ... kind::mxf8f6f4.block_scale`, m16n8k32). With F32 accumulators it runs at 1,015 TFLOP/s on the RTX 5090, against 254 for BF16; without block scales the same MMA runs at 509. Each option rounds activations to E4M3, so each went through the quality gate. Decode never uses them. `bench` and `eval` take the flags (`siphon serve` takes `--prefill-attention`), and the `Model` setters take the same choices:
 
 | Option | Flag | Setter | Default |
 | --- | --- | --- | --- |
@@ -1119,7 +1119,7 @@ Ada lacks five things the `sm_120a` kernels use. `kernels/arch.cuh` defines `SIP
 - **The block-scaled MMA.** The kernels of FP8 prefill attention, quantized and FP8 expert activations and FP8 dense products trap there, and the `Model` setters refuse them. `--prefill-attention auto` stays on BF16 at every length. `siphon_cuda::BLOCK_SCALED_MMA` is false, and the 9 kernel tests of those paths are skipped.
 - **An E2M1 converter.** CUDA's `__nv_cvt_fp4x2_to_halfraw2` falls back to an E2M3 conversion in software on Ada, which took the decode step's NVFP4 expert MLP to 131 us per call, 27% of the DRAM bandwidth, while the MXFP8 one ran at 87%. The F16 forms of the eight E2M1 magnitudes differ only in their high byte, so one `prmt` looks up both values of a byte (`e2m1x2_to_f16x2_sm89`). It matches CUDA's conversion on all 256 bytes. The NVFP4 KV cache uses it too, with an encoder of its own ([below](#nvfp4-and-mixed-caches-on-the-rtx-4090)).
 
-The memory plan has the same parts. The cluster stand-ins add 10.3 MB of module globals, inside `RUNTIME_BYTES`. The CUDA context takes 392 MiB with driver 595, against the 507 MiB of `CONTEXT_BYTES`, so `siphon-plan` without `--free` underestimates the free memory by 115 MiB there.
+The memory plan has the same parts. The cluster stand-ins add 10.3 MB of module globals, inside `RUNTIME_BYTES`. The CUDA context takes 392 MiB with driver 595, against the 507 MiB of `CONTEXT_BYTES`, so `siphon plan` without `--free` underestimates the free memory by 115 MiB there.
 
 ### Results on the RTX 4090
 
@@ -1186,7 +1186,7 @@ Two fixes would pass the gate without loosening it: decode could read the output
 
 ### Longest context on the RTX 4090
 
-`siphon-serve --prefill-chunk 1024` without `--context` took 244,736 positions with FP8 weights and cache and the bundled draft. One chat request filled it: 243,975 tokens of Python standard library source with a one-line note about 500 tokens in, then a question about the note, greedy, at effort 0. The first token came after 48.5 s, 5,030 tok/s over the prompt. The reply used 329 tokens, 244,304 positions in all, and decoded at 161 tok/s. It gave the note's code, which was right. The memory check reported a peak of 23,392 MiB against a plan of 23,414 MiB. At the default effort of 0.9 the same request spent all of its 512 tokens thinking, at 167 tok/s.
+`siphon serve --prefill-chunk 1024` without `--context` took 244,736 positions with FP8 weights and cache and the bundled draft. One chat request filled it: 243,975 tokens of Python standard library source with a one-line note about 500 tokens in, then a question about the note, greedy, at effort 0. The first token came after 48.5 s, 5,030 tok/s over the prompt. The reply used 329 tokens, 244,304 positions in all, and decoded at 161 tok/s. It gave the note's code, which was right. The memory check reported a peak of 23,392 MiB against a plan of 23,414 MiB. At the default effort of 0.9 the same request spent all of its 512 tokens thinking, at 167 tok/s.
 
 With DFlash 2, which keeps no global caches, the longest FP8 context is 239,616 positions at the default chunk and 265,216 at chunks of 1024, against 222,208 and 244,736 with the bundled draft.
 

@@ -1,4 +1,4 @@
-# siphon-serve in a container. The NVIDIA driver comes from the host through the NVIDIA
+# Siphon in a container. The NVIDIA driver comes from the host through the NVIDIA
 # container toolkit (`docker run --gpus all`); the image holds no driver libraries.
 #
 #   docker build -t siphon .
@@ -16,13 +16,13 @@ ENV PATH=/root/.cargo/bin:$PATH \
     NVCC=/usr/local/cuda/bin/nvcc
 WORKDIR /src
 COPY . .
-# The commit siphon-serve logs at startup: the copy holds no .git.
+# The commit the server logs at startup: the copy holds no .git.
 ARG SIPHON_COMMIT=unknown
 ENV SIPHON_COMMIT=$SIPHON_COMMIT
-RUN cargo build --release --locked -p siphon-serve \
-    && cp target/release/siphon-serve /siphon-serve
+RUN cargo build --release --locked -p siphon-cli \
+    && cp target/release/siphon /siphon
 
 FROM nvidia/cuda:13.5.0-base-ubuntu24.04@sha256:8c30b31b13a97ee353c21e666b227dea44f4331d38a221f257de70fc04b437d0
-COPY --from=build /siphon-serve /usr/local/bin/siphon-serve
+COPY --from=build /siphon /usr/local/bin/siphon
 EXPOSE 8000
-ENTRYPOINT ["siphon-serve"]
+ENTRYPOINT ["siphon", "serve"]

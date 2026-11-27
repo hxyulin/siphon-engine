@@ -1,4 +1,4 @@
-//! Shared helpers for the server tests: a `siphon-serve` process and HTTP requests to it.
+//! Shared helpers for the server tests: a `siphon serve` process and HTTP requests to it.
 
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
@@ -53,12 +53,13 @@ pub struct Server {
 }
 
 impl Server {
-    /// Starts `siphon-serve` on `SIPHON_MODEL` with `args`, and `--kv` from `SIPHON_KV` if
+    /// Starts `siphon serve` on `SIPHON_MODEL` with `args`, and `--kv` from `SIPHON_KV` if
     /// set, and waits until it answers `/health`.
     pub fn start<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> anyhow::Result<Self> {
         let model = env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?;
         let port = free_port()?;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_siphon-serve"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_siphon"))
+            .arg("serve")
             .arg(&model)
             .args(["--port", &port.to_string()])
             .args(args)

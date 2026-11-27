@@ -1,6 +1,6 @@
 # Coding agents
 
-Setup recipes that point coding-agent clients at `siphon-serve`. [server.md](server.md) covers the routes and their fields. The examples assume a server at `http://localhost:8000` with `--name inkling-2-mini`, the defaults. They follow the source of Codex 0.171.0, Pi 1.6.1, OpenCode 2.4.1 and DeepSeek Harness 0.2.3-alpha.2, and are not yet run against a server.
+Setup recipes that point coding-agent clients at `siphon serve`. [server.md](server.md) covers the routes and their fields. The examples assume a server at `http://localhost:8000` with `--name inkling-2-mini`, the defaults. They follow the source of Codex 0.171.0, Pi 1.6.1, OpenCode 2.4.1 and DeepSeek Harness 0.2.3-alpha.2, and are not yet run against a server.
 
 ## Common settings
 
@@ -8,14 +8,14 @@ Setup recipes that point coding-agent clients at `siphon-serve`. [server.md](ser
 
 Each client needs the context window set to what the server planned. The server prints its planned context at startup, and `/v1/models` lists it as `max_model_len`. A client value above it lets a prompt overflow: the server then answers 400 with the code `context_length_exceeded` instead of the client compacting first.
 
-| GPU | `siphon-serve` flags | Planned positions |
+| GPU | `siphon serve` flags | Planned positions |
 | --- | --- | ---: |
 | RTX 4090, one user | `--streams 2 --kv mixed --host-cache 12` | 314,368 |
 | RTX 4090, most context | `--kv nvfp4 --drafter <dflash2-dir> --prefill-chunk 1024 --margin 0.1` | 497,664 |
 | RTX 4090, 2 to 4 users | `--streams 4 --kv mixed --host-cache 12` | 311,296, shared |
 | RTX 5090, one user | `--streams 2 --host-cache 12` | 648,192 |
 
-The RTX 4090 rows are measured ([Serving on an RTX 4090](server.md#serving-on-an-rtx-4090)). The RTX 5090 row is `siphon-plan`'s plan for an idle 32 GB card with FP8 caches. A display or another process on the card lowers it, so use the number your server prints. With several streams, one request may still take the whole pool.
+The RTX 4090 rows are measured ([Serving on an RTX 4090](server.md#serving-on-an-rtx-4090)). The RTX 5090 row is `siphon plan`'s plan for an idle 32 GB card with FP8 caches. A display or another process on the card lowers it, so use the number your server prints. With several streams, one request may still take the whole pool.
 
 At 478K tokens on the RTX 4090, the first token took 138.5 s. A client that gives up on a quiet connection sooner cuts long prompts off, so each section names its timeout.
 
@@ -46,7 +46,7 @@ The server needs no key unless it runs with `SIPHON_API_KEY`. Some clients refus
 
 ### Sampling and images
 
-A request that sets no sampling fields gets the checkpoint's defaults: temperature 1 with no filters. Images need `siphon-serve --vision`. Without it, the server replaces each image with the text `[image omitted: the model cannot see images]`.
+A request that sets no sampling fields gets the checkpoint's defaults: temperature 1 with no filters. Images need `siphon serve --vision`. Without it, the server replaces each image with the text `[image omitted: the model cannot see images]`.
 
 ## Codex
 

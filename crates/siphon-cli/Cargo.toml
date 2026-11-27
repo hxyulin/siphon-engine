@@ -1,0 +1,25 @@
+[package]
+name = "siphon-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "siphon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_complete = "4.6"
+siphon = { path = "../siphon" }
+siphon-plan = { path = "../siphon-plan" }
+siphon-serve = { path = "../siphon-serve" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

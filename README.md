@@ -64,7 +64,7 @@ The same kernels serve the RTX 5090 and the RTX PRO 6000 Blackwell (`sm_120a`). 
 | **RTX PRO 6000 Blackwell** | 96 GB, 1.79 TB/s, `sm_120a` | 883 · 706 | 352 · 326 | 36,053 · 33,975 | 1,449 · 2,176 · 3,462 | 1,048,576 · 1,048,576 | [RTX PRO 6000](docs/recipes.md#rtx-pro-6000-blackwell) |
 | **RTX 4090** | 24 GB, 1.01 TB/s, `sm_89` | 479 · 375 | 226 · 194 | 14,457 · 14,324 | 814 · 1,208 · — | 247,808 · **606,208** | [RTX 4090](docs/recipes.md#rtx-4090) |
 
-See [docs/recipes.md](docs/recipes.md) for copy-pasteable `siphon-serve` commands per card (single-user coding, multi-user serving, relaxed speculation, and max context). [RTX PRO 6000 Blackwell](#rtx-pro-6000-blackwell) and [RTX 4090](#rtx-4090) below have full breakdowns.
+See [docs/recipes.md](docs/recipes.md) for copy-pasteable `siphon serve` commands per card (single-user coding, multi-user serving, relaxed speculation, and max context). [RTX PRO 6000 Blackwell](#rtx-pro-6000-blackwell) and [RTX 4090](#rtx-4090) below have full breakdowns.
 
 ## Performance
 
@@ -112,7 +112,7 @@ Neither mode is clearly more accurate. On 23 quickbench items at a3fc890, 4 atte
 
 ### Concurrent requests
 
-`siphon-serve --streams N` runs up to 32 requests at once, each in its own KV cache. A request alone speculates. When others arrive, all of them decode in batched steps of one row each, and a request left alone speculates again. Tok/s in all, with tok/s per stream in brackets:
+`siphon serve --streams N` runs up to 32 requests at once, each in its own KV cache. A request alone speculates. When others arrive, all of them decode in batched steps of one row each, and a request left alone speculates again. Tok/s in all, with tok/s per stream in brackets:
 
 | Context of each stream | 1 stream | 2 streams | 4 streams | 8 streams |
 | ---: | ---: | ---: | ---: | ---: |
@@ -164,7 +164,7 @@ On a 96 GB RTX PRO 6000 Blackwell (`94.2 GiB` budget) with `--streams 32`, the s
 
 `--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts on a 32 GB card to 679,936 and 754,688 for 6 to 7% of prefill speed.
 
-`siphon-plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
+`siphon plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
 
 ### RTX PRO 6000 Blackwell
 
@@ -175,7 +175,7 @@ Measured on an RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver 
 - **Single-stream DFlash 2 speculation** (`anyhow` 10.7K / 32K, 256 tokens, fast profile + `--draft-weights nvfp4`):
   - Greedy `--spec auto`: **`883.4 tok/s`** (`2.51x`) at 10.7K, **`797.5 tok/s`** (`2.44x`) at 32K (RTX 5090: **`884.6` / `816.6 tok/s`**).
   - Sampled lossless (`--spec-beta 1.0`, 6-seed medians): `T=0.6, p=0.95` **`829.4`** / `732.5 tok/s`; `T=0.8, p=0.95` **`705.6`** / `743.6 tok/s`; `T=1.0, p=0.95, m=0.05` linear `585.9` / `591.0` → entropy-gated 2-branch tree (`--spec-tree`) **`647.7`** (`+10.5%`) / **`639.8 tok/s`** (`+8.3%`). On RTX 5090 (4-seed medians): `T=0.8` lossless tree **`714.5` / `602.3 tok/s`** (`--spec-beta 0.80`: **`805.1` / `717.5 tok/s`**), `T=1.0, m=0.05` lossless tree **`616.4` / `532.6 tok/s`**.
-- **Live `siphon-serve` batched DFlash 2 speculation** (`--streams 32 --no-prefix-cache`, 1.77K prompt → 200 tokens, `T=0.8, p=0.95`):
+- **Live `siphon serve` batched DFlash 2 speculation** (`--streams 32 --no-prefix-cache`, 1.77K prompt → 200 tokens, `T=0.8, p=0.95`):
   - Default FP8 + `--spec-beta 1.0`: `C=1` `375.2`, `C=8` `773.0`, `C=16` `900.6`, `C=32` `961.5 tok/s` (`p50 TTFT 2.13 s`).
   - Fast profile + `--spec-beta 1.0` (lossless): `C=1` `389.9`, `C=8` `884.4`, `C=16` `1,133.6`, `C=32` **`1,232.3 tok/s`** (`p50 TTFT 1.35 s`).
   - Fast profile + `--spec-beta 0.80`: `C=1` `437.0` (`p50 user 508.7 tok/s`), `C=8` `943.9`, `C=16` `1,168.7`, `C=32` **`1,314.4 tok/s`** (`p50 TTFT 1.31 s`).
@@ -206,7 +206,7 @@ Measured on an RTX 4090 (24 GB, 450 W, driver 620.70.10) with the `sm_89` build 
   - **Code (`anyhow`, 10.7K / 32K):** greedy **`479.3`** (`2.30x`) / **`458.1 tok/s`** (`2.37x`, bundled DSpark `460.2` / `413.4`; **`486.2 tok/s`** with `--kv nvfp4`); sampled lossless (`--spec-beta 1.0`) `T=0.8, p=0.95` **`375.3 tok/s`** (`449.0 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`346.7 tok/s`**.
   - **Prose (`regex-readme`, 2.3K / 32K):** greedy **`394.8`** (`1.79x`) / **`385.4 tok/s`** (`1.99x`, bundled DSpark `339.4` / `362.3`); sampled lossless (`--spec-beta 1.0 --fallback`) `T=0.8, p=0.95` **`254.0 tok/s`** (`280.5 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`249.1 tok/s`**.
 - **Batched plain decode** (`bench`, FP8 KV, `ctx 0 / 4,096`): `B=8` `563 / 502`, `B=16` **`814 / 709`**, `B=24` **`1,009 / 869`**, `B=32` **`1,208 / 1,016 tok/s`**.
-- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8 --prefill-dense fp8` (which streams layer quantization and frees ~1.0–1.3 GiB of unused BF16 weights) and DFlash 2, one stream at full `--prefill-chunk 2048 --margin 0.25` reaches **`563,200`** positions with `--kv nvfp4 --output-projection mxfp8`, **`606,208`** with `--lm-head nvfp4 --draft-weights nvfp4`, and **`614,400`** with `--kv nvfp4-all` (verified live in `siphon-serve --context 524288` with `peak <= planned` and full `--host-cache` compatibility; up to **`632,832`** with `--prefill-chunk 1024 --margin 0.1`). See [docs/recipes.md](docs/recipes.md#rtx-4090) and [server.md](docs/server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](docs/engine.md#rtx-4090-sm_89) for architectural details.
+- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8 --prefill-dense fp8` (which streams layer quantization and frees ~1.0–1.3 GiB of unused BF16 weights) and DFlash 2, one stream at full `--prefill-chunk 2048 --margin 0.25` reaches **`563,200`** positions with `--kv nvfp4 --output-projection mxfp8`, **`606,208`** with `--lm-head nvfp4 --draft-weights nvfp4`, and **`614,400`** with `--kv nvfp4-all` (verified live in `siphon serve --context 524288` with `peak <= planned` and full `--host-cache` compatibility; up to **`632,832`** with `--prefill-chunk 1024 --margin 0.1`). See [docs/recipes.md](docs/recipes.md#rtx-4090) and [server.md](docs/server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](docs/engine.md#rtx-4090-sm_89) for architectural details.
 
 ## Features
 
@@ -227,7 +227,9 @@ Not yet: the presence, frequency and repetition penalties (accepted and ignored)
 ```sh
 pixi run cargo build --release
 pixi run cargo test --workspace
-target/release/siphon-serve <model-dir> --port 8000
+target/release/siphon inspect <model-dir>
+target/release/siphon plan <model-dir>
+target/release/siphon serve <model-dir> --port 8000
 ```
 
 The `bench` binary measures decode, prefill, speculation and batched decode:
@@ -243,17 +245,26 @@ For an RTX 4090, build with `SIPHON_CUDA_ARCH=sm_89`. That build uses native Ada
 
 On macOS, `siphon-cuda` compiles to an empty crate, so the tests run but the server cannot serve. `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command there.
 
+## Shell completions
+
+Run `siphon completions --help` for the supported shells. The commands below load completions into your current shell when `siphon` is on your PATH.
+
+- In Bash, run `source <(siphon completions bash)`.
+- In Zsh, run `autoload -Uz compinit && compinit` if your shell has not initialized completions, then `source <(siphon completions zsh)`.
+- In Fish, run `siphon completions fish | source`.
+
 ## Project layout
 
 | Path | Contents |
 | --- | --- |
-| `crates/siphon` | Config parsing, the memory-mapped safetensors checkpoint, the GPU memory planner and the `siphon inspect` CLI |
+| `crates/siphon` | Config parsing, the memory-mapped safetensors checkpoint and GPU memory planning |
+| `crates/siphon-cli` | The `siphon` command and its shell completions |
 | `crates/siphon-cuda` | Kernels (`kernels/*.cu`), their Rust launchers (`src/ops`), the model, the drafts and speculation, and the `bench`, `eval`, `parity` and `dspark` binaries |
 | `crates/siphon-serve` | The HTTP server: chat rendering, output parsing and the engine thread |
-| `crates/siphon-plan` | `siphon-plan`, a terminal view of the memory plan |
+| `crates/siphon-plan` | `siphon plan`, a terminal view of the memory plan |
 | `reference` | MLX-LM captures and kernel fixtures, run on a Mac with uv |
 | `scripts` | Remote sync, the PDL read-order audit and profiling scripts |
-| [`docs/recipes.md`](docs/recipes.md) | Copy-pasteable `siphon-serve` recipes per GPU (RTX 5090, RTX PRO 6000 Blackwell, RTX 4090) |
+| [`docs/recipes.md`](docs/recipes.md) | Copy-pasteable `siphon serve` recipes per GPU (RTX 5090, RTX PRO 6000 Blackwell, RTX 4090) |
 | [`docs/server.md`](docs/server.md) | Server options, routes and request fields |
 | [`docs/engine.md`](docs/engine.md) | How the engine works, how it is tested and measured, and its formats |
 | [`docs/batching.md`](docs/batching.md) | The design of batched decode |

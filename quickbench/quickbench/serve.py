@@ -1,4 +1,4 @@
-"""Starts and stops siphon-serve, reads its job log, and lists GPU processes."""
+"""Starts and stops siphon serve, reads its job log, and lists GPU processes."""
 
 import json
 import os
@@ -16,7 +16,7 @@ ENGINE = re.compile(r"(\d+) speculated, (\d+) batched steps")
 
 class Siphon:
     def __init__(self, binary: Path, model: Path, args: list[str], log: Path, port: int = 8471):
-        self.command = [str(binary), str(model), "--port", str(port), *args]
+        self.command = [str(binary), "serve", str(model), "--port", str(port), *args]
         self.base = f"http://127.0.0.1:{port}/v1"
         self.log = log
         self.process = None
@@ -31,13 +31,13 @@ class Siphon:
         deadline = time.time() + 900
         while time.time() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError(f"siphon-serve exited, see {self.log}:\n{self.tail()}")
+                raise RuntimeError(f"siphon serve exited, see {self.log}:\n{self.tail()}")
             try:
                 client.get(f"{self.base}/models", timeout=2)
                 return self
             except OSError:
                 time.sleep(1)
-        raise RuntimeError(f"siphon-serve did not start in 15 minutes, see {self.log}")
+        raise RuntimeError(f"siphon serve did not start in 15 minutes, see {self.log}")
 
     def __exit__(self, *_):
         self.process.terminate()

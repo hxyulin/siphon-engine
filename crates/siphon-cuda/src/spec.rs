@@ -301,12 +301,7 @@ impl WidthPolicy {
     /// A policy over `widths` (ascending, 1 to 8, the widest at least 2) that prices a
     /// round of width `w` at `round_ms[w - 1]` milliseconds.
     pub fn new(widths: &[usize], round_ms: [f64; VERIFY_ROWS]) -> anyhow::Result<Self> {
-        ensure!(
-            widths.windows(2).all(|w| w[0] < w[1])
-                && widths.iter().all(|w| (1..=VERIFY_ROWS).contains(w))
-                && widths.last().is_some_and(|&w| w >= 2),
-            "widths {widths:?} are not ascending from 1 to {VERIFY_ROWS} up to at least 2"
-        );
+        siphon::memory::validate_verify_widths(widths)?;
         ensure!(
             widths.iter().all(|&w| round_ms[w - 1] > 0.0),
             "a round time is not positive"

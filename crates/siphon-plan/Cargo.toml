@@ -7,9 +7,16 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+anstream = "1"
 anyhow.workspace = true
+clap.workspace = true
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+shlex = "2"
 siphon = { path = "../siphon" }
+
+[dev-dependencies]
+siphon-serve = { path = "../siphon-serve" }
+tempfile = "3"
 
 [lints]
 workspace = true

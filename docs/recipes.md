@@ -1,11 +1,11 @@
 # Hardware Recipes
 
-Copy-pasteable `siphon-serve` configurations for each supported GPU. All speeds below are measured on `inkling-2-mini` / [`hxyulin/Inkling-2-Mini-Fast-NVFP4`](https://huggingface.co/hxyulin/Inkling-2-Mini-Fast-NVFP4) with Inco AI's DFlash 2 drafter ([`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)).
+Copy-pasteable `siphon serve` configurations for each supported GPU. All speeds below are measured on `inkling-2-mini` / [`hxyulin/Inkling-2-Mini-Fast-NVFP4`](https://huggingface.co/hxyulin/Inkling-2-Mini-Fast-NVFP4) with Inco AI's DFlash 2 drafter ([`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)).
 
 Before launching, you can inspect the exact VRAM breakdown and context ceiling for any machine with:
 
 ```sh
-target/release/siphon-plan <model-dir> --drafter <dflash2-dir> --output-projection mxfp8
+target/release/siphon plan <model-dir> --drafter <dflash2-dir> --output-projection mxfp8
 ```
 
 > **Checkpoints & Drafters:**
@@ -24,7 +24,7 @@ target/release/siphon-plan <model-dir> --drafter <dflash2-dir> --output-projecti
 Best all-around recipe for Claude Code, Codex, or interactive coding on a 32 GB card. Uses MXFP8 output projections, NVFP4 LM head and draft weights, FP8/quantized prefill, lossless tree speculation, 4 streams (so background agent calls don't evict the main conversation), and a 12 GiB host prefix cache.
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv fp8 --prefill-dense fp8 --expert-activations quantized --prefill-attention fp8 \
@@ -41,7 +41,7 @@ target/release/siphon-serve <model-dir> \
 Same fast weights/prefill profile, switching to `--spec-beta 0.80` for higher sampled acceptance and `--fallback` so unpredictable prose drops to plain decode automatically.
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv fp8 --prefill-dense fp8 --expert-activations quantized --prefill-attention fp8 \
@@ -57,7 +57,7 @@ target/release/siphon-serve <model-dir> \
 Switches global KV caches to NVFP4 (9 KiB/pos instead of 16 KiB/pos) with native Blackwell NVFP4 prefill attention, hitting the model's full `1,048,576` token context limit on a single 32 GB card.
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv nvfp4 --prefill-dense fp8 --expert-activations quantized --prefill-attention fp4 \
@@ -73,7 +73,7 @@ target/release/siphon-serve <model-dir> \
 Zero extra approximations beyond the default FP8 dense weights and FP8 KV cache, with BF16 output projections and the bundled DSpark draft:
 
 ```sh
-target/release/siphon-serve <model-dir> --host 0.0.0.0 --port 8000
+target/release/siphon serve <model-dir> --host 0.0.0.0 --port 8000
 ```
 
 - **Measured speeds:** **356 / 303 tok/s** plain decode (ctx 0 / 32K) · **875 tok/s** greedy code (with `--output-projection fp8`) · **16,203 tok/s** BF16 prefill (8K) · **661,504** context.
@@ -89,7 +89,7 @@ target/release/siphon-serve <model-dir> --host 0.0.0.0 --port 8000
 Full 32-stream continuous batching with batched DFlash 2 speculation, confidence-grouped micro-batches, and a **4.67M-position** shared FP8 KV pool (capped at `1,048,576` per individual request).
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv fp8 --prefill-dense fp8 --expert-activations quantized --prefill-attention fp8 \
@@ -98,7 +98,7 @@ target/release/siphon-serve <model-dir> \
   --host 0.0.0.0 --port 8000
 ```
 
-- **Measured live `siphon-serve` throughput (`T=0.8, p=0.95`):** `C=1` **390** · `C=8` **884** · `C=16` **1,134** · `C=32` **1,232 tok/s** (p50 TTFT 1.35 s).
+- **Measured live `siphon serve` throughput (`T=0.8, p=0.95`):** `C=1` **390** · `C=8` **884** · `C=16` **1,134** · `C=32` **1,232 tok/s** (p50 TTFT 1.35 s).
 - Swap `--spec-beta 1.0` → `--spec-beta 0.80` for `C=1` **437** (p50 user 509 tok/s) · `C=32` **1,314 tok/s**.
 - **Prefill:** **36,053 tok/s** (4K) · **33,975 tok/s** (16K) · **31,929 tok/s** (32K).
 
@@ -107,7 +107,7 @@ target/release/siphon-serve <model-dir> \
 Stores global KV caches in NVFP4 with native Blackwell FP4 prefill attention. Tested live serving 8 concurrent 162K-token requests (`1.30M` simultaneous prompt tokens) without swapping.
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv nvfp4 --prefill-dense fp8 --expert-activations quantized --prefill-attention fp4 \
@@ -124,7 +124,7 @@ target/release/siphon-serve <model-dir> \
 Minimizes multi-stream overhead while keeping 4 slots for parallel background agent calls and 1M context per request:
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv fp8 --prefill-dense fp8 --expert-activations quantized --prefill-attention fp8 \
@@ -148,7 +148,7 @@ The `sm_89` build uses native Ada FP8 Tensor Cores for prefill attention, dense 
 Maximum speed on code, prose, and prefill with full FP8 KV fidelity:
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv fp8 --prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8 \
@@ -169,7 +169,7 @@ Because `--weights fp8 --prefill-dense fp8` streams layer quantization and relea
 
 ```sh
 # 512K+ context (plans up to 606,208 positions with NVFP4 KV, or 614,400 with --kv nvfp4-all):
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv nvfp4 --prefill-dense fp8 --expert-activations fp8 \
@@ -190,7 +190,7 @@ target/release/siphon-serve <model-dir> \
 Shares a ~370K mixed-precision KV pool across 4 streams and swaps idle conversations to pinned host RAM at 16–25 GB/s when oversubscribed:
 
 ```sh
-target/release/siphon-serve <model-dir> \
+target/release/siphon serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv mixed --prefill-dense fp8 --expert-activations fp8 \

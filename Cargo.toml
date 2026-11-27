@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/siphon", "crates/siphon-cuda", "crates/siphon-plan", "crates/siphon-serve"]
+members = ["crates/siphon", "crates/siphon-cli", "crates/siphon-cuda", "crates/siphon-plan", "crates/siphon-serve"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000", "f16"] }
 half = "2"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }

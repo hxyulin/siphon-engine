@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use ratatui::crossterm::event::KeyCode;
 use siphon::{
     Checkpoint, KvFormat, OutputProjection, TextConfig, WeightFormat,
@@ -15,18 +15,20 @@ use crate::device::Device;
 const SMALL_STEP: usize = 8 * 1024;
 const LARGE_STEP: usize = 64 * 1024;
 
-/// The weight and KV formats: the first four in the order the keys cycle through them,
-/// then the NVFP4 and mixed caches, which only the table of longest contexts shows.
-pub const FORMATS: [(WeightFormat, KvFormat); 8] = [
-    (WeightFormat::Fp8, KvFormat::Fp8),
-    (WeightFormat::Fp8, KvFormat::Bf16),
-    (WeightFormat::Bf16, KvFormat::Fp8),
-    (WeightFormat::Bf16, KvFormat::Bf16),
-    (WeightFormat::Fp8, KvFormat::Nvfp4),
-    (WeightFormat::Fp8, KvFormat::Nvfp4All),
-    (WeightFormat::Bf16, KvFormat::Nvfp4),
-    (WeightFormat::Fp8, KvFormat::Mixed),
+const WEIGHT_FORMATS: [WeightFormat; 2] = [WeightFormat::Fp8, WeightFormat::Bf16];
+pub const KV_FORMATS: [KvFormat; 5] = [
+    KvFormat::Fp8,
+    KvFormat::Bf16,
+    KvFormat::Nvfp4,
+    KvFormat::Nvfp4All,
+    KvFormat::Mixed,
 ];
+
+pub fn formats() -> impl Iterator<Item = (WeightFormat, KvFormat)> {
+    WEIGHT_FORMATS
+        .into_iter()
+        .flat_map(|weights| KV_FORMATS.into_iter().map(move |kv| (weights, kv)))
+}
 
 /// A draft the server can run, as siphon-serve's `--drafter` picks it.
 #[derive(Clone, Debug)]
@@ -55,6 +57,8 @@ pub struct Config {
 
 /// The command-line choices the plans follow.
 pub struct Settings {
+    pub weights: WeightFormat,
+    pub kv: KvFormat,
     /// `--memory`.
     pub limit: Option<usize>,
     /// `--margin`.
@@ -89,10 +93,11 @@ pub struct App {
     /// Bytes a plan may take.
     pub budget: usize,
     pub drafts: Vec<Draft>,
-    /// `configs[draft][format]`, in the order of `drafts` and [`FORMATS`].
+    /// `configs[draft][format]`, in the order of `drafts` and [`formats`].
     pub configs: Vec<Vec<Config>>,
     pub draft: usize,
-    pub format: usize,
+    weights: usize,
+    kv: usize,
     /// Positions on screen; `None` follows the most that fit.
     context: Option<usize>,
     /// Streams, each with caches of the context.
@@ -151,6 +156,8 @@ impl App {
         settings: &Settings,
     ) -> anyhow::Result<Self> {
         let Settings {
+            weights,
+            kv,
             limit,
             margin,
             prefill_chunk,
@@ -160,30 +167,16 @@ impl App {
             output,
             lm_head,
             prefill_dense_fp8,
-            draft_weights,
-        } = settings;
-        let (
-            limit,
-            margin,
-            prefill_chunk,
-            context,
-            streams,
-            vision,
-            output,
-            lm_head,
-            prefill_dense_fp8,
-        ) = (
-            *limit,
-            *margin,
-            *prefill_chunk,
-            *context,
-            *streams,
-            *vision,
-            *output,
-            *lm_head,
-            *prefill_dense_fp8,
-        );
+            ref draft_weights,
+        } = *settings;
         let config = TextConfig::load(model_dir)?;
+        if let Some(context) = context {
+            let limit = config.model_max_length.saturating_mul(streams);
+            ensure!(
+                (1..=limit).contains(&context),
+                "--context {context} must be between 1 and the KV pool limit of {limit} positions"
+            );
+        }
         let checkpoint = Checkpoint::open(model_dir)?;
         let mut drafts = vec![Draft::Bundled];
         drafts.extend(drafter.map(|d| Draft::Dflash(d.to_owned())));
@@ -192,9 +185,8 @@ impl App {
         let configs = drafts
             .iter()
             .map(|draft| {
-                FORMATS
-                    .iter()
-                    .map(|&(weights, kv)| {
+                formats()
+                    .map(|(weights, kv)| {
                         let planner = Planner::new(&PlanInputs {
                             config: &config,
                             checkpoint: &checkpoint,
@@ -240,15 +232,31 @@ impl App {
             drafts,
             configs,
             draft: 0,
-            format: 0,
+            weights: WEIGHT_FORMATS
+                .iter()
+                .position(|&value| value == weights)
+                .expect("planner lists every weight format"),
+            kv: KV_FORMATS
+                .iter()
+                .position(|&value| value == kv)
+                .expect("planner lists every KV format"),
             context,
             streams,
             vision: vision.is_some(),
         })
     }
 
+    pub fn format_index(&self) -> usize {
+        self.weights * KV_FORMATS.len() + self.kv
+    }
+
     pub fn config(&self) -> &Config {
-        &self.configs[self.draft][self.format]
+        &self.configs[self.draft][self.format_index()]
+    }
+
+    /// The server always loads a draft. The last entry is a comparison for the table.
+    pub fn selectable_drafts(&self) -> &[Draft] {
+        &self.drafts[..self.drafts.len() - 1]
     }
 
     /// The longest context that fits the budget in `config`.
@@ -274,13 +282,13 @@ impl App {
         let limit = self.config().planner.max_pool_positions();
         let step = |by: isize| {
             let moved = context.saturating_add_signed(by);
-            Some(moved.clamp(memory::CAPACITY_STEP, limit))
+            Some(moved.clamp(memory::CAPACITY_STEP.min(limit), limit))
         };
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
-            KeyCode::Char('w') => self.format ^= 2,
-            KeyCode::Char('k') => self.format ^= 1,
-            KeyCode::Char('d') => self.draft = (self.draft + 1) % self.drafts.len(),
+            KeyCode::Char('w') => self.weights = (self.weights + 1) % WEIGHT_FORMATS.len(),
+            KeyCode::Char('k') => self.kv = (self.kv + 1) % KV_FORMATS.len(),
+            KeyCode::Char('d') => self.draft = (self.draft + 1) % self.selectable_drafts().len(),
             KeyCode::Char('m') => self.context = None,
             KeyCode::Right => self.context = step(SMALL_STEP.cast_signed()),
             KeyCode::Left => self.context = step(-SMALL_STEP.cast_signed()),
