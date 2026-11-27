@@ -41,7 +41,7 @@ const DECODE_FLOOR: f64 = 20.0;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] \
-                     [--output-projection bf16|fp8] [--kv fp8|bf16|nvfp4|nvfp4-all|mixed] [--streams 1] \
+                     [--output-projection bf16|fp8|mxfp8] [--kv fp8|bf16|nvfp4|nvfp4-all|mixed] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--draft-shortlist N] [--draft-context-rows N] \
                      [--fallback] [--spec-tree] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
@@ -72,9 +72,9 @@ decode and prefill rows.
 plan may use the free memory at startup less --margin, 0.25 GiB by default.
 --prefill-chunk runs prompts in chunks of N rows, 1 to 2048. Its buffers grow with N: 0.85 GiB
 at 2048 rows and 0.47 GiB at 1024, and the memory they free goes to the context.
---output-projection fp8 makes decode read an FP8 copy of the attention output projection with
---weights fp8, which saves 4 to 6% of a plain step but moves the logits further from the
-model; bf16 (the default) reads its BF16 weights.
+--output-projection fp8|mxfp8 makes decode read an FP8 (per-row) or MXFP8 (per-32 block-scaled)
+copy of the attention output projection with --weights fp8, which saves 4 to 6% of a plain step;
+bf16 (the default) reads its BF16 weights.
 --drafter runs the drafter in DIR instead of the bundled draft: Inco AI's DFlash 2 drafter
 or a DFlash draft exported by the 2DSD project.
 --draft picks the draft's approximations as bench does: fast (the default, FP8 plus the
@@ -174,7 +174,7 @@ fn args() -> anyhow::Result<Args> {
     let mut margin = None;
     let mut prefill_chunk = None;
     let mut fp8_weights = true;
-    let mut fp8_output = false;
+    let mut output_projection = siphon::OutputProjection::default();
     let mut kv = "fp8".to_owned();
     let mut queue = 8;
     let mut streams = 1;
@@ -222,7 +222,7 @@ fn args() -> anyhow::Result<Args> {
             "--margin" => margin = Some(gib_bytes(&value()?, "--margin", true)?),
             "--prefill-chunk" => prefill_chunk = Some(chunk_rows(&value()?)?),
             "--weights" => fp8_weights = fp8(&value()?)?,
-            "--output-projection" => fp8_output = fp8(&value()?)?,
+            "--output-projection" => output_projection = value()?.parse()?,
             "--kv" => {
                 kv = value()?;
                 ensure!(
@@ -389,7 +389,7 @@ fn args() -> anyhow::Result<Args> {
             margin,
             prefill_chunk,
             fp8_weights,
-            fp8_output,
+            output_projection,
             kv,
             widths,
             queue,

@@ -348,10 +348,16 @@ impl Weights {
                 .into_iter()
                 .map(|w| quantize(w, hidden))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let q_dims = a.o.len() / hidden;
             let o = match self.output {
-                OutputProjection::Fp8 => Some(quantize(&a.o, a.o.len() / hidden)?),
-                OutputProjection::Bf16 => None,
+                OutputProjection::Fp8 => Some(quantize(&a.o, q_dims)?),
+                OutputProjection::Bf16 | OutputProjection::Mxfp8 => None,
             };
+            if self.output == OutputProjection::Mxfp8 && layer.mxfp8_o.is_none() {
+                let mxfp8 = linear.quantize_mxfp8(stream, &a.o, hidden, q_dims)?;
+                bytes += mxfp8.bytes();
+                layer.mxfp8_o = Some(mxfp8);
+            }
             bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>()
                 + o.as_ref().map_or(0, Fp8Matrix::bytes);
             layer.fp8 = Some(Fp8Projections { inputs, o });

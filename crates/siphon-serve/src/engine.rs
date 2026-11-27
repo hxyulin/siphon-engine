@@ -343,9 +343,9 @@ pub struct Options {
     /// Rows of each prefill chunk; `None` runs `DEFAULT_PREFILL_CHUNK`.
     pub prefill_chunk: Option<usize>,
     pub fp8_weights: bool,
-    /// Whether decode reads an FP8 copy of the attention output projection with FP8
-    /// weights, instead of its BF16 weights.
-    pub fp8_output: bool,
+    /// Format of the attention output projection decode reads under `--weights fp8`:
+    /// `bf16` (default), `fp8` (per-row E4M3), or `mxfp8` (per-32 UE8M0 block-scaled E4M3).
+    pub output_projection: siphon::OutputProjection,
     /// The global KV cache format, as `KvFormat` parses it.
     pub kv: String,
     /// Verify widths the adaptive policy chooses among.
@@ -1097,11 +1097,7 @@ mod cuda {
 
     /// The attention output projection's format `options` ask for.
     fn output_projection(options: &Options) -> OutputProjection {
-        if options.fp8_output {
-            OutputProjection::Fp8
-        } else {
-            OutputProjection::Bf16
-        }
+        options.output_projection
     }
 
     /// The KV options of `siphon_cuda::kv_options` that `options` carries.

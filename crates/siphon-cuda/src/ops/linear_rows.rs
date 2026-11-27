@@ -24,7 +24,7 @@ use crate::{
     gpu::{KernelArgs, cubin, load_module},
     ops::{
         linear::{Start, launch_by_value},
-        linear_fp8::Fp8Matrix,
+        linear_fp8::{Fp8Matrix, Mxfp8Matrix},
     },
 };
 
@@ -53,6 +53,13 @@ const STAGE_BYTES: usize = 256;
 const TARGET_WARPS_BF16: usize = 2048;
 const TARGET_WARPS_FP8: usize = 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeightKind {
+    Bf16,
+    Fp8,
+    Mxfp8,
+}
+
 /// The weight of one product.
 pub enum RowsWeight<'a> {
     /// BF16 `[n, k]`, row-major.
@@ -66,6 +73,8 @@ pub enum RowsWeight<'a> {
         rows: usize,
         k: usize,
     },
+    /// E4M3 with one UE8M0 scale per 32 weights.
+    Mxfp8(&'a Mxfp8Matrix),
 }
 
 /// One product `out = x @ weight^T` of a batch, over `m` rows.
@@ -124,11 +133,25 @@ impl<'a> RowsProduct<'a> {
         }
     }
 
-    fn is_fp8(&self) -> bool {
-        matches!(
-            self.weight,
-            RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. }
-        )
+    /// As [`Self::bf16`] with an MXFP8 weight of `weight.rows()` rows of `weight.k()`.
+    pub fn mxfp8(
+        weight: &'a Mxfp8Matrix,
+        x: &'a impl DeviceIn<bf16>,
+        out: &'a mut impl DeviceOut<bf16>,
+    ) -> Self {
+        Self {
+            weight: RowsWeight::Mxfp8(weight),
+            x: x.view(),
+            out: out.view_mut(),
+        }
+    }
+
+    fn weight_kind(&self) -> WeightKind {
+        match self.weight {
+            RowsWeight::Bf16(_) => WeightKind::Bf16,
+            RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. } => WeightKind::Fp8,
+            RowsWeight::Mxfp8(_) => WeightKind::Mxfp8,
+        }
     }
 }
 
@@ -160,7 +183,7 @@ struct Batch {
 /// 4-tile entry points for `m > 32`.
 #[derive(Debug)]
 struct Entry {
-    fp8: bool,
+    kind: WeightKind,
     k: usize,
     functions: Vec<CudaFunction>,
     pairs: Vec<CudaFunction>,
@@ -252,6 +275,14 @@ fn resolve_weight(
                 *rows,
             ))
         }
+        RowsWeight::Mxfp8(w) => {
+            ensure!(w.k() == width, "weight has k = {}, expected {width}", w.k());
+            Ok((
+                w.values().device_ptr(stream).0,
+                w.scales().device_ptr(stream).0,
+                w.rows(),
+            ))
+        }
     }
 }
 
@@ -259,7 +290,7 @@ impl LinearRows {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "linear_rows", cubin!("linear_rows"))?;
         let smem = i32::try_from(MAX_WARPS * WARP_SMEM)?;
-        let load_entry = |fp8: bool, k: usize, name: &str| -> anyhow::Result<Entry> {
+        let load_entry = |kind: WeightKind, k: usize, name: &str| -> anyhow::Result<Entry> {
             let load = |name: String| -> anyhow::Result<CudaFunction> {
                 let function = module.load_function(&name)?;
                 function
@@ -285,7 +316,7 @@ impl LinearRows {
             let chunk = load(format!("{name}_{MAX_TILES}_chunk"))?;
             let chunk_pair = load(format!("{name}_{MAX_TILES}_pair_chunk"))?;
             Ok(Entry {
-                fp8,
+                kind,
                 k,
                 functions,
                 pairs,
@@ -294,25 +325,26 @@ impl LinearRows {
             })
         };
         let mut entries = Vec::new();
-        for (fp8, k, name) in [
-            (false, 2304, "rows_bf16_k2304"),
-            (true, 2304, "rows_fp8_k2304"),
-            (false, 3072, "rows_bf16_k3072"),
-            (true, 3072, "rows_fp8_k3072"),
-            (false, 4096, "rows_bf16_k4096"),
-            (true, 4096, "rows_fp8_k4096"),
-            (false, 4608, "rows_bf16_k4608"),
-            (true, 4608, "rows_fp8_k4608"),
-            (false, 6912, "rows_bf16_k6912"),
-            (true, 6912, "rows_fp8_k6912"),
-            (false, 9216, "rows_bf16_k9216"),
-            (true, 9216, "rows_fp8_k9216"),
+        for (kind, k, name) in [
+            (WeightKind::Bf16, 2304, "rows_bf16_k2304"),
+            (WeightKind::Fp8, 2304, "rows_fp8_k2304"),
+            (WeightKind::Bf16, 3072, "rows_bf16_k3072"),
+            (WeightKind::Fp8, 3072, "rows_fp8_k3072"),
+            (WeightKind::Mxfp8, 3072, "rows_mxfp8_k3072"),
+            (WeightKind::Bf16, 4096, "rows_bf16_k4096"),
+            (WeightKind::Fp8, 4096, "rows_fp8_k4096"),
+            (WeightKind::Bf16, 4608, "rows_bf16_k4608"),
+            (WeightKind::Fp8, 4608, "rows_fp8_k4608"),
+            (WeightKind::Bf16, 6912, "rows_bf16_k6912"),
+            (WeightKind::Fp8, 6912, "rows_fp8_k6912"),
+            (WeightKind::Bf16, 9216, "rows_bf16_k9216"),
+            (WeightKind::Fp8, 9216, "rows_fp8_k9216"),
         ] {
-            entries.push(load_entry(fp8, k, name)?);
+            entries.push(load_entry(kind, k, name)?);
         }
         let argmax_entries = vec![
-            load_entry(false, 2304, "rows_bf16_k2304_argmax")?,
-            load_entry(true, 2304, "rows_fp8_k2304_argmax")?,
+            load_entry(WeightKind::Bf16, 2304, "rows_bf16_k2304_argmax")?,
+            load_entry(WeightKind::Fp8, 2304, "rows_fp8_k2304_argmax")?,
         ];
         Ok(Self {
             entries,
@@ -349,7 +381,7 @@ impl LinearRows {
             (1..=MAX_ROWS).contains(&m),
             "m is {m}, expected 1 to {MAX_ROWS}"
         );
-        let fp8 = products[0].is_fp8();
+        let kind = products[0].weight_kind();
         ensure!(
             products[0].x.len().is_multiple_of(m),
             "input 0 has {} elements, not whole rows of {m}",
@@ -359,8 +391,8 @@ impl LinearRows {
         let entry = self
             .entries
             .iter()
-            .find(|e| e.fp8 == fp8 && e.k == width)
-            .with_context(|| format!("no multi-row product for k = {width}"))?;
+            .find(|e| e.kind == kind && e.k == width)
+            .with_context(|| format!("no multi-row product for {kind:?} k = {width}"))?;
 
         let mut batch = Batch {
             count: i32::try_from(products.len())?,
@@ -371,7 +403,10 @@ impl LinearRows {
         let mut tiles = 0usize;
         let mut pairs = 0usize;
         for (i, p) in products.iter_mut().enumerate() {
-            ensure!(p.is_fp8() == fp8, "product {i} has another weight format");
+            ensure!(
+                p.weight_kind() == kind,
+                "product {i} has another weight format"
+            );
             ensure!(
                 p.x.len() == m * width,
                 "product {i}: input has {} elements, expected {m} x {width}",
@@ -421,6 +456,18 @@ impl LinearRows {
                     );
                     (values.device_ptr(stream).0, scales.device_ptr(stream).0)
                 }
+                RowsWeight::Mxfp8(w) => {
+                    ensure!(
+                        w.rows() == out_rows && w.k() == width,
+                        "product {i}: weight is {} x {}, expected {out_rows} x {width}",
+                        w.rows(),
+                        w.k()
+                    );
+                    (
+                        w.values().device_ptr(stream).0,
+                        w.scales().device_ptr(stream).0,
+                    )
+                }
             };
             let x = p.x.device_ptr(stream).0;
             let out = p.out.device_ptr_mut(stream).0;
@@ -442,8 +489,9 @@ impl LinearRows {
         }
         // The split depends on the shapes only, never on m, so each row's sum order is the
         // same for every m.
-        let stages = width * if fp8 { 1 } else { 2 } / STAGE_BYTES;
-        let target = if fp8 {
+        let byte_weight = kind != WeightKind::Bf16;
+        let stages = width * if byte_weight { 1 } else { 2 } / STAGE_BYTES;
+        let target = if byte_weight {
             TARGET_WARPS_FP8
         } else {
             TARGET_WARPS_BF16
@@ -497,11 +545,16 @@ impl LinearRows {
             x.len()
         );
         let width = x.len() / m;
-        let fp8 = matches!(weight, RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. });
+        let kind = match weight {
+            RowsWeight::Bf16(_) => WeightKind::Bf16,
+            RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. } => WeightKind::Fp8,
+            RowsWeight::Mxfp8(_) => anyhow::bail!("fused argmax does not take MXFP8 weights"),
+        };
+        let fp8 = kind == WeightKind::Fp8;
         let entry = self
             .argmax_entries
             .iter()
-            .find(|e| e.fp8 == fp8 && e.k == width)
+            .find(|e| e.kind == kind && e.k == width)
             .with_context(|| format!("no fused argmax multi-row product for k = {width}"))?;
 
         let (w_ptr, scale_ptr, weight_rows) = resolve_weight(stream, weight, width)?;

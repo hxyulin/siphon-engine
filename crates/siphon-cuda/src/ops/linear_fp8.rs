@@ -135,13 +135,13 @@ struct Entry {
     function: CudaFunction,
 }
 
-/// A weight `[rows, k]` in MXFP8 format: E4M3 bytes `[rows, k]` and one UE8M0 scale byte
-/// per 32 values `[rows, k / 32]`. Used for `W_o` under opt-in `--prefill-dense fp8`, where
-/// per-32 block scales preserve outlier head precision that per-row F32 scales lose.
+/// A weight `[rows, k]` in MXFP8 format: E4M3 bytes `[padded_rows, k]` followed by one
+/// UE8M0 scale byte per 32 values `[padded_rows, k / 32]`, in one device buffer. Padding
+/// rows are zero. Used for `W_o` under `--output-projection mxfp8` and `--prefill-dense fp8`,
+/// where per-32 block scales preserve outlier head precision that per-row F32 scales lose.
 #[derive(Debug)]
 pub struct Mxfp8Matrix {
-    values: CudaSlice<u8>,
-    scales: CudaSlice<u8>,
+    data: CudaSlice<u8>,
     rows: usize,
     k: usize,
 }
@@ -157,22 +157,55 @@ impl Mxfp8Matrix {
         self.k
     }
 
+    fn padded_rows(&self) -> usize {
+        self.rows.next_multiple_of(ROW_PAD)
+    }
+
+    /// The whole buffer: values, padding and scales.
+    #[must_use]
+    pub fn buffer(&self) -> &CudaSlice<u8> {
+        &self.data
+    }
+
     /// Device bytes the matrix takes.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.values.len() + self.scales.len()
+        self.data.len()
     }
 
     /// The E4M3 values `[rows, k]`, as bytes.
     #[must_use]
     pub fn values(&self) -> CudaView<'_, u8> {
-        self.values.slice(..)
+        self.data.slice(..self.rows * self.k)
     }
 
     /// The UE8M0 scales `[rows, k / 32]`, as bytes.
     #[must_use]
     pub fn scales(&self) -> CudaView<'_, u8> {
-        self.scales.slice(..)
+        let start = self.padded_rows() * self.k;
+        self.data.slice(start..start + self.rows * (self.k / 32))
+    }
+}
+
+/// One product `out = weight @ x` of an MXFP8 GEMV batch.
+pub struct Mxfp8Gemv<'a> {
+    weight: &'a Mxfp8Matrix,
+    x: CudaView<'a, bf16>,
+    out: CudaViewMut<'a, bf16>,
+}
+
+impl<'a> Mxfp8Gemv<'a> {
+    /// `x` has `weight.k()` elements and `out` `weight.rows()`.
+    pub fn new(
+        weight: &'a Mxfp8Matrix,
+        x: &'a impl DeviceIn<bf16>,
+        out: &'a mut impl DeviceOut<bf16>,
+    ) -> Self {
+        Self {
+            weight,
+            x: x.view(),
+            out: out.view_mut(),
+        }
     }
 }
 
@@ -187,6 +220,7 @@ struct GemmFamily {
 #[derive(Debug)]
 pub struct LinearFp8 {
     entries: Vec<Entry>,
+    mxfp8_entries: Vec<Entry>,
     quantize: CudaFunction,
     /// `gemm_fp8_{128x128,64x64,32x64}` (per-row F32 weight scales).
     gemm: GemmFamily,
@@ -373,6 +407,7 @@ impl LinearFp8 {
                 entry(2304, "gemv_fp8_k2304")?,
                 entry(3072, "gemv_fp8_k3072")?,
             ],
+            mxfp8_entries: vec![entry(3072, "gemv_mxfp8_k3072")?],
             quantize: module.load_function("quantize_e4m3_rows")?,
             gemm: GemmFamily {
                 large: load_gemm("gemm_fp8_128x128", GEMM_SHARED)?,
@@ -409,33 +444,31 @@ impl LinearFp8 {
             "weight has {} elements, expected {rows} x {k}",
             weight.len()
         );
-        let mut values = stream.alloc_zeros::<u8>(rows * k)?;
-        let mut scales = stream.alloc_zeros::<u8>(rows * (k / 32))?;
-        let rows_arg = i32::try_from(rows)?;
-        let k_arg = i32::try_from(k)?;
-        let x = weight.slice(..);
-        let mut launch = stream.launch_builder(&self.quantize_rows);
-        launch
-            .arg(&x)
-            .arg(&rows_arg)
-            .arg(&k_arg)
-            .arg(&mut values)
-            .arg(&mut scales);
-        let config = LaunchConfig {
-            grid_dim: (u32::try_from(rows.div_ceil(8))?, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: the arguments match `quantize_rows_mxfp8_dense(const bf16*, int, int, u8*,
-        // u8*)`; `weight` holds `rows * k` elements, `values` holds `rows * k` bytes,
-        // `scales` holds `rows * (k / 32)` bytes, and `k` is a multiple of 128 (hence 32).
-        unsafe { launch.launch(config) }?;
-        Ok(Mxfp8Matrix {
-            values,
-            scales,
-            rows,
-            k,
-        })
+        let padded = rows.next_multiple_of(ROW_PAD);
+        let mut data = stream.alloc_zeros::<u8>(padded * k + padded * (k / 32))?;
+        {
+            let (mut values, mut scales) = data.split_at_mut(padded * k);
+            let rows_arg = i32::try_from(rows)?;
+            let k_arg = i32::try_from(k)?;
+            let x = weight.slice(..);
+            let mut launch = stream.launch_builder(&self.quantize_rows);
+            launch
+                .arg(&x)
+                .arg(&rows_arg)
+                .arg(&k_arg)
+                .arg(&mut values)
+                .arg(&mut scales);
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from(rows.div_ceil(8))?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: the arguments match `quantize_rows_mxfp8_dense(const bf16*, int, int, u8*,
+            // u8*)`; `weight` holds `rows * k` elements, `values` holds `padded * k` bytes,
+            // `scales` holds `padded * (k / 32)` bytes, and `k` is a multiple of 128 (hence 32).
+            unsafe { launch.launch(config) }?;
+        }
+        Ok(Mxfp8Matrix { data, rows, k })
     }
 
     /// Runs every product `out = x @ weight^T`, all with `m` rows and the same k (a multiple
@@ -515,18 +548,18 @@ impl LinearFp8 {
         let mut raw: Vec<RawProduct<'_>> = products
             .iter_mut()
             .map(|p| {
-                let (w_ptr, _) = p.weight.values.device_ptr(stream);
-                let (w_scale_ptr, _) = p.weight.scales.device_ptr(stream);
-                RawProduct {
+                let (w_ptr, _) = p.weight.data.device_ptr(stream);
+                let scale_off = u64::try_from(p.weight.padded_rows() * p.weight.k)?;
+                Ok(RawProduct {
                     w_ptr,
-                    w_scale_ptr,
+                    w_scale_ptr: w_ptr + scale_off,
                     rows: p.weight.rows,
                     k: p.weight.k,
                     x: p.x.slice(..),
                     out: p.out.slice_mut(..),
-                }
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
         self.launch_gemm(&self.gemm_mxfp8, stream, &mut raw, m, scratch)
     }
 
@@ -1004,9 +1037,94 @@ impl LinearFp8 {
             )
         }
     }
+
+    /// Runs every MXFP8 block-32 product in one launch: BF16 inputs and outputs, F32
+    /// accumulation, with each 32-element UE8M0 block scale applied as weights accumulate.
+    pub fn gemv_mxfp8(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Mxfp8Gemv<'_>],
+        start: Start,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..=MAX_PRODUCTS).contains(&products.len()),
+            "{} products, expected 1 to {MAX_PRODUCTS}",
+            products.len()
+        );
+        let k = products[0].weight.k;
+        let entry = self
+            .mxfp8_entries
+            .iter()
+            .find(|e| e.k == k)
+            .with_context(|| format!("no MXFP8 GEMV product for k = {k}"))?;
+        let mut batch = Batch {
+            count: i32::try_from(products.len())?,
+            pdl: i32::from(start == Start::Early),
+            ..Batch::default()
+        };
+        let mut blocks = 0usize;
+        for (i, p) in products.iter_mut().enumerate() {
+            let rows = p.weight.rows;
+            ensure!(
+                p.weight.k == k,
+                "product {i} has k = {}, expected {k}",
+                p.weight.k
+            );
+            ensure!(
+                p.x.len() == k,
+                "product {i}: input has {} elements",
+                p.x.len()
+            );
+            ensure!(
+                p.out.len() == rows,
+                "product {i}: output has {} elements, expected {rows}",
+                p.out.len()
+            );
+            blocks += rows.div_ceil(ROWS_PER_BLOCK);
+            let (w, _) = p.weight.data.device_ptr(stream);
+            let (x, _) = p.x.device_ptr(stream);
+            let (out, _) = p.out.device_ptr_mut(stream);
+            ensure!(
+                (w | x).is_multiple_of(16),
+                "product {i}: weight and input must be 16-byte aligned"
+            );
+            batch.seg[i] = Segment {
+                w,
+                scale: w + u64::try_from(p.weight.padded_rows() * k)?,
+                x,
+                out,
+                rows: i32::try_from(rows).context("too many rows")?,
+                block_end: i32::try_from(blocks).context("too many rows")?,
+            };
+        }
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks)?, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: u32::try_from(k * size_of::<bf16>())?,
+        };
+        // SAFETY: `batch` has the kernel's `Batch` layout. Each weight buffer holds
+        // `padded_rows` rows of k bytes and `padded_rows * (k / 32)` scale bytes, and a
+        // segment's blocks cover at most its padded rows, so every load stays inside it;
+        // the kernel stores only rows below `rows` and reads x only after `pdl_wait`.
+        unsafe {
+            launch_by_value(
+                stream,
+                &entry.function,
+                config,
+                &batch,
+                start == Start::Early,
+            )
+        }
+    }
 }
 
 impl Prefetch for Fp8Matrix {
+    fn device_bytes(&self, stream: &CudaStream) -> (u64, usize) {
+        self.data.device_bytes(stream)
+    }
+}
+
+impl Prefetch for Mxfp8Matrix {
     fn device_bytes(&self, stream: &CudaStream) -> (u64, usize) {
         self.data.device_bytes(stream)
     }

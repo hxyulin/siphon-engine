@@ -38,7 +38,7 @@ use crate::{
 };
 
 const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] \
-                     [--prefill-chunk N] [--output-projection bf16|fp8] [--free GiB] [--context N] \
+                     [--prefill-chunk N] [--output-projection bf16|fp8|mxfp8] [--free GiB] [--context N] \
                      [--streams N] [--vision] [--max-image-pixels N] [--print]
 --drafter adds a DFlash drafter's plan beside the bundled draft's.
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's

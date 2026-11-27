@@ -642,7 +642,7 @@ impl Planner {
                 WeightFormat::Bf16 => 0,
                 WeightFormat::Fp8 => {
                     fp8_copy_bytes(c, inputs.output)
-                        + if inputs.prefill_dense_fp8 {
+                        + if inputs.prefill_dense_fp8 && inputs.output != OutputProjection::Mxfp8 {
                             mxfp8_output_bytes(c)
                         } else {
                             0
@@ -784,6 +784,12 @@ fn fp8_matrix(rows: usize, k: usize) -> usize {
     padded * k + 4 * padded
 }
 
+/// Bytes of an MXFP8 copy of the target, `rows` padded, with one UE8M0 scale per 32 values.
+fn mxfp8_matrix(rows: usize, k: usize) -> usize {
+    let padded = rows.next_multiple_of(FP8_ROW_PAD);
+    padded * k + padded * (k / 32)
+}
+
 /// Bytes of a draft's FP8 rows: values and an F32 scale per row.
 fn fp8_rows(rows: usize, k: usize) -> usize {
     rows * k + 4 * rows
@@ -822,6 +828,7 @@ fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
                 .sum::<usize>()
                 + match output {
                     OutputProjection::Fp8 => fp8_matrix(hidden, q_dims),
+                    OutputProjection::Mxfp8 => mxfp8_matrix(hidden, q_dims),
                     OutputProjection::Bf16 => 0,
                 }
                 + gates
@@ -831,12 +838,12 @@ fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
 }
 
 /// Device bytes of the per-layer MXFP8 block-32 copies of the attention output projection
-/// (`W_o`), allocated lazily when opt-in `--prefill-dense fp8` is enabled.
+/// (`W_o`), allocated when `--output-projection mxfp8` or `--prefill-dense fp8` is enabled.
 #[must_use]
 pub fn mxfp8_output_bytes(c: &TextConfig) -> usize {
     let hidden = c.hidden_size;
     let q_dims = c.num_attention_heads * c.head_dim;
-    c.num_hidden_layers * (hidden * q_dims + hidden * (q_dims / 32))
+    c.num_hidden_layers * mxfp8_matrix(hidden, q_dims)
 }
 
 /// Rows of block states a step keeps: the block starts of the prelude, of one pass of the
@@ -1206,6 +1213,8 @@ mod tests {
         // Without the copies of the 24 output projections of 2304 x 3072.
         let bf16 = fp8_copy_bytes(&config(), OutputProjection::Bf16);
         assert_eq!(bytes - bf16, 24 * (2304 * 3072 + 4 * 2304));
+        let mxfp8 = fp8_copy_bytes(&config(), OutputProjection::Mxfp8);
+        assert_eq!(mxfp8 - bf16, mxfp8_output_bytes(&config()));
     }
 
     #[test]

@@ -42,7 +42,9 @@ constexpr float kE4m3Max = 448.f;
 
 struct Segment {
     const uint8_t* w;
-    const float* scale;
+    // Per-row F32 scales (`const float*`) for gemv_fp8, or per-32 UE8M0 scales
+    // (`const uint8_t*`, `[padded_rows, K / 32]`) for gemv_mxfp8.
+    const void* scale;
     const __nv_bfloat16* x;
     __nv_bfloat16* out;
     int rows;
@@ -70,6 +72,17 @@ __device__ __forceinline__ float load_scale(const float* p) {
     float v;
     asm volatile("ld.global.nc.L1::no_allocate.f32 %0, [%1];" : "=f"(v) : "l"(p));
     return v;
+}
+
+__device__ __forceinline__ uint32_t load_scale_u32(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+
+// UE8M0 scale to float: 2^(bits - 127), with 0 mapped to 2^-127.
+__device__ __forceinline__ float e8m0(uint32_t bits) {
+    return __uint_as_float(bits == 0 ? 0x400000u : bits << 23);
 }
 
 __device__ __forceinline__ float lo(uint32_t pair) { return __uint_as_float(pair << 16); }
@@ -137,7 +150,8 @@ __device__ void gemv_fp8(const Batch& b, __nv_bfloat16* x_smem) {
         wv[v] = load_weight(w + v * 32 + lane);
     }
     // Lane r < R loads the scale of row r; padding rows have scales too.
-    const float scale = lane < R ? load_scale(seg.scale + row0 + lane) : 0.f;
+    const float scale =
+        lane < R ? load_scale(static_cast<const float*>(seg.scale) + row0 + lane) : 0.f;
 
     // Triggering before the wait cost 50 us per step: the next kernel's blocks then take
     // SM slots while this one still needs them. ptxas moves read-only loads freely across
@@ -203,6 +217,108 @@ __device__ void gemv_fp8(const Batch& b, __nv_bfloat16* x_smem) {
     }
 }
 
+// MXFP8 GEMV: per-32 UE8M0 block-scaled E4M3 weights, BF16 inputs and outputs, F32
+// accumulation. Each warp owns R = 2 consecutive rows and loads all V 16-byte weight
+// vectors plus all R * (K / 32) scale bytes (packed in 4-byte words) before pdl_wait.
+template <int K, int V>
+__device__ void gemv_mxfp8(const Batch& b, __nv_bfloat16* x_smem) {
+    constexpr int R = kRowsPerWarp;
+    static_assert(R * K == 512 * V, "a warp's rows fill its loads exactly");
+    static_assert(K % 512 == 0, "each row fills whole warp stripes so scale words align");
+    constexpr int kRowsPerBlock = kWarps * R;
+    constexpr int kRowVecs = K / 16;
+    constexpr int kRowStripes = kRowVecs / 32;
+    constexpr int kRowScales = K / 32;
+    constexpr int kWarpScaleWords = R * kRowScales / 4;
+    static_assert(kWarpScaleWords <= 64, "a warp's scales fit in two u32 registers per lane");
+
+    int s = 0;
+    int block_begin = 0;
+    while (s + 1 < b.count && int(blockIdx.x) >= b.seg[s].block_end) {
+        block_begin = b.seg[s].block_end;
+        ++s;
+    }
+    const Segment& seg = b.seg[s];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int row0 = (int(blockIdx.x) - block_begin) * kRowsPerBlock + warp * R;
+    const auto* w = reinterpret_cast<const uint4*>(seg.w + size_t(row0) * K);
+
+    uint4 wv[V];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        wv[v] = load_weight(w + v * 32 + lane);
+    }
+    // Coalesced loads of both rows' UE8M0 scales (192 bytes = 48 u32 words for K = 3072):
+    // sc0 holds words 0..31, sc1 holds words 32..kWarpScaleWords-1. Padding rows have scales.
+    const auto* s_ptr = reinterpret_cast<const uint32_t*>(
+        static_cast<const uint8_t*>(seg.scale) + size_t(row0) * kRowScales);
+    const uint32_t sc0 = lane < kWarpScaleWords ? load_scale_u32(s_ptr + lane) : 0u;
+    const uint32_t sc1 =
+        lane + 32 < kWarpScaleWords ? load_scale_u32(s_ptr + 32 + lane) : 0u;
+
+    if (b.pdl) {
+        pdl_wait();
+    }
+    pdl_trigger();
+
+    // Every load of x before any store, so the loads overlap.
+    const auto* x = reinterpret_cast<const uint4*>(seg.x);
+    auto* xs = reinterpret_cast<uint4*>(x_smem);
+    constexpr int kXUnits = K / 8;
+    constexpr int kXPerThread = (kXUnits + kThreads - 1) / kThreads;
+    uint4 xv[kXPerThread];
+#pragma unroll
+    for (int i = 0; i < kXPerThread; ++i) {
+        const int u = threadIdx.x + i * kThreads;
+        if (u < kXUnits) {
+            xv[i] = x[u];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kXPerThread; ++i) {
+        const int u = threadIdx.x + i * kThreads;
+        if (u < kXUnits) {
+            xs[x_slot(u)] = xv[i];
+        }
+    }
+    __syncthreads();
+
+    float acc[R] = {};
+    const int lane_word = lane >> 3;
+    const int byte_shift = ((lane >> 1) & 3) * 8;
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        const int r = v / kRowStripes;
+        const int seg_base = (v % kRowStripes) * 32;
+        const int word_base = v * 4;
+        const float d = dot16(wv[v], xs, seg_base + lane, 0.f);
+        const uint32_t word =
+            word_base < 32
+                ? __shfl_sync(0xffffffffu, sc0, word_base + lane_word)
+                : __shfl_sync(0xffffffffu, sc1, (word_base - 32) + lane_word);
+        const float scale = e8m0((word >> byte_shift) & 0xffu);
+        acc[r] = fmaf(scale, d, acc[r]);
+    }
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            acc[rr] += __shfl_xor_sync(0xffffffffu, acc[rr], offset);
+        }
+    }
+    // Lane r stores row r.
+    float mine = acc[0];
+#pragma unroll
+    for (int rr = 1; rr < R; ++rr) {
+        mine = lane == rr ? acc[rr] : mine;
+    }
+    const int row = row0 + lane;
+    if (lane < R && row < seg.rows) {
+        seg.out[row] = __float2bfloat16_rn(mine);
+    }
+}
+
 }  // namespace
 
 // Entry points by k: the launcher picks one. Dynamic shared memory: k * 2 bytes.
@@ -213,10 +329,18 @@ __device__ void gemv_fp8(const Batch& b, __nv_bfloat16* x_smem) {
         gemv_fp8<K, V>(batch, reinterpret_cast<__nv_bfloat16*>(x_smem));                  \
     }
 
+#define GEMV_MXFP8_ENTRY(name, K, V)                                                       \
+    extern "C" __global__ void __launch_bounds__(kThreads)                                 \
+    name(const __grid_constant__ Batch batch) {                                            \
+        extern __shared__ uint4 x_smem[];                                                  \
+        gemv_mxfp8<K, V>(batch, reinterpret_cast<__nv_bfloat16*>(x_smem));                \
+    }
+
 // The attention input projections and the LM head.
 GEMV_FP8_ENTRY(gemv_fp8_k2304, 2304, 9)
 // The output projection.
 GEMV_FP8_ENTRY(gemv_fp8_k3072, 3072, 12)
+GEMV_MXFP8_ENTRY(gemv_mxfp8_k3072, 3072, 12)
 
 // Quantizes a BF16 matrix [rows, k] to the layout above: one block per row writes the
 // row's E4M3 bytes to q [rows, k] and its scale to scale[row]. The caller zeroes the

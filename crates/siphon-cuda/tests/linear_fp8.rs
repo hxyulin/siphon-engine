@@ -16,7 +16,9 @@ use siphon_cuda::{
     Gpu,
     ops::{
         linear::{Gemv, Linear, Start},
-        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8RawGemm, Fp8Rows, LinearFp8, Mxfp8Gemm},
+        linear_fp8::{
+            Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8RawGemm, Fp8Rows, LinearFp8, Mxfp8Gemm, Mxfp8Gemv,
+        },
     },
 };
 
@@ -742,6 +744,116 @@ fn gemm_mxfp8_matches_reference() -> anyhow::Result<()> {
         }
         eprintln!("gemm_mxfp8 case {ci} ({m} x {n} x {k}): worst error {worst:.3} of bound");
     }
+    Ok(())
+}
+
+/// Checks `LinearFp8::gemv_mxfp8` (`gemv_mxfp8_k3072`) against the F64 exact product of the
+/// MXFP8 weights with BF16 inputs across partial and full `W_o` row counts, both `Serial`
+/// and `Early` (PDL) starts, multi-segment batches, all-zero rows, and outlier rows.
+#[test]
+fn gemv_mxfp8_matches_reference() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let fp8 = LinearFp8::load(gpu.context())?;
+    let linear = Linear::load(gpu.context())?;
+    let u = f64::from(f32::EPSILON) / 2.0;
+    let k = 3072usize;
+    let ku = k as f64 * u;
+    let gamma = ku / (1.0 - ku);
+
+    for (ci, &n) in [1usize, 7, 37, 100, 2304].iter().enumerate() {
+        let mut w_host = hash_values(1100 + ci as u32, n * k);
+        // Inject head outliers and an all-zero row when present.
+        for r in (0..n).step_by(13) {
+            w_host[r * k + 32] = bf16::from_f32(32.0);
+        }
+        if n > 2 {
+            w_host[k..2 * k].fill(bf16::from_f32(0.0));
+        }
+        let x_host = hash_values(1200 + ci as u32, k);
+        let w_ref = mxfp8_rows(&w_host);
+
+        let w_dev = stream.clone_htod(&w_host)?;
+        let x_dev = stream.clone_htod(&x_host)?;
+        let mat = fp8.quantize_mxfp8(stream, &w_dev, n, k)?;
+
+        for start in [Start::Serial, Start::Early] {
+            let mut out_dev = stream.alloc_zeros::<bf16>(n)?;
+            fp8.gemv_mxfp8(stream, &mut [Mxfp8Gemv::new(&mat, &x_dev, &mut out_dev)], start)?;
+            let got = stream.clone_dtoh(&out_dev)?;
+
+            let mut worst = 0.0f64;
+            for r in 0..n {
+                let (sum, abs) = w_ref[r * k..(r + 1) * k]
+                    .iter()
+                    .zip(&x_host)
+                    .fold((0.0, 0.0), |(sum, abs), (&wv, &xv)| {
+                        let p = wv * f64::from(xv.to_f32());
+                        (sum + p, abs + p.abs())
+                    });
+                let bound = gamma * abs;
+                let allowed = bound + bf16_half_ulp(sum + bound.copysign(sum));
+                let err = (got[r].to_f64() - sum).abs();
+                assert!(
+                    err <= allowed,
+                    "gemv_mxfp8 n={n} start={start:?} row={r}: got {}, want {sum}, err {err:e} > {allowed:e}",
+                    got[r]
+                );
+                worst = worst.max(if allowed > 0.0 { err / allowed } else { 0.0 });
+            }
+            if start == Start::Serial {
+                // Compare against BF16 GEMV on the full W_o shape to check quantization error.
+                let mut bf16_out = stream.alloc_zeros::<bf16>(n)?;
+                linear.gemv_bf16(
+                    stream,
+                    &mut [Gemv::new(&w_dev, &x_dev, &mut bf16_out)],
+                    Start::Serial,
+                )?;
+                let bf16_got = stream.clone_dtoh(&bf16_out)?;
+                let max_bf16_diff = got
+                    .iter()
+                    .zip(&bf16_got)
+                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "gemv_mxfp8 n={n} k={k}: worst error {worst:.3} of bound, max |mxfp8 - bf16| = {max_bf16_diff:.4}"
+                );
+            }
+        }
+    }
+
+    // Multi-segment batch: two MXFP8 weights sharing k = 3072.
+    let (n0, n1) = (37usize, 2304usize);
+    let w0_dev = stream.clone_htod(&hash_values(1301, n0 * k))?;
+    let w1_dev = stream.clone_htod(&hash_values(1302, n1 * k))?;
+    let m0 = fp8.quantize_mxfp8(stream, &w0_dev, n0, k)?;
+    let m1 = fp8.quantize_mxfp8(stream, &w1_dev, n1, k)?;
+    let x0_dev = stream.clone_htod(&hash_values(1303, k))?;
+    let x1_dev = stream.clone_htod(&hash_values(1304, k))?;
+    let mut o0_batch = stream.alloc_zeros::<bf16>(n0)?;
+    let mut o1_batch = stream.alloc_zeros::<bf16>(n1)?;
+    let mut o0_solo = stream.alloc_zeros::<bf16>(n0)?;
+    let mut o1_solo = stream.alloc_zeros::<bf16>(n1)?;
+    fp8.gemv_mxfp8(
+        stream,
+        &mut [
+            Mxfp8Gemv::new(&m0, &x0_dev, &mut o0_batch),
+            Mxfp8Gemv::new(&m1, &x1_dev, &mut o1_batch),
+        ],
+        Start::Early,
+    )?;
+    fp8.gemv_mxfp8(
+        stream,
+        &mut [Mxfp8Gemv::new(&m0, &x0_dev, &mut o0_solo)],
+        Start::Serial,
+    )?;
+    fp8.gemv_mxfp8(
+        stream,
+        &mut [Mxfp8Gemv::new(&m1, &x1_dev, &mut o1_solo)],
+        Start::Serial,
+    )?;
+    assert_eq!(stream.clone_dtoh(&o0_batch)?, stream.clone_dtoh(&o0_solo)?);
+    assert_eq!(stream.clone_dtoh(&o1_batch)?, stream.clone_dtoh(&o1_solo)?);
     Ok(())
 }
 

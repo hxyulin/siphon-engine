@@ -37,9 +37,10 @@ impl fmt::Display for WeightFormat {
     }
 }
 
-/// The attention output projection decode reads under [`WeightFormat::Fp8`]. Its FP8 copy
-/// moved the engine furthest from the model of all the FP8 copies, so it stays BF16 unless
-/// asked: on an RTX 5090 the FP8 copy saves 0.16 ms of a 2.93 ms step.
+/// The attention output projection decode reads under [`WeightFormat::Fp8`]. Its per-row
+/// FP8 copy moved the engine furthest from the model of all the FP8 copies, so it stays
+/// BF16 unless asked; [`OutputProjection::Mxfp8`] uses per-32 UE8M0 block scales to halve
+/// the bytes read while preserving outlier head precision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputProjection {
     /// The checkpoint's BF16 weights, which prefill reads too.
@@ -47,6 +48,8 @@ pub enum OutputProjection {
     Bf16,
     /// An E4M3 copy with one scale per row, as the other FP8 copies.
     Fp8,
+    /// An MXFP8 copy: E4M3 values with one UE8M0 power-of-two scale per 32 elements.
+    Mxfp8,
 }
 
 impl FromStr for OutputProjection {
@@ -56,7 +59,8 @@ impl FromStr for OutputProjection {
         match s {
             "bf16" => Ok(Self::Bf16),
             "fp8" => Ok(Self::Fp8),
-            _ => bail!("unknown output projection format {s:?}; expected bf16 or fp8"),
+            "mxfp8" => Ok(Self::Mxfp8),
+            _ => bail!("unknown output projection format {s:?}; expected bf16, fp8 or mxfp8"),
         }
     }
 }
@@ -66,6 +70,7 @@ impl fmt::Display for OutputProjection {
         f.write_str(match self {
             Self::Bf16 => "bf16",
             Self::Fp8 => "fp8",
+            Self::Mxfp8 => "mxfp8",
         })
     }
 }

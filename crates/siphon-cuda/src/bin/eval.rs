@@ -129,7 +129,7 @@ mod linux {
             } else if arg == "--output-projection" {
                 output = it
                     .next()
-                    .context("--output-projection needs blocks, rows or bf16")?
+                    .context("--output-projection needs bf16, fp8 or mxfp8")?
                     .parse()?;
             } else if arg == "--expert-activations" {
                 expert_activations = it
@@ -181,7 +181,7 @@ mod linux {
         }
         let [model, capture] = <[PathBuf; 2]>::try_from(positional).ok().context(
             "usage: eval <model-dir> <capture.safetensors> [--passes N] [--kv bf16|fp8] \
-             [--weights bf16|fp8] [--output-projection bf16|fp8] [--prefill CHUNK] \
+             [--weights bf16|fp8] [--output-projection bf16|fp8|mxfp8] [--prefill CHUNK] \
              [--verify WIDTH] [--accept-margin MARGIN] [--dump FILE] \
              [--expert-activations bf16|quantized|fp8] [--prefill-attention auto|bf16|fp8|fp4] \
              [--prefill-dense bf16|fp8] [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] \

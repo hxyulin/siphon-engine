@@ -123,7 +123,7 @@ mod linux {
     const LONG_CONTEXT: usize = 131_072;
     const USAGE: &str = "usage: bench <model-dir> [--contexts 0,4096,32768] [--passes N] \
                          [--steps N] [--warmup N] [--kv bf16|fp8] [--weights bf16|fp8] \
-                         [--output-projection bf16|fp8] [--json]\n       \
+                         [--output-projection bf16|fp8|mxfp8] [--json]\n       \
                          bench <model-dir> --prefill 512,4096 [--chunk N] [--passes N] \
                          [--kv bf16|fp8] [--weights bf16|fp8] \
                          [--expert-activations bf16|quantized|fp8] \

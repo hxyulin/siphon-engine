@@ -57,7 +57,9 @@ use crate::{
         experts::{self, ExpertActivations, Experts, MoeEnd},
         experts_rows::ExpertsRows,
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
-        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8, Mxfp8Gemm, Mxfp8Matrix},
+        linear_fp8::{
+            Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8, Mxfp8Gemm, Mxfp8Gemv, Mxfp8Matrix,
+        },
         linear_rows::{self, LinearRows, RowsProduct},
         misc::{ArgmaxScratch, DepthGateSlot, Misc},
         norm::{KvConvWeights, Norm},
@@ -67,7 +69,8 @@ use crate::{
     },
     vmm::PagePool,
     weights::{
-        ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, WeightFormat, Weights,
+        ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, OutputProjection,
+        WeightFormat, Weights,
     },
 };
 
@@ -1041,7 +1044,7 @@ impl Model {
             if quantized {
                 self.ctx.stream.synchronize()?;
             }
-        } else {
+        } else if self.ctx.weights.output != OutputProjection::Mxfp8 {
             for layer in &mut self.ctx.weights.layers {
                 layer.mxfp8_o = None;
             }
@@ -1079,7 +1082,9 @@ impl Model {
                     }
                 }
                 self.ctx.stream.synchronize()?;
-            } else if products == Products::Bf16 {
+            } else if products == Products::Bf16
+                && self.ctx.weights.output != OutputProjection::Mxfp8
+            {
                 for layer in &mut self.ctx.weights.layers {
                     layer.mxfp8_o = None;
                 }
@@ -1994,9 +1999,16 @@ impl Ctx {
         window: Option<Window>,
     ) -> anyhow::Result<()> {
         let w = &self.weights.layers[layer];
-        let mut prefetch: Vec<&dyn Prefetch> = match w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
-            Some(o) => vec![o],
-            None => vec![&w.attention.o],
+        let mut prefetch: Vec<&dyn Prefetch> = if let Some(o) =
+            w.fp8.as_ref().and_then(|f| f.o.as_ref())
+        {
+            vec![o]
+        } else if self.weights.output == OutputProjection::Mxfp8
+            && let Some(o) = w.mxfp8_o.as_ref()
+        {
+            vec![o]
+        } else {
+            vec![&w.attention.o]
         };
         if let Some(gates) = w.message_gates.as_ref().filter(|_| gated) {
             prefetch.extend(if rows {
@@ -2344,6 +2356,10 @@ impl Ctx {
 
     /// Attention from the normalized query, key and value inputs to the output projection
     /// in `t.proj`, as MLX-LM's `SlidingAttention` and `FullAttention`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "follows SlidingAttention and FullAttention op by op"
+    )]
     fn attention(
         &self,
         state: &mut VisitState,
@@ -2459,6 +2475,14 @@ impl Ctx {
             self.kernels.linear_fp8.gemv(
                 &self.stream,
                 &mut [Fp8Gemv::new(o, &t.gated, &mut t.proj)],
+                Start::Early,
+            )
+        } else if self.weights.output == OutputProjection::Mxfp8
+            && let Some(o) = w.mxfp8_o.as_ref()
+        {
+            self.kernels.linear_fp8.gemv_mxfp8(
+                &self.stream,
+                &mut [Mxfp8Gemv::new(o, &t.gated, &mut t.proj)],
                 Start::Early,
             )
         } else {
@@ -2638,11 +2662,14 @@ impl Ctx {
                 "{m} rows; the invariant products take at most {}",
                 linear_rows::MAX_ROWS
             );
-            let fp8 = products.iter().all(|p| p.fp8.is_some());
+            let mxfp8 = self.weights.output == OutputProjection::Mxfp8
+                && products.iter().all(|p| p.mxfp8.is_some());
+            let fp8 = !mxfp8 && products.iter().all(|p| p.fp8.is_some());
             let mut rows: Vec<RowsProduct<'_>> = products
                 .iter_mut()
-                .map(|p| match p.fp8 {
-                    Some(q) if fp8 => RowsProduct::fp8(q, &p.x, &mut p.out),
+                .map(|p| match (p.mxfp8, p.fp8) {
+                    (Some(q), _) if mxfp8 => RowsProduct::mxfp8(q, &p.x, &mut p.out),
+                    (_, Some(q)) if fp8 => RowsProduct::fp8(q, &p.x, &mut p.out),
                     _ => RowsProduct::bf16(p.weight, &p.x, &mut p.out),
                 })
                 .collect();

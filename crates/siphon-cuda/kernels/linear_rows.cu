@@ -60,10 +60,12 @@ constexpr int kTileRows = 16;
 // 16-byte vectors per slot.
 constexpr int kSlotVecs = kTileRows * kChunks;
 
+enum class WeightKind { Bf16 = 0, Fp8 = 1, Mxfp8 = 2 };
+
 struct Segment {
     const uint8_t* w;
-    // FP8 only: one F32 scale per row.
-    const float* scale;
+    // FP8: one F32 scale per row; MXFP8: one UE8M0 scale byte per 32 weights `[n, K / 32]`.
+    const void* scale;
     const __nv_bfloat16* x;
     __nv_bfloat16* out;
     int n;
@@ -108,17 +110,38 @@ __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ uint32_t load_scale_u8(const uint8_t* p) {
+    uint32_t v;
+    asm volatile("ld.global.nc.u8 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+
+// UE8M0 scale (`2^(bits - 127)`, with 0 mapped to `2^-127`) times `2^112` duplicated into
+// a BF16x2 pair: exact for normal weight scales with zero FP conversions.
+__device__ __forceinline__ uint32_t e8m0_scale_pair(uint32_t bits) {
+    const uint32_t exp = bits == 0 ? 112u : min(bits + 112u, 255u);
+    const uint32_t b = exp << 7;
+    return b | (b << 16);
+}
+
+// Two E4M3 values (low byte first) as two BF16 values scaled by `scale_pair` (which
+// carries the 2^112 shift compensation: 0x77807780u for unit scale, or e8m0_scale_pair).
+__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2_scaled(uint32_t pair, uint32_t scale_pair) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3);
+    const uint32_t u = uint32_t(h.x) | (uint32_t(h.y) << 16);
+    uint32_t r = ((u & 0x7fff7fffu) >> 3) | (u & 0x80008000u);
+    __nv_bfloat162 v = *reinterpret_cast<__nv_bfloat162*>(&r);
+    const __nv_bfloat162 s = *reinterpret_cast<const __nv_bfloat162*>(&scale_pair);
+    v = __hmul2(v, s);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
 // Two E4M3 values (low byte first) as two BF16 values, exactly. Every E4M3 value is a
 // normal F16 value with the low 7 mantissa bits zero, so shifting its exponent and
 // mantissa right by 3 gives a BF16 value 2^-112 times as large, which the multiply
 // scales back exactly.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t pair) {
-    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3);
-    const uint32_t u = uint32_t(h.x) | (uint32_t(h.y) << 16);
-    uint32_t r = ((u & 0x7fff7fffu) >> 3) | (u & 0x80008000u);
-    __nv_bfloat162 v = *reinterpret_cast<__nv_bfloat162*>(&r);
-    v = __hmul2(v, __floats2bfloat162_rn(0x1p112f, 0x1p112f));
-    return *reinterpret_cast<uint32_t*>(&v);
+    return e4m3x2_to_bf16x2_scaled(pair, 0x77807780u);
 }
 
 // Chunk c of tile row r within a slot. Rows of odd index swap their two 64-byte halves of
@@ -133,9 +156,12 @@ __device__ __forceinline__ int slot_index(int r, int c) { return r * kChunks + (
 // With kChunked, gridDim.x chunks m into groups of 8 * NT rows (32) and gridDim.y indexes
 // weight tiles so sibling column chunks of the same weight tile execute concurrently and
 // share the tile's weights in L2.
-template <bool kFp8, int K, int NT, int kT, bool kChunked = false>
+template <WeightKind kKind, int K, int NT, int kT, bool kChunked = false>
 __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
-    constexpr int kBytes = kFp8 ? 1 : 2;
+    constexpr bool kFp8 = kKind == WeightKind::Fp8;
+    constexpr bool kMxfp8 = kKind == WeightKind::Mxfp8;
+    constexpr bool kByteWeight = kFp8 || kMxfp8;
+    constexpr int kBytes = kByteWeight ? 1 : 2;
     constexpr int kKPerStage = kStageBytes / kBytes;
     constexpr int kStagesPerRow = K / kKPerStage;
     static_assert(kStagesPerRow * kKPerStage == K, "whole stages per row");
@@ -207,8 +233,8 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
             acc[u][n][0] = acc[u][n][1] = acc[u][n][2] = acc[u][n][3] = 0.f;
         }
     }
-    // Input vectors per lane per stage and tile: one per BF16 chunk, two per FP8 chunk.
-    constexpr int kXVecs = kChunks / 4 * (kFp8 ? 2 : 1);
+    // Input vectors per lane per stage and tile: one per BF16 chunk, two per FP8/MXFP8 chunk.
+    constexpr int kXVecs = kChunks / 4 * (kByteWeight ? 2 : 1);
     for (int i = 0; i < stages; ++i) {
         issue(i + kSlots - 1);
         const int stage = warp + i * splits;
@@ -221,7 +247,7 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
                 const int c = 4 * j + t;
 #pragma unroll
                 for (int h = 0; h < kXVecs / (kChunks / 4); ++h) {
-                    const int xi = (stage * kKPerStage + c * (kFp8 ? 16 : 8)) / 8 + h;
+                    const int xi = (stage * kKPerStage + c * (kByteWeight ? 16 : 8)) / 8 + h;
                     xv[n][j * (kXVecs / (kChunks / 4)) + h] = live[n] ? x[n][xi] : make_uint4(0, 0, 0, 0);
                 }
             }
@@ -236,16 +262,27 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
                 const int c = 4 * j + t;
                 const uint4 a = slot[slot_index(g, c)];
                 const uint4 a8 = slot[slot_index(g + 8, c)];
-                if constexpr (kFp8) {
+                if constexpr (kByteWeight) {
                     // 16 E4M3 weights per row and 16 inputs: four products of k = 16.
                     const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
                     const uint32_t bw[4] = {a8.x, a8.y, a8.z, a8.w};
+                    uint32_t scale_a = 0x77807780u;
+                    uint32_t scale_b = 0x77807780u;
+                    if constexpr (kMxfp8) {
+                        constexpr int kRowScales = K / 32;
+                        const auto* scales = static_cast<const uint8_t*>(seg.scale);
+                        const int ra = min(r0 + u * kTileRows + g, seg.n - 1);
+                        const int rb = min(r0 + u * kTileRows + g + 8, seg.n - 1);
+                        const int sc_off = stage * 8 + (c >> 1);
+                        scale_a = e8m0_scale_pair(load_scale_u8(scales + size_t(ra) * kRowScales + sc_off));
+                        scale_b = e8m0_scale_pair(load_scale_u8(scales + size_t(rb) * kRowScales + sc_off));
+                    }
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
-                        const uint32_t a0 = e4m3x2_to_bf16x2(aw[q] & 0xffffu);
-                        const uint32_t a1 = e4m3x2_to_bf16x2(bw[q] & 0xffffu);
-                        const uint32_t a2 = e4m3x2_to_bf16x2(aw[q] >> 16);
-                        const uint32_t a3 = e4m3x2_to_bf16x2(bw[q] >> 16);
+                        const uint32_t a0 = e4m3x2_to_bf16x2_scaled(aw[q] & 0xffffu, scale_a);
+                        const uint32_t a1 = e4m3x2_to_bf16x2_scaled(bw[q] & 0xffffu, scale_b);
+                        const uint32_t a2 = e4m3x2_to_bf16x2_scaled(aw[q] >> 16, scale_a);
+                        const uint32_t a3 = e4m3x2_to_bf16x2_scaled(bw[q] >> 16, scale_b);
 #pragma unroll
                         for (int n = 0; n < NT; ++n) {
                             const uint4 x0 = xv[n][2 * j];
@@ -309,7 +346,9 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
                 const int col = col_base + 8 * n + 2 * t + (e & 1);
                 const int row = r0 + u * kTileRows + g + (e >> 1) * 8;
                 if (col < b.m && row < seg.n) {
-                    const float v = kFp8 ? seg.scale[row] * acc[u][n][e] : acc[u][n][e];
+                    const float v =
+                        kFp8 ? static_cast<const float*>(seg.scale)[row] * acc[u][n][e]
+                             : acc[u][n][e];
                     seg.out[size_t(col) * seg.n + row] = __float2bfloat16_rn(v);
                 }
             }
@@ -547,21 +586,21 @@ __device__ __forceinline__ void rows_product_argmax(
 // `<name>_<NT>_pair`, for 3 and 4 column tiles, gives each block a pair of tiles (see
 // rows_product) with twice the shared memory. `<name>_4[_pair]_chunk` tiles m > 32 in
 // 32-row chunks along gridDim.x with weight tiles along gridDim.y.
-#define ROWS_ENTRY_NT(name, fp8, K, NT, kT, chunked)                                       \
+#define ROWS_ENTRY_NT(name, kind, K, NT, kT, chunked)                                      \
     extern "C" __global__ void __launch_bounds__(kMaxWarps * 32)                           \
         name(const __grid_constant__ Batch batch) {                                        \
         extern __shared__ uint4 ring[];                                                    \
-        rows_product<fp8, K, NT, kT, chunked>(batch, ring);                                \
+        rows_product<kind, K, NT, kT, chunked>(batch, ring);                               \
     }
-#define ROWS_ENTRY(name, fp8, K)                                                           \
-    ROWS_ENTRY_NT(name, fp8, K, 1, 1, false)                                               \
-    ROWS_ENTRY_NT(name##_2, fp8, K, 2, 1, false)                                           \
-    ROWS_ENTRY_NT(name##_3, fp8, K, 3, 1, false)                                           \
-    ROWS_ENTRY_NT(name##_4, fp8, K, 4, 1, false)                                           \
-    ROWS_ENTRY_NT(name##_3_pair, fp8, K, 3, 2, false)                                      \
-    ROWS_ENTRY_NT(name##_4_pair, fp8, K, 4, 2, false)                                      \
-    ROWS_ENTRY_NT(name##_4_chunk, fp8, K, 4, 1, true)                                      \
-    ROWS_ENTRY_NT(name##_4_pair_chunk, fp8, K, 4, 2, true)
+#define ROWS_ENTRY(name, kind, K)                                                          \
+    ROWS_ENTRY_NT(name, kind, K, 1, 1, false)                                              \
+    ROWS_ENTRY_NT(name##_2, kind, K, 2, 1, false)                                          \
+    ROWS_ENTRY_NT(name##_3, kind, K, 3, 1, false)                                          \
+    ROWS_ENTRY_NT(name##_4, kind, K, 4, 1, false)                                          \
+    ROWS_ENTRY_NT(name##_3_pair, kind, K, 3, 2, false)                                     \
+    ROWS_ENTRY_NT(name##_4_pair, kind, K, 4, 2, false)                                     \
+    ROWS_ENTRY_NT(name##_4_chunk, kind, K, 4, 1, true)                                     \
+    ROWS_ENTRY_NT(name##_4_pair_chunk, kind, K, 4, 2, true)
 
 // Fused tile-argmax entry points for the LM head (K = 2304).
 #define ROWS_ARGMAX_ENTRY_NT(name, fp8, K, NT, kT, chunked)                                    \
@@ -585,22 +624,23 @@ __device__ __forceinline__ void rows_product_argmax(
     ROWS_ARGMAX_ENTRY_NT(name##_argmax_4_pair_chunk, fp8, K, 4, 2, true)
 
 // The attention input projections and the LM head.
-ROWS_ENTRY(rows_bf16_k2304, false, 2304)
-ROWS_ENTRY(rows_fp8_k2304, true, 2304)
+ROWS_ENTRY(rows_bf16_k2304, WeightKind::Bf16, 2304)
+ROWS_ENTRY(rows_fp8_k2304, WeightKind::Fp8, 2304)
 ROWS_ARGMAX_ENTRY(rows_bf16_k2304, false, 2304)
 ROWS_ARGMAX_ENTRY(rows_fp8_k2304, true, 2304)
 // The output projection.
-ROWS_ENTRY(rows_bf16_k3072, false, 3072)
-ROWS_ENTRY(rows_fp8_k3072, true, 3072)
+ROWS_ENTRY(rows_bf16_k3072, WeightKind::Bf16, 3072)
+ROWS_ENTRY(rows_fp8_k3072, WeightKind::Fp8, 3072)
+ROWS_ENTRY(rows_mxfp8_k3072, WeightKind::Mxfp8, 3072)
 // The message gates' down projections.
-ROWS_ENTRY(rows_bf16_k4608, false, 4608)
-ROWS_ENTRY(rows_fp8_k4608, true, 4608)
+ROWS_ENTRY(rows_bf16_k4608, WeightKind::Bf16, 4608)
+ROWS_ENTRY(rows_fp8_k4608, WeightKind::Fp8, 4608)
 // DFlash 2 attention output projection (32 heads x 128).
-ROWS_ENTRY(rows_bf16_k4096, false, 4096)
-ROWS_ENTRY(rows_fp8_k4096, true, 4096)
+ROWS_ENTRY(rows_bf16_k4096, WeightKind::Bf16, 4096)
+ROWS_ENTRY(rows_fp8_k4096, WeightKind::Fp8, 4096)
 // DFlash 2 MLP down projection.
-ROWS_ENTRY(rows_bf16_k6912, false, 6912)
-ROWS_ENTRY(rows_fp8_k6912, true, 6912)
+ROWS_ENTRY(rows_bf16_k6912, WeightKind::Bf16, 6912)
+ROWS_ENTRY(rows_fp8_k6912, WeightKind::Fp8, 6912)
 // DFlash 2 context fusion projection (4 taps x 2304).
-ROWS_ENTRY(rows_bf16_k9216, false, 9216)
-ROWS_ENTRY(rows_fp8_k9216, true, 9216)
+ROWS_ENTRY(rows_bf16_k9216, WeightKind::Bf16, 9216)
+ROWS_ENTRY(rows_fp8_k9216, WeightKind::Fp8, 9216)

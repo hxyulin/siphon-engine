@@ -18,7 +18,7 @@ use siphon_cuda::{
     Gpu,
     ops::{
         linear::{Gemm, Gemv, Linear, Start},
-        linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8},
+        linear_fp8::{Fp8Gemv, Fp8Matrix, LinearFp8, Mxfp8Gemv, Mxfp8Matrix},
         linear_rows::{LinearRows, MAX_ROWS, RowsProduct},
     },
 };
@@ -306,6 +306,140 @@ fn rows_against_decode_and_prefill() -> anyhow::Result<()> {
                 &stream.clone_dtoh(&out)?,
             );
         }
+    }
+    Ok(())
+}
+
+/// Dequantizes an `Mxfp8Matrix` to F64 on the host: `e4m3(val) * 2^(scale - 127)`.
+fn dense_mxfp8(s: &Setup, m: &Mxfp8Matrix) -> anyhow::Result<Vec<f64>> {
+    let stream = s.gpu.stream();
+    let bytes = stream.clone_dtoh(&m.values())?;
+    let scales = stream.clone_dtoh(&m.scales())?;
+    let k = m.k();
+    let scale_cols = k / 32;
+    Ok(bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let row = i / k;
+            let col = i % k;
+            let e = scales[row * scale_cols + col / 32];
+            let scale = if e == 0 {
+                f32::from_bits(0x0040_0000)
+            } else {
+                f32::from_bits(u32::from(e) << 23)
+            };
+            f64::from(e4m3(b)) * f64::from(scale)
+        })
+        .collect())
+}
+
+fn run_mxfp8(
+    setup: &Setup,
+    weight: &Mxfp8Matrix,
+    input: &[bf16],
+    rows: usize,
+    start: Start,
+) -> anyhow::Result<Vec<bf16>> {
+    let stream = setup.gpu.stream();
+    let input = stream.clone_htod(input)?;
+    let mut out = stream.alloc_zeros::<bf16>(rows * weight.rows())?;
+    let mut p = [RowsProduct::mxfp8(weight, &input, &mut out)];
+    setup.rows.run(stream, &mut p, rows, start)?;
+    Ok(stream.clone_dtoh(&out)?)
+}
+
+/// Checks `rows_mxfp8_k3072` across `m = 1, 2, 4, 8, 16, 24, 32, 48, 64` for F64 reference
+/// parity, bit-for-bit row invariance, PDL (`Start::Early`), and agreement with
+/// `gemv_mxfp8_k3072` at `m = 1`.
+#[test]
+fn rows_mxfp8_matches_reference_and_is_invariant() -> anyhow::Result<()> {
+    let ctx = setup()?;
+    let stream = ctx.gpu.stream();
+    let k = 3072usize;
+    let mxfp8_rows: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 33, 48, 64];
+    let max_m = *mxfp8_rows.last().unwrap();
+
+    for (ci, &n) in [100usize, 2304usize].iter().enumerate() {
+        let mut weight = weights(n, k, 50 + ci as u32);
+        // Add head outliers and an all-zero row to exercise per-32 UE8M0 scales.
+        for r in (0..n).step_by(11) {
+            weight[r * k + 64] = bf16::from_f32(32.0);
+        }
+        weight[k..2 * k].fill(bf16::from_f32(0.0));
+        let w_dev = stream.clone_htod(&weight)?;
+        let mat = ctx.fp8.quantize_mxfp8(stream, &w_dev, n, k)?;
+        let wd = dense_mxfp8(&ctx, &mat)?;
+        let input = pseudo_random_bf16(max_m * k, 500 + ci as u32, 2.0, 0.0);
+
+        let full = run_mxfp8(&ctx, &mat, &input, max_m, Start::Early)?;
+        let mut worst = 0f64;
+        for &m in mxfp8_rows {
+            let start = if m == 8 || m == 32 || m == 64 {
+                Start::Early
+            } else {
+                Start::Serial
+            };
+            let got = run_mxfp8(&ctx, &mat, &input[..m * k], m, start)?;
+            worst = worst.max(check_bound(
+                &format!("mxfp8 {n} x {k}, m = {m}"),
+                &got,
+                &wd,
+                &input,
+                n,
+                k,
+                m,
+            ));
+            assert!(
+                got.iter()
+                    .zip(&full)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "mxfp8 {n} x {k}: rows of m = {m} differ from m = {max_m}"
+            );
+        }
+
+        // Row 0 must be bit-identical even when later rows hold huge values.
+        let mut other = pseudo_random_bf16(max_m * k, 600 + ci as u32, 50.0, 1.0);
+        other[..k].copy_from_slice(&input[..k]);
+        other[3 * k] = bf16::from_f32(3e38);
+        let mixed = run_mxfp8(&ctx, &mat, &other, max_m, Start::Serial)?;
+        assert!(
+            mixed[..n]
+                .iter()
+                .zip(&full[..n])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "mxfp8 {n} x {k}: row 0 depends on the other rows"
+        );
+
+        // Compare m = 1 against `gemv_mxfp8_k3072`.
+        let x0 = stream.clone_htod(&input[..k])?;
+        let mut gemv_out = stream.alloc_zeros::<bf16>(n)?;
+        ctx.fp8.gemv_mxfp8(
+            stream,
+            &mut [Mxfp8Gemv::new(&mat, &x0, &mut gemv_out)],
+            Start::Early,
+        )?;
+        let gemv_host = stream.clone_dtoh(&gemv_out)?;
+        compare(
+            &format!("mxfp8 {n} x {k}, m = 1 rows vs gemv_mxfp8"),
+            &full[..n],
+            &gemv_host,
+        );
+        // Both must be within 1-2 BF16 ulps of the same quantized F64 product.
+        let max_ulps = full[..n]
+            .iter()
+            .zip(&gemv_host)
+            .map(|(a, b)| common::bf16_ulps(*a, *b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_ulps <= 2,
+            "mxfp8 {n} x {k}: rows m=1 and gemv_mxfp8 differed by {max_ulps} BF16 ulps"
+        );
+
+        eprintln!(
+            "mxfp8 {n} x {k}: worst error {worst:.3} of bound, bit-identical across m = 1..={max_m}"
+        );
     }
     Ok(())
 }
