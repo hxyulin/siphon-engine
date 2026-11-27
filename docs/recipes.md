@@ -163,31 +163,27 @@ target/release/siphon-serve <model-dir> \
   - **Prefill:** **14,457 tok/s** (4K) · **14,324 tok/s** (16K) · **13,832 tok/s** (32K).
 - **Context:** **247,808** positions (1 stream). For coding agents that issue parallel background requests (like Claude Code), add `--streams 2 --kv mixed --host-cache 12 --cache-dir /var/cache/siphon` (~371K shared KV pool at near-FP8 quality).
 
-### 2. Long context (440K–506K with DFlash 2)
+### 2. Full 512K+ context (524K–614K with DFlash 2, zero slowdown)
 
-Switches global KV caches to NVFP4 (9 KiB/pos), boosting both capacity and long-context decode bandwidth (`159 tok/s` plain at 128K vs. `145 tok/s` FP8):
+Because `--weights fp8 --prefill-dense fp8` streams layer quantization and releases unused BF16 dense weights, a 24 GB RTX 4090 comfortably exceeds **524,288 (512K)** positions **at full `--prefill-chunk 2048 --margin 0.25`**—keeping `--host-cache`, prefix caching, DFlash 2 speculation, and full prefill/decode speed intact:
 
 ```sh
-# 440K context, keeps 2048-row prefill chunks and --host-cache support:
+# 512K+ context (plans up to 606,208 positions with NVFP4 KV, or 614,400 with --kv nvfp4-all):
 target/release/siphon-serve <model-dir> \
   --drafter <dflash2-dir> --draft-weights nvfp4 \
   --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
   --kv nvfp4 --prefill-dense fp8 --expert-activations fp8 \
+  --prefill-chunk 2048 --margin 0.25 --context 524288 \
   --spec-beta 1.0 --spec-tree --fallback \
   --host-cache 12 --cache-dir /var/cache/siphon \
   --host 0.0.0.0 --port 8000
-
-# 506K context (without --host-cache, which requires 2048-row chunks):
-target/release/siphon-serve <model-dir> \
-  --drafter <dflash2-dir> --draft-weights nvfp4 \
-  --weights fp8 --output-projection mxfp8 --lm-head nvfp4 \
-  --kv nvfp4 --prefill-dense fp8 --expert-activations fp8 \
-  --prefill-chunk 1024 --margin 0.1 \
-  --spec-beta 1.0 --spec-tree --fallback \
-  --host 0.0.0.0 --port 8000
 ```
 
-- **Context:** **440,320** (chunk 2048, margin 0.25) · **505,856** (chunk 1024, margin 0.10).
+- **Planned ceiling (23.17 GiB free, chunk 2048, margin 0.25):**
+  - `--output-projection mxfp8 --prefill-dense fp8`: **563,200** (`--kv nvfp4`) / **571,392** (`--kv nvfp4-all`)
+  - Adding `--lm-head nvfp4 --draft-weights nvfp4`: **606,208** (`--kv nvfp4`) / **614,400** (`--kv nvfp4-all`)
+  - With `--prefill-chunk 1024 --margin 0.1`: up to **632,832** (without `--host-cache`)
+- **Verified live at `--context 524288`:** `22.19 GiB` planned (`22,680 / 22,717 MiB` peak), **481–486 tok/s** greedy code (`anyhow` 10.7K), **14,132 tok/s** prefill (4K), **200.9 tok/s** plain at 32K, **159.2 tok/s** at 128K, and **85.8 tok/s** plain decode at full **524,288** context.
 
 ### 3. Multi-user / small team (2–4 streams with host swapping)
 
