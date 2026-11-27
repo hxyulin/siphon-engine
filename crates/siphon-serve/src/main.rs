@@ -3,6 +3,9 @@
 mod anthropic;
 mod chat;
 mod engine;
+mod invalid;
+mod keepalive;
+mod log;
 mod metrics;
 mod openai;
 mod parse;
@@ -20,8 +23,13 @@ mod vision;
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Context as _, bail, ensure};
+
+use crate::log::log;
 use axum::serve::ListenerExt as _;
 use serde_json::json;
+
+/// The commit the server is built from (`build.rs`).
+pub const COMMIT: &str = env!("SIPHON_COMMIT");
 
 /// Requests that may run at once: up to the rows of a batched step.
 const STREAMS: std::ops::RangeInclusive<usize> = 1..=64;
@@ -47,7 +55,8 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--draft-weights auto|bf16|fp8|nvfp4|nvfp4-backbone] \
                      [--draft-shortlist N] [--draft-context-rows N] \
                      [--fallback] [--spec-tree] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
-                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8|fp4] \
+                     [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--keepalive-after 20] \
+                     [--prefill-attention auto|bf16|fp8|fp4] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
                      [--decode-floor 20] [--piggyback-prefill] [--piggyback-budget 256] [--greedy] [--vision] \
                      [--accept-margin 0.0] [--group-by-confidence] \
@@ -107,6 +116,10 @@ another checkpoint, drafter, format, draft or build of the kernels is discarded.
 On SIGTERM or Ctrl-C the server drains: it answers new requests with 503 and Retry-After,
 /health turns 503, and it finishes the running and queued requests. After --drain-timeout
 seconds it ends what is left with an error. Then it saves --cache-dir and exits.
+--keepalive-after N: a reply that is not streamed and is not ready after N seconds (default
+20, 0 turns it off) gets status 200 at once, then a space every 15 s and its JSON, so that a
+proxy that drops silent requests, as Cloudflare does after 100 s, waits for it. A reply that
+then fails keeps status 200, with the route's error JSON as its body.
 --prefill-attention picks prefill's global attention products over an FP8 or NVFP4 cache. auto (the
 default) runs BF16 up to 2,048 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, fp8 runs FP8 throughout, and
@@ -162,6 +175,8 @@ struct Args {
     engine: engine::Options,
     /// How long a drain waits for the running and queued requests.
     drain_timeout: std::time::Duration,
+    /// How long a reply that is not streamed may stay silent before keep-alive bytes.
+    keepalive_after: std::time::Duration,
     /// `--max-images`, with `--vision`.
     max_images: usize,
 }
@@ -196,6 +211,7 @@ fn args() -> anyhow::Result<Args> {
     let mut host_cache = 0;
     let mut cache_dir = None;
     let mut drain_timeout = 600;
+    let mut keepalive_after = 20;
     let mut prefill_attention = "auto".to_owned();
     let mut prefill_dense = "bf16".to_owned();
     let mut expert_activations = "bf16".to_owned();
@@ -292,6 +308,7 @@ fn args() -> anyhow::Result<Args> {
             "--host-cache" => host_cache = gib_bytes(&value()?, "--host-cache", true)?,
             "--cache-dir" => cache_dir = Some(PathBuf::from(value()?)),
             "--drain-timeout" => drain_timeout = value()?.parse()?,
+            "--keepalive-after" => keepalive_after = value()?.parse()?,
             "--prefill-attention" => prefill_attention = value()?,
             "--prefill-dense" => {
                 prefill_dense = value()?;
@@ -479,6 +496,7 @@ fn args() -> anyhow::Result<Args> {
         address,
         name,
         drain_timeout: std::time::Duration::from_secs(drain_timeout),
+        keepalive_after: std::time::Duration::from_secs(keepalive_after),
     })
 }
 
@@ -543,7 +561,7 @@ async fn drain(engine: engine::Engine, timeout: std::time::Duration) {
     engine.drain();
     let started = std::time::Instant::now();
     let (running, waiting) = engine.counts();
-    eprintln!(
+    log!(
         "draining: refusing new requests, finishing {running} running and {waiting} queued \
          within {} s",
         timeout.as_secs()
@@ -558,7 +576,7 @@ async fn drain(engine: engine::Engine, timeout: std::time::Duration) {
     let (left_running, left_waiting) = engine.counts();
     if left_running + left_waiting > 0 {
         engine.cancel();
-        eprintln!(
+        log!(
             "drain: cut {left_running} running and {left_waiting} queued requests after {:.1} s",
             started.elapsed().as_secs_f64()
         );
@@ -566,14 +584,14 @@ async fn drain(engine: engine::Engine, timeout: std::time::Duration) {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
-    eprintln!(
+    log!(
         "drain: finished {} requests in {:.1} s",
         (running + waiting).saturating_sub(left_running + left_waiting),
         started.elapsed().as_secs_f64()
     );
     match tokio::task::spawn_blocking(move || engine.stop()).await {
-        Ok(report) => eprintln!("{report}"),
-        Err(e) => eprintln!("stopping the engine failed: {e}"),
+        Ok(report) => log!("{report}"),
+        Err(e) => log!("stopping the engine failed: {e}"),
     }
 }
 
@@ -613,7 +631,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            log!("error: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -631,6 +649,11 @@ fn nodelay_listener(
 
 fn run() -> anyhow::Result<()> {
     let args = args()?;
+    log!(
+        "siphon-serve {} (commit {COMMIT}) starting with {}",
+        env!("CARGO_PKG_VERSION"),
+        args.model_dir.display()
+    );
     let api_key = env::var("SIPHON_API_KEY").ok().filter(|k| !k.is_empty());
     let mut vocab = chat::Vocab::load(&args.model_dir)?;
     if let Some(options) = &args.engine.vision {
@@ -658,9 +681,13 @@ fn run() -> anyhow::Result<()> {
         started: openai::started(),
         sampling,
         greedy: args.engine.greedy,
+        keepalive: (!args.keepalive_after.is_zero()).then_some(keepalive::KeepAlive {
+            after: args.keepalive_after,
+            every: keepalive::EVERY,
+        }),
     });
     if app.api_key.is_none() && !args.address.ip().is_loopback() {
-        eprintln!(
+        log!(
             "warning: listening on {} without SIPHON_API_KEY",
             args.address
         );
@@ -672,7 +699,7 @@ fn run() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(args.address)
             .await
             .with_context(|| format!("binding {}", args.address))?;
-        eprintln!("serving {} on http://{}", app.name, args.address);
+        log!("serving {} on http://{}", app.name, args.address);
         let engine = app.engine.clone();
         axum::serve(nodelay_listener(listener), openai::router(app))
             .with_graceful_shutdown(async move {

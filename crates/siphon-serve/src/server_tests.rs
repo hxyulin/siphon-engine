@@ -17,6 +17,7 @@ use tower::ServiceExt as _;
 use crate::{
     chat::{Vocab, tests::vocab},
     engine::{Engine, Event, Finish, Job},
+    keepalive::KeepAlive,
     metrics::Metrics,
     openai::{self, App},
     request::SamplingDefaults,
@@ -47,6 +48,15 @@ impl Server {
         max_context: usize,
         engine: impl Fn(&Vocab, &Job) + Send + 'static,
     ) -> Self {
+        Self::with_keepalive(max_context, None, engine)
+    }
+
+    /// [`Server::with_engine`] with `keepalive` for replies that are not streamed.
+    pub(crate) fn with_keepalive(
+        max_context: usize,
+        keepalive: Option<KeepAlive>,
+        engine: impl Fn(&Vocab, &Job) + Send + 'static,
+    ) -> Self {
         let (fake, jobs) = Engine::fake(max_context);
         let labels = Arc::new(Mutex::new(Vec::new()));
         let taken = Arc::clone(&labels);
@@ -69,6 +79,7 @@ impl Server {
             started: 0,
             sampling: SamplingDefaults::default(),
             greedy: false,
+            keepalive,
         });
         Self {
             router: openai::router(app),
@@ -758,4 +769,495 @@ async fn image_encodes_leave_the_prompt_time() {
         "{}",
         body["timings"]
     );
+}
+
+/// The `request` log line of the request `id`, once its last part has let go of it.
+async fn request_line(id: &str) -> String {
+    let needle = format!(" request id={id} ");
+    for _ in 0..400 {
+        let found = crate::log::CAPTURED
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| line.contains(&needle))
+            .cloned();
+        if let Some(line) = found {
+            return line;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("no request line for {id}");
+}
+
+/// A request's error body, after checking its status.
+async fn error_of(server: &Server, request: Request<Body>, status: u16) -> Value {
+    let response = server.call(request).await;
+    assert_eq!(response.status(), status);
+    json_body(response).await
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+#[expect(clippy::too_many_lines, reason = "one case per kind of error")]
+async fn rejected_requests_name_the_field_and_reach_the_log() {
+    let server = Server::new(4096, |vocab, _| text_reply(vocab, "Hello.", 0));
+    let chat = |extra: Value, id: &str| {
+        let mut body = chat_body(false);
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        post("/v1/chat/completions", &body, &[("x-request-id", id)])
+    };
+
+    // An effort sent as a string: OpenAI's param, and advice to send a number.
+    let body = error_of(
+        &server,
+        chat(json!({"reasoning_effort": "0.9"}), "e-str"),
+        400,
+    )
+    .await;
+    let error = &body["error"];
+    assert_eq!(error["param"], "reasoning_effort");
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(
+        error["message"],
+        "reasoning_effort: got \"0.9\" (a string); send 0.9 as a JSON number, not a string. \
+         Accepted: a number from 0 to 0.99, or one of \"none\", \"minimal\", \"low\", \
+         \"medium\", \"high\", \"xhigh\" or \"max\""
+    );
+    let line = request_line("e-str").await;
+    assert!(
+        line.contains(" route=\"POST /v1/chat/completions\" status=400 ")
+            && line.contains(" error=\"reasoning_effort: got \\\"0.9\\\" (a string); send 0.9"),
+        "{line}"
+    );
+
+    // An unknown name, and a number out of range.
+    let body = error_of(
+        &server,
+        chat(json!({"reasoning_effort": "huge"}), "e-name"),
+        400,
+    )
+    .await;
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("reasoning_effort: expected a number from 0 to 0.99, or one of")
+            && message.ends_with("got \"huge\" (a string)"),
+        "{message}"
+    );
+    let body = error_of(
+        &server,
+        chat(json!({"reasoning_effort": 1.5}), "e-range"),
+        400,
+    )
+    .await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("got 1.5 (a number)")
+    );
+
+    // A string where serde wants a number, in a flattened sampling field and a plain one.
+    let body = error_of(&server, chat(json!({"temperature": "0.7"}), "t-str"), 400).await;
+    assert_eq!(body["error"]["param"], "temperature");
+    assert_eq!(
+        body["error"]["message"],
+        "temperature: expected a number, got \"0.7\" (a string); send 0.7 as a JSON number, \
+         not a string"
+    );
+    let body = error_of(&server, chat(json!({"max_tokens": "5"}), "m-str"), 400).await;
+    assert_eq!(body["error"]["param"], "max_tokens");
+
+    // A message's part, by its path; an image names the flag that enables it.
+    let image = json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]}]});
+    let body = error_of(&server, chat(image, "img"), 400).await;
+    assert_eq!(body["error"]["param"], "messages[0].content[1]");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("start it with --vision"),
+        "{body}"
+    );
+    let role = json!({"messages": [{"role": "user", "content": "a"}, {"role": "robot"}]});
+    let body = error_of(&server, chat(role, "role"), 400).await;
+    assert_eq!(body["error"]["param"], "messages[1].role");
+
+    // The context's numbers.
+    let long = json!({"messages": [{"role": "user", "content": "word ".repeat(5000)}]});
+    let body = error_of(&server, chat(long, "long"), 400).await;
+    assert_eq!(body["error"]["code"], "context_length_exceeded");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("context holds 4096") && message.contains("at most 4095 tokens"),
+        "{message}"
+    );
+
+    // Anthropic's shape, with the field's path in the message.
+    let mut messages = messages_body(false);
+    messages["tool_choice"] = json!({"type": "sometimes"});
+    let body = error_of(&server, post("/v1/messages", &messages, &[]), 400).await;
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "tool_choice.type: expected \"auto\", \"any\", \"tool\" or \"none\", got \"sometimes\" \
+         (a string)"
+    );
+
+    // A route that does not exist still gets its line.
+    let response = server
+        .call(
+            Request::get("/v1/nothing")
+                .header("x-request-id", "no-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), 404);
+    let _ = body::to_bytes(response.into_body(), usize::MAX).await;
+    let line = request_line("no-route").await;
+    assert!(
+        line.contains(" status=404 ") && line.ends_with(" error=\"no such route\""),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn finished_requests_log_one_line() {
+    let server = Server::new(4096, |vocab, _| speculated_reply(vocab, "Hello there.", 2));
+    let field = |line: &str, key: &str| {
+        line.split(' ')
+            .find_map(|f| f.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            .to_owned()
+    };
+
+    let response = server
+        .call(post(
+            "/v1/chat/completions",
+            &chat_body(false),
+            &[("x-request-id", "ok-whole")],
+        ))
+        .await;
+    let body = json_body(response).await;
+    let line = request_line("ok-whole").await;
+    assert!(
+        line.split(' ').next().unwrap().ends_with('Z'),
+        "a timestamp starts the line: {line}"
+    );
+    assert_eq!(field(&line, "route"), "\"POST");
+    assert_eq!(field(&line, "status"), "200");
+    assert_eq!(field(&line, "reply"), body["id"].as_str().unwrap());
+    assert_eq!(field(&line, "stream"), "false");
+    assert_eq!(field(&line, "effort"), "0.9");
+    assert_eq!(field(&line, "finish"), "stop");
+    assert_eq!(
+        field(&line, "prompt"),
+        body["usage"]["prompt_tokens"].to_string()
+    );
+    assert_eq!(field(&line, "cached"), "2");
+    assert_eq!(
+        field(&line, "output"),
+        body["usage"]["completion_tokens"].to_string()
+    );
+    for key in ["ms", "queue_ms", "prefill_ms", "per_round"] {
+        field(&line, key);
+    }
+    assert!(!line.contains("error="), "{line}");
+
+    // A stream, with thinking off.
+    let mut body = messages_body(true);
+    body["thinking"] = json!({"type": "disabled"});
+    let response = server
+        .call(post(
+            "/v1/messages",
+            &body,
+            &[("x-request-id", "ok-stream")],
+        ))
+        .await;
+    let _ = body::to_bytes(response.into_body(), usize::MAX).await;
+    let line = request_line("ok-stream").await;
+    assert_eq!(field(&line, "stream"), "true");
+    assert_eq!(field(&line, "effort"), "off");
+    assert_eq!(field(&line, "finish"), "stop");
+    assert!(!line.contains("client="), "{line}");
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn a_client_that_leaves_mid_stream_is_logged() {
+    // A reply that goes on, a token at a time, until its client leaves.
+    let server = Server::with_engine(4096, |vocab, job| {
+        let _ = job.events.send(Event::Started);
+        let _ = job.events.send(Event::Cached(0));
+        let word = vocab.encode("word");
+        let _ = job
+            .events
+            .send(Event::Tokens(vec![vocab.special.content_text]));
+        while job.events.send(Event::Tokens(word.clone())).is_ok() {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let response = server
+        .call(post(
+            "/v1/chat/completions",
+            &chat_body(true),
+            &[("x-request-id", "gone")],
+        ))
+        .await;
+    let mut data = response.into_body().into_data_stream();
+    let _ = data.next().await;
+    let _ = data.next().await;
+    drop(data);
+    let line = request_line("gone").await;
+    assert!(
+        line.contains(" status=200 ")
+            && line.contains(" finish=abort ")
+            && line.ends_with(" client=disconnected"),
+        "{line}"
+    );
+}
+
+/// Keep-alive after 100 ms of silence, then every 50 ms.
+const KEEPALIVE: KeepAlive = KeepAlive {
+    after: std::time::Duration::from_millis(100),
+    every: std::time::Duration::from_millis(50),
+};
+
+/// A server whose engine waits `delay` before it answers each job with `script`'s events.
+fn slow_server(
+    delay: std::time::Duration,
+    script: impl Fn(&Vocab) -> Vec<Event> + Send + 'static,
+) -> Server {
+    Server::with_keepalive(4096, Some(KEEPALIVE), move |vocab, job| {
+        thread::sleep(delay);
+        for event in script(vocab) {
+            let _ = job.events.send(event);
+        }
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn a_fast_reply_keeps_its_status_and_body() {
+    let server = slow_server(std::time::Duration::ZERO, |vocab| {
+        text_reply(vocab, "Hello.", 0)
+    });
+    let response = server
+        .call(post("/v1/chat/completions", &chat_body(false), &[]))
+        .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().contains_key("server-timing"));
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes[0], b'{', "no keep-alive before a fast reply");
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello.");
+
+    // A rejected request keeps its 400.
+    let body = json!({"messages": [{"role": "robot"}]});
+    let response = server.call(post("/v1/messages", &body, &[])).await;
+    assert_eq!(response.status(), 400);
+}
+
+/// The status line, headers and each body chunk of a response read off a socket, with the
+/// time each chunk arrived after the request was sent.
+async fn over_tcp(
+    server: &Server,
+    path: &str,
+    body: &Value,
+) -> (String, Vec<(std::time::Duration, Vec<u8>)>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, server.router.clone()).into_future());
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+         Accept-Encoding: gzip, zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let sent = tokio::time::Instant::now();
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut reads = Vec::new();
+    let mut buffer = vec![0u8; 8192];
+    loop {
+        let n = socket.read(&mut buffer).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buffer[..n]);
+        reads.push((sent.elapsed(), raw.len()));
+    }
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8(raw[..end].to_vec()).unwrap();
+    // Each chunk of the chunked body, with the time the read that completed it arrived.
+    let mut chunks = Vec::new();
+    let mut at = end;
+    loop {
+        let line = raw[at..].windows(2).position(|w| w == b"\r\n").unwrap();
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&raw[at..at + line]).unwrap(), 16).unwrap();
+        at += line + 2;
+        if size == 0 {
+            break;
+        }
+        let arrived = reads.iter().find(|(_, len)| *len >= at + size).unwrap().0;
+        chunks.push((arrived, raw[at..at + size].to_vec()));
+        at += size + 2;
+    }
+    (head, chunks)
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn a_slow_reply_sends_spaces_then_its_json() {
+    let delay = std::time::Duration::from_millis(600);
+    let server = slow_server(delay, |vocab| text_reply(vocab, "Hello.", 0));
+    let (head, chunks) = over_tcp(&server, "/v1/chat/completions", &chat_body(false)).await;
+    let head = head.to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    // The spaces are not compressed, which would hold them back.
+    assert!(!head.contains("content-encoding"), "{head}");
+    // The first space reaches the socket right after the grace period, long before the
+    // reply, and spaces follow every interval.
+    let (first, bytes) = &chunks[0];
+    assert_eq!(bytes, b" ");
+    assert!(*first < delay / 2, "first space after {first:?}");
+    let spaces = chunks.iter().filter(|(_, b)| b == b" ").count();
+    assert!((5..=12).contains(&spaces), "{spaces} spaces");
+    let body: Vec<u8> = chunks.iter().flat_map(|(_, b)| b.clone()).collect();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.starts_with("      ") && text.trim_start().starts_with('{'),
+        "{text}"
+    );
+    let reply: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(reply["choices"][0]["message"]["content"], "Hello.");
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn a_slow_failure_sends_the_error_after_status_200() {
+    let server = slow_server(std::time::Duration::from_millis(300), |_| {
+        vec![
+            Event::Started,
+            Event::Failed("the GPU fell over".to_owned()),
+        ]
+    });
+    for (path, body, id) in [
+        ("/v1/chat/completions", chat_body(false), "slow-fail-chat"),
+        ("/v1/messages", messages_body(false), "slow-fail-messages"),
+    ] {
+        let response = server
+            .call(post(path, &body, &[("x-request-id", id)]))
+            .await;
+        assert_eq!(response.status(), 200);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes[0], b' ');
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        let line = request_line(id).await;
+        assert!(line.contains(" keepalive=committed"), "{line}");
+        if path == "/v1/messages" {
+            assert_eq!(error["type"], "error");
+            assert_eq!(error["error"]["type"], "api_error");
+            assert_eq!(error["error"]["message"], "the GPU fell over");
+        } else {
+            assert_eq!(error["error"]["type"], "server_error");
+            assert_eq!(error["error"]["message"], "the GPU fell over");
+            // The log records the real outcome, not the 200 the client got.
+            assert!(
+                line.contains(" status=500 ") && line.ends_with(" error=\"the GPU fell over\""),
+                "{line}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn a_client_that_leaves_during_keepalive_cancels_the_job() {
+    let (left, gone) = std::sync::mpsc::channel();
+    let left = Mutex::new(left);
+    let server = Server::with_keepalive(4096, Some(KEEPALIVE), move |_, job| {
+        let _ = job.events.send(Event::Started);
+        // A long prefill, until the client leaves.
+        while !job.events.is_closed() {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        left.lock().unwrap().send(()).unwrap();
+    });
+    let response = server
+        .call(post(
+            "/v1/completions",
+            &json!({"prompt": "Hi", "max_tokens": 4}),
+            &[("x-request-id", "left-waiting")],
+        ))
+        .await;
+    assert_eq!(response.status(), 200);
+    let mut data = response.into_body().into_data_stream();
+    assert_eq!(data.next().await.unwrap().unwrap(), " ");
+    drop(data);
+    gone.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the job ends once its client leaves");
+    let line = request_line("left-waiting").await;
+    assert!(
+        line.contains(" keepalive=committed") && line.contains(" client=disconnected"),
+        "{line}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs the tokenizer (SIPHON_MODEL)"]
+async fn chat_streams_send_comments_before_the_first_token() {
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let server = Server::with_engine(4096, move |vocab, job| {
+        let _ = job.events.send(Event::Started);
+        // A prefill that lasts until the test has seen the keep-alives.
+        wait.lock().unwrap().recv().unwrap();
+        for event in text_reply(vocab, "Hello.", 0) {
+            let _ = job.events.send(event);
+        }
+    });
+    for path in ["/v1/chat/completions", "/v1/completions"] {
+        let body = if path == "/v1/completions" {
+            json!({"prompt": "Hi", "max_tokens": 16, "stream": true})
+        } else {
+            chat_body(true)
+        };
+        let started = tokio::time::Instant::now();
+        let response = server.call(post(path, &body, &[])).await;
+        let mut data = response.into_body().into_data_stream();
+        for _ in 0..2 {
+            let frame = data.next().await.unwrap().unwrap();
+            assert_eq!(frame, ":\n\n", "{path}");
+        }
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(30),
+            "two comments in {:?}",
+            started.elapsed()
+        );
+        go.send(()).unwrap();
+        let rest = body::to_bytes(Body::from_stream(data), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&rest).unwrap().contains("data: "),
+            "{path}"
+        );
+    }
 }

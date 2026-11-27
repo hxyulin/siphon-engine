@@ -15,8 +15,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
-    chat::{Ending, InvalidRequest},
+    chat::Ending,
     engine::Sampling,
+    invalid::{InvalidRequest, describe, one_of},
 };
 
 /// The sampling fields of a request, as vLLM names them.
@@ -84,22 +85,34 @@ pub fn sampling(
     fields: &SamplingFields,
     defaults: &SamplingDefaults,
 ) -> Result<Sampling, InvalidRequest> {
-    let invalid = |message: &str| Err(InvalidRequest(message.to_owned()));
+    let invalid = |param: &str, accepted: &str, got: f64| {
+        Err(InvalidRequest::field(
+            param,
+            format!("expected {accepted}, got {got}"),
+        ))
+    };
     let temperature = fields.temperature.unwrap_or(defaults.temperature);
     let top_p = fields.top_p.unwrap_or(defaults.top_p);
     let top_k = fields.top_k.unwrap_or(defaults.top_k);
     let min_p = fields.min_p.unwrap_or(defaults.min_p);
     if !(temperature.is_finite() && temperature >= 0.0) {
-        return invalid("temperature must be at least 0");
+        return invalid(
+            "temperature",
+            "a number of at least 0 (0 is greedy)",
+            temperature,
+        );
     }
     if !(top_p > 0.0 && top_p <= 1.0) {
-        return invalid("top_p must be in (0, 1]");
+        return invalid("top_p", "a number above 0 and at most 1", top_p);
     }
     if top_k < -1 {
-        return invalid("top_k must be -1 or 0 (no limit) or at least 1");
+        return Err(InvalidRequest::field(
+            "top_k",
+            format!("expected -1 or 0 (no limit) or an integer of at least 1, got {top_k}"),
+        ));
     }
     if !(0.0..=1.0).contains(&min_p) {
-        return invalid("min_p must be in [0, 1]");
+        return invalid("min_p", "a number from 0 to 1", min_p);
     }
     #[expect(
         clippy::cast_possible_truncation,
@@ -127,9 +140,13 @@ pub fn samplings(
 ) -> Result<Vec<Sampling>, InvalidRequest> {
     let first = sampling(fields, defaults)?;
     if n > 1 && first.temperature == 0.0 {
-        return Err(InvalidRequest(format!(
-            "n must be 1 when using greedy sampling, got {n}"
-        )));
+        return Err(InvalidRequest::field(
+            "n",
+            format!(
+                "must be 1 with greedy sampling (temperature 0), got {n}: every choice would \
+                 be the same"
+            ),
+        ));
     }
     Ok((0..n)
         .zip(0_u64..)
@@ -183,7 +200,10 @@ const REFUSED: &[(&str, &str)] = &[
 pub fn refuse(fields: &Map<String, Value>) -> Result<(), InvalidRequest> {
     for (name, why) in REFUSED {
         if fields.get(*name).is_some_and(is_set) {
-            return Err(InvalidRequest(format!("{name}: {why}")));
+            return Err(InvalidRequest::field(
+                *name,
+                format!("{why}; leave it out or send null"),
+            ));
         }
     }
     Ok(())
@@ -205,7 +225,10 @@ fn is_set(value: &Value) -> bool {
 pub fn choices(n: Option<u64>) -> Result<usize, InvalidRequest> {
     match n {
         None => Ok(1),
-        Some(0) => Err(InvalidRequest("n must be at least 1".to_owned())),
+        Some(0) => Err(InvalidRequest::field(
+            "n",
+            "expected an integer of at least 1, got 0",
+        )),
         Some(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
     }
 }
@@ -218,11 +241,18 @@ pub fn best_of(best_of: Option<u64>, n: usize) -> Result<(), InvalidRequest> {
     };
     let best_of = usize::try_from(best_of).unwrap_or(usize::MAX);
     if best_of < n {
-        return Err(InvalidRequest("best_of must be at least n".to_owned()));
+        return Err(InvalidRequest::field(
+            "best_of",
+            format!("must be at least n ({n}), got {best_of}"),
+        ));
     }
     if best_of > n {
-        return Err(InvalidRequest(
-            "best_of above n is not supported: ranking choices needs log probabilities".to_owned(),
+        return Err(InvalidRequest::field(
+            "best_of",
+            format!(
+                "above n is not supported, got {best_of} with n {n}: ranking choices needs \
+                 log probabilities; send best_of equal to n or leave it out"
+            ),
         ));
     }
     Ok(())
@@ -234,35 +264,49 @@ pub fn response_format(value: Option<&Value>) -> Result<(), InvalidRequest> {
         None | Some(Value::Null) => Ok(()),
         Some(format) => match format.get("type").and_then(Value::as_str) {
             Some("text") => Ok(()),
-            kind => Err(InvalidRequest(format!(
-                "response_format {} is not supported: it needs constrained decoding",
-                kind.unwrap_or("without a type")
-            ))),
+            _ => Err(InvalidRequest::field(
+                "response_format.type",
+                format!(
+                    "only \"text\" is supported, got {}: JSON modes need constrained decoding",
+                    describe(format.get("type").unwrap_or(&Value::Null))
+                ),
+            )),
         },
     }
 }
 
 /// The stop strings of `stop`: a string or an array of strings, none empty.
-pub fn stops(value: Option<&Value>) -> Result<Vec<String>, InvalidRequest> {
+/// `param` names the field in errors: `stop`, or Anthropic's `stop_sequences`.
+pub fn stops(param: &str, value: Option<&Value>) -> Result<Vec<String>, InvalidRequest> {
     let stops = match value {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(s)) => vec![s.clone()],
         Some(Value::Array(items)) => items
             .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| InvalidRequest("stop must hold strings".to_owned()))
+            .enumerate()
+            .map(|(i, item)| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    InvalidRequest::expected(format!("{param}[{i}]"), "a string", item)
+                })
             })
             .collect::<Result<_, _>>()?,
-        Some(_) => {
-            return Err(InvalidRequest(
-                "stop must be a string or an array of strings".to_owned(),
+        Some(other) => {
+            return Err(InvalidRequest::expected(
+                param,
+                "a string or an array of strings",
+                other,
             ));
         }
     };
-    if stops.iter().any(String::is_empty) {
-        return Err(InvalidRequest("stop strings must not be empty".to_owned()));
+    if let Some(i) = stops.iter().position(String::is_empty) {
+        let param = match value {
+            Some(Value::Array(_)) => format!("{param}[{i}]"),
+            _ => param.to_owned(),
+        };
+        return Err(InvalidRequest::field(
+            param,
+            "stop strings must not be empty",
+        ));
     }
     Ok(stops)
 }
@@ -279,10 +323,13 @@ pub enum ToolChoice {
 impl ToolChoice {
     pub fn parse(value: Option<&Value>) -> Result<Self, InvalidRequest> {
         let invalid = || {
-            InvalidRequest(
-                "tool_choice must be auto, none, required or {\"type\": \"function\", \
-                 \"function\": {\"name\": ...}}"
-                    .to_owned(),
+            InvalidRequest::expected(
+                "tool_choice",
+                &format!(
+                    "{} or {{\"type\": \"function\", \"function\": {{\"name\": ...}}}}",
+                    one_of(&["auto", "none", "required"])
+                ),
+                value.unwrap_or(&Value::Null),
             )
         };
         match value {
@@ -319,8 +366,9 @@ pub fn ending(
         continue_final_message.unwrap_or(false),
         add_generation_prompt,
     ) {
-        (true, Some(true)) => Err(InvalidRequest(
-            "continue_final_message needs add_generation_prompt false".to_owned(),
+        (true, Some(true)) => Err(InvalidRequest::field(
+            "add_generation_prompt",
+            "must be false (or left out) with continue_final_message true, got true",
         )),
         (true, _) => Ok(Ending::Continue),
         (false, Some(false)) => Ok(Ending::Bare),
@@ -356,7 +404,11 @@ mod tests {
         ] {
             let e = refuse(&fields(&bad)).unwrap_err();
             let name = bad.as_object().unwrap().keys().next().unwrap().clone();
-            assert!(e.0.starts_with(&name), "{e} for {bad}");
+            assert_eq!(e.param(), Some(name.as_str()), "{e} for {bad}");
+            assert!(
+                e.to_string().starts_with(&format!("{name}: ")),
+                "{e} for {bad}"
+            );
         }
     }
 
@@ -454,13 +506,23 @@ mod tests {
 
     #[test]
     fn stop_strings() {
+        let stops = |value: Option<&Value>| stops("stop", value);
         assert_eq!(stops(None).unwrap(), Vec::<String>::new());
         assert_eq!(stops(Some(&json!("\n"))).unwrap(), ["\n"]);
         assert_eq!(stops(Some(&json!(["a", "b"]))).unwrap(), ["a", "b"]);
         assert_eq!(stops(Some(&json!([]))).unwrap(), Vec::<String>::new());
-        assert!(stops(Some(&json!([""]))).is_err());
-        assert!(stops(Some(&json!([1]))).is_err());
-        assert!(stops(Some(&json!(1))).is_err());
+        assert_eq!(
+            stops(Some(&json!(["a", ""]))).unwrap_err().to_string(),
+            "stop[1]: stop strings must not be empty"
+        );
+        assert_eq!(
+            stops(Some(&json!(["a", 1]))).unwrap_err().to_string(),
+            "stop[1]: expected a string, got 1 (a number)"
+        );
+        assert_eq!(
+            stops(Some(&json!(1))).unwrap_err().to_string(),
+            "stop: expected a string or an array of strings, got 1 (a number)"
+        );
     }
 
     #[test]

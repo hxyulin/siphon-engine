@@ -27,7 +27,7 @@ use siphon::{
     vision::{self, PreparedImage, VisionConfig},
 };
 
-use crate::chat::InvalidRequest;
+use crate::invalid::InvalidRequest;
 
 /// Images a request may send unless `--max-images` says otherwise.
 pub const DEFAULT_MAX_IMAGES: usize = 16;
@@ -140,10 +140,10 @@ impl Vision {
         let image = self
             .preprocess
             .prepare(&bytes)
-            .map_err(|e| InvalidRequest(format!("the image could not be read: {e:#}")))?;
+            .map_err(|e| InvalidRequest::new(format!("the image could not be read: {e:#}")))?;
         let tokens = image.tokens();
         if tokens == 0 || tokens > self.max_image_tokens() {
-            return Err(InvalidRequest(format!(
+            return Err(InvalidRequest::new(format!(
                 "the {}x{} image takes {tokens} image tokens once shrunk to {} pixels; this \
                  server takes at most {}, so an image this narrow or wide does not fit",
                 size.0,
@@ -163,7 +163,7 @@ impl Vision {
         let count = ids.iter().filter(|&&id| id == self.placeholder).count();
         match first {
             Some(first) if run == tokens && count == tokens => Ok((image, ids, first)),
-            _ => Err(InvalidRequest(format!(
+            _ => Err(InvalidRequest::new(format!(
                 "the image's prompt ids hold {count} placeholders, not one run of {tokens}"
             ))),
         }
@@ -201,21 +201,21 @@ impl Vision {
 fn image_size(bytes: &[u8]) -> Result<(u32, u32), InvalidRequest> {
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|e| InvalidRequest(format!("the image could not be read: {e}")))?;
+        .map_err(|e| InvalidRequest::new(format!("the image could not be read: {e}")))?;
     if !matches!(
         reader.format(),
         Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif)
     ) {
-        return Err(InvalidRequest(
-            "the image is not PNG, JPEG, WebP or GIF".to_owned(),
+        return Err(InvalidRequest::new(
+            "the image is not PNG, JPEG, WebP or GIF",
         ));
     }
     let (width, height) = reader
         .into_dimensions()
-        .map_err(|e| InvalidRequest(format!("the image's header could not be read: {e}")))?;
+        .map_err(|e| InvalidRequest::new(format!("the image's header could not be read: {e}")))?;
     let pixels = width as usize * height as usize;
     if pixels == 0 || pixels > MAX_DECODE_PIXELS {
-        return Err(InvalidRequest(format!(
+        return Err(InvalidRequest::new(format!(
             "the image is {width}x{height} pixels; this server decodes at most \
              {MAX_DECODE_PIXELS}"
         )));
@@ -240,14 +240,14 @@ impl<'a> Collector<'a> {
     /// The ids of an image part whose ids start at prompt position `at`.
     pub fn image(&mut self, part: &Value, at: usize) -> Result<Vec<u32>, InvalidRequest> {
         let Some(vision) = self.vision else {
-            return Err(InvalidRequest(
-                "image input is not supported by this server".to_owned(),
+            return Err(InvalidRequest::new(
+                "image input is off on this server; start it with --vision to accept images",
             ));
         };
         if self.images.len() == vision.max_images {
-            return Err(InvalidRequest(format!(
-                "the request has more than {} images, the most this server takes \
-                 (--max-images)",
+            return Err(InvalidRequest::new(format!(
+                "the request has more than {} images, the most this server takes; \
+                 --max-images sets the limit",
                 vision.max_images
             )));
         }
@@ -287,7 +287,9 @@ pub fn image_bytes(part: &Value) -> Result<Vec<u8>, InvalidRequest> {
             other => other,
         })
         .and_then(Value::as_str)
-        .ok_or_else(|| InvalidRequest("an image part needs a data: URL in image_url".to_owned()))?;
+        .ok_or_else(|| {
+            InvalidRequest::missing("image_url.url", "a data:image/...;base64,... URL string")
+        })?;
     data_url(url)
 }
 
@@ -299,17 +301,16 @@ fn data_url(url: &str) -> Result<Vec<u8>, InvalidRequest> {
         } else {
             "an image URL must be a data: URL"
         };
-        return Err(InvalidRequest(format!(
-            "{what}; send the image inline as data:image/png;base64,..."
+        return Err(InvalidRequest::new(format!(
+            "{what}, got {}; send the image inline as data:image/png;base64,...",
+            crate::invalid::quote(url)
         )));
     };
     let (header, data) = rest
         .split_once(',')
-        .ok_or_else(|| InvalidRequest("the image's data: URL has no comma".to_owned()))?;
+        .ok_or_else(|| InvalidRequest::new("the image's data: URL has no comma"))?;
     let Some(media_type) = header.strip_suffix(";base64") else {
-        return Err(InvalidRequest(
-            "the image's data: URL must be base64".to_owned(),
-        ));
+        return Err(InvalidRequest::new("the image's data: URL must be base64"));
     };
     check_media_type(media_type)?;
     decode(data)
@@ -324,26 +325,28 @@ fn anthropic_source(source: &Value) -> Result<Vec<u8>, InvalidRequest> {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             check_media_type(media_type)?;
-            let data = source
-                .get("data")
-                .and_then(Value::as_str)
-                .ok_or_else(|| InvalidRequest("the image source has no data".to_owned()))?;
+            let data = source.get("data").and_then(Value::as_str).ok_or_else(|| {
+                InvalidRequest::missing("source.data", "the image's base64 string")
+            })?;
             decode(data)
         }
-        Some("url") => Err(InvalidRequest(
-            "this server does not fetch image URLs; send the image as a base64 source".to_owned(),
+        Some("url") => Err(InvalidRequest::field(
+            "source.type",
+            "\"url\" is not supported: this server does not fetch image URLs; send a \
+             \"base64\" source",
         )),
-        other => Err(InvalidRequest(format!(
-            "image source type {} is not supported; send a base64 source",
-            other.unwrap_or("(none)")
-        ))),
+        _ => Err(InvalidRequest::expected(
+            "source.type",
+            "\"base64\"",
+            source.get("type").unwrap_or(&Value::Null),
+        )),
     }
 }
 
 fn check_media_type(media_type: &str) -> Result<(), InvalidRequest> {
     match media_type {
         "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif" => Ok(()),
-        _ => Err(InvalidRequest(format!(
+        _ => Err(InvalidRequest::new(format!(
             "image type {media_type:?} is not supported; send PNG, JPEG, WebP or GIF"
         ))),
     }
@@ -353,7 +356,7 @@ fn decode(data: &str) -> Result<Vec<u8>, InvalidRequest> {
     let data: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     BASE64
         .decode(data)
-        .map_err(|e| InvalidRequest(format!("the image's base64 does not decode: {e}")))
+        .map_err(|e| InvalidRequest::new(format!("the image's base64 does not decode: {e}")))
 }
 
 #[cfg(test)]
@@ -460,14 +463,15 @@ pub(crate) mod tests {
 
     #[test]
     fn image_parts_refuse_urls_and_other_types() {
-        let refused = |part: Value| image_bytes(&part).unwrap_err().0;
+        let refused = |part: Value| image_bytes(&part).unwrap_err().to_string();
         assert!(
             refused(json!({"type": "image_url", "image_url": {"url": "https://x/y.png"}}))
                 .starts_with("this server does not fetch image URLs")
         );
-        assert!(
-            refused(json!({"type": "image", "source": {"type": "url", "url": "https://x"}}))
-                .starts_with("this server does not fetch image URLs")
+        assert_eq!(
+            refused(json!({"type": "image", "source": {"type": "url", "url": "https://x"}})),
+            "source.type: \"url\" is not supported: this server does not fetch image URLs; \
+             send a \"base64\" source"
         );
         assert!(
             refused(json!({"type": "image_url", "image_url": "data:image/tiff;base64,AAAA"}))
@@ -481,7 +485,10 @@ pub(crate) mod tests {
             refused(json!({"type": "image_url", "image_url": "data:image/png;base64,***"}))
                 .contains("does not decode")
         );
-        assert!(refused(json!({"type": "image_url"})).contains("needs a data: URL"));
+        assert_eq!(
+            refused(json!({"type": "image_url"})),
+            "image_url.url: missing; expected a data:image/...;base64,... URL string"
+        );
     }
 
     #[test]
@@ -494,17 +501,25 @@ pub(crate) mod tests {
         assert_eq!(v.image(&image_url(401, 400)).unwrap().0.tokens(), 110);
         // Fake shrinks nothing: 1,641 x 1,641 pixels pads to 42 x 42 tokens, past the
         // limit, as an image too narrow to shrink into it would.
-        let refused = v.image(&image_url(1641, 1641)).unwrap_err().0;
+        let refused = v.image(&image_url(1641, 1641)).unwrap_err().to_string();
         assert!(refused.contains("1764 image tokens"), "{refused}");
-        let refused = v.image(&image_url(10_000, 5001)).unwrap_err().0;
+        let refused = v.image(&image_url(10_000, 5001)).unwrap_err().to_string();
         assert!(refused.contains("decodes at most"), "{refused}");
         let not_an_image = json!({"type": "image_url", "image_url": "data:image/png;base64,AAAA"});
-        assert!(v.image(&not_an_image).unwrap_err().0.contains("not PNG"));
+        assert!(
+            v.image(&not_an_image)
+                .unwrap_err()
+                .to_string()
+                .contains("not PNG")
+        );
 
         let mut collector = Collector::new(Some(&v));
         assert_eq!(collector.image(&image_url(40, 80), 10).unwrap().len(), 4);
         collector.image(&image_url(40, 40), 20).unwrap();
-        let third = collector.image(&image_url(40, 40), 30).unwrap_err().0;
+        let third = collector
+            .image(&image_url(40, 40), 30)
+            .unwrap_err()
+            .to_string();
         assert!(third.contains("--max-images"), "{third}");
         let offsets: Vec<usize> = collector.images.iter().map(|i| i.offset).collect();
         assert_eq!(offsets, [11, 21]);
@@ -512,8 +527,11 @@ pub(crate) mod tests {
         let off = Collector::new(None)
             .image(&image_url(40, 40), 0)
             .unwrap_err()
-            .0;
-        assert_eq!(off, "image input is not supported by this server");
+            .to_string();
+        assert_eq!(
+            off,
+            "image input is off on this server; start it with --vision to accept images"
+        );
     }
 
     /// The checkpoint's preprocessing config, at its default pixel limit.
@@ -617,8 +635,12 @@ pub(crate) mod tests {
         let off = vocab
             .render_prompt(messages, &[], 0.0, generate)
             .unwrap_err()
-            .0;
-        assert_eq!(off, "image input is not supported by this server");
+            .to_string();
+        assert_eq!(
+            off,
+            "messages[0].content[1]: image input is off on this server; start it with --vision \
+             to accept images"
+        );
 
         vocab.set_vision(Some(vision(4)));
         let rendered = vocab.render_prompt(messages, &[], 0.0, generate).unwrap();
@@ -657,7 +679,7 @@ pub(crate) mod tests {
         let refused = vocab
             .render_prompt(assistant.as_array().unwrap(), &[], 0.0, generate)
             .unwrap_err()
-            .0;
+            .to_string();
         assert!(refused.contains("user and tool messages"), "{refused}");
     }
 

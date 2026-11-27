@@ -395,6 +395,7 @@ impl HostCache {
             local,
             rings,
             used,
+            used_at: std::time::Instant::now(),
         });
         Ok(Some(read))
     }

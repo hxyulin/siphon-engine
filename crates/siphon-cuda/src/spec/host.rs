@@ -198,6 +198,8 @@ struct HostEntry {
     rings: bool,
     /// When it was last saved or restored, in [`HostCache::tick`]s.
     used: u64,
+    /// When it was last saved, restored or read from disk, for the log.
+    used_at: Instant,
 }
 
 /// A sequence parked in host memory mid-generation ([`HostCache::park`]): its global caches
@@ -366,6 +368,35 @@ impl HostCache {
         self.entries[h].rings
     }
 
+    /// Drops the least recently used entry, because the pool lacks free chunks for `need`
+    /// chunks `purpose` takes, and notes it for the log. Returns false when no entry is
+    /// left to drop.
+    fn evict_lru(&mut self, need: usize, purpose: &str) -> bool {
+        let Some(lru) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.used)
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        let (used, total, free) = (
+            self.used_chunks(),
+            self.pool.addresses.len(),
+            self.pool.free.len(),
+        );
+        let e = self.entries.swap_remove(lru);
+        self.release(&e);
+        self.notes.push(format!(
+            "host cache: evicted an entry of {} tokens, unused for {:.0} s, {purpose}: the \
+             host cache is full ({used} of {total} chunks in use, {free} free, {need} needed)",
+            e.tokens.len(),
+            e.used_at.elapsed().as_secs_f64()
+        ));
+        true
+    }
+
     fn release(&mut self, e: &HostEntry) {
         for &c in e.kv.iter().chain(&e.local) {
             self.pool.release(c);
@@ -415,6 +446,7 @@ impl HostCache {
         let (kv, local_chunks, shared) = if let Some(h) = existing {
             // The same prompt again: only the draft's state may be new.
             self.entries[h].used = self.tick;
+            self.entries[h].used_at = Instant::now();
             if rings.is_none() || self.complete(&self.entries[h]) {
                 return Ok(Some(Saved {
                     copied: 0,
@@ -464,6 +496,7 @@ impl HostCache {
                 local: local_chunks,
                 rings: rings.is_some(),
                 used: self.tick,
+                used_at: Instant::now(),
             });
         }
         self.pending = Some(
@@ -566,20 +599,12 @@ impl HostCache {
         }
         let need = n - kv.len() + self.local_chunks();
         while self.pool.free.len() < need {
-            let Some(lru) = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(i, _)| i)
-            else {
+            if !self.evict_lru(need, "to save a new entry") {
                 for &c in &kv {
                     self.pool.release(c);
                 }
                 return Ok(None);
-            };
-            let e = self.entries.swap_remove(lru);
-            self.release(&e);
+            }
         }
         while kv.len() < n {
             kv.push(self.pool.take().context("a free chunk was counted")?);
@@ -623,6 +648,7 @@ impl HostCache {
             .copy_run(&self.main, &e.local, 0, &spans, Direction::ToDevice)?;
         let len = e.tokens.len();
         self.entries[h].used = self.tick;
+        self.entries[h].used_at = Instant::now();
         model.set_loaded_position(slot, len)?;
         Ok(len * target.bytes_per_position() + self.local_bytes)
     }
@@ -742,20 +768,12 @@ impl HostCache {
         }
         let need = n - shared + self.local_chunks();
         while self.pool.free.len() < need {
-            let Some(lru) = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(i, _)| i)
-            else {
+            if !self.evict_lru(need, "to park a request") {
                 for &c in &kv {
                     self.pool.release(c);
                 }
                 return Ok(None);
-            };
-            let e = self.entries.swap_remove(lru);
-            self.release(&e);
+            }
         }
         while kv.len() < n {
             kv.push(self.pool.take().context("a free chunk was counted")?);

@@ -55,7 +55,7 @@ mod prefix;
 
 pub use host::{DISK_FORMAT, DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS, ParkSaved};
 use prefix::PrefixCache;
-pub use prefix::PrefixHit;
+pub use prefix::{PrefixHit, PrefixTier};
 
 use crate::{
     draft::{Draft, DraftOptions, STEPS, WINDOW},

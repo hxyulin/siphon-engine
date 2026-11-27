@@ -46,6 +46,32 @@ pub(super) struct PrefixCache {
     draft_global: bool,
     /// The host tier, with [`Speculator::enable_host_cache`].
     host: Option<HostCache>,
+    /// Where the last [`Speculator::prefill_cached`] or [`Speculator::claim_slot`] found
+    /// its prefix, `None` for a miss.
+    last_tier: Option<PrefixTier>,
+    /// Lines for the server's log about dropped entries, drained by
+    /// [`Speculator::cache_notes`].
+    notes: Vec<String>,
+}
+
+/// The tier a prompt's cached prefix came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixTier {
+    /// A device entry, whose global caches stay in its slot's pages of the KV pool.
+    Slot,
+    /// A host entry.
+    Host,
+}
+
+impl PrefixTier {
+    /// The tier's name in the server's log.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::Host => "host",
+        }
+    }
 }
 
 /// Where a prompt's longest cached prefix lies.
@@ -251,6 +277,34 @@ impl PrefixCache {
             .or_else(|| self.victim_slot(model, busy, now))
     }
 
+    /// Notes for the log that entry `i`, live until now, is dropped, and `why`. Says
+    /// nothing for an empty entry.
+    fn note_drop(&mut self, i: usize, now: Instant, why: &str) {
+        let e = &self.entries[i];
+        if e.tokens.is_empty() {
+            return;
+        }
+        let slot = e.slot.map_or_else(String::new, |s| format!(" in slot {s}"));
+        self.notes.push(format!(
+            "prefix cache: dropped the entry of {} tokens{slot}, unused for {:.0} s: {why}",
+            e.tokens.len(),
+            now.saturating_duration_since(e.used).as_secs_f64()
+        ));
+    }
+
+    /// [`Self::drop_slot`] of a slot that [`Self::victim_slot`] picked for a new sequence,
+    /// noting for the log the live entry it drops: every slot held one.
+    fn drop_victim(&mut self, model: &Model, slot: usize, now: Instant) {
+        if let Some(i) = self.of_slot(model, slot, now) {
+            self.note_drop(
+                i,
+                now,
+                "every free slot holds a cached prompt, and it was the least recently used",
+            );
+        }
+        self.drop_slot(slot);
+    }
+
     /// Drops the entry of slot `slot`, if any.
     fn drop_slot(&mut self, slot: usize) {
         for e in &mut self.entries {
@@ -301,6 +355,8 @@ impl Speculator {
             ttl,
             draft_global: self.draft.has_global_layers(),
             host: None,
+            last_tier: None,
+            notes: Vec::new(),
         });
         Ok(bytes)
     }
@@ -369,12 +425,22 @@ impl Speculator {
         self.prefix.as_ref().map_or(Ok(()), PrefixCache::fence)
     }
 
-    /// Lines about the host tier's saves and restores since the last call, for a log.
-    pub fn host_notes(&mut self) -> Vec<String> {
-        self.prefix
-            .as_mut()
-            .and_then(|c| c.host.as_mut())
-            .map_or_else(Vec::new, HostCache::notes)
+    /// Lines about the prefix cache's dropped entries and the host tier's saves, restores
+    /// and evictions since the last call, for a log.
+    pub fn cache_notes(&mut self) -> Vec<String> {
+        let Some(cache) = self.prefix.as_mut() else {
+            return Vec::new();
+        };
+        let mut notes = std::mem::take(&mut cache.notes);
+        notes.extend(cache.host.as_mut().map_or_else(Vec::new, HostCache::notes));
+        notes
+    }
+
+    /// Where the last [`Self::prefill_cached`] or [`Self::claim_slot`] found its prompt's
+    /// prefix, `None` for a miss or without a cache.
+    #[must_use]
+    pub fn last_prefix_tier(&self) -> Option<PrefixTier> {
+        self.prefix.as_ref().and_then(|c| c.last_tier)
     }
 
     /// Drops entries after `ttl` unused from now on.
@@ -446,6 +512,10 @@ impl Speculator {
         } = prompt;
         cache.fence()?;
         let source = cache.pick(model, key, chunk, &[], Some(self.draft_sequence), now);
+        let tier = source.map(|s| match s {
+            Source::Device(_) => PrefixTier::Slot,
+            Source::Host(..) => PrefixTier::Host,
+        });
         let (mut hit, start) = match source {
             Some(Source::Device(i)) => {
                 let e = &cache.entries[i];
@@ -465,6 +535,7 @@ impl Speculator {
         self.start_prompt(model, tokens)?;
         let stream = std::sync::Arc::clone(model.stream());
         let cache = self.prefix.as_mut().context("the cache is on")?;
+        cache.last_tier = tier;
         match source {
             Some(Source::Device(i)) => {
                 let e = &mut cache.entries[i];
@@ -542,6 +613,10 @@ impl Speculator {
         };
         cache.fence()?;
         let source = cache.pick(model, prompt, chunk, busy, None, now);
+        cache.last_tier = source.map(|s| match s {
+            Source::Device(_) => PrefixTier::Slot,
+            Source::Host(..) => PrefixTier::Host,
+        });
         if let Some(Source::Device(i)) = source {
             let e = &mut cache.entries[i];
             let slot = e.slot.context("a live entry has a slot")?;
@@ -561,7 +636,7 @@ impl Speculator {
         let slot = cache
             .victim_slot(model, busy, now)
             .context("every slot runs a request")?;
-        cache.drop_slot(slot);
+        cache.drop_victim(model, slot, now);
         model.reset_slot(slot)?;
         if self.draft.is_dflash2() {
             self.draft.reset_slot(slot);
@@ -659,8 +734,9 @@ impl Speculator {
             return (0..model.slots()).find(|s| !busy.contains(s));
         };
         cache.fence().ok()?;
-        let slot = cache.victim_slot(model, busy, Instant::now())?;
-        cache.drop_slot(slot);
+        let now = Instant::now();
+        let slot = cache.victim_slot(model, busy, now)?;
+        cache.drop_victim(model, slot, now);
         Some(slot)
     }
 
@@ -704,14 +780,24 @@ impl Speculator {
         let mut busy = busy.to_vec();
         busy.push(0);
         let Some(to) = cache.victim_slot(model, &busy, now) else {
+            cache.note_drop(
+                i,
+                now,
+                "slot 0 takes another sequence, and no other slot is free",
+            );
             return Ok(());
         };
         if let Some(j) = cache.of_slot(model, to, now)
             && cache.entries[j].used >= cache.entries[i].used
         {
+            cache.note_drop(
+                i,
+                now,
+                "slot 0 takes another sequence, and every other slot holds a more recent prompt",
+            );
             return Ok(());
         }
-        cache.drop_slot(to);
+        cache.drop_victim(model, to, now);
         model.transfer_slot(0, to)?;
         let e = &mut cache.entries[i];
         e.slot = Some(to);
@@ -730,6 +816,29 @@ impl Speculator {
         chunk: usize,
     ) -> anyhow::Result<()> {
         let cache = self.prefix.as_mut().context("the cache is on")?;
+        let now = Instant::now();
+        let old = &cache.entries[i];
+        // A conversation that grows replaces its own entry: nothing is lost.
+        if !old.tokens.is_empty() && !tokens.starts_with(&old.tokens) {
+            let same_sequence = old
+                .slot
+                .is_some_and(|s| model.slot_sequence(s).is_ok_and(|q| q == old.sequence));
+            let expired = same_sequence && now.saturating_duration_since(old.used) > cache.ttl;
+            if cache.live(old, model, now) {
+                cache.note_drop(
+                    i,
+                    now,
+                    "every entry holds a cached prompt, and it was the least recently used",
+                );
+            } else if expired {
+                let ttl = cache.ttl.as_secs_f64();
+                cache.note_drop(
+                    i,
+                    now,
+                    &format!("expired, unused past the {ttl:.0} s time to live"),
+                );
+            }
+        }
         // Nothing is kept until the copies are whole, in case this fails midway.
         cache.entries[i].slot = None;
         cache.drop_slot(slot);
@@ -928,10 +1037,21 @@ impl Speculator {
     }
 
     /// Drops slot `slot`'s entry and returns all of its pages to the pool, once the host
-    /// tier's copies from it are done.
-    pub fn evict_slot(&mut self, model: &mut Model, slot: usize) -> anyhow::Result<()> {
+    /// tier's copies from it are done, for a caller that needs `need` free pages.
+    pub fn evict_slot(
+        &mut self,
+        model: &mut Model,
+        slot: usize,
+        need: usize,
+    ) -> anyhow::Result<()> {
         if let Some(cache) = self.prefix.as_mut() {
             cache.fence()?;
+            let now = Instant::now();
+            if let Some(i) = cache.of_slot(model, slot, now) {
+                let pages = model.slot_pages(slot).unwrap_or(0) + cache.entries[i].model.pages();
+                let why = format!("the KV pool needs {need} free pages, and it held {pages}");
+                cache.note_drop(i, now, &why);
+            }
             cache.drop_slot(slot);
             cache.release_dead(model)?;
         }

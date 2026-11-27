@@ -420,7 +420,7 @@ fn parked_sequences_return_exactly() -> anyhow::Result<()> {
 
     // `p` again from position 0, parked after its first chunk, then prefilled to the end.
     for s in [slot_p, slot_q] {
-        spec.evict_slot(&mut model, s)?;
+        spec.evict_slot(&mut model, s, 0)?;
     }
     let (slot, _) = spec.claim_slot(&mut model, &capture[..4499], CHUNK, &[])?;
     model.reset_slot(slot)?;
@@ -441,7 +441,7 @@ fn parked_sequences_return_exactly() -> anyhow::Result<()> {
         "the first token's logits differ after a swap mid-prefill"
     );
     for s in 0..model.slots() {
-        spec.evict_slot(&mut model, s)?;
+        spec.evict_slot(&mut model, s, 0)?;
     }
     spec.trim_draft(&model)?;
     let free = model.kv_pool().context("pooled")?.free_pages();
@@ -925,7 +925,7 @@ fn host_cache_matches_prefill(
         chunk_bytes >> 20
     );
     let notes = |spec: &mut Speculator| {
-        for line in spec.host_notes() {
+        for line in spec.cache_notes() {
             println!("  {line}");
         }
     };

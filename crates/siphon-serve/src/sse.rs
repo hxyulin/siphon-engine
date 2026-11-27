@@ -111,14 +111,16 @@ pub(crate) async fn respond<R: Reply>(
         ignore_eos,
         samplings,
         output,
+        thinking,
         ..
     } = prepared;
     let sampling = samplings
         .first()
         .copied()
         .ok_or_else(|| ApiError::internal("no sampling"))?;
-    let label = id.label(reply.id(), 0, 1);
     let tokens = prompt.len();
+    let streaming = matches!(delivery, Delivery::Stream { .. });
+    id.log.reply(reply.id(), streaming, thinking, tokens);
     let results = submit(
         &app,
         prompt,
@@ -126,7 +128,8 @@ pub(crate) async fn respond<R: Reply>(
         max_tokens,
         ignore_eos,
         sampling,
-        &|_| Arc::clone(&label),
+        id,
+        reply.id(),
     )?;
     if matches!(delivery, Delivery::Whole) {
         // Runs in the handler, so that a client that leaves drops the job.
@@ -138,18 +141,13 @@ pub(crate) async fn respond<R: Reply>(
             None => R::failed_response("the reply ended early"),
         };
         return Ok(match &timings {
-            Some(timings) => {
-                timings.log(&label);
-                openai::with_server_timing(response, timings)
-            }
+            Some(timings) => openai::with_server_timing(response, timings),
             None => response,
         });
     }
     let (out, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        if let Some(timings) = run(&app.vocab, results, output, reply, tokens, out, true).await {
-            timings.log(&label);
-        }
+        run(&app.vocab, results, output, reply, tokens, out, true).await;
     });
     let events = ReceiverStream::new(rx).map(|frame| Ok::<_, Infallible>(sse(frame)));
     Ok(Sse::new(events).into_response())

@@ -25,8 +25,8 @@ use std::{
 };
 
 use axum::{
-    Extension, Json,
-    extract::{State, rejection::JsonRejection},
+    Extension,
+    extract::State,
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -35,11 +35,13 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     anthropic::{NO_DOCUMENT, NO_IMAGE},
-    chat::{self, Ending, InvalidRequest, Rendered, Vocab},
+    chat::{self, Ending, Rendered, Thinking, Vocab},
     engine::Finish,
+    invalid::{InvalidRequest, Origin, one_of},
+    keepalive,
     openai::{
-        self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, blocking,
-        tool_ending,
+        self, ApiError, App, Calls, Decoder, Delivery, JsonBody, Output, Prepared, RequestId,
+        blocking, tool_ending,
     },
     parse::{Delta, Parser, ToolPart},
     request::{self, SamplingFields, ToolChoice},
@@ -81,35 +83,49 @@ pub struct ResponsesRequest {
 pub async fn responses(
     State(app): State<Arc<App>>,
     Extension(id): Extension<RequestId>,
-    request: Result<Json<ResponsesRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(request) = request?;
-    let prepared = blocking(&app, move |app| prepare(app, &request)).await?;
-    let (prepared, reply) = prepared;
-    sse::respond(app, prepared, reply, &id).await
+    JsonBody(request): JsonBody<ResponsesRequest>,
+) -> Response {
+    let keepalive = app.keepalive.filter(|_| request.stream != Some(true));
+    let log = Arc::clone(&id.log);
+    keepalive::respond(keepalive, &log, async move {
+        let (prepared, reply) = blocking(&app, move |app| prepare(app, &request)).await?;
+        sse::respond(app, prepared, reply, &id).await
+    })
+    .await
 }
 
 fn prepare(app: &App, request: &ResponsesRequest) -> Result<(Prepared, Reply), ApiError> {
     let set = |value: Option<&Value>| value.is_some_and(|v| !v.is_null());
-    if set(request.previous_response_id.as_ref()) || set(request.conversation.as_ref()) {
-        return Err(ApiError::bad_request(
-            "previous_response_id and conversation are not supported: this server stores no \
-             responses, so send the whole conversation in input",
-        ));
+    for (param, value) in [
+        ("previous_response_id", &request.previous_response_id),
+        ("conversation", &request.conversation),
+    ] {
+        if set(value.as_ref()) {
+            return Err(InvalidRequest::field(
+                param,
+                "is not supported: this server stores no responses, so send the whole \
+                 conversation in input",
+            )
+            .into());
+        }
     }
     if request.background == Some(true) {
-        return Err(ApiError::bad_request(
-            "background is not supported: this server stores no responses",
-        ));
+        return Err(InvalidRequest::field(
+            "background",
+            "true is not supported: this server stores no responses; leave it out",
+        )
+        .into());
     }
     request::refuse(&request.other)?;
-    request::response_format(request.text.as_ref().and_then(|t| t.get("format")))?;
-    let stops = request::stops(request.stop.as_ref())?;
+    request::response_format(request.text.as_ref().and_then(|t| t.get("format")))
+        .map_err(|e| e.within("text"))?;
+    let stops = request::stops("stop", request.stop.as_ref())?;
     let sampling = request::sampling(&request.sampling, &app.sampling)?;
-    let (rendered, parser, calls) = render(&app.vocab, request)?;
+    let (rendered, parser, calls, thinking) = render(&app.vocab, request)?;
     let max_tokens = openai::max_tokens(
         app.engine.max_context(),
         rendered.ids.len(),
+        "max_output_tokens",
         request.max_output_tokens,
     )?;
     let encrypted = request
@@ -132,6 +148,7 @@ fn prepare(app: &App, request: &ResponsesRequest) -> Result<(Prepared, Reply), A
         ignore_eos: false,
         samplings: vec![sampling],
         output: Output::new(Decoder::Chat(parser), Stops::new(stops), Vec::new(), calls),
+        thinking: Some(thinking),
     };
     // Codex shows a reasoning item's summary unless its user sets show_raw_agent_reasoning,
     // so a request that asks for a summary gets the whole text there too.
@@ -143,13 +160,14 @@ fn prepare(app: &App, request: &ResponsesRequest) -> Result<(Prepared, Reply), A
     Ok((prepared, Reply::new(app, encrypted, summary)))
 }
 
-/// The prompt of a request, the parser for its output, and the tool calls that end it.
+/// The prompt of a request, the parser for its output, the tool calls that end it, and its
+/// thinking.
 fn render(
     vocab: &Vocab,
     request: &ResponsesRequest,
-) -> Result<(Rendered, Parser, Calls), ApiError> {
+) -> Result<(Rendered, Parser, Calls, Thinking), ApiError> {
     let images = vocab.vision().is_some();
-    let messages = translate(
+    let (messages, origins) = translate(
         request.instructions.as_ref(),
         request.input.as_ref(),
         images,
@@ -161,11 +179,13 @@ fn render(
     }
     let parallel = request.parallel_tool_calls != Some(false);
     let effort = request.reasoning.as_ref().and_then(|r| r.get("effort"));
-    let thinking = chat::request_thinking(effort, None)?;
+    let thinking = chat::request_thinking("reasoning.effort", effort, None)?;
     let ending = thinking.ending(Ending::Generate, &tools);
     let (ending, calls) = tool_ending(&choice, &tools, parallel, ending)?;
-    let prompt = vocab.render_prompt(&messages, &tools, thinking.effort(), &ending)?;
-    Ok((prompt, Parser::new(vocab, &ending), calls))
+    let prompt = vocab
+        .render_prompt(&messages, &tools, thinking.effort(), &ending)
+        .map_err(|e| e.relocate(&origins))?;
+    Ok((prompt, Parser::new(vocab, &ending), calls, thinking))
 }
 
 /// The function tools among `tools`, in the Responses API's flat shape, which the chat
@@ -178,31 +198,47 @@ fn tools(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn invalid(message: &str) -> InvalidRequest {
-    InvalidRequest(message.to_owned())
-}
-
-/// `instructions` and `input` as chat messages, with images kept if `images` (`--vision`).
+/// `instructions` and `input` as chat messages, with images kept if `images` (`--vision`),
+/// and where each came from in the request.
 fn translate(
     instructions: Option<&Value>,
     input: Option<&Value>,
     images: bool,
-) -> Result<Vec<Value>, InvalidRequest> {
+) -> Result<(Vec<Value>, Vec<Origin>), InvalidRequest> {
     let mut out = Vec::new();
+    let mut origins = Vec::new();
     match instructions {
         None | Some(Value::Null) => {}
         Some(Value::String(text)) if text.is_empty() => {}
-        Some(Value::String(text)) => out.push(json!({"role": "system", "content": text})),
-        Some(Value::Array(list)) => items(list, &mut out, images)?,
-        Some(_) => return Err(invalid("instructions must be a string")),
+        Some(Value::String(text)) => {
+            out.push(json!({"role": "system", "content": text}));
+            origins.push(Origin::new("instructions"));
+        }
+        Some(Value::Array(list)) => items("instructions", list, &mut out, &mut origins, images)?,
+        Some(other) => {
+            return Err(InvalidRequest::expected(
+                "instructions",
+                "a string or an array of input items",
+                other,
+            ));
+        }
     }
     match input {
         None | Some(Value::Null) => {}
-        Some(Value::String(text)) => out.push(json!({"role": "user", "content": text})),
-        Some(Value::Array(list)) => items(list, &mut out, images)?,
-        Some(_) => return Err(invalid("input must be a string or an array of items")),
+        Some(Value::String(text)) => {
+            out.push(json!({"role": "user", "content": text}));
+            origins.push(Origin::new("input"));
+        }
+        Some(Value::Array(list)) => items("input", list, &mut out, &mut origins, images)?,
+        Some(other) => {
+            return Err(InvalidRequest::expected(
+                "input",
+                "a string or an array of input items",
+                other,
+            ));
+        }
     }
-    Ok(out)
+    Ok((out, origins))
 }
 
 /// One model turn: the reasoning, assistant messages and function calls that follow each
@@ -212,12 +248,13 @@ struct Turn {
     reasoning: Vec<String>,
     texts: Vec<Value>,
     calls: Vec<Value>,
+    origin: Origin,
 }
 
 impl Turn {
     /// The assistant message: the template renders its thinking, then its text, then its
     /// calls.
-    fn message(self) -> Value {
+    fn message(self) -> (Value, Origin) {
         let mut message = json!({"role": "assistant", "content": self.texts});
         if !self.reasoning.is_empty() {
             message["reasoning_content"] = Value::String(self.reasoning.join("\n\n"));
@@ -225,76 +262,154 @@ impl Turn {
         if !self.calls.is_empty() {
             message["tool_calls"] = Value::Array(self.calls);
         }
-        message
+        (message, self.origin)
     }
 }
 
-/// Adds the chat messages of input `list`.
-fn items(list: &[Value], out: &mut Vec<Value>, images: bool) -> Result<(), InvalidRequest> {
+/// The item types an input list takes.
+const ITEM_TYPES: [&str; 5] = [
+    "message",
+    "reasoning",
+    "function_call",
+    "function_call_output",
+    "item_reference",
+];
+
+/// The open turn, or a new one that starts at the item `at`.
+fn open_turn<'a>(turn: &'a mut Option<Turn>, at: &str) -> &'a mut Turn {
+    turn.get_or_insert_with(|| Turn {
+        origin: Origin::new(at),
+        ..Turn::default()
+    })
+}
+
+/// Adds the chat messages of the input list `list` at `at`, and where each came from.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the items, as the template's loop"
+)]
+fn items(
+    at: &str,
+    list: &[Value],
+    out: &mut Vec<Value>,
+    origins: &mut Vec<Origin>,
+    images: bool,
+) -> Result<(), InvalidRequest> {
     // Ends the open turn, then adds `message`.
-    fn push(message: Value, turn: &mut Option<Turn>, out: &mut Vec<Value>) {
+    let push = |message: Value,
+                origin: Origin,
+                turn: &mut Option<Turn>,
+                out: &mut Vec<Value>,
+                origins: &mut Vec<Origin>| {
         if let Some(turn) = turn.take() {
-            out.push(turn.message());
+            let (message, origin) = turn.message();
+            out.push(message);
+            origins.push(origin);
         }
         out.push(message);
-    }
+        origins.push(origin);
+    };
     let mut turn: Option<Turn> = None;
-    for item in list {
-        let kind = match item.get("type").and_then(Value::as_str) {
+    for (i, item) in list.iter().enumerate() {
+        let item_at = format!("{at}[{i}]");
+        let within = |e: InvalidRequest| e.within(&item_at);
+        let kind = match item.get("type") {
             // An easy input message: a role and content, without a type.
             None if item.get("role").is_some() => "message",
-            None => return Err(invalid("every input item needs a type")),
-            Some(kind) => kind,
+            Some(Value::String(kind)) => kind.as_str(),
+            other => {
+                return Err(within(InvalidRequest::expected(
+                    "type",
+                    &one_of(&ITEM_TYPES),
+                    other.unwrap_or(&Value::Null),
+                )));
+            }
         };
         match kind {
             "message" => {
                 let content = item.get("content").unwrap_or(&Value::Null);
-                match item.get("role").and_then(Value::as_str) {
-                    Some("assistant") => turn
-                        .get_or_insert_default()
-                        .texts
-                        .extend(parts(content, images)?),
+                let role = item.get("role").unwrap_or(&Value::Null);
+                match role.as_str() {
+                    Some("assistant") => {
+                        let (parts, paths) = parts(content, &format!("{item_at}.content"), images)?;
+                        let turn = open_turn(&mut turn, &item_at);
+                        turn.texts.extend(parts);
+                        turn.origin.parts.extend(paths);
+                    }
                     Some(role @ ("user" | "system" | "developer")) => {
-                        let content = match content {
-                            Value::String(text) => Value::String(text.clone()),
-                            _ => Value::Array(parts(content, images)?),
+                        let (content, paths) = if let Value::String(text) = content {
+                            (
+                                Value::String(text.clone()),
+                                vec![format!("{item_at}.content")],
+                            )
+                        } else {
+                            let (parts, paths) =
+                                parts(content, &format!("{item_at}.content"), images)?;
+                            (Value::Array(parts), paths)
                         };
-                        push(json!({"role": role, "content": content}), &mut turn, out);
+                        let origin = Origin {
+                            parts: paths,
+                            ..Origin::new(item_at.clone())
+                        };
+                        push(
+                            json!({"role": role, "content": content}),
+                            origin,
+                            &mut turn,
+                            out,
+                            origins,
+                        );
                     }
-                    Some(role) => {
-                        return Err(InvalidRequest(format!("unknown message role: {role}")));
+                    _ => {
+                        return Err(within(InvalidRequest::expected(
+                            "role",
+                            &one_of(&["user", "assistant", "system", "developer"]),
+                            role,
+                        )));
                     }
-                    None => return Err(invalid("every message needs a string role")),
                 }
             }
             "reasoning" => {
                 let text = reasoning_text(item);
                 if !text.is_empty() {
-                    turn.get_or_insert_default().reasoning.push(text);
+                    open_turn(&mut turn, &item_at).reasoning.push(text);
                 }
             }
             "function_call" => {
                 let field = |key| item.get(key).cloned().unwrap_or(Value::Null);
-                turn.get_or_insert_default().calls.push(json!({
+                let turn = open_turn(&mut turn, &item_at);
+                turn.calls.push(json!({
                     "id": field("call_id"),
                     "type": "function",
                     "function": {"name": field("name"), "arguments": field("arguments")},
                 }));
+                turn.origin.calls.push(item_at.clone());
             }
             "function_call_output" => {
-                let content = match item.get("output") {
-                    Some(Value::String(text)) => Value::String(text.clone()),
-                    Some(output @ Value::Array(_)) => Value::Array(parts(output, images)?),
-                    _ => Value::String(String::new()),
+                let (content, paths) = match item.get("output") {
+                    Some(Value::String(text)) => (
+                        Value::String(text.clone()),
+                        vec![format!("{item_at}.output")],
+                    ),
+                    Some(output @ Value::Array(_)) => {
+                        let (parts, paths) = parts(output, &format!("{item_at}.output"), images)?;
+                        (Value::Array(parts), paths)
+                    }
+                    _ => (Value::String(String::new()), Vec::new()),
                 };
                 let id = item.get("call_id").cloned().unwrap_or(Value::Null);
                 let message = json!({"role": "tool", "tool_call_id": id, "content": content});
-                push(message, &mut turn, out);
+                let origin = Origin {
+                    parts: paths,
+                    ..Origin::new(item_at.clone())
+                };
+                push(message, origin, &mut turn, out, origins);
             }
             "item_reference" => {
-                return Err(invalid(
-                    "item_reference is not supported: this server stores no responses",
-                ));
+                return Err(within(InvalidRequest::field(
+                    "type",
+                    "\"item_reference\" is not supported: this server stores no responses, so \
+                     send the items themselves",
+                )));
             }
             // Hosted and custom tool calls and their outputs, and compaction items: the
             // server declares no such tools, so the model made none of them.
@@ -302,36 +417,51 @@ fn items(list: &[Value], out: &mut Vec<Value>, images: bool) -> Result<(), Inval
         }
     }
     if let Some(turn) = turn {
-        out.push(turn.message());
+        let (message, origin) = turn.message();
+        out.push(message);
+        origins.push(origin);
     }
     Ok(())
 }
 
-/// The chat content parts of a message's content: text parts as text, an image as itself
-/// if `images` or else a note, a file as a note. Other parts are left out.
-fn parts(content: &Value, images: bool) -> Result<Vec<Value>, InvalidRequest> {
+/// The chat content parts of `content`, the field at `at`: text parts as text, an image as
+/// itself if `images` or else a note, a file as a note, and each one's path. Other parts
+/// are left out.
+fn parts(
+    content: &Value,
+    at: &str,
+    images: bool,
+) -> Result<(Vec<Value>, Vec<String>), InvalidRequest> {
     let text = |text: &str| json!({"type": "text", "text": text});
     let list = match content {
-        Value::String(s) => return Ok(vec![text(s)]),
+        Value::String(s) => return Ok((vec![text(s)], vec![at.to_owned()])),
         Value::Array(list) => list,
-        Value::Null => return Ok(Vec::new()),
-        _ => return Err(invalid("content must be a string or an array of parts")),
+        Value::Null => return Ok((Vec::new(), Vec::new())),
+        other => {
+            return Err(InvalidRequest::expected(
+                at,
+                "a string or an array of content parts",
+                other,
+            ));
+        }
     };
-    Ok(list
-        .iter()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+    let mut parts = Vec::new();
+    let mut paths = Vec::new();
+    for (j, part) in list.iter().enumerate() {
+        let part = match part.get("type").and_then(Value::as_str) {
             Some("input_text" | "output_text" | "text") => {
-                Some(text(part.get("text").and_then(Value::as_str).unwrap_or("")))
+                text(part.get("text").and_then(Value::as_str).unwrap_or(""))
             }
-            Some("refusal") => Some(text(
-                part.get("refusal").and_then(Value::as_str).unwrap_or(""),
-            )),
-            Some("input_image") if images => Some(part.clone()),
-            Some("input_image") => Some(text(NO_IMAGE)),
-            Some("input_file") => Some(text(NO_DOCUMENT)),
-            _ => None,
-        })
-        .collect())
+            Some("refusal") => text(part.get("refusal").and_then(Value::as_str).unwrap_or("")),
+            Some("input_image") if images => part.clone(),
+            Some("input_image") => text(NO_IMAGE),
+            Some("input_file") => text(NO_DOCUMENT),
+            _ => continue,
+        };
+        parts.push(part);
+        paths.push(format!("{at}[{j}]"));
+    }
+    Ok((parts, paths))
 }
 
 /// The thinking text of a reasoning item: its content's text, else its `encrypted_content`
@@ -958,7 +1088,7 @@ mod tests {
         let mut named = base.clone();
         named["tools"] = json!([exec_tool()]);
         named["tool_choice"] = json!({"type": "function", "name": "exec_command"});
-        let (rendered, _, calls) = render(&vocab, &parse(named.clone())).unwrap();
+        let (rendered, _, calls, _) = render(&vocab, &parse(named.clone())).unwrap();
         assert!(
             vocab
                 .decode(&rendered.ids)
@@ -993,7 +1123,7 @@ mod tests {
         let request = json!({"input": [
             {"role": "user", "content": [image.clone(), {"type": "input_text", "text": "What?"}]},
         ]});
-        let (rendered, _, _) = render(&vocab, &parse(request)).unwrap();
+        let (rendered, _, _, _) = render(&vocab, &parse(request)).unwrap();
         assert_eq!(rendered.images.len(), 1);
         assert!(!vocab.decode(&rendered.ids).contains("image omitted"));
     }
@@ -1067,6 +1197,7 @@ mod tests {
         let results = Results {
             receiver,
             tracker: Arc::new(Metrics::new("m")).track(10),
+            log: None,
         };
         let output = Output::new(
             Decoder::Chat(Parser::new(vocab, &Ending::Generate)),
@@ -1273,6 +1404,7 @@ mod tests {
         let results = Results {
             receiver,
             tracker: Arc::new(Metrics::new("m")).track(10),
+            log: None,
         };
         let output = Output::new(
             Decoder::Chat(Parser::new(vocab, &Ending::Generate)),

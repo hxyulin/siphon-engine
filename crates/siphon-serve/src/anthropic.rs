@@ -22,7 +22,7 @@ use std::{
 
 use axum::{
     Extension, Json,
-    extract::{State, rejection::JsonRejection},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -30,11 +30,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    chat::{self, Ending, InvalidRequest, Rendered, Thinking, Vocab},
+    chat::{self, Ending, Rendered, Thinking, Vocab},
     engine::Finish,
+    invalid::{InvalidRequest, Origin, one_of},
+    keepalive,
     openai::{
-        self, ApiError, App, Calls, Decoder, Delivery, Output, Prepared, RequestId, blocking,
-        tool_ending,
+        self, ApiError, App, Calls, Decoder, Delivery, JsonBody, Output, Prepared, RequestId,
+        blocking, tool_ending,
     },
     parse::{Delta, Parser, ToolPart},
     request::{self, SamplingFields, ToolChoice},
@@ -72,8 +74,8 @@ impl IntoResponse for Error {
         } else {
             error_kind(self.0.status)
         };
-        self.0
-            .with_retry_after((status, Json(error_body(kind, &self.0.message))).into_response())
+        let response = (status, Json(error_body(kind, &self.0.message))).into_response();
+        self.0.noted(self.0.with_retry_after(response))
     }
 }
 
@@ -115,23 +117,31 @@ pub struct MessagesRequest {
 pub async fn messages(
     State(app): State<Arc<App>>,
     Extension(id): Extension<RequestId>,
-    request: Result<Json<MessagesRequest>, JsonRejection>,
-) -> Result<Response, Error> {
-    let Json(request) = request.map_err(|e| Error(e.into()))?;
-    let prepared = blocking(&app, move |app| prepare(app, &request))
-        .await
-        .map_err(Error)?;
-    let message = Message::new(&app);
-    sse::respond(app, prepared, message, &id)
-        .await
-        .map_err(Error)
+    request: Result<JsonBody<MessagesRequest>, ApiError>,
+) -> Response {
+    let request = match request {
+        Ok(JsonBody(request)) => request,
+        Err(e) => return Error(e).into_response(),
+    };
+    let keepalive = app.keepalive.filter(|_| request.stream != Some(true));
+    let log = Arc::clone(&id.log);
+    keepalive::respond(keepalive, &log, async move {
+        let prepared = blocking(&app, move |app| prepare(app, &request))
+            .await
+            .map_err(Error)?;
+        let message = Message::new(&app);
+        sse::respond(app, prepared, message, &id)
+            .await
+            .map_err(Error)
+    })
+    .await
 }
 
 pub async fn count_tokens(
     State(app): State<Arc<App>>,
-    request: Result<Json<MessagesRequest>, JsonRejection>,
+    request: Result<JsonBody<MessagesRequest>, ApiError>,
 ) -> Result<Json<Value>, Error> {
-    let Json(request) = request.map_err(|e| Error(e.into()))?;
+    let JsonBody(request) = request.map_err(Error)?;
     let body = blocking(&app, move |app| count(&app.vocab, &request))
         .await
         .map_err(Error)?;
@@ -145,9 +155,13 @@ fn count(vocab: &Vocab, request: &MessagesRequest) -> Result<Value, ApiError> {
 
 fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
     let Some(requested) = request.max_tokens else {
-        return Err(ApiError::bad_request("max_tokens: Field required"));
+        return Err(InvalidRequest::field(
+            "max_tokens",
+            "Field required: the most tokens the reply may generate, an integer of at least 1",
+        )
+        .into());
     };
-    let stops = request::stops(request.stop_sequences.as_ref())?;
+    let stops = request::stops("stop_sequences", request.stop_sequences.as_ref())?;
     let sampling = request::sampling(
         &SamplingFields {
             temperature: request.temperature,
@@ -157,7 +171,7 @@ fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
         },
         &app.sampling,
     )?;
-    let (rendered, parser, calls) = render(&app.vocab, request)?;
+    let (rendered, parser, calls, thinking) = render(&app.vocab, request)?;
     let max_tokens = limit(app.engine.max_context(), rendered.ids.len(), requested)?;
     Ok(Prepared {
         prompt: rendered.ids,
@@ -174,6 +188,7 @@ fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
         ignore_eos: false,
         samplings: vec![sampling],
         output: Output::new(Decoder::Chat(parser), Stops::new(stops), Vec::new(), calls),
+        thinking: Some(thinking),
     })
 }
 
@@ -181,24 +196,34 @@ fn prepare(app: &App, request: &MessagesRequest) -> Result<Prepared, ApiError> {
 /// them to shrink `max_tokens` or to compact the conversation.
 fn limit(max_context: usize, prompt_len: usize, requested: u64) -> Result<usize, ApiError> {
     if prompt_len >= max_context {
-        return Err(ApiError::bad_request(format!(
-            "prompt is too long: {prompt_len} tokens > {max_context} maximum"
-        )));
+        return Err(ApiError {
+            param: Some("messages".to_owned()),
+            ..ApiError::bad_request(format!(
+                "prompt is too long: {prompt_len} tokens > {max_context} maximum"
+            ))
+        });
     }
     let n = usize::try_from(requested).unwrap_or(usize::MAX);
     if n > max_context - prompt_len {
-        return Err(ApiError::bad_request(format!(
-            "input length and `max_tokens` exceed context limit: {prompt_len} + {n} > \
-             {max_context}, decrease input length or `max_tokens` and try again"
-        )));
+        return Err(ApiError {
+            param: Some("max_tokens".to_owned()),
+            ..ApiError::bad_request(format!(
+                "input length and `max_tokens` exceed context limit: {prompt_len} + {n} > \
+                 {max_context}, decrease input length or `max_tokens` and try again"
+            ))
+        });
     }
-    openai::max_tokens(max_context, prompt_len, Some(requested))
+    openai::max_tokens(max_context, prompt_len, "max_tokens", Some(requested))
 }
 
-/// The prompt of a request, the parser for its output, and the tool calls that end it.
-fn render(vocab: &Vocab, request: &MessagesRequest) -> Result<(Rendered, Parser, Calls), ApiError> {
+/// The prompt of a request, the parser for its output, the tool calls that end it, and its
+/// thinking.
+fn render(
+    vocab: &Vocab,
+    request: &MessagesRequest,
+) -> Result<(Rendered, Parser, Calls, Thinking), ApiError> {
     let images = vocab.vision().is_some();
-    let messages = translate(request.system.as_ref(), &request.messages, images)?;
+    let (messages, origins) = translate(request.system.as_ref(), &request.messages, images)?;
     let mut tools = tools(request.tools.as_deref().unwrap_or_default());
     let (choice, parallel) = tool_choice(request.tool_choice.as_ref())?;
     if choice == ToolChoice::None {
@@ -212,8 +237,10 @@ fn render(vocab: &Vocab, request: &MessagesRequest) -> Result<(Rendered, Parser,
     };
     let thinking = thinking(request.thinking.as_ref(), request.output_config.as_ref());
     let (ending, calls) = tool_ending(&choice, &tools, parallel, thinking.ending(ending, &tools))?;
-    let prompt = vocab.render_prompt(&messages, &tools, thinking.effort(), &ending)?;
-    Ok((prompt, Parser::new(vocab, &ending), calls))
+    let prompt = vocab
+        .render_prompt(&messages, &tools, thinking.effort(), &ending)
+        .map_err(|e| e.relocate(&origins))?;
+    Ok((prompt, Parser::new(vocab, &ending), calls, thinking))
 }
 
 /// The request's thinking: off when `thinking` is disabled, else `output_config.effort`
@@ -225,7 +252,7 @@ fn thinking(thinking: Option<&Value>, output_config: Option<&Value>) -> Thinking
     let effort = output_config
         .and_then(|c| c.get("effort"))
         .filter(|e| e.is_string())
-        .and_then(|e| chat::effort(Some(e)).ok())
+        .and_then(|e| chat::effort("output_config.effort", Some(e)).ok())
         .unwrap_or(chat::DEFAULT_EFFORT);
     Thinking::Effort(effort)
 }
@@ -242,15 +269,22 @@ fn tool_choice(value: Option<&Value>) -> Result<(ToolChoice, bool), InvalidReque
         Some("none") => ToolChoice::None,
         Some("tool") => match value.get("name").and_then(Value::as_str) {
             Some(name) => ToolChoice::Function(name.to_owned()),
-            None => return Err(invalid("tool_choice of type tool needs a name")),
+            None => {
+                return Err(InvalidRequest::missing(
+                    "tool_choice.name",
+                    "the name of the tool to call, for type \"tool\"",
+                ));
+            }
         },
-        _ => return Err(invalid("tool_choice type must be auto, any, tool or none")),
+        _ => {
+            return Err(InvalidRequest::expected(
+                "tool_choice.type",
+                &one_of(&["auto", "any", "tool", "none"]),
+                value.get("type").unwrap_or(&Value::Null),
+            ));
+        }
     };
     Ok((choice, parallel))
-}
-
-fn invalid(message: &str) -> InvalidRequest {
-    InvalidRequest(message.to_owned())
 }
 
 /// Anthropic's tools as OpenAI function tools. Server tools, whose `type` is set and not
@@ -278,32 +312,50 @@ fn tools(tools: &[Value]) -> Vec<Value> {
 }
 
 /// Anthropic's `system` and `messages` as OpenAI-shaped messages, with image blocks kept
-/// as images if `images` (`--vision`).
+/// as images if `images` (`--vision`), and where each came from in the request.
 fn translate(
     system: Option<&Value>,
     messages: &[Value],
     images: bool,
-) -> Result<Vec<Value>, InvalidRequest> {
+) -> Result<(Vec<Value>, Vec<Origin>), InvalidRequest> {
     let mut out = Vec::new();
+    let mut origins = Vec::new();
     if let Some(system) = system {
-        let text = system_text(system)?;
+        let text = system_text(system).map_err(|e| e.within("system"))?;
         if !text.is_empty() {
             out.push(json!({"role": "system", "content": text}));
+            origins.push(Origin::new("system"));
         }
     }
-    for message in messages {
+    for (i, message) in messages.iter().enumerate() {
+        let at = format!("messages[{i}]");
         let content = message.get("content").unwrap_or(&Value::Null);
-        match message.get("role").and_then(Value::as_str) {
-            Some("user") => user(content, &mut out, images)?,
-            Some("assistant") => out.push(assistant(content)?),
+        let role = message.get("role").unwrap_or(&Value::Null);
+        let within = |e: InvalidRequest| e.within(&at);
+        match role.as_str() {
+            Some("user") => user(content, &at, &mut out, &mut origins, images).map_err(within)?,
+            Some("assistant") => {
+                let (message, origin) = assistant(content, &at).map_err(within)?;
+                out.push(message);
+                origins.push(origin);
+            }
             // Claude Code sends these mid-conversation. The template renders a system
             // message where it stands.
-            Some("system") => out.push(json!({"role": "system", "content": system_text(content)?})),
-            Some(role) => return Err(InvalidRequest(format!("unknown message role: {role}"))),
-            None => return Err(invalid("every message needs a string role")),
+            Some("system") => {
+                let text = system_text(content).map_err(|e| within(e.within("content")))?;
+                out.push(json!({"role": "system", "content": text}));
+                origins.push(Origin::new(at.clone()));
+            }
+            _ => {
+                return Err(within(InvalidRequest::expected(
+                    "role",
+                    &one_of(&["user", "assistant", "system"]),
+                    role,
+                )));
+            }
         }
     }
-    Ok(out)
+    Ok((out, origins))
 }
 
 /// The text blocks of a system prompt joined into one, less Claude Code's billing header.
@@ -312,9 +364,11 @@ fn system_text(system: &Value) -> Result<String, InvalidRequest> {
         Value::String(text) => return Ok(text.clone()),
         Value::Array(blocks) => blocks,
         Value::Null => return Ok(String::new()),
-        _ => {
-            return Err(invalid(
-                "system must be a string or an array of text blocks",
+        other => {
+            return Err(InvalidRequest::expected(
+                "",
+                "a string or an array of text blocks",
+                other,
             ));
         }
     };
@@ -339,8 +393,10 @@ fn content_blocks(content: &Value) -> Result<ContentBlocks<'_>, InvalidRequest> 
         Value::String(text) => Ok(ContentBlocks::Text(text.as_str())),
         Value::Array(blocks) => Ok(ContentBlocks::Array(blocks.as_slice())),
         Value::Null => Ok(ContentBlocks::Empty),
-        _ => Err(invalid(
-            "message content must be a string or an array of blocks",
+        other => Err(InvalidRequest::expected(
+            "content",
+            "a string or an array of content blocks",
+            other,
         )),
     }
 }
@@ -361,69 +417,107 @@ fn text_part(text: &str) -> Value {
     json!({"type": "text", "text": text})
 }
 
-/// Adds a user message: its text and image blocks as user messages and each `tool_result`
-/// as a tool message, in their order.
-fn user(content: &Value, out: &mut Vec<Value>, images: bool) -> Result<(), InvalidRequest> {
+/// Adds the user message at `at`: its text and image blocks as user messages and each
+/// `tool_result` as a tool message, in their order, and where each came from.
+fn user(
+    content: &Value,
+    at: &str,
+    out: &mut Vec<Value>,
+    origins: &mut Vec<Origin>,
+    images: bool,
+) -> Result<(), InvalidRequest> {
     let blocks = match content_blocks(content)? {
         ContentBlocks::Empty => return Ok(()),
         ContentBlocks::Text(text) => {
             out.push(json!({"role": "user", "content": [text_part(text)]}));
+            origins.push(Origin {
+                parts: vec![format!("{at}.content")],
+                ..Origin::new(at)
+            });
             return Ok(());
         }
         ContentBlocks::Array(blocks) => blocks,
     };
     let mut parts = Vec::new();
-    let flush = |parts: &mut Vec<Value>, out: &mut Vec<Value>| {
+    let mut paths = Vec::new();
+    let flush = |parts: &mut Vec<Value>,
+                 paths: &mut Vec<String>,
+                 out: &mut Vec<Value>,
+                 origins: &mut Vec<Origin>| {
         if !parts.is_empty() {
             out.push(json!({"role": "user", "content": std::mem::take(parts)}));
+            origins.push(Origin {
+                parts: std::mem::take(paths),
+                ..Origin::new(at)
+            });
         }
     };
-    for block in blocks {
+    for (k, block) in blocks.iter().enumerate() {
+        let block_at = format!("{at}.content[{k}]");
         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-            flush(&mut parts, out);
+            flush(&mut parts, &mut paths, out, origins);
             let id = block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let content = match content_blocks(block.get("content").unwrap_or(&Value::Null))? {
-                ContentBlocks::Empty => Value::String(String::new()),
-                ContentBlocks::Text(text) => Value::Array(vec![text_part(text)]),
-                ContentBlocks::Array(items) => {
-                    let texts: Vec<Value> = items
-                        .iter()
-                        .filter_map(|b| block_part(b, images))
-                        .collect();
-                    if texts.is_empty() {
-                        Value::String(String::new())
-                    } else {
-                        Value::Array(texts)
+            let inner = block.get("content").unwrap_or(&Value::Null);
+            let mut inner_paths = Vec::new();
+            let content =
+                match content_blocks(inner).map_err(|e| e.within(format_args!("content[{k}]")))? {
+                    ContentBlocks::Empty => Value::String(String::new()),
+                    ContentBlocks::Text(text) => {
+                        inner_paths.push(format!("{block_at}.content"));
+                        Value::Array(vec![text_part(text)])
                     }
-                }
-            };
+                    ContentBlocks::Array(items) => {
+                        let mut texts = Vec::new();
+                        for (m, item) in items.iter().enumerate() {
+                            if let Some(part) = block_part(item, images) {
+                                texts.push(part);
+                                inner_paths.push(format!("{block_at}.content[{m}]"));
+                            }
+                        }
+                        if texts.is_empty() {
+                            Value::String(String::new())
+                        } else {
+                            Value::Array(texts)
+                        }
+                    }
+                };
             out.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
+            origins.push(Origin {
+                parts: inner_paths,
+                ..Origin::new(block_at)
+            });
         } else if let Some(part) = block_part(block, images) {
             parts.push(part);
+            paths.push(block_at);
         }
     }
-    flush(&mut parts, out);
+    flush(&mut parts, &mut paths, out, origins);
     Ok(())
 }
 
-/// An assistant message: thinking as `reasoning_content`, text blocks as content, and
-/// `tool_use` blocks as tool calls. The template renders a message's thinking first, then its
-/// text, then its calls.
-fn assistant(content: &Value) -> Result<Value, InvalidRequest> {
+/// The assistant message at `at`: thinking as `reasoning_content`, text blocks as content,
+/// and `tool_use` blocks as tool calls, and where its parts came from. The template renders
+/// a message's thinking first, then its text, then its calls.
+fn assistant(content: &Value, at: &str) -> Result<(Value, Origin), InvalidRequest> {
+    let mut origin = Origin::new(at);
     let blocks = match content_blocks(content)? {
-        ContentBlocks::Empty => return Ok(json!({"role": "assistant", "content": []})),
+        ContentBlocks::Empty => return Ok((json!({"role": "assistant", "content": []}), origin)),
         ContentBlocks::Text(text) => {
-            return Ok(json!({"role": "assistant", "content": [text_part(text)]}));
+            origin.parts.push(format!("{at}.content"));
+            return Ok((
+                json!({"role": "assistant", "content": [text_part(text)]}),
+                origin,
+            ));
         }
         ContentBlocks::Array(blocks) => blocks,
     };
     let mut thinking = Vec::new();
     let mut texts = Vec::new();
     let mut calls = Vec::new();
-    for block in blocks {
+    for (k, block) in blocks.iter().enumerate() {
         match block.get("type").and_then(Value::as_str) {
             Some("thinking") => {
                 if let Some(text) = block.get("thinking").and_then(Value::as_str)
@@ -436,20 +530,38 @@ fn assistant(content: &Value) -> Result<Value, InvalidRequest> {
                 texts.push(text_part(
                     block.get("text").and_then(Value::as_str).unwrap_or(""),
                 ));
+                origin.parts.push(format!("{at}.content[{k}]"));
             }
             Some("tool_use") => {
+                let block_at = |field| format!("content[{k}].{field}");
+                let name = match block.get("name") {
+                    Some(Value::String(name)) => name.clone(),
+                    None => return Err(InvalidRequest::missing(block_at("name"), "a string")),
+                    Some(other) => {
+                        return Err(InvalidRequest::expected(
+                            block_at("name"),
+                            "a string",
+                            other,
+                        ));
+                    }
+                };
                 let arguments = match block.get("input") {
-                    Some(input) => input.to_string(),
                     None => "{}".to_owned(),
+                    Some(input @ Value::Object(_)) => input.to_string(),
+                    Some(other) => {
+                        return Err(InvalidRequest::expected(
+                            block_at("input"),
+                            "an object of the tool's arguments",
+                            other,
+                        ));
+                    }
                 };
                 calls.push(json!({
                     "id": block.get("id").cloned().unwrap_or(Value::Null),
                     "type": "function",
-                    "function": {
-                        "name": block.get("name").cloned().unwrap_or(Value::Null),
-                        "arguments": arguments,
-                    },
+                    "function": {"name": name, "arguments": arguments},
                 }));
+                origin.calls.push(format!("{at}.content[{k}]"));
             }
             // `redacted_thinking` and server tool blocks carry nothing the model can read.
             _ => {}
@@ -462,7 +574,7 @@ fn assistant(content: &Value) -> Result<Value, InvalidRequest> {
     if !calls.is_empty() {
         message["tool_calls"] = Value::Array(calls);
     }
-    Ok(message)
+    Ok((message, origin))
 }
 
 /// One reply: the fields its body and events share, and its content blocks.
@@ -847,7 +959,7 @@ mod tests {
              "data": png}},
             {"type": "text", "text": "And this one?"},
         ]);
-        let (rendered, _, _) = render(&vocab, &parse(request)).unwrap();
+        let (rendered, _, _, _) = render(&vocab, &parse(request)).unwrap();
         let text = vocab.decode(&rendered.ids);
         let image = "<|content_image|><|unused_200054|><|unused_200054|><|end_message|>";
         assert!(
@@ -1113,6 +1225,7 @@ mod tests {
         let results = Results {
             receiver,
             tracker: Arc::new(Metrics::new("m")).track(10),
+            log: None,
         };
         let output = Output::new(
             Decoder::Chat(parser),
@@ -1271,7 +1384,7 @@ mod tests {
         let vocab = vocab();
         let request = parse(json!({"max_tokens": 32, "thinking": {"type": "disabled"},
             "messages": [{"role": "user", "content": "Capital of Australia?"}]}));
-        let (_, parser, calls) = render(&vocab, &request).unwrap();
+        let (_, parser, calls, _) = render(&vocab, &request).unwrap();
         // After the prompt's thinking block, the model opens a text block.
         let mut ids = text(&vocab, "Canberra.");
         ids.push(vocab.special.end_message);
@@ -1304,7 +1417,7 @@ mod tests {
         let mut ids = text(&vocab, "Canberra.");
         ids.push(vocab.special.end_message);
         let events = vec![Event::Tokens(ids), Event::Done(Finish::Stop)];
-        let (_, _, calls) = render(&vocab, &request).unwrap();
+        let (_, _, calls, _) = render(&vocab, &request).unwrap();
         let frames = collect_parsed(&vocab, parser, &[], calls, events, false).await;
         assert_eq!(
             frames[0].1["content"],
@@ -1407,6 +1520,7 @@ mod tests {
         let results = Results {
             receiver,
             tracker: Arc::new(Metrics::new("m")).track(10),
+            log: None,
         };
         let output = Output::new(
             Decoder::Chat(Parser::new(vocab, &Ending::Generate)),
@@ -1553,7 +1667,8 @@ mod tests {
             ],
             false,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(translated.len(), 5);
         assert_eq!(translated[0]["role"], "system");
         assert_eq!(translated[1]["role"], "user");

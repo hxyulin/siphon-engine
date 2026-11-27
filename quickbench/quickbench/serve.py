@@ -1,5 +1,6 @@
 """Starts and stops siphon-serve, reads its job log, and lists GPU processes."""
 
+import json
 import os
 import re
 import subprocess
@@ -8,11 +9,9 @@ from pathlib import Path
 
 from . import client
 
-JOB = re.compile(
-    r"job: (\d+) prompt tokens \((\d+) cached\), prefill (\d+) ms, (\d+) tokens in "
-    r"([\d.]+) s \(([\d.]+) tok/s, (\d+) speculated, (\d+) batched steps(.*)\), (\S+)"
-)
-PER_ROUND = re.compile(r"([\d.]+) tokens per round")
+# A `request` log line's fields: bare values, or JSON strings when they hold a space.
+FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
+ENGINE = re.compile(r"(\d+) speculated, (\d+) batched steps")
 
 
 class Siphon:
@@ -52,15 +51,22 @@ class Siphon:
         return "".join(self.log.read_text(errors="replace").splitlines(True)[-lines:])
 
     def jobs(self) -> list[dict]:
-        """Every finished job in the log so far, in finishing order."""
+        """Every request that ran a job, from the log's `request` lines, in finishing order."""
         out = []
         for line in self.log.read_text(errors="replace").splitlines():
-            if m := JOB.search(line):
-                per_round = PER_ROUND.search(m.group(9))
-                out.append({"prompt_tokens": int(m.group(1)), "cached": int(m.group(2)),
-                            "tokens": int(m.group(4)), "speculated": int(m.group(7)),
-                            "batched": int(m.group(8)),
-                            "tokens_per_round": float(per_round.group(1)) if per_round else None})
+            if " request id=" not in line:
+                continue
+            fields = {k: json.loads(v) if v.startswith('"') else v
+                      for k, v in FIELD.findall(line.split(" request ", 1)[1])}
+            if "output" not in fields:
+                continue
+            engine = ENGINE.search(fields.get("engine", ""))
+            out.append({"prompt_tokens": int(fields["prompt"]), "cached": int(fields["cached"]),
+                        "tokens": int(fields["output"]),
+                        "speculated": int(engine.group(1)) if engine else 0,
+                        "batched": int(engine.group(2)) if engine else 0,
+                        "tokens_per_round": float(fields["per_round"])
+                        if "per_round" in fields else None})
         return out
 
 

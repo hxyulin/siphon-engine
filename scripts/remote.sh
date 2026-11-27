@@ -17,4 +17,9 @@ rsync -a --delete \
     --exclude /target --exclude .pixi --exclude /.git --exclude /reference/.venv \
     --exclude /reference/out --exclude /quickbench/.venv --exclude /experiments --exclude /releases --exclude /.claude \
     "$root/" "$host:$dir/"
-ssh -o BatchMode=yes "$host" "cd $(printf %q "$dir") && pixi run $(printf '%q ' "$@")"
+# The copy holds no .git, so the build reads the commit from here.
+commit=$(git -C "$root" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+if [ -n "$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    commit=$commit-dirty
+fi
+ssh -o BatchMode=yes "$host" "cd $(printf %q "$dir") && SIPHON_COMMIT=$commit pixi run $(printf '%q ' "$@")"

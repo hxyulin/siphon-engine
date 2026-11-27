@@ -48,7 +48,8 @@ use std::{
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
+    body::{Body, Bytes, HttpBody},
+    extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
@@ -58,16 +59,22 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt as _;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tower_http::{compression::CompressionLayer, decompression::RequestDecompressionLayer};
+use tower_http::{
+    compression::{CompressionLayer, DefaultPredicate, Predicate as _},
+    decompression::RequestDecompressionLayer,
+};
 
 use crate::{
     anthropic,
-    chat::{self, Ending, InvalidRequest, Vocab},
+    chat::{self, Ending, Thinking, Vocab},
     engine::{Engine, Event, Finish, Job, Refused, Sampling},
+    invalid::{InvalidRequest, serde_detail},
+    keepalive::{self, Uncompressed},
+    log::RequestLog,
     metrics::{Metrics, Reason, Times, Tracker},
     parse::{Delta, Detokenizer, Parser, ToolCall, ToolPart},
     request::{self, SamplingDefaults, SamplingFields, ToolChoice},
@@ -91,6 +98,8 @@ pub struct App {
     pub sampling: SamplingDefaults,
     /// `--greedy`: every request decodes greedily, whatever its sampling fields ask.
     pub greedy: bool,
+    /// `--keepalive-after`: keep-alive bytes for replies that are not streamed.
+    pub keepalive: Option<keepalive::KeepAlive>,
 }
 
 /// The sampling of each of a request's `n` choices. Under `--greedy` every choice would be
@@ -101,9 +110,11 @@ fn choice_samplings(
     n: usize,
 ) -> Result<Vec<Sampling>, ApiError> {
     if app.greedy && n > 1 {
-        return Err(ApiError::bad_request(format!(
-            "n must be 1 when the server decodes greedily (--greedy), got {n}"
-        )));
+        return Err(InvalidRequest::field(
+            "n",
+            format!("must be 1 when the server decodes greedily (--greedy), got {n}"),
+        )
+        .into());
     }
     Ok(request::samplings(fields, &app.sampling, n)?)
 }
@@ -145,18 +156,30 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/metrics", get(metrics_route))
         .route(
             "/version",
-            get(|| async { Json(json!({"version": env!("CARGO_PKG_VERSION")})) }),
+            get(|| async {
+                Json(json!({"version": env!("CARGO_PKG_VERSION"), "commit": crate::COMMIT}))
+            }),
         )
         .with_state(app)
         .layer(middleware::from_fn(request_id))
         .layer(RequestDecompressionLayer::new())
-        .layer(CompressionLayer::new())
+        .layer(
+            CompressionLayer::new().compress_when(DefaultPredicate::new().and(
+                |_, _, _: &HeaderMap, extensions: &axum::http::Extensions| {
+                    extensions.get::<Uncompressed>().is_none()
+                },
+            )),
+        )
 }
 
 /// A request's id: the client's `x-request-id` or `x-client-request-id` when valid, else
-/// one the server makes. Job log lines carry it, and the response echoes it.
+/// one the server makes. Log lines carry it, and the response echoes it. It holds the
+/// request's [`RequestLog`].
 #[derive(Clone, Debug)]
-pub(crate) struct RequestId(pub(crate) Arc<str>);
+pub(crate) struct RequestId {
+    pub(crate) id: Arc<str>,
+    pub(crate) log: Arc<RequestLog>,
+}
 
 /// The longest client request id the server takes.
 const REQUEST_ID_BYTES: usize = 128;
@@ -164,7 +187,7 @@ const REQUEST_ID_BYTES: usize = 128;
 impl RequestId {
     /// The client's id from `headers`, if one is valid: 1 to 128 printable ASCII bytes
     /// without spaces.
-    fn from_client(headers: &HeaderMap) -> Option<Self> {
+    fn from_client(headers: &HeaderMap) -> Option<Arc<str>> {
         ["x-request-id", "x-client-request-id"]
             .into_iter()
             .filter_map(|name| headers.get(name))
@@ -173,37 +196,125 @@ impl RequestId {
                 (1..=REQUEST_ID_BYTES).contains(&id.len()) && id.iter().all(u8::is_ascii_graphic)
             })
             .and_then(|id| std::str::from_utf8(id).ok())
-            .map(|id| Self(id.into()))
+            .map(Arc::from)
     }
 
     /// A new id: 64 random bits.
-    fn generate() -> Self {
+    fn generate() -> Arc<str> {
         use std::hash::{BuildHasher as _, Hasher as _};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
         hasher.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
-        Self(format!("req-{:016x}", hasher.finish()).into())
+        format!("req-{:016x}", hasher.finish()).into()
     }
 
     /// The log label of the job of the response `response_id`: choice `choice` of `n`.
     pub(crate) fn label(&self, response_id: &str, choice: usize, n: usize) -> Arc<str> {
         if n > 1 {
-            format!("{} {response_id} choice {choice}", self.0).into()
+            format!("{} {response_id} choice {choice}", self.id).into()
         } else {
-            format!("{} {response_id}", self.0).into()
+            format!("{} {response_id}", self.id).into()
         }
     }
 }
 
-/// Gives the request its [`RequestId`] and puts it in the response's `x-request-id`.
+/// An error response's message, which [`request_id`] puts in the request's log line.
+#[derive(Clone, Debug)]
+pub(crate) struct ErrorNote(pub(crate) Arc<str>);
+
+/// Gives the request its [`RequestId`], puts it in the response's `x-request-id`, and
+/// ends its [`RequestLog`]: with the response's status, or as a client that left before
+/// the response or before the end of its body.
 async fn request_id(mut request: Request, next: Next) -> Response {
     let id = RequestId::from_client(request.headers()).unwrap_or_else(RequestId::generate);
-    request.extensions_mut().insert(id.clone());
+    let log = Arc::new(RequestLog::new(
+        Arc::clone(&id),
+        request.method().clone(),
+        request.uri().path(),
+    ));
+    request.extensions_mut().insert(RequestId {
+        id: Arc::clone(&id),
+        log: Arc::clone(&log),
+    });
+    // Dropped with this future when the client leaves before the response.
+    let pending = Pending(Some(log));
     let mut response = next.run(request).await;
-    if let Ok(value) = header::HeaderValue::from_str(&id.0) {
+    let log = pending.done();
+    let error = response
+        .extensions()
+        .get::<ErrorNote>()
+        .map(|e| e.0.clone());
+    let error = error.or_else(|| {
+        (response.status() == StatusCode::NOT_FOUND).then(|| Arc::from("no such route"))
+    });
+    log.respond(response.status(), error.as_deref());
+    if let Ok(value) = header::HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);
     }
-    response
+    response.map(|body| {
+        Body::new(LoggedBody {
+            inner: body,
+            log: Some(log),
+        })
+    })
+}
+
+/// A request's log while its handler runs, which records a client that left if dropped.
+struct Pending(Option<Arc<RequestLog>>);
+
+impl Pending {
+    fn done(mut self) -> Arc<RequestLog> {
+        self.0.take().expect("taken once")
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(log) = &self.0 {
+            log.disconnected();
+        }
+    }
+}
+
+/// A response body that holds the request's log until its end, and records a client that
+/// left before it.
+struct LoggedBody {
+    inner: Body,
+    log: Option<Arc<RequestLog>>,
+}
+
+impl HttpBody for LoggedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, axum::Error>>> {
+        let frame = ready!(std::pin::Pin::new(&mut self.inner).poll_frame(cx));
+        if frame.is_none() {
+            self.log = None;
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for LoggedBody {
+    fn drop(&mut self) {
+        if let Some(log) = &self.log
+            && !self.inner.is_end_stream()
+        {
+            log.disconnected();
+        }
+    }
 }
 
 /// `ok`, or a 503 once the server drains, so that the proxy in front stops sending
@@ -220,6 +331,8 @@ async fn health(State(app): State<Arc<App>>) -> Response {
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
     pub(crate) message: String,
+    /// The request field the error is about, OpenAI's error `param`.
+    pub(crate) param: Option<String>,
     /// Seconds for a `Retry-After` header.
     pub(crate) retry_after: Option<u32>,
     /// OpenAI's error `code`, when it is one clients act on.
@@ -235,6 +348,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            param: None,
             retry_after: None,
             code: None,
         }
@@ -245,8 +359,17 @@ impl ApiError {
     pub(crate) fn context_exceeded(message: impl Into<String>) -> Self {
         Self {
             code: Some("context_length_exceeded"),
+            param: Some("messages".to_owned()),
             ..Self::bad_request(message)
         }
+    }
+
+    /// `response` with this error's message for the request's log line.
+    pub(crate) fn noted(&self, mut response: Response) -> Response {
+        response
+            .extensions_mut()
+            .insert(ErrorNote(self.message.as_str().into()));
+        response
     }
 
     /// A 503 with `Retry-After` for a request that arrives while the server drains.
@@ -281,18 +404,87 @@ impl ApiError {
 
 impl From<InvalidRequest> for ApiError {
     fn from(e: InvalidRequest) -> Self {
-        Self::bad_request(e.0)
+        Self {
+            param: e.param().map(str::to_owned),
+            ..Self::bad_request(e.to_string())
+        }
     }
 }
 
 impl From<JsonRejection> for ApiError {
-    /// A 413 for a body past the limit, else a 400.
+    /// A 413 for a body past the limit, else a 400; a body that does not fit the route's
+    /// fields names the field, as [`InvalidRequest`] does.
     fn from(e: JsonRejection) -> Self {
         let status = match e.status() {
             StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
             _ => StatusCode::BAD_REQUEST,
         };
-        Self::new(status, e.body_text())
+        let text = e.body_text();
+        let Some(rest) =
+            text.strip_prefix("Failed to deserialize the JSON body into the target type: ")
+        else {
+            return Self::new(status, text);
+        };
+        // serde_path_to_error puts the field's path first, unless it is the body itself.
+        match rest.split_once(": ") {
+            Some((path, detail)) if !path.contains(char::is_whitespace) => {
+                InvalidRequest::field(path, serde_detail(detail)).into()
+            }
+            _ => InvalidRequest::new(serde_detail(rest)).into(),
+        }
+    }
+}
+
+/// A route's JSON body, as `Json` extracts it, with an error that names the field when the
+/// body does not fit.
+///
+/// Serde loses the path of a field in a `#[serde(flatten)]` struct, such as a request's
+/// [`SamplingFields`], so for an error without one this reads the body's sampling fields
+/// alone, whose errors keep it.
+pub(crate) struct JsonBody<T>(pub(crate) T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for JsonBody<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, ApiError> {
+        let json = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                let mime = v.split(';').next().unwrap_or("").trim();
+                mime.starts_with("application/") && mime.ends_with("json")
+            });
+        let bytes = Bytes::from_request(request, state).await.map_err(|e| {
+            let status = match e.status() {
+                StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            ApiError::new(status, e.body_text())
+        })?;
+        if !json {
+            return Err(ApiError::bad_request(
+                "expected the header Content-Type: application/json",
+            ));
+        }
+        match Json::<T>::from_bytes(&bytes) {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(e) => {
+                let error = ApiError::from(e);
+                if error.param.is_some() {
+                    return Err(error);
+                }
+                let fields = &mut serde_json::Deserializer::from_slice(&bytes);
+                match serde_path_to_error::deserialize::<_, SamplingFields>(fields) {
+                    Err(e) if e.path().iter().next().is_some() => Err(InvalidRequest::field(
+                        e.path().to_string(),
+                        serde_detail(&e.inner().to_string()),
+                    )
+                    .into()),
+                    _ => Err(error),
+                }
+            }
+        }
     }
 }
 
@@ -307,9 +499,10 @@ impl IntoResponse for ApiError {
             _ => ("server_error", Value::Null),
         };
         let code = self.code.map_or(code, Value::from);
-        let body =
-            json!({"error": {"message": self.message, "type": kind, "param": null, "code": code}});
-        self.with_retry_after((self.status, Json(body)).into_response())
+        let body = json!({"error": {
+            "message": self.message, "type": kind, "param": self.param, "code": code,
+        }});
+        self.noted(self.with_retry_after((self.status, Json(body)).into_response()))
     }
 }
 
@@ -403,36 +596,32 @@ pub(crate) async fn blocking<T: Send + 'static>(
 
 async fn tokenize_route(
     State(app): State<Arc<App>>,
-    request: Result<Json<EncodeRequest>, JsonRejection>,
+    JsonBody(request): JsonBody<EncodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(request) = request?;
     let ids = blocking(&app, |app| Ok(tokenize::encode(&app.vocab, request)?)).await?;
     Ok(Json(tokenize::tokenized(&ids, app.engine.max_context())))
 }
 
 async fn token_encode(
     State(app): State<Arc<App>>,
-    request: Result<Json<EncodeRequest>, JsonRejection>,
+    JsonBody(request): JsonBody<EncodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(request) = request?;
     let ids = blocking(&app, |app| Ok(tokenize::encode(&app.vocab, request)?)).await?;
     Ok(Json(tokenize::encoded(&ids)))
 }
 
 async fn detokenize_route(
     State(app): State<Arc<App>>,
-    request: Result<Json<DecodeRequest>, JsonRejection>,
+    JsonBody(request): JsonBody<DecodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(request) = request?;
     let text = blocking(&app, move |app| Ok(tokenize::decode(&app.vocab, &request)?)).await?;
     Ok(Json(json!({"prompt": text})))
 }
 
 async fn token_decode(
     State(app): State<Arc<App>>,
-    request: Result<Json<DecodeRequest>, JsonRejection>,
+    JsonBody(request): JsonBody<DecodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(request) = request?;
     let text = blocking(&app, move |app| Ok(tokenize::decode(&app.vocab, &request)?)).await?;
     Ok(Json(json!({"text": text})))
 }
@@ -506,22 +695,31 @@ pub(crate) struct Prepared {
     pub(crate) samplings: Vec<Sampling>,
     /// The output of a choice before its first token, for every choice.
     pub(crate) output: Output,
+    /// The request's thinking, for the log; `None` for a raw completion.
+    pub(crate) thinking: Option<Thinking>,
 }
 
 fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     request::refuse(&request.other)?;
     let n = request::choices(request.n)?;
     request::response_format(request.response_format.as_ref())?;
-    let stops = request::stops(request.stop.as_ref())?;
-    let stop_ids = tokenize::token_ids(&app.vocab, &request.stop_token_ids.unwrap_or_default())?;
+    let stops = request::stops("stop", request.stop.as_ref())?;
+    let stop_ids = tokenize::token_ids(
+        &app.vocab,
+        "stop_token_ids",
+        &request.stop_token_ids.unwrap_or_default(),
+    )?;
     let ending = request::ending(
         request.continue_final_message,
         request.add_generation_prompt,
     )?;
     if matches!(ending, Ending::Bare) {
-        return Err(ApiError::bad_request(
-            "add_generation_prompt false needs continue_final_message",
-        ));
+        return Err(InvalidRequest::field(
+            "add_generation_prompt",
+            "false needs continue_final_message true; a chat prompt ends either with the \
+             model's turn or inside the last assistant message",
+        )
+        .into());
     }
     let mut tools = request.tools.unwrap_or_default();
     let choice = ToolChoice::parse(request.tool_choice.as_ref())?;
@@ -530,6 +728,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     }
     let parallel = request.parallel_tool_calls != Some(false);
     let thinking = chat::request_thinking(
+        "reasoning_effort",
         request.reasoning_effort.as_ref(),
         request.chat_template_kwargs.as_ref(),
     )?;
@@ -540,6 +739,11 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
     let max_tokens = max_tokens(
         app.engine.max_context(),
         rendered.ids.len(),
+        if request.max_completion_tokens.is_some() {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        },
         request.max_completion_tokens.or(request.max_tokens),
     )?;
     Ok(Prepared {
@@ -556,6 +760,7 @@ fn prepare_chat(app: &App, request: ChatRequest) -> Result<Prepared, ApiError> {
             stop_ids,
             calls,
         ),
+        thinking: Some(thinking),
     })
 }
 
@@ -589,9 +794,12 @@ pub(crate) fn tool_ending<'a>(
         (None, ending) => ending,
         (Some(call), Ending::Generate | Ending::Answer) => call,
         (Some(_), _) => {
-            return Err(ApiError::bad_request(
-                "continue_final_message cannot be used with a forced tool call",
-            ));
+            return Err(InvalidRequest::field(
+                "tool_choice",
+                "forces a tool call, which cannot continue the last assistant message; send \
+                 \"auto\" or end the messages with a user or tool message",
+            )
+            .into());
         }
     };
     Ok((ending, calls))
@@ -600,26 +808,35 @@ pub(crate) fn tool_ending<'a>(
 /// The tokens a request may generate: `requested`, capped at the positions left after a
 /// prompt of `prompt_len` tokens in a context of `max_context`, or all of them. A cap past
 /// the context is cut to fit, as a client's token count can differ from the server's, so
-/// the reply finishes with `length` there.
+/// the reply finishes with `length` there. `param` names the cap's field in errors.
 pub(crate) fn max_tokens(
     max_context: usize,
     prompt_len: usize,
+    param: &str,
     requested: Option<u64>,
 ) -> Result<usize, ApiError> {
     let room = max_context.saturating_sub(prompt_len);
     if room == 0 {
         return Err(ApiError::context_exceeded(format!(
-            "the prompt has {prompt_len} tokens, and this server holds {max_context} in all"
+            "the prompt has {prompt_len} tokens, and this server's context holds \
+             {max_context} for the prompt and the reply together; send a prompt of at most \
+             {} tokens",
+            max_context - 1
         )));
     }
     match requested {
         None => Ok(room),
-        Some(0) => Err(ApiError::bad_request("max_tokens must be at least 1")),
+        Some(0) => Err(InvalidRequest::field(
+            param,
+            format!("expected an integer of at least 1, got 0; up to {room} fit after the {prompt_len}-token prompt"),
+        )
+        .into()),
         Some(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX).min(room)),
     }
 }
 
-/// Queues a job and returns its events. `label` names it in the log.
+/// Queues a job of request `id`'s reply `reply_id` and returns its events.
+#[expect(clippy::too_many_arguments, reason = "a job's parts")]
 pub(crate) fn submit(
     app: &App,
     prompt: Vec<u32>,
@@ -627,7 +844,8 @@ pub(crate) fn submit(
     max_tokens: usize,
     ignore_eos: bool,
     sampling: Sampling,
-    label: &dyn Fn(usize) -> Arc<str>,
+    id: &RequestId,
+    reply_id: &str,
 ) -> Result<Results, ApiError> {
     let mut results = submit_choices(
         app,
@@ -636,7 +854,8 @@ pub(crate) fn submit(
         max_tokens,
         ignore_eos,
         &[sampling],
-        label,
+        id,
+        reply_id,
     )?;
     results
         .pop()
@@ -645,7 +864,8 @@ pub(crate) fn submit(
 
 /// Queues one job per entry of `samplings`, all of the same prompt and `images`, and
 /// returns their events in that order. The jobs fit the queue together or not at all.
-/// `label` names choice `i`'s job in the log.
+/// They are request `id`'s reply `reply_id`, which names them in the log.
+#[expect(clippy::too_many_arguments, reason = "a job's parts")]
 pub(crate) fn submit_choices(
     app: &App,
     prompt: Vec<u32>,
@@ -653,14 +873,17 @@ pub(crate) fn submit_choices(
     max_tokens: usize,
     ignore_eos: bool,
     samplings: &[Sampling],
-    label: &dyn Fn(usize) -> Arc<str>,
+    id: &RequestId,
+    reply_id: &str,
 ) -> Result<Vec<Results>, ApiError> {
     let most = app.engine.max_jobs();
-    if samplings.len() > most {
-        return Err(ApiError::bad_request(format!(
-            "n is {}, more than the {most} requests this server runs and queues at once",
-            samplings.len()
-        )));
+    let n = samplings.len();
+    if n > most {
+        return Err(InvalidRequest::field(
+            "n",
+            format!("is {n}, more than the {most} requests this server runs and queues at once"),
+        )
+        .into());
     }
     let prompt_len = prompt.len();
     let mut key = app
@@ -689,16 +912,19 @@ pub(crate) fn submit_choices(
                 ignore_eos,
                 sampling,
                 events,
-                label(i),
+                id.label(reply_id, i, n),
             )
-            .with_images(std::sync::Arc::clone(&images), job_key);
+            .with_images(std::sync::Arc::clone(&images), job_key)
+            .with_log(Arc::downgrade(&id.log));
             (job, receiver)
         })
         .unzip();
     app.engine.submit(jobs).map_err(|e| match e {
         Refused::Busy => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "the request queue is full, retry later",
+            format!(
+                "the request queue is full ({most} requests run and wait at most), retry later"
+            ),
         ),
         Refused::Draining => ApiError::draining(),
         Refused::Stopped => ApiError::internal("the engine has stopped"),
@@ -710,15 +936,28 @@ pub(crate) fn submit_choices(
         .map(|(i, receiver)| Results {
             receiver,
             tracker: app.metrics.track(if i == 0 { prompt_len } else { 0 }),
+            log: Some(Arc::clone(&id.log)),
         })
         .collect())
 }
 
 /// One job's events, recorded in the metrics as they arrive. Dropping it cancels the job,
-/// and counts it as aborted unless it finished.
+/// counts it as aborted unless it finished, and gives the request's log the job's end.
 pub(crate) struct Results {
     pub(crate) receiver: mpsc::UnboundedReceiver<Event>,
     pub(crate) tracker: Tracker,
+    pub(crate) log: Option<Arc<RequestLog>>,
+}
+
+impl Drop for Results {
+    fn drop(&mut self) {
+        self.tracker.finish(Reason::Abort);
+        if let Some(log) = &self.log {
+            let t = &self.tracker;
+            let reason = t.reason().unwrap_or(Reason::Abort);
+            log.job(t.times(), t.generated(), t.cached_tokens(), reason);
+        }
+    }
 }
 
 impl Results {
@@ -738,7 +977,12 @@ impl Results {
             Event::SmallTokens(_, len) => self.tracker.tokens(usize::from(*len)),
             Event::Tokens(ids) => self.tracker.tokens(ids.len()),
             Event::Done(finish) => self.tracker.finish(reason(*finish)),
-            Event::Failed(_) => self.tracker.finish(Reason::Error),
+            Event::Failed(message) => {
+                self.tracker.finish(Reason::Error);
+                if let Some(log) = &self.log {
+                    log.failed(message);
+                }
+            }
         }
         Poll::Ready(event)
     }
@@ -819,11 +1063,15 @@ fn reason(finish: Finish) -> Reason {
 async fn chat_completions(
     State(app): State<Arc<App>>,
     Extension(id): Extension<RequestId>,
-    request: Result<Json<ChatRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(request) = request?;
-    let prepared = blocking(&app, |app| prepare_chat(app, request)).await?;
-    respond(app, prepared, Kind::Chat, &id).await
+    JsonBody(request): JsonBody<ChatRequest>,
+) -> Response {
+    let keepalive = app.keepalive.filter(|_| request.stream != Some(true));
+    let log = Arc::clone(&id.log);
+    keepalive::respond(keepalive, &log, async move {
+        let prepared = blocking(&app, |app| prepare_chat(app, request)).await?;
+        respond(app, prepared, Kind::Chat, &id).await
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -848,28 +1096,49 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
     request::refuse(&request.other)?;
     let n = request::choices(request.n)?;
     request::best_of(request.best_of, n)?;
-    let stops = request::stops(request.stop.as_ref())?;
-    let stop_ids = tokenize::token_ids(&app.vocab, &request.stop_token_ids.unwrap_or_default())?;
+    let stops = request::stops("stop", request.stop.as_ref())?;
+    let stop_ids = tokenize::token_ids(
+        &app.vocab,
+        "stop_token_ids",
+        &request.stop_token_ids.unwrap_or_default(),
+    )?;
+    let accepted = "a string, an array of token ids, or an array of one string or one \
+                    array of token ids";
     let prompt = match request.prompt {
         Value::String(text) => app.vocab.encode(&text),
         Value::Array(items) if items.iter().all(Value::is_u64) => {
-            tokenize::token_ids(&app.vocab, &items)?
+            tokenize::token_ids(&app.vocab, "prompt", &items)?
         }
         Value::Array(items) => match items.as_slice() {
             [Value::String(text)] => app.vocab.encode(text),
-            [Value::Array(ids)] => tokenize::token_ids(&app.vocab, ids)?,
-            _ => return Err(ApiError::bad_request("only one prompt per request")),
+            [Value::Array(ids)] => tokenize::token_ids(&app.vocab, "prompt[0]", ids)?,
+            [_, _, ..] => {
+                return Err(InvalidRequest::field(
+                    "prompt",
+                    format!(
+                        "holds {} prompts; this server takes one prompt per request",
+                        items.len()
+                    ),
+                )
+                .into());
+            }
+            _ => {
+                return Err(
+                    InvalidRequest::expected("prompt", accepted, &Value::Array(items)).into(),
+                );
+            }
         },
-        _ => {
-            return Err(ApiError::bad_request(
-                "prompt must be a string or token ids",
-            ));
-        }
+        other => return Err(InvalidRequest::expected("prompt", accepted, &other).into()),
     };
     if prompt.is_empty() {
-        return Err(ApiError::bad_request("the prompt is empty"));
+        return Err(InvalidRequest::field("prompt", "is empty; send at least one token").into());
     }
-    let max_tokens = max_tokens(app.engine.max_context(), prompt.len(), request.max_tokens)?;
+    let max_tokens = max_tokens(
+        app.engine.max_context(),
+        prompt.len(),
+        "max_tokens",
+        request.max_tokens,
+    )?;
     Ok(Prepared {
         prompt,
         images: Vec::new(),
@@ -884,6 +1153,7 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
             stop_ids,
             Calls::Free,
         ),
+        thinking: None,
     })
 }
 
@@ -892,11 +1162,15 @@ fn prepare_completion(app: &App, request: CompletionRequest) -> Result<Prepared,
 async fn completions(
     State(app): State<Arc<App>>,
     Extension(id): Extension<RequestId>,
-    request: Result<Json<CompletionRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(request) = request?;
-    let prepared = blocking(&app, |app| prepare_completion(app, request)).await?;
-    respond(app, prepared, Kind::Text, &id).await
+    JsonBody(request): JsonBody<CompletionRequest>,
+) -> Response {
+    let keepalive = app.keepalive.filter(|_| request.stream != Some(true));
+    let log = Arc::clone(&id.log);
+    keepalive::respond(keepalive, &log, async move {
+        let prepared = blocking(&app, |app| prepare_completion(app, request)).await?;
+        respond(app, prepared, Kind::Text, &id).await
+    })
+    .await
 }
 
 /// Runs a prepared request and answers it, streaming or not.
@@ -915,29 +1189,23 @@ async fn respond(
         ignore_eos,
         samplings,
         output,
+        thinking,
     } = prepared;
     let reply = Reply::new(&app, prompt.len(), kind);
+    let streaming = matches!(delivery, Delivery::Stream { .. });
+    id.log.reply(&reply.id, streaming, thinking, prompt.len());
     let outputs = vec![output; samplings.len()];
-    let n = samplings.len();
     let prompt_ids = return_token_ids.then(|| prompt.clone());
     let results = submit_choices(
-        &app,
-        prompt,
-        images,
-        max_tokens,
-        ignore_eos,
-        &samplings,
-        &|i| id.label(&reply.id, i, n),
+        &app, prompt, images, max_tokens, ignore_eos, &samplings, id, &reply.id,
     )?;
     let fanout = Fanout::new(results);
-    let label = id.label(&reply.id, 0, 1);
     if let Delivery::Stream { include_usage } = delivery {
         let (out, rx) = mpsc::channel(64);
         let chunks = Chunks {
             out,
             reply,
             prompt_ids,
-            label,
         };
         tokio::spawn(
             async move { stream(&app.vocab, fanout, outputs, chunks, include_usage).await },
@@ -949,7 +1217,6 @@ async fn respond(
     }
     // Runs in the handler, so that a client that leaves drops the jobs.
     let (body, timings) = whole(&app.vocab, fanout, outputs, reply, prompt_ids).await?;
-    timings.log(&label);
     Ok(with_server_timing(Json(body).into_response(), &timings))
 }
 
@@ -1530,8 +1797,6 @@ struct Chunks {
     reply: Reply,
     /// The prompt's ids, sent with the first chunk (`return_token_ids`).
     prompt_ids: Option<Vec<u32>>,
-    /// The request's label for the log.
-    label: Arc<str>,
 }
 
 impl Chunks {
@@ -1680,7 +1945,6 @@ async fn stream(
             return;
         }
     }
-    timings.log(&chunks.label);
     let _ = chunks.raw("[DONE]".to_owned()).await;
 }
 
@@ -1707,7 +1971,7 @@ mod tests {
             for &(name, value) in pairs {
                 headers.insert(name, header::HeaderValue::from_bytes(value).unwrap());
             }
-            RequestId::from_client(&headers).map(|id| id.0.to_string())
+            RequestId::from_client(&headers).map(|id| id.to_string())
         };
         assert_eq!(
             id(&[("x-request-id", b"a-1_B.c")]).as_deref(),
@@ -1727,18 +1991,32 @@ mod tests {
             assert_eq!(id(&[("x-request-id", bad)]), None, "{bad:?}");
         }
         assert!(id(&[("x-request-id", &long[..128])]).is_some());
-        let (a, b) = (RequestId::generate().0, RequestId::generate().0);
+        let (a, b) = (RequestId::generate(), RequestId::generate());
         assert!(a.starts_with("req-") && a.len() == 20 && a != b, "{a} {b}");
     }
 
     #[test]
     fn max_tokens_fits_the_context() {
+        let max_tokens =
+            |context, prompt, requested| max_tokens(context, prompt, "max_tokens", requested);
         assert_eq!(max_tokens(100, 40, None).ok(), Some(60));
         assert_eq!(max_tokens(100, 40, Some(60)).ok(), Some(60));
         assert_eq!(max_tokens(100, 40, Some(61)).ok(), Some(60));
         assert_eq!(max_tokens(100, 40, Some(u64::MAX)).ok(), Some(60));
-        assert!(max_tokens(100, 40, Some(0)).is_err());
-        assert!(max_tokens(100, 100, None).is_err());
+        let zero = max_tokens(100, 40, Some(0)).unwrap_err();
+        assert_eq!(zero.param.as_deref(), Some("max_tokens"));
+        assert_eq!(
+            zero.message,
+            "max_tokens: expected an integer of at least 1, got 0; up to 60 fit after the \
+             40-token prompt"
+        );
+        let full = max_tokens(100, 100, None).unwrap_err();
+        assert_eq!(full.code, Some("context_length_exceeded"));
+        assert!(
+            full.message.contains("has 100 tokens") && full.message.contains("at most 99 tokens"),
+            "{}",
+            full.message
+        );
     }
 
     /// Feeds `ids` one at a time and returns the content, the tool calls and the output.
@@ -1947,6 +2225,7 @@ mod tests {
             results.push(Results {
                 receiver,
                 tracker: metrics.track(if i == 0 { prompt } else { 0 }),
+                log: None,
             });
         }
         (Fanout::new(results), senders)
@@ -2129,7 +2408,6 @@ mod tests {
             out,
             reply: reply(Kind::Chat),
             prompt_ids: None,
-            label: "test".into(),
         };
         stream(&vocab, fanout, vec![output; 3], chunks, true).await;
         let mut frames = Vec::new();
@@ -2392,7 +2670,6 @@ mod tests {
             out,
             reply: reply(Kind::Text),
             prompt_ids: None,
-            label: "small".into(),
         };
         stream(&vocab, fanout, vec![output], chunks, false).await;
         let mut text = String::new();

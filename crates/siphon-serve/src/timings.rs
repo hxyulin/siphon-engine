@@ -123,11 +123,6 @@ impl Timings {
         );
         HeaderValue::from_str(&value).expect("the header is ASCII")
     }
-
-    /// Logs the timings on the request's last `job:` line.
-    pub fn log(&self, label: &str) {
-        eprintln!("job: {label}: timings {}", self.json());
-    }
 }
 
 /// `a / b`, or 0 when `b` is 0.

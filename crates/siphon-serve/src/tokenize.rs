@@ -16,7 +16,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    chat::{self, InvalidRequest, Vocab},
+    chat::{self, Vocab},
+    invalid::InvalidRequest,
     request,
 };
 
@@ -48,12 +49,14 @@ pub fn encode(vocab: &Vocab, request: EncodeRequest) -> Result<Vec<u32>, Invalid
         }
         (None, Some(Value::Array(messages)), None) | (None, None, Some(messages)) => messages,
         _ => {
-            return Err(InvalidRequest(
-                "send one of prompt, text or messages; text is a string or messages".to_owned(),
+            return Err(InvalidRequest::new(
+                "send exactly one of prompt (a string), text (a string or an array of \
+                 messages) or messages (an array of messages)",
             ));
         }
     };
     let thinking = chat::request_thinking(
+        "reasoning_effort",
         request.reasoning_effort.as_ref(),
         request.chat_template_kwargs.as_ref(),
     )?;
@@ -82,19 +85,26 @@ pub fn encoded(ids: &[u32]) -> Value {
 
 /// The text of a request's ids, special tokens included.
 pub fn decode(vocab: &Vocab, request: &DecodeRequest) -> Result<String, InvalidRequest> {
-    let ids = token_ids(vocab, &request.tokens)?;
+    let ids = token_ids(vocab, "tokens", &request.tokens)?;
     Ok(vocab.decode(&ids))
 }
 
-/// Ids in the vocabulary, refusing anything else.
-pub fn token_ids(vocab: &Vocab, items: &[Value]) -> Result<Vec<u32>, InvalidRequest> {
+/// Ids in the vocabulary, refusing anything else. `param` names the field in errors.
+pub fn token_ids(vocab: &Vocab, param: &str, items: &[Value]) -> Result<Vec<u32>, InvalidRequest> {
     items
         .iter()
-        .map(|id| {
+        .enumerate()
+        .map(|(i, id)| {
             id.as_u64()
                 .and_then(|id| u32::try_from(id).ok())
                 .filter(|&id| (id as usize) < vocab.len())
-                .ok_or_else(|| InvalidRequest(format!("{id} is not a token id")))
+                .ok_or_else(|| {
+                    InvalidRequest::expected(
+                        format!("{param}[{i}]"),
+                        &format!("an integer token id from 0 to {}", vocab.len() - 1),
+                        id,
+                    )
+                })
         })
         .collect()
 }

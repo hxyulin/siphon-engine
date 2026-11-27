@@ -12,23 +12,13 @@ use anyhow::Context as _;
 use serde_json::{Map, Value};
 use tokenizers::{DecoderWrapper, Tokenizer};
 
-use crate::vision::{Collector, PromptImage, Vision};
+use crate::{
+    invalid::{InvalidRequest, one_of},
+    vision::{Collector, PromptImage, Vision},
+};
 
-/// A request the server cannot serve, reported to the client as a 400.
-#[derive(Debug)]
-pub struct InvalidRequest(pub String);
-
-impl std::fmt::Display for InvalidRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for InvalidRequest {}
-
-fn invalid(message: impl Into<String>) -> InvalidRequest {
-    InvalidRequest(message.into())
-}
+/// The roles a chat message may have.
+const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
 
 /// Ids of the special tokens that frame Inkling messages.
 #[derive(Clone, Copy, Debug)]
@@ -403,8 +393,13 @@ impl Vocab {
                 .and_then(Value::as_str)
                 != Some("assistant")
         {
-            return Err(invalid(
-                "continue_final_message needs an assistant message last",
+            let last = messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .map_or_else(|| "no message".to_owned(), crate::invalid::describe);
+            return Err(InvalidRequest::field(
+                "continue_final_message",
+                format!("needs an assistant message last, but the last role is {last}"),
             ));
         }
         let mut ids = Vec::with_capacity(messages.len().saturating_mul(32).max(64));
@@ -422,16 +417,22 @@ impl Vocab {
         for (i, message) in messages.iter().enumerate() {
             // The final assistant message, left open for the model to continue.
             let open = continuing && i + 1 == messages.len();
-            let role = message
-                .get("role")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("every message needs a string role"))?;
+            let at = |e: InvalidRequest| e.within(format_args!("messages[{i}]"));
+            let role_value = message.get("role").unwrap_or(&Value::Null);
+            let bad_role = || {
+                at(InvalidRequest::expected(
+                    "role",
+                    &one_of(&ROLES),
+                    role_value,
+                ))
+            };
+            let role = role_value.as_str().ok_or_else(bad_role)?;
             let role_token = match role {
                 "user" => s.message_user,
                 "assistant" => s.message_model,
                 "system" | "developer" => s.message_system,
                 "tool" => s.message_tool,
-                _ => return Err(invalid(format!("unknown message role: {role}"))),
+                _ => return Err(bad_role()),
             };
             let assistant = role == "assistant";
             if !effort_done && role_token != s.message_system {
@@ -464,7 +465,19 @@ impl Vocab {
             let tool_calls = match message.get("tool_calls") {
                 Some(Value::Array(calls)) if assistant => calls.as_slice(),
                 None | Some(Value::Null) => &[],
-                Some(_) => return Err(invalid("tool_calls must be an array on an assistant")),
+                Some(Value::Array(_)) => {
+                    return Err(at(InvalidRequest::field(
+                        "tool_calls",
+                        format!("only assistant messages make tool calls, not a {role} message"),
+                    )));
+                }
+                Some(other) => {
+                    return Err(at(InvalidRequest::expected(
+                        "tool_calls",
+                        "an array of tool calls",
+                        other,
+                    )));
+                }
             };
             for call in tool_calls {
                 if let Some(call_id) = non_empty(call, "id")
@@ -481,30 +494,42 @@ impl Vocab {
             }
             // An assistant's empty text is left out next to its reasoning or tool calls.
             let skip_empty = assistant && (!tool_calls.is_empty() || reasoning.is_some());
-            let mut parts = parts(message, skip_empty)?;
+            let mut parts = parts(message, skip_empty).map_err(at)?;
             if open && !tool_calls.is_empty() {
-                return Err(invalid(
-                    "continue_final_message cannot continue a message with tool calls",
-                ));
+                return Err(at(InvalidRequest::field(
+                    "tool_calls",
+                    "the last assistant message is left open for the reply to continue, and \
+                     a message with tool calls cannot be continued",
+                )));
             }
-            let has_image = parts.iter().any(|p| matches!(p, Part::Image(_)));
-            if self.vision.is_some() && has_image && role != "user" && role != "tool" {
-                return Err(invalid(
-                    "Image content is only supported for user and tool messages",
-                ));
+            let image = parts.iter().position(|p| matches!(p, Part::Image(_)));
+            if let Some(j) = image
+                && self.vision.is_some()
+                && role != "user"
+                && role != "tool"
+            {
+                return Err(at(InvalidRequest::field(
+                    format!("content[{j}]"),
+                    format!(
+                        "images are accepted in user and tool messages, not in a {role} message"
+                    ),
+                )));
             }
             // An open message is an assistant's, so its parts are text.
             let last = open.then(|| match parts.pop() {
                 Some(Part::Text(text)) => text,
                 _ => "",
             });
-            for part in parts {
+            for (j, part) in parts.into_iter().enumerate() {
                 match part {
                     Part::Text(text) => block(&mut ids, &header, s.content_text, text),
                     Part::Image(image) => {
                         ids.extend_from_slice(&header);
-                        let at = ids.len();
-                        ids.extend(images.image(image, at)?);
+                        let position = ids.len();
+                        let image_ids = images
+                            .image(image, position)
+                            .map_err(|e| at(e.within(format_args!("content[{j}]"))))?;
+                        ids.extend(image_ids);
                     }
                 }
             }
@@ -515,8 +540,9 @@ impl Vocab {
                 self.encode_into(last, &mut ids);
                 continue;
             }
-            for call in tool_calls {
-                self.tool_call_block(&mut ids, message, call)?;
+            for (k, call) in tool_calls.iter().enumerate() {
+                self.tool_call_block(&mut ids, message, k, call)
+                    .map_err(at)?;
             }
             if assistant {
                 ids.push(s.content_model_end_sampling);
@@ -544,7 +570,11 @@ impl Vocab {
 
     /// Appends the system block that declares `tools`.
     fn declare_tools(&self, ids: &mut Vec<u32>, tools: &[Value]) -> Result<(), InvalidRequest> {
-        let specs: Vec<Value> = tools.iter().map(tool_spec).collect::<Result<_, _>>()?;
+        let specs: Vec<Value> = tools
+            .iter()
+            .enumerate()
+            .map(|(k, tool)| tool_spec(tool).map_err(|e| e.within(format_args!("tools[{k}]"))))
+            .collect::<Result<_, _>>()?;
         let mut header = vec![self.special.message_system];
         self.encode_into("tool_declare", &mut header);
         let specs = canonical_json(&Value::Array(specs));
@@ -572,9 +602,19 @@ impl Vocab {
                     .iter()
                     .any(|tool| tool_function_name(tool) == Some(name))
                 {
-                    return Err(invalid(format!(
-                        "tool_choice names {name}, which is not a tool"
-                    )));
+                    let names: Vec<&str> = tools.iter().filter_map(tool_function_name).collect();
+                    let declared = if names.is_empty() {
+                        "the request declares no tools".to_owned()
+                    } else {
+                        format!("the request's tools are {}", one_of(&names))
+                    };
+                    return Err(InvalidRequest::field(
+                        "tool_choice",
+                        format!(
+                            "names the tool {}, which is not declared; {declared}",
+                            crate::invalid::quote(name)
+                        ),
+                    ));
                 }
                 ids.push(s.message_model);
                 self.encode_into(name, ids);
@@ -582,7 +622,10 @@ impl Vocab {
             }
             Ending::AnyCall => {
                 if tools.is_empty() {
-                    return Err(invalid("tool_choice required needs tools"));
+                    return Err(InvalidRequest::field(
+                        "tool_choice",
+                        "requires a tool call, but the request declares no tools",
+                    ));
                 }
                 ids.extend([s.message_model, s.content_invoke_tool_json]);
             }
@@ -590,20 +633,27 @@ impl Vocab {
         Ok(())
     }
 
-    /// Appends the block of one tool call that the assistant `message` made.
+    /// Appends the block of tool call `k` that the assistant `message` made.
     fn tool_call_block(
         &self,
         ids: &mut Vec<u32>,
         message: &Value,
+        k: usize,
         call: &Value,
     ) -> Result<(), InvalidRequest> {
-        let (name, args) = tool_call(call)?;
+        let (name, args) =
+            tool_call(call).map_err(|e| e.within(format_args!("tool_calls[{k}]")))?;
         if let Some(own) = non_empty(message, "name")
             && own != name
         {
-            return Err(invalid(format!(
-                "assistant name {own} does not match its tool call {name}"
-            )));
+            return Err(InvalidRequest::field(
+                "name",
+                format!(
+                    "{} does not match the function name {} of tool_calls[{k}]",
+                    crate::invalid::quote(own),
+                    crate::invalid::quote(name)
+                ),
+            ));
         }
         let mut header = vec![self.special.message_model];
         self.encode_into(name, &mut header);
@@ -628,8 +678,9 @@ impl Vocab {
 /// `chat_template_kwargs.reasoning_effort`, else off when
 /// `chat_template_kwargs.enable_thinking` is false, else [`DEFAULT_EFFORT`]. The effort
 /// named `none` turns thinking off; a number is the template's effort, so 0 still thinks
-/// briefly.
+/// briefly. `effort_param` names the `reasoning_effort` field in errors.
 pub fn request_thinking(
+    effort_param: &str,
     reasoning_effort: Option<&Value>,
     chat_template_kwargs: Option<&Value>,
 ) -> Result<Thinking, InvalidRequest> {
@@ -638,37 +689,68 @@ pub fn request_thinking(
             .and_then(|k| k.get(key))
             .filter(|v| !v.is_null())
     };
-    match reasoning_effort
-        .filter(|v| !v.is_null())
-        .or_else(|| kwarg("reasoning_effort"))
-    {
+    let (param, value) = match reasoning_effort.filter(|v| !v.is_null()) {
+        Some(value) => (effort_param, Some(value)),
+        None => (
+            "chat_template_kwargs.reasoning_effort",
+            kwarg("reasoning_effort"),
+        ),
+    };
+    match value {
         Some(Value::String(name)) if name.trim() == "none" => Ok(Thinking::Off),
-        Some(named) => effort(Some(named)).map(Thinking::Effort),
+        Some(named) => effort(param, Some(named)).map(Thinking::Effort),
         None => match kwarg("enable_thinking") {
             None | Some(Value::Bool(true)) => Ok(Thinking::Effort(DEFAULT_EFFORT)),
             Some(Value::Bool(false)) => Ok(Thinking::Off),
-            Some(_) => Err(invalid("enable_thinking must be a boolean")),
+            Some(other) => Err(InvalidRequest::expected(
+                "chat_template_kwargs.enable_thinking",
+                "a boolean",
+                other,
+            )),
         },
     }
 }
 
-/// The thinking effort of a request: a name from `chat_template.jinja` or a number in
-/// [0, 0.99], or [`DEFAULT_EFFORT`].
-pub fn effort(value: Option<&Value>) -> Result<f64, InvalidRequest> {
-    let value = match value {
-        None | Some(Value::Null) => return Ok(DEFAULT_EFFORT),
-        Some(Value::String(name)) => EFFORTS
-            .iter()
-            .find(|(n, _)| *n == name.trim())
-            .map(|&(_, v)| v)
-            .ok_or_else(|| invalid(format!("unknown reasoning_effort: {name}")))?,
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
-        Some(_) => return Err(invalid("reasoning_effort must be a string or a number")),
-    };
-    if (0.0..=0.99).contains(&value) {
-        Ok(value)
-    } else {
-        Err(invalid("reasoning_effort must be in [0.0, 0.99]"))
+/// The highest effort a number may ask for, as `chat_template.jinja` takes it.
+const MAX_EFFORT: f64 = 0.99;
+
+/// The thinking effort of a request's field `param`: a name from `chat_template.jinja` or
+/// a number from 0 to [`MAX_EFFORT`], or [`DEFAULT_EFFORT`].
+pub fn effort(param: &str, value: Option<&Value>) -> Result<f64, InvalidRequest> {
+    let names: Vec<&str> = EFFORTS.iter().map(|&(name, _)| name).collect();
+    let accepted = format!(
+        "a number from 0 to {MAX_EFFORT}, or one of {}",
+        one_of(&names)
+    );
+    let in_range = |v: f64| (0.0..=MAX_EFFORT).contains(&v);
+    match value {
+        None | Some(Value::Null) => Ok(DEFAULT_EFFORT),
+        Some(Value::String(name)) => {
+            if let Some(&(_, v)) = EFFORTS.iter().find(|(n, _)| *n == name.trim()) {
+                return Ok(v);
+            }
+            // A number in a string: say so, unless it is out of range anyway.
+            let quoted = crate::invalid::quote(name);
+            Err(match name.trim().parse::<f64>() {
+                Ok(v) if in_range(v) => InvalidRequest::field(
+                    param,
+                    format!(
+                        "got {quoted} (a string); send {} as a JSON number, not a string. \
+                         Accepted: {accepted}",
+                        name.trim()
+                    ),
+                ),
+                _ => InvalidRequest::field(
+                    param,
+                    format!("expected {accepted}, got {quoted} (a string)"),
+                ),
+            })
+        }
+        Some(number @ Value::Number(n)) => match n.as_f64() {
+            Some(v) if in_range(v) => Ok(v),
+            _ => Err(InvalidRequest::expected(param, &accepted, number)),
+        },
+        Some(other) => Err(InvalidRequest::expected(param, &accepted, other)),
     }
 }
 
@@ -714,26 +796,42 @@ fn parts(message: &Value, skip_empty: bool) -> Result<Vec<Part<'_>>, InvalidRequ
     match message.get("content") {
         Some(Value::String(text)) if text.is_empty() && skip_empty => Ok(Vec::new()),
         Some(Value::String(text)) => Ok(vec![Part::Text(text.as_str())]),
-        Some(Value::Array(parts)) => parts.iter().map(content_part).collect(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .enumerate()
+            .map(|(j, part)| content_part(part).map_err(|e| e.within(format_args!("content[{j}]"))))
+            .collect(),
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(_) => Err(invalid("message content must be a string or an array")),
+        Some(other) => Err(InvalidRequest::expected(
+            "content",
+            "a string or an array of content parts",
+            other,
+        )),
     }
 }
+
+/// The content part types a chat message takes.
+const PART_TYPES: [&str; 5] = ["text", "input_text", "image_url", "input_image", "image"];
 
 /// One content part: text or an image; audio is refused.
 fn content_part(part: &Value) -> Result<Part<'_>, InvalidRequest> {
     if let Value::String(text) = part {
         return Ok(Part::Text(text));
     }
-    match part.get("type").and_then(Value::as_str) {
-        None | Some("text" | "input_text") => Ok(Part::Text(
+    let kind = part.get("type").unwrap_or(&Value::Null);
+    match kind.as_str() {
+        _ if kind.is_null() => Ok(Part::Text(
+            part.get("text").and_then(Value::as_str).unwrap_or(""),
+        )),
+        Some("text" | "input_text") => Ok(Part::Text(
             part.get("text").and_then(Value::as_str).unwrap_or(""),
         )),
         Some("image" | "input_image" | "image_url") => Ok(Part::Image(part)),
-        Some("audio" | "input_audio" | "audio_url") => {
-            Err(invalid("Inkling 2 does not accept audio input"))
-        }
-        Some(other) => Err(invalid(format!("unsupported content part type: {other}"))),
+        Some(audio @ ("audio" | "input_audio" | "audio_url")) => Err(InvalidRequest::field(
+            "type",
+            format!("{audio:?} is not supported: Inkling 2 reads text and images, not audio"),
+        )),
+        _ => Err(InvalidRequest::expected("type", &one_of(&PART_TYPES), kind)),
     }
 }
 
@@ -748,8 +846,17 @@ pub fn tool_function_name(tool: &Value) -> Option<&str> {
 /// The declaration of one tool, with the template's keys.
 fn tool_spec(tool: &Value) -> Result<Value, InvalidRequest> {
     let function = tool.get("function").unwrap_or(tool);
-    let name =
-        tool_function_name(tool).ok_or_else(|| invalid("every tool needs a function name"))?;
+    let name = tool_function_name(tool).ok_or_else(|| {
+        let param = if tool.get("function").is_some() {
+            "function.name"
+        } else {
+            "name"
+        };
+        match function.get("name") {
+            None => InvalidRequest::missing(param, "the function's name as a string"),
+            Some(other) => InvalidRequest::expected(param, "a string", other),
+        }
+    })?;
     let description = function
         .get("description")
         .filter(|d| !is_empty(d))
@@ -787,23 +894,37 @@ fn is_empty(value: &Value) -> bool {
 
 /// The name and argument object of an assistant tool call.
 fn tool_call(call: &Value) -> Result<(&str, Map<String, Value>), InvalidRequest> {
-    let function = call
-        .get("function")
-        .ok_or_else(|| invalid("a tool call needs a function"))?;
+    let function = call.get("function").ok_or_else(|| {
+        InvalidRequest::missing(
+            "function",
+            "an object with the function's name and arguments",
+        )
+    })?;
     let name = function
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid("tool call function name must be a string"))?;
+        .ok_or_else(|| match function.get("name") {
+            None => InvalidRequest::missing("function.name", "a string"),
+            Some(other) => InvalidRequest::expected("function.name", "a string", other),
+        })?;
     let args = match function.get("arguments") {
         None | Some(Value::Null) => Value::Object(Map::new()),
         Some(Value::String(s)) if s.trim().is_empty() => Value::Object(Map::new()),
-        Some(Value::String(s)) => serde_json::from_str(s)
-            .map_err(|e| invalid(format!("tool call arguments are not JSON: {e}")))?,
+        Some(Value::String(s)) => serde_json::from_str(s).map_err(|e| {
+            InvalidRequest::field(
+                "function.arguments",
+                format!("expected a JSON object in a string, but it is not JSON: {e}"),
+            )
+        })?,
         Some(other) => other.clone(),
     };
     match args {
         Value::Object(args) => Ok((name, args)),
-        _ => Err(invalid("tool call arguments must be an object")),
+        other => Err(InvalidRequest::expected(
+            "function.arguments",
+            "a JSON object, or a string that holds one",
+            &other,
+        )),
     }
 }
 
@@ -1082,6 +1203,7 @@ pub(crate) mod tests {
 
     #[test]
     fn effort_names_numbers_and_default() {
+        let effort = |value: Option<&Value>| effort("reasoning_effort", value);
         assert_eq!(effort(None).unwrap(), 0.9);
         assert_eq!(effort(Some(&json!("medium"))).unwrap(), 0.7);
         assert_eq!(effort(Some(&json!(0))).unwrap(), 0.0);
@@ -1097,10 +1219,13 @@ pub(crate) mod tests {
         let off = json!({"enable_thinking": false});
         let on = json!({"enable_thinking": true});
         let thinking = |effort: Option<Value>, kwargs: &Value| {
-            request_thinking(effort.as_ref(), Some(kwargs)).unwrap()
+            request_thinking("reasoning_effort", effort.as_ref(), Some(kwargs)).unwrap()
         };
         let default = Thinking::Effort(DEFAULT_EFFORT);
-        assert_eq!(request_thinking(None, None).unwrap(), default);
+        assert_eq!(
+            request_thinking("reasoning_effort", None, None).unwrap(),
+            default
+        );
         assert_eq!(thinking(None, &off), Thinking::Off);
         assert_eq!(thinking(None, &on), default);
         assert_eq!(thinking(Some(json!("none")), &on), Thinking::Off);
@@ -1112,8 +1237,24 @@ pub(crate) mod tests {
         assert_eq!(thinking(None, &kwarg), Thinking::Effort(0.7));
         let kwarg = json!({"reasoning_effort": "none"});
         assert_eq!(thinking(None, &kwarg), Thinking::Off);
-        assert!(request_thinking(None, Some(&json!({"enable_thinking": "no"}))).is_err());
-        assert!(request_thinking(Some(&json!("nothing")), None).is_err());
+        let e = request_thinking(
+            "reasoning_effort",
+            None,
+            Some(&json!({"enable_thinking": "no"})),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "chat_template_kwargs.enable_thinking: expected a boolean, got \"no\" (a string)"
+        );
+        let e = request_thinking(
+            "reasoning_effort",
+            None,
+            Some(&json!({"reasoning_effort": 2})),
+        )
+        .unwrap_err();
+        assert_eq!(e.param(), Some("chat_template_kwargs.reasoning_effort"));
+        assert!(request_thinking("reasoning_effort", Some(&json!("nothing")), None).is_err());
     }
 
     #[test]

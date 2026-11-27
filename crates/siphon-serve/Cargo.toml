@@ -11,9 +11,11 @@ anyhow.workspace = true
 axum = "0.8"
 base64 = "0.22"
 futures-util = { version = "0.3.34", default-features = false }
+http-body = "1.0.1"
 image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error = "0.1.20"
 siphon = { path = "../siphon" }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
@@ -22,7 +24,7 @@ tower-http = { version = "0.6.11", default-features = false, features = ["compre
 
 [dev-dependencies]
 flate2 = "1"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["io-util", "test-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 zstd = "0.14"
 

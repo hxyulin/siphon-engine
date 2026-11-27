@@ -68,6 +68,9 @@ pub struct Job {
     pub events: UnboundedSender<Event>,
     /// The request's id and the response's id, for the job's log lines.
     pub label: Arc<str>,
+    /// The request's log line, which takes the engine's summary of the job while the
+    /// request runs.
+    pub log: std::sync::Weak<crate::log::RequestLog>,
     /// The submission the job came in: jobs of one submission share their prompt.
     group: u64,
     /// The job's place in the engine's [`Load`], from [`Engine::submit`].
@@ -100,6 +103,7 @@ impl Job {
             sampling,
             events,
             label,
+            log: std::sync::Weak::new(),
             group: 0,
             ticket: None,
             control: None,
@@ -115,6 +119,12 @@ impl Job {
             key,
             ..self
         }
+    }
+
+    /// The job with the request's log line `log`.
+    #[must_use]
+    pub fn with_log(self, log: std::sync::Weak<crate::log::RequestLog>) -> Self {
+        Self { log, ..self }
     }
 
     /// The key the prefix cache matches the prompt by.
@@ -575,8 +585,8 @@ mod cuda {
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
-            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, Prompt, Rebuild, Speculator,
-            Width, WidthPolicy, load_draft, price,
+            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, PrefixTier, Prompt, Rebuild,
+            Speculator, Width, WidthPolicy, load_draft, price,
         },
         vision::{VisionFormat, VisionTower},
         vmm::{PagePool, granularity},
@@ -585,9 +595,14 @@ mod cuda {
 
     use super::{Control, Engine, Event, Finish, Job, Options, starts_with_chained};
     use crate::{
+        log::log,
         piggyback::{self, PiggybackSlice, PrefillCandidate, TurnPlan},
         vision::{ImageStats, PromptImage},
     };
+
+    /// Prompts of at least this many tokens get a log line about their prefix cache lookup
+    /// when they start, since their prefill takes seconds.
+    const LONG_PROMPT: usize = 16_384;
 
     /// The vision tower, with `--vision`.
     type Tower = Option<VisionTower>;
@@ -798,8 +813,8 @@ mod cuda {
             slot_capacity > warmup + 128 + MARGIN,
             "a context of {capacity} is too small"
         );
-        eprintln!("memory plan: {}", planner.plan(capacity));
-        eprintln!("memory {budget_line}");
+        log!("memory plan: {}", planner.plan(capacity));
+        log!("memory {budget_line}");
         Ok(capacity)
     }
 
@@ -839,7 +854,7 @@ mod cuda {
                 warned: false,
                 reported: 0,
             };
-            eprintln!(
+            log!(
                 "memory check: {} GiB of a planned {} GiB in use after warmup ({} GiB in \
                  buffers, peak {} GiB; {} GiB in the KV pool; {} GiB in modules and graphs)",
                 gib(check.peak(&now)),
@@ -864,7 +879,7 @@ mod cuda {
                     let peak = self.peak(&now);
                     if peak > self.reported {
                         self.reported = peak;
-                        eprintln!(
+                        log!(
                             "memory check: peak {} MiB of a planned {} MiB after a job",
                             peak >> 20,
                             self.planned >> 20
@@ -872,7 +887,7 @@ mod cuda {
                     }
                     self.warn(&now);
                 }
-                Err(e) => eprintln!("memory check failed: {e:#}"),
+                Err(e) => log!("memory check failed: {e:#}"),
             }
         }
 
@@ -880,7 +895,7 @@ mod cuda {
             let peak = self.peak(now);
             if !self.warned && peak > self.planned {
                 self.warned = true;
-                eprintln!(
+                log!(
                     "warning: memory use peaked at {} GiB, {} MiB past the plan; the plan \
                      undercounts this configuration",
                     gib(peak),
@@ -954,7 +969,7 @@ mod cuda {
         )?;
         let (page, _) = granularity(gpu.context())?;
         if page != memory::KV_PAGE_BYTES {
-            eprintln!(
+            log!(
                 "warning: the device maps pages of {} KiB, the plan assumes {} KiB",
                 page >> 10,
                 memory::KV_PAGE_BYTES >> 10
@@ -962,7 +977,7 @@ mod cuda {
         }
         let pool_started = Instant::now();
         let pool = PagePool::new(gpu.context(), planner.plan(capacity).kv.div_ceil(page))?;
-        eprintln!(
+        log!(
             "KV pool: {} pages of {} MiB ({} GiB) in {:.2} s, for {capacity} positions over \
              up to {} streams (up to {slot_capacity} per request)",
             pool.total_pages(),
@@ -989,7 +1004,7 @@ mod cuda {
         };
         model.set_moe_pruning(moe_pruning)?;
         if moe_pruning.is_active() {
-            eprintln!("moe pruning: {moe_pruning}");
+            log!("moe pruning: {moe_pruning}");
         }
         model.set_prefill_attention(options.prefill_attention.parse()?)?;
         model.set_prefill_dense(options.prefill_dense.parse()?)?;
@@ -999,14 +1014,14 @@ mod cuda {
         }
         model.set_accept_margin(options.accept_margin)?;
         if options.accept_margin > 0.0 {
-            eprintln!(
+            log!(
                 "speculative margin acceptance enabled (margin {:.3})",
                 options.accept_margin
             );
         }
         model.set_spec_beta(options.spec_beta)?;
         if let Some(beta) = options.spec_beta {
-            eprintln!("speculative beta rejection enabled (beta {beta:.2})");
+            log!("speculative beta rejection enabled (beta {beta:.2})");
         }
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
         let source = options
@@ -1021,7 +1036,7 @@ mod cuda {
         }
         speculator.set_prefill_chunk(chunk)?;
         let tower = load_tower(options, &gpu, &checkpoint)?;
-        eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
+        log!("loaded in {:.1} s", started.elapsed().as_secs_f64());
 
         // Price each width at the warmup prompt, which also captures the graphs.
         model.reset()?;
@@ -1033,7 +1048,7 @@ mod cuda {
             .iter()
             .map(|&w| format!("{w}: {:.3}", policy.round_ms()[w - 1]))
             .collect();
-        eprintln!(
+        log!(
             "round ms by width: {}; plain step {:.3}, probe {:.3}",
             priced.join(", "),
             policy.plain().map_or(f64::NAN, |p| p.step_ms),
@@ -1064,19 +1079,19 @@ mod cuda {
                 speculator.reserve_batch_spec(&model, spec_seqs, options.streams - 1)?;
                 let warmup_started = Instant::now();
                 let captured = speculator.warmup_batch_spec(&mut model, spec_seqs, warmup[0])?;
-                eprintln!(
+                log!(
                     "batched DFlash 2 speculation enabled (up to {spec_seqs} sequences per verify, \
                      pre-captured {captured} bucketed verify+draft graph pairs in {:.2} s)",
                     warmup_started.elapsed().as_secs_f64()
                 );
             }
             if let Some(budget) = options.piggyback_budget {
-                eprintln!(
+                log!(
                     "hybrid piggyback prefill enabled (up to {budget} prefill tokens per \
                      decode/verify step)"
                 );
             }
-            eprintln!("serving up to {} requests at once", options.streams);
+            log!("serving up to {} requests at once", options.streams);
         }
         drop(saved);
         // Pricing left the draft's caches mapped; the pool starts empty.
@@ -1088,7 +1103,7 @@ mod cuda {
                 options.prefix_entries,
                 options.prefix_ttl,
             )?;
-            eprintln!(
+            log!(
                 "prefix cache: {} entries, {} MiB of copies besides their rings' in the KV pool, \
                  {} s to live",
                 options.prefix_entries,
@@ -1117,7 +1132,7 @@ mod cuda {
         };
         let mut tower = VisionTower::load(gpu, checkpoint, v.format)?;
         tower.reserve(v.max_image_tokens * v.patches_per_token)?;
-        eprintln!(
+        log!(
             "vision tower: {} weights, images shrunk to {} pixels, up to {} image tokens",
             v.format,
             options.vision.map_or(0, |o| o.max_pixels),
@@ -1193,7 +1208,7 @@ mod cuda {
         );
         let started = Instant::now();
         let (chunks, chunk_bytes) = speculator.enable_host_cache(model, options.host_cache)?;
-        eprintln!(
+        log!(
             "host cache: {:.2} GiB of page-locked host memory in {:.2} s, {chunks} chunks of \
              {} MiB ({HOST_CHUNK_POSITIONS} positions each)",
             (chunks * chunk_bytes) as f64 / f64::from(1u32 << 30),
@@ -1221,8 +1236,8 @@ mod cuda {
                 bytes as f64 / seconds.max(1e-9) / 1e9
             ),
         };
-        eprintln!("host cache: {line}");
-        log_host(speculator);
+        log!("host cache: {line}");
+        log_cache(speculator);
         Ok(())
     }
 
@@ -1285,7 +1300,7 @@ mod cuda {
         };
         let saved = cache_identity(options)
             .and_then(|identity| speculator.save_host_cache(model, dir, &identity));
-        log_host(speculator);
+        log_cache(speculator);
         match saved {
             Ok(s) => format!(
                 "host cache: saved {} entries ({:.2} GiB) to {} in {:.1} s ({:.2} GB/s)",
@@ -1335,6 +1350,8 @@ mod cuda {
         failed: bool,
         /// Whether the prompt's state came from a sibling's prefill (`share_prefill`).
         shared: bool,
+        /// The prefix cache tier its cached prompt tokens came from.
+        tier: Option<&'static str>,
         /// Whether the draft follows this request through batched steps.
         followed: bool,
         /// Whether this slot's DFlash 2 sliding rings hold its positions for batched
@@ -1383,6 +1400,7 @@ mod cuda {
                 done: false,
                 failed: false,
                 shared: false,
+                tier: None,
                 followed: false,
                 draft_ready: false,
                 stay_batched: false,
@@ -1472,16 +1490,15 @@ mod cuda {
             ControlFlow::Continue(())
         }
 
-        /// Logs the job and tells its client it is done.
+        /// Gives the request's log line the engine's summary of the job, or logs it on its
+        /// own line when the request has already ended, and tells its client it is done.
         fn finish(&self, detail: &str) {
             let decode_s = self.started.elapsed().as_secs_f64() - self.prefill_s;
             let events = &self.job.events;
-            let mut prefill_ms = self.prefill_s * 1e3;
             let images = match self.job.images.len() {
                 0 => String::new(),
                 n => {
                     let stats = self.encodes.stats(&self.job.images, self.cached);
-                    prefill_ms = (prefill_ms - stats.ms).max(0.0);
                     format!(
                         ", {n} images: {} encoded in {:.0} ms, {} from the cache",
                         stats.encoded, stats.ms, stats.cached
@@ -1496,26 +1513,61 @@ mod cuda {
             } else {
                 String::new()
             };
-            eprintln!(
-                "job: {}: {} prompt tokens ({} cached{images}), prefill {:.0} ms{}, {} tokens \
-                 in {:.2} s ({:.1} tok/s, {} speculated, {} batched steps{parks}{detail}), {}",
-                self.job.label,
-                self.job.prompt.len(),
-                self.cached,
-                prefill_ms,
-                if self.shared { " (copied)" } else { "" },
-                self.output.len(),
-                decode_s,
-                self.output.len() as f64 / decode_s.max(1e-9),
+            let summary = format!(
+                "{} speculated, {} batched steps{}{images}{parks}{detail}",
                 self.speculated,
                 self.batched,
-                if events.is_closed() {
-                    "client left".to_owned()
+                if self.shared {
+                    ", prompt copied from a sibling"
                 } else {
-                    format!("{:?}", self.finish)
+                    ""
                 },
             );
+            let tier = if self.shared {
+                Some("copied")
+            } else {
+                self.tier
+            };
+            match self.job.log.upgrade() {
+                Some(log) if !events.is_closed() => log.engine(tier, summary),
+                _ => log!(
+                    "job: {}: client left after {} of {} tokens in {:.2} s ({} prompt tokens, \
+                     {} cached): {summary}",
+                    self.job.label,
+                    self.output.len(),
+                    self.job.max_tokens,
+                    decode_s.max(0.0),
+                    self.job.prompt.len(),
+                    self.cached,
+                ),
+            }
             let _ = events.send(Event::Done(self.finish));
+        }
+
+        /// Records that `cached` prompt tokens came from the prefix cache, in the tier of
+        /// `speculator`'s last lookup, tells the client, and logs the lookup of a long
+        /// prompt.
+        fn cached_from(&mut self, speculator: &Speculator, cached: usize) {
+            self.cached = cached;
+            let tier = speculator.last_prefix_tier().filter(|_| cached > 0);
+            self.tier = tier.map(PrefixTier::name);
+            let _ = self.job.events.send(Event::Cached(cached));
+            let len = self.job.prompt.len();
+            if len < LONG_PROMPT {
+                return;
+            }
+            match tier {
+                Some(tier) => log!(
+                    "job: {}: prefix cache hit, {} of {len} prompt tokens from the {} tier",
+                    self.job.label,
+                    self.cached,
+                    tier.name()
+                ),
+                None => log!(
+                    "job: {}: prefix cache miss, prefilling all {len} prompt tokens",
+                    self.job.label
+                ),
+            }
         }
 
         /// Tells its client what the tower did, once its prompt's prefill has ended.
@@ -1527,7 +1579,7 @@ mod cuda {
         }
 
         fn fail(&mut self, e: &anyhow::Error) {
-            eprintln!("job failed: {}: {e:#}", self.job.label);
+            log!("job failed: {}: {e:#}", self.job.label);
             let _ = self.job.events.send(Event::Failed(format!("{e:#}")));
             self.done = true;
             self.failed = true;
@@ -1706,7 +1758,7 @@ mod cuda {
                 Ok(true) => {
                     if speculator.supports_batch_spec() {
                         if let Err(e) = speculator.sync_slot0_draft(&model) {
-                            eprintln!("syncing slot 0 DFlash 2 state failed: {e:#}");
+                            log!("syncing slot 0 DFlash 2 state failed: {e:#}");
                             speculator.follow(&model);
                             request.followed = true;
                         } else {
@@ -1770,7 +1822,7 @@ mod cuda {
     /// the KV pool. A failure goes to the log.
     fn release(model: &mut Model, speculator: &mut Speculator, slot: usize) {
         if let Err(e) = speculator.release_slot(model, slot) {
-            eprintln!("returning slot {slot}'s pages failed: {e:#}");
+            log!("returning slot {slot}'s pages failed: {e:#}");
         }
     }
 
@@ -1800,7 +1852,7 @@ mod cuda {
             return true;
         }
         if let Err(e) = speculator.release_dead_entries(model) {
-            eprintln!("returning the pages of dropped prefix cache entries failed: {e:#}");
+            log!("returning the pages of dropped prefix cache entries failed: {e:#}");
         }
         if free(model) >= need {
             return true;
@@ -1814,13 +1866,11 @@ mod cuda {
         if reclaim < Reclaim::Entries {
             return false;
         }
-        for (slot, pages) in speculator.evictable_slots(model, keep) {
-            match speculator.evict_slot(model, slot) {
-                Ok(()) => eprintln!(
-                    "KV pool: dropped slot {slot}'s cached prompt, {pages} pages, for {need} \
-                     pages"
-                ),
-                Err(e) => eprintln!("dropping slot {slot}'s cached prompt failed: {e:#}"),
+        for (slot, _) in speculator.evictable_slots(model, keep) {
+            // The prefix cache notes the entry it drops, with its pages.
+            match speculator.evict_slot(model, slot, need) {
+                Ok(()) => log_cache(speculator),
+                Err(e) => log!("dropping slot {slot}'s cached prompt failed: {e:#}"),
             }
             if free(model) >= need {
                 return true;
@@ -1831,8 +1881,8 @@ mod cuda {
         }
         match speculator.trim_draft(model) {
             Ok(0) => {}
-            Ok(pages) => eprintln!("KV pool: dropped the draft's {pages} pages"),
-            Err(e) => eprintln!("dropping the draft's pages failed: {e:#}"),
+            Ok(pages) => log!("KV pool: dropped the draft's {pages} pages"),
+            Err(e) => log!("dropping the draft's pages failed: {e:#}"),
         }
         free(model) >= need
     }
@@ -1876,14 +1926,14 @@ mod cuda {
     fn park(model: &mut Model, speculator: &mut Speculator, r: &mut Request) -> bool {
         let fed = r.fed();
         let parked = speculator.park(model, r.slot, &fed, r.job.prompt.len());
-        log_host(speculator);
+        log_cache(speculator);
         match parked {
             Ok(Some(id)) => {
                 if r.followed {
                     speculator.forget();
                     r.followed = false;
                 }
-                eprintln!(
+                log!(
                     "round robin: swapped out a request at position {} after {:.2} s",
                     fed.len(),
                     r.since.elapsed().as_secs_f64()
@@ -2135,15 +2185,14 @@ mod cuda {
                 }
                 let key = request.job.key();
                 let claimed = speculator.claim_slot(model, key, speculator.prefill_chunk(), &busy);
-                log_host(speculator);
+                log_cache(speculator);
                 match claimed {
                     Ok((slot, cached)) => {
                         request.slot = slot;
                         request.prefilled = cached;
-                        request.cached = cached;
                         request.draft_ready = speculator.supports_batch_spec()
                             && (cached == 0 || speculator.slot_draft_committed(slot) == cached);
-                        let _ = request.job.events.send(Event::Cached(cached));
+                        request.cached_from(speculator, cached);
                         active.push(request);
                     }
                     Err(e) => request.fail(&e),
@@ -2153,11 +2202,11 @@ mod cuda {
                 let mut r = parked.remove(i);
                 let Some(id) = r.parked.take() else { return };
                 let back = speculator.unpark(model, id, &busy);
-                log_host(speculator);
+                log_cache(speculator);
                 match back {
                     Ok((slot, position)) if position == r.position() => {
                         r.parked_s += r.since.elapsed().as_secs_f64();
-                        eprintln!(
+                        log!(
                             "round robin: a request at position {position} returned to slot \
                              {slot} after {:.2} s",
                             r.since.elapsed().as_secs_f64()
@@ -2218,9 +2267,8 @@ mod cuda {
                 },
             };
             let (first, cached) = speculator.prefill_cached(model, prompt, chunk)?;
-            log_host(speculator);
-            request.cached = cached;
-            let _ = request.job.events.send(Event::Cached(cached));
+            log_cache(speculator);
+            request.cached_from(speculator, cached);
             request.prefilled = request.job.prompt.len();
             request.prefill_s = request.started.elapsed().as_secs_f64();
             request.send_images();
@@ -2253,7 +2301,7 @@ mod cuda {
                     }
                 }
                 // The reply ends here, still with `Finish::Length`.
-                eprintln!("KV pool: full at position {}", model.position());
+                log!("KV pool: full at position {}", model.position());
                 false
             };
             speculator.generate_with_room(model, remaining, Drafts::Dspark, room, |ids| {
@@ -2293,7 +2341,7 @@ mod cuda {
             acceptance.join(", "),
         );
         if interrupted {
-            eprintln!("{episode}, then batched from position {}", model.position());
+            log!("{episode}, then batched from position {}", model.position());
             request.next = Some(last);
             return Ok(true);
         }
@@ -2301,10 +2349,11 @@ mod cuda {
         Ok(false)
     }
 
-    /// Prints what the prefix cache's host tier did since the last call.
-    fn log_host(speculator: &mut Speculator) {
-        for line in speculator.host_notes() {
-            eprintln!("{line}");
+    /// Logs what the prefix cache and its host tier did since the last call: saves,
+    /// restores and dropped entries.
+    fn log_cache(speculator: &mut Speculator) {
+        for line in speculator.cache_notes() {
+            log!("{line}");
         }
     }
 
@@ -2338,7 +2387,7 @@ mod cuda {
             speculator.resume_dflash2_slot(model, r.slot, next)?;
             r.slot = 0;
             model.stream().synchronize()?;
-            eprintln!(
+            log!(
                 "speculating again (DFlash 2) at position {position} from slot {from}, {:.1} ms",
                 started.elapsed().as_secs_f64() * 1e3
             );
@@ -2356,7 +2405,7 @@ mod cuda {
         r.slot = 0;
         speculator.resume(model, next)?;
         model.stream().synchronize()?;
-        eprintln!(
+        log!(
             "speculating again at position {position} from slot {from}, {:.1} ms",
             started.elapsed().as_secs_f64() * 1e3
         );
@@ -2388,17 +2437,17 @@ mod cuda {
             &keep,
             reclaim.min(Reclaim::Entries),
         ) {
-            eprintln!("no room in the KV pool to rebuild the draft");
+            log!("no room in the KV pool to rebuild the draft");
             *rebuild = None;
             return None;
         }
         let (r, _) = rebuild.as_mut()?;
         let stepped = speculator.rebuild_step(model, r, prompt);
-        log_host(speculator);
+        log_cache(speculator);
         match stepped {
             Ok(done) => Some(done),
             Err(e) => {
-                eprintln!("rebuilding the draft failed: {e:#}");
+                log!("rebuilding the draft failed: {e:#}");
                 *rebuild = None;
                 None
             }
@@ -2439,11 +2488,11 @@ mod cuda {
             match speculator.start_rebuild(model, scratch) {
                 Ok(r) => *rebuild = Some((r, Instant::now())),
                 Err(e) => {
-                    eprintln!("starting a draft rebuild failed: {e:#}");
+                    log!("starting a draft rebuild failed: {e:#}");
                     return false;
                 }
             }
-            eprintln!(
+            log!(
                 "idle: rebuilding the draft's state for the cached prompt of {} tokens in slot \
                  {slot}, in slot {scratch}",
                 key.len()
@@ -2453,7 +2502,7 @@ mod cuda {
         match step_rebuild(model, speculator, rebuild, prompt, &[slot], Reclaim::Pages) {
             Some(true) => {
                 if let Some((_, started)) = rebuild.take() {
-                    eprintln!(
+                    log!(
                         "idle: the cached prompt of {} tokens has the draft's state, {:.2} s",
                         key.len(),
                         started.elapsed().as_secs_f64()
@@ -2512,11 +2561,11 @@ mod cuda {
             match speculator.start_rebuild(model, scratch) {
                 Ok(rb) => *rebuild = Some((rb, Instant::now())),
                 Err(e) => {
-                    eprintln!("starting a draft rebuild failed: {e:#}");
+                    log!("starting a draft rebuild failed: {e:#}");
                     return false;
                 }
             }
-            eprintln!(
+            log!(
                 "rebuilding the draft at position {key_len} of a request in slot {} after {} \
                  batched steps, in slot {scratch}",
                 r.slot,
@@ -2565,14 +2614,14 @@ mod cuda {
                 };
                 match speculator.follow_rebuilt(model, rb, &tokens) {
                     Ok(()) => {
-                        eprintln!(
+                        log!(
                             "rebuilt the draft at position {} in {:.2} s",
                             tokens.len(),
                             started.elapsed().as_secs_f64()
                         );
                         r.followed = true;
                     }
-                    Err(e) => eprintln!("following a rebuilt request failed: {e:#}"),
+                    Err(e) => log!("following a rebuilt request failed: {e:#}"),
                 }
                 true
             }
@@ -2821,7 +2870,7 @@ mod cuda {
                     Ok(true) => return active.pop(),
                     Ok(false) => {}
                     Err(e) => {
-                        eprintln!("returning to speculation failed, staying batched: {e:#}");
+                        log!("returning to speculation failed, staying batched: {e:#}");
                         speculator.forget();
                         r.followed = false;
                         r.draft_ready = false;
@@ -3185,12 +3234,10 @@ mod cuda {
                                 let key = active[idx].job.key();
                                 if let Err(e) = speculator.save_prefix(model, slot, key, chunk, &busy)
                                 {
-                                    eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+                                    log!("keeping a prompt in the prefix cache failed: {e:#}");
                                 }
                             } else {
-                                eprintln!(
-                                    "no room in the KV pool to keep a prompt in the prefix cache"
-                                );
+                                log!("no room in the KV pool to keep a prompt in the prefix cache");
                             }
                         }
                         if end == len
@@ -3204,7 +3251,7 @@ mod cuda {
                             r.done = r.take(&[first], stop).is_break();
                         }
                     }
-                    log_host(speculator);
+                    log_cache(speculator);
                     return total_processed.max(1);
                 }
                 Err(e) => {
@@ -3291,14 +3338,14 @@ mod cuda {
             if make_room(model, speculator, model.ring_pages(), &busy, Reclaim::Draft) {
                 let key = active[i].job.key();
                 if let Err(e) = speculator.save_prefix(model, slot, key, chunk, &busy) {
-                    eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+                    log!("keeping a prompt in the prefix cache failed: {e:#}");
                 }
             } else {
-                eprintln!("no room in the KV pool to keep a prompt in the prefix cache");
+                log!("no room in the KV pool to keep a prompt in the prefix cache");
             }
         }
         let r = &mut active[i];
-        log_host(speculator);
+        log_cache(speculator);
         if end == len {
             r.kept = None;
             r.prefill_s = r.started.elapsed().as_secs_f64();
@@ -3511,7 +3558,7 @@ mod cuda {
                         if r.followed
                             && let Err(e) = speculator.keep_batched(model, row, token)
                         {
-                            eprintln!("the draft stops following a request: {e:#}");
+                            log!("the draft stops following a request: {e:#}");
                             speculator.forget();
                             r.followed = false;
                         }
@@ -3558,10 +3605,10 @@ mod cuda {
                 if make_room(model, speculator, model.ring_pages(), &busy, Reclaim::Draft) {
                     let key = active[s.index].job.key();
                     if let Err(e) = speculator.save_prefix(model, s.slot, key, chunk, &busy) {
-                        eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+                        log!("keeping a prompt in the prefix cache failed: {e:#}");
                     }
                 } else {
-                    eprintln!("no room in the KV pool to keep a prompt in the prefix cache");
+                    log!("no room in the KV pool to keep a prompt in the prefix cache");
                 }
             }
             if s.finishes_prompt
@@ -3693,7 +3740,7 @@ mod cuda {
                         if r.followed
                             && let Err(e) = speculator.keep_batched(model, row, token)
                         {
-                            eprintln!("the draft stops following a request: {e:#}");
+                            log!("the draft stops following a request: {e:#}");
                             speculator.forget();
                             r.followed = false;
                         }
@@ -3822,7 +3869,7 @@ mod cuda {
                             if r.followed
                                 && let Err(e) = speculator.keep_batched(model, row, token)
                             {
-                                eprintln!("the draft stops following a request: {e:#}");
+                                log!("the draft stops following a request: {e:#}");
                                 speculator.forget();
                                 r.followed = false;
                             }
@@ -3839,7 +3886,7 @@ mod cuda {
                 }
             }
         }
-        log_host(speculator);
+        log_cache(speculator);
     }
 }
 

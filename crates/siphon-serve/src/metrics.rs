@@ -49,7 +49,7 @@ pub enum Reason {
 impl Reason {
     const ALL: [Self; 4] = [Self::Stop, Self::Length, Self::Abort, Self::Error];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Stop => "stop",
             Self::Length => "length",
@@ -166,6 +166,8 @@ impl Metrics {
             cached: 0,
             last: None,
             times: Times::new(Instant::now()),
+            generated: 0,
+            reason: None,
         }
     }
 
@@ -315,9 +317,27 @@ pub struct Tracker {
     /// When the last tokens arrived.
     last: Option<Instant>,
     times: Times,
+    /// Tokens that arrived, and how the request ended.
+    generated: usize,
+    reason: Option<Reason>,
 }
 
 impl Tracker {
+    /// Tokens that arrived so far.
+    pub fn generated(&self) -> usize {
+        self.generated
+    }
+
+    /// Prompt tokens whose state came from the prefix cache.
+    pub fn cached_tokens(&self) -> usize {
+        usize::try_from(self.cached).unwrap_or(usize::MAX)
+    }
+
+    /// How the request ended, once it has.
+    pub fn reason(&self) -> Option<Reason> {
+        self.reason
+    }
+
     /// The engine took the request from its queue.
     pub fn started(&mut self) {
         self.started_at(Instant::now());
@@ -366,6 +386,7 @@ impl Tracker {
             return;
         }
         self.started_at(now);
+        self.generated += n;
         let n = n as u64;
         if std::mem::take(&mut self.times.round) {
             self.times.rounds += 1;
@@ -406,6 +427,7 @@ impl Tracker {
             Phase::Running => s.running -= 1,
         }
         self.phase = Phase::Finished;
+        self.reason = Some(reason);
         self.times.ended = Some(now);
         let index = Reason::ALL
             .iter()

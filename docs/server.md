@@ -40,6 +40,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 | `--host-cache GiB` | `0`, off | Keeps prefix cache entries in that much page-locked host memory too, global KV cache included, so a conversation whose stream another request took restores over PCIe instead of prefilling again. Needs the default `--prefill-chunk` of 2048. |
 | `--cache-dir DIR` | none | Saves the host cache to DIR when the server stops and loads it at startup. Needs `--host-cache`. See [Restarts](#restarts). |
 | `--drain-timeout SECONDS` | `600` | How long a drain on SIGTERM waits for the running and queued requests before it ends them. |
+| `--keepalive-after SECONDS` | `20` | How long a reply that is not streamed may stay silent before the server commits to status 200 and sends keep-alive spaces; 0 turns this off. See [Keep-alive](#keep-alive). |
 | `--prefill-attention auto\|bf16\|fp8` | `auto` | Prefill's global attention over an FP8 cache. `auto` runs BF16 up to 16,384 keys and FP8 tensor cores past them. |
 | `--greedy` | off | Decodes every request greedily, whatever its sampling fields ask. |
 | `--vision` | off | Loads the vision tower and takes images in requests. See [Images](#images). |
@@ -48,13 +49,7 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 
 With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` needs `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-Each request gets an ID. The server takes the client's `x-request-id`, or else `x-client-request-id`, when it holds 1 to 128 printable ASCII characters without spaces, and otherwise makes one such as `req-5e0c1f7a9b3d2e64`. Every response, errors included, returns the ID in `x-request-id`. The `job:` and `job failed:` log lines start with it and the response's own id, so a proxy's request log matches them:
-
-```text
-job: trace-7f3a chatcmpl-6929a1c4000003: 31204 prompt tokens (30720 cached), prefill 48 ms, ...
-```
-
-A request with `n` choices logs one line per choice, labelled `choice i`.
+Each request gets an ID. The server takes the client's `x-request-id`, or else `x-client-request-id`, when it holds 1 to 128 printable ASCII characters without spaces, and otherwise makes one such as `req-5e0c1f7a9b3d2e64`. Every response, errors included, returns the ID in `x-request-id`. The request's [log](#logs) line carries it as `id=`, and the `job:` lines start with it and the response's own id, so a proxy's request log matches them. The `job:` lines of a request with `n` choices are labelled `choice i`.
 
 A request body may be compressed with `Content-Encoding: gzip` or `zstd`; other encodings get a 415. A body may hold 32 bytes per position of the context, at least 2 MiB, plus 20 MiB per image with `--vision`. The limit applies to the decompressed bytes, so a small compressed body that inflates past it gets a 413, as an uncompressed one does. Responses that are not streamed are compressed with gzip or zstd when `Accept-Encoding` asks for it. Streams are never compressed, so each event reaches the client as the server sends it.
 
@@ -178,7 +173,7 @@ Each image goes through the reference preprocessing ([vision.md](vision.md)). An
 
 A request gets a 400 when it holds more than `--max-images` images, when an image is not one of the four formats or does not decode, or when an image has more than 50 million pixels before shrinking. An image that still needs more image tokens after shrinking than a square of `--max-image-pixels` with one more row and column of tokens, 1,369 by default, gets a 400 too; only very narrow or wide images do. The request body may grow by 20 MiB per image allowed.
 
-The tower runs on the engine thread right before the prefill chunk that first reaches an image, and its time counts as prefill for `--decode-floor`. Prefill writes the image's rows over the placeholders' embeddings after `embed_norm`, as Transformers does, and positions stay sequential. An image that crosses a prefill chunk boundary is encoded once and its rows serve both chunks. The `job:` line counts the images, as in `2 images: 1 encoded in 38 ms, 1 from the cache`, and its prefill time leaves the encodes out, as [`timings`](#request-timings) does.
+The tower runs on the engine thread right before the prefill chunk that first reaches an image, and its time counts as prefill for `--decode-floor`. Prefill writes the image's rows over the placeholders' embeddings after `embed_norm`, as Transformers does, and positions stay sequential. An image that crosses a prefill chunk boundary is encoded once and its rows serve both chunks. The request's [log](#logs) line counts the images in its `engine` field, as in `2 images: 1 encoded in 38 ms, 1 from the cache`, and its `images` and `image_ms` fields, and its `prefill_ms` leaves the encodes out, as [`timings`](#request-timings) does.
 
 Two prompts with different images have the same tokens, so the [prefix cache](#prefix-cache) does not match prompts by their tokens alone. Its device entries, its host tier and the files in `--cache-dir` hold each prompt's key: its tokens with each image's placeholders replaced by ids above the vocabulary, taken from the SHA-256 of the image file and from `--max-image-pixels`. A prompt whose images differ from an entry's below the entry's boundary does not match it. A follow-up turn of a conversation with images reads every image below its boundary from the cache, and the tower encodes only the images past it.
 
@@ -220,6 +215,14 @@ The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) an
 
 Fields the server cannot honour get a 400: `best_of` other than `n` (ranking choices needs log probabilities), `logprobs`, `top_logprobs`, `prompt_logprobs`, `echo`, `suffix`, `logit_bias`, `min_tokens`, `response_format` other than `text`, vLLM's guided decoding fields, and the deprecated `functions` and `function_call`.
 
+A 400's message starts with the field's path, quotes the value with its JSON type, and says what the server accepts. OpenAI-shaped errors also carry the path as `param`; Anthropic's error shape has no such field, so its message alone holds it. A number or boolean sent as a string gets advice to send it unquoted:
+
+```json
+{"error": {"message": "reasoning_effort: got \"0.9\" (a string); send 0.9 as a JSON number, not a string. Accepted: a number from 0 to 0.99, or one of \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\" or \"max\"", "type": "invalid_request_error", "param": "reasoning_effort", "code": null}}
+```
+
+An error about a Messages or Responses request names the field of that request, such as `messages[2].content[1]` or `input[4]`, not of the chat messages the server translates it to. An image sent without `--vision` gets an error that names the flag on the chat route; the Messages and Responses routes replace it with a note to the model, since a 400 would end a Claude Code or Codex session.
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text with vLLM's metric names and a `model_name` label. The server records them as each request's events arrive at the HTTP layer:
@@ -258,11 +261,58 @@ The times are taken when the engine's events reach the HTTP layer. The queue sta
 
 A response that is not streamed has `timings` at the top level and a `Server-Timing` header, `queue;dur=…, prefill;dur=…, decode;dur=…` in milliseconds, with `image;dur=…` after the queue for a prompt with images. A stream has sent its headers before the times are known, so its last chunk holds `timings`: in a chat or completion stream, the chunk with the last `finish_reason`, or the usage chunk when `stream_options.include_usage` asks for one, in a Messages stream, the `message_delta` event, and in a Responses stream, the response of its last event. OpenAI's and Anthropic's SDKs ignore fields they do not know.
 
-The log repeats the numbers in the request's last `job:` line:
+The request's [log](#logs) line repeats the main numbers.
+
+## Logs
+
+The server logs to stderr, one line per event, each after a UTC timestamp to the millisecond. At startup it logs its version and the commit it was built from (`SIPHON_COMMIT` at build time, else `git rev-parse`; `scripts/remote.sh` and the Docker build set it), the memory plan and what it loaded:
 
 ```text
-job: trace-7f3a chatcmpl-6929a1c4000003: timings {"cache_n":30720,"predicted_ms":1210.4,"predicted_n":612,...}
+2026-11-27T10:14:58.204Z siphon-serve 0.1.0 (commit 060d897a1b2c) starting with /home/u/models/inkling-2-mini
 ```
+
+Each HTTP request ends with one `request` line of `key=value` fields, quoted when they hold a space. It comes after the response's last byte and after the request's jobs have ended, so rejected requests, unknown routes and clients that leave get one too. Successful `GET /health` and `GET /metrics` requests are left out, since a proxy and a scraper poll them.
+
+```text
+2026-11-27T10:15:02.412Z request id=req-5fc02f989d827497 route="POST /v1/chat/completions" status=200 ms=412 reply=chatcmpl-6b095471000000 stream=true effort=0.9 finish=stop prompt=31204 cached=30720 cache=slot queue_ms=0 prefill_ms=48 output=215 tok_s=634.3 per_round=3.79 engine="216 speculated, 0 batched steps, last speculated 214 tokens in 0.34 s (631.4 tok/s, 3.79 tokens per round, ...)"
+2026-11-27T10:15:03.020Z request id=req-0a5e4c1d9b7f2e31 route="POST /v1/chat/completions" status=400 ms=1 error="reasoning_effort: got \"0.9\" (a string); send 0.9 as a JSON number, not a string. Accepted: a number from 0 to 0.99, or one of \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\" or \"max\""
+2026-11-27T10:15:09.733Z request id=req-77c3a0e2f1d4b569 route="POST /v1/messages" status=200 ms=6120 reply=msg_6b0954710003 stream=true effort=0.9 finish=abort prompt=1840 cached=0 queue_ms=0 prefill_ms=95 output=57 tok_s=402.1 per_round=3.10 client=disconnected
+```
+
+| Field | Value |
+| --- | --- |
+| `id`, `route`, `status`, `ms` | The request ID, method and path, status, and milliseconds from arrival to the line. `status=499` means the client left before the response started. |
+| `reply`, `stream`, `effort` | The response's id, whether it streamed, and the thinking effort, `off` when thinking is off. |
+| `finish` | How each choice's job ended: `stop` (the model's end or a stop string or token), `length`, `abort` (the client left) or `error`. |
+| `prompt`, `cached`, `cache` | Prompt tokens, those read from the prefix cache, and where they came from: `slot` (an entry on the GPU), `host` (the host cache) or `copied` (another choice's prefill). |
+| `queue_ms`, `prefill_ms`, `output`, `tok_s`, `per_round` | As [`timings`](#request-timings): queue and prefill time, generated tokens, decode tokens per second, and tokens per speculation round. |
+| `images`, `image_ms` | Images the vision tower encoded, and their GPU time. |
+| `engine` | The engine's summary: tokens from speculation and from batched steps, swaps to the host cache, and the last speculation episode. |
+| `keepalive`, `client`, `error` | `keepalive=committed` when [keep-alive](#keep-alive) sent status 200 before the reply was ready, while `status` is the reply's own; `client=disconnected` when the client left before the end, with `output` counting the tokens it had been sent; the error message of a response that is not a success, or of a job that failed mid-stream. |
+
+Other lines report engine events, one line each:
+
+```text
+2026-11-27T10:16:40.118Z job: req-1b2c3d4e5f607182 msg_6b0954710007: prefix cache hit, 438272 of 440017 prompt tokens from the host tier
+2026-11-27T10:16:40.119Z job: req-9a8b7c6d5e4f3021 chatcmpl-6b095471000009: prefix cache miss, prefilling all 97311 prompt tokens
+2026-11-27T10:16:52.640Z prefix cache: dropped the entry of 96256 tokens in slot 2, unused for 412 s: every free slot holds a cached prompt, and it was the least recently used
+2026-11-27T10:16:52.641Z prefix cache: dropped the entry of 36864 tokens in slot 1, unused for 75 s: the KV pool needs 5784 free pages, and it held 1032
+2026-11-27T10:17:30.002Z prefix cache: dropped the entry of 12288 tokens in slot 3, unused for 640 s: expired, unused past the 600 s time to live
+2026-11-27T10:18:05.871Z host cache: evicted an entry of 438272 tokens, unused for 1832 s, to save a new entry: the host cache is full (1021 of 1024 chunks in use, 3 free, 214 needed)
+2026-11-27T10:18:06.120Z host cache: saving 98304 tokens with the draft's state: 167 MiB, 2 chunks copied, 46 shared; 181 of 1024 chunks in use by 3 entries
+2026-11-27T10:18:09.477Z job: req-77c3a0e2f1d4b569 msg_6b0954710003: client left after 57 of 4096 tokens in 0.14 s (1840 prompt tokens, 0 cached): 60 speculated, 0 batched steps, ...
+```
+
+The prefix cache lookup gets a line for prompts of 16,384 tokens or more, whose prefill takes seconds; every request's line has `cached` and `cache`. A prefix cache entry that its own conversation's next turn replaces is not logged as dropped, nor is a host entry that a longer one of the same conversation replaces. The `job: ... client left` line comes from the engine when it ends a job whose request has already logged its line.
+
+## Keep-alive
+
+A proxy may drop a request that sends no bytes for a while: Cloudflare answers 524 after 100 s. A 512K-token cold prefill takes about 65 s on an RTX 5090, a request may first wait behind others, and a reply of 4,096 tokens at 40 tok/s takes about 100 s, so no response stays silent for long:
+
+- Streams send bytes at least every 15 s, also before the first token: chat and completion streams an SSE comment after 15 s without an event, Messages streams a comment before `message_start` and a `ping` after it every 5 s, and Responses streams a comment every 15 s.
+- A reply that is not streamed, on `/v1/chat/completions`, `/v1/completions`, `/v1/messages` and `/v1/responses`, goes out as before when it is ready within `--keepalive-after` seconds (20 by default). Past that, the server sends status 200, `Content-Type: application/json` and a chunked body: a space at once and every 15 s, then the reply's JSON. JSON parsers skip leading whitespace, as `serde_json`, Python's `json` and JavaScript's `JSON.parse` do. Such a response is never compressed, since a compressor would hold the spaces back, and it has no `Server-Timing` header, whose times are not known when the headers go out.
+
+The trade-off: a reply that fails after the 200 has gone out keeps status 200, with the route's error JSON (`{"error": ...}`, or Anthropic's `{"type": "error", ...}`) as its body, so a client that trusts the status alone sees a success. The request's log line records the real status and error, with `keepalive=committed`. A client that leaves during the wait cancels the request's jobs, as with a stream. Set `--keepalive-after 0` for clients that need the real status and do not sit behind such a proxy.
 
 ## Concurrent requests
 

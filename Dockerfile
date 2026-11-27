@@ -16,6 +16,9 @@ ENV PATH=/root/.cargo/bin:$PATH \
     NVCC=/usr/local/cuda/bin/nvcc
 WORKDIR /src
 COPY . .
+# The commit siphon-serve logs at startup: the copy holds no .git.
+ARG SIPHON_COMMIT=unknown
+ENV SIPHON_COMMIT=$SIPHON_COMMIT
 RUN cargo build --release --locked -p siphon-serve \
     && cp target/release/siphon-serve /siphon-serve
 
