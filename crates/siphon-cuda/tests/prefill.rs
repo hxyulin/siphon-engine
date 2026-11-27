@@ -171,6 +171,85 @@ fn nvfp4_prefill_matches_stepping() -> anyhow::Result<()> {
     prefill_matches_stepping_with(KvFormat::Nvfp4, WeightFormat::Bf16, false)
 }
 
+/// Full-model `chunk=4096` prefill parity against `chunk=2048` on a 4096-token prompt
+/// with tuned prefill settings (`ea=quantized`, `pd=fp8`).
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL) and about 22 GB of GPU memory"]
+fn chunk_4096_matches_chunk_2048() -> anyhow::Result<()> {
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        eprintln!("skipped: tuned prefill needs the block-scaled MMA, which sm_89 lacks");
+        return Ok(());
+    }
+    let capture = tokens()?;
+    let prompt: Vec<u32> = (0..4096).map(|i| capture[i % capture.len()]).collect();
+    let gpu = Gpu::new(0)?;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let config = TextConfig::load(&model_dir)?;
+    let passes = config.loop_config.num_passes;
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+    let mut model = Model::with_formats(
+        &gpu,
+        config,
+        weights,
+        passes,
+        4096 + DECODE,
+        KvFormat::Fp8,
+        WeightFormat::Fp8,
+    )?;
+    model.set_expert_activations(ExpertActivations::Quantized)?;
+    model.set_prefill_dense(Products::Fp8)?;
+
+    let mut ref_sampled = Vec::new();
+    let mut ref_cb = |pos: usize, logits: &[f32]| {
+        if pos.is_multiple_of(512) || pos == prompt.len() - 1 {
+            ref_sampled.push((pos, logits.to_vec()));
+        }
+        Ok(())
+    };
+    let next_2k = model.prefill(&prompt, 2048, PrefillLogits::All(&mut ref_cb))?;
+    let mut decode_2k = Vec::new();
+    let mut tok = next_2k;
+    for _ in 0..DECODE {
+        tok = model.step(tok, None)?;
+        decode_2k.push(model.logits()?);
+    }
+
+    model.reset()?;
+    let mut got_sampled = Vec::new();
+    let mut got_cb = |pos: usize, logits: &[f32]| {
+        if pos.is_multiple_of(512) || pos == prompt.len() - 1 {
+            got_sampled.push((pos, logits.to_vec()));
+        }
+        Ok(())
+    };
+    let next_4k = model.prefill(&prompt, 4096, PrefillLogits::All(&mut got_cb))?;
+    let mut kls = Vec::new();
+    for ((p0, w), (p1, g)) in ref_sampled.iter().zip(&got_sampled) {
+        ensure!(p0 == p1, "position mismatch {p0} vs {p1}");
+        kls.push(kl(w, g));
+    }
+    let mut tok4 = next_4k;
+    for want in &decode_2k {
+        tok4 = model.step(tok4, None)?;
+        kls.push(kl(want, &model.logits()?));
+    }
+    let mean_kl = kls.iter().sum::<f64>() / kls.len() as f64;
+    let max_kl = kls.iter().copied().fold(0.0, f64::max);
+    println!(
+        "chunk 4096 vs 2048 (4096 tokens): next {next_4k} vs {next_2k}, KL mean {mean_kl:.2e} max {max_kl:.2e}"
+    );
+    ensure!(
+        next_4k == next_2k,
+        "chunk 4096 next token {next_4k} != chunk 2048 {next_2k}"
+    );
+    ensure!(
+        mean_kl <= MAX_MEAN_KL && max_kl <= MAX_KL,
+        "chunk 4096 vs 2048 KL mean {mean_kl:.2e} max {max_kl:.2e}"
+    );
+    Ok(())
+}
+
 /// The checkpoint's model with the given cache and weight formats, and with
 /// `fp8_products` every FP8 prefill product on.
 fn load(

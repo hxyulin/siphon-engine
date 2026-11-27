@@ -34,8 +34,8 @@ const BLOCK: u32 = 256;
 /// Rows per block of `moe_conv_residual_rows_packed_2304`, and its threads and columns.
 pub const MOE_CONV_ROWS: usize = 8;
 /// Maximum 8-row tiles across `BATCH_ROWS` packed slices totaling at most `MAX_PREFILL_CHUNK`
-/// rows (`2048 / 8 + 64 = 320`).
-pub const MOE_PACKED_MAX_TILES: usize = 320;
+/// rows (`4096 / 8 + 64 = 576`).
+pub const MOE_PACKED_MAX_TILES: usize = 576;
 const MOE_CONV_THREADS: u32 = 192;
 const MOE_CONV_BLOCK_COLS: usize = 768;
 /// Tile of `moe_conv_residual_rows_2304`: 29 output rows x 128 cols, 128 threads.
@@ -357,10 +357,8 @@ impl Conv {
 
     /// [`Conv::moe_conv_residual`] for the `rows` rows of a chunk: `experts`
     /// `[rows, 8, 2304]`, `weights` `[rows, 8]`, `residual` and `out` `[rows, 2304]`.
-    /// `combined` `[rows, 2304]` receives the MoE combine, the conv's input, of the last
-    /// three rows, which the state shift reads; its other rows are left alone. Updates
-    /// `state` as [`Conv::short_conv_residual_rows`] does, and gives the single-row results
-    /// bit for bit.
+    /// Updates `state` in place inside the same launch (no separate `shift_state` launch
+    /// and no writes to `combined`), giving the single-row results bit for bit.
     #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
     pub fn moe_conv_residual_rows(
         &self,
@@ -374,18 +372,87 @@ impl Conv {
         out: &mut impl DeviceOut<bf16>,
         rows: usize,
     ) -> anyhow::Result<()> {
+        let _ = combined;
+        self.moe_conv_residual_rows_inner(
+            stream,
+            experts,
+            weights,
+            weight,
+            state,
+            residual,
+            out,
+            None,
+            rows,
+        )
+    }
+
+    /// [`Conv::moe_conv_residual_rows`] that also shifts the visit's other three conv states
+    /// (`proj_state`, `k_state`, `v_state`) from `convs` in the same launch (`rows >= 3`,
+    /// `convs.inputs` must be `None`). Eliminates all four `shift_state_rows` launches of a
+    /// prefill visit, bit for bit identical to shifting each state separately.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn moe_conv_residual_visit_rows(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        state: &mut CudaSlice<f32>,
+        residual: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<bf16>,
+        convs: VisitConvs<'_>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            rows >= STATE_ROWS,
+            "fused visit shift needs at least {STATE_ROWS} rows, got {rows}"
+        );
+        ensure!(
+            convs.inputs.is_none(),
+            "moe_conv_residual_visit_rows does not record verify inputs"
+        );
+        self.moe_conv_residual_rows_inner(
+            stream,
+            experts,
+            weights,
+            weight,
+            state,
+            residual,
+            out,
+            Some(convs),
+            rows,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    fn moe_conv_residual_rows_inner(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        state: &mut CudaSlice<f32>,
+        residual: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<bf16>,
+        convs: Option<VisitConvs<'_>>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
         let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
-        let (mut combined, mut out) = (combined.view_mut(), out.view_mut());
+        let mut out = out.view_mut();
         check_hidden_conv(weight, state)?;
         ensure!(rows > 0, "no rows");
         check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
         check_len("weights", weights.len(), rows * TOP_K)?;
-        for (name, len) in [
-            ("residual", residual.len()),
-            ("combined", combined.len()),
-            ("out", out.len()),
-        ] {
+        for (name, len) in [("residual", residual.len()), ("out", out.len())] {
             check_len(name, len, rows * HIDDEN)?;
+        }
+        if let Some(convs) = &convs {
+            check_len("proj", convs.proj.len(), rows * HIDDEN)?;
+            check_len("proj state", convs.proj_state.len(), STATE_ROWS * HIDDEN)?;
+            check_len("k_raw", convs.k_raw.len(), rows * DYNAMIC_DIMS)?;
+            check_len("v_raw", convs.v_raw.len(), rows * DYNAMIC_DIMS)?;
+            check_len("k state", convs.k_state.len(), STATE_ROWS * DYNAMIC_DIMS)?;
+            check_len("v state", convs.v_state.len(), STATE_ROWS * DYNAMIC_DIMS)?;
         }
         let config = LaunchConfig {
             grid_dim: (
@@ -400,17 +467,26 @@ impl Conv {
         args.ptr(&experts, stream)
             .ptr(&weights, stream)
             .ptr(weight, stream)
-            .ptr(&*state, stream)
+            .ptr_mut(state, stream)
             .ptr(&residual, stream)
-            .ptr_mut(&mut combined, stream)
             .ptr_mut(&mut out, stream)
             .i32(i32::try_from(rows).context("too many rows")?);
+        if let Some(convs) = convs {
+            args.ptr(&convs.proj, stream)
+                .ptr_mut(convs.proj_state, stream)
+                .ptr(&convs.k_raw, stream)
+                .ptr(&convs.v_raw, stream)
+                .ptr_mut(convs.k_state, stream)
+                .ptr_mut(convs.v_state, stream);
+        } else {
+            args.u64(0).u64(0).u64(0).u64(0).u64(0).u64(0);
+        }
         // SAFETY: the arguments match `moe_conv_residual_rows_2304(const bf16*, const float*,
-        // const bf16*, const float*, const float*, bf16*, bf16*, int)`, the buffers hold
-        // `rows` rows as checked above, and the grid covers the row in 18 blocks of 128
-        // columns and the rows in tiles of 29 (the kernel stops at `rows`).
-        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_rows_2304, config) }?;
-        self.shift_state(stream, &combined.slice(..), state, HIDDEN, rows)
+        // const bf16*, float*, const float*, bf16*, int, const bf16*, float*, const bf16*,
+        // const bf16*, float*, float*)`, the buffers hold `rows` rows as checked above, only
+        // `blockIdx.y == 0` reads and updates `state` (and the optional visit states when
+        // `proj_state` is non-null and `rows >= 3`), and the grid covers all 2304 channels.
+        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_rows_2304, config) }
     }
 
     /// [`Conv::moe_conv_residual_rows`] for the 1 to 8 rows of a step. With `convs.inputs`

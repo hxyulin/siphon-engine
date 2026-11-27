@@ -2075,6 +2075,239 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fused SwiGLU + quantized activation epilogue (`expert_matmul_quantized_swiglu_quant_grouped`)
+/// against separate `expert_matmul_quantized_swiglu_grouped` + `quantize_rows*`, then `w2`:
+/// - MXFP8 (`expert_gemm_q_mxfp8_swiglu_q`) and FP8-paired (`expert_gemm_q8_nvfp4_swiglu_q`)
+///   must match bit for bit in values, scales, and `w2` output.
+/// - NVFP4 (`expert_gemm_q_nvfp4_swiglu_q`) uses fixed outer scale `gate_softcap * up_softcap /
+///   1536` and must agree closely with per-row outer scale after `w2` (cosine > 0.999, valid
+///   finite outputs, NaN preserved on unknown expert ids).
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "tests NVFP4, MXFP8, and paired-FP8 fused SwiGLU-quant against separate kernels"
+)]
+fn fused_swiglu_quant_matches_separate_kernels() -> anyhow::Result<()> {
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        eprintln!("skipped: fused SwiGLU-quant needs the block-scaled MMA, which sm_89 lacks");
+        return Ok(());
+    }
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let rows = 37;
+    let pairs = rows * SLOTS;
+    let mut scratch = ExpertScratch::new(stream, rows, EXPERTS)?;
+    let mut ids = routing(rows, Routing::Uniform, 23);
+    ids[9] = -1;
+    ids[25] = i32::try_from(EXPERTS)?;
+    let indices = stream.clone_htod(&ids)?;
+    s.experts
+        .expert_group_quantized(stream, &indices, EXPERTS, &mut scratch)?;
+
+    let x_host = common::pseudo_random_bf16(rows * HIDDEN, 29, 1.0, 0.0);
+    let x = stream.clone_htod(&x_host)?;
+
+    for (fp4, fp8) in [(true, false), (false, false), (true, true)] {
+        let w13 = Synthetic::new(&s, fp4, HIDDEN, HIDDEN, 31)?;
+        let w2 = Synthetic::new(&s, fp4, HIDDEN, INTERMEDIATE, 37)?;
+        let w13_w = w13.gpu.weights();
+        let w2_w = w2.gpu.weights();
+
+        let mut xq_in = QuantizedRows::new(stream, rows * HIDDEN, rows)?;
+        if fp8 {
+            s.experts
+                .quantize_rows_fp8(stream, &x, HIDDEN, w13_w.format, &mut xq_in)?;
+        } else {
+            s.experts
+                .quantize_rows(stream, &x, HIDDEN, w13_w.format, &mut xq_in)?;
+        }
+
+        // Separate path: w13 SwiGLU -> BF16 act -> quantize_rows* -> w2.
+        let mut act_bf16 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+        s.experts.expert_matmul_quantized_swiglu_grouped(
+            stream,
+            &xq_in,
+            &w13_w,
+            &mut act_bf16,
+            &scratch,
+            GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        let mut act_q_sep = QuantizedRows::new(stream, pairs * INTERMEDIATE, pairs)?;
+        if fp8 {
+            s.experts
+                .quantize_rows_fp8(stream, &act_bf16, INTERMEDIATE, w2_w.format, &mut act_q_sep)?;
+        } else {
+            s.experts
+                .quantize_rows(stream, &act_bf16, INTERMEDIATE, w2_w.format, &mut act_q_sep)?;
+        }
+        let mut down_sep = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+        s.experts.expert_matmul_quantized_grouped(
+            stream,
+            &act_q_sep,
+            &w2_w,
+            &mut down_sep,
+            &scratch,
+        )?;
+
+        // Fused path: w13 SwiGLU-quant -> QuantizedRows -> w2.
+        let mut act_q_fused = QuantizedRows::new(stream, pairs * INTERMEDIATE, pairs)?;
+        s.experts.expert_matmul_quantized_swiglu_quant_grouped(
+            stream,
+            &xq_in,
+            &w13_w,
+            &mut act_q_fused,
+            &scratch,
+            GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        let mut down_fused = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+        s.experts.expert_matmul_quantized_grouped(
+            stream,
+            &act_q_fused,
+            &w2_w,
+            &mut down_fused,
+            &scratch,
+        )?;
+
+        let down_sep_h = stream.clone_dtoh(&down_sep)?;
+        let down_fused_h = stream.clone_dtoh(&down_fused)?;
+        for bad_pair in [9usize, 25usize] {
+            assert!(
+                down_fused_h[bad_pair * HIDDEN..(bad_pair + 1) * HIDDEN]
+                    .iter()
+                    .all(|v| v.is_nan()),
+                "fp4 {fp4} fp8 {fp8}: unknown pair {bad_pair} must remain NaN"
+            );
+        }
+
+        if !fp4 || fp8 {
+            // MXFP8 and paired-FP8 have per-32 block scales only: fused output is bit-exact
+            // for every valid pair.
+            let val_sep = stream.clone_dtoh(act_q_sep.values())?;
+            let val_fused = stream.clone_dtoh(act_q_fused.values())?;
+            let scl_sep = stream.clone_dtoh(act_q_sep.scales())?;
+            let scl_fused = stream.clone_dtoh(act_q_fused.scales())?;
+            let scl_stride = INTERMEDIATE / 32;
+            for (pair, &id) in ids.iter().enumerate() {
+                if usize::try_from(id).is_ok_and(|e| e < EXPERTS) {
+                    assert_eq!(
+                        &val_fused[pair * INTERMEDIATE..(pair + 1) * INTERMEDIATE],
+                        &val_sep[pair * INTERMEDIATE..(pair + 1) * INTERMEDIATE],
+                        "fp4 {fp4} fp8 {fp8}: pair {pair} values differ"
+                    );
+                    assert_eq!(
+                        &scl_fused[pair * scl_stride..(pair + 1) * scl_stride],
+                        &scl_sep[pair * scl_stride..(pair + 1) * scl_stride],
+                        "fp4 {fp4} fp8 {fp8}: pair {pair} scales differ"
+                    );
+                }
+            }
+            let diff = down_fused_h
+                .iter()
+                .zip(&down_sep_h)
+                .filter(|(a, b)| a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()))
+                .count();
+            assert_eq!(
+                diff, 0,
+                "fp4 {fp4} fp8 {fp8}: fused SwiGLU-quant w2 differs by {diff} elements"
+            );
+        } else {
+            // NVFP4 uses fixed outer = cap * (1.0 / 1536.0), matching `__fmul_rn(cap, 1.f / 1536.f)`.
+            let want_outer = (GATE_SOFTCAP * UP_SOFTCAP) * (1.0f32 / 1536.0);
+            let outer_h = stream.clone_dtoh(act_q_fused.outer())?;
+            for (pair, &id) in ids.iter().enumerate() {
+                let valid = usize::try_from(id).is_ok_and(|e| e < EXPERTS);
+                let expected = if valid { want_outer } else { 0.0 };
+                assert_eq!(
+                    outer_h[pair].to_bits(),
+                    expected.to_bits(),
+                    "pair {pair} outer scale mismatch"
+                );
+            }
+            let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+            for (pair, &id) in ids.iter().enumerate() {
+                if !usize::try_from(id).is_ok_and(|e| e < EXPERTS) {
+                    continue;
+                }
+                for c in 0..HIDDEN {
+                    let a = f64::from(f32::from(down_fused_h[pair * HIDDEN + c]));
+                    let b = f64::from(f32::from(down_sep_h[pair * HIDDEN + c]));
+                    assert!(a.is_finite(), "pair {pair} col {c} non-finite");
+                    dot += a * b;
+                    na += a * a;
+                    nb += b * b;
+                }
+            }
+            let cosine = dot / (na.sqrt() * nb.sqrt());
+            eprintln!("NVFP4 fused SwiGLU-quant vs separate w2 cosine = {cosine:.6}");
+            assert!(
+                cosine > 0.995,
+                "NVFP4 fused SwiGLU-quant cosine {cosine:.6} below 0.995"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Exercises `expert_group` and fused SwiGLU-quant at `MAX_PREFILL_CHUNK = 4096` rows
+/// (32,768 pairs), including out-of-range expert ids beyond 16-bit signed bounds.
+#[test]
+fn expert_group_supports_4096_rows() -> anyhow::Result<()> {
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        eprintln!("skipped: block-scaled MMA needed");
+        return Ok(());
+    }
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let rows = 4096;
+    let pairs = rows * SLOTS;
+    let mut scratch = ExpertScratch::new(stream, rows, EXPERTS)?;
+    let mut ids = routing(rows, Routing::Uniform, 41);
+    ids[17] = -1;
+    ids[20000] = 100_000;
+    ids[pairs - 1] = i32::try_from(EXPERTS)?;
+    let indices = stream.clone_htod(&ids)?;
+    s.experts
+        .expert_group_quantized(stream, &indices, EXPERTS, &mut scratch)?;
+
+    let w13 = Synthetic::new(&s, true, HIDDEN, HIDDEN, 43)?;
+    let w2 = Synthetic::new(&s, true, HIDDEN, INTERMEDIATE, 47)?;
+    let x = stream.clone_htod(&common::pseudo_random_bf16(rows * HIDDEN, 53, 1.0, 0.0))?;
+    let mut xq_in = QuantizedRows::new(stream, rows * HIDDEN, rows)?;
+    s.experts
+        .quantize_rows(stream, &x, HIDDEN, w13.gpu.weights().format, &mut xq_in)?;
+    let mut act_q = QuantizedRows::new(stream, pairs * INTERMEDIATE, pairs)?;
+    s.experts.expert_matmul_quantized_swiglu_quant_grouped(
+        stream,
+        &xq_in,
+        &w13.gpu.weights(),
+        &mut act_q,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+    )?;
+    let mut down = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    s.experts.expert_matmul_quantized_grouped(
+        stream,
+        &act_q,
+        &w2.gpu.weights(),
+        &mut down,
+        &scratch,
+    )?;
+    let down_h = stream.clone_dtoh(&down)?;
+    for (pair, &id) in ids.iter().enumerate() {
+        let valid = usize::try_from(id).is_ok_and(|e| e < EXPERTS);
+        let first = down_h[pair * HIDDEN];
+        assert_eq!(
+            first.is_finite(),
+            valid,
+            "pair {pair} (id {id}) expected valid={valid}, got {first}"
+        );
+    }
+    Ok(())
+}
+
 /// Times one 2048-row chunk's expert products with each activation format: BF16, quantized
 /// (NVFP4 or MXFP8 inputs) and FP8 (MXFP8 inputs), each with its quantization.
 #[test]

@@ -28,7 +28,7 @@ const STREAMS: std::ops::RangeInclusive<usize> = 1..=64;
 #[cfg(target_os = "linux")]
 const _: () = assert!(*STREAMS.end() == siphon::memory::BATCH_ROWS);
 /// Rows of a prefill chunk.
-const PREFILL_CHUNK: std::ops::RangeInclusive<usize> = 1..=2048;
+const PREFILL_CHUNK: std::ops::RangeInclusive<usize> = 1..=4096;
 #[cfg(target_os = "linux")]
 const _: () = assert!(*PREFILL_CHUNK.end() == siphon::memory::MAX_PREFILL_CHUNK);
 /// Granularity of `--draft-shortlist` and `--draft-context-rows`.
@@ -65,12 +65,12 @@ another request's prompt prefills, by running more batched steps between its chu
 --prefill-chunk tokens. The prefill keeps at least half of the time. 0 runs one step per chunk.
 --piggyback-prefill (off by default) piggybacks bounded prefill chunks onto active decode or
 batched-verify forward passes instead of stalling active streams behind an exclusive prefill step.
---piggyback-budget N sets the max prefill tokens piggybacked per step (1 to 2048, default 256;
+--piggyback-budget N sets the max prefill tokens piggybacked per step (1 to 4096, default 256;
 0 disables piggybacking). Piggybacked passes run the shared multi-row prefill GEMMs/MoE across
 decode and prefill rows.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
 plan may use the free memory at startup less --margin, 0.25 GiB by default.
---prefill-chunk runs prompts in chunks of N rows, 1 to 2048. Its buffers grow with N: 0.85 GiB
+--prefill-chunk runs prompts in chunks of N rows, 1 to 4096. Its buffers grow with N: 0.85 GiB
 at 2048 rows and 0.47 GiB at 1024, and the memory they free goes to the context.
 --output-projection fp8|mxfp8 makes decode read an FP8 (per-row) or MXFP8 (per-32 block-scaled)
 copy of the attention output projection with --weights fp8, which saves 4 to 6% of a plain step;
@@ -346,7 +346,7 @@ fn args() -> anyhow::Result<Args> {
                 } else {
                     ensure!(
                         PREFILL_CHUNK.contains(&budget),
-                        "--piggyback-budget takes 0 (off) or 1 to 2048"
+                        "--piggyback-budget takes 0 (off) or 1 to 4096"
                     );
                     piggyback_budget = budget;
                     piggyback_prefill = true;
@@ -469,7 +469,7 @@ fn chunk_rows(value: &str) -> anyhow::Result<usize> {
     let rows = value.parse().context("--prefill-chunk takes rows")?;
     ensure!(
         PREFILL_CHUNK.contains(&rows),
-        "--prefill-chunk takes 1 to 2048"
+        "--prefill-chunk takes 1 to 4096"
     );
     Ok(rows)
 }

@@ -50,7 +50,7 @@ pub const DEFAULT_MARGIN: usize = 256 << 20;
 
 /// Rows of a prefill chunk unless `--prefill-chunk` says otherwise, and the most it takes.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
-pub const MAX_PREFILL_CHUNK: usize = 2048;
+pub const MAX_PREFILL_CHUNK: usize = 4096;
 
 /// What a KV pool adds beyond its pages: the page tables of every slot's reservations and
 /// copies between them. On an RTX PRO 6000 Blackwell, two sequences of 300,000 positions
@@ -896,11 +896,13 @@ fn rows_scratch_core(c: &TextConfig, rows: usize, sms: usize) -> usize {
         + ROUTER_SPLITS * experts
         + 2 * top_k; // indices, weights
     let pairs = rows * top_k;
+    let quantized_in = rows * hidden;
     let quantized = pairs * width.max(hidden / top_k);
     let per_rows = rows * (2 * bf16_per_row + 4 * f32_per_row + 4)
         + 4 * (1 + pairs + rows) // expert counters
         + 4 * pairs // perm
         + 16 * pairs.min(pairs / 64 + experts) // tiles
+        + quantized_in + quantized_in / 16 + 4 * rows
         + quantized + quantized / 16 + 4 * pairs
         + 4 * (rows * (heads / c.num_key_value_heads)).div_ceil(128) * c.num_key_value_heads;
     let fixed = 4 * 2 * sms * PREFILL_SLOT + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2);

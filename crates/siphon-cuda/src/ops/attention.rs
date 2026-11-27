@@ -80,20 +80,20 @@ const DECODE_BLOCK: u32 = 128;
 const BIAS_BLOCK: u32 = 256;
 /// Most rows one [`Attention::prefill_attention`] call takes, `kPrefillMaxBlocks` blocks of
 /// rows in the kernel.
-pub const MAX_PREFILL_ROWS: usize = 2048;
+pub const MAX_PREFILL_ROWS: usize = 4096;
 /// Rows of (query row, head) pairs per prefill block: 8 warps of 16.
 const PREFILL_BLOCK_ROWS: usize = 128;
 /// Threads per prefill block.
 const PREFILL_BLOCK: u32 = 256;
 /// Dynamic shared memory of a prefill block, checked against the kernel's layout by
 /// `static_assert`s in `attention.cu`. One block fits on an SM.
-const PREFILL_SHARED_BYTES: u32 = 84_240;
+const PREFILL_SHARED_BYTES: u32 = 84_432;
 /// Maximum global `block_m` blocks across up to `BATCH_ROWS` packed slices totaling at most
 /// `MAX_PREFILL_ROWS` rows (`kPrefillPackedMaxBlocks` in `attention.cu`).
-pub const PREFILL_PACKED_MAX_BLOCKS: usize = 128;
+pub const PREFILL_PACKED_MAX_BLOCKS: usize = 192;
 /// Dynamic shared memory of a packed prefill block, checked against `PrefillPackedShared`'s
 /// `static_assert`s in `attention.cu`.
-const PREFILL_PACKED_SHARED_BYTES: u32 = 84_864;
+const PREFILL_PACKED_SHARED_BYTES: u32 = 85_248;
 /// F32 values of one prefill partial slot: 128 rows of 128 outputs, a max and a sum.
 const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
 const _: () = assert!(PREFILL_SLOT == siphon::memory::PREFILL_SLOT);

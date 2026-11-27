@@ -249,6 +249,45 @@ __device__ __forceinline__ void unpack_bf16x8(uint4 packed, float (&v)[8]) {
     }
 }
 
+__device__ __forceinline__ void combine_row_wide(const __nv_bfloat16* experts, const float* weights,
+                                                 int r, int c0, __nv_bfloat16 (&cb)[kMoeConvWideCols]) {
+    const float* w_ptr = weights + size_t(r) * kTopK;
+    const float4 w0 = *reinterpret_cast<const float4*>(w_ptr);
+    const float4 w1 = *reinterpret_cast<const float4*>(w_ptr + 4);
+    const float wv[kTopK] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+    const __nv_bfloat16* e = experts + size_t(r) * kTopK * kHidden + c0;
+    float total[kMoeConvWideCols] = {};
+#pragma unroll
+    for (int x = 0; x < kTopK; x += 2) {
+        const float wx0 = wv[x];
+        const float wx1 = wv[x + 1];
+        const uint4 raw0 = wx0 != 0.f ? *reinterpret_cast<const uint4*>(e + size_t(x) * kHidden)
+                                      : make_uint4(0u, 0u, 0u, 0u);
+        const uint4 raw1 = wx1 != 0.f ? *reinterpret_cast<const uint4*>(e + size_t(x + 1) * kHidden)
+                                      : make_uint4(0u, 0u, 0u, 0u);
+        if (wx0 != 0.f) {
+            float v0[kMoeConvWideCols];
+            unpack_bf16x8(raw0, v0);
+#pragma unroll
+            for (int j = 0; j < kMoeConvWideCols; ++j) {
+                total[j] = __fadd_rn(total[j], __fmul_rn(v0[j], wx0));
+            }
+        }
+        if (wx1 != 0.f) {
+            float v1[kMoeConvWideCols];
+            unpack_bf16x8(raw1, v1);
+#pragma unroll
+            for (int j = 0; j < kMoeConvWideCols; ++j) {
+                total[j] = __fadd_rn(total[j], __fmul_rn(v1[j], wx1));
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kMoeConvWideCols; ++j) {
+        cb[j] = __float2bfloat16(total[j]);
+    }
+}
+
 }  // namespace
 
 // moe_conv_residual_2304 for the rows of a chunk: the MoE combine of each row's 8 expert
@@ -256,15 +295,23 @@ __device__ __forceinline__ void unpack_bf16x8(uint4 packed, float (&v)[8]) {
 // out = bf16(residual + conv) ([rows, 2304]). A block takes 29 output rows and 128 columns
 // (16 threads x 8 BF16s per row, 8 rows in parallel across 4 warps), walking the 32-row
 // window (3 halo rows + 29 output rows) in 4 full 8-row steps through shared memory.
-// Rows before the chunk come from `state`, which it only reads. The combines of the
-// chunk's last 3 rows go to `combined` for shift_state_rows. Every row rounds as the
-// single-row kernel does, bit for bit. Grid: (18, ceil(rows / 29)), 128 threads.
+//
+// Only `blockIdx.y == 0` reads `state`, so once its 4 steps finish it shifts the chunk's
+// last 3 combines into `state` in place with zero race and zero extra launch (recomputing
+// the last 3 rows' combines when `rows > 29`, or reusing `comb_s` / saved old `state`
+// otherwise). When `proj_state` is non-null (and `rows >= 3`), `blockIdx.y == 0` also
+// shifts `proj`, `k_raw` and `v_raw` into `proj_state`, `k_state` and `v_state`,
+// eliminating all 4 `shift_state_rows` launches per prefill visit. Every row and state
+// rounds as the single-row kernel does, bit for bit. Grid: (18, ceil(rows / 29)), 128 threads.
 extern "C" __global__ void __launch_bounds__(kMoeConvWideThreads)
 moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
-                            const __nv_bfloat16* __restrict__ weight, const float* state,
-                            const float* residual, __nv_bfloat16* __restrict__ combined,
-                            __nv_bfloat16* __restrict__ out, int rows) {
+                            const __nv_bfloat16* __restrict__ weight, float* state,
+                            const float* residual, __nv_bfloat16* __restrict__ out, int rows,
+                            const __nv_bfloat16* proj, float* proj_state,
+                            const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw,
+                            float* k_state, float* v_state) {
     __shared__ __align__(16) __nv_bfloat16 comb_s[kMoeConvWideWindow][kMoeConvWideBlockCols];
+    __shared__ __align__(16) float old_state_s[kKernel - 1][kMoeConvWideBlockCols];
     __shared__ float taps_s[kKernel][kMoeConvWideCols][kMoeConvWideColThreads];
     const int tid = threadIdx.x;
     const int c_block = int(blockIdx.x) * kMoeConvWideBlockCols;
@@ -291,65 +338,37 @@ moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
         pdl_wait();
     }
 
+    constexpr int kOld = kKernel - 1;
     constexpr int kSteps = kMoeConvWideWindow / kMoeConvWideRowGroups;
 #pragma unroll 1
     for (int step = 0; step < kSteps; ++step) {
-        const int base_r = r0 - (kKernel - 1) + step * kMoeConvWideRowGroups;
+        const int base_r = r0 - kOld + step * kMoeConvWideRowGroups;
         if (base_r >= r_end) {
             break;
         }
         const int idx = step * kMoeConvWideRowGroups + g;
         const int r = base_r + g;
         if (r < 0) {
-            const float* sp = state + size_t(kKernel - 1 + r) * kHidden + c0;
+            const int sk = kOld + r;
+            const float* sp = state + size_t(sk) * kHidden + c0;
             const float4 s0 = *reinterpret_cast<const float4*>(sp);
             const float4 s1 = *reinterpret_cast<const float4*>(sp + 4);
+            if (rows < kOld) {
+                *reinterpret_cast<float4*>(&old_state_s[sk][c_local]) = s0;
+                *reinterpret_cast<float4*>(&old_state_s[sk][c_local + 4]) = s1;
+            }
             __nv_bfloat16 cb[kMoeConvWideCols] = {
                 __float2bfloat16(s0.x), __float2bfloat16(s0.y), __float2bfloat16(s0.z), __float2bfloat16(s0.w),
                 __float2bfloat16(s1.x), __float2bfloat16(s1.y), __float2bfloat16(s1.z), __float2bfloat16(s1.w),
             };
             *reinterpret_cast<uint4*>(&comb_s[idx][c_local]) = *reinterpret_cast<const uint4*>(cb);
         } else if (r < r_end) {
-            const float* w_ptr = weights + size_t(r) * kTopK;
-            const float4 w0 = *reinterpret_cast<const float4*>(w_ptr);
-            const float4 w1 = *reinterpret_cast<const float4*>(w_ptr + 4);
-            const float wv[kTopK] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
-            const __nv_bfloat16* e = experts + size_t(r) * kTopK * kHidden + c0;
-            float total[kMoeConvWideCols] = {};
-#pragma unroll
-            for (int x = 0; x < kTopK; x += 2) {
-                const float wx0 = wv[x];
-                const float wx1 = wv[x + 1];
-                const uint4 raw0 = wx0 != 0.f ? *reinterpret_cast<const uint4*>(e + size_t(x) * kHidden)
-                                              : make_uint4(0u, 0u, 0u, 0u);
-                const uint4 raw1 = wx1 != 0.f ? *reinterpret_cast<const uint4*>(e + size_t(x + 1) * kHidden)
-                                              : make_uint4(0u, 0u, 0u, 0u);
-                if (wx0 != 0.f) {
-                    float v0[kMoeConvWideCols];
-                    unpack_bf16x8(raw0, v0);
-#pragma unroll
-                    for (int j = 0; j < kMoeConvWideCols; ++j) {
-                        total[j] = __fadd_rn(total[j], __fmul_rn(v0[j], wx0));
-                    }
-                }
-                if (wx1 != 0.f) {
-                    float v1[kMoeConvWideCols];
-                    unpack_bf16x8(raw1, v1);
-#pragma unroll
-                    for (int j = 0; j < kMoeConvWideCols; ++j) {
-                        total[j] = __fadd_rn(total[j], __fmul_rn(v1[j], wx1));
-                    }
-                }
-            }
             __nv_bfloat16 cb[kMoeConvWideCols];
-#pragma unroll
-            for (int j = 0; j < kMoeConvWideCols; ++j) {
-                cb[j] = __float2bfloat16(total[j]);
-            }
+            combine_row_wide(experts, weights, r, c0, cb);
             *reinterpret_cast<uint4*>(&comb_s[idx][c_local]) = *reinterpret_cast<const uint4*>(cb);
         }
         __syncthreads();
-        if (idx >= kKernel - 1 && r < r_end) {
+        if (idx >= kOld && r < r_end) {
             const float* rp = residual + size_t(r) * kHidden + c0;
             const float4 r_lo = *reinterpret_cast<const float4*>(rp);
             const float4 r_hi = *reinterpret_cast<const float4*>(rp + 4);
@@ -357,7 +376,7 @@ moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
             float win[kKernel][kMoeConvWideCols];
 #pragma unroll
             for (int k = 0; k < kKernel; ++k) {
-                unpack_bf16x8(*reinterpret_cast<const uint4*>(&comb_s[idx - (kKernel - 1) + k][c_local]), win[k]);
+                unpack_bf16x8(*reinterpret_cast<const uint4*>(&comb_s[idx - kOld + k][c_local]), win[k]);
             }
             __nv_bfloat16 o[kMoeConvWideCols];
 #pragma unroll
@@ -368,13 +387,56 @@ moe_conv_residual_rows_2304(const __nv_bfloat16* experts, const float* weights,
                 for (int k = 0; k < kKernel; ++k) {
                     acc = __fadd_rn(acc, __fmul_rn(win[k][j], taps_s[k][j][lane16]));
                 }
-                const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), win[kKernel - 1][j]), kShortDivisor));
+                const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), win[kOld][j]), kShortDivisor));
                 o[j] = __float2bfloat16(__fadd_rn(rv[j], y));
             }
             *reinterpret_cast<uint4*>(out + size_t(r) * kHidden + c0) = *reinterpret_cast<const uint4*>(o);
-            if (r >= rows - (kKernel - 1)) {
-                *reinterpret_cast<uint4*>(combined + size_t(r) * kHidden + c0) =
-                    *reinterpret_cast<const uint4*>(&comb_s[idx][c_local]);
+        }
+    }
+
+    // Only blockIdx.y == 0 ever reads `state`, and its step 0 __syncthreads() already
+    // completed those reads across the entire CTA. Update `state` (and optionally the
+    // visit's other 3 conv states when `proj_state != nullptr` and `rows >= 3`) in place.
+    if (blockIdx.y == 0 && g < kOld) {
+        const int i = g + rows;
+        float* const sp = state + size_t(g) * kHidden + c0;
+        if (i < kOld) {
+            *reinterpret_cast<float4*>(sp) = *reinterpret_cast<const float4*>(&old_state_s[i][c_local]);
+            *reinterpret_cast<float4*>(sp + 4) = *reinterpret_cast<const float4*>(&old_state_s[i][c_local + 4]);
+        } else {
+            const int src_r = i - kOld;
+            float sv[kMoeConvWideCols];
+            if (src_r < kMoeConvWideRows) {
+                unpack_bf16x8(*reinterpret_cast<const uint4*>(&comb_s[kOld + src_r][c_local]), sv);
+            } else {
+                __nv_bfloat16 cb[kMoeConvWideCols];
+                combine_row_wide(experts, weights, src_r, c0, cb);
+#pragma unroll
+                for (int j = 0; j < kMoeConvWideCols; ++j) {
+                    sv[j] = __bfloat162float(cb[j]);
+                }
+            }
+            *reinterpret_cast<float4*>(sp) = make_float4(sv[0], sv[1], sv[2], sv[3]);
+            *reinterpret_cast<float4*>(sp + 4) = make_float4(sv[4], sv[5], sv[6], sv[7]);
+        }
+        if (proj_state != nullptr) {
+            const int src_r = rows - kOld + g;
+            float pv[kMoeConvWideCols];
+            unpack_bf16x8(*reinterpret_cast<const uint4*>(proj + size_t(src_r) * kHidden + c0), pv);
+            float* const psp = proj_state + size_t(g) * kHidden + c0;
+            *reinterpret_cast<float4*>(psp) = make_float4(pv[0], pv[1], pv[2], pv[3]);
+            *reinterpret_cast<float4*>(psp + 4) = make_float4(pv[4], pv[5], pv[6], pv[7]);
+            if (c0 < 1024) {
+                float kv_v[kMoeConvWideCols];
+                unpack_bf16x8(*reinterpret_cast<const uint4*>(k_raw + size_t(src_r) * 1024 + c0), kv_v);
+                float* const ksp = k_state + size_t(g) * 1024 + c0;
+                *reinterpret_cast<float4*>(ksp) = make_float4(kv_v[0], kv_v[1], kv_v[2], kv_v[3]);
+                *reinterpret_cast<float4*>(ksp + 4) = make_float4(kv_v[4], kv_v[5], kv_v[6], kv_v[7]);
+
+                unpack_bf16x8(*reinterpret_cast<const uint4*>(v_raw + size_t(src_r) * 1024 + c0), kv_v);
+                float* const vsp = v_state + size_t(g) * 1024 + c0;
+                *reinterpret_cast<float4*>(vsp) = make_float4(kv_v[0], kv_v[1], kv_v[2], kv_v[3]);
+                *reinterpret_cast<float4*>(vsp + 4) = make_float4(kv_v[4], kv_v[5], kv_v[6], kv_v[7]);
             }
         }
     }

@@ -16,7 +16,10 @@ use cudarc::driver::{CudaSlice, CudaStream};
 use half::bf16;
 use siphon_cuda::{
     Gpu,
-    ops::{conv::Conv, elementwise::Elementwise},
+    ops::{
+        conv::{Conv, VisitConvs},
+        elementwise::Elementwise,
+    },
 };
 
 /// Rows in the fixture's prefill; the decode step is the row after them.
@@ -358,6 +361,99 @@ fn moe_conv_residual_rows_match_single_rows() -> anyhow::Result<()> {
             &stream.clone_dtoh(&state_single)?,
             0,
         );
+    }
+    Ok(())
+}
+
+/// `moe_conv_residual_visit_rows` fuses all 4 conv state shifts (k, v, post-attention,
+/// post-MLP) into the post-MLP conv kernel. Must match separate `moe_conv_residual_rows`
+/// + `shift_state` bit for bit across single-tile, boundary, and full-chunk row counts.
+#[test]
+fn moe_conv_residual_visit_rows_matches_separate_shifts() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let conv = Conv::load(gpu.context())?;
+    let weight = stream.clone_htod(&pseudo_random_bf16(HIDDEN * 4, 17, 0.5, 0.0))?;
+    let mut k_fused = stream.clone_htod(&pseudo_random(3 * 1024, 21, 2.0))?;
+    let mut v_fused = stream.clone_htod(&pseudo_random(3 * 1024, 22, 2.0))?;
+    let mut p_fused = stream.clone_htod(&pseudo_random(3 * HIDDEN, 23, 2.0))?;
+    let mut m_fused = stream.clone_htod(&pseudo_random(3 * HIDDEN, 24, 2.0))?;
+    let mut k_ref = stream.clone_htod(&stream.clone_dtoh(&k_fused)?)?;
+    let mut v_ref = stream.clone_htod(&stream.clone_dtoh(&v_fused)?)?;
+    let mut p_ref = stream.clone_htod(&stream.clone_dtoh(&p_fused)?)?;
+    let mut m_ref = stream.clone_htod(&stream.clone_dtoh(&m_fused)?)?;
+
+    for (chunk, &rows) in [3usize, 9, 29, 30, 130, 2048].iter().enumerate() {
+        let seed = 200 + 10 * chunk as u32;
+        let experts = stream.clone_htod(&pseudo_random_bf16(rows * TOP_K * HIDDEN, seed, 2.0, 0.0))?;
+        let routing: Vec<f32> = pseudo_random(rows * TOP_K, seed + 1, 1.0)
+            .into_iter()
+            .map(f32::abs)
+            .collect();
+        let weights = stream.clone_htod(&routing)?;
+        let residual = stream.clone_htod(&pseudo_random(rows * HIDDEN, seed + 2, 4.0))?;
+        let proj = stream.clone_htod(&pseudo_random_bf16(rows * HIDDEN, seed + 3, 2.0, 0.0))?;
+        let k_raw = stream.clone_htod(&pseudo_random_bf16(rows * 1024, seed + 4, 2.0, 0.0))?;
+        let v_raw = stream.clone_htod(&pseudo_random_bf16(rows * 1024, seed + 5, 2.0, 0.0))?;
+
+        let mut combined = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        let mut out_ref = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        conv.moe_conv_residual_rows(
+            stream,
+            &experts,
+            &weights,
+            &weight,
+            &mut m_ref,
+            &residual,
+            &mut combined,
+            &mut out_ref,
+            rows,
+        )?;
+        conv.shift_state(stream, &k_raw, &mut k_ref, 1024, rows)?;
+        conv.shift_state(stream, &v_raw, &mut v_ref, 1024, rows)?;
+        conv.shift_state(stream, &proj, &mut p_ref, HIDDEN, rows)?;
+
+        let mut out_fused = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        conv.moe_conv_residual_visit_rows(
+            stream,
+            &experts,
+            &weights,
+            &weight,
+            &mut m_fused,
+            &residual,
+            &mut out_fused,
+            VisitConvs {
+                proj: proj.slice(..),
+                proj_state: &mut p_fused,
+                k_raw: k_raw.slice(..),
+                v_raw: v_raw.slice(..),
+                k_state: &mut k_fused,
+                v_state: &mut v_fused,
+                inputs: None,
+            },
+            rows,
+        )?;
+
+        let label = format!("visit_rows chunk {chunk} ({rows} rows)");
+        assert_bf16_close(
+            &label,
+            &stream.clone_dtoh(&out_fused)?,
+            &stream.clone_dtoh(&out_ref)?,
+            0,
+        );
+        for (name, got, want) in [
+            ("k_state", &k_fused, &k_ref),
+            ("v_state", &v_fused, &v_ref),
+            ("proj_state", &p_fused, &p_ref),
+            ("moe_state", &m_fused, &m_ref),
+        ] {
+            assert_f32_within_ulps(
+                &format!("{label} {name}"),
+                &stream.clone_dtoh(got)?,
+                &stream.clone_dtoh(want)?,
+                0,
+            );
+        }
     }
     Ok(())
 }

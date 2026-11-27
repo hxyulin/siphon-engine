@@ -380,8 +380,12 @@ struct MoeRows {
     combined: CudaSlice<bf16>,
     /// Grouping of the (row, slot) pairs by expert, shared by w13 and w2.
     experts: ExpertScratch,
-    /// The quantized expert inputs of `ExpertActivations::Quantized`, one projection's at a
-    /// time: up to `rows * 8` rows of 1152 values.
+    /// The quantized `w13` inputs of `ExpertActivations::Quantized` / `Fp8`: up to `rows`
+    /// rows of `hidden` values (kept distinct from `quantized` so `w13` can write fused
+    /// quantized SwiGLU activations directly into `quantized` for `w2`).
+    quantized_in: QuantizedRows,
+    /// The quantized `w2` inputs of `ExpertActivations::Quantized` / `Fp8`: up to `rows * 8`
+    /// rows of `intermediate` values.
     quantized: QuantizedRows,
 }
 
@@ -647,6 +651,7 @@ impl PrefillScratch {
                 down: zeros(stream, rows * top_k * hidden)?,
                 combined: zeros(stream, rows * hidden)?,
                 experts: ExpertScratch::new(stream, rows, cfg.n_routed_experts)?,
+                quantized_in: QuantizedRows::new(stream, rows * hidden, rows)?,
                 quantized: QuantizedRows::new(
                     stream,
                     rows * top_k * width.max(hidden / top_k),
@@ -2983,6 +2988,7 @@ impl Ctx {
         } else {
             (k_in, v_in)
         };
+        let tree_active = p.verify.as_ref().is_some_and(|v| v.tree_active);
         let tree_attn = p
             .verify
             .as_mut()
@@ -2995,6 +3001,12 @@ impl Ctx {
                 k_stage: &mut tv.stage_k[index],
                 v_stage: &mut tv.stage_v[index],
             });
+        // Up to STEP_ROWS rows, and in a batched step, the kernel that ends the visit shifts
+        // every conv state. For larger non-tree prefill chunks, `moe_conv_residual_visit_rows`
+        // fuses all 4 conv state shifts (k, v, post-attn proj, post-MLP moe) at the end of the
+        // visit.
+        let step = m <= STEP_ROWS || batch.is_some();
+        let fuse_shift = !step && !tree_active;
         self.attention_block_rows(
             state,
             &mut p.attention,
@@ -3007,11 +3019,8 @@ impl Ctx {
             m,
             batch.as_ref(),
             tree_attn,
+            !fuse_shift,
         )?;
-        let tree_active = p.verify.as_ref().is_some_and(|v| v.tree_active);
-        // Up to STEP_ROWS rows, and in a batched step, the kernel that ends the visit shifts
-        // every conv state.
-        let step = m <= STEP_ROWS || batch.is_some();
 
         let partial = if let Some(batch) = batch {
             RowsPartial::ConvResidualBatch {
@@ -3066,7 +3075,7 @@ impl Ctx {
         if gates.is_none()
             && let Some(qfmt) = w13_quant
         {
-            let quant = p.moe.quantized.as_quant_dest(m, hidden, qfmt)?;
+            let quant = p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
                 DepthRowsQuant {
@@ -3093,7 +3102,7 @@ impl Ctx {
                 self.eps(),
             )?;
             p.moe
-                .quantized
+                .quantized_in
                 .mark_quantized(&self.stream, m, hidden, qfmt);
         } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
             let mut slots = p
@@ -3174,7 +3183,7 @@ impl Ctx {
                 self.eps(),
             )?;
         }
-        if !step {
+        if !step && !fuse_shift {
             self.kernels.conv.shift_state(
                 &self.stream,
                 &rows(&p.attention.proj, m, hidden),
@@ -3188,7 +3197,7 @@ impl Ctx {
                 Some(qfmt) => GateNorms::Quant {
                     weight: &w.mlp_norm,
                     normed: rows_mut(&mut p.mlp_x, m, hidden),
-                    quant: p.moe.quantized.as_quant_dest(m, hidden, qfmt)?,
+                    quant: p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?,
                 },
                 None => GateNorms::Bf16(vec![(&w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))]),
             };
@@ -3212,7 +3221,7 @@ impl Ctx {
             )?;
             if let Some(qfmt) = w13_quant {
                 p.moe
-                    .quantized
+                    .quantized_in
                     .mark_quantized(&self.stream, m, hidden, qfmt);
             }
         }
@@ -3334,17 +3343,40 @@ impl Ctx {
             std::mem::swap(&mut p.hidden, &mut p.out);
             return Ok(());
         }
-        self.kernels.conv.moe_conv_residual_rows(
-            &self.stream,
-            &rows(&p.moe.down, m, 8 * hidden),
-            &rows(&p.moe.weights, m, 8),
-            &w.post_mlp_conv,
-            &mut state.conv[3],
-            &rows(&p.residual, m, hidden),
-            &mut rows_mut(&mut p.moe.combined, m, hidden),
-            &mut rows_mut(&mut p.out, m, hidden),
-            m,
-        )?;
+        if fuse_shift {
+            let [k_state, v_state, proj_state, moe_state] = &mut state.conv;
+            self.kernels.conv.moe_conv_residual_visit_rows(
+                &self.stream,
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
+                &w.post_mlp_conv,
+                moe_state,
+                &rows(&p.residual, m, hidden),
+                &mut rows_mut(&mut p.out, m, hidden),
+                VisitConvs {
+                    proj: rows(&p.attention.proj, m, hidden),
+                    proj_state,
+                    k_raw: rows(&p.attention.k_raw, m, kv_dims),
+                    v_raw: rows(&p.attention.v_raw, m, kv_dims),
+                    k_state,
+                    v_state,
+                    inputs: None,
+                },
+                m,
+            )?;
+        } else {
+            self.kernels.conv.moe_conv_residual_rows(
+                &self.stream,
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
+                &w.post_mlp_conv,
+                &mut state.conv[3],
+                &rows(&p.residual, m, hidden),
+                &mut rows_mut(&mut p.moe.combined, m, hidden),
+                &mut rows_mut(&mut p.out, m, hidden),
+                m,
+            )?;
+        }
         std::mem::swap(&mut p.hidden, &mut p.out);
         Ok(())
     }
@@ -3876,6 +3908,7 @@ impl Ctx {
         m: usize,
         batch: Option<&BatchRows<'_>>,
         tree: Option<TreeAttentionVisit<'_>>,
+        shift_kv: bool,
     ) -> anyhow::Result<()> {
         fn product<'a>(
             (weight, fp8): (&'a CudaSlice<bf16>, Option<&'a Fp8Matrix>),
@@ -3985,7 +4018,7 @@ impl Ctx {
                 .norm
                 .attention_post_rows(&self.stream, post_args, m)?;
         }
-        if !step {
+        if !step && shift_kv {
             let [k_state, v_state, ..] = &mut state.conv;
             self.kernels.conv.shift_state(
                 &self.stream,
@@ -4421,6 +4454,10 @@ impl Ctx {
     /// [`Ctx::moe`] for a chunk of `m` rows from the MLP input `x` after its norm: the
     /// router, then the expert products and SwiGLU into `t.down`. When `w13_prequantized` is
     /// true, `t.quantized` already holds the fused-norm-quantized `w13` inputs.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "handles invariant, fused quantized SwiGLU, and BF16 MoE paths"
+    )]
     fn moe_block_rows(
         &self,
         w: &LayerWeights,
@@ -4476,6 +4513,45 @@ impl Ctx {
         )?;
         let (w13, w2) = self.expert_weights(w);
         self.group_rows(&rows(&t.indices, m, top_k), &mut t.experts, m)?;
+        if self.expert_activations != ExpertActivations::Bf16 {
+            let experts = &self.kernels.experts;
+            let stream = &self.stream;
+            if !w13_prequantized {
+                if self.expert_activations == ExpertActivations::Fp8 {
+                    experts.quantize_rows_fp8(
+                        stream,
+                        &rows(x, m, hidden),
+                        w13.k,
+                        w13.format,
+                        &mut t.quantized_in,
+                    )?;
+                } else {
+                    experts.quantize_rows(
+                        stream,
+                        &rows(x, m, hidden),
+                        w13.k,
+                        w13.format,
+                        &mut t.quantized_in,
+                    )?;
+                }
+            }
+            experts.expert_matmul_quantized_swiglu_quant_grouped(
+                stream,
+                &t.quantized_in,
+                &w13,
+                &mut t.quantized,
+                &t.experts,
+                cfg.mlp_gate_softcap,
+                cfg.mlp_up_softcap,
+            )?;
+            return experts.expert_matmul_quantized_grouped(
+                stream,
+                &t.quantized,
+                &w2,
+                &mut rows_mut(&mut t.down, m, top_k * hidden),
+                &t.experts,
+            );
+        }
         self.moe_rows(
             &rows(x, m, hidden),
             &w13,
@@ -4483,7 +4559,7 @@ impl Ctx {
             &t.experts,
             true,
             w13_prequantized,
-            &mut t.quantized,
+            &mut t.quantized_in,
         )?;
         self.moe_rows(
             &rows(&t.act, m, top_k * width),
@@ -5121,7 +5197,7 @@ impl Ctx {
         if gates.is_none()
             && let Some(qfmt) = w13_quant
         {
-            let quant = p.moe.quantized.as_quant_dest(m, hidden, qfmt)?;
+            let quant = p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
                 DepthRowsQuant {
@@ -5148,7 +5224,7 @@ impl Ctx {
                 self.eps(),
             )?;
             p.moe
-                .quantized
+                .quantized_in
                 .mark_quantized(&self.stream, m, hidden, qfmt);
         } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
             let mut slots = p
@@ -5234,7 +5310,7 @@ impl Ctx {
                 Some(qfmt) => GateNorms::Quant {
                     weight: &layer_w.mlp_norm,
                     normed: rows_mut(&mut p.mlp_x, m, hidden),
-                    quant: p.moe.quantized.as_quant_dest(m, hidden, qfmt)?,
+                    quant: p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?,
                 },
                 None => GateNorms::Bf16(vec![(
                     &layer_w.mlp_norm,
@@ -5261,7 +5337,7 @@ impl Ctx {
             )?;
             if let Some(qfmt) = w13_quant {
                 p.moe
-                    .quantized
+                    .quantized_in
                     .mark_quantized(&self.stream, m, hidden, qfmt);
             }
         }
@@ -6127,7 +6203,7 @@ impl Ctx {
         if gates.is_none()
             && let Some(qfmt) = w13_quant
         {
-            let quant = p.moe.quantized.as_quant_dest(m, hidden, qfmt)?;
+            let quant = p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
                 DepthRowsQuant {
@@ -6154,7 +6230,7 @@ impl Ctx {
                 self.eps(),
             )?;
             p.moe
-                .quantized
+                .quantized_in
                 .mark_quantized(&self.stream, m, hidden, qfmt);
         } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
             let mut slots = p
@@ -6240,7 +6316,7 @@ impl Ctx {
                 Some(qfmt) => GateNorms::Quant {
                     weight: &layer_w.mlp_norm,
                     normed: rows_mut(&mut p.mlp_x, m, hidden),
-                    quant: p.moe.quantized.as_quant_dest(m, hidden, qfmt)?,
+                    quant: p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?,
                 },
                 None => GateNorms::Bf16(vec![(
                     &layer_w.mlp_norm,
@@ -6267,7 +6343,7 @@ impl Ctx {
             )?;
             if let Some(qfmt) = w13_quant {
                 p.moe
-                    .quantized
+                    .quantized_in
                     .mark_quantized(&self.stream, m, hidden, qfmt);
             }
         }

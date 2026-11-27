@@ -38,6 +38,7 @@
 #include "mlx_ops.cuh"
 #include "arch.cuh"
 #include "mxfp8.cuh"
+#include "quant_epilogue.cuh"
 
 namespace {
 
@@ -55,8 +56,8 @@ constexpr int kThreads = kWarps * 32;
 // Largest expert count `expert_group` supports.
 constexpr int kMaxExperts = 1024;
 constexpr int kGroupThreads = 1024;
-// Largest pair count `expert_group` supports: 2048 rows of 8 slots.
-constexpr int kMaxPairs = 16384;
+// Largest pair count `expert_group` supports: 4096 rows of 8 slots.
+constexpr int kMaxPairs = 32768;
 constexpr int kGroupRounds = kMaxPairs / kGroupThreads;
 // `F8E4M3_MAX * F4E2M1_MAX`, as in experts.cu.
 constexpr float kNvfp4ScaleEnc = 448.f * 6.f;
@@ -255,6 +256,261 @@ __device__ void write_tile(const __nv_bfloat16* staged, __nv_bfloat16* __restric
                 *reinterpret_cast<uint2*>(dst + part * 4) = *reinterpret_cast<const uint2*>(act);
             } else {
                 *reinterpret_cast<uint4*>(dst + part * 8) = v;
+            }
+        }
+    }
+}
+
+// NaN/invalid-id rows for the fused quantized SwiGLU epilogues (`kQuantOut = true`):
+// zero-fills each unknown pair's quantized value/scale/outer slots deterministically.
+// The following `w2` GEMM writes BF16 NaN directly for unknown ids without reading them.
+template <bool kFp4, int kBlockThreads = kThreads>
+__device__ void nan_rows_q(uint8_t* __restrict__ out_val, uint8_t* __restrict__ out_scl,
+                           float* __restrict__ out_outer, const int* __restrict__ perm,
+                           const int* __restrict__ group_counts, int n, int n0) {
+    const int out_n = n / 2;
+    const int out0 = n0 / 2;
+    const int out_cols = min(kTileN / 2, out_n - out0);
+    const int valid = group_counts[1];
+    const int total = group_counts[2];
+    const int val_stride = kFp4 ? out_n / 2 : out_n;
+    const int val0 = kFp4 ? out0 / 2 : out0;
+    const int val_bytes = kFp4 ? out_cols / 2 : out_cols;
+    const int scl_stride = kFp4 ? out_n / 16 : out_n / 32;
+    const int scl0 = kFp4 ? out0 / 16 : out0 / 32;
+    const int scl_bytes = kFp4 ? out_cols / 16 : out_cols / 32;
+    for (int pos = valid; pos < total; ++pos) {
+        const int p = perm[pos];
+        for (int b = int(threadIdx.x); b < val_bytes; b += kBlockThreads) {
+            out_val[size_t(p) * val_stride + val0 + b] = 0u;
+        }
+        for (int b = int(threadIdx.x); b < scl_bytes; b += kBlockThreads) {
+            out_scl[size_t(p) * scl_stride + scl0 + b] = 0u;
+        }
+        if constexpr (kFp4) {
+            if (n0 == 0 && threadIdx.x == 0) {
+                out_outer[p] = 0.f;
+            }
+        }
+    }
+}
+
+// Fast hardware SwiGLU for the fused NVFP4 epilogue: uses sm_75+ `tanh.approx.f32`,
+// `__expf`, `__frcp_rn`, and precomputed reciprocals of the softcaps (< 1e-6 relative
+// error vs `softcapped_swiglu`, orders of magnitude below BF16/E2M1 quantization).
+__device__ __forceinline__ float fast_softcapped_swiglu_f32(float gate, float up, float gate_cap,
+                                                            float inv_gate_cap, float up_cap,
+                                                            float inv_up_cap) {
+    float tg;
+    float tu;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(tg) : "f"(gate * inv_gate_cap));
+    asm("tanh.approx.f32 %0, %1;" : "=f"(tu) : "f"(up * inv_up_cap));
+    const float sig = __frcp_rn(1.f + __expf(-gate));
+    return __bfloat162float(__float2bfloat16((tg * gate_cap * sig) * (tu * up_cap)));
+}
+
+// Packs two F32 values to one E2M1 byte (`lo` in low nibble) and returns both
+// dequantized F32 values via `cvt.rn.f16x2.e2m1x2` for fast Four-Over-Six MAE selection.
+__device__ __forceinline__ uint32_t pack_e2m1x2_dq(float lo, float hi, float& lo_dq, float& hi_dq) {
+    uint32_t byte;
+    uint32_t halves;
+#if SIPHON_SM89
+    __trap();
+    byte = halves = 0u;
+#else
+    asm("{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %3, %2; cvt.u32.u8 %0, b; "
+        "cvt.rn.f16x2.e2m1x2 %1, b; }"
+        : "=r"(byte), "=r"(halves)
+        : "f"(lo), "f"(hi));
+#endif
+    const __half2 h = *reinterpret_cast<const __half2*>(&halves);
+    lo_dq = __low2float(h);
+    hi_dq = __high2float(h);
+    return byte;
+}
+
+// Fused softcapped SwiGLU + activation quantization epilogue from BF16 `staged`
+// (`[pair][column]`, `kOutStride` apart) directly into `QuantizedRows` (`out_val`,
+// `out_scl`, and for NVFP4 `out_outer`), skipping the BF16 `act` round-trip and separate
+// `quantize_rows_*` launch.
+//
+// Marked `__noinline__` so the epilogue's constants and temporary shuffles never
+// extend live ranges across the MMA K-mainloop (keeping 0 register spills in both
+// `expert_gemm_q_nvfp4_swiglu_q` and `expert_gemm_q_mxfp8_swiglu_q`).
+//
+// Each 16-thread half-warp owns one pair's 64 SwiGLU columns (16 threads x 4 values =
+// one uint4 load of 8 BF16 (gate, up) values per thread):
+// - NVFP4 (`kFp4 = true`): 4 quads of 4 lanes quantize 4 blocks of 16 elements using
+//   Four-Over-Six MAE under a fixed outer scale derived from the exact mathematical
+//   bound `cap = gate_softcap * up_softcap` (`outer_scale = cap / 1536`, `scale6 =
+//   e4m3(block_max * 256 / cap)`, `scale4 = e4m3(block_max * 384 / cap)`). Because
+//   `|softcapped_swiglu| <= cap` strictly, both candidates stay within E4M3's 448 ceiling
+//   with full normal range and zero cross-tile global max reduction.
+// - MXFP8 (`kFp4 = false`, natural or `kPaired` for `expert_gemm_q8`): 2 octets of 8
+//   lanes quantize 2 blocks of 32 elements bit-for-bit identically to `quantize_rows_mxfp8`
+//   / `quantize_rows_fp8`.
+template <bool kFp4, bool kPaired, int kBlockThreads = kThreads>
+__device__ __noinline__ void write_tile_swiglu_quant(
+    const __nv_bfloat16* staged, uint8_t* __restrict__ out_val, uint8_t* __restrict__ out_scl,
+    float* __restrict__ out_outer, const int* __restrict__ pairs, int count, int n, int n0,
+    float gate_softcap, float up_softcap) {
+    static_assert(kBlockThreads == 256, "16 half-warps of 16 threads");
+    const int out_n = n / 2;
+    const int out0 = n0 / 2;
+    const int out_cols = min(kTileN / 2, out_n - out0);
+    const int tid = int(threadIdx.x);
+    const int lane = tid & 31;
+    const int lane16 = tid & 15;
+    const int group16 = tid >> 4;
+    const bool valid_col = lane16 * 4 < out_cols;
+
+    float inv_gate_cap = 0.f;
+    float inv_up_cap = 0.f;
+    float enc6 = 0.f;
+    float enc4 = 0.f;
+    float outer_scale = 0.f;
+    if constexpr (kFp4) {
+        inv_gate_cap = __fdiv_rn(1.f, gate_softcap);
+        inv_up_cap = __fdiv_rn(1.f, up_softcap);
+        const float cap = __fmul_rn(gate_softcap, up_softcap);
+        enc6 = __fdiv_rn(256.f, cap);
+        enc4 = __fdiv_rn(384.f, cap);
+        outer_scale = __fmul_rn(cap, 1.f / 1536.f);
+    }
+
+    for (int base_pair = 0; base_pair < count; base_pair += 16) {
+        const int pair = base_pair + group16;
+        const bool valid_pair = pair < count;
+        const uint4 v =
+            valid_col
+                ? *reinterpret_cast<const uint4*>(
+                      staged + (valid_pair ? pair : 0) * kOutStride + lane16 * 8)
+                : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+        float x[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 gu =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words[i]));
+            if constexpr (kFp4) {
+                x[i] = fast_softcapped_swiglu_f32(gu.x, gu.y, gate_softcap, inv_gate_cap,
+                                                  up_softcap, inv_up_cap);
+            } else {
+                x[i] = __bfloat162float(softcapped_swiglu(gu.x, gu.y, gate_softcap, up_softcap));
+            }
+        }
+
+        if constexpr (kFp4) {
+            const int sub4 = lane16 & 3;
+            const int b4 = lane16 >> 2;
+            float block_max = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
+            block_max = fmaxf(block_max, __shfl_xor_sync(0xffffffffu, block_max, 1));
+            block_max = fmaxf(block_max, __shfl_xor_sync(0xffffffffu, block_max, 2));
+
+            // Candidate 6 (max mapped to 6) and Candidate 4 (max mapped to 4).
+            const __nv_fp8_e4m3 s6_fp8(fminf(__fmul_rn(block_max, enc6), 448.f));
+            const float s6_outer = __fmul_rn(float(s6_fp8), outer_scale);
+            const float inv6 = s6_outer > 0.f ? __frcp_rn(s6_outer) : 0.f;
+            float dq0, dq1, dq2, dq3;
+            const uint32_t b6_0 =
+                pack_e2m1x2_dq(__fmul_rn(x[0], inv6), __fmul_rn(x[1], inv6), dq0, dq1);
+            const uint32_t b6_1 =
+                pack_e2m1x2_dq(__fmul_rn(x[2], inv6), __fmul_rn(x[3], inv6), dq2, dq3);
+            const float err6 =
+                (fabsf(fmaf(dq0, s6_outer, -x[0])) + fabsf(fmaf(dq1, s6_outer, -x[1]))) +
+                (fabsf(fmaf(dq2, s6_outer, -x[2])) + fabsf(fmaf(dq3, s6_outer, -x[3])));
+
+            const __nv_fp8_e4m3 s4_fp8(fminf(__fmul_rn(block_max, enc4), 448.f));
+            const float s4_outer = __fmul_rn(float(s4_fp8), outer_scale);
+            const float inv4 = s4_outer > 0.f ? __frcp_rn(s4_outer) : 0.f;
+            const uint32_t b4_0 =
+                pack_e2m1x2_dq(__fmul_rn(x[0], inv4), __fmul_rn(x[1], inv4), dq0, dq1);
+            const uint32_t b4_1 =
+                pack_e2m1x2_dq(__fmul_rn(x[2], inv4), __fmul_rn(x[3], inv4), dq2, dq3);
+            const float err4 =
+                (fabsf(fmaf(dq0, s4_outer, -x[0])) + fabsf(fmaf(dq1, s4_outer, -x[1]))) +
+                (fabsf(fmaf(dq2, s4_outer, -x[2])) + fabsf(fmaf(dq3, s4_outer, -x[3])));
+
+            // Single quad reduction on `(err4 - err6)` selects 4 iff strictly better.
+            float diff = err4 - err6;
+            diff += __shfl_xor_sync(0xffffffffu, diff, 1);
+            diff += __shfl_xor_sync(0xffffffffu, diff, 2);
+            const bool use4 = diff < 0.f;
+            const uint32_t packed16 = use4 ? (b4_0 | (b4_1 << 8)) : (b6_0 | (b6_1 << 8));
+            const uint32_t scale_byte = uint32_t(use4 ? s4_fp8.__x : s6_fp8.__x);
+
+            const int base4 = lane & ~3;
+            const uint32_t p1 = __shfl_sync(0xffffffffu, packed16, base4 + 1);
+            const uint32_t p2 = __shfl_sync(0xffffffffu, packed16, base4 + 2);
+            const uint32_t p3 = __shfl_sync(0xffffffffu, packed16, base4 + 3);
+            const uint2 packed_val = make_uint2(packed16 | (p1 << 16), p2 | (p3 << 16));
+
+            if (valid_pair) {
+                const int pair_idx = pairs[pair];
+                if (sub4 == 0 && valid_col) {
+                    *reinterpret_cast<uint2*>(out_val + size_t(pair_idx) * (out_n / 2) +
+                                              (out0 / 2) + b4 * 8) = packed_val;
+                }
+            }
+
+            const int base16 = lane & ~15;
+            const uint32_t s1 = __shfl_sync(0xffffffffu, scale_byte, base16 + 4);
+            const uint32_t s2 = __shfl_sync(0xffffffffu, scale_byte, base16 + 8);
+            const uint32_t s3 = __shfl_sync(0xffffffffu, scale_byte, base16 + 12);
+
+            if (valid_pair) {
+                const int pair_idx = pairs[pair];
+                if (out_cols == 64) {
+                    if (lane16 == 0) {
+                        *reinterpret_cast<uint32_t*>(out_scl + size_t(pair_idx) * (out_n / 16) +
+                                                     (out0 / 16)) =
+                            scale_byte | (s1 << 8) | (s2 << 16) | (s3 << 24);
+                    }
+                } else if (sub4 == 0 && valid_col) {
+                    out_scl[size_t(pair_idx) * (out_n / 16) + (out0 / 16) + b4] =
+                        uint8_t(scale_byte);
+                }
+                if (n0 == 0 && lane16 == 0) {
+                    out_outer[pair_idx] = outer_scale;
+                }
+            }
+        } else {
+            const int sub8 = lane16 & 7;
+            const int b8 = lane16 >> 3;
+            float amax = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                amax = fmaxf(amax, fabsf(x[i]));
+            }
+#pragma unroll
+            for (int offset = 1; offset < 8; offset *= 2) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+            }
+            const float raw = __fmul_rn(amax, 1.f / 448.f);
+            const float min_scale = 0x1p-127f;
+            int exponent = ((__float_as_int(raw) + 0x007fffff) & 0x7f800000) >> 23;
+            exponent = raw <= min_scale ? 0 : min(exponent, 254);
+            exponent = raw != raw ? 255 : exponent;
+            const float scale = fmaxf(__int_as_float(exponent << 23), min_scale);
+            float inverse = exponent == 0 ? 0x1p127f : __frcp_rn(scale);
+            inverse = exponent == 255 ? 0.f : inverse;
+            uint32_t word = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float val = __fmul_rn(x[i], inverse);
+                val = val != val ? val : fminf(fmaxf(val, -448.f), 448.f);
+                const __nv_fp8_e4m3 q(val);
+                word |= uint32_t(q.__x) << (8 * i);
+            }
+            if (valid_pair && valid_col) {
+                const int pair_idx = pairs[pair];
+                const int block32 = out0 / 32 + b8;
+                if (sub8 == 0) {
+                    out_scl[size_t(pair_idx) * (out_n / 32) + block32] = uint8_t(exponent);
+                }
+                const int dst_w = kPaired ? ((sub8 & 1) * 4 + (sub8 >> 1)) : sub8;
+                reinterpret_cast<uint32_t*>(out_val + size_t(pair_idx) * out_n +
+                                            size_t(block32) * 32)[dst_w] = word;
             }
         }
     }
@@ -798,7 +1054,7 @@ __device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], u
 // One CTA of the quantized GEMM: 128 output columns of one tile of up to 128
 // pairs of one expert. `xq`, `xq_scales` and `xq_outer` hold the quantized
 // inputs; `xq_outer` (NVFP4 only) is each input row's outer scale.
-template <bool kFp4, bool kSwiglu>
+template <bool kFp4, bool kSwiglu, bool kQuantOut = false>
 __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xq_scales,
                               const float* __restrict__ xq_outer, const uint8_t* __restrict__ weight,
                               const uint8_t* __restrict__ scales,
@@ -806,13 +1062,19 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
                               __nv_bfloat16* __restrict__ out, const int* __restrict__ perm,
                               const int4* __restrict__ tiles, const int* __restrict__ group_counts,
                               int n, int k, int inputs_per_row, float gate_softcap,
-                              float up_softcap) {
+                              float up_softcap, uint8_t* __restrict__ out_val = nullptr,
+                              uint8_t* __restrict__ out_scl = nullptr,
+                              float* __restrict__ out_outer = nullptr) {
     using F = QFormat<kFp4>;
     const int tile_count = group_counts[0];
     const int n0 = blockIdx.x * kTileN;
     const int tid = threadIdx.x;
     if (int(blockIdx.y) == tile_count) {
-        nan_rows<kSwiglu>(out, perm, group_counts, n, n0);
+        if constexpr (kQuantOut) {
+            nan_rows_q<kFp4>(out_val, out_scl, out_outer, perm, group_counts, n, n0);
+        } else {
+            nan_rows<kSwiglu>(out, perm, group_counts, n, n0);
+        }
         return;
     }
     if (int(blockIdx.y) > tile_count) {
@@ -1095,7 +1357,12 @@ __device__ void expert_gemm_q(const uint8_t* __restrict__ xq, const uint8_t* __r
         }
     }
     __syncthreads();
-    write_tile<kSwiglu>(staged, out, perm + start, count, n, n0, gate_softcap, up_softcap);
+    if constexpr (kQuantOut) {
+        write_tile_swiglu_quant<kFp4, false>(staged, out_val, out_scl, out_outer, perm + start,
+                                             count, n, n0, gate_softcap, up_softcap);
+    } else {
+        write_tile<kSwiglu>(staged, out, perm + start, count, n, n0, gate_softcap, up_softcap);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,19 +1499,24 @@ __device__ __forceinline__ void mma_fp8_scaled(float (&c)[4], const uint32_t (&a
 // One CTA of the FP8-activation NVFP4 GEMM: 128 output columns of one tile of
 // up to 128 pairs of one expert. `xq` and `xq_scales` come from
 // `quantize_rows_fp8`.
-template <bool kSwiglu>
+template <bool kSwiglu, bool kQuantOut = false>
 __device__ void expert_gemm_q8(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xq_scales,
                                const uint8_t* __restrict__ weight, const uint8_t* __restrict__ scales,
                                const float* __restrict__ global_scale,
                                __nv_bfloat16* __restrict__ out, const int* __restrict__ perm,
                                const int4* __restrict__ tiles, const int* __restrict__ group_counts,
                                int n, int k, int inputs_per_row, float gate_softcap,
-                               float up_softcap) {
+                               float up_softcap, uint8_t* __restrict__ out_val = nullptr,
+                               uint8_t* __restrict__ out_scl = nullptr) {
     const int tile_count = group_counts[0];
     const int n0 = blockIdx.x * kTileN;
     const int tid = threadIdx.x;
     if (int(blockIdx.y) == tile_count) {
-        nan_rows<kSwiglu>(out, perm, group_counts, n, n0);
+        if constexpr (kQuantOut) {
+            nan_rows_q<false>(out_val, out_scl, nullptr, perm, group_counts, n, n0);
+        } else {
+            nan_rows<kSwiglu>(out, perm, group_counts, n, n0);
+        }
         return;
     }
     if (int(blockIdx.y) > tile_count) {
@@ -1456,7 +1728,12 @@ __device__ void expert_gemm_q8(const uint8_t* __restrict__ xq, const uint8_t* __
         staged[(pair + 1) * kOutStride + col + 8] = __float2bfloat16(acc[j][3] * w_scale);
     }
     __syncthreads();
-    write_tile<kSwiglu>(staged, out, perm + start, count, n, n0, gate_softcap, up_softcap);
+    if constexpr (kQuantOut) {
+        write_tile_swiglu_quant<false, true>(staged, out_val, out_scl, nullptr, perm + start,
+                                             count, n, n0, gate_softcap, up_softcap);
+    } else {
+        write_tile<kSwiglu>(staged, out, perm + start, count, n, n0, gate_softcap, up_softcap);
+    }
 }
 
 }  // namespace
@@ -1469,11 +1746,13 @@ __device__ void expert_gemm_q8(const uint8_t* __restrict__ xq, const uint8_t* __
 // expert. Pairs with an id outside `[0, experts)` come last in `perm`, in no
 // particular order, and get no tile. `group_counts` receives the number of
 // tiles, the number of pairs with known ids, and `entries`. One block of 1024
-// threads; at most 16,384 pairs and 1024 experts.
+// threads; at most 32,768 pairs (4096 rows) and 1024 experts.
 extern "C" __global__ void __launch_bounds__(kGroupThreads)
     expert_group(const int32_t* __restrict__ indices, int entries, int experts, int tile_pairs,
                  int32_t* __restrict__ perm, int4* __restrict__ tiles,
                  int32_t* __restrict__ group_counts) {
+    static_assert(kGroupRounds % 2 == 0, "even rounds for 16-bit register packing");
+    static_assert(kMaxPairs <= 65536, "ranks fit in uint16_t");
     __shared__ int count[kMaxExperts];
     __shared__ int first[kMaxExperts];
     __shared__ int warp_sums[32];
@@ -1481,13 +1760,8 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
     __shared__ int valid_count;
     const int tid = threadIdx.x;
 
-    // Each thread keeps its pairs' ids in registers; -1 marks no pair.
-    int ids[kGroupRounds];
-#pragma unroll
-    for (int r = 0; r < kGroupRounds; ++r) {
-        const int i = r * kGroupThreads + tid;
-        ids[r] = i < entries ? indices[i] : -1;
-    }
+    // Count: keep only packed uint16_t ranks (16 registers, 0 spills at 1024 threads)
+    // and re-read L1/L2-cached `indices` during scatter.
     for (int e = tid; e < kMaxExperts; e += kGroupThreads) {
         count[e] = 0;
     }
@@ -1496,19 +1770,22 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
     }
     __syncthreads();
 
-    // Count. Each pair's rank among its expert's pairs, or among the pairs
-    // with unknown ids, is the count before its own atomic; the order of ranks
-    // varies between runs, but each output depends only on its own pair.
-    int rank[kGroupRounds];
-#pragma unroll
-    for (int r = 0; r < kGroupRounds; ++r) {
-        const int i = r * kGroupThreads + tid;
-        const bool valid = ids[r] >= 0 && ids[r] < experts;
-        if (valid) {
-            rank[r] = atomicAdd(&count[ids[r]], 1);
-        } else if (i < entries) {
-            rank[r] = atomicAdd(&invalid_count, 1);
+    uint32_t rank_pair[kGroupRounds / 2];
+    auto count_one = [&](int i) -> uint32_t {
+        if (i >= entries) {
+            return 0u;
         }
+        const int id = indices[i];
+        if (id >= 0 && id < experts) {
+            return uint32_t(atomicAdd(&count[id], 1));
+        }
+        return uint32_t(atomicAdd(&invalid_count, 1));
+    };
+#pragma unroll
+    for (int p = 0; p < kGroupRounds / 2; ++p) {
+        const uint32_t r0 = count_one((2 * p) * kGroupThreads + tid);
+        const uint32_t r1 = count_one((2 * p + 1) * kGroupThreads + tid);
+        rank_pair[p] = (r0 & 0xffffu) | (r1 << 16);
     }
     __syncthreads();
 
@@ -1542,14 +1819,23 @@ extern "C" __global__ void __launch_bounds__(kGroupThreads)
     __syncthreads();
 
     // Scatter.
-#pragma unroll
-    for (int r = 0; r < kGroupRounds; ++r) {
-        const int i = r * kGroupThreads + tid;
-        if (ids[r] >= 0 && ids[r] < experts) {
-            perm[first[ids[r]] + rank[r]] = i;
-        } else if (i < entries) {
-            perm[valid_count + rank[r]] = i;
+    auto scatter_one = [&](int i, int r) {
+        if (i >= entries) {
+            return;
         }
+        const int id = indices[i];
+        if (id >= 0 && id < experts) {
+            perm[first[id] + r] = i;
+        } else {
+            perm[valid_count + r] = i;
+        }
+    };
+#pragma unroll
+    for (int p = 0; p < kGroupRounds / 2; ++p) {
+        const int r0 = int(rank_pair[p] & 0xffffu);
+        const int r1 = int(rank_pair[p] >> 16);
+        scatter_one((2 * p) * kGroupThreads + tid, r0);
+        scatter_one((2 * p + 1) * kGroupThreads + tid, r1);
     }
 }
 
@@ -1643,6 +1929,25 @@ EXPERT_GEMM_Q(expert_gemm_q_mxfp8, false, false)
 EXPERT_GEMM_Q(expert_gemm_q_nvfp4_swiglu, true, true)
 EXPERT_GEMM_Q(expert_gemm_q_mxfp8_swiglu, false, true)
 
+// Quantized GEMMs with fused SwiGLU + quantized activation epilogue (`QuantizedRows`
+// output directly for `w2`, eliminating the BF16 intermediate write/read and
+// `quantize_rows_*` launch).
+#define EXPERT_GEMM_Q_SWIGLU_Q(name, fp4)                                                         \
+    static_assert(kQShared + kQTileT * 4 <= 50176);                                               \
+    extern "C" __global__ void __launch_bounds__(kThreads, 2)                                     \
+        name(const uint8_t* xq, const uint8_t* xq_scales, const float* xq_outer,                  \
+             const uint8_t* weight, const uint8_t* scales, const float* global_scale,             \
+             uint8_t* out_val, uint8_t* out_scl, float* out_outer, const int* perm,               \
+             const int4* tiles, const int* group_counts, int n, int k, int inputs_per_row,        \
+             float gate_softcap, float up_softcap) {                                              \
+        expert_gemm_q<fp4, true, true>(xq, xq_scales, xq_outer, weight, scales, global_scale,     \
+                                       nullptr, perm, tiles, group_counts, n, k, inputs_per_row,  \
+                                       gate_softcap, up_softcap, out_val, out_scl, out_outer);    \
+    }
+
+EXPERT_GEMM_Q_SWIGLU_Q(expert_gemm_q_nvfp4_swiglu_q, true)
+EXPERT_GEMM_Q_SWIGLU_Q(expert_gemm_q_mxfp8_swiglu_q, false)
+
 // The NVFP4 GEMMs with FP8 activations: `expert_gemm_q_nvfp4` with
 // `quantize_rows_fp8` inputs. Needs `kQ8Shared` (47,872) bytes of dynamic shared
 // memory, k a multiple of 128, and weight scales that `nvfp4_scale_spread`
@@ -1660,6 +1965,21 @@ EXPERT_GEMM_Q(expert_gemm_q_mxfp8_swiglu, false, true)
 
 EXPERT_GEMM_Q8(expert_gemm_q8_nvfp4, false)
 EXPERT_GEMM_Q8(expert_gemm_q8_nvfp4_swiglu, true)
+
+extern "C" __global__ void __launch_bounds__(kThreads, 2)
+    expert_gemm_q8_nvfp4_swiglu_q(const uint8_t* xq, const uint8_t* xq_scales,
+                                  const float* xq_outer, const uint8_t* weight,
+                                  const uint8_t* scales, const float* global_scale,
+                                  uint8_t* out_val, uint8_t* out_scl, float* out_outer,
+                                  const int* perm, const int4* tiles, const int* group_counts,
+                                  int n, int k, int inputs_per_row, float gate_softcap,
+                                  float up_softcap) {
+    (void)xq_outer;
+    (void)out_outer;
+    expert_gemm_q8<true, true>(xq, xq_scales, weight, scales, global_scale, nullptr, perm, tiles,
+                               group_counts, n, k, inputs_per_row, gate_softcap, up_softcap,
+                               out_val, out_scl);
+}
 
 // Counts the NVFP4 group scales (`scales`, `count` pairs of E4M3 bytes, one
 // pair per 32-value block) for which `expert_gemm_q8_*` would not be exact

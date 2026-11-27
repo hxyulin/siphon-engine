@@ -1630,8 +1630,8 @@ decode_step_fp4(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __
 namespace {
 
 constexpr int kPrefillKeys = 64;
-// Most blocks of M rows per KV head: 2048 rows of 3 heads in blocks of 128.
-constexpr int kPrefillMaxBlocks = 48;
+// Most blocks of M rows per KV head: 4096 rows of 3 heads in blocks of 128.
+constexpr int kPrefillMaxBlocks = 96;
 // 64 consecutive distances span at most 9 aligned chunks of 8 bias values.
 constexpr int kBiasChunks = kPrefillKeys / 8 + 1;
 constexpr int kBiasStride = kBiasChunks * 8;
@@ -1922,23 +1922,37 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
     };
 
     // Work item (block of M rows b, KV head g, tile t) has index
-    // tiles[b] + g * count(b) + t. Lane l of warp 0 counts blocks 2l and
-    // 2l + 1 and the warp scans the counts.
+    // tiles[b] + g * count(b) + t. Lane l of warp 0 counts 4 blocks
+    // (4l..4l+3, covering up to 128 >= kPrefillMaxBlocks) and the warp scans.
     if (warp == 0) {
-        const unsigned c0 = 2 * lane < blocks_m ? range_of(2 * lane).tiles * kKvHeads : 0;
-        const unsigned c1 = 2 * lane + 1 < blocks_m ? range_of(2 * lane + 1).tiles * kKvHeads : 0;
-        unsigned inclusive = c0 + c1;
+        unsigned c[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int b = 4 * lane + k;
+            if (b < blocks_m) {
+                c[k] = range_of(b).tiles * kKvHeads;
+            }
+        }
+        const unsigned sum4 = c[0] + c[1] + c[2] + c[3];
+        unsigned inclusive = sum4;
 #pragma unroll
         for (int offset = 1; offset < 32; offset *= 2) {
             const unsigned v = __shfl_up_sync(0xffffffffu, inclusive, offset);
             inclusive += lane >= offset ? v : 0;
         }
-        const unsigned exclusive = inclusive - c0 - c1;
-        if (2 * lane <= blocks_m) {
-            sm.tiles[2 * lane] = exclusive;
-        }
-        if (2 * lane + 1 <= blocks_m) {
-            sm.tiles[2 * lane + 1] = exclusive + c0;
+        const unsigned exclusive = inclusive - sum4;
+        const unsigned p[4] = {
+            exclusive,
+            exclusive + c[0],
+            exclusive + c[0] + c[1],
+            exclusive + c[0] + c[1] + c[2],
+        };
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int b = 4 * lane + k;
+            if (b <= blocks_m) {
+                sm.tiles[b] = p[k];
+            }
         }
     }
     __syncthreads();
@@ -3033,25 +3047,25 @@ prefill_attention_fp4_mma(const __nv_bfloat16* q, const __nv_bfloat16* k_in, con
 }
 
 // The launcher passes PREFILL_SHARED_BYTES of dynamic shared memory.
-static_assert(sizeof(PrefillShared<Bf16Format, kPrefillWarps>) <= 84240);
-static_assert(sizeof(PrefillShared<Fp8Format, kPrefillWarps>) <= 84240);
-static_assert(sizeof(PrefillShared<Fp8MmaFormat, kPrefillWarps>) <= 84240);
-static_assert(sizeof(PrefillShared<Fp4Format, kPrefillWarps>) <= 84240);
-static_assert(sizeof(PrefillShared<Fp4MmaFormat, kPrefillWarps>) <= 84240);
+static_assert(sizeof(PrefillShared<Bf16Format, kPrefillWarps>) <= 84432);
+static_assert(sizeof(PrefillShared<Fp8Format, kPrefillWarps>) <= 84432);
+static_assert(sizeof(PrefillShared<Fp8MmaFormat, kPrefillWarps>) <= 84432);
+static_assert(sizeof(PrefillShared<Fp4Format, kPrefillWarps>) <= 84432);
+static_assert(sizeof(PrefillShared<Fp4MmaFormat, kPrefillWarps>) <= 84432);
 static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <= PrefillShared<Fp4Format, kPrefillWarps>::kStaged);
 static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <= PrefillShared<Fp4MmaFormat, kPrefillWarps>::kStaged);
 
 // ---------------------------------------------------------------------------
 // Ragged packed multi-slice prefill KV append & flash attention: runs across
-// all S variable-length slices (1 <= S <= 64, sum(row_len) <= 2048) in one
+// all S variable-length slices (1 <= S <= 64, sum(row_len) <= 4096) in one
 // persistent grid launch so short slices saturate every SM concurrently.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// Upper bound on sum_s ceil(row_len[s] * 3 / 128) across S <= 64 slices totaling <= 2048
-// rows: at most 64 + 47 = 111 blocks, rounded up to 128.
-constexpr int kPrefillPackedMaxBlocks = 128;
+// Upper bound on sum_s ceil(row_len[s] * 3 / 128) across S <= 64 slices totaling <= 4096
+// rows: at most 64 + 95 = 159 blocks, rounded up to 192 (6 blocks per warp-0 lane).
+constexpr int kPrefillPackedMaxBlocks = 192;
 
 template <class F, int kWarps>
 struct alignas(16) PrefillPackedShared {
@@ -3127,13 +3141,13 @@ __device__ __forceinline__ void prefill_attention_packed(
         return r;
     };
 
-    // Warp 0 scans the tile counts across all `total_blocks_m <= 128` global blocks
-    // (4 blocks per lane), storing prefix sums in `sm.tiles` and descriptors in `sm.block_desc`.
+    // Warp 0 scans the tile counts across all `total_blocks_m <= 192` global blocks
+    // (6 blocks per lane), storing prefix sums in `sm.tiles` and descriptors in `sm.block_desc`.
     if (warp == 0) {
-        unsigned c[4] = {0, 0, 0, 0};
+        unsigned c[6] = {0, 0, 0, 0, 0, 0};
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int gb = 4 * lane + k;
+        for (int k = 0; k < 6; ++k) {
+            const int gb = 6 * lane + k;
             if (gb < int(total_blocks_m)) {
                 const uint32_t desc = block_descs[gb];
                 sm.block_desc[gb] = uint16_t(desc);
@@ -3142,26 +3156,22 @@ __device__ __forceinline__ void prefill_attention_packed(
                 c[k] = range_of(slices[si], bm).tiles * kKvHeads;
             }
         }
-        const unsigned sum4 = c[0] + c[1] + c[2] + c[3];
-        unsigned inclusive = sum4;
+        const unsigned sum6 = c[0] + c[1] + c[2] + c[3] + c[4] + c[5];
+        unsigned inclusive = sum6;
 #pragma unroll
         for (int offset = 1; offset < 32; offset *= 2) {
             const unsigned v = __shfl_up_sync(0xffffffffu, inclusive, offset);
             inclusive += lane >= offset ? v : 0;
         }
-        const unsigned exclusive = inclusive - sum4;
-        const unsigned p[4] = {
-            exclusive,
-            exclusive + c[0],
-            exclusive + c[0] + c[1],
-            exclusive + c[0] + c[1] + c[2],
-        };
+        const unsigned exclusive = inclusive - sum6;
+        unsigned running = exclusive;
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int gb = 4 * lane + k;
+        for (int k = 0; k < 6; ++k) {
+            const int gb = 6 * lane + k;
             if (gb <= int(total_blocks_m)) {
-                sm.tiles[gb] = p[k];
+                sm.tiles[gb] = running;
             }
+            running += c[k];
         }
         if (lane == 31 && total_blocks_m == kPrefillPackedMaxBlocks) {
             sm.tiles[kPrefillPackedMaxBlocks] = inclusive;
@@ -4008,10 +4018,10 @@ prefill_attention_packed_fp8_mma(const __nv_bfloat16* q, const __nv_bfloat16* k_
 }
 
 // The launcher passes PREFILL_PACKED_SHARED_BYTES of dynamic shared memory.
-static_assert(sizeof(PrefillPackedShared<Bf16Format, kPrefillWarps>) <= 84864);
-static_assert(sizeof(PrefillPackedShared<Fp8Format, kPrefillWarps>) <= 84864);
-static_assert(sizeof(PrefillPackedShared<Fp8MmaFormat, kPrefillWarps>) <= 84864);
-static_assert(sizeof(PrefillPackedShared<Fp4Format, kPrefillWarps>) <= 84864);
+static_assert(sizeof(PrefillPackedShared<Bf16Format, kPrefillWarps>) <= 85248);
+static_assert(sizeof(PrefillPackedShared<Fp8Format, kPrefillWarps>) <= 85248);
+static_assert(sizeof(PrefillPackedShared<Fp8MmaFormat, kPrefillWarps>) <= 85248);
+static_assert(sizeof(PrefillPackedShared<Fp4Format, kPrefillWarps>) <= 85248);
 static_assert(kPrefillKeys * (kFp4HeadBytes + kFp4HeadScales) <=
               PrefillPackedShared<Fp4Format, kPrefillWarps>::kStaged);
 
