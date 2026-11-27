@@ -35,7 +35,9 @@ use crate::{
         linear::Start,
         linear_fp8::{self, Fp8GemmQuantized, Fp8Matrix, Fp8Rows, Mxfp8GemmQuantized},
         linear_rows::{self, RowsProduct, RowsWeight},
-        misc::{GATE_SLOTS, GateNormQuant, GateRowsSlot, MessageMix},
+        misc::{
+            GATE_SLOTS, GateNormQuant, GateOut3Buffers, GateOut3Slot, GateRowsSlot, MessageMix,
+        },
         norm::{AttentionPostRows, AttentionPostRowsPacked, KvConvWeights},
         routing::{
             DepthRows, DepthRowsQuant, FUSED_MAX_CANDIDATES, NormDest, QuantNormDest,
@@ -61,11 +63,11 @@ const _: () = assert!(DEFAULT_PREFILL_CHUNK == siphon::memory::DEFAULT_PREFILL_C
 /// [`Model::set_prefill_attention`] says otherwise.
 pub const DEFAULT_PREFILL_ATTENTION: PrefillAttention = PrefillAttention::Auto;
 /// Keys past which [`PrefillAttention::Auto`] runs a chunk's global attention on FP8 tensor
-/// cores. Rounding the softmax weights to E4M3 moves the output most where few keys share
-/// them, while attention's time grows with the square of the length: FP8 saves 2% of time to
-/// first token at 8,192 tokens, and keys below this mark are 3% of global attention's work at
-/// 92,160 tokens.
-pub const FP8_ATTENTION_KEYS: usize = 16_384;
+/// cores. Chunks up to 2,048 keys (including short prompts and the first 2,048 positions
+/// where few keys share the rounded softmax weights) stay on BF16 tensor cores, while
+/// longer chunks dispatch `prefill_attention_fp8_mma` for a 1.4-3.5% TTFT speedup at
+/// 4K-32K tokens on Blackwell.
+pub const FP8_ATTENTION_KEYS: usize = 2_048;
 
 /// Which products [`Model::prefill`]'s global attention runs over an FP8 or NVFP4 cache.
 /// FP8 passes the quality gate (see `docs/engine.md`) and halves global attention's time,
@@ -2035,6 +2037,20 @@ struct AttentionInputsRows<'a> {
     messages: Option<(&'a [MessageGateWeights; MESSAGE_SLOTS], Messages<'a>)>,
 }
 
+/// State (`h`) buffer handed to [`Ctx::message_gate_rows`].
+enum GateState<'a> {
+    /// Single-slot MLP gate (`[rows, hidden]`, read-only).
+    Single(CudaView<'a, f32>),
+    /// Three attention-side gates (`p.attention_inputs`, `[rows, 3, hidden]` capacity):
+    /// when `shared` (sliding layer), `inputs[..m*hidden]` holds `h` and `inputs[m*hidden..3*m*hidden]`
+    /// provides two F32 output scratch slots alongside `GateRows::out`; otherwise `inputs[..3*m*hidden]`
+    /// is overwritten in-place by each thread with its F32 gate output before RMSNorm.
+    Attention {
+        inputs: &'a mut CudaSlice<f32>,
+        shared: bool,
+    },
+}
+
 /// Where [`Ctx::message_gate_rows`] writes each gate's normalized output.
 enum GateNorms<'a> {
     /// BF16 normalized rows (invariant chunks and non-quantized prefill).
@@ -3205,7 +3221,7 @@ impl Ctx {
                 &gates[3..],
                 &mut p.gate,
                 3,
-                (rows(&p.mlp_input, m, hidden), hidden, 0),
+                GateState::Single(rows(&p.mlp_input, m, hidden)),
                 &Messages::new(
                     &p.bank,
                     p.bank_rows,
@@ -3799,11 +3815,10 @@ impl Ctx {
             &gates[..GATE_SLOTS],
             a.gate,
             0,
-            (
-                a.inputs.slice(..),
-                count * hidden,
-                if shared { 0 } else { hidden },
-            ),
+            GateState::Attention {
+                inputs: a.inputs,
+                shared,
+            },
             &messages,
             gate_norms,
             m,
@@ -4134,22 +4149,23 @@ impl Ctx {
     }
 
     /// [`Ctx::message_gate`] for a chunk of `m` rows and the gates of slots
-    /// `first .. first + g.len()`, one, or three at once. `h` holds the gates' states with
-    /// its row and gate strides. Each gate normalizes its output according to `norms`.
+    /// `first .. first + g.len()`, one, or three at once. Each gate normalizes its output
+    /// according to `norms`.
     #[expect(clippy::too_many_arguments, reason = "the gates' inputs and outputs")]
-    #[expect(clippy::too_many_lines, reason = "handles BF16 and fused quant norm epilogues")]
+    #[expect(clippy::too_many_lines, reason = "handles 1-slot, 3-slot batched, and fused quant epilogues")]
     fn message_gate_rows(
         &self,
         weights: &[MessageGateWeights],
         t: &mut GateRows,
         first: usize,
-        (state, h_stride, h_slot_stride): (CudaView<'_, f32>, usize, usize),
+        state: GateState<'_>,
         messages: &Messages<'_>,
         norms: GateNorms<'_>,
         m: usize,
     ) -> anyhow::Result<()> {
         let hidden = self.hidden();
         let rank = self.config.loop_config.gate_rank;
+        let mh = m * hidden;
         let mr = m * rank;
         let n = weights.len();
         let invariant = t.invariant;
@@ -4163,12 +4179,20 @@ impl Ctx {
             let GateNorms::Bf16(norms) = norms else {
                 anyhow::bail!("invariant message gates write BF16 outputs");
             };
+            let (state_view, h_stride, h_slot_stride) = match state {
+                GateState::Single(view) => (view, hidden, 0),
+                GateState::Attention { inputs, shared } => (
+                    inputs.slice(..),
+                    if shared { hidden } else { GATE_SLOTS * hidden },
+                    if shared { 0 } else { hidden },
+                ),
+            };
             // One launch for the gates: down projections, outputs and norms, as below.
             return self.message_gate_launch(
                 weights,
                 t,
                 first,
-                (state, h_stride, h_slot_stride),
+                (state_view, h_stride, h_slot_stride),
                 messages,
                 norms,
                 m,
@@ -4288,8 +4312,109 @@ impl Ctx {
                 _ => anyhow::bail!("{n} gates; one or three run at once"),
             }
         }
-        // One gate at a time, so that every gate rewrites the same output rows in L2.
-        let candidates = messages.bank.len() / (m * hidden) + 1;
+        let candidates = messages.bank.len() / mh + 1;
+        if n == GATE_SLOTS
+            && let GateState::Attention { inputs, shared } = state
+        {
+            let probs_stride = MESSAGE_SLOTS * candidates;
+            let bank_view = messages.bank.slice(..);
+            let run_gate3 = |buffers: &mut GateOut3Buffers<'_>| match norms {
+                GateNorms::Bf16(norms) => {
+                    let [(n0, o0), (n1, o1), (n2, o2)]: [_; GATE_SLOTS] = norms
+                        .try_into()
+                        .ok()
+                        .context("expected 3 BF16 gate norms")?;
+                    let mut slots = [
+                        (0, n0, o0),
+                        (1, n1, o1),
+                        (2, n2, o2),
+                    ]
+                    .map(|(i, norm, normed)| {
+                        let slot = first + i;
+                        GateOut3Slot {
+                            down: t.down.slice(slot * mr..(slot + 1) * mr),
+                            forget: &weights[i].forget,
+                            gain: &weights[i].gain,
+                            probs: Some(messages.probs.slice(slot * candidates..)),
+                            norm_weight: norm,
+                            normed: Some(normed),
+                            q_values: None,
+                            q_scales: None,
+                        }
+                    });
+                    self.kernels.misc.message_gate_out_rows_3(
+                        &self.stream,
+                        &mut slots,
+                        buffers,
+                        (&messages.normed, hidden),
+                        Some(&bank_view),
+                        probs_stride,
+                        None,
+                        self.eps(),
+                        m,
+                    )
+                }
+                GateNorms::DenseFp8(norm_weights) => {
+                    let [(v0, s0), (v1, s1), (v2, s2)]: [_; GATE_SLOTS] = t
+                        .dense
+                        .split_slots_mut(m, hidden, GATE_SLOTS)?
+                        .try_into()
+                        .ok()
+                        .context("expected 3 dense slots")?;
+                    let mut slots = [(0, v0, s0), (1, v1, s1), (2, v2, s2)].map(
+                        |(i, values, scales)| {
+                            let slot = first + i;
+                            GateOut3Slot {
+                                down: t.down.slice(slot * mr..(slot + 1) * mr),
+                                forget: &weights[i].forget,
+                                gain: &weights[i].gain,
+                                probs: Some(messages.probs.slice(slot * candidates..)),
+                                norm_weight: norm_weights[i],
+                                normed: None,
+                                q_values: Some(values),
+                                q_scales: Some(scales),
+                            }
+                        },
+                    );
+                    self.kernels.misc.message_gate_out_rows_3(
+                        &self.stream,
+                        &mut slots,
+                        buffers,
+                        (&messages.normed, hidden),
+                        Some(&bank_view),
+                        probs_stride,
+                        Some(QuantFormat::Mxfp8),
+                        self.eps(),
+                        m,
+                    )
+                }
+                GateNorms::Quant { .. } => unreachable!("3 gates cannot use single Quant"),
+            };
+            if shared {
+                let (h_slice, mut rest) = inputs.split_at_mut(mh);
+                let (out1, mut rest2) = rest.split_at_mut(mh);
+                let out2 = rest2.slice_mut(..mh);
+                let out0 = rows_mut(&mut t.out, m, hidden);
+                let mut buffers = GateOut3Buffers::Shared {
+                    h: h_slice.slice(..),
+                    out: [out0, out1, out2],
+                };
+                return run_gate3(&mut buffers);
+            }
+            let mut buffers = GateOut3Buffers::InPlace {
+                h_and_out: inputs.slice_mut(..GATE_SLOTS * mh),
+            };
+            return run_gate3(&mut buffers);
+        }
+        let (state_view, h_stride, h_slot_stride) = match state {
+            GateState::Single(view) => (view, hidden, 0),
+            GateState::Attention { inputs, shared } => (
+                inputs.slice(..),
+                if shared { hidden } else { GATE_SLOTS * hidden },
+                if shared { 0 } else { hidden },
+            ),
+        };
+        // Sequential per-gate path (1-slot MLP gate).
         match norms {
             GateNorms::Bf16(norms) => {
                 for (i, (w, (norm, mut normed))) in weights.iter().zip(norms).enumerate() {
@@ -4299,7 +4424,7 @@ impl Ctx {
                         &t.down.slice(slot * mr..(slot + 1) * mr),
                         &w.forget,
                         &w.gain,
-                        (&state.slice(i * h_slot_stride..), h_stride),
+                        (&state_view.slice(i * h_slot_stride..), h_stride),
                         (&messages.normed, hidden),
                         Some(&MessageMix {
                             blocks: messages.bank.slice(..),
@@ -4329,7 +4454,7 @@ impl Ctx {
                         &t.down.slice(slot * mr..(slot + 1) * mr),
                         &w.forget,
                         &w.gain,
-                        (&state.slice(i * h_slot_stride..), h_stride),
+                        (&state_view.slice(i * h_slot_stride..), h_stride),
                         (&messages.normed, hidden),
                         Some(&MessageMix {
                             blocks: messages.bank.slice(..),
@@ -4364,7 +4489,7 @@ impl Ctx {
                     &t.down.slice(slot * mr..(slot + 1) * mr),
                     &w.forget,
                     &w.gain,
-                    (&state, h_stride),
+                    (&state_view, h_stride),
                     (&messages.normed, hidden),
                     Some(&MessageMix {
                         blocks: messages.bank.slice(..),
@@ -5321,7 +5446,7 @@ impl Ctx {
                 &gates[3..],
                 &mut p.gate,
                 3,
-                (rows(&p.mlp_input, m, hidden), hidden, 0),
+                GateState::Single(rows(&p.mlp_input, m, hidden)),
                 &Messages::new(
                     &p.bank,
                     p.bank_rows,
@@ -6327,7 +6452,7 @@ impl Ctx {
                 &gates[3..],
                 &mut p.gate,
                 3,
-                (rows(&p.mlp_input, m, hidden), hidden, 0),
+                GateState::Single(rows(&p.mlp_input, m, hidden)),
                 &Messages::new(
                     &p.bank,
                     p.bank_rows,

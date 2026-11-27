@@ -1072,5 +1072,173 @@ fn fused_depth_and_gate_norm_quant_match_separate() -> anyhow::Result<()> {
             assert_quant_exact(&label, stream, &got_q, &want_q, ROWS, format)?;
         }
     }
+
+    // 4. message_gate_out_rows_3 (3-slot batched attention-side message gates): matches
+    //    3 sequential calls of message_gate_out_rows + standalone quant BIT FOR BIT for
+    //    both Shared (sliding) and InPlace (global) buffer layouts, BF16 and MXFP8.
+    {
+        use siphon_cuda::ops::misc::{GateOut3Buffers, GateOut3Slot, MessageMix};
+        const NB: usize = 3;
+        let blocks = stream.clone_htod(&pseudo_random(NB * ROWS * HIDDEN, 930, 1.5))?;
+        let probs_stride = 4 * (NB + 1);
+        let probs_host: Vec<f32> = (0..ROWS * probs_stride)
+            .map(|i| 0.1 + ((i * 37) % 17) as f32 * 0.05)
+            .collect();
+        let probs = stream.clone_htod(&probs_host)?;
+        let downs3 = [
+            stream.clone_htod(&pseudo_random_bf16(ROWS * 64, 940, 2.0, 0.0))?,
+            stream.clone_htod(&pseudo_random_bf16(ROWS * 64, 941, 2.0, 0.0))?,
+            stream.clone_htod(&pseudo_random_bf16(ROWS * 64, 942, 2.0, 0.0))?,
+        ];
+        let forgets3 = [
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 943, 0.3, 0.0))?,
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 944, 0.3, 0.0))?,
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 945, 0.3, 0.0))?,
+        ];
+        let gains3 = [
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 946, 0.3, 0.0))?,
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 947, 0.3, 0.0))?,
+            stream.clone_htod(&pseudo_random_bf16(HIDDEN * 64, 948, 0.3, 0.0))?,
+        ];
+        let h3_host = pseudo_random(ROWS * 3 * HIDDEN, 949, 2.5);
+        for h_shared in [true, false] {
+            let (h_stride, h_slot_stride) = if h_shared {
+                (HIDDEN, 0)
+            } else {
+                (3 * HIDDEN, HIDDEN)
+            };
+            let h_ref = if h_shared {
+                h.clone()
+            } else {
+                stream.clone_htod(&h3_host)?
+            };
+            let mut ref_out = stream.alloc_zeros::<f32>(ROWS * HIDDEN)?;
+            let mut ref_norms = [
+                stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?,
+                stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?,
+                stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?,
+            ];
+            for k in 0..3 {
+                misc.message_gate_out_rows(
+                    stream,
+                    &downs3[k],
+                    &forgets3[k],
+                    &gains3[k],
+                    (&h_ref.slice(k * h_slot_stride..), h_stride),
+                    (&m_vec, HIDDEN),
+                    Some(&MessageMix {
+                        blocks: blocks.as_view(),
+                        probs: probs.slice(k * (NB + 1)..),
+                        probs_stride,
+                    }),
+                    &mut ref_out,
+                    Some((&norm_weights[k], &mut ref_norms[k])),
+                    EPS,
+                    ROWS,
+                )?;
+            }
+
+            let mut batched_norms = [
+                stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?,
+                stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?,
+                stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?,
+            ];
+            let mut out_scratch = stream.alloc_zeros::<f32>(ROWS * 3 * HIDDEN)?;
+            let mut in_place_buf = stream.clone_htod(&h3_host)?;
+            let (o0, mut rest) = out_scratch.split_at_mut(ROWS * HIDDEN);
+            let (o1, o2) = rest.split_at_mut(ROWS * HIDDEN);
+            let mut buffers = if h_shared {
+                GateOut3Buffers::Shared {
+                    h: h.as_view(),
+                    out: [o0, o1, o2],
+                }
+            } else {
+                GateOut3Buffers::InPlace {
+                    h_and_out: in_place_buf.as_view_mut(),
+                }
+            };
+            let q_slots = fp8_rows.split_slots_mut(ROWS, HIDDEN, 3)?;
+            let mut q_iter = q_slots.into_iter();
+            let [n0, n1, n2] = &mut batched_norms;
+            let (v0, s0) = q_iter.next().unwrap();
+            let (v1, s1) = q_iter.next().unwrap();
+            let (v2, s2) = q_iter.next().unwrap();
+            let mut slots = [
+                GateOut3Slot {
+                    down: downs3[0].as_view(),
+                    forget: &forgets3[0],
+                    gain: &gains3[0],
+                    probs: Some(probs.slice(0..)),
+                    norm_weight: &norm_weights[0],
+                    normed: Some(n0.as_view_mut()),
+                    q_values: Some(v0),
+                    q_scales: Some(s0),
+                },
+                GateOut3Slot {
+                    down: downs3[1].as_view(),
+                    forget: &forgets3[1],
+                    gain: &gains3[1],
+                    probs: Some(probs.slice(NB + 1..)),
+                    norm_weight: &norm_weights[1],
+                    normed: Some(n1.as_view_mut()),
+                    q_values: Some(v1),
+                    q_scales: Some(s1),
+                },
+                GateOut3Slot {
+                    down: downs3[2].as_view(),
+                    forget: &forgets3[2],
+                    gain: &gains3[2],
+                    probs: Some(probs.slice(2 * (NB + 1)..)),
+                    norm_weight: &norm_weights[2],
+                    normed: Some(n2.as_view_mut()),
+                    q_values: Some(v2),
+                    q_scales: Some(s2),
+                },
+            ];
+            misc.message_gate_out_rows_3(
+                stream,
+                &mut slots,
+                &mut buffers,
+                (&m_vec, HIDDEN),
+                Some(&blocks.as_view()),
+                probs_stride,
+                Some(QuantFormat::Mxfp8),
+                EPS,
+                ROWS,
+            )?;
+            let slot_vals = ROWS * HIDDEN;
+            let slot_scales = ROWS * (HIDDEN / 32);
+            for k in 0..3 {
+                assert_bf16_close(
+                    &format!("message_gate_out_rows_3 h_shared={h_shared} slot {k}: normed"),
+                    &stream.clone_dtoh(&batched_norms[k])?,
+                    &stream.clone_dtoh(&ref_norms[k])?,
+                    0,
+                );
+                quantize_reference(
+                    stream,
+                    &experts,
+                    &ref_norms[k],
+                    QuantFormat::Mxfp8,
+                    &dummy_scale,
+                    &mut want_q,
+                )?;
+                assert_eq!(
+                    stream.clone_dtoh(&fp8_rows.values().slice(k * slot_vals..(k + 1) * slot_vals))?,
+                    stream.clone_dtoh(&want_q.values().slice(..slot_vals))?,
+                    "message_gate_out_rows_3 h_shared={h_shared} slot {k}: mxfp8 values"
+                );
+                assert_eq!(
+                    stream.clone_dtoh(
+                        &fp8_rows
+                            .scales()
+                            .slice(k * slot_scales..(k + 1) * slot_scales)
+                    )?,
+                    stream.clone_dtoh(&want_q.scales().slice(..slot_scales))?,
+                    "message_gate_out_rows_3 h_shared={h_shared} slot {k}: mxfp8 scales"
+                );
+            }
+        }
+    }
     Ok(())
 }

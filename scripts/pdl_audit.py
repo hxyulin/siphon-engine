@@ -119,6 +119,11 @@ STRUCT_FIELDS = {
         0: "g.down", 8: "g.down_scale", 16: "g.forget", 24: "g.gain", 32: "g.x_state",
         40: "g.x_message", 48: "g.h", 56: "g.probs", 64: "g.norm_weight", 72: "g.normed",
         80: "g.out"}),
+    # message_gate_out_rows_3_2304 & message_gate_norm_rows_3_2304: 3 batched attention-side slots.
+    ("misc.cu", "GateOut3Args"): (48, 144, {
+        0: "g.down_act", 8: "g.forget", 16: "g.gain", 24: "g.h", 32: "g.probs", 40: "g.out"}),
+    ("misc.cu", "GateNorm3Args"): (40, 120, {
+        0: "g.out", 8: "g.norm_weight", 16: "g.normed", 24: "g.q_values", 32: "g.q_scales"}),
 }
 READ_ONLY |= {"batch.seg.w", "batch.seg.scale", "batch.seg.outer", "outer"}
 READ_ONLY |= {f"args.g.{n}" for n in ("down", "down_scale", "forget", "gain", "norm_weight")}

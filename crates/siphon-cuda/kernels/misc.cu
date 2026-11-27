@@ -1943,6 +1943,347 @@ message_gate_out_rows_2304(const __nv_bfloat16* down, const __nv_bfloat16* __res
     }
 }
 
+namespace gate_out3 {
+
+struct Slot {
+    const __nv_bfloat16* down;    // 0:  [rows, 64]
+    const __nv_bfloat16* forget;  // 8:  [2304, 64] (read-only weight)
+    const __nv_bfloat16* gain;    // 16: [2304, 64] (read-only weight)
+    const float* h;               // 24: rows h_stride apart
+    const float* probs;           // 32: rows probs_stride apart (or null)
+    float* out;                   // 40: rows out_stride apart (may alias h when !h_shared)
+};
+static_assert(sizeof(Slot) == 48, "scripts/pdl_audit.py names the fields by offset");
+
+struct GateOut3Args {
+    Slot g[3];        // 0..143
+    const float* m;   // 144: rows m_stride apart
+    const float* blocks;  // 152: nb block states, block_stride apart
+    int h_stride;
+    int m_stride;
+    int out_stride;
+    int block_stride;
+    int nb;
+    int probs_stride;
+    int rows;
+    int h_shared;     // 1 when all 3 slots share g[0].h (sliding layers)
+};
+
+struct GateNorm3Slot {
+    const float* out;                  // 0:  rows out_stride apart
+    const __nv_bfloat16* norm_weight;  // 8:  [2304] (read-only weight)
+    __nv_bfloat16* normed;             // 16: [rows, 2304] or null
+    uint8_t* q_values;                 // 24: quantized values or null
+    uint8_t* q_scales;                 // 32: quantized scales or null
+};
+static_assert(sizeof(GateNorm3Slot) == 40, "scripts/pdl_audit.py names the fields by offset");
+
+struct GateNorm3Args {
+    GateNorm3Slot g[3];  // 0..119
+    int out_stride;
+    int q_mode;
+    float eps;
+};
+
+}  // namespace gate_out3
+
+// 3-slot batched `message_gate_out_rows_2304` for attention-side message gates (Q, K, V):
+// reads shared `blocks` and `m` (and `h` on sliding layers where `h_shared == 1`) ONCE across
+// all 3 slots, overlapping `h` loads with each slot's MMA loop.
+// Produces bit-identical F32 outputs to 3 calls of `message_gate_out_rows_2304`.
+// Grid: (2304 / 64, ceil(rows / 64)), 256 threads (2 CTAs/SM).
+extern "C" __global__ void __launch_bounds__(kGtThreads, 2)
+message_gate_out_rows_3_2304(const __grid_constant__ gate_out3::GateOut3Args args) {
+    __shared__ __align__(16) __nv_bfloat16 as[kGtRows * kGateRank];
+    __shared__ __align__(16) __nv_bfloat16 fs[kGtCols * kGateRank];
+    __shared__ __align__(16) __nv_bfloat16 gs[kGtCols * kGateRank];
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int d0 = blockIdx.x * kGtCols;
+    const int r0 = blockIdx.y * kGtRows;
+    const int rows = args.rows;
+
+    // Preload slot 0 weights before pdl_wait().
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int idx = tid + i * kGtThreads;
+        const int r = idx / kGtChunks;
+        const int c = idx % kGtChunks;
+        const size_t at = size_t(d0 + r) * kGateRank + 8 * c;
+        *reinterpret_cast<uint4*>(&fs[gate_swizzle(r, c)]) =
+            *reinterpret_cast<const uint4*>(args.g[0].forget + at);
+        *reinterpret_cast<uint4*>(&gs[gate_swizzle(r, c)]) =
+            *reinterpret_cast<const uint4*>(args.g[0].gain + at);
+    }
+    pdl_trigger();
+    if (rows > 0) {
+        pdl_wait();
+    }
+
+    // Load slot 0 down tile while streaming blocks + m_partial ONCE for all 3 slots.
+    uint4 dv0[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int idx = tid + i * kGtThreads;
+        const int r = idx / kGtChunks;
+        const int c = idx % kGtChunks;
+        dv0[i] = make_uint4(0, 0, 0, 0);
+        if (r0 + r < rows) {
+            dv0[i] = *reinterpret_cast<const uint4*>(args.g[0].down + size_t(r0 + r) * kGateRank + 8 * c);
+        }
+    }
+
+    const int wr = warp / 2 * 16;
+    const int wc = warp % 2 * 32;
+    const bool has_probs = args.g[0].probs != nullptr;
+    const int nb = args.nb;
+
+    // Issue all m_partial loads upfront; defer slot-0 h loads until after the block mix
+    // finishes so peak register pressure stays <= 128 with zero stack spills.
+    float2 mp[2][4];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+            mp[half][n] = *reinterpret_cast<const float2*>(args.m + size_t(row) * args.m_stride + d);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int idx = tid + i * kGtThreads;
+        *reinterpret_cast<uint4*>(&as[gate_swizzle(idx / kGtChunks, idx % kGtChunks)]) = dv0[i];
+    }
+
+    float2 mv[3][2][4];
+    if (has_probs) {
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                for (int n = 0; n < 4; ++n) {
+                    mv[s][half][n] = make_float2(0.f, 0.f);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kGtMaxBlocks; ++i) {
+            if (i < nb) {
+                float2 bv[2][4];
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+                        bv[half][n] = *reinterpret_cast<const float2*>(
+                            args.blocks + size_t(i) * args.block_stride + size_t(row) * kHidden + d);
+                    }
+                }
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+                    for (int s = 0; s < 3; ++s) {
+                        const float wi = args.g[s].probs[size_t(row) * args.probs_stride + i];
+#pragma unroll
+                        for (int n = 0; n < 4; ++n) {
+                            mv[s][half][n].x = fmaf(wi, bv[half][n].x, mv[s][half][n].x);
+                            mv[s][half][n].y = fmaf(wi, bv[half][n].y, mv[s][half][n].y);
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const float wp = args.g[s].probs[size_t(row) * args.probs_stride + nb];
+#pragma unroll
+                for (int n = 0; n < 4; ++n) {
+                    mv[s][half][n].x = fmaf(wp, mp[half][n].x, mv[s][half][n].x);
+                    mv[s][half][n].y = fmaf(wp, mp[half][n].y, mv[s][half][n].y);
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                for (int n = 0; n < 4; ++n) {
+                    mv[s][half][n] = mp[half][n];
+                }
+            }
+        }
+    }
+
+    float2 hv[2][4];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+            hv[half][n] = *reinterpret_cast<const float2*>(args.g[0].h + size_t(row) * args.h_stride + d);
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int s = 0; s < 3; ++s) {
+        if (s > 0) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int idx = tid + i * kGtThreads;
+                const int r = idx / kGtChunks;
+                const int c = idx % kGtChunks;
+                const size_t at = size_t(d0 + r) * kGateRank + 8 * c;
+                *reinterpret_cast<uint4*>(&fs[gate_swizzle(r, c)]) =
+                    *reinterpret_cast<const uint4*>(args.g[s].forget + at);
+                *reinterpret_cast<uint4*>(&gs[gate_swizzle(r, c)]) =
+                    *reinterpret_cast<const uint4*>(args.g[s].gain + at);
+                uint4 dv = make_uint4(0, 0, 0, 0);
+                if (r0 + r < rows) {
+                    dv = *reinterpret_cast<const uint4*>(args.g[s].down + size_t(r0 + r) * kGateRank + 8 * c);
+                }
+                *reinterpret_cast<uint4*>(&as[gate_swizzle(r, c)]) = dv;
+            }
+            if (!args.h_shared) {
+                const float* h_s = args.g[s].h;
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int row = min(r0 + wr + lane / 4 + 8 * half, rows - 1);
+#pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+                        hv[half][n] = *reinterpret_cast<const float2*>(h_s + size_t(row) * args.h_stride + d);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        float acc_f[4][4] = {};
+        float acc_g[4][4] = {};
+#pragma unroll
+        for (int k = 0; k < kGateRank / 16; ++k) {
+            uint32_t a[4];
+            gate_ldmatrix_x4(a, &as[gate_swizzle(wr + lane % 16, 2 * k + lane / 16)]);
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                const int n = wc + 16 * np + lane % 8 + 8 * (lane / 16);
+                const int chunk = 2 * k + (lane / 8) % 2;
+                uint32_t bf[4];
+                uint32_t bg[4];
+                gate_ldmatrix_x4(bf, &fs[gate_swizzle(n, chunk)]);
+                gate_ldmatrix_x4(bg, &gs[gate_swizzle(n, chunk)]);
+                gate_mma(acc_f[2 * np], a, bf[0], bf[1]);
+                gate_mma(acc_f[2 * np + 1], a, bf[2], bf[3]);
+                gate_mma(acc_g[2 * np], a, bg[0], bg[1]);
+                gate_mma(acc_g[2 * np + 1], a, bg[2], bg[3]);
+            }
+        }
+        float* out_s = args.g[s].out;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int row = r0 + wr + lane / 4 + 8 * half;
+            if (row >= rows) {
+                continue;
+            }
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const int d = d0 + wc + 8 * n + 2 * (lane % 4);
+                const float o0 = fadd(fmul(fsub(1.f, tanhf(acc_f[n][2 * half])), hv[half][n].x),
+                                      fmul(tanhf(acc_g[n][2 * half]), mv[s][half][n].x));
+                const float o1 = fadd(fmul(fsub(1.f, tanhf(acc_f[n][2 * half + 1])), hv[half][n].y),
+                                      fmul(tanhf(acc_g[n][2 * half + 1]), mv[s][half][n].y));
+                *reinterpret_cast<float2*>(out_s + size_t(row) * args.out_stride + d) = make_float2(o0, o1);
+            }
+        }
+        if (s < 2) {
+            __syncthreads();
+        }
+    }
+}
+
+// 3-slot batched `message_gate_norm_rows_2304` + optional MXFP8 quantization (`grid = (rows, 3, 1)`).
+// Bit-identical to 3 launches of `message_gate_norm[_quant]_rows_2304`.
+extern "C" __global__ void __launch_bounds__(kGateThreads)
+message_gate_norm_rows_3_2304(const __grid_constant__ gate_out3::GateNorm3Args args) {
+    __shared__ float vw[kNormVirtualWarps];
+    const int s = blockIdx.y;
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const size_t row = blockIdx.x;
+    const size_t out_at = row * size_t(args.out_stride);
+    const size_t dst_at = row * kHidden;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kGateThreads);
+    const __nv_bfloat16* norm_weight = args.g[s].norm_weight;
+    const uint2 wpa = *reinterpret_cast<const uint2*>(norm_weight + ca);
+    const uint2 wpb = *reinterpret_cast<const uint2*>(norm_weight + cb);
+    pdl_trigger();
+    if (args.out_stride > 0) {
+        pdl_wait();
+    }
+    const float* out = args.g[s].out;
+    const float4 av = *reinterpret_cast<const float4*>(out + out_at + ca);
+    const float4 bv = *reinterpret_cast<const float4*>(out + out_at + cb);
+    const float a[4] = {av.x, av.y, av.z, av.w};
+    const float b[4] = {bv.x, bv.y, bv.z, bv.w};
+    const auto* wa = reinterpret_cast<const __nv_bfloat16*>(&wpa);
+    const auto* wb = reinterpret_cast<const __nv_bfloat16*>(&wpb);
+    float pa = 0.f;
+    float pb = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        pa = fmaf(a[i], a[i], pa);
+        pb = fmaf(b[i], b[i], pb);
+    }
+    pa = warp_sum(pa);
+    pb = warp_sum(pb);
+    if (lane == 0) {
+        vw[warp] = pa;
+        vw[warp + kGateWarps] = pb;
+    }
+    __syncthreads();
+    const float ss = warp_sum(lane < kNormVirtualWarps ? vw[lane] : 0.f);
+    const float inv = 1.f / sqrtf(ss / static_cast<float>(kHidden) + args.eps);
+    uint2 na;
+    uint2 nb;
+    auto* va = reinterpret_cast<__nv_bfloat16*>(&na);
+    auto* vb = reinterpret_cast<__nv_bfloat16*>(&nb);
+    float qa[4];
+    float qb[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        va[i] = __float2bfloat16((a[i] * inv) * __bfloat162float(wa[i]));
+        vb[i] = __float2bfloat16((b[i] * inv) * __bfloat162float(wb[i]));
+        qa[i] = __bfloat162float(va[i]);
+        qb[i] = __bfloat162float(vb[i]);
+    }
+    __nv_bfloat16* normed = args.g[s].normed;
+    if (normed != nullptr) {
+        *reinterpret_cast<uint2*>(normed + dst_at + ca) = na;
+        *reinterpret_cast<uint2*>(normed + dst_at + cb) = nb;
+    }
+    if (args.q_mode == quant_epilogue::kQuantMxfp8 || args.q_mode == quant_epilogue::kQuantMxfp8Paired) {
+        const bool paired = args.q_mode == quant_epilogue::kQuantMxfp8Paired;
+        uint8_t* qv = args.g[s].q_values + row * kHidden;
+        uint8_t* qs = args.g[s].q_scales + row * (kHidden / 32);
+        quant_epilogue::quantize_vec4_mxfp8(qa, t / 8, lane % 8, paired, qv, qs);
+        quant_epilogue::quantize_vec4_mxfp8(qb, 36 + t / 8, lane % 8, paired, qv, qs);
+    }
+}
+
 // normed = bf16(rms_norm(out) * norm_weight) for each row (blockIdx.x) of out and normed
 // ([rows, 2304]): the norm at the end of message_gate_out_row, with the same sums, read
 // with vector loads. 288 threads.

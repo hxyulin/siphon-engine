@@ -12,7 +12,7 @@ use half::bf16;
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
     ops::{
-        QuantDest,
+        QuantDest, QuantFormat,
         linear::launch_by_value,
         linear_fp8::Fp8Matrix,
         routing::FUSED_MAX_CANDIDATES,
@@ -289,6 +289,77 @@ pub struct DepthGateSlot<'a> {
     pub normed: CudaViewMut<'a, bf16>,
 }
 
+/// One slot of [`Misc::message_gate_out_rows_3`].
+pub struct GateOut3Slot<'a> {
+    pub down: CudaView<'a, bf16>,
+    pub forget: &'a CudaSlice<bf16>,
+    pub gain: &'a CudaSlice<bf16>,
+    pub probs: Option<CudaView<'a, f32>>,
+    pub norm_weight: &'a CudaSlice<bf16>,
+    pub normed: Option<CudaViewMut<'a, bf16>>,
+    pub q_values: Option<CudaViewMut<'a, u8>>,
+    pub q_scales: Option<CudaViewMut<'a, u8>>,
+}
+
+/// State (`h`) and F32 intermediate scratch (`out`) layout for [`Misc::message_gate_out_rows_3`].
+pub enum GateOut3Buffers<'a> {
+    /// Sliding layers: all 3 slots share `h` (`[rows, 2304]`) and write to 3 disjoint
+    /// `[rows, 2304]` F32 scratch slices (reusing `t.out` + `attention_inputs[mh..3*mh]`).
+    Shared {
+        h: CudaView<'a, f32>,
+        out: [CudaViewMut<'a, f32>; GATE_SLOTS],
+    },
+    /// Global layers: `h_and_out` (`[rows, 3, 2304]`, stride `3 * 2304`) holds each slot's
+    /// input `h` and is overwritten in-place element-by-element by each thread with `out`.
+    InPlace { h_and_out: CudaViewMut<'a, f32> },
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GateOut3KernelSlot {
+    down: u64,
+    forget: u64,
+    gain: u64,
+    h: u64,
+    probs: u64,
+    out: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GateOut3Args {
+    g: [GateOut3KernelSlot; GATE_SLOTS],
+    m: u64,
+    blocks: u64,
+    h_stride: i32,
+    m_stride: i32,
+    out_stride: i32,
+    block_stride: i32,
+    nb: i32,
+    probs_stride: i32,
+    rows: i32,
+    h_shared: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GateNorm3KernelSlot {
+    out: u64,
+    norm_weight: u64,
+    normed: u64,
+    q_values: u64,
+    q_scales: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GateNorm3Args {
+    g: [GateNorm3KernelSlot; GATE_SLOTS],
+    out_stride: i32,
+    q_mode: i32,
+    eps: f32,
+}
+
 #[derive(Debug)]
 pub struct Misc {
     message_gate_combine_f32: CudaFunction,
@@ -298,8 +369,10 @@ pub struct Misc {
     argmax_partials: CudaFunction,
     message_gate_out_2304: CudaFunction,
     message_gate_out_rows_2304: CudaFunction,
+    message_gate_out_rows_3_2304: CudaFunction,
     message_gate_norm_rows_2304: CudaFunction,
     message_gate_norm_quant_rows_2304: CudaFunction,
+    message_gate_norm_rows_3_2304: CudaFunction,
     argmax_wide_f32: CudaFunction,
     message_gate_step_2304: CudaFunction,
     message_gate_step_fp8_2304: CudaFunction,
@@ -366,9 +439,11 @@ impl Misc {
             argmax_partials: module.load_function("argmax_partials")?,
             message_gate_out_2304: module.load_function("message_gate_out_2304")?,
             message_gate_out_rows_2304: module.load_function("message_gate_out_rows_2304")?,
+            message_gate_out_rows_3_2304: module.load_function("message_gate_out_rows_3_2304")?,
             message_gate_norm_rows_2304: module.load_function("message_gate_norm_rows_2304")?,
             message_gate_norm_quant_rows_2304: module
                 .load_function("message_gate_norm_quant_rows_2304")?,
+            message_gate_norm_rows_3_2304: module.load_function("message_gate_norm_rows_3_2304")?,
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
             message_gate_step_2304: cluster_function(&module, "message_gate_step_2304")?,
             message_gate_step_fp8_2304: cluster_function(&module, "message_gate_step_fp8_2304")?,
@@ -1356,6 +1431,177 @@ impl Misc {
         // bf16*, bf16*, u8*, u8*, float*, int, float)`, all buffers hold `rows` rows of 2304
         // as checked above, and the kernel reads only `norm_weight` before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.message_gate_norm_quant_rows_2304, config) }
+    }
+
+    /// 3-slot batched `message_gate_out_rows` + `message_gate_norm[_quant]_rows` for the
+    /// three attention-side message gates (Q, K, V). Reads shared `blocks` and `m` (and `h`
+    /// on sliding layers) once across all three slots, pins the F32 intermediates in L2 via
+    /// `L2::evict_first` on the inputs, and runs the 3 trailing RMSNorm (+ optional MXFP8)
+    /// passes in one grid `(rows, 3, 1)` launch. Bit-identical to 3 sequential calls of
+    /// [`Self::message_gate_out_rows`] / [`Self::message_gate_out_rows_quant`].
+    #[expect(clippy::too_many_arguments, reason = "mirrors the batched kernel signature")]
+    #[expect(clippy::too_many_lines, reason = "validates and packs 3 gate slots")]
+    pub fn message_gate_out_rows_3(
+        &self,
+        stream: &CudaStream,
+        slots: &mut [GateOut3Slot<'_>; GATE_SLOTS],
+        buffers: &mut GateOut3Buffers<'_>,
+        (m, m_stride): (&impl DeviceIn<f32>, usize),
+        mix_blocks: Option<&CudaView<'_, f32>>,
+        probs_stride: usize,
+        quant_format: Option<QuantFormat>,
+        eps: f32,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(rows > 0, "no rows");
+        let m = m.view();
+        ensure!(
+            m_stride >= HIDDEN
+                && m_stride.is_multiple_of(2)
+                && m.len() >= (rows - 1) * m_stride + HIDDEN,
+            "m has {} elements, too few for {rows} even rows {m_stride} apart",
+            m.len()
+        );
+        let block_len = rows * HIDDEN;
+        let (blocks_ptr, nb) = match mix_blocks {
+            Some(blocks) => {
+                ensure!(
+                    !blocks.is_empty() && blocks.len().is_multiple_of(block_len),
+                    "blocks has {} elements, not a positive multiple of {rows} x {HIDDEN}",
+                    blocks.len()
+                );
+                let nb = blocks.len() / block_len;
+                ensure!(
+                    nb <= GATE_MAX_BLOCKS,
+                    "{nb} block states; at most {GATE_MAX_BLOCKS} fit"
+                );
+                ensure!(
+                    probs_stride > nb,
+                    "probs_stride {probs_stride} holds no {} weights",
+                    nb + 1
+                );
+                (blocks.device_ptr(stream).0, nb)
+            }
+            None => (0, 0),
+        };
+        let q_mode = match quant_format {
+            None => 0,
+            Some(fmt @ (QuantFormat::Mxfp8 | QuantFormat::Mxfp8Paired)) => fmt.mode(),
+            Some(QuantFormat::Nvfp4) => {
+                anyhow::bail!("3-slot batched message gate supports BF16 or MXFP8 only")
+            }
+        };
+        let (h_ptrs, out_ptrs, h_stride, out_stride, h_shared) = match buffers {
+            GateOut3Buffers::Shared { h, out } => {
+                check_len("h", h.len(), rows * HIDDEN)?;
+                let hp = h.device_ptr(stream).0;
+                let mut ops = [0u64; GATE_SLOTS];
+                for (k, o) in out.iter_mut().enumerate() {
+                    check_len("out", o.len(), rows * HIDDEN)?;
+                    ops[k] = o.device_ptr_mut(stream).0;
+                }
+                ([hp; GATE_SLOTS], ops, HIDDEN, HIDDEN, 1)
+            }
+            GateOut3Buffers::InPlace { h_and_out } => {
+                check_len("h_and_out", h_and_out.len(), rows * GATE_SLOTS * HIDDEN)?;
+                let base = h_and_out.device_ptr_mut(stream).0;
+                let stride_bytes = (HIDDEN * size_of::<f32>()) as u64;
+                let ptrs = [base, base + stride_bytes, base + 2 * stride_bytes];
+                (ptrs, ptrs, GATE_SLOTS * HIDDEN, GATE_SLOTS * HIDDEN, 0)
+            }
+        };
+        let mut out_args = GateOut3Args {
+            m: m.device_ptr(stream).0,
+            blocks: blocks_ptr,
+            h_stride: i32::try_from(h_stride)?,
+            m_stride: i32::try_from(m_stride)?,
+            out_stride: i32::try_from(out_stride)?,
+            block_stride: i32::try_from(block_len)?,
+            nb: i32::try_from(nb)?,
+            probs_stride: i32::try_from(probs_stride)?,
+            rows: i32::try_from(rows).context("too many rows")?,
+            h_shared,
+            ..GateOut3Args::default()
+        };
+        let mut norm_args = GateNorm3Args {
+            out_stride: i32::try_from(out_stride)?,
+            q_mode,
+            eps,
+            ..GateNorm3Args::default()
+        };
+        let want_values = rows * HIDDEN;
+        let want_scales = rows * (HIDDEN / 32);
+        for (k, slot) in slots.iter_mut().enumerate() {
+            check_len("down", slot.down.len(), rows * GATE_RANK)?;
+            check_len("forget", slot.forget.len(), HIDDEN * GATE_RANK)?;
+            check_len("gain", slot.gain.len(), HIDDEN * GATE_RANK)?;
+            check_len("norm_weight", slot.norm_weight.len(), HIDDEN)?;
+            let probs_ptr = match (&slot.probs, mix_blocks) {
+                (Some(p), Some(_)) => {
+                    ensure!(
+                        p.len() > (rows - 1) * probs_stride + nb,
+                        "slot {k}: probs has {} elements, too few for {rows} rows",
+                        p.len()
+                    );
+                    p.device_ptr(stream).0
+                }
+                (None, None) => 0,
+                _ => anyhow::bail!("slot {k}: probs and mix_blocks must both be set or both None"),
+            };
+            let normed_ptr = match slot.normed.as_mut() {
+                Some(normed) => {
+                    check_len("normed", normed.len(), rows * HIDDEN)?;
+                    normed.device_ptr_mut(stream).0
+                }
+                None => 0,
+            };
+            let (values_ptr, scales_ptr) =
+                match (quant_format, slot.q_values.as_mut(), slot.q_scales.as_mut()) {
+                    (Some(_), Some(qv), Some(qs)) => {
+                        check_len("q_values", qv.len(), want_values)?;
+                        check_len("q_scales", qs.len(), want_scales)?;
+                        (qv.device_ptr_mut(stream).0, qs.device_ptr_mut(stream).0)
+                    }
+                    (None, None, None) => (0, 0),
+                    _ => anyhow::bail!("slot {k}: quant_format and q_values/q_scales mismatch"),
+                };
+            out_args.g[k] = GateOut3KernelSlot {
+                down: slot.down.device_ptr(stream).0,
+                forget: slot.forget.device_ptr(stream).0,
+                gain: slot.gain.device_ptr(stream).0,
+                h: h_ptrs[k],
+                probs: probs_ptr,
+                out: out_ptrs[k],
+            };
+            norm_args.g[k] = GateNorm3KernelSlot {
+                out: out_ptrs[k],
+                norm_weight: slot.norm_weight.device_ptr(stream).0,
+                normed: normed_ptr,
+                q_values: values_ptr,
+                q_scales: scales_ptr,
+            };
+        }
+        let out_config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(HIDDEN / GATE_TILE_COLS)?,
+                u32::try_from(rows.div_ceil(GATE_TILE_ROWS)).context("too many rows")?,
+                1,
+            ),
+            block_dim: (GATE_TILE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: `out_args` matches `gate_out3::GateOut3Args`, all slot buffers are validated
+        // above, in-place mode updates each thread's own disjoint `(row, d)` element after
+        // reading it, and only `forget`/`gain` weights are read before `pdl_wait()`.
+        unsafe { launch_by_value(stream, &self.message_gate_out_rows_3_2304, out_config, &out_args, true) }?;
+        let norm_config = LaunchConfig {
+            grid_dim: (u32::try_from(rows).context("too many rows")?, GATE_SLOTS as u32, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: `norm_args` matches `gate_out3::GateNorm3Args`, all slot buffers are
+        // validated above, and only `norm_weight` is read before `pdl_wait()`.
+        unsafe { launch_by_value(stream, &self.message_gate_norm_rows_3_2304, norm_config, &norm_args, true) }
     }
 }
 
