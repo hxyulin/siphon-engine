@@ -44,7 +44,9 @@ use crate::{
     ops::{
         Products,
         norm::KvConvWeights,
-        spec::{BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, PACKED_SLICE_WORDS, PackedRows},
+        spec::{
+            BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, PACKED_SLICE_WORDS, PackedRows,
+        },
     },
     vmm::{Page, PagePool, Pooled},
 };
@@ -238,7 +240,8 @@ impl RingSlab {
                 anyhow::bail!("sliding caches take a concrete format (BF16, FP8 or NVFP4)")
             }
         };
-        let layout = siphon::memory::RingSlabLayout::new(ring_count, buffer_bytes, pool.page_bytes());
+        let layout =
+            siphon::memory::RingSlabLayout::new(ring_count, buffer_bytes, pool.page_bytes());
         let pooled = Pooled::reserve(pool, layout.total_bytes)?;
         Ok(Self {
             pooled,
@@ -901,9 +904,11 @@ pub struct DecodeStep<'a> {
 }
 
 /// Splits of the cache slots that [`Attention::decode_attention`] launches for a cache of
-/// `slots`: [`SPLITS`], or fewer so that each covers at least `min_slots`.
-fn splits(slots: usize, min_slots: usize) -> u32 {
-    let splits = slots.div_ceil(min_slots).clamp(1, SPLITS);
+/// `slots`: at most [`SPLITS`] (capped at `2 * sms / KV_HEADS` so one 2-block/SM wave covers
+/// the device), or fewer so that each covers at least `min_slots`.
+fn splits(sms: u32, slots: usize, min_slots: usize) -> u32 {
+    let max_splits = ((2 * sms as usize) / KV_HEADS).clamp(1, SPLITS);
+    let splits = slots.div_ceil(min_slots).clamp(1, max_splits);
     debug_assert!(splits <= MAX_SPLITS);
     splits as u32
 }
@@ -1743,7 +1748,10 @@ impl Attention {
                 .f32(SCALE)
                 .i32(split_blocks.cast_signed());
             let recent_blocks = u32::try_from(rows_per_seq.div_ceil(4))?;
-            (&self.batch_verify[nt_idx][format_idx], split_blocks + recent_blocks)
+            (
+                &self.batch_verify[nt_idx][format_idx],
+                split_blocks + recent_blocks,
+            )
         };
         let config = LaunchConfig {
             grid_dim: (KV_HEADS as u32, grid_y, u32::try_from(seqs)?),
@@ -1758,7 +1766,10 @@ impl Attention {
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
-    #[expect(clippy::too_many_arguments, reason = "mirrors attention_batch_nosplit parameters")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors attention_batch_nosplit parameters"
+    )]
     fn launch_batch_nosplit(
         &self,
         stream: &CudaStream,
@@ -2002,7 +2013,11 @@ impl Attention {
             .arg(&extent)
             .arg(&SCALE);
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, splits(cache.slots, MIN_SPLIT_SLOTS), 1),
+            grid_dim: (
+                KV_HEADS as u32,
+                splits(self.sms, cache.slots, MIN_SPLIT_SLOTS),
+                1,
+            ),
             block_dim: (DECODE_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -2139,7 +2154,11 @@ impl Attention {
             .f32(s.eps)
             .f32(SCALE);
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, splits(cache.slots, s.min_split_slots), 1),
+            grid_dim: (
+                KV_HEADS as u32,
+                splits(self.sms, cache.slots, s.min_split_slots),
+                1,
+            ),
             block_dim: (DECODE_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -2386,7 +2405,11 @@ impl Attention {
         ensure!(packed.num_slices > 0, "no packed slices");
         check_len("k", k.len(), rows * KV_ROW)?;
         check_len("v", v.len(), rows * KV_ROW)?;
-        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        check_len(
+            "slices",
+            packed.slices.len(),
+            packed.num_slices * PACKED_SLICE_WORDS,
+        )?;
         ensure!(
             !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
             "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",
@@ -2467,7 +2490,11 @@ impl Attention {
         check_len("v", v.len(), rows * KV_ROW)?;
         check_len("sinks", sinks.len(), rows * HEADS)?;
         check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
-        check_len("slices", packed.slices.len(), packed.num_slices * PACKED_SLICE_WORDS)?;
+        check_len(
+            "slices",
+            packed.slices.len(),
+            packed.num_slices * PACKED_SLICE_WORDS,
+        )?;
         ensure!(
             !packed.states.is_empty() && packed.states.len().is_multiple_of(BATCH_STATE_WORDS),
             "states has {} elements, not a positive multiple of {BATCH_STATE_WORDS}",

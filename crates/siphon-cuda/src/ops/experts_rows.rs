@@ -47,9 +47,9 @@ const N2: usize = 2304;
 /// Warps per block, `kWarps` in the kernel.
 const WARPS: usize = 4;
 /// Ring slots per warp of the two kernels of each format: the deeper ring for up to
-/// [`DEEP_RING_ROWS`] rows. On an RTX 5090, one step's expert MLPs with real routing took
-/// 1517 instead of 1663 us at 1 row and 2182 instead of 2228 at 2, but 3198 instead of
-/// 3139 at 4, where the 2 blocks per SM of the deeper ring held too few warps.
+/// [`DEEP_RING_ROWS`] rows on `sm_120a` (where 3-slot 3 blocks/SM beats 4-slot 2 blocks/SM at
+/// `m >= 4`), and for all `m = 1..=8` on `sm_89` (RTX 4090), where 3 stages in flight per warp
+/// beats both 2-slot (4 blocks/SM) and 3-slot (3 blocks/SM) across every verify width.
 const RINGS: [usize; 2] = [3, 4];
 const DEEP_RING_ROWS: usize = 3;
 /// Dynamic shared memory per block: `kWarps` warps of `ring` slots, each 16 rows of 128
@@ -147,14 +147,11 @@ impl ExpertsRows {
         let (multi_nvfp4_s4, multi_nvfp4_s4_blocks) =
             load("expert_mlp_rows_multi_nvfp4_s4_3", smem(RINGS[0]))?;
         let group = module.load_function("expert_group_rows")?;
-        let (wide_nvfp4, wide_nvfp4_blocks) =
-            load("expert_mlp_rows_wide_nvfp4_3", smem(RINGS[0]))?;
-        let (wide_mxfp8, wide_mxfp8_blocks) =
-            load("expert_mlp_rows_wide_mxfp8_3", smem(RINGS[0]))?;
+        let (wide_nvfp4, wide_nvfp4_blocks) = load("expert_mlp_rows_wide_nvfp4_3", smem(RINGS[0]))?;
+        let (wide_mxfp8, wide_mxfp8_blocks) = load("expert_mlp_rows_wide_mxfp8_3", smem(RINGS[0]))?;
         let (wide_nvfp4_s4, wide_nvfp4_s4_blocks) =
             load("expert_mlp_rows_wide_nvfp4_s4_3", smem(RINGS[0]))?;
-        let (mxfp6_kernel, mxfp6_blocks) =
-            load("expert_mlp_rows_mxfp6_3", smem_mxfp6(RINGS[0]))?;
+        let (mxfp6_kernel, mxfp6_blocks) = load("expert_mlp_rows_mxfp6_3", smem_mxfp6(RINGS[0]))?;
         let (mxfp6_multi, mxfp6_multi_blocks) =
             load("expert_mlp_rows_multi_mxfp6_3", smem_mxfp6(RINGS[0]))?;
         let (mxfp6_wide, mxfp6_wide_blocks) =
@@ -163,7 +160,11 @@ impl ExpertsRows {
             kernels: [shallow, deep],
             blocks: [shallow_blocks, deep_blocks],
             multi_kernels: [multi_nvfp4, multi_mxfp8, multi_nvfp4_s4],
-            multi_blocks: [multi_nvfp4_blocks, multi_mxfp8_blocks, multi_nvfp4_s4_blocks],
+            multi_blocks: [
+                multi_nvfp4_blocks,
+                multi_mxfp8_blocks,
+                multi_nvfp4_s4_blocks,
+            ],
             group,
             wide_kernels: [wide_nvfp4, wide_mxfp8, wide_nvfp4_s4],
             wide_blocks: [wide_nvfp4_blocks, wide_mxfp8_blocks, wide_nvfp4_s4_blocks],
@@ -357,9 +358,17 @@ impl ExpertsRows {
                 .ptr_mut(&mut sync, stream)
                 .i32(sync_end);
             let (wide_kernel, wide_blocks, wide_smem) = if format == 3 {
-                (&self.mxfp6_wide, self.mxfp6_wide_blocks, smem_mxfp6(RINGS[0]))
+                (
+                    &self.mxfp6_wide,
+                    self.mxfp6_wide_blocks,
+                    smem_mxfp6(RINGS[0]),
+                )
             } else {
-                (&self.wide_kernels[format], self.wide_blocks[format], smem(RINGS[0]))
+                (
+                    &self.wide_kernels[format],
+                    self.wide_blocks[format],
+                    smem(RINGS[0]),
+                )
             };
             let config = LaunchConfig {
                 grid_dim: (u32::try_from(wide_blocks).context("grid")?, 1, 1),
@@ -376,10 +385,14 @@ impl ExpertsRows {
             if m <= SINGLE_MAX_ROWS {
                 (&self.mxfp6_kernel, self.mxfp6_blocks, smem_mxfp6(RINGS[0]))
             } else {
-                (&self.mxfp6_multi, self.mxfp6_multi_blocks, smem_mxfp6(RINGS[0]))
+                (
+                    &self.mxfp6_multi,
+                    self.mxfp6_multi_blocks,
+                    smem_mxfp6(RINGS[0]),
+                )
             }
         } else if m <= SINGLE_MAX_ROWS {
-            let ring = usize::from(m <= DEEP_RING_ROWS);
+            let ring = usize::from(cfg!(sm89) || m <= DEEP_RING_ROWS);
             (
                 &self.kernels[ring][format],
                 self.blocks[ring][format],

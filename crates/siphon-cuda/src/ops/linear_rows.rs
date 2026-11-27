@@ -55,9 +55,9 @@ const NVFP4_STAGE_K: usize = 256;
 /// the grid has this many. On one step's projections, 2048 beat 512 and 1024 with BF16
 /// weights (1.15 ms per step for the input projections against 1.24 and 1.21), and 1024
 /// beat 512 and 2048 with FP8 weights (0.68 ms against 0.74 and 0.71).
-const TARGET_WARPS_BF16: usize = 2048;
-const TARGET_WARPS_FP8: usize = 1024;
-const TARGET_WARPS_NVFP4: usize = 1024;
+const TARGET_WARPS_BF16: usize = if cfg!(sm89) { 512 } else { 2048 };
+const TARGET_WARPS_FP8: usize = if cfg!(sm89) { 512 } else { 1024 };
+const TARGET_WARPS_NVFP4: usize = if cfg!(sm89) { 512 } else { 1024 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WeightKind {
@@ -274,7 +274,11 @@ impl Entry {
                     2 * self.warp_smem,
                 )
             } else {
-                (&self.functions[column_tiles - 1], (tiles, 1), self.warp_smem)
+                (
+                    &self.functions[column_tiles - 1],
+                    (tiles, 1),
+                    self.warp_smem,
+                )
             }
         }
     }
@@ -658,7 +662,10 @@ impl LinearRows {
     /// Matches `LinearRows::run -> logit_softcap_bf16_f32 -> argmax_f32` bit for bit (0-ULP)
     /// for all logits in the strictly monotonic range of softcap, including tie-breaking and
     /// NaN handling.
-    #[expect(clippy::too_many_arguments, reason = "weight, input, vocab and partials")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "weight, input, vocab and partials"
+    )]
     pub fn run_argmax(
         &self,
         stream: &CudaStream,
@@ -692,7 +699,9 @@ impl LinearRows {
             .argmax_entries
             .iter()
             .find(|e| e.kind == kind && e.k == width)
-            .with_context(|| format!("no fused argmax multi-row {kind:?} product for k = {width}"))?;
+            .with_context(|| {
+                format!("no fused argmax multi-row {kind:?} product for k = {width}")
+            })?;
 
         let (w_ptr, scale_ptr, outer_ptr, weight_rows) = resolve_weight(stream, weight, width)?;
         ensure!(

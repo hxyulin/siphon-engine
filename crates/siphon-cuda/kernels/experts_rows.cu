@@ -8,7 +8,8 @@
 // core passes):
 // - m = 1..8 (`expert_mlp_rows`): every expert has at most 8 pairs (one column group), so
 //   each block groups in shared memory (1 barrier at m == 1, 3 barriers at m = 2..8, zero
-//   warp_count/pstart/vstart/binary search), uses static strided task scheduling, streams
+//   warp_count/pstart/vstart/binary search), uses a dynamic warp work queue (`sync[0]` task
+//   counter, `sync[1]` finished-block counter, `sync[2 + ordinal]` w13 tile counters), streams
 //   16-row weight tiles through a per-warp ring, and writes coalesced 16-byte `act` / 32-byte
 //   `out` stores via warp shuffles with zero smem epilogue traffic.
 // - m = 9..32 (`expert_mlp_rows_multi`): each block groups pairs deterministically into
@@ -197,13 +198,19 @@ __device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a, uint32_t b) {
     return *reinterpret_cast<uint32_t*>(&r);
 }
 
-// Two E2M1 values (one byte, low nibble first) as F16, exactly.
-__device__ __forceinline__ uint32_t e2m1x2_to_f16x2(uint32_t byte) {
+// Two E2M1 values (low byte of `byte`, low nibble first) as scaled BF16x2 (2^-112 times the
+// values), exactly. On sm_89 this fuses `f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2_sm89(byte))`:
+// `prmt.b32` produces F16 magnitudes with zero sign bits and zero low bytes, so shifting right
+// by 3 and ORing the sign bits directly avoids masking off the sign bits it just inserted.
+__device__ __forceinline__ uint32_t e2m1x2_to_scaled_bf16x2(uint32_t byte) {
 #if SIPHON_SM89
-    return e2m1x2_to_f16x2_sm89(byte);
+    const uint32_t select = ((byte & 0x7u) << 4) | ((byte & 0x70u) << 8);
+    uint32_t h;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(h) : "r"(0x3e3c3800u), "r"(0x46444240u), "r"(select));
+    return (h >> 3) | ((byte & 0x8u) << 12) | ((byte & 0x80u) << 24);
 #else
     const __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(uint8_t(byte), __NV_E2M1);
-    return uint32_t(h.x) | (uint32_t(h.y) << 16);
+    return f16x2_to_scaled_bf16x2(uint32_t(h.x) | (uint32_t(h.y) << 16));
 #endif
 }
 
@@ -273,12 +280,6 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
     const int t = lane % 4;
     const uint8_t* const w_base = w + size_t(row0) * G::kRowBytes;
     const uint8_t* const s_base = s + size_t(row0) * G::kRowScaleBytes;
-    uint32_t base_a = 0u;
-    uint32_t base_b = 0u;
-    if constexpr (kScale4) {
-        base_a = s_row_base[row0 + g];
-        base_b = s_row_base[row0 + g + 8];
-    }
 
     auto issue = [&](int i) {
         if (i < G::kStages) {
@@ -305,6 +306,12 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
         issue(q);
     }
     ready();
+    uint32_t base_a = 0u;
+    uint32_t base_b = 0u;
+    if constexpr (kScale4) {
+        base_a = s_row_base[row0 + g];
+        base_b = s_row_base[row0 + g + 8];
+    }
     for (int i = 0; i < G::kStages; ++i) {
         issue(i + kRing - 1);
         // The stage's inputs load from L2 while its weights arrive. Keep this predicated
@@ -339,17 +346,8 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
             const uint4 bv = slot[slot_index<G::kChunks>(g + 8, c)];
             const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
             const uint32_t bw[4] = {bv.x, bv.y, bv.z, bv.w};
-            uint32_t xw[G::kValues / 2];
-#pragma unroll
-            for (int h = 0; h < kXVecs; ++h) {
-                xw[4 * h] = xv[j][h].x;
-                xw[4 * h + 1] = xv[j][h].y;
-                xw[4 * h + 2] = xv[j][h].z;
-                xw[4 * h + 3] = xv[j][h].w;
-            }
-            // The chunk's weights times their scales as BF16 pairs, in k order.
-            uint32_t a[G::kValues / 2];
-            uint32_t b[G::kValues / 2];
+            // Stream-unpack each 32-bit weight word into BF16 pairs and issue its MMA(s)
+            // immediately, in exact k order, keeping peak live weight registers to 4.
             if constexpr (kFp4) {
                 uint32_t scale_a[2];
                 uint32_t scale_b[2];
@@ -357,35 +355,36 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
                 e4m3x2_scale_pairs(sb, scale_b[0], scale_b[1]);
 #pragma unroll
                 for (int wi = 0; wi < 4; ++wi) {
-#pragma unroll
-                    for (int byte = 0; byte < 4; ++byte) {
-                        a[4 * wi + byte] = bf16x2_mul(
-                            f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2((aw[wi] >> (8 * byte)) & 0xff)),
-                            scale_a[wi / 2]);
-                        b[4 * wi + byte] = bf16x2_mul(
-                            f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2((bw[wi] >> (8 * byte)) & 0xff)),
-                            scale_b[wi / 2]);
-                    }
+                    const uint32_t sa_w = scale_a[wi / 2];
+                    const uint32_t sb_w = scale_b[wi / 2];
+                    const uint32_t a0 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[wi]), sa_w);
+                    const uint32_t b0 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[wi]), sb_w);
+                    const uint32_t a1 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[wi] >> 8), sa_w);
+                    const uint32_t b1 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[wi] >> 8), sb_w);
+                    mma(acc, a0, b0, a1, b1, xv[j][wi].x, xv[j][wi].y);
+                    const uint32_t a2 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[wi] >> 16), sa_w);
+                    const uint32_t b2 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[wi] >> 16), sb_w);
+                    const uint32_t a3 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[wi] >> 24), sa_w);
+                    const uint32_t b3 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[wi] >> 24), sb_w);
+                    mma(acc, a2, b2, a3, b3, xv[j][wi].z, xv[j][wi].w);
                 }
             } else {
                 const uint32_t scale_a = e8m0_scale_pair(sa);
                 const uint32_t scale_b = e8m0_scale_pair(sb);
 #pragma unroll
                 for (int wi = 0; wi < 4; ++wi) {
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        a[2 * wi + h] = bf16x2_mul(
-                            f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2((aw[wi] >> (16 * h)) & 0xffff)),
-                            scale_a);
-                        b[2 * wi + h] = bf16x2_mul(
-                            f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2((bw[wi] >> (16 * h)) & 0xffff)),
-                            scale_b);
-                    }
+                    const uint32_t x0 = (wi & 1) == 0 ? xv[j][wi >> 1].x : xv[j][wi >> 1].z;
+                    const uint32_t x1 = (wi & 1) == 0 ? xv[j][wi >> 1].y : xv[j][wi >> 1].w;
+                    const uint32_t a0 = bf16x2_mul(
+                        f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(aw[wi] & 0xffffu)), scale_a);
+                    const uint32_t b0 = bf16x2_mul(
+                        f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(bw[wi] & 0xffffu)), scale_b);
+                    const uint32_t a1 =
+                        bf16x2_mul(f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(aw[wi] >> 16)), scale_a);
+                    const uint32_t b1 =
+                        bf16x2_mul(f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(bw[wi] >> 16)), scale_b);
+                    mma(acc, a0, b0, a1, b1, x0, x1);
                 }
-            }
-#pragma unroll
-            for (int q = 0; q < G::kValues / 4; ++q) {
-                mma(acc, a[2 * q], b[2 * q], a[2 * q + 1], b[2 * q + 1], xw[2 * q], xw[2 * q + 1]);
             }
         }
         // Every lane has read the slot before a later stage overwrites it.
@@ -486,11 +485,9 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
 #pragma unroll
                     for (int byte = 0; byte < 4; ++byte) {
                         a[4 * wi + byte] = bf16x2_mul(
-                            f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2((aw[wi] >> (8 * byte)) & 0xff)),
-                            scale_a[wi / 2]);
+                            e2m1x2_to_scaled_bf16x2(aw[wi] >> (8 * byte)), scale_a[wi / 2]);
                         b[4 * wi + byte] = bf16x2_mul(
-                            f16x2_to_scaled_bf16x2(e2m1x2_to_f16x2((bw[wi] >> (8 * byte)) & 0xff)),
-                            scale_b[wi / 2]);
+                            e2m1x2_to_scaled_bf16x2(bw[wi] >> (8 * byte)), scale_b[wi / 2]);
                     }
                 }
             } else {
@@ -737,9 +734,18 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
     uint4* const ring = ring_all + warp * kRing * kSlotVecs;
     const int tasks13 = distinct * kTiles;
     const int tasks = 2 * tasks13;
-    const int warps = gridDim.x * kWarps;
 
-    for (int task = blockIdx.x * kWarps + warp; task < tasks; task += warps) {
+    // Dynamic warp work queue: sync[0] is the task counter, sync[1] the finished-block counter,
+    // and sync[2 + ordinal] each expert's w13 tile completion counter (`2 + distinct <= 1 + 9m`).
+    for (;;) {
+        int task;
+        if (lane == 0) {
+            task = int(atomicAdd(&sync[0], 1u));
+        }
+        task = __shfl_sync(0xffffffffu, task, 0);
+        if (task >= tasks) {
+            break;
+        }
         const bool up_proj = task < tasks13;
         const int flat = up_proj ? task : task - tasks13;
         const int ordinal = flat / kTiles;
@@ -757,7 +763,7 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
                 mine >= 0 ? x + size_t(mine / 8) * kK13 : nullptr, ring, lane, policy, acc, [] {});
             const float scale = kFp4 ? __fdiv_rn(g13[e], kNvfp4ScaleEnc) : 1.f;
             store_act_single(acc, scale, count, pairs_of, row0, gate_softcap, up_softcap, act,
-                             lane, g, t, &sync[1 + ordinal]);
+                             lane, g, t, &sync[2 + ordinal]);
         } else {
             const uint8_t* const w2e = w2 + size_t(e) * kN2 * G2::kRowBytes;
             // Overlap the first `kRing - 1` weight stages with any wait for w13 activations.
@@ -765,7 +771,7 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
                 w2e, s2 + size_t(e) * kN2 * G2::kRowScaleBytes,
                 kScale4 ? s2_base + size_t(e) * kN2 : nullptr, row0,
                 mine >= 0 ? act + size_t(mine) * kK2 : nullptr, ring, lane, policy, acc,
-                [&] { wait_sync_tiles(&sync[1 + ordinal], lane); });
+                [&] { wait_sync_tiles(&sync[2 + ordinal], lane); });
             const float scale = kFp4 ? __fdiv_rn(g2[e], kNvfp4ScaleEnc) : 1.f;
             store_out_single(acc, scale, count, pairs_of, row0, out, g, t);
         }
@@ -775,15 +781,16 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
     if (warp == 0) {
         int last = 0;
         if (lane == 0) {
-            last = atomicAdd(&sync[0], 1u) == gridDim.x - 1 ? 1 : 0;
+            last = atomicAdd(&sync[1], 1u) == gridDim.x - 1 ? 1 : 0;
         }
         if (__shfl_sync(0xffffffffu, last, 0)) {
             for (int i = lane; i < distinct; i += 32) {
-                sync[1 + i] = 0;
+                sync[2 + i] = 0;
             }
             __syncwarp();
             if (lane == 0) {
                 sync[0] = 0;
+                sync[1] = 0;
             }
         }
     }
@@ -1561,21 +1568,35 @@ __device__ __forceinline__ void tile_product_mxfp6(const uint8_t* w_lo4, const u
             const uint4 bv = slot[slot_index<G::kChunks>(g + 8, c)];
             const uint2 ah = reinterpret_cast<const uint2*>(hi_slot + g * G::kHi2Chunks)[c];
             const uint2 bh = reinterpret_cast<const uint2*>(hi_slot + (g + 8) * G::kHi2Chunks)[c];
-            uint32_t xw[16];
+            const uint32_t alw[4] = {av.x, av.y, av.z, av.w};
+            const uint32_t blw[4] = {bv.x, bv.y, bv.z, bv.w};
 #pragma unroll
-            for (int h = 0; h < kXVecs; ++h) {
-                xw[4 * h + 0] = xv[j][h].x;
-                xw[4 * h + 1] = xv[j][h].y;
-                xw[4 * h + 2] = xv[j][h].z;
-                xw[4 * h + 3] = xv[j][h].w;
-            }
-            uint32_t a[16];
-            uint32_t b[16];
-            decode_mxfp6_chunk(av, ah, scale_a, a);
-            decode_mxfp6_chunk(bv, bh, scale_b, b);
-#pragma unroll
-            for (int q = 0; q < 8; ++q) {
-                mma(acc, a[2 * q], b[2 * q], a[2 * q + 1], b[2 * q + 1], xw[2 * q], xw[2 * q + 1]);
+            for (int wi = 0; wi < 4; ++wi) {
+                const uint32_t ahi16 = ((wi < 2 ? ah.x : ah.y) >> (16 * (wi & 1))) & 0xffffu;
+                const uint32_t bhi16 = ((wi < 2 ? bh.x : bh.y) >> (16 * (wi & 1))) & 0xffffu;
+                const uint32_t ae0 = mxfp6::e2m3x4_to_e4m3x4(alw[wi] & 0xffffu, ahi16 & 0xffu);
+                const uint32_t be0 = mxfp6::e2m3x4_to_e4m3x4(blw[wi] & 0xffffu, bhi16 & 0xffu);
+                const uint32_t a0 = bf16x2_mul(
+                    f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(ae0 & 0xffffu)), scale_a);
+                const uint32_t b0 = bf16x2_mul(
+                    f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(be0 & 0xffffu)), scale_b);
+                const uint32_t a1 =
+                    bf16x2_mul(f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(ae0 >> 16)), scale_a);
+                const uint32_t b1 =
+                    bf16x2_mul(f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(be0 >> 16)), scale_b);
+                mma(acc, a0, b0, a1, b1, xv[j][wi].x, xv[j][wi].y);
+
+                const uint32_t ae1 = mxfp6::e2m3x4_to_e4m3x4(alw[wi] >> 16, ahi16 >> 8);
+                const uint32_t be1 = mxfp6::e2m3x4_to_e4m3x4(blw[wi] >> 16, bhi16 >> 8);
+                const uint32_t a2 = bf16x2_mul(
+                    f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(ae1 & 0xffffu)), scale_a);
+                const uint32_t b2 = bf16x2_mul(
+                    f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(be1 & 0xffffu)), scale_b);
+                const uint32_t a3 =
+                    bf16x2_mul(f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(ae1 >> 16)), scale_a);
+                const uint32_t b3 =
+                    bf16x2_mul(f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(be1 >> 16)), scale_b);
+                mma(acc, a2, b2, a3, b3, xv[j][wi].z, xv[j][wi].w);
             }
         }
         __syncwarp();
@@ -1798,9 +1819,16 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32, 2)
     uint4* const ring = ring_all + warp * kRing * kMxfp6SlotVecs;
     const int tasks13 = distinct * kTiles;
     const int tasks = 2 * tasks13;
-    const int warps = gridDim.x * kWarps;
 
-    for (int task = blockIdx.x * kWarps + warp; task < tasks; task += warps) {
+    for (;;) {
+        int task;
+        if (lane == 0) {
+            task = int(atomicAdd(&sync[0], 1u));
+        }
+        task = __shfl_sync(0xffffffffu, task, 0);
+        if (task >= tasks) {
+            break;
+        }
         const bool up_proj = task < tasks13;
         const int flat = up_proj ? task : task - tasks13;
         const int ordinal = flat / kTiles;
@@ -1817,14 +1845,14 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32, 2)
                 s13 + size_t(e) * kN13 * G13::kRowScaleBytes, row0,
                 mine >= 0 ? x + size_t(mine / 8) * kK13 : nullptr, ring, lane, policy, acc, [] {});
             store_act_single(acc, 1.f, count, pairs_of, row0, gate_softcap, up_softcap, act, lane,
-                             g, t, &sync[1 + ordinal]);
+                             g, t, &sync[2 + ordinal]);
         } else {
             tile_product_mxfp6<kK2, kRing>(
                 w2_lo4 + size_t(e) * kN2 * G2::kRowLo4Bytes,
                 w2_hi2 + size_t(e) * kN2 * G2::kRowHi2Bytes,
                 s2 + size_t(e) * kN2 * G2::kRowScaleBytes, row0,
                 mine >= 0 ? act + size_t(mine) * kK2 : nullptr, ring, lane, policy, acc,
-                [&] { wait_sync_tiles(&sync[1 + ordinal], lane); });
+                [&] { wait_sync_tiles(&sync[2 + ordinal], lane); });
             store_out_single(acc, 1.f, count, pairs_of, row0, out, g, t);
         }
     }
@@ -1833,15 +1861,16 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32, 2)
     if (warp == 0) {
         int last = 0;
         if (lane == 0) {
-            last = atomicAdd(&sync[0], 1u) == gridDim.x - 1 ? 1 : 0;
+            last = atomicAdd(&sync[1], 1u) == gridDim.x - 1 ? 1 : 0;
         }
         if (__shfl_sync(0xffffffffu, last, 0)) {
             for (int i = lane; i < distinct; i += 32) {
-                sync[1 + i] = 0;
+                sync[2 + i] = 0;
             }
             __syncwarp();
             if (lane == 0) {
                 sync[0] = 0;
+                sync[1] = 0;
             }
         }
     }
