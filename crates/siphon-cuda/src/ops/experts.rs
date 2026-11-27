@@ -294,6 +294,10 @@ enum RowFormat {
     Mxfp8 = 1,
     /// MXFP8 in the order of `expert_gemm_q8_*`, for NVFP4 weights.
     Fp8Paired = 2,
+    /// Per-row E4M3 (natural order + F32 scale in `outer`) for sm_89 MXFP8 experts.
+    Fp8PerRowNatural = 3,
+    /// Per-row E4M3 (paired order + F32 scale in `outer`) for sm_89 NVFP4 experts.
+    Fp8PerRowPaired = 4,
 }
 
 impl RowFormat {
@@ -304,6 +308,14 @@ impl RowFormat {
             (ExpertFormat::Nvfp4 { .. }, false) => Self::Nvfp4,
             (ExpertFormat::Nvfp4 { .. }, true) => Self::Fp8Paired,
             (ExpertFormat::Mxfp8, _) => Self::Mxfp8,
+        }
+    }
+
+    /// Per-row E4M3 input format for sm_89 Ada FP8 tensor-core expert GEMMs.
+    fn per_row(weights: ExpertFormat<'_>) -> Self {
+        match weights {
+            ExpertFormat::Nvfp4 { .. } => Self::Fp8PerRowPaired,
+            ExpertFormat::Mxfp8 => Self::Fp8PerRowNatural,
         }
     }
 
@@ -496,8 +508,8 @@ pub struct Experts {
     gemm_q8: [CudaFunction; 2],
     /// `expert_gemm_q8_nvfp4_swiglu_q`: paired MXFP8 SwiGLU output directly for `w2`.
     fp8_swiglu_quant: CudaFunction,
-    /// `quantize_rows_*` for NVFP4, MXFP8 and paired MXFP8, in [`RowFormat`] order.
-    quantize: [CudaFunction; 3],
+    /// `quantize_rows_*` in [`RowFormat`] order.
+    quantize: [CudaFunction; 5],
     /// `nvfp4_scale_spread`.
     scale_spread: CudaFunction,
 }
@@ -517,8 +529,12 @@ impl GemmInput<'_, '_> {
                 let contents = xq
                     .contents
                     .context("the quantized products need inputs from quantize_rows")?;
-                let suits = contents.format == RowFormat::of(weights.format, false)
-                    || contents.format == RowFormat::of(weights.format, true);
+                let suits = if crate::BLOCK_SCALED_MMA {
+                    contents.format == RowFormat::of(weights.format, false)
+                        || contents.format == RowFormat::of(weights.format, true)
+                } else {
+                    contents.format == RowFormat::per_row(weights.format)
+                };
                 ensure!(
                     contents.k == weights.k && suits,
                     "the inputs were quantized for k = {} or another format than the weights' \
@@ -627,6 +643,8 @@ impl Experts {
                 matmul.load_function("quantize_rows_nvfp4")?,
                 matmul.load_function("quantize_rows_mxfp8")?,
                 matmul.load_function("quantize_rows_fp8")?,
+                matmul.load_function("quantize_rows_fp8_per_row_natural")?,
+                matmul.load_function("quantize_rows_fp8_per_row_paired")?,
             ],
             scale_spread: matmul.load_function("nvfp4_scale_spread")?,
         })
@@ -1038,6 +1056,20 @@ impl Experts {
         self.quantize(stream, x, k, RowFormat::of(format, true), out)
     }
 
+    /// Quantizes each row of `x` (BF16 `[rows, k]`) to per-row E4M3 with one F32 scale
+    /// (`amax / 448`) in `out.outer` for Ada `sm_89` FP8 tensor-core expert products
+    /// (natural word order for MXFP8 weights, paired word order for NVFP4 weights).
+    pub fn quantize_rows_fp8_per_row(
+        &self,
+        stream: &CudaStream,
+        x: &impl DeviceIn<bf16>,
+        k: usize,
+        format: ExpertFormat<'_>,
+        out: &mut QuantizedRows,
+    ) -> anyhow::Result<()> {
+        self.quantize(stream, x, k, RowFormat::per_row(format), out)
+    }
+
     /// Counts the NVFP4 group scales in `scales` (E4M3 bytes, two per 32 weights) for which
     /// the products with FP8 activations would not be exact. They split each weight in two
     /// E4M3 values under one power-of-two scale per 32 weights, which is exact while the
@@ -1251,8 +1283,15 @@ impl Experts {
         let out_format = in_format;
         let n_mult = match out_format {
             RowFormat::Nvfp4 => 32,
-            RowFormat::Mxfp8 | RowFormat::Fp8Paired => 64,
+            RowFormat::Mxfp8
+            | RowFormat::Fp8Paired
+            | RowFormat::Fp8PerRowNatural
+            | RowFormat::Fp8PerRowPaired => 64,
         };
+        ensure!(
+            crate::BLOCK_SCALED_MMA,
+            "fused SwiGLU-quant needs the block-scaled MMA, which this sm_89 build lacks"
+        );
         ensure!(
             n.is_multiple_of(n_mult) && k.is_multiple_of(GEMM_K_MULTIPLE),
             "fused SwiGLU-quant needs n a multiple of {n_mult} and k of {GEMM_K_MULTIPLE}, got n = {n}, k = {k}"
@@ -1263,11 +1302,17 @@ impl Experts {
         );
         let val_bytes = match out_format {
             RowFormat::Nvfp4 => pairs * (out_n / 2),
-            RowFormat::Mxfp8 | RowFormat::Fp8Paired => pairs * out_n,
+            RowFormat::Mxfp8
+            | RowFormat::Fp8Paired
+            | RowFormat::Fp8PerRowNatural
+            | RowFormat::Fp8PerRowPaired => pairs * out_n,
         };
         let scl_bytes = match out_format {
             RowFormat::Nvfp4 => pairs * (out_n / 16),
-            RowFormat::Mxfp8 | RowFormat::Fp8Paired => pairs * (out_n / 32),
+            RowFormat::Mxfp8
+            | RowFormat::Fp8Paired
+            | RowFormat::Fp8PerRowNatural
+            | RowFormat::Fp8PerRowPaired => pairs * (out_n / 32),
         };
         ensure!(
             val_bytes <= act_q.values.len()
@@ -1280,12 +1325,12 @@ impl Experts {
             let n_arg = i32::try_from(n).context("n is too large")?;
             let k_arg = i32::try_from(k).context("k is too large")?;
             let (function, shared, threads) = match out_format {
-                RowFormat::Fp8Paired => (
+                RowFormat::Fp8Paired | RowFormat::Fp8PerRowPaired => (
                     &self.fp8_swiglu_quant,
                     ExpertFormat::fp8_shared_bytes(),
                     FP8_GEMM_THREADS,
                 ),
-                RowFormat::Nvfp4 | RowFormat::Mxfp8 => (
+                RowFormat::Nvfp4 | RowFormat::Mxfp8 | RowFormat::Fp8PerRowNatural => (
                     &self.gemm_swiglu_quant[format.index()],
                     ExpertFormat::quantized_shared_bytes(),
                     GEMM_THREADS,
@@ -1476,7 +1521,10 @@ impl Experts {
                 GEMM_THREADS,
             ),
             GemmInput::Quantized(xq) => {
-                if xq.contents.map(|c| c.format) == Some(RowFormat::Fp8Paired) {
+                if matches!(
+                    xq.contents.map(|c| c.format),
+                    Some(RowFormat::Fp8Paired | RowFormat::Fp8PerRowPaired)
+                ) {
                     (
                         &self.gemm_q8[swiglu],
                         ExpertFormat::fp8_shared_bytes(),

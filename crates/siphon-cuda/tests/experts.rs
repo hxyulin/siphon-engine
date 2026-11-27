@@ -772,6 +772,18 @@ fn check_reference(
     inputs_per_row: usize,
     got: &[bf16],
 ) -> f64 {
+    check_reference_with_mma_err(label, host, x, indices, inputs_per_row, got, 2f64.powi(-14))
+}
+
+fn check_reference_with_mma_err(
+    label: &str,
+    host: &HostProjection<'_>,
+    x: &[f64],
+    indices: &[i32],
+    inputs_per_row: usize,
+    got: &[bf16],
+    mma_err: f64,
+) -> f64 {
     let (n, k) = (host.n, host.k);
     let expert_of = |pair: usize| usize::try_from(indices[pair]).ok();
     let mut experts: Vec<usize> = (0..indices.len()).filter_map(expert_of).collect();
@@ -804,7 +816,7 @@ fn check_reference(
                                 }
                                 let want = dot * scale;
                                 let bound =
-                                    2f64.powi(-8) * want.abs() + 2f64.powi(-14) * sum * scale;
+                                    2f64.powi(-8) * want.abs() + mma_err * sum * scale;
                                 let value = f64::from(got[pair * n + col].to_f32());
                                 let err = (value - want).abs();
                                 assert!(
@@ -1830,9 +1842,57 @@ fn quantize_rows_fp8_pairs_mxfp8() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Per-row E4M3 quantization matching `quantize_rows_fp8_per_row_*` on sm_89.
+fn quantize_fp8_per_row(table: &[f64], x: &[f32], max_fp8: f32) -> Vec<f64> {
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if amax == 0.0 {
+        return vec![0.0; x.len()];
+    }
+    let scale = amax * (1.0f32 / max_fp8);
+    let inv = max_fp8 / amax;
+    x.iter()
+        .map(|&v| e4m3(to_e4m3(table, v * inv)) * f64::from(scale))
+        .collect()
+}
+
+/// Decodes NVFP4 weights using sm_89's single-pass E4M3 table rounding (`q8_table_entry`,
+/// scaled by 1/8 for overflow-proof f16-acc FP8 MMA), returning `[n, k]` F64 values before
+/// the per-expert global scale.
+fn decode_nvfp4_sm89(table: &[f64], host: &HostProjection<'_>, expert: usize) -> Vec<f64> {
+    let k = host.k;
+    let mut decoded = vec![0.0; host.n * k];
+    for row in 0..host.n {
+        let flat_row = expert * host.n + row;
+        for blk in 0..(k / 32) {
+            let s0 = host.scales[flat_row * (k / 16) + 2 * blk];
+            let s1 = host.scales[flat_row * (k / 16) + 2 * blk + 1];
+            let field = |b: u8| u32::from((b & 0x7f) >> 3).max(1);
+            let f_max = field(s0).max(field(s1));
+            let row_scale = 2f64.powi(i32::try_from(f_max).expect("small") - 9);
+            for grp in 0..2 {
+                let s = if grp == 0 { s0 } else { s1 } & 0x7f;
+                let m = u32::from(s & 7) | if s >= 8 { 8 } else { 0 };
+                let d = (f_max - field(s)).min(10);
+                let factor = f32::from(u16::try_from(m).expect("small"))
+                    * 2f32.powi(-1 - i32::try_from(d).expect("small"));
+                for i in 0..16 {
+                    let col = blk * 32 + grp * 16 + i;
+                    let byte = host.weight[flat_row * (k / 2) + col / 2];
+                    let nibble = if col % 2 == 0 { byte & 15 } else { byte >> 4 };
+                    let mag = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][usize::from(nibble & 7)];
+                    let sign = if nibble & 8 == 0 { 1.0 } else { -1.0 };
+                    let w_e4m3 = e4m3(to_e4m3(table, mag * factor));
+                    decoded[row * k + col] = sign * w_e4m3 * row_scale;
+                }
+            }
+        }
+    }
+    decoded
+}
+
 /// `expert_matmul_quantized_grouped` against the F64 reference on the dequantized inputs,
-/// with every output written and two runs equal. With `fp8`, the inputs are MXFP8 for both
-/// weight formats (`quantize_rows_fp8`).
+/// with every output written and two runs equal. With `fp8`, the inputs are MXFP8 (sm_120a)
+/// or per-row E4M3 (sm_89) for both weight formats.
 fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
@@ -1845,6 +1905,7 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
         (true, true) => "nvfp4 with fp8 inputs",
         (false, _) => "mxfp8",
     };
+    let sm89_per_row = !siphon_cuda::BLOCK_SCALED_MMA;
     // FP4 inputs only for NVFP4 weights without `fp8`.
     let fp4_inputs = fp4 && !fp8;
     for (name, k, inputs_per_row) in [("w13", HIDDEN, 1), ("w2", INTERMEDIATE, SLOTS)] {
@@ -1860,7 +1921,10 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
             let indices = routing(rows, kind, rows as u32 * 7 + 1);
             let x = common::pseudo_random_bf16(rows * inputs_per_row * k, rows as u32, 2.0, 0.0);
             let x_gpu = stream.clone_htod(&x)?;
-            if fp8 {
+            if sm89_per_row {
+                s.experts
+                    .quantize_rows_fp8_per_row(stream, &x_gpu, k, weights.format, &mut xq)?;
+            } else if fp8 {
                 s.experts
                     .quantize_rows_fp8(stream, &x_gpu, k, weights.format, &mut xq)?;
             } else {
@@ -1871,12 +1935,16 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
                 .chunks(k)
                 .flat_map(|row| {
                     let row: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
-                    let q = if fp4_inputs {
-                        quantize_nvfp4(&table, &row)
+                    if sm89_per_row {
+                        quantize_fp8_per_row(&table, &row, if fp4 { 44.0 } else { 448.0 })
                     } else {
-                        quantize_mxfp8(&table, &row)
-                    };
-                    dequantize(&q, k, fp4_inputs)
+                        let q = if fp4_inputs {
+                            quantize_nvfp4(&table, &row)
+                        } else {
+                            quantize_mxfp8(&table, &row)
+                        };
+                        dequantize(&q, k, fp4_inputs)
+                    }
                 })
                 .collect();
             let indices_gpu = stream.clone_htod(&indices)?;
@@ -1900,7 +1968,83 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
             );
             assert!(!got.iter().any(|v| v.to_f32() == SENTINEL));
             let case = format!("quantized {label} {name} rows {rows} {kind:?}");
-            let worst = check_reference(&case, &host, &x64, &indices, inputs_per_row, got);
+            // Ada sm_89 FP8 tensor-core MMA accumulates with ~14-bit precision (f32) or
+            // 11-bit precision per 32-element k-step (f16, NVFP4).
+            let mma_err = if sm89_per_row {
+                if fp4 {
+                    2f64.powi(-9)
+                } else {
+                    2f64.powi(-10)
+                }
+            } else {
+                2f64.powi(-14)
+            };
+            let worst = if sm89_per_row && fp4 {
+                // Compare against sm_89's single-pass E4M3-rounded weight table.
+                let expert_of = |pair: usize| usize::try_from(indices[pair]).ok();
+                let mut experts: Vec<usize> = (0..indices.len()).filter_map(expert_of).collect();
+                experts.sort_unstable();
+                experts.dedup();
+                std::thread::scope(|scope| {
+                    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+                    let handles: Vec<_> = (0..threads)
+                        .map(|thread| {
+                            let experts = &experts;
+                            let table = &table;
+                            let x64 = &x64;
+                            let indices = &indices;
+                            let host = &host;
+                            let case_ref = &case;
+                            scope.spawn(move || {
+                                let mut worst = 0.0f64;
+                                for &expert in experts.iter().skip(thread).step_by(threads) {
+                                    let decoded = decode_nvfp4_sm89(table, host, expert);
+                                    let scale = host.output_scale(expert);
+                                    for pair in
+                                        (0..indices.len()).filter(|&p| expert_of(p) == Some(expert))
+                                    {
+                                        let input = if inputs_per_row == 1 {
+                                            pair / SLOTS
+                                        } else {
+                                            pair
+                                        };
+                                        let xin = &x64[input * k..(input + 1) * k];
+                                        for col in 0..n {
+                                            let (mut dot, mut sum) = (0.0f64, 0.0f64);
+                                            let row = &decoded[col * k..(col + 1) * k];
+                                            for (xi, wi) in xin.iter().zip(row) {
+                                                let product = xi * wi;
+                                                dot += product;
+                                                sum += product.abs();
+                                            }
+                                            let want = dot * scale;
+                                            let bound = 2f64.powi(-8) * want.abs()
+                                                + mma_err * sum * scale;
+                                            let value = f64::from(got[pair * n + col].to_f32());
+                                            let err = (value - want).abs();
+                                            assert!(
+                                                err <= bound,
+                                                "{case_ref}: pair {pair} (expert {expert}) col {col}: \
+                                                 got {value}, want {want}, bound {bound}"
+                                            );
+                                            if bound > 0.0 {
+                                                worst = worst.max(err / bound);
+                                            }
+                                        }
+                                    }
+                                }
+                                worst
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("reference thread panicked"))
+                        .fold(0.0, f64::max)
+                })
+            } else {
+                check_reference_with_mma_err(&case, &host, &x64, &indices, inputs_per_row, got, mma_err)
+            };
             eprintln!("{case}: worst error {worst:.3} of bound");
         }
     }
@@ -1914,13 +2058,11 @@ fn matmul_quantized_nvfp4_matches_reference() -> anyhow::Result<()> {
 }
 
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_quantized_mxfp8_matches_reference() -> anyhow::Result<()> {
     check_quantized(false, false)
 }
 
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_fp8_nvfp4_matches_reference() -> anyhow::Result<()> {
     check_quantized(true, true)
 }
@@ -2016,7 +2158,6 @@ fn matmul_fp8_nvfp4_exact_at_wide_scale_gaps() -> anyhow::Result<()> {
 /// `expert_matmul_quantized_swiglu_grouped` equals `expert_matmul_quantized_grouped`
 /// followed by `softcapped_swiglu`, bit for bit, unknown ids included.
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.stream();
@@ -2031,10 +2172,18 @@ fn matmul_quantized_swiglu_matches_separate_kernels() -> anyhow::Result<()> {
     let x = stream.clone_htod(&common::pseudo_random_bf16(rows * HIDDEN, 9, 4.0, 0.0))?;
     s.experts
         .expert_group_quantized(stream, &indices, EXPERTS, &mut scratch)?;
-    for (fp4, fp8) in [(true, false), (false, false), (true, true)] {
+    let cases: &[(bool, bool)] = if siphon_cuda::BLOCK_SCALED_MMA {
+        &[(true, false), (false, false), (true, true)]
+    } else {
+        &[(false, true), (true, true)]
+    };
+    for &(fp4, fp8) in cases {
         let w13 = Synthetic::new(&s, fp4, 2 * INTERMEDIATE, HIDDEN, 43)?;
         let weights = w13.gpu.weights();
-        if fp8 {
+        if !siphon_cuda::BLOCK_SCALED_MMA {
+            s.experts
+                .quantize_rows_fp8_per_row(stream, &x, HIDDEN, weights.format, &mut xq)?;
+        } else if fp8 {
             s.experts
                 .quantize_rows_fp8(stream, &x, HIDDEN, weights.format, &mut xq)?;
         } else {
@@ -2314,10 +2463,6 @@ fn expert_group_supports_4096_rows() -> anyhow::Result<()> {
 #[ignore = "benchmark; run alone on an idle GPU with --nocapture"]
 #[expect(clippy::too_many_lines, reason = "benchmark prints activation matrix")]
 fn bench_expert_activations() -> anyhow::Result<()> {
-    if !siphon_cuda::BLOCK_SCALED_MMA {
-        eprintln!("skipped: the quantized products need the block-scaled MMA, which sm_89 lacks");
-        return Ok(());
-    }
     let s = Setup::new()?;
     let stream = s.stream();
     let rows = 2048;
@@ -2325,6 +2470,7 @@ fn bench_expert_activations() -> anyhow::Result<()> {
     let mut xq = QuantizedRows::new(stream, rows * SLOTS * INTERMEDIATE, rows * SLOTS)?;
     let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
     let indices = stream.clone_htod(&routing(rows, Routing::Uniform, 11))?;
+    let has_block_scaled = siphon_cuda::BLOCK_SCALED_MMA;
     println!(
         "| format | projection | bf16 (us) | bf16 (TF/s) | quantized (us) | quant (TF/s) | fp8 (us) | fp8 (TF/s) |"
     );
@@ -2346,6 +2492,9 @@ fn bench_expert_activations() -> anyhow::Result<()> {
             let out_n = if swiglu { INTERMEDIATE } else { HIDDEN };
             let mut out = stream.alloc_zeros::<bf16>(rows * SLOTS * out_n)?;
             let mut time = |mode: usize| -> anyhow::Result<f64> {
+                if mode == 1 && !has_block_scaled {
+                    return Ok(f64::NAN);
+                }
                 if mode == 0 {
                     s.experts
                         .expert_group(stream, &indices, EXPERTS, &mut scratch)?;
@@ -2373,9 +2522,12 @@ fn bench_expert_activations() -> anyhow::Result<()> {
                     if mode == 1 {
                         s.experts
                             .quantize_rows(stream, &x, k, weights.format, &mut xq)?;
-                    } else {
+                    } else if has_block_scaled {
                         s.experts
                             .quantize_rows_fp8(stream, &x, k, weights.format, &mut xq)?;
+                    } else {
+                        s.experts
+                            .quantize_rows_fp8_per_row(stream, &x, k, weights.format, &mut xq)?;
                     }
                     if swiglu {
                         s.experts.expert_matmul_quantized_swiglu_grouped(

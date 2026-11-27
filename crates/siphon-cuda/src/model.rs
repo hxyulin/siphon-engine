@@ -987,7 +987,7 @@ impl Model {
     /// products' exact split (see [`Experts::fp8_inexact_scales`]), and fails otherwise.
     pub fn set_expert_activations(&mut self, activations: ExpertActivations) -> anyhow::Result<()> {
         ensure!(
-            crate::BLOCK_SCALED_MMA || activations == ExpertActivations::Bf16,
+            crate::BLOCK_SCALED_MMA || activations != ExpertActivations::Quantized,
             "{activations:?} expert activations need the block-scaled MMA, which this sm_89 build lacks"
         );
         if activations == ExpertActivations::Fp8 {
@@ -2897,13 +2897,23 @@ impl Ctx {
             (activations @ (ExpertActivations::Quantized | ExpertActivations::Fp8), _) => {
                 if !prequantized {
                     if activations == ExpertActivations::Fp8 {
-                        experts.quantize_rows_fp8(
-                            stream,
-                            x,
-                            weights.k,
-                            weights.format,
-                            quantized,
-                        )?;
+                        if crate::BLOCK_SCALED_MMA {
+                            experts.quantize_rows_fp8(
+                                stream,
+                                x,
+                                weights.k,
+                                weights.format,
+                                quantized,
+                            )?;
+                        } else {
+                            experts.quantize_rows_fp8_per_row(
+                                stream,
+                                x,
+                                weights.k,
+                                weights.format,
+                                quantized,
+                            )?;
+                        }
                     } else {
                         experts.quantize_rows(stream, x, weights.k, weights.format, quantized)?;
                     }

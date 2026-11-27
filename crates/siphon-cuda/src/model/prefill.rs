@@ -3261,8 +3261,10 @@ impl Ctx {
         // Non-invariant prefill with quantized expert activations fuses w13 activation
         // quantization directly into the MLP RMSNorm epilogue (writing both BF16 `p.mlp_x`
         // for the router and quantized `p.moe.quantized` for `w13`).
-        let w13_quant =
-            (!p.moe.invariant && self.expert_activations != ExpertActivations::Bf16).then(|| {
+        let w13_quant = (crate::BLOCK_SCALED_MMA
+            && !p.moe.invariant
+            && self.expert_activations != ExpertActivations::Bf16)
+            .then(|| {
                 let (w13, _) = self.expert_weights(w);
                 experts::expert_quant_format(
                     w13.format,
@@ -4825,7 +4827,7 @@ impl Ctx {
         )?;
         let (w13, w2) = self.expert_weights(w);
         self.group_rows(&rows(&t.indices, m, top_k), &mut t.experts, m)?;
-        if self.expert_activations != ExpertActivations::Bf16 {
+        if crate::BLOCK_SCALED_MMA && self.expert_activations != ExpertActivations::Bf16 {
             let experts = &self.kernels.experts;
             let stream = &self.stream;
             if !w13_prequantized {
@@ -5498,8 +5500,10 @@ impl Ctx {
                 m,
             )?;
         }
-        let w13_quant =
-            (!p.moe.invariant && self.expert_activations != ExpertActivations::Bf16).then(|| {
+        let w13_quant = (crate::BLOCK_SCALED_MMA
+            && !p.moe.invariant
+            && self.expert_activations != ExpertActivations::Bf16)
+            .then(|| {
                 let (w13, _) = self.expert_weights(layer_w);
                 experts::expert_quant_format(
                     w13.format,
@@ -6553,8 +6557,10 @@ impl Ctx {
         }
 
         // MLP depth attention + optional message gate once across all `m` rows.
-        let w13_quant =
-            (!p.moe.invariant && self.expert_activations != ExpertActivations::Bf16).then(|| {
+        let w13_quant = (crate::BLOCK_SCALED_MMA
+            && !p.moe.invariant
+            && self.expert_activations != ExpertActivations::Bf16)
+            .then(|| {
                 let (w13, _) = self.expert_weights(layer_w);
                 experts::expert_quant_format(
                     w13.format,
