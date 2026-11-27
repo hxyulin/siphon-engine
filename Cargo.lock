@@ -1807,10 +1807,13 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "serde",
  "serde_json",
  "siphon",
  "siphon-plan",
  "siphon-serve",
+ "tempfile",
+ "zstd",
 ]
 
 [[package]]

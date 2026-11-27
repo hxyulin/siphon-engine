@@ -10,13 +10,25 @@ license.workspace = true
 name = "siphon"
 path = "src/main.rs"
 
+[[test]]
+name = "archive"
+required-features = ["archive"]
+
+[features]
+archive = ["dep:serde", "dep:serde_json", "dep:tempfile", "dep:zstd"]
+http-zstd = ["siphon-serve/http-zstd"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 clap_complete = "4.6"
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, features = ["raw_value"], optional = true }
 siphon = { path = "../siphon" }
 siphon-plan = { path = "../siphon-plan" }
 siphon-serve = { path = "../siphon-serve" }
+tempfile = { version = "3", optional = true }
+zstd = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

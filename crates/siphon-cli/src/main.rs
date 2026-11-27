@@ -1,3 +1,6 @@
+#[cfg(feature = "archive")]
+mod archive;
+
 use std::{
     collections::BTreeMap,
     env, io,
@@ -16,7 +19,7 @@ fn command() -> Command {
         .about("Serve, plan, and inspect Inkling 2 Mini model checkpoints")
         .subcommand_required(true)
         .arg_required_else_help(true)
-        .subcommand(
+        .subcommands([
             Command::new("inspect")
                 .about("Show the model configuration and list checkpoint tensors")
                 .args_override_self(true)
@@ -34,10 +37,10 @@ fn command() -> Command {
                         .action(ArgAction::SetTrue)
                         .help("List each tensor individually"),
                 ),
-        )
-        .subcommand(siphon_plan::command())
-        .subcommand(siphon_serve::command())
-        .subcommand(
+            siphon_plan::command(),
+            siphon_serve::command(),
+            #[cfg(feature = "archive")]
+            archive::command(),
             Command::new("completions")
                 .about("Print a shell completion script")
                 .arg(
@@ -46,7 +49,7 @@ fn command() -> Command {
                         .value_parser(clap::builder::EnumValueParser::<Shell>::new())
                         .required(true),
                 ),
-        )
+        ])
 }
 
 fn main() -> ExitCode {
@@ -80,6 +83,8 @@ fn main() -> ExitCode {
                 .expect("serve is defined");
             return siphon_serve::run(subcommand, matches).unwrap_or_else(|error| error.exit());
         }
+        #[cfg(feature = "archive")]
+        "archive" => archive::run(&matches),
         "completions" => {
             let shell = matches
                 .remove_one::<Shell>("shell")

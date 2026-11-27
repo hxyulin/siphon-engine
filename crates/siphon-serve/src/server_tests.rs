@@ -387,15 +387,21 @@ async fn compressed_bodies_decompress_within_the_limit() {
             .await,
     )
     .await;
-    for (encoding, bytes) in [
-        ("gzip", gzip(&plain)),
-        ("zstd", zstd::encode_all(&plain[..], 3).unwrap()),
-    ] {
-        let response = server
-            .call(encoded_post("/v1/chat/completions", bytes, encoding))
-            .await;
-        assert_eq!(reply(response).await, expected, "{encoding}");
-    }
+    let response = server
+        .call(encoded_post("/v1/chat/completions", gzip(&plain), "gzip"))
+        .await;
+    assert_eq!(reply(response).await, expected);
+    #[cfg(feature = "http-zstd")]
+    let zstd_body = zstd::encode_all(&plain[..], 3).unwrap();
+    #[cfg(not(feature = "http-zstd"))]
+    let zstd_body = plain.clone();
+    let response = server
+        .call(encoded_post("/v1/chat/completions", zstd_body, "zstd"))
+        .await;
+    #[cfg(feature = "http-zstd")]
+    assert_eq!(reply(response).await, expected);
+    #[cfg(not(feature = "http-zstd"))]
+    assert_eq!(response.status(), 415);
 
     // An encoding the server does not decode.
     let response = server
@@ -461,6 +467,25 @@ async fn responses_compress_and_streams_do_not() {
     std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut text)
         .unwrap();
     let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["content"][0]["text"], "Hello there.");
+
+    let response = server
+        .call(post(
+            "/v1/messages",
+            &messages_body(false),
+            &[("accept-encoding", "zstd")],
+        ))
+        .await;
+    #[cfg(feature = "http-zstd")]
+    assert_eq!(response.headers()["content-encoding"], "zstd");
+    #[cfg(not(feature = "http-zstd"))]
+    assert!(response.headers().get("content-encoding").is_none());
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    #[cfg(feature = "http-zstd")]
+    let bytes = zstd::decode_all(&bytes[..]).unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["content"][0]["text"], "Hello there.");
 
     // A stream is not compressed, and its first chunk arrives while the job still runs.

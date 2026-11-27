@@ -53,7 +53,11 @@ With `SIPHON_API_KEY` set, every route but `/health`, `/version` and `/metrics` 
 
 Each request gets an ID. The server takes the client's `x-request-id`, or else `x-client-request-id`, when it holds 1 to 128 printable ASCII characters without spaces, and otherwise makes one such as `req-5e0c1f7a9b3d2e64`. Every response, errors included, returns the ID in `x-request-id`. The request's [log](#logs) line carries it as `id=`, and the `job:` lines start with it and the response's own id, so a proxy's request log matches them. The `job:` lines of a request with `n` choices are labelled `choice i`.
 
-A request body may be compressed with `Content-Encoding: gzip` or `zstd`; other encodings get a 415. A body may hold 32 bytes per position of the context, at least 2 MiB, plus 20 MiB per image with `--vision`. The limit applies to the decompressed bytes, so a small compressed body that inflates past it gets a 413, as an uncompressed one does. Responses that are not streamed are compressed with gzip or zstd when `Accept-Encoding` asks for it. Streams are never compressed, so each event reaches the client as the server sends it.
+## HTTP compression
+
+A request body may be compressed with `Content-Encoding: gzip`. Build with `pixi run cargo build --release -p siphon-cli --features http-zstd` to also support zstd for HTTP. Unsupported request encodings get a 415. Whole responses use the supported encoding negotiated via `Accept-Encoding`. Streams are sent uncompressed so each event reaches the client as the server sends it.
+
+A body may hold 32 bytes per position of the context, at least 2 MiB, plus 20 MiB per image with `--vision`. The limit applies to the decompressed bytes, so a small compressed body that inflates past it gets a 413, as an uncompressed one does.
 
 ## Routes
 

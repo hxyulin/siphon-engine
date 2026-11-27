@@ -15,4 +15,12 @@ fn generates_completions_for_the_full_command_tree() {
     for flag in ["--all", "--interactive", "--streams"] {
         assert!(script.contains(flag), "completion script is missing {flag}");
     }
+    let archive = cfg!(feature = "archive");
+    for command in [
+        "siphon__subcmd__archive)",
+        "siphon__subcmd__archive__subcmd__pack)",
+        "siphon__subcmd__archive__subcmd__expand)",
+    ] {
+        assert_eq!(script.contains(command), archive, "command {command}");
+    }
 }

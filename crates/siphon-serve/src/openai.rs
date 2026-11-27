@@ -125,10 +125,9 @@ const BODY_BYTES_PER_POSITION: usize = 32;
 
 /// The routes, behind the API key where one is set.
 ///
-/// Request bodies may come compressed with `Content-Encoding: gzip` or `zstd`, and the body
-/// limit applies to the decompressed bytes, which the handlers read through it. Responses
-/// are compressed as `Accept-Encoding` asks, except server-sent events, which tower-http's
-/// default predicate leaves alone, so that streams are neither compressed nor buffered.
+/// Request bodies may use `Content-Encoding: gzip`, or `zstd` with the `http-zstd` feature.
+/// The body limit applies to the decompressed bytes. Responses negotiate compression via
+/// `Accept-Encoding`, and tower-http leaves server-sent events uncompressed.
 pub fn router(app: Arc<App>) -> Router {
     // axum's default limit of 2 MB holds a prompt of only about 400K tokens.
     let body_limit = (app.engine.max_context() * BODY_BYTES_PER_POSITION).max(2 << 20)
@@ -136,6 +135,10 @@ pub fn router(app: Arc<App>) -> Router {
             .vocab
             .vision()
             .map_or(0, crate::vision::Vision::body_bytes);
+    let decompress = RequestDecompressionLayer::new();
+    let compress = CompressionLayer::new();
+    #[cfg(not(feature = "http-zstd"))]
+    let (decompress, compress) = (decompress.no_zstd(), compress.no_zstd());
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/models/{*id}", get(model))
@@ -162,14 +165,12 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .with_state(app)
         .layer(middleware::from_fn(request_id))
-        .layer(RequestDecompressionLayer::new())
-        .layer(
-            CompressionLayer::new().compress_when(DefaultPredicate::new().and(
-                |_, _, _: &HeaderMap, extensions: &axum::http::Extensions| {
-                    extensions.get::<Uncompressed>().is_none()
-                },
-            )),
-        )
+        .layer(decompress)
+        .layer(compress.compress_when(DefaultPredicate::new().and(
+            |_, _, _: &HeaderMap, extensions: &axum::http::Extensions| {
+                extensions.get::<Uncompressed>().is_none()
+            },
+        )))
 }
 
 /// A request's id: the client's `x-request-id` or `x-client-request-id` when valid, else
