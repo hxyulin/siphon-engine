@@ -56,7 +56,10 @@ mod linux {
             PrefillAttention, PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
-        weights::{LmHeadFormat, OutputProjection, WeightFormat, Weights},
+        weights::{
+            LmHeadFormat, Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection, WeightFormat,
+            Weights,
+        },
     };
 
     // Thresholds, from MLX's disagreement with itself between its chunked (multi-row)
@@ -93,6 +96,8 @@ mod linux {
         expert_activations: ExpertActivations,
         prefill_attention: PrefillAttention,
         prefill_dense: Products,
+        nvfp4_scales: Nvfp4ScaleFormat,
+        mxfp8_experts: Mxfp8ExpertFormat,
         accept_margin: f32,
         kv_options: KvOptions,
         moe_pruning: MoePruning,
@@ -112,6 +117,8 @@ mod linux {
         let mut expert_activations = ExpertActivations::Bf16;
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         let mut prefill_dense = Products::Bf16;
+        let mut nvfp4_scales = Nvfp4ScaleFormat::default();
+        let mut mxfp8_experts = Mxfp8ExpertFormat::default();
         let mut accept_margin = 0.0f32;
         let mut kv_options = KvOptions::default();
         let mut moe_top_k = None;
@@ -153,6 +160,16 @@ mod linux {
                 prefill_dense = it
                     .next()
                     .context("--prefill-dense needs bf16 or fp8")?
+                    .parse()?;
+            } else if arg == "--nvfp4-scales" {
+                nvfp4_scales = it
+                    .next()
+                    .context("--nvfp4-scales needs 8bit or 4bit")?
+                    .parse()?;
+            } else if arg == "--mxfp8-experts" {
+                mxfp8_experts = it
+                    .next()
+                    .context("--mxfp8-experts needs mxfp8 or mxfp6")?
                     .parse()?;
             } else if arg == "--moe-top-k" {
                 moe_top_k = Some(it.next().context("--moe-top-k needs 1..=8")?.parse()?);
@@ -221,6 +238,8 @@ mod linux {
             expert_activations,
             prefill_attention,
             prefill_dense,
+            nvfp4_scales,
+            mxfp8_experts,
             accept_margin,
             kv_options,
             moe_pruning,
@@ -453,6 +472,8 @@ mod linux {
                 output: args.output,
                 lm_head: args.lm_head,
                 prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+                nvfp4_scales: args.nvfp4_scales,
+                mxfp8_experts: args.mxfp8_experts,
             },
         )?;
         gpu.stream().synchronize()?;

@@ -120,7 +120,10 @@ impl Projection {
     fn weights(&self) -> ExpertWeights<'_> {
         ExpertWeights {
             format: match &self.global_scale {
-                Some(global_scale) => ExpertFormat::Nvfp4 { global_scale },
+                Some(global_scale) => ExpertFormat::Nvfp4 {
+                    global_scale,
+                    scale_base: None,
+                },
                 None => ExpertFormat::Mxfp8,
             },
             weight: &self.weight,

@@ -109,7 +109,10 @@ mod linux {
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
-        weights::{LmHeadFormat, OutputProjection, WeightFormat, Weights},
+        weights::{
+            LmHeadFormat, Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection, WeightFormat,
+            Weights,
+        },
     };
 
     /// Bytes of weights one decode step reads.
@@ -147,6 +150,8 @@ mod linux {
         expert_activations: ExpertActivations,
         prefill_attention: PrefillAttention,
         prefill_dense: Products,
+        nvfp4_scales: Nvfp4ScaleFormat,
+        mxfp8_experts: Mxfp8ExpertFormat,
         json: bool,
         /// Prompt lengths to time prefill at, instead of timing decode.
         prefill: Option<Vec<usize>>,
@@ -220,6 +225,8 @@ mod linux {
         let mut expert_activations = ExpertActivations::Bf16;
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
         let mut prefill_dense = Products::Bf16;
+        let mut nvfp4_scales = Nvfp4ScaleFormat::default();
+        let mut mxfp8_experts = Mxfp8ExpertFormat::default();
         let mut json = false;
         let mut prefill = None;
         let mut chunk = None;
@@ -272,6 +279,8 @@ mod linux {
                 "--expert-activations" => expert_activations = value()?.parse()?,
                 "--prefill-attention" => prefill_attention = value()?.parse()?,
                 "--prefill-dense" => prefill_dense = value()?.parse()?,
+                "--nvfp4-scales" => nvfp4_scales = value()?.parse()?,
+                "--mxfp8-experts" => mxfp8_experts = value()?.parse()?,
                 "--json" => json = true,
                 "--prompt" => prompt = Some(PathBuf::from(value()?)),
                 "--spec" => {
@@ -378,6 +387,8 @@ mod linux {
             expert_activations,
             prefill_attention,
             prefill_dense,
+            nvfp4_scales,
+            mxfp8_experts,
             json,
             prefill,
             chunk,
@@ -541,6 +552,8 @@ mod linux {
                 output: args.output,
                 lm_head: args.lm_head,
                 prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+                nvfp4_scales: args.nvfp4_scales,
+                mxfp8_experts: args.mxfp8_experts,
             },
         )?;
         let mut model = Model::with_formats(
@@ -721,6 +734,8 @@ mod linux {
             lm_head: args.lm_head,
             prefill_dense_fp8: args.prefill_dense == Products::Fp8,
             block_scaled_mma: siphon_cuda::BLOCK_SCALED_MMA,
+            nvfp4_scales: args.nvfp4_scales,
+            mxfp8_experts: args.mxfp8_experts,
             kv: args.kv,
             draft: DraftChoice::None,
             prefill_chunk: 0,
@@ -744,6 +759,8 @@ mod linux {
                 output: args.output,
                 lm_head: args.lm_head,
                 prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+                nvfp4_scales: args.nvfp4_scales,
+                mxfp8_experts: args.mxfp8_experts,
             },
         )?;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
@@ -861,6 +878,8 @@ mod linux {
                 output: args.output,
                 lm_head: args.lm_head,
                 prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+                nvfp4_scales: args.nvfp4_scales,
+                mxfp8_experts: args.mxfp8_experts,
             },
         )?;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
@@ -1185,6 +1204,8 @@ mod linux {
                     output: args.output,
                     lm_head: args.lm_head,
                     prefill_dense_fp8: args.prefill_dense == siphon_cuda::ops::Products::Fp8,
+                    nvfp4_scales: args.nvfp4_scales,
+                    mxfp8_experts: args.mxfp8_experts,
                 },
             )?;
             let mut model = Model::with_formats(

@@ -270,3 +270,75 @@ impl fmt::Display for VisionFormat {
         })
     }
 }
+
+/// Storage format of NVFP4 expert block scales (`--nvfp4-scales`).
+///
+/// The checkpoint stores one 8-bit E4M3 scale per 16-element weight block (`E4m3`, 1.19 GiB
+/// across layers 0–19). Within any weight row those E4M3 codes span a median of 13–14 codes,
+/// so `Offset4` stores one 8-bit E4M3 base (`max`) per row plus a 4-bit offset (`0..=15`) per
+/// block, re-rounding the ~0.3–0.4% of tiny blocks below `base - 15` at load time. That halves
+/// scale VRAM (`-0.58 GiB`, ~`+68K` NVFP4 KV positions) and scale DRAM traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Nvfp4ScaleFormat {
+    /// Raw checkpoint 8-bit E4M3 scales per 16-element block.
+    #[default]
+    E4m3,
+    /// Per-row 8-bit E4M3 base plus packed 4-bit offset (`base - off`) per 16-element block.
+    Offset4,
+}
+
+impl FromStr for Nvfp4ScaleFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "8bit" | "e4m3" => Ok(Self::E4m3),
+            "4bit" | "offset4" => Ok(Self::Offset4),
+            _ => bail!("unknown NVFP4 scale format {s:?}; expected 8bit or 4bit"),
+        }
+    }
+}
+
+impl fmt::Display for Nvfp4ScaleFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::E4m3 => "8bit",
+            Self::Offset4 => "4bit",
+        })
+    }
+}
+
+/// Storage format of the checkpoint's MXFP8 expert layers (layers 20–23, `--mxfp8-experts`).
+///
+/// `Mxfp6` re-quantizes each 32-element MXFP8 block to OCP MXFP6 E2M3 at load time using
+/// MSE-optimal UE8M0 block scales, saving 25% of weight bytes (`-0.95 GiB`, ~`+111K` NVFP4 KV
+/// positions) while mapping bit-exactly back into E4M3 for single-pass FP8 MMA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mxfp8ExpertFormat {
+    /// Raw checkpoint MXFP8 (E4M3 values + UE8M0 per-32 scales).
+    #[default]
+    Mxfp8,
+    /// Load-time MXFP6 E2M3 (6-bit values in 2 planes `lo4` + `hi2` + UE8M0 per-32 scales).
+    Mxfp6,
+}
+
+impl FromStr for Mxfp8ExpertFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "mxfp8" => Ok(Self::Mxfp8),
+            "mxfp6" => Ok(Self::Mxfp6),
+            _ => bail!("unknown MXFP8 expert format {s:?}; expected mxfp8 or mxfp6"),
+        }
+    }
+}
+
+impl fmt::Display for Mxfp8ExpertFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Mxfp8 => "mxfp8",
+            Self::Mxfp6 => "mxfp6",
+        })
+    }
+}

@@ -57,23 +57,35 @@ const DEEP_RING_ROWS: usize = 3;
 const fn smem(ring: usize) -> usize {
     WARPS * ring * 16 * (128 + 16)
 }
+/// Dynamic shared memory per block for MXFP6 (lo4 128 B + hi2 64 B + scales 16 B per row).
+const fn smem_mxfp6(ring: usize) -> usize {
+    WARPS * ring * 16 * (128 + 64 + 16)
+}
 
+/// CUDA entry points for multi-row mixture-of-experts blocks.
 #[derive(Debug)]
 pub struct ExpertsRows {
-    /// By ring ([`RINGS`]), then NVFP4 and MXFP8 (for `m <= 8`).
-    kernels: [[CudaFunction; 2]; 2],
+    /// By ring ([`RINGS`]), then format (`0 = nvfp4`, `1 = mxfp8`, `2 = nvfp4_s4`, for `m <= 8`).
+    kernels: [[CudaFunction; 3]; 2],
     /// Blocks of each single-group kernel that fit on the GPU at once.
-    blocks: [[usize; 2]; 2],
-    /// Inline multi-group 8-pair MLP kernels (`9 <= m <= 32`), NVFP4 and MXFP8.
-    multi_kernels: [CudaFunction; 2],
+    blocks: [[usize; 3]; 2],
+    /// Inline multi-group 8-pair MLP kernels (`9 <= m <= 32`).
+    multi_kernels: [CudaFunction; 3],
     /// Blocks of each multi-group kernel that fit on the GPU at once.
-    multi_blocks: [usize; 2],
+    multi_blocks: [usize; 3],
     /// 1-block grouping kernel for `m > 32`.
     group: CudaFunction,
-    /// Resident wide MLP kernels (`m > 32`), NVFP4 and MXFP8.
-    wide_kernels: [CudaFunction; 2],
+    /// Resident wide MLP kernels (`m > 32`).
+    wide_kernels: [CudaFunction; 3],
     /// Blocks of each wide kernel that fit on the GPU at once.
-    wide_blocks: [usize; 2],
+    wide_blocks: [usize; 3],
+    /// MXFP6 E2M3 single-group (`m <= 8`), multi-group (`9..=32`), and wide (`> 32`) kernels.
+    mxfp6_kernel: CudaFunction,
+    mxfp6_blocks: usize,
+    mxfp6_multi: CudaFunction,
+    mxfp6_multi_blocks: usize,
+    mxfp6_wide: CudaFunction,
+    mxfp6_wide_blocks: usize,
 }
 
 impl ExpertsRows {
@@ -90,6 +102,12 @@ impl ExpertsRows {
         }
     }
 
+    /// Loads the fused multi-row expert kernels for this CUDA context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a CUDA module or kernel cannot load or its launch attributes
+    /// cannot be queried or set.
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "experts_rows", cubin!("experts_rows"))?;
         let sms = usize::try_from(
@@ -110,10 +128,15 @@ impl ExpertsRows {
             ensure!(per_sm > 0, "{name} does not fit on an SM");
             Ok((function, per_sm * sms))
         };
-        let load_ring = |ring: usize| -> anyhow::Result<([CudaFunction; 2], [usize; 2])> {
+        let load_ring = |ring: usize| -> anyhow::Result<([CudaFunction; 3], [usize; 3])> {
             let (nvfp4, nvfp4_blocks) = load(&format!("expert_mlp_rows_nvfp4_{ring}"), smem(ring))?;
             let (mxfp8, mxfp8_blocks) = load(&format!("expert_mlp_rows_mxfp8_{ring}"), smem(ring))?;
-            Ok(([nvfp4, mxfp8], [nvfp4_blocks, mxfp8_blocks]))
+            let (nvfp4_s4, nvfp4_s4_blocks) =
+                load(&format!("expert_mlp_rows_nvfp4_s4_{ring}"), smem(ring))?;
+            Ok((
+                [nvfp4, mxfp8, nvfp4_s4],
+                [nvfp4_blocks, mxfp8_blocks, nvfp4_s4_blocks],
+            ))
         };
         let (shallow, shallow_blocks) = load_ring(RINGS[0])?;
         let (deep, deep_blocks) = load_ring(RINGS[1])?;
@@ -121,19 +144,35 @@ impl ExpertsRows {
             load("expert_mlp_rows_multi_nvfp4_3", smem(RINGS[0]))?;
         let (multi_mxfp8, multi_mxfp8_blocks) =
             load("expert_mlp_rows_multi_mxfp8_3", smem(RINGS[0]))?;
+        let (multi_nvfp4_s4, multi_nvfp4_s4_blocks) =
+            load("expert_mlp_rows_multi_nvfp4_s4_3", smem(RINGS[0]))?;
         let group = module.load_function("expert_group_rows")?;
         let (wide_nvfp4, wide_nvfp4_blocks) =
             load("expert_mlp_rows_wide_nvfp4_3", smem(RINGS[0]))?;
         let (wide_mxfp8, wide_mxfp8_blocks) =
             load("expert_mlp_rows_wide_mxfp8_3", smem(RINGS[0]))?;
+        let (wide_nvfp4_s4, wide_nvfp4_s4_blocks) =
+            load("expert_mlp_rows_wide_nvfp4_s4_3", smem(RINGS[0]))?;
+        let (mxfp6_kernel, mxfp6_blocks) =
+            load("expert_mlp_rows_mxfp6_3", smem_mxfp6(RINGS[0]))?;
+        let (mxfp6_multi, mxfp6_multi_blocks) =
+            load("expert_mlp_rows_multi_mxfp6_3", smem_mxfp6(RINGS[0]))?;
+        let (mxfp6_wide, mxfp6_wide_blocks) =
+            load("expert_mlp_rows_wide_mxfp6_3", smem_mxfp6(RINGS[0]))?;
         Ok(Self {
             kernels: [shallow, deep],
             blocks: [shallow_blocks, deep_blocks],
-            multi_kernels: [multi_nvfp4, multi_mxfp8],
-            multi_blocks: [multi_nvfp4_blocks, multi_mxfp8_blocks],
+            multi_kernels: [multi_nvfp4, multi_mxfp8, multi_nvfp4_s4],
+            multi_blocks: [multi_nvfp4_blocks, multi_mxfp8_blocks, multi_nvfp4_s4_blocks],
             group,
-            wide_kernels: [wide_nvfp4, wide_mxfp8],
-            wide_blocks: [wide_nvfp4_blocks, wide_mxfp8_blocks],
+            wide_kernels: [wide_nvfp4, wide_mxfp8, wide_nvfp4_s4],
+            wide_blocks: [wide_nvfp4_blocks, wide_mxfp8_blocks, wide_nvfp4_s4_blocks],
+            mxfp6_kernel,
+            mxfp6_blocks,
+            mxfp6_multi,
+            mxfp6_multi_blocks,
+            mxfp6_wide,
+            mxfp6_wide_blocks,
         })
     }
 
@@ -216,11 +255,29 @@ impl ExpertsRows {
             w2.k
         );
         let format = match (w13.format, w2.format) {
-            (ExpertFormat::Nvfp4 { .. }, ExpertFormat::Nvfp4 { .. }) => 0,
+            (
+                ExpertFormat::Nvfp4 {
+                    scale_base: None, ..
+                },
+                ExpertFormat::Nvfp4 {
+                    scale_base: None, ..
+                },
+            ) => 0,
             (ExpertFormat::Mxfp8, ExpertFormat::Mxfp8) => 1,
+            (
+                ExpertFormat::Nvfp4 {
+                    scale_base: Some(_),
+                    ..
+                },
+                ExpertFormat::Nvfp4 {
+                    scale_base: Some(_),
+                    ..
+                },
+            ) => 2,
+            (ExpertFormat::Mxfp6 { .. }, ExpertFormat::Mxfp6 { .. }) => 3,
             _ => anyhow::bail!("w13 and w2 must share a format"),
         };
-        let experts = |p: &ExpertWeights<'_>, row_bytes: usize, group: usize| {
+        let experts = |p: &ExpertWeights<'_>, row_bytes: usize, scale_div: usize| {
             let per_expert = p.n * row_bytes;
             ensure!(
                 p.weight.len().is_multiple_of(per_expert) && !p.weight.is_empty(),
@@ -229,20 +286,44 @@ impl ExpertsRows {
             );
             let n = p.weight.len() / per_expert;
             ensure!(
-                p.scales.len() == n * p.n * (p.k / group),
+                p.scales.len() == n * p.n * (p.k / scale_div),
                 "scales of {} bytes, expected {n} x {} x {}",
                 p.scales.len(),
                 p.n,
-                p.k / group
+                p.k / scale_div
             );
-            if let ExpertFormat::Nvfp4 { global_scale } = p.format {
+            if let ExpertFormat::Nvfp4 {
+                global_scale,
+                scale_base,
+            } = p.format
+            {
                 ensure!(global_scale.len() == n, "one global scale per expert");
+                if let Some(base) = scale_base {
+                    ensure!(
+                        base.len() == n * p.n,
+                        "scale_base of {} bytes, expected {n} x {}",
+                        base.len(),
+                        p.n
+                    );
+                }
+            } else if let ExpertFormat::Mxfp6 { hi2 } = p.format {
+                ensure!(
+                    hi2.len() == n * p.n * (p.k / 4),
+                    "hi2 of {} bytes, expected {n} x {} x {}",
+                    hi2.len(),
+                    p.n,
+                    p.k / 4
+                );
             }
             Ok(n)
         };
-        let (bytes, group) = if format == 0 { (2, 16) } else { (1, 32) };
-        let n13 = experts(w13, w13.k / bytes, group)?;
-        let n2 = experts(w2, w2.k / bytes, group)?;
+        let (bytes, scale_div) = match format {
+            0 => (2, 16),
+            1 => (1, 32),
+            _ => (2, 32),
+        };
+        let n13 = experts(w13, w13.k / bytes, scale_div)?;
+        let n2 = experts(w2, w2.k / bytes, scale_div)?;
         ensure!(n13 == n2, "w13 has {n13} experts and w2 {n2}");
 
         if m > INLINE_MAX_ROWS {
@@ -266,58 +347,57 @@ impl ExpertsRows {
             unsafe { gargs.launch_pdl(stream, &self.group, gcfg) }?;
 
             let mut args = KernelArgs::default();
-            args.ptr(&x, stream)
-                .i32(i32::try_from(m)?)
-                .ptr(w13.weight, stream)
-                .ptr(w13.scales, stream);
-            global_scale(&mut args, w13.format, stream);
-            args.ptr(w2.weight, stream).ptr(w2.scales, stream);
-            global_scale(&mut args, w2.format, stream);
+            args.ptr(&x, stream).i32(i32::try_from(m)?);
+            push_weight_args(&mut args, w13, stream);
+            push_weight_args(&mut args, w2, stream);
             args.ptr_mut(&mut act, stream)
                 .ptr_mut(&mut out, stream)
                 .f32(gate_softcap)
                 .f32(up_softcap)
                 .ptr_mut(&mut sync, stream)
                 .i32(sync_end);
-            let config = LaunchConfig {
-                grid_dim: (
-                    u32::try_from(self.wide_blocks[format]).context("grid")?,
-                    1,
-                    1,
-                ),
-                block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
-                shared_mem_bytes: u32::try_from(smem(RINGS[0]))?,
+            let (wide_kernel, wide_blocks, wide_smem) = if format == 3 {
+                (&self.mxfp6_wide, self.mxfp6_wide_blocks, smem_mxfp6(RINGS[0]))
+            } else {
+                (&self.wide_kernels[format], self.wide_blocks[format], smem(RINGS[0]))
             };
-            // SAFETY: the arguments match `expert_mlp_rows_wide_*(const bf16*, int, const u8*,
-            // const u8*, const float*, const u8*, const u8*, const float*, bf16*, bf16*, float,
-            // float, unsigned*, int)`. `expert_group_rows` wrote the metadata at `sync + sync_end`
-            // before this kernel's `pdl_wait`, and the last block zeroes both counters and metadata.
-            return unsafe { args.launch_pdl(stream, &self.wide_kernels[format], config) };
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from(wide_blocks).context("grid")?, 1, 1),
+                block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
+                shared_mem_bytes: u32::try_from(wide_smem)?,
+            };
+            // SAFETY: the arguments match `expert_mlp_rows_wide_*`; `expert_group_rows` wrote the
+            // metadata at `sync + sync_end` before this kernel's `pdl_wait`, and the last block
+            // zeroes both counters and metadata.
+            return unsafe { args.launch_pdl(stream, wide_kernel, config) };
         }
 
-        let (kernel, grid_blocks, ring_slots) = if m <= SINGLE_MAX_ROWS {
+        let (kernel, grid_blocks, smem_bytes) = if format == 3 {
+            if m <= SINGLE_MAX_ROWS {
+                (&self.mxfp6_kernel, self.mxfp6_blocks, smem_mxfp6(RINGS[0]))
+            } else {
+                (&self.mxfp6_multi, self.mxfp6_multi_blocks, smem_mxfp6(RINGS[0]))
+            }
+        } else if m <= SINGLE_MAX_ROWS {
             let ring = usize::from(m <= DEEP_RING_ROWS);
             (
                 &self.kernels[ring][format],
                 self.blocks[ring][format],
-                RINGS[ring],
+                smem(RINGS[ring]),
             )
         } else {
             (
                 &self.multi_kernels[format],
                 self.multi_blocks[format],
-                RINGS[0],
+                smem(RINGS[0]),
             )
         };
         let mut args = KernelArgs::default();
         args.ptr(&x, stream)
             .ptr(&indices, stream)
-            .i32(i32::try_from(m)?)
-            .ptr(w13.weight, stream)
-            .ptr(w13.scales, stream);
-        global_scale(&mut args, w13.format, stream);
-        args.ptr(w2.weight, stream).ptr(w2.scales, stream);
-        global_scale(&mut args, w2.format, stream);
+            .i32(i32::try_from(m)?);
+        push_weight_args(&mut args, w13, stream);
+        push_weight_args(&mut args, w2, stream);
         args.ptr_mut(&mut act, stream)
             .ptr_mut(&mut out, stream)
             .f32(gate_softcap)
@@ -326,24 +406,39 @@ impl ExpertsRows {
         let config = LaunchConfig {
             grid_dim: (u32::try_from(grid_blocks).context("grid")?, 1, 1),
             block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
-            shared_mem_bytes: u32::try_from(smem(ring_slots))?,
+            shared_mem_bytes: u32::try_from(smem_bytes)?,
         };
-        // SAFETY: the arguments match `expert_mlp_rows[_multi]_*(const bf16*, const int*, int,
-        // const u8*, const u8*, const float*, const u8*, const u8*, const float*, bf16*,
-        // bf16*, float, float, unsigned*)`. The checks above give `x` m rows of 2304, `act`
-        // and `out` 8 m pairs of 1152 and 2304, the weights the kernel's shapes for every
-        // expert id the router writes, and `sync` a counter per column group, zero as the kernel
-        // leaves them. The grid holds only blocks that fit on the GPU at once with the
-        // ring's shared memory, which the kernel's waits need. Only the NVFP4 kernels read
-        // the global scales. The kernel reads nothing before `pdl_wait`.
+        // SAFETY: the arguments match `expert_mlp_rows[_multi]_*`. The checks above give `x` m
+        // rows of 2304, `act` and `out` 8 m pairs of 1152 and 2304, the weights the kernel's
+        // shapes for every expert id the router writes, and `sync` a counter per column group,
+        // zero as the kernel leaves them. The grid holds only blocks that fit on the GPU at once
+        // with the ring's shared memory, which the kernel's waits need. The kernel reads nothing
+        // before `pdl_wait`.
         unsafe { args.launch_pdl(stream, kernel, config) }
     }
 }
 
-/// The global scale argument: NVFP4's scales, or a null pointer for MXFP8.
-fn global_scale(args: &mut KernelArgs, format: ExpertFormat<'_>, stream: &CudaStream) {
-    match format {
-        ExpertFormat::Nvfp4 { global_scale } => args.ptr(global_scale, stream),
-        ExpertFormat::Mxfp8 => args.u64(0),
-    };
+/// Pushes `(weight, scales, [scale_base,] global_scale)` for NVFP4/MXFP8 or `(lo4, hi2, scales)`
+/// for MXFP6.
+fn push_weight_args(args: &mut KernelArgs, p: &ExpertWeights<'_>, stream: &CudaStream) {
+    match p.format {
+        ExpertFormat::Nvfp4 {
+            global_scale,
+            scale_base,
+        } => {
+            args.ptr(p.weight, stream).ptr(p.scales, stream);
+            if let Some(base) = scale_base {
+                args.ptr(base, stream);
+            }
+            args.ptr(global_scale, stream);
+        }
+        ExpertFormat::Mxfp8 => {
+            args.ptr(p.weight, stream).ptr(p.scales, stream).u64(0);
+        }
+        ExpertFormat::Mxfp6 { hi2 } => {
+            args.ptr(p.weight, stream)
+                .ptr(hi2, stream)
+                .ptr(p.scales, stream);
+        }
+    }
 }

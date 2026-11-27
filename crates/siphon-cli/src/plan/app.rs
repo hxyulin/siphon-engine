@@ -77,6 +77,10 @@ pub struct Settings {
     pub lm_head: Option<siphon::LmHeadFormat>,
     /// `--prefill-dense fp8`.
     pub prefill_dense_fp8: bool,
+    /// `--nvfp4-scales`.
+    pub nvfp4_scales: siphon::Nvfp4ScaleFormat,
+    /// `--mxfp8-experts`.
+    pub mxfp8_experts: siphon::Mxfp8ExpertFormat,
     /// `--draft-weights`.
     pub draft_weights: String,
 }
@@ -167,6 +171,8 @@ impl App {
             output,
             lm_head,
             prefill_dense_fp8,
+            nvfp4_scales,
+            mxfp8_experts,
             ref draft_weights,
         } = *settings;
         let config = TextConfig::load(model_dir)?;
@@ -195,6 +201,8 @@ impl App {
                             lm_head,
                             prefill_dense_fp8,
                             block_scaled_mma: device.block_scaled_mma,
+                            nvfp4_scales,
+                            mxfp8_experts,
                             kv,
                             draft: match draft {
                                 Draft::Bundled => DraftChoice::Bundled(approx),

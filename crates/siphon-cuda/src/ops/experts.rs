@@ -28,10 +28,15 @@ const CONV_TAPS: usize = 4;
 /// short conv with taps `conv_weight` (`[2304, 1, 4]`) and state `conv_state`
 /// (`[3, 2304]`, updated).
 pub struct MoeEnd<'a> {
+    /// Routing weight for each selected expert, F32 `[8]`.
     pub weights: &'a CudaSlice<f32>,
+    /// Post-MLP convolution weight, BF16 `[2304, 1, 4]`.
     pub conv_weight: &'a CudaSlice<bf16>,
+    /// Post-MLP convolution history, F32 `[3, 2304]`, updated in place.
     pub conv_state: &'a mut CudaSlice<f32>,
+    /// Residual added after the convolution, F32 `[2304]`.
     pub residual: &'a CudaSlice<f32>,
+    /// Destination for the updated hidden row, BF16 `[2304]`.
     pub hidden: &'a mut CudaSlice<bf16>,
 }
 /// `expert_matvec` and `expert_mlp`: warps per block, and 16-byte weight chunks per lane.
@@ -39,18 +44,23 @@ const MATVEC_WARPS: usize = 4;
 const MATVEC_CHUNKS: usize = 9;
 /// Input widths the `expert_matvec` kernels support, in the order of [`MATVEC_KERNELS`].
 const MATVEC_K: [usize; 2] = [2304, 1152];
-/// `expert_matvec` kernels by format and input width.
-const MATVEC_KERNELS: [&str; 4] = [
+/// `expert_matvec` kernels by format (`0 = nvfp4`, `1 = mxfp8`, `2 = nvfp4_s4`, `3 = mxfp6`)
+/// and input width.
+const MATVEC_KERNELS: [&str; 8] = [
     "expert_matvec_nvfp4_2304",
     "expert_matvec_nvfp4_1152",
     "expert_matvec_mxfp8_2304",
     "expert_matvec_mxfp8_1152",
+    "expert_matvec_nvfp4_s4_2304",
+    "expert_matvec_nvfp4_s4_1152",
+    "expert_matvec_mxfp6_2304",
+    "expert_matvec_mxfp6_1152",
 ];
 /// `expert_mlp`: the input widths of `w13` and `w2`, and the resident block ceiling per SM
-/// for NVFP4 and MXFP8 (`__launch_bounds__(128, 5)`, 92-96 registers, zero spills).
+/// for NVFP4, MXFP8, NVFP4-4bit-scale, and MXFP6.
 const MLP_K13: usize = 2304;
 const MLP_K2: usize = 1152;
-const MLP_BLOCKS_PER_SM: [usize; 2] = [5, 5];
+const MLP_BLOCKS_PER_SM: [usize; 4] = [5, 5, 5, 4];
 /// `expert_matmul`: output columns per block, pairs per tile, input values per pipeline stage,
 /// and threads per block.
 const GEMM_COLUMNS: usize = 128;
@@ -113,26 +123,63 @@ impl fmt::Display for ExpertActivations {
 /// Quantization format of one expert projection.
 #[derive(Debug, Clone, Copy)]
 pub enum ExpertFormat<'a> {
-    /// Layers 0 to 19: E2M1 weights, one E4M3 scale per 16 values, and one F32 global scale per
-    /// expert (`[experts]`), computed as `amax * 6 * 448 / outer_scale_denominator`.
-    Nvfp4 { global_scale: &'a CudaSlice<f32> },
+    /// Layers 0 to 19: E2M1 weights, one E4M3 scale per 16 values (or packed 4-bit offsets
+    /// from per-row E4M3 `scale_base`), and one F32 global scale per expert (`[experts]`),
+    /// computed as `amax * 6 * 448 / outer_scale_denominator`.
+    Nvfp4 {
+        /// One outer scale per expert.
+        global_scale: &'a CudaSlice<f32>,
+        /// When `Some`, `scales` holds packed 4-bit offsets (`[experts, n, k / 32]`) and
+        /// `scale_base` holds one E4M3 base byte per weight row (`[experts, n]`).
+        scale_base: Option<&'a CudaSlice<u8>>,
+    },
     /// Layers 20 to 23: E4M3 weights and one E8M0 scale per 32 values.
     Mxfp8,
+    /// Layers 20 to 23 packed to 2-plane MXFP6 E2M3: `weight` holds `lo4` (`[experts, n, k / 2]`),
+    /// `hi2` holds packed 2-bit exponent fields (`[experts, n, k / 4]`), and `scales` holds one
+    /// UE8M0 scale per 32 values (`[experts, n, k / 32]`).
+    Mxfp6 {
+        /// Packed 2-bit exponent plane (`[experts, n, k / 4]`).
+        hi2: &'a CudaSlice<u8>,
+    },
 }
 
 impl ExpertFormat<'_> {
     fn group(self) -> usize {
         match self {
             Self::Nvfp4 { .. } => 16,
-            Self::Mxfp8 => 32,
+            Self::Mxfp8 | Self::Mxfp6 { .. } => 32,
         }
+    }
+
+    fn scale_bytes_per_row(self, k: usize) -> usize {
+        match self {
+            Self::Nvfp4 {
+                scale_base: Some(_),
+                ..
+            } => k / 32,
+            Self::Nvfp4 {
+                scale_base: None, ..
+            } => k / 16,
+            Self::Mxfp8 | Self::Mxfp6 { .. } => k / 32,
+        }
+    }
+
+    fn is_scale4(self) -> bool {
+        matches!(
+            self,
+            Self::Nvfp4 {
+                scale_base: Some(_),
+                ..
+            }
+        )
     }
 
     /// Output rows one `expert_matvec` or `expert_mlp` block covers for input width k:
     /// `MATVEC_WARPS` warps, each with whole rows of `MATVEC_CHUNKS` 16-byte chunks per lane.
     fn matvec_block_rows(self, k: usize) -> usize {
         let chunk_values = match self {
-            Self::Nvfp4 { .. } => 32,
+            Self::Nvfp4 { .. } | Self::Mxfp6 { .. } => 32,
             Self::Mxfp8 => 16,
         };
         MATVEC_WARPS * 32 * MATVEC_CHUNKS * chunk_values / k
@@ -140,24 +187,38 @@ impl ExpertFormat<'_> {
 
     fn index(self) -> usize {
         match self {
-            Self::Nvfp4 { .. } => 0,
+            Self::Nvfp4 {
+                scale_base: None, ..
+            } => 0,
             Self::Mxfp8 => 1,
+            Self::Nvfp4 {
+                scale_base: Some(_),
+                ..
+            } => 2,
+            Self::Mxfp6 { .. } => 3,
         }
     }
 
     fn row_bytes(self, k: usize) -> usize {
         match self {
-            Self::Nvfp4 { .. } => k / 2,
+            Self::Nvfp4 { .. } | Self::Mxfp6 { .. } => k / 2,
             Self::Mxfp8 => k,
         }
     }
 
     /// Dynamic shared memory of an `expert_gemm_q_*` block, `kQShared` in
     /// `kernels/expert_matmul.cu`: 2 stages of 64 bytes for each of the 128 weight rows and
-    /// 128 pairs, then 2 scale slots of 16 bytes per row. The same for both formats.
+    /// 128 pairs, then 2 scale slots of 16 bytes per row.
     fn quantized_shared_bytes() -> usize {
         let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
         2 * rows * 64 + 2 * rows * 16
+    }
+
+    /// Dynamic shared memory of an `expert_gemm_q_mxfp6*` block (`kQMxfp6Shared` = 36,864 B):
+    /// 2 stages of (48 B weight + 64 B pair) + 2 scale slots of 16 B per row.
+    fn mxfp6_quantized_shared_bytes() -> usize {
+        let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
+        2 * (GEMM_COLUMNS * 48 + QUANTIZED_PAIRS * 64) + 2 * rows * 16
     }
 
     /// Dynamic shared memory of an `expert_gemm_q8_*` block, `kQ8Shared` in
@@ -169,23 +230,29 @@ impl ExpertFormat<'_> {
     }
 
     /// Dynamic shared memory of an `expert_gemm_*` block: per pipeline stage, the weight bytes
-    /// and the BF16 inputs (64 pairs), then 2 slots of scales for a pair of stages. Both
-    /// formats run 3 stages (38,912 B NVFP4, 50,176 B MXFP8), so two blocks fit in an SM.
+    /// and the BF16 inputs (64 pairs), then 2 slots of scales for a pair of stages. All
+    /// formats run 3 stages (38,912 B NVFP4, 37,888 B NVFP4-s4, 44,032 B MXFP6, 50,176 B MXFP8),
+    /// so two blocks fit in an SM.
     fn gemm_shared_bytes(self) -> usize {
         let stages = 3;
         let scale_slots = 2;
-        stages * (GEMM_COLUMNS * self.row_bytes(GEMM_K) + GEMM_PAIRS * GEMM_K * 2)
-            + scale_slots * GEMM_COLUMNS * 2 * GEMM_K / self.group()
+        let weight_row_bytes = match self {
+            Self::Mxfp6 { .. } => GEMM_K * 3 / 4,
+            _ => self.row_bytes(GEMM_K),
+        };
+        stages * (GEMM_COLUMNS * weight_row_bytes + GEMM_PAIRS * GEMM_K * 2)
+            + scale_slots * GEMM_COLUMNS * self.scale_bytes_per_row(2 * GEMM_K)
     }
 }
 
 /// One expert projection (`w13` or `w2`) as raw checkpoint bytes on the GPU.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpertWeights<'a> {
+    /// The value encoding and scale layout.
     pub format: ExpertFormat<'a>,
     /// `*_weight`: `[experts, n, k / 2]` for NVFP4, `[experts, n, k]` for MXFP8.
     pub weight: &'a CudaSlice<u8>,
-    /// `*_weight_scale`: `[experts, n, k / 16]` for NVFP4, `[experts, n, k / 32]` for MXFP8.
+    /// Block scales. The NVFP4 byte layout depends on whether a scale base is set.
     pub scales: &'a CudaSlice<u8>,
     /// Output rows per expert: 2304 for both projections. Tests pass a slice.
     pub n: usize,
@@ -224,17 +291,35 @@ impl ExpertWeights<'_> {
             format.row_bytes(k)
         );
         let experts = weight.len() / row_bytes;
+        let scale_row_bytes = format.scale_bytes_per_row(k);
         ensure!(
-            scales.len() == experts * n * (k / group),
-            "scales has {} bytes, expected {experts} x {n} x {}",
+            scales.len() == experts * n * scale_row_bytes,
+            "scales has {} bytes, expected {experts} x {n} x {scale_row_bytes}",
             scales.len(),
-            k / group
         );
-        if let ExpertFormat::Nvfp4 { global_scale } = format {
+        if let ExpertFormat::Nvfp4 {
+            global_scale,
+            scale_base,
+        } = format
+        {
             ensure!(
                 global_scale.len() == experts,
                 "global_scale has {} elements, expected {experts}",
                 global_scale.len()
+            );
+            if let Some(base) = scale_base {
+                ensure!(
+                    base.len() == experts * n,
+                    "scale_base has {} bytes, expected {experts} x {n}",
+                    base.len()
+                );
+            }
+        } else if let ExpertFormat::Mxfp6 { hi2 } = format {
+            let hi2_row_bytes = k / 4;
+            ensure!(
+                hi2.len() == experts * n * hi2_row_bytes,
+                "hi2 has {} bytes, expected {experts} x {n} x {hi2_row_bytes}",
+                hi2.len()
             );
         }
         ensure!(
@@ -307,7 +392,7 @@ impl RowFormat {
         match (weights, fp8) {
             (ExpertFormat::Nvfp4 { .. }, false) => Self::Nvfp4,
             (ExpertFormat::Nvfp4 { .. }, true) => Self::Fp8Paired,
-            (ExpertFormat::Mxfp8, _) => Self::Mxfp8,
+            (ExpertFormat::Mxfp8 | ExpertFormat::Mxfp6 { .. }, _) => Self::Mxfp8,
         }
     }
 
@@ -315,7 +400,7 @@ impl RowFormat {
     fn per_row(weights: ExpertFormat<'_>) -> Self {
         match weights {
             ExpertFormat::Nvfp4 { .. } => Self::Fp8PerRowPaired,
-            ExpertFormat::Mxfp8 => Self::Fp8PerRowNatural,
+            ExpertFormat::Mxfp8 | ExpertFormat::Mxfp6 { .. } => Self::Fp8PerRowNatural,
         }
     }
 
@@ -335,7 +420,7 @@ pub const fn expert_quant_format(weights: ExpertFormat<'_>, fp8: bool) -> QuantF
     match (weights, fp8) {
         (ExpertFormat::Nvfp4 { .. }, false) => QuantFormat::Nvfp4,
         (ExpertFormat::Nvfp4 { .. }, true) => QuantFormat::Mxfp8Paired,
-        (ExpertFormat::Mxfp8, _) => QuantFormat::Mxfp8,
+        (ExpertFormat::Mxfp8 | ExpertFormat::Mxfp6 { .. }, _) => QuantFormat::Mxfp8,
     }
 }
 
@@ -488,26 +573,32 @@ fn max_tiles(pairs: usize, experts: usize) -> usize {
     max_tiles_for(pairs, experts, SCRATCH_TILE_PAIRS)
 }
 
+/// CUDA entry points for expert products and fused mixture-of-experts blocks.
 #[derive(Debug)]
 pub struct Experts {
     /// The kernels of [`MATVEC_KERNELS`], in its order.
     matvec: Vec<CudaFunction>,
-    /// `expert_mlp` for NVFP4 and MXFP8, and the blocks each runs: all must fit on the GPU
-    /// at once.
-    mlp: [CudaFunction; 2],
-    mlp_blocks: [usize; 2],
+    /// `expert_mlp` for NVFP4, MXFP8, NVFP4-s4, and MXFP6, and the blocks each runs: all must
+    /// fit on the GPU at once.
+    mlp: [CudaFunction; 4],
+    mlp_blocks: [usize; 4],
+    /// `pack_nvfp4_scales_4bit`: load-time 8-bit -> 4-bit offset scale packer.
+    pack_scales_4bit: CudaFunction,
+    /// `pack_mxfp8_to_mxfp6`: load-time MXFP8 -> 2-plane MXFP6 E2M3 packer.
+    pack_mxfp6: CudaFunction,
     group: CudaFunction,
-    /// `expert_gemm_*` for NVFP4 and MXFP8, each plain and with the SwiGLU epilogue.
-    gemm: [[CudaFunction; 2]; 2],
-    /// The same for `expert_gemm_q_*`, the products with quantized activations.
+    /// `expert_gemm_*` for NVFP4, MXFP8, NVFP4-s4, and MXFP6, each plain and with SwiGLU.
+    gemm: [[CudaFunction; 2]; 4],
+    /// The same for `expert_gemm_q_*`, the products with quantized activations (NVFP4 and MXFP8).
     gemm_q: [[CudaFunction; 2]; 2],
+    /// `expert_gemm_q_mxfp6[_swiglu]`: MXFP6 weights with FP8 activations.
+    gemm_q_mxfp6: [CudaFunction; 2],
     /// `expert_gemm_q_{nvfp4,mxfp8}_swiglu_q`: quantized SwiGLU output directly for `w2`.
     gemm_swiglu_quant: [CudaFunction; 2],
-    /// `expert_gemm_q8_nvfp4`, plain and with the SwiGLU epilogue: NVFP4 weights with FP8
-    /// activations.
-    gemm_q8: [CudaFunction; 2],
-    /// `expert_gemm_q8_nvfp4_swiglu_q`: paired MXFP8 SwiGLU output directly for `w2`.
-    fp8_swiglu_quant: CudaFunction,
+    /// `expert_gemm_q8_nvfp4` (0 = 8-bit scales, 1 = 4-bit scales), plain and SwiGLU epilogue.
+    gemm_q8: [[CudaFunction; 2]; 2],
+    /// `expert_gemm_q8_nvfp4[_s4]_swiglu_q`: paired MXFP8 SwiGLU output directly for `w2`.
+    fp8_swiglu_quant: [CudaFunction; 2],
     /// `quantize_rows_*` in [`RowFormat`] order.
     quantize: [CudaFunction; 5],
     /// `nvfp4_scale_spread`.
@@ -562,6 +653,12 @@ enum Epilogue {
 }
 
 impl Experts {
+    /// Loads expert matrix product and mixture-of-experts kernels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a CUDA module or kernel cannot load or its launch attributes
+    /// cannot be queried or set.
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "experts", cubin!("experts"))?;
         let matmul = load_module(ctx, "expert_matmul", cubin!("expert_matmul"))?;
@@ -574,6 +671,14 @@ impl Experts {
                 matmul.load_function("expert_gemm_mxfp8")?,
                 matmul.load_function("expert_gemm_mxfp8_swiglu")?,
             ],
+            [
+                matmul.load_function("expert_gemm_nvfp4_s4")?,
+                matmul.load_function("expert_gemm_nvfp4_s4_swiglu")?,
+            ],
+            [
+                matmul.load_function("expert_gemm_mxfp6")?,
+                matmul.load_function("expert_gemm_mxfp6_swiglu")?,
+            ],
         ];
         let gemm_q = [
             [
@@ -585,13 +690,17 @@ impl Experts {
                 matmul.load_function("expert_gemm_q_mxfp8_swiglu")?,
             ],
         ];
+        let gemm_q_mxfp6 = [
+            matmul.load_function("expert_gemm_q_mxfp6")?,
+            matmul.load_function("expert_gemm_q_mxfp6_swiglu")?,
+        ];
         let gemm_swiglu_quant = [
             matmul.load_function("expert_gemm_q_nvfp4_swiglu_q")?,
             matmul.load_function("expert_gemm_q_mxfp8_swiglu_q")?,
         ];
         // MXFP8 needs the most: 3 stages of 16 KiB and 1 KiB of scales (50,176 B) against
-        // NVFP4's 3 of 12 KiB and 2 KiB of scales (38,912 B), and the quantized kernels'
-        // 2 of 16 KiB and 8 KiB (40,960 B).
+        // NVFP4's 3 of 12 KiB and 2 KiB of scales (38,912 B), MXFP6's 44,032 B, and the
+        // quantized kernels' 2 of 16 KiB and 8 KiB (40,960 B).
         let shared = i32::try_from(
             ExpertFormat::Mxfp8
                 .gemm_shared_bytes()
@@ -601,6 +710,7 @@ impl Experts {
             .iter()
             .chain(&gemm_q)
             .flatten()
+            .chain(&gemm_q_mxfp6)
             .chain(&gemm_swiglu_quant)
         {
             function.set_attribute(
@@ -609,11 +719,20 @@ impl Experts {
             )?;
         }
         let gemm_q8 = [
-            matmul.load_function("expert_gemm_q8_nvfp4")?,
-            matmul.load_function("expert_gemm_q8_nvfp4_swiglu")?,
+            [
+                matmul.load_function("expert_gemm_q8_nvfp4")?,
+                matmul.load_function("expert_gemm_q8_nvfp4_swiglu")?,
+            ],
+            [
+                matmul.load_function("expert_gemm_q8_nvfp4_s4")?,
+                matmul.load_function("expert_gemm_q8_nvfp4_s4_swiglu")?,
+            ],
         ];
-        let fp8_swiglu_quant = matmul.load_function("expert_gemm_q8_nvfp4_swiglu_q")?;
-        for function in gemm_q8.iter().chain(std::iter::once(&fp8_swiglu_quant)) {
+        let fp8_swiglu_quant = [
+            matmul.load_function("expert_gemm_q8_nvfp4_swiglu_q")?,
+            matmul.load_function("expert_gemm_q8_nvfp4_s4_swiglu_q")?,
+        ];
+        for function in gemm_q8.iter().flatten().chain(&fp8_swiglu_quant) {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 i32::try_from(ExpertFormat::fp8_shared_bytes())?,
@@ -622,7 +741,11 @@ impl Experts {
         let mlp = [
             module.load_function("expert_mlp_nvfp4")?,
             module.load_function("expert_mlp_mxfp8")?,
+            module.load_function("expert_mlp_nvfp4_s4")?,
+            module.load_function("expert_mlp_mxfp6")?,
         ];
+        let pack_scales_4bit = module.load_function("pack_nvfp4_scales_4bit")?;
+        let pack_mxfp6 = module.load_function("pack_mxfp8_to_mxfp6")?;
         Ok(Self {
             matvec: MATVEC_KERNELS
                 .iter()
@@ -631,11 +754,16 @@ impl Experts {
             mlp_blocks: [
                 mlp_blocks(ctx, &mlp[0], MLP_BLOCKS_PER_SM[0])?,
                 mlp_blocks(ctx, &mlp[1], MLP_BLOCKS_PER_SM[1])?,
+                mlp_blocks(ctx, &mlp[2], MLP_BLOCKS_PER_SM[2])?,
+                mlp_blocks(ctx, &mlp[3], MLP_BLOCKS_PER_SM[3])?,
             ],
             mlp,
+            pack_scales_4bit,
+            pack_mxfp6,
             group: matmul.load_function("expert_group")?,
             gemm,
             gemm_q,
+            gemm_q_mxfp6,
             gemm_swiglu_quant,
             gemm_q8,
             fp8_swiglu_quant,
@@ -648,6 +776,103 @@ impl Experts {
             ],
             scale_spread: matmul.load_function("nvfp4_scale_spread")?,
         })
+    }
+
+    /// Packs raw NVFP4 8-bit E4M3 scales (`[rows, blocks_per_row]`) into per-row 8-bit E4M3
+    /// bases (`[rows]`) and packed 4-bit offsets (`[rows, blocks_per_row / 2]`), clamping tiny
+    /// blocks below `base - 15` up to `base - 15` and re-rounding their 16 E2M1 nibbles in
+    /// place inside `weight` (`[rows, blocks_per_row * 8]`).
+    pub fn pack_nvfp4_scales_4bit(
+        &self,
+        stream: &Arc<CudaStream>,
+        weight: &mut CudaSlice<u8>,
+        scales_in: &CudaSlice<u8>,
+        rows: usize,
+        blocks_per_row: usize,
+    ) -> anyhow::Result<(CudaSlice<u8>, CudaSlice<u8>)> {
+        ensure!(
+            blocks_per_row > 0 && blocks_per_row.is_multiple_of(2),
+            "blocks_per_row = {blocks_per_row} must be a positive even number"
+        );
+        ensure!(
+            scales_in.len() == rows * blocks_per_row,
+            "scales_in has {} bytes, expected {rows} x {blocks_per_row}",
+            scales_in.len()
+        );
+        ensure!(
+            weight.len() == rows * blocks_per_row * 8,
+            "weight has {} bytes, expected {rows} x {}",
+            weight.len(),
+            blocks_per_row * 8
+        );
+        let mut scales_out = stream.alloc_zeros::<u8>(rows * (blocks_per_row / 2))?;
+        let mut scale_base = stream.alloc_zeros::<u8>(rows)?;
+        if rows > 0 {
+            let rows_arg = i32::try_from(rows).context("too many rows")?;
+            let blocks_arg = i32::try_from(blocks_per_row).context("blocks_per_row too large")?;
+            let mut launch = stream.launch_builder(&self.pack_scales_4bit);
+            launch
+                .arg(weight)
+                .arg(scales_in)
+                .arg(&mut scales_out)
+                .arg(&mut scale_base)
+                .arg(&rows_arg)
+                .arg(&blocks_arg);
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from(rows.div_ceil(8))?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: matches `pack_nvfp4_scales_4bit(u8*, const u8*, u8*, u8*, int, int)`;
+            // all buffer lengths match `rows` and `blocks_per_row` as checked above.
+            unsafe { launch.launch(config) }?;
+        }
+        Ok((scales_out, scale_base))
+    }
+
+    /// Re-quantizes raw MXFP8 weights (`[total_blocks * 32]` E4M3 bytes) and UE8M0 scales
+    /// (`[total_blocks]` bytes) into 2-plane MXFP6 E2M3: `(w_lo4, w_hi2, scales_out)` of sizes
+    /// `total_blocks * 16`, `total_blocks * 8`, and `total_blocks` bytes.
+    pub fn pack_mxfp8_to_mxfp6(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_in: &CudaSlice<u8>,
+        s_in: &CudaSlice<u8>,
+    ) -> anyhow::Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>)> {
+        ensure!(
+            w_in.len().is_multiple_of(32),
+            "w_in has {} bytes, not a multiple of 32",
+            w_in.len()
+        );
+        let total_blocks = w_in.len() / 32;
+        ensure!(
+            s_in.len() == total_blocks,
+            "s_in has {} bytes, expected {total_blocks}",
+            s_in.len()
+        );
+        let mut w_lo4 = stream.alloc_zeros::<u8>(total_blocks * 16)?;
+        let mut w_hi2 = stream.alloc_zeros::<u8>(total_blocks * 8)?;
+        let mut s_out = stream.alloc_zeros::<u8>(total_blocks)?;
+        if total_blocks > 0 {
+            let blocks_arg = u64::try_from(total_blocks)?;
+            let mut launch = stream.launch_builder(&self.pack_mxfp6);
+            launch
+                .arg(w_in)
+                .arg(s_in)
+                .arg(&mut w_lo4)
+                .arg(&mut w_hi2)
+                .arg(&mut s_out)
+                .arg(&blocks_arg);
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from(total_blocks.div_ceil(256))?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: matches `pack_mxfp8_to_mxfp6(const u8*, const u8*, u8*, u8*, u8*, size_t)`;
+            // all buffer lengths match `total_blocks` as checked above.
+            unsafe { launch.launch(config) }?;
+        }
+        Ok((w_lo4, w_hi2, s_out))
     }
 
     /// Multiplies each row's input by the weights of its 8 selected experts, writing BF16
@@ -693,11 +918,8 @@ impl Experts {
             return Ok(());
         }
         let mut args = KernelArgs::default();
-        args.ptr(&x, stream)
-            .ptr(&indices, stream)
-            .ptr(weight, stream)
-            .ptr(scales, stream);
-        global_scale_arg(&mut args, format, stream);
+        args.ptr(&x, stream).ptr(&indices, stream);
+        push_weight_args(&mut args, weight, scales, format, stream);
         args.ptr_mut(&mut out, stream)
             .i32(i32::try_from(n).context("n is too large")?)
             .i32(inputs_per_row)
@@ -820,13 +1042,9 @@ impl Experts {
         let tiles2 = w2.n / block_rows2;
         let blocks = mlp_grid_blocks(pairs, tiles13, tiles2, self.mlp_blocks[w13.format.index()]);
         let mut args = KernelArgs::default();
-        args.ptr(&x, stream)
-            .ptr(&indices, stream)
-            .ptr(w13.weight, stream)
-            .ptr(w13.scales, stream);
-        global_scale_arg(&mut args, w13.format, stream);
-        args.ptr(w2.weight, stream).ptr(w2.scales, stream);
-        global_scale_arg(&mut args, w2.format, stream);
+        args.ptr(&x, stream).ptr(&indices, stream);
+        push_weight_args(&mut args, w13.weight, w13.scales, w13.format, stream);
+        push_weight_args(&mut args, w2.weight, w2.scales, w2.format, stream);
         args.ptr_mut(&mut act, stream)
             .ptr_mut(&mut out, stream)
             .i32(i32::try_from(w2.n).context("n is too large")?)
@@ -1289,6 +1507,10 @@ impl Experts {
             | RowFormat::Fp8PerRowPaired => 64,
         };
         ensure!(
+            !matches!(format, ExpertFormat::Mxfp6 { .. }),
+            "fused SwiGLU-quant does not support MXFP6 weights"
+        );
+        ensure!(
             crate::BLOCK_SCALED_MMA,
             "fused SwiGLU-quant needs the block-scaled MMA, which this sm_89 build lacks"
         );
@@ -1326,15 +1548,21 @@ impl Experts {
             let k_arg = i32::try_from(k).context("k is too large")?;
             let (function, shared, threads) = match out_format {
                 RowFormat::Fp8Paired | RowFormat::Fp8PerRowPaired => (
-                    &self.fp8_swiglu_quant,
+                    &self.fp8_swiglu_quant[usize::from(format.is_scale4())],
                     ExpertFormat::fp8_shared_bytes(),
                     FP8_GEMM_THREADS,
                 ),
-                RowFormat::Nvfp4 | RowFormat::Mxfp8 | RowFormat::Fp8PerRowNatural => (
-                    &self.gemm_swiglu_quant[format.index()],
-                    ExpertFormat::quantized_shared_bytes(),
-                    GEMM_THREADS,
-                ),
+                RowFormat::Nvfp4 | RowFormat::Mxfp8 | RowFormat::Fp8PerRowNatural => {
+                    ensure!(
+                        !format.is_scale4(),
+                        "4-bit NVFP4 scales require BF16 or FP8 expert activations, not quantized NVFP4 activations"
+                    );
+                    (
+                        &self.gemm_swiglu_quant[format.index()],
+                        ExpertFormat::quantized_shared_bytes(),
+                        GEMM_THREADS,
+                    )
+                }
             };
             let null: u64 = 0;
             let config = LaunchConfig {
@@ -1353,9 +1581,16 @@ impl Experts {
                 .arg(&xq.outer)
                 .arg(weight)
                 .arg(scales);
+            if let ExpertFormat::Nvfp4 {
+                scale_base: Some(base),
+                ..
+            } = format
+            {
+                launch.arg(base);
+            }
             match format {
-                ExpertFormat::Nvfp4 { global_scale } => launch.arg(global_scale),
-                ExpertFormat::Mxfp8 => launch.arg(&null),
+                ExpertFormat::Nvfp4 { global_scale, .. } => launch.arg(global_scale),
+                ExpertFormat::Mxfp8 | ExpertFormat::Mxfp6 { .. } => launch.arg(&null),
             };
             launch
                 .arg(&mut act_q.values)
@@ -1456,7 +1691,7 @@ impl Experts {
         let pairs = rows * SLOTS;
         let n_arg = i32::try_from(n).context("n is too large")?;
         let k_arg = i32::try_from(k).context("k is too large")?;
-        let (function, shared, threads) = self.gemm_function(input, format, swiglu);
+        let (function, shared, threads) = self.gemm_function(input, format, swiglu)?;
         let null: u64 = 0;
         // One more row of blocks than tiles: the row at the tile count writes the NaN rows.
         let config = LaunchConfig {
@@ -1473,11 +1708,24 @@ impl Experts {
             GemmInput::Bf16(x) => launch.arg(x),
             GemmInput::Quantized(xq) => launch.arg(&xq.values).arg(&xq.scales).arg(&xq.outer),
         };
-        launch.arg(weight).arg(scales);
         match format {
-            ExpertFormat::Nvfp4 { global_scale } => launch.arg(global_scale),
-            ExpertFormat::Mxfp8 => launch.arg(&null),
-        };
+            ExpertFormat::Nvfp4 {
+                global_scale,
+                scale_base,
+            } => {
+                launch.arg(weight).arg(scales);
+                if let Some(base) = scale_base {
+                    launch.arg(base);
+                }
+                launch.arg(global_scale);
+            }
+            ExpertFormat::Mxfp8 => {
+                launch.arg(weight).arg(scales).arg(&null);
+            }
+            ExpertFormat::Mxfp6 { hi2 } => {
+                launch.arg(weight).arg(hi2).arg(scales);
+            }
+        }
         launch
             .arg(&mut out)
             .arg(&scratch.perm)
@@ -1489,8 +1737,8 @@ impl Experts {
             .arg(&gate_softcap)
             .arg(&up_softcap);
         // SAFETY: the arguments match `expert_gemm_*(const bf16*, const u8*, const u8*,
-        // const float*, bf16*, const int*, const int4*, const int*, int, int, int, float,
-        // float)`, or for quantized inputs `expert_gemm_q_*` and `expert_gemm_q8_*(const u8*,
+        // [const u8*,] const float*, bf16*, const int*, const int4*, const int*, int, int, int,
+        // float, float)`, or for quantized inputs `expert_gemm_q_*` and `expert_gemm_q8_*(const u8*,
         // const u8*, const float*, ...)` with the same remaining parameters; the paired rows
         // go only to `expert_gemm_q8_nvfp4*`, with NVFP4 weights, as `len` checked. `quantize_rows` wrote
         // `x_len / k` rows of k values of the weights' format into `xq`, so its values,
@@ -1513,8 +1761,8 @@ impl Experts {
         input: &GemmInput<'_, '_>,
         format: ExpertFormat<'_>,
         swiglu: usize,
-    ) -> (&CudaFunction, usize, u32) {
-        match *input {
+    ) -> anyhow::Result<(&CudaFunction, usize, u32)> {
+        Ok(match *input {
             GemmInput::Bf16(_) => (
                 &self.gemm[format.index()][swiglu],
                 format.gemm_shared_bytes(),
@@ -1526,18 +1774,63 @@ impl Experts {
                     Some(RowFormat::Fp8Paired | RowFormat::Fp8PerRowPaired)
                 ) {
                     (
-                        &self.gemm_q8[swiglu],
+                        &self.gemm_q8[usize::from(format.is_scale4())][swiglu],
                         ExpertFormat::fp8_shared_bytes(),
                         FP8_GEMM_THREADS,
                     )
                 } else {
-                    (
-                        &self.gemm_q[format.index()][swiglu],
-                        ExpertFormat::quantized_shared_bytes(),
-                        GEMM_THREADS,
-                    )
+                    if matches!(format, ExpertFormat::Mxfp6 { .. }) {
+                        (
+                            &self.gemm_q_mxfp6[swiglu],
+                            ExpertFormat::mxfp6_quantized_shared_bytes(),
+                            GEMM_THREADS,
+                        )
+                    } else {
+                        ensure!(
+                            !format.is_scale4(),
+                            "4-bit NVFP4 scales require BF16 or FP8 expert activations, not quantized NVFP4 activations"
+                        );
+                        (
+                            &self.gemm_q[format.index()][swiglu],
+                            ExpertFormat::quantized_shared_bytes(),
+                            GEMM_THREADS,
+                        )
+                    }
                 }
             }
+        })
+    }
+}
+
+/// Pushes the weight, scale, and format-specific auxiliary pointer arguments for `expert_matvec_*`
+/// and `expert_mlp_*`:
+/// - NVFP4 (8-bit): `(weight, scales, global_scale)`
+/// - NVFP4 (4-bit): `(weight, scales, scale_base, global_scale)`
+/// - MXFP8: `(weight, scales, nullptr)`
+/// - MXFP6: `(w_lo4, w_hi2, scales)`
+fn push_weight_args(
+    args: &mut KernelArgs,
+    weight: &CudaSlice<u8>,
+    scales: &CudaSlice<u8>,
+    format: ExpertFormat<'_>,
+    stream: &CudaStream,
+) {
+    match format {
+        ExpertFormat::Nvfp4 {
+            global_scale,
+            scale_base,
+        } => {
+            args.ptr(weight, stream).ptr(scales, stream);
+            if let Some(base) = scale_base {
+                args.ptr(base, stream);
+            }
+            args.ptr(global_scale, stream);
+        }
+        ExpertFormat::Mxfp8 => {
+            args.ptr(weight, stream).ptr(scales, stream).u64(0);
+        }
+        ExpertFormat::Mxfp6 { hi2 } => {
+            args.ptr(weight, stream).ptr(hi2, stream).ptr(scales, stream);
         }
     }
 }
@@ -1587,15 +1880,6 @@ fn mlp_blocks(
     let per_sm = per_sm.min(usize::try_from(resident)?);
     ensure!(per_sm > 0, "expert_mlp does not fit on an SM");
     Ok(per_sm * usize::try_from(sms)?)
-}
-
-/// The global scale argument of an expert kernel: the NVFP4 scales, or a null pointer for
-/// MXFP8, which has none.
-fn global_scale_arg(args: &mut KernelArgs, format: ExpertFormat<'_>, stream: &CudaStream) {
-    match format {
-        ExpertFormat::Nvfp4 { global_scale } => args.ptr(global_scale, stream),
-        ExpertFormat::Mxfp8 => args.u64(0),
-    };
 }
 
 /// Identifies a stream for [`Grouping`].

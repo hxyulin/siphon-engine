@@ -30,6 +30,7 @@ use crate::{
     Gpu,
     gpu::HostMapped,
     ops::{
+        experts::Experts,
         linear::Prefetch,
         linear_fp8::{Fp8Matrix, LinearFp8, Mxfp8Matrix},
         linear_nvfp4::{LinearNvfp4, Nvfp4Matrix},
@@ -45,14 +46,18 @@ const NVFP4_E2M1_MAX: f32 = 6.0;
 /// Largest E4M3 value, from MLX-LM's `sanitize`.
 const NVFP4_E4M3_MAX: f32 = 448.0;
 
+/// The loaded Inkling 2 Mini text-model tensors used by the CUDA runner.
 #[derive(Debug)]
 pub struct Weights {
     /// `[vocab, hidden]`, in mapped host memory.
     pub embed: HostMapped<bf16>,
+    /// BF16 RMS-normalization weights applied to the token embedding.
     pub embed_norm: CudaSlice<bf16>,
+    /// One set of tensors per checkpoint layer, in layer order.
     pub layers: Vec<LayerWeights>,
     /// Query of the final depth attention, F32 `[hidden]`.
     pub final_query: CudaSlice<f32>,
+    /// BF16 RMS-normalization weights applied before the language-model head.
     pub norm: CudaSlice<bf16>,
     /// `[vocab, hidden]`: on the device, or after [`Weights::quantize_fp8`] in mapped host
     /// memory, where only the bundled draft's load and its shortlist read it.
@@ -73,7 +78,9 @@ pub struct Weights {
 /// A BF16 tensor in device memory or in mapped host memory.
 #[derive(Debug)]
 pub enum Table {
+    /// A tensor allocated on the CUDA device.
     Device(CudaSlice<bf16>),
+    /// A tensor in page-locked, device-mapped host memory.
     Host(HostMapped<bf16>),
 }
 
@@ -94,23 +101,31 @@ impl Table {
     }
 }
 
-pub use siphon::{LmHeadFormat, OutputProjection, WeightFormat};
+pub use siphon::{LmHeadFormat, Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection, WeightFormat};
 
 /// Options for [`Weights::load_with_options`]: streaming layer-by-layer quantization that
 /// drops unused BF16 weights as each layer is quantized and loads quantized LM heads
 /// directly from mapped host memory to avoid startup VRAM spikes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
+    /// Format of the main model's dense decode weights.
     pub weights: WeightFormat,
+    /// Format of the attention output projections when loading FP8 weights.
     pub output: OutputProjection,
+    /// Override for the language-model head. `None` follows the main model's weight format.
     pub lm_head: Option<LmHeadFormat>,
     /// When true under [`WeightFormat::Fp8`], every path reads the FP8 attention input
     /// projections and message-gate `down` projections (and `W_o` when its quantized copy
     /// covers prefill too), so their BF16 originals are dropped per layer right after
     /// quantization.
     pub prefill_dense_fp8: bool,
+    /// Storage format of NVFP4 expert block scales (`8bit` E4M3 or `4bit` per-row offsets).
+    pub nvfp4_scales: Nvfp4ScaleFormat,
+    /// Storage format of MXFP8 expert layers (`mxfp8` or load-time `mxfp6` E2M3).
+    pub mxfp8_experts: Mxfp8ExpertFormat,
 }
 
+/// All device tensors used by one checkpoint decoder layer.
 #[derive(Debug)]
 pub struct LayerWeights {
     /// Depth-attention queries for the attention input, F32 `[1 or 3, hidden]`.
@@ -118,16 +133,21 @@ pub struct LayerWeights {
     pub attention_query: Option<CudaSlice<f32>>,
     /// Depth-attention query for the MLP input, F32 `[hidden]`.
     pub mlp_query: CudaSlice<f32>,
+    /// Normalization weights for the attention inputs.
     pub input_norms: InputNorms,
+    /// Attention projections and auxiliary tensors.
     pub attention: AttentionWeights,
     /// Depthwise conv weights `[hidden, 4]`.
     pub post_attention_conv: CudaSlice<bf16>,
+    /// Depthwise convolution weights applied after the experts, `[hidden, kernel]`.
     pub post_mlp_conv: CudaSlice<bf16>,
+    /// RMS-normalization weights for the MLP input, `[hidden]`.
     pub mlp_norm: CudaSlice<bf16>,
     /// F32 `[experts, hidden]`.
     pub router: CudaSlice<f32>,
     /// F32 `[experts]`.
     pub router_bias: CudaSlice<f32>,
+    /// Packed expert parameters and their quantization scales.
     pub experts: ExpertWeights,
     /// Query, key, value and MLP gates, present on looped layers.
     pub message_gates: Option<[MessageGateWeights; 4]>,
@@ -149,27 +169,40 @@ pub struct Fp8Projections {
     pub o: Option<Fp8Matrix>,
 }
 
+/// The RMS-normalization weights for a layer's query, key, and value inputs.
 #[derive(Debug)]
 pub enum InputNorms {
     /// Sliding layers normalize one input for queries, keys and values.
     Shared(CudaSlice<bf16>),
     /// Global layers normalize three separate inputs.
     Separate {
+        /// Weights for query inputs.
         q: CudaSlice<bf16>,
+        /// Weights for key inputs.
         k: CudaSlice<bf16>,
+        /// Weights for value inputs.
         v: CudaSlice<bf16>,
     },
 }
 
+/// BF16 attention projections and parameters for one layer.
+///
+/// Optional BF16 projections can be released after quantized copies cover all passes.
 #[derive(Debug)]
 pub struct AttentionWeights {
+    /// Query projection.
     pub q: Option<CudaSlice<bf16>>,
+    /// Key projection.
     pub k: Option<CudaSlice<bf16>>,
+    /// Value projection.
     pub v: Option<CudaSlice<bf16>>,
     /// Relative-feature projection `[heads * d_rel, hidden]`.
     pub r: Option<CudaSlice<bf16>>,
+    /// Output projection from query-head space back to the hidden width.
     pub o: Option<CudaSlice<bf16>>,
+    /// Projection for the elementwise attention output gate.
     pub gate: Option<CudaSlice<bf16>>,
+    /// Projection for the per-head sink logits.
     pub sink: Option<CudaSlice<bf16>>,
     /// `[heads, head_dim]`.
     pub q_clip_scale: CudaSlice<bf16>,
@@ -177,23 +210,31 @@ pub struct AttentionWeights {
     pub rel_clip_scale: CudaSlice<bf16>,
     /// `[d_rel, rel_extent]`.
     pub rel_table: CudaSlice<bf16>,
+    /// Convolution weights for keys and values before they are cached.
     pub kv_conv: KvConv,
 }
 
+/// Short-convolution weights used to process keys and values before caching.
 #[derive(Debug)]
 pub enum KvConv {
     /// Sliding layers: depthwise conv weights `[kv_dims, 4]` for keys and values.
     Static {
+        /// Static BF16 kernel for keys.
         k: CudaSlice<bf16>,
+        /// Static BF16 kernel for values.
         v: CudaSlice<bf16>,
     },
     /// Global layers: F32 static weights `[4, kv_dims]` plus a BF16 projection
     /// `[kv_heads * 4, hidden]` to per-token weights, for keys and values (dropped when
     /// FP8 copies cover every path).
     Dynamic {
+        /// Static F32 component of the key convolution.
         k_static: CudaSlice<f32>,
+        /// BF16 projection for token-dependent key weights, when retained.
         k_proj: Option<CudaSlice<bf16>>,
+        /// Static F32 component of the value convolution.
         v_static: CudaSlice<f32>,
+        /// BF16 projection for token-dependent value weights, when retained.
         v_proj: Option<CudaSlice<bf16>>,
     },
 }
@@ -201,26 +242,46 @@ pub enum KvConv {
 /// One layer's 128 experts as raw checkpoint bytes.
 #[derive(Debug)]
 pub struct ExpertWeights {
+    /// Encoding of the packed weights and their block scales.
     pub format: ExpertFormat,
     /// Gate and up rows interleaved, `[experts, 2 * width, hidden]` in the packed format.
     pub w13: CudaSlice<u8>,
+    /// Encoded block scales for the interleaved gate and up projections.
     pub w13_scale: CudaSlice<u8>,
     /// `[experts, hidden, width]` in the packed format.
     pub w2: CudaSlice<u8>,
+    /// Encoded block scales for the down projection.
     pub w2_scale: CudaSlice<u8>,
 }
 
+/// The checkpoint's expert weight encoding and any NVFP4 scaling metadata.
 #[derive(Debug)]
 pub enum ExpertFormat {
-    /// E2M1 pairs per byte, E4M3 scales per 16 values, and an F32 global scale per expert.
+    /// E2M1 pairs per byte, E4M3 scales per 16 values (or packed 4-bit offsets from per-row
+    /// `*_scale_base`), and an F32 global scale per expert.
     Nvfp4 {
+        /// F32 per-expert global scales for the gate and up projections.
         w13_global_scale: CudaSlice<f32>,
+        /// F32 per-expert global scales for the down projection.
         w2_global_scale: CudaSlice<f32>,
+        /// Row bases for offset-encoded gate and up block scales, when packed.
+        w13_scale_base: Option<CudaSlice<u8>>,
+        /// Row bases for offset-encoded down-projection block scales, when packed.
+        w2_scale_base: Option<CudaSlice<u8>>,
     },
     /// E4M3 values with E8M0 scales per 32 values.
     Mxfp8,
+    /// Two-plane MXFP6 E2M3: `w13` / `w2` hold `lo4` (`k/2`), `w13_hi2` / `w2_hi2` hold
+    /// packed 2-bit exponents (`k/4`), and `w13_scale` / `w2_scale` hold UE8M0 scales (`k/32`).
+    Mxfp6 {
+        /// Packed 2-bit exponent plane for `w13` (`[experts, 2 * width, hidden / 4]`).
+        w13_hi2: CudaSlice<u8>,
+        /// Packed 2-bit exponent plane for `w2` (`[experts, hidden, width / 4]`).
+        w2_hi2: CudaSlice<u8>,
+    },
 }
 
+/// Projections for one of the repeated core's recurrent message gates.
 #[derive(Debug)]
 pub struct MessageGateWeights {
     /// `[rank, 2 * hidden]`, dropped when FP8 copies cover every path.
@@ -317,6 +378,11 @@ impl Loader<'_> {
 impl Weights {
     /// Uploads every text-model weight but the embedding table, which goes to mapped host
     /// memory. Takes about 18 GB of device memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing or incompatible checkpoint tensors, or if
+    /// CUDA cannot allocate or upload a buffer.
     pub fn load(
         checkpoint: &Checkpoint,
         config: &TextConfig,
@@ -356,6 +422,11 @@ impl Weights {
     /// - Whenever the effective LM head format is `Fp8` or `Nvfp4`, loads
     ///   `model.llm.unembed.weight` directly into mapped host memory and quantizes from
     ///   there, avoiding the 885 MiB BF16 LM-head device peak.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing or incompatible checkpoint tensors, or if CUDA
+    /// cannot load a kernel, allocate memory, upload weights, or quantize them.
     pub fn load_with_options(
         checkpoint: &Checkpoint,
         config: &TextConfig,
@@ -378,6 +449,10 @@ impl Weights {
         let linear_nvfp4 = (effective_lm_head == LmHeadFormat::Nvfp4)
             .then(|| LinearNvfp4::load(gpu.context()))
             .transpose()?;
+        let experts_ops = (options.nvfp4_scales == Nvfp4ScaleFormat::Offset4
+            || options.mxfp8_experts == Mxfp8ExpertFormat::Mxfp6)
+            .then(|| Experts::load(gpu.context()))
+            .transpose()?;
         let release_inputs = options.weights == WeightFormat::Fp8 && options.prefill_dense_fp8;
         let release_o = release_inputs
             && matches!(options.output, OutputProjection::Fp8 | OutputProjection::Mxfp8);
@@ -388,6 +463,19 @@ impl Weights {
         for layer_idx in 0..config.num_hidden_layers {
             let mut layer = LayerWeights::load(&loader, config, layer_idx)
                 .with_context(|| format!("loading layer {layer_idx}"))?;
+            if let Some(experts) = experts_ops.as_ref() {
+                if options.nvfp4_scales == Nvfp4ScaleFormat::Offset4 {
+                    pack_layer_nvfp4_scales_4bit(&mut layer, experts, config, stream)
+                        .with_context(|| {
+                            format!("packing 4-bit NVFP4 scales for layer {layer_idx}")
+                        })?;
+                }
+                if options.mxfp8_experts == Mxfp8ExpertFormat::Mxfp6 {
+                    pack_layer_mxfp8_to_mxfp6(&mut layer, experts, stream).with_context(|| {
+                        format!("packing MXFP6 E2M3 experts for layer {layer_idx}")
+                    })?;
+                }
+            }
             if options.weights == WeightFormat::Fp8 {
                 let linear = linear_fp8.as_ref().context("LinearFp8 missing")?;
                 quantize_layer_fp8(
@@ -446,7 +534,11 @@ impl Weights {
             output: options.output,
         };
         stream.synchronize()?;
-        if release_inputs || effective_lm_head != LmHeadFormat::Bf16 {
+        if release_inputs
+            || effective_lm_head != LmHeadFormat::Bf16
+            || options.nvfp4_scales == Nvfp4ScaleFormat::Offset4
+            || options.mxfp8_experts == Mxfp8ExpertFormat::Mxfp6
+        {
             gpu.trim_mem_pool()?;
         }
         Ok(weights)
@@ -476,6 +568,11 @@ impl Weights {
     /// projection too with [`OutputProjection::Fp8`], which decode then reads, and moves
     /// the BF16 LM head to mapped host memory when quantized. Returns the bytes the copies
     /// take.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projections are already quantized, a required BF16
+    /// tensor is missing, or CUDA cannot complete the conversion.
     pub fn quantize_fp8(
         &mut self,
         linear: &LinearFp8,
@@ -524,6 +621,11 @@ impl Weights {
 
     /// Quantizes `lm_head` to `format` (if not already quantized) and moves the BF16 original
     /// to mapped host memory. Returns the bytes of any newly allocated quantized copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an incompatible tensor shape or a CUDA conversion,
+    /// allocation, or synchronization failure.
     pub fn quantize_lm_head(
         &mut self,
         linear_fp8: &LinearFp8,
@@ -751,7 +853,12 @@ impl AttentionWeights {
         }
     }
 
-    /// The projections of the attention inputs, in the runner's launch order.
+    /// Borrows the BF16 projections in launch order: query, relative feature, gate,
+    /// sink, key, then value. Dynamic convolutions append their key and value projections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of these BF16 tensors was released.
     pub fn input_projections(&self) -> anyhow::Result<Vec<&CudaSlice<bf16>>> {
         let missing = "BF16 attention input projections were released for FP8 copies";
         let mut weights = vec![
@@ -847,6 +954,8 @@ impl ExpertWeights {
                     format: ExpertFormat::Nvfp4 {
                         w13_global_scale: global_scale("w13")?,
                         w2_global_scale: global_scale("w2")?,
+                        w13_scale_base: None,
+                        w2_scale_base: None,
                     },
                     w13: loader.raw(&name, Dtype::U8, &[experts, 2 * width, hidden / 2])?,
                     w13_scale: loader.raw(
@@ -891,8 +1000,74 @@ impl ExpertWeights {
     }
 }
 
+/// Packs one layer's NVFP4 8-bit E4M3 expert scales into per-row bases + 4-bit offsets on GPU
+/// (re-rounding the ~0.3–0.4% of tiny clamped blocks in place) and drops the full 8-bit scales.
+fn pack_layer_nvfp4_scales_4bit(
+    layer: &mut LayerWeights,
+    experts: &Experts,
+    config: &TextConfig,
+    stream: &Arc<CudaStream>,
+) -> anyhow::Result<()> {
+    let e = &mut layer.experts;
+    let ExpertFormat::Nvfp4 {
+        w13_scale_base,
+        w2_scale_base,
+        ..
+    } = &mut e.format
+    else {
+        return Ok(());
+    };
+    let n_experts = config.n_routed_experts;
+    let hidden = config.hidden_size;
+    let width = config.intermediate_size;
+    let (s13_packed, b13) = experts.pack_nvfp4_scales_4bit(
+        stream,
+        &mut e.w13,
+        &e.w13_scale,
+        n_experts * 2 * width,
+        hidden / 16,
+    )?;
+    e.w13_scale = s13_packed;
+    *w13_scale_base = Some(b13);
+    let (s2_packed, b2) = experts.pack_nvfp4_scales_4bit(
+        stream,
+        &mut e.w2,
+        &e.w2_scale,
+        n_experts * hidden,
+        width / 16,
+    )?;
+    e.w2_scale = s2_packed;
+    *w2_scale_base = Some(b2);
+    Ok(())
+}
+
+/// Re-quantizes one MXFP8 expert layer (`w13`, `w2`) to 2-plane MXFP6 E2M3 on GPU and drops
+/// the original 8-bit buffers right away so peak VRAM stays low.
+fn pack_layer_mxfp8_to_mxfp6(
+    layer: &mut LayerWeights,
+    experts: &Experts,
+    stream: &Arc<CudaStream>,
+) -> anyhow::Result<()> {
+    let e = &mut layer.experts;
+    if !matches!(e.format, ExpertFormat::Mxfp8) {
+        return Ok(());
+    }
+    let (w13_lo4, w13_hi2, s13_out) = experts.pack_mxfp8_to_mxfp6(stream, &e.w13, &e.w13_scale)?;
+    e.w13 = w13_lo4;
+    e.w13_scale = s13_out;
+    let (w2_lo4, w2_hi2, s2_out) = experts.pack_mxfp8_to_mxfp6(stream, &e.w2, &e.w2_scale)?;
+    e.w2 = w2_lo4;
+    e.w2_scale = s2_out;
+    e.format = ExpertFormat::Mxfp6 { w13_hi2, w2_hi2 };
+    Ok(())
+}
+
 impl MessageGateWeights {
     /// The down, forget and gain weights, in the order the gate reads them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BF16 down projection was released.
     pub fn matrices(&self) -> anyhow::Result<[&CudaSlice<bf16>; 3]> {
         let down = self
             .down

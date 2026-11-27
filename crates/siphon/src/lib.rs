@@ -12,5 +12,6 @@ pub mod vision;
 pub use checkpoint::{Checkpoint, TensorEntry};
 pub use config::{LoopConfig, TextConfig};
 pub use format::{
-    KvFormat, KvQuant, LmHeadFormat, MIXED_FP8_VISITS, OutputProjection, VisionFormat, WeightFormat,
+    KvFormat, KvQuant, LmHeadFormat, MIXED_FP8_VISITS, Mxfp8ExpertFormat, Nvfp4ScaleFormat,
+    OutputProjection, VisionFormat, WeightFormat,
 };

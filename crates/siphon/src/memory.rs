@@ -17,7 +17,8 @@ use anyhow::{Context as _, ensure};
 use safetensors::Dtype;
 
 use crate::{
-    Checkpoint, KvFormat, LmHeadFormat, OutputProjection, TextConfig, VisionFormat, WeightFormat,
+    Checkpoint, KvFormat, LmHeadFormat, Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection,
+    TextConfig, VisionFormat, WeightFormat,
 };
 
 /// Device memory the CUDA context takes, rounded up: 507 MiB on an RTX 5090 with driver
@@ -50,8 +51,9 @@ pub const STREAM_RUNTIME_BYTES: usize = 4 << 20;
 /// 65 MiB under it on an RTX 5090 (`docs/engine.md`).
 pub const DEFAULT_MARGIN: usize = 256 << 20;
 
-/// Rows of a prefill chunk unless `--prefill-chunk` says otherwise, and the most it takes.
+/// Default number of prompt tokens processed in one prefill chunk.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+/// Maximum number of prompt tokens accepted in one prefill chunk.
 pub const MAX_PREFILL_CHUNK: usize = 4096;
 
 /// What a KV pool adds beyond its pages: the page tables of every slot's reservations and
@@ -231,19 +233,23 @@ pub const DFLASH2_RING_SLOTS: usize = 2048 + 8;
 pub const TAIL_ROWS: usize = DFLASH2_RING_SLOTS;
 /// Plain steps whose taps the speculator keeps at most.
 pub const PLAIN_RUN_ROWS: usize = 32;
-/// Ranked tokens and context tokens a shortlist head holds at most, and the first special
-/// token id, from which on it keeps every token.
+/// Number of ranked tokens the default shortlist retains.
 pub const SHORTLIST_ROWS: usize = 32768;
+/// Number of additional context tokens the default shortlist can retain.
 pub const SHORTLIST_CONTEXT_ROWS: usize = 16384;
+/// First special token ID in the checkpoint; the shortlist retains all later IDs.
 pub const FIRST_SPECIAL: usize = 199_990;
-/// The bundled draft's layers, taps, query width and MLP width; a 2DSD DFlash draft has
-/// the same widths.
+/// Number of decoder layers in the bundled draft.
 pub const DRAFT_LAYERS: usize = 3;
+/// Number of target-layer activations consumed by each draft token in the bundled draft.
 pub const DRAFT_TAPS: usize = 4;
+/// Query projection width of the bundled draft and 2DSD DFlash.
 pub const DRAFT_Q_WIDTH: usize = 24 * 128;
+/// MLP intermediate width of the bundled draft and 2DSD DFlash.
 pub const DRAFT_MLP_WIDTH: usize = 9216;
-/// DFlash 2's query width and MLP width.
+/// Query projection width of DFlash 2.
 pub const DFLASH2_Q_WIDTH: usize = 32 * 128;
+/// MLP intermediate width of DFlash 2.
 pub const DFLASH2_MLP_WIDTH: usize = 6912;
 /// Rank of the Markov heads, the width of their fold rows.
 pub const MARKOV_RANK: usize = 256;
@@ -276,12 +282,19 @@ pub const KV_PAGE_BYTES: usize = 2 << 20;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[expect(clippy::struct_excessive_bools, reason = "one flag per approximation")]
 pub struct DraftApprox {
+    /// Count FP8 copies of the draft block and context projections.
     pub fp8_backbone: bool,
+    /// Count NVFP4 copies of the draft block and context projections.
     pub nvfp4_backbone: bool,
+    /// Count an FP8 copy of the draft LM head or its shortlist rows.
     pub fp8_head: bool,
+    /// Count an NVFP4 copy of the draft LM head or its shortlist rows.
     pub nvfp4_head: bool,
+    /// Count an FP8 copy of the Markov fold projection when the draft has one.
     pub fp8_fold: bool,
+    /// Count the draft key and value caches in E4M3.
     pub fp8_kv: bool,
+    /// Limit the draft LM head and Markov fold to the shortlist's rows.
     pub shortlist: bool,
 }
 
@@ -299,6 +312,7 @@ pub enum DraftChoice<'a> {
 /// The vision tower of `--vision`, and the largest image a request may send.
 #[derive(Clone, Copy, Debug)]
 pub struct VisionInputs {
+    /// Element format used by the vision encoder's weights.
     pub format: VisionFormat,
     /// Image tokens of the largest image ([`max_image_tokens`]).
     pub max_image_tokens: usize,
@@ -310,6 +324,10 @@ pub struct VisionInputs {
 /// `max_pixels` pixels: a square of `max_pixels` covers `ceil(sqrt(max_pixels) / side)`
 /// tokens a side, `side` being the pixels of one token (40), and one more row and column
 /// leave room for the padding of images that are not square. 1,369 for 1920 x 1080.
+///
+/// # Panics
+///
+/// Panics if `side` is zero.
 #[must_use]
 pub fn max_image_tokens(side: usize, max_pixels: usize) -> usize {
     let tokens = max_pixels.isqrt().div_ceil(side) + 1;
@@ -319,9 +337,11 @@ pub fn max_image_tokens(side: usize, max_pixels: usize) -> usize {
 /// What a plan depends on.
 #[derive(Clone, Copy, Debug)]
 pub struct PlanInputs<'a> {
+    /// Target decoder configuration used to derive layer visits and tensor shapes.
     pub config: &'a TextConfig,
     /// The target checkpoint, of which only the headers are read.
     pub checkpoint: &'a Checkpoint,
+    /// Storage format used by default for the target's large projections.
     pub weights: WeightFormat,
     /// The output projection's format under [`WeightFormat::Fp8`].
     pub output: OutputProjection,
@@ -335,7 +355,13 @@ pub struct PlanInputs<'a> {
     /// Whether the target GPU supports block-scaled MMA (`sm_120a` Blackwell = `true`,
     /// `sm_89` Ada = `false`). Controls whether MXFP8 `W_o` runs in prefill.
     pub block_scaled_mma: bool,
+    /// Storage format of NVFP4 expert block scales (`8bit` E4M3 or `4bit` per-row offsets).
+    pub nvfp4_scales: Nvfp4ScaleFormat,
+    /// Storage format of MXFP8 expert layers (`mxfp8` or load-time `mxfp6` E2M3).
+    pub mxfp8_experts: Mxfp8ExpertFormat,
+    /// Layout and element format of the target's key and value caches.
     pub kv: KvFormat,
+    /// Draft model and quantization settings for speculative decoding.
     pub draft: DraftChoice<'a>,
     /// Rows of the largest prefill chunk, or 0 if nothing prefills.
     pub prefill_chunk: usize,
@@ -540,6 +566,11 @@ enum DraftKind {
 impl Planner {
     /// Reads the shapes `inputs` names: the target's from its config and headers, the
     /// draft's from its headers and, for a DFlash drafter, its `config.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream count is outside `1..=`[`BATCH_ROWS`] or the
+    /// selected draft's configuration or tensor metadata cannot be read or interpreted.
     #[expect(clippy::too_many_lines, reason = "one term per buffer")]
     pub fn new(inputs: &PlanInputs<'_>) -> anyhow::Result<Self> {
         let c = inputs.config;
@@ -697,7 +728,14 @@ impl Planner {
             capacity: 0,
             pooled: inputs.pooled,
             streams,
-            weights: target_weight_bytes(inputs.checkpoint, lm_head, release_bf16, release_bf16_o),
+            weights: target_weight_bytes(
+                inputs.checkpoint,
+                lm_head,
+                release_bf16,
+                release_bf16_o,
+                inputs.nvfp4_scales,
+                inputs.mxfp8_experts,
+            ),
             fp8_copies: quantized_copy_bytes(
                 c,
                 inputs.weights,
@@ -854,6 +892,8 @@ fn target_weight_bytes(
     lm_head: LmHeadFormat,
     release_bf16_inputs: bool,
     release_bf16_o: bool,
+    nvfp4_scales: Nvfp4ScaleFormat,
+    mxfp8_experts: Mxfp8ExpertFormat,
 ) -> usize {
     checkpoint
         .tensors()
@@ -863,6 +903,24 @@ fn target_weight_bytes(
             name.starts_with("model.llm.") && !host_tensor(name, lm_head) && !released
         })
         .map(|(name, entry)| {
+            if nvfp4_scales == Nvfp4ScaleFormat::Offset4
+                && entry.dtype == Dtype::F8_E4M3
+                && (name.ends_with(".w13_weight_scale") || name.ends_with(".w2_weight_scale"))
+            {
+                // Packed 4-bit offsets (half the bytes) plus one E4M3 base byte per row.
+                let rows: usize = entry
+                    .shape
+                    .split_last()
+                    .map_or(0, |(_, prefix)| prefix.iter().product());
+                return entry.byte_len() / 2 + rows;
+            }
+            if mxfp8_experts == Mxfp8ExpertFormat::Mxfp6
+                && entry.dtype == Dtype::F8_E4M3
+                && (name.ends_with(".w13_weight") || name.ends_with(".w2_weight"))
+            {
+                // 6-bit E2M3 (lo4 = k/2, hi2 = k/4 -> 3/4 of MXFP8 weight bytes).
+                return entry.byte_len() * 3 / 4;
+            }
             let widened = [
                 "attn_res.",
                 ".mlp.gate.",
@@ -1297,14 +1355,19 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
     bytes
 }
 
-/// The vision tower's width, layers, MLP width, values per patch, position-table rows,
-/// projector width and output width, which `siphon_cuda::vision` checks at load.
+/// Width of the vision encoder's residual stream.
 pub const VISION_DIM: usize = 1024;
+/// Number of transformer layers in the vision encoder.
 pub const VISION_LAYERS: usize = 23;
+/// MLP intermediate width of the vision encoder.
 pub const VISION_MLP: usize = 4096;
+/// Number of scalar input values in one RGB patch.
 pub const VISION_PATCH_VALUES: usize = 1200;
+/// Number of rows in the learned image position table.
 pub const VISION_POSITIONS: usize = 32 * 32;
+/// Intermediate width of the vision projector.
 pub const VISION_PROJECTION: usize = 4096;
+/// Width of the vision projector's output in the text decoder's embedding space.
 pub const VISION_OUT: usize = 2304;
 
 /// Device bytes of the vision tower with its linear layers in `format`: the weights, plus
@@ -1480,15 +1543,36 @@ mod tests {
         );
         let checkpoint = Checkpoint::open(&dir).expect("opening");
         assert_eq!(
-            target_weight_bytes(&checkpoint, LmHeadFormat::Bf16, false, false),
+            target_weight_bytes(
+                &checkpoint,
+                LmHeadFormat::Bf16,
+                false,
+                false,
+                Nvfp4ScaleFormat::E4m3,
+                Mxfp8ExpertFormat::Mxfp8
+            ),
             200 + 40 + 1000 + 50
         );
         assert_eq!(
-            target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, false, false),
+            target_weight_bytes(
+                &checkpoint,
+                LmHeadFormat::Fp8,
+                false,
+                false,
+                Nvfp4ScaleFormat::E4m3,
+                Mxfp8ExpertFormat::Mxfp8
+            ),
             50 + 40 + 1000
         );
         assert_eq!(
-            target_weight_bytes(&checkpoint, LmHeadFormat::Nvfp4, false, false),
+            target_weight_bytes(
+                &checkpoint,
+                LmHeadFormat::Nvfp4,
+                false,
+                false,
+                Nvfp4ScaleFormat::E4m3,
+                Mxfp8ExpertFormat::Mxfp8
+            ),
             50 + 40 + 1000
         );
         assert_eq!(bundled_shape(&checkpoint).expect("a draft").weights, 600);
@@ -1518,14 +1602,97 @@ mod tests {
             ],
         );
         let checkpoint = Checkpoint::open(&dir).expect("opening");
-        let keep_all = target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, false, false);
-        let drop_inputs = target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, true, false);
-        let drop_inputs_and_o = target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, true, true);
+        let keep_all = target_weight_bytes(
+            &checkpoint,
+            LmHeadFormat::Fp8,
+            false,
+            false,
+            Nvfp4ScaleFormat::E4m3,
+            Mxfp8ExpertFormat::Mxfp8,
+        );
+        let drop_inputs = target_weight_bytes(
+            &checkpoint,
+            LmHeadFormat::Fp8,
+            true,
+            false,
+            Nvfp4ScaleFormat::E4m3,
+            Mxfp8ExpertFormat::Mxfp8,
+        );
+        let drop_inputs_and_o = target_weight_bytes(
+            &checkpoint,
+            LmHeadFormat::Fp8,
+            true,
+            true,
+            Nvfp4ScaleFormat::E4m3,
+            Mxfp8ExpertFormat::Mxfp8,
+        );
         // Dropped input projections + gate down = 2 * (500+200+200+100+500+20+30+30+80) = 3320 B.
         assert_eq!(keep_all - drop_inputs, 3320);
         // Dropping W_o frees an additional 2 * 400 = 800 B; forget/gain/experts stay.
         assert_eq!(drop_inputs - drop_inputs_and_o, 800);
         assert_eq!(drop_inputs_and_o, 1000 + 2 * 80 + 2 * 80);
+
+        // 4-bit offset NVFP4 scales halve F8_E4M3 w13/w2 scale tensors plus 1 base byte per row,
+        // and MXFP6 shrinks F8_E4M3 w13/w2 weights by 25% without touching NVFP4 U8 weights.
+        let s4_dir = self::checkpoint(
+            "nvfp4-scales-4bit",
+            &[
+                (
+                    "model.llm.layers.0.mlp.experts.w13_weight",
+                    Dtype::U8,
+                    &[2, 4, 1152],
+                ),
+                (
+                    "model.llm.layers.0.mlp.experts.w13_weight_scale",
+                    Dtype::F8_E4M3,
+                    &[2, 4, 144],
+                ),
+                (
+                    "model.llm.layers.0.mlp.experts.w2_weight_scale",
+                    Dtype::F8_E4M3,
+                    &[2, 4, 72],
+                ),
+                (
+                    "model.llm.layers.20.mlp.experts.w13_weight",
+                    Dtype::F8_E4M3,
+                    &[2, 4, 2304],
+                ),
+                (
+                    "model.llm.layers.20.mlp.experts.w13_weight_scale",
+                    Dtype::U8,
+                    &[2, 4, 72],
+                ),
+            ],
+        );
+        let s4_cp = Checkpoint::open(&s4_dir).expect("opening");
+        let b8 = target_weight_bytes(
+            &s4_cp,
+            LmHeadFormat::Fp8,
+            false,
+            false,
+            Nvfp4ScaleFormat::E4m3,
+            Mxfp8ExpertFormat::Mxfp8,
+        );
+        let b4 = target_weight_bytes(
+            &s4_cp,
+            LmHeadFormat::Fp8,
+            false,
+            false,
+            Nvfp4ScaleFormat::Offset4,
+            Mxfp8ExpertFormat::Mxfp8,
+        );
+        let b4_fp6 = target_weight_bytes(
+            &s4_cp,
+            LmHeadFormat::Fp8,
+            false,
+            false,
+            Nvfp4ScaleFormat::Offset4,
+            Mxfp8ExpertFormat::Mxfp6,
+        );
+        assert_eq!(b8, 2 * 4 * (1152 + 144 + 72 + 2304 + 72));
+        assert_eq!(b4, 2 * 4 * (1152 + 72 + 1 + 36 + 1 + 2304 + 72));
+        assert_eq!(b4_fp6, 2 * 4 * (1152 + 72 + 1 + 36 + 1 + 1728 + 72));
+        std::fs::remove_dir_all(s4_dir).expect("cleaning up");
 
         // NVFP4 LM head replaces FP8 LM head copy (never keeps both).
         let c = config();
@@ -1589,6 +1756,8 @@ mod tests {
                 lm_head: None,
                 prefill_dense_fp8: false,
                 block_scaled_mma: true,
+                nvfp4_scales: Nvfp4ScaleFormat::E4m3,
+                mxfp8_experts: Mxfp8ExpertFormat::Mxfp8,
                 kv: KvFormat::Fp8,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
@@ -1630,6 +1799,8 @@ mod tests {
                 lm_head: None,
                 prefill_dense_fp8: false,
                 block_scaled_mma: true,
+                nvfp4_scales: Nvfp4ScaleFormat::E4m3,
+                mxfp8_experts: Mxfp8ExpertFormat::Mxfp8,
                 kv,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
@@ -1827,6 +1998,8 @@ mod tests {
                 lm_head: None,
                 prefill_dense_fp8: false,
                 block_scaled_mma: true,
+                nvfp4_scales: Nvfp4ScaleFormat::E4m3,
+                mxfp8_experts: Mxfp8ExpertFormat::Mxfp8,
                 kv,
                 draft,
                 prefill_chunk: 2048,

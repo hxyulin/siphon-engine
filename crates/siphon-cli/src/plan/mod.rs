@@ -80,6 +80,12 @@ struct Args {
     /// Set the dense prefill format under FP8 weights.
     #[arg(long, value_name = "FORMAT", default_value = "bf16", value_parser = ["bf16", "fp8"])]
     prefill_dense: String,
+    /// Set NVFP4 expert block scale format (8bit or 4bit).
+    #[arg(long, value_name = "FORMAT", default_value_t)]
+    nvfp4_scales: siphon::Nvfp4ScaleFormat,
+    /// Set MXFP8 expert layer storage format (mxfp8 or mxfp6).
+    #[arg(long, value_name = "FORMAT", default_value_t)]
+    mxfp8_experts: siphon::Mxfp8ExpertFormat,
     /// Set the draft weight format.
     #[arg(long, value_name = "FORMAT", default_value = "auto",
           value_parser = ["auto", "bf16", "fp8", "nvfp4", "nvfp4-backbone"])]
@@ -140,6 +146,8 @@ impl Args {
                 output: self.output_projection,
                 lm_head: self.lm_head,
                 prefill_dense_fp8: self.prefill_dense == "fp8",
+                nvfp4_scales: self.nvfp4_scales,
+                mxfp8_experts: self.mxfp8_experts,
                 draft_weights: self.draft_weights.clone(),
             },
         )
@@ -245,6 +253,12 @@ fn serve_command(args: &Args, app: &App) -> anyhow::Result<String> {
     )?;
     if let Some(format) = args.lm_head {
         write!(command, " --lm-head {format}")?;
+    }
+    if args.nvfp4_scales != siphon::Nvfp4ScaleFormat::default() {
+        write!(command, " --nvfp4-scales {}", args.nvfp4_scales)?;
+    }
+    if args.mxfp8_experts != siphon::Mxfp8ExpertFormat::default() {
+        write!(command, " --mxfp8-experts {}", args.mxfp8_experts)?;
     }
     if args.vision {
         write!(

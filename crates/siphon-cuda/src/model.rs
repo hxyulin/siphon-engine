@@ -1004,7 +1004,13 @@ impl Model {
         );
         if activations == ExpertActivations::Fp8 {
             for (layer, w) in self.ctx.weights.layers.iter().enumerate() {
-                if matches!(w.experts.format, ExpertFormat::Nvfp4 { .. }) {
+                if matches!(
+                    w.experts.format,
+                    ExpertFormat::Nvfp4 {
+                        w13_scale_base: None,
+                        ..
+                    }
+                ) {
                     for scales in [&w.experts.w13_scale, &w.experts.w2_scale] {
                         let bad = self
                             .ctx
@@ -2743,15 +2749,23 @@ impl Ctx {
             ExpertFormat::Nvfp4 {
                 w13_global_scale,
                 w2_global_scale,
+                w13_scale_base,
+                w2_scale_base,
             } => (
                 experts::ExpertFormat::Nvfp4 {
                     global_scale: w13_global_scale,
+                    scale_base: w13_scale_base.as_ref(),
                 },
                 experts::ExpertFormat::Nvfp4 {
                     global_scale: w2_global_scale,
+                    scale_base: w2_scale_base.as_ref(),
                 },
             ),
             ExpertFormat::Mxfp8 => (experts::ExpertFormat::Mxfp8, experts::ExpertFormat::Mxfp8),
+            ExpertFormat::Mxfp6 { w13_hi2, w2_hi2 } => (
+                experts::ExpertFormat::Mxfp6 { hi2: w13_hi2 },
+                experts::ExpertFormat::Mxfp6 { hi2: w2_hi2 },
+            ),
         };
         let w13 = experts::ExpertWeights {
             format: w13_format,

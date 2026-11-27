@@ -4851,7 +4851,10 @@ impl Ctx {
         )?;
         let (w13, w2) = self.expert_weights(w);
         self.group_rows(&rows(&t.indices, m, top_k), &mut t.experts, m)?;
-        if crate::BLOCK_SCALED_MMA && self.expert_activations != ExpertActivations::Bf16 {
+        if crate::BLOCK_SCALED_MMA
+            && self.expert_activations != ExpertActivations::Bf16
+            && !matches!(w13.format, experts::ExpertFormat::Mxfp6 { .. })
+        {
             let experts = &self.kernels.experts;
             let stream = &self.stream;
             if !w13_prequantized {

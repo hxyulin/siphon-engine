@@ -603,6 +603,7 @@ fn quantize_reference(
             HIDDEN,
             ExpertFormat::Nvfp4 {
                 global_scale: dummy_global_scale,
+                scale_base: None,
             },
             out,
         ),
@@ -612,6 +613,7 @@ fn quantize_reference(
             HIDDEN,
             ExpertFormat::Nvfp4 {
                 global_scale: dummy_global_scale,
+                scale_base: None,
             },
             out,
         ),

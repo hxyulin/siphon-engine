@@ -427,6 +427,10 @@ pub struct Options {
     /// Expert activation precision (`bf16`, `quantized`, or `fp8`), as `ExpertActivations`
     /// parses it.
     pub expert_activations: String,
+    /// Storage format of NVFP4 expert block scales (`8bit` E4M3 or `4bit` per-row offsets).
+    pub nvfp4_scales: siphon::Nvfp4ScaleFormat,
+    /// Storage format of MXFP8 expert layers (`mxfp8` or load-time `mxfp6` E2M3).
+    pub mxfp8_experts: siphon::Mxfp8ExpertFormat,
     /// Whether every request decodes greedily, whatever it asks.
     pub greedy: bool,
     /// Tokens per second that each decoding request gets at least while another prefills,
@@ -966,6 +970,8 @@ mod cuda {
             lm_head,
             prefill_dense_fp8,
             block_scaled_mma: siphon_cuda::BLOCK_SCALED_MMA,
+            nvfp4_scales: options.nvfp4_scales,
+            mxfp8_experts: options.mxfp8_experts,
             kv,
             draft: options
                 .drafter
@@ -994,6 +1000,8 @@ mod cuda {
                 output,
                 lm_head,
                 prefill_dense_fp8,
+                nvfp4_scales: options.nvfp4_scales,
+                mxfp8_experts: options.mxfp8_experts,
             },
         )?;
         let (page, _) = granularity(gpu.context())?;
@@ -1292,6 +1300,8 @@ mod cuda {
             "prefill_attention": options.prefill_attention,
             "prefill_dense": options.prefill_dense,
             "expert_activations": options.expert_activations,
+            "nvfp4_scales": options.nvfp4_scales.to_string(),
+            "mxfp8_experts": options.mxfp8_experts.to_string(),
             "moe_top_k": options.moe_top_k,
             "moe_min_k": options.moe_min_k,
             "moe_prune": options.moe_prune,

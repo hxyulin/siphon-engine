@@ -5,7 +5,7 @@ use clap::{
     ArgMatches, Command, FromArgMatches, Parser, ValueEnum, ValueHint,
     builder::RangedU64ValueParser, parser::ValueSource,
 };
-use siphon::{OutputProjection, memory};
+use siphon::{Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection, memory};
 
 use crate::serve::{engine, vision};
 
@@ -207,6 +207,12 @@ struct FormatOptions {
     #[arg(long, value_name = "FORMAT", default_value = "bf16",
           value_parser = ["bf16", "quantized", "fp8"])]
     expert_activations: String,
+    /// Set the NVFP4 expert block scale format (8bit or 4bit).
+    #[arg(long, value_name = "FORMAT", default_value_t)]
+    nvfp4_scales: Nvfp4ScaleFormat,
+    /// Set the MXFP8 expert layer storage format (mxfp8 or mxfp6).
+    #[arg(long, value_name = "FORMAT", default_value_t)]
+    mxfp8_experts: Mxfp8ExpertFormat,
 }
 
 #[derive(clap::Args)]
@@ -412,6 +418,8 @@ impl Cli {
                 prefill_attention: formats.prefill_attention,
                 prefill_dense: formats.prefill_dense,
                 expert_activations: formats.expert_activations,
+                nvfp4_scales: formats.nvfp4_scales,
+                mxfp8_experts: formats.mxfp8_experts,
                 greedy: spec.greedy,
                 decode_floor: gpu.decode_floor,
                 piggyback_budget: gpu.piggyback_budget.filter(|&budget| budget > 0),

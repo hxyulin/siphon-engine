@@ -103,7 +103,10 @@ impl Projection {
     fn weights(&self) -> ExpertWeights<'_> {
         ExpertWeights {
             format: match &self.global_scale {
-                Some(global_scale) => ExpertFormat::Nvfp4 { global_scale },
+                Some(global_scale) => ExpertFormat::Nvfp4 {
+                    global_scale,
+                    scale_base: None,
+                },
                 None => ExpertFormat::Mxfp8,
             },
             weight: &self.weight,
@@ -1725,6 +1728,7 @@ fn quantize_rows_matches_cpu_model() -> anyhow::Result<()> {
         let format = if fp4 {
             ExpertFormat::Nvfp4 {
                 global_scale: &dummy,
+                scale_base: None,
             }
         } else {
             ExpertFormat::Mxfp8
@@ -1814,6 +1818,7 @@ fn quantize_rows_fp8_pairs_mxfp8() -> anyhow::Result<()> {
     let dummy = s.stream().clone_htod(&[1f32])?;
     let nvfp4 = ExpertFormat::Nvfp4 {
         global_scale: &dummy,
+        scale_base: None,
     };
     let mut out = QuantizedRows::new(s.stream(), 300 * HIDDEN, 300)?;
     for (k, rows) in [(HIDDEN, 300), (INTERMEDIATE, 77)] {
@@ -2587,5 +2592,495 @@ fn bench_expert_activations() -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Verifies `pack_nvfp4_scales_4bit` and every 4-bit offset scale expert kernel (`matvec`,
+/// `mlp`, `mlp_rows` for m = 1, 4, 12, 40, `matmul` BF16-act, and `matmul` FP8-act) against
+/// the existing 8-bit scale kernels running on the unpacked `(packed_weight, unpacked_scales)`
+/// tensors — they must agree bit for bit.
+#[test]
+fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
+    use siphon_cuda::ops::experts_rows::ExpertsRows;
+
+    let s = Setup::new()?;
+    let rows_ops = ExpertsRows::load(s.gpu.context())?;
+    let stream = s.stream();
+    let file = "experts_nvfp4";
+    let fixture = Fixture::load(file)?;
+
+    let pack_proj = |name: &str, target_n: usize| -> anyhow::Result<_> {
+        let proj = Projection::load(&s, &fixture, file, name)?;
+        let experts = proj.weight.len() / (proj.n * (proj.k / 2));
+        // Tile fixture rows up to `target_n` (2304) so full-size `expert_mlp` / `expert_mlp_rows`
+        // run without needing an external checkpoint.
+        assert_eq!(target_n % proj.n, 0);
+        let reps = target_n / proj.n;
+        let orig_w = stream.clone_dtoh(&proj.weight)?;
+        let orig_s = stream.clone_dtoh(&proj.scales)?;
+        let w_stride = proj.n * (proj.k / 2);
+        let s_stride = proj.n * (proj.k / 16);
+        let mut full_w = Vec::with_capacity(experts * reps * w_stride);
+        let mut full_s = Vec::with_capacity(experts * reps * s_stride);
+        for e in 0..experts {
+            for _ in 0..reps {
+                full_w.extend_from_slice(&orig_w[e * w_stride..(e + 1) * w_stride]);
+                full_s.extend_from_slice(&orig_s[e * s_stride..(e + 1) * s_stride]);
+            }
+        }
+        let mut full_w_gpu = stream.clone_htod(&full_w)?;
+        let full_s_gpu = stream.clone_htod(&full_s)?;
+        let rows = experts * target_n;
+        let blocks = proj.k / 16;
+        let (packed_scales, scale_base) = s.experts.pack_nvfp4_scales_4bit(
+            stream,
+            &mut full_w_gpu,
+            &full_s_gpu,
+            rows,
+            blocks,
+        )?;
+        let h_packed = stream.clone_dtoh(&packed_scales)?;
+        let h_base = stream.clone_dtoh(&scale_base)?;
+        let mut h_unpacked = vec![0u8; rows * blocks];
+        let pairs = blocks / 2;
+        for r in 0..rows {
+            let b = h_base[r];
+            for p in 0..pairs {
+                let byte = h_packed[r * pairs + p];
+                let off0 = byte & 0x0f;
+                let off1 = byte >> 4;
+                assert!(off0 <= b && off1 <= b, "row {r} pair {p}: offset > base");
+                h_unpacked[r * blocks + 2 * p] = b - off0;
+                h_unpacked[r * blocks + 2 * p + 1] = b - off1;
+            }
+        }
+        let unpacked_scales = stream.clone_htod(&h_unpacked)?;
+        let full_proj = Projection {
+            weight: full_w_gpu,
+            scales: full_s_gpu,
+            global_scale: proj.global_scale,
+            n: target_n,
+            k: proj.k,
+        };
+        Ok((full_proj, packed_scales, scale_base, unpacked_scales, experts))
+    };
+
+    let (w13_p, s13_4, b13, s13_8, n_exp) = pack_proj("gate_up", 2 * INTERMEDIATE)?;
+    let (w2_p, s2_4, b2, s2_8, _) = pack_proj("down", HIDDEN)?;
+    let g13 = w13_p.global_scale.as_ref().expect("nvfp4 global scale");
+    let g2 = w2_p.global_scale.as_ref().expect("nvfp4 global scale");
+
+    let w13_8 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: g13,
+            scale_base: None,
+        },
+        weight: &w13_p.weight,
+        scales: &s13_8,
+        n: w13_p.n,
+        k: w13_p.k,
+    };
+    let w13_4 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: g13,
+            scale_base: Some(&b13),
+        },
+        weight: &w13_p.weight,
+        scales: &s13_4,
+        n: w13_p.n,
+        k: w13_p.k,
+    };
+    let w2_8 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: g2,
+            scale_base: None,
+        },
+        weight: &w2_p.weight,
+        scales: &s2_8,
+        n: w2_p.n,
+        k: w2_p.k,
+    };
+    let w2_4 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: g2,
+            scale_base: Some(&b2),
+        },
+        weight: &w2_p.weight,
+        scales: &s2_4,
+        n: w2_p.n,
+        k: w2_p.k,
+    };
+
+    let (indices_h, _) = fixture.i32("indices")?;
+    let (x13_h, _) = fixture.bf16("gate_up.x")?;
+    let (x2_h, _) = fixture.bf16("down.x")?;
+    let indices_gpu = stream.clone_htod(&indices_h)?;
+    let x13_gpu = stream.clone_htod(&x13_h)?;
+    let x2_gpu = stream.clone_htod(&x2_h)?;
+
+    let assert_bf16_eq = |label: &str, a: &CudaSlice<bf16>, b: &CudaSlice<bf16>| -> anyhow::Result<()> {
+        let ha = stream.clone_dtoh(a)?;
+        let hb = stream.clone_dtoh(b)?;
+        assert_eq!(ha.len(), hb.len(), "{label}: length mismatch");
+        for (i, (&x, &y)) in ha.iter().zip(&hb).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{label}: mismatch at {i}: 4bit={x} ({:#06x}) vs 8bit={y} ({:#06x})",
+                x.to_bits(),
+                y.to_bits()
+            );
+        }
+        Ok(())
+    };
+
+    // 1. expert_matvec (w13 and w2)
+    for (label, x, w8, w4, out_len) in [
+        ("matvec w13", &x13_gpu, &w13_8, &w13_4, indices_h.len() * w13_p.n),
+        ("matvec w2", &x2_gpu, &w2_8, &w2_4, indices_h.len() * w2_p.n),
+    ] {
+        let mut out8 = stream.alloc_zeros::<bf16>(out_len)?;
+        let mut out4 = stream.alloc_zeros::<bf16>(out_len)?;
+        s.experts.expert_matvec(stream, x, &indices_gpu, w8, &mut out8)?;
+        s.experts.expert_matvec(stream, x, &indices_gpu, w4, &mut out4)?;
+        assert_bf16_eq(label, &out4, &out8)?;
+    }
+
+    // 2. expert_mlp (decode)
+    let pairs = indices_h.len();
+    let mut act8 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+    let mut act4 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+    let mut out8 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    let mut out4 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    let mut sync = stream.alloc_zeros::<u32>(1 + pairs)?;
+    s.experts.expert_mlp(
+        stream, &x13_gpu, &indices_gpu, &w13_8, &w2_8, &mut act8, &mut out8, &mut sync,
+        GATE_SOFTCAP, UP_SOFTCAP, None,
+    )?;
+    s.experts.expert_mlp(
+        stream, &x13_gpu, &indices_gpu, &w13_4, &w2_4, &mut act4, &mut out4, &mut sync,
+        GATE_SOFTCAP, UP_SOFTCAP, None,
+    )?;
+    assert_bf16_eq("mlp act", &act4, &act8)?;
+    assert_bf16_eq("mlp out", &out4, &out8)?;
+
+    // 3. expert_mlp_rows across all 4 tiers (m = 1 ring4, 4 ring3, 12 multi, 40 wide)
+    for m in [1usize, 4, 12, 40] {
+        let mut xm = Vec::with_capacity(m * HIDDEN);
+        let mut idm = Vec::with_capacity(m * SLOTS);
+        for r in 0..m {
+            let src = r % (x13_h.len() / HIDDEN);
+            xm.extend_from_slice(&x13_h[src * HIDDEN..(src + 1) * HIDDEN]);
+            for slot in 0..SLOTS {
+                idm.push(((r * 3 + slot) % n_exp) as i32);
+            }
+        }
+        let x_g = stream.clone_htod(&xm)?;
+        let id_g = stream.clone_htod(&idm)?;
+        let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+        let mut a4 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+        let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+        let mut o4 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+        let mut rsync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(m))?;
+        rows_ops.expert_mlp_rows(
+            stream, &x_g, &id_g, &w13_8, &w2_8, &mut a8, &mut o8, &mut rsync, GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        rows_ops.expert_mlp_rows(
+            stream, &x_g, &id_g, &w13_4, &w2_4, &mut a4, &mut o4, &mut rsync, GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        assert_bf16_eq(&format!("mlp_rows m={m} act"), &a4, &a8)?;
+        assert_bf16_eq(&format!("mlp_rows m={m} out"), &o4, &o8)?;
+    }
+
+    // 4. expert_matmul (BF16-act + FP8-act, plain + SwiGLU)
+    let m = 48usize;
+    let mut xm = Vec::with_capacity(m * HIDDEN);
+    let mut idm = Vec::with_capacity(m * SLOTS);
+    for r in 0..m {
+        let src = r % (x13_h.len() / HIDDEN);
+        xm.extend_from_slice(&x13_h[src * HIDDEN..(src + 1) * HIDDEN]);
+        for slot in 0..SLOTS {
+            idm.push(((r * 5 + slot) % n_exp) as i32);
+        }
+    }
+    let x_g = stream.clone_htod(&xm)?;
+    let id_g = stream.clone_htod(&idm)?;
+    let mut scratch = ExpertScratch::new(stream, m, n_exp)?;
+
+    // BF16-act SwiGLU + w2
+    s.experts.expert_group(stream, &id_g, n_exp, &mut scratch)?;
+    let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+    let mut a4 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+    s.experts.expert_matmul_swiglu_grouped(
+        stream, &x_g, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    s.experts.expert_matmul_swiglu_grouped(
+        stream, &x_g, &w13_4, &mut a4, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    assert_bf16_eq("gemm bf16 w13 swiglu", &a4, &a8)?;
+    let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+    let mut o4 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+    s.experts.expert_matmul_grouped(stream, &a8, &w2_8, &mut o8, &scratch)?;
+    s.experts.expert_matmul_grouped(stream, &a4, &w2_4, &mut o4, &scratch)?;
+    assert_bf16_eq("gemm bf16 w2", &o4, &o8)?;
+
+    // FP8-act SwiGLU + w2
+    s.experts.expert_group_quantized(stream, &id_g, n_exp, &mut scratch)?;
+    let mut xq = QuantizedRows::new(stream, m * SLOTS * HIDDEN, m * SLOTS)?;
+    if siphon_cuda::BLOCK_SCALED_MMA {
+        s.experts.quantize_rows_fp8(stream, &x_g, HIDDEN, w13_4.format, &mut xq)?;
+    } else {
+        s.experts.quantize_rows_fp8_per_row(stream, &x_g, HIDDEN, w13_4.format, &mut xq)?;
+    }
+    s.experts.expert_matmul_quantized_swiglu_grouped(
+        stream, &xq, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    s.experts.expert_matmul_quantized_swiglu_grouped(
+        stream, &xq, &w13_4, &mut a4, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    assert_bf16_eq("gemm fp8 w13 swiglu", &a4, &a8)?;
+    if siphon_cuda::BLOCK_SCALED_MMA {
+        s.experts.quantize_rows_fp8(stream, &a4, INTERMEDIATE, w2_4.format, &mut xq)?;
+    } else {
+        s.experts.quantize_rows_fp8_per_row(stream, &a4, INTERMEDIATE, w2_4.format, &mut xq)?;
+    }
+    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_8, &mut o8, &scratch)?;
+    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_4, &mut o4, &scratch)?;
+    assert_bf16_eq("gemm fp8 w2", &o4, &o8)?;
+    Ok(())
+}
+
+/// Verifies `pack_mxfp8_to_mxfp6` and every 2-plane MXFP6 E2M3 expert kernel (`matvec`,
+/// `mlp`, `mlp_rows` across all tiers, `gemm` BF16-act, and `gemm_q` FP8-act) against
+/// the existing MXFP8 kernels running on exact E2M3->E4M3 unpacked weights.
+#[test]
+fn mxfp6_matches_unpacked_mxfp8() -> anyhow::Result<()> {
+    use siphon_cuda::ops::experts_rows::ExpertsRows;
+
+    let s = Setup::new()?;
+    let rows_ops = ExpertsRows::load(s.gpu.context())?;
+    let stream = s.stream();
+    let file = "experts_mxfp8";
+    let fixture = Fixture::load(file)?;
+
+    // Exact E2M3 (sign, e1..0, m2..0) -> E4M3 byte conversion on CPU.
+    let e2m3_to_e4m3 = |lo4: u8, hi2: u8| -> u8 {
+        let sign = (lo4 & 0x08) << 4;
+        let m = lo4 & 0x07;
+        let e = hi2 & 0x03;
+        if e != 0 {
+            sign | ((e + 6) << 3) | m
+        } else {
+            const SUB: [u8; 8] = [0x00, 0x20, 0x28, 0x2c, 0x30, 0x32, 0x34, 0x36];
+            sign | SUB[usize::from(m)]
+        }
+    };
+
+    let pack_proj = |name: &str, target_n: usize| -> anyhow::Result<_> {
+        let proj = Projection::load(&s, &fixture, file, name)?;
+        let experts = proj.weight.len() / (proj.n * proj.k);
+        assert_eq!(target_n % proj.n, 0);
+        let reps = target_n / proj.n;
+        let orig_w = stream.clone_dtoh(&proj.weight)?;
+        let orig_s = stream.clone_dtoh(&proj.scales)?;
+        let w_stride = proj.n * proj.k;
+        let s_stride = proj.n * (proj.k / 32);
+        let mut full_w = Vec::with_capacity(experts * reps * w_stride);
+        let mut full_s = Vec::with_capacity(experts * reps * s_stride);
+        for e in 0..experts {
+            for _ in 0..reps {
+                full_w.extend_from_slice(&orig_w[e * w_stride..(e + 1) * w_stride]);
+                full_s.extend_from_slice(&orig_s[e * s_stride..(e + 1) * s_stride]);
+            }
+        }
+        let full_w_gpu = stream.clone_htod(&full_w)?;
+        let full_s_gpu = stream.clone_htod(&full_s)?;
+        let (lo4, hi2, scales_out) =
+            s.experts.pack_mxfp8_to_mxfp6(stream, &full_w_gpu, &full_s_gpu)?;
+        let h_lo4 = stream.clone_dtoh(&lo4)?;
+        let h_hi2 = stream.clone_dtoh(&hi2)?;
+        let total = experts * target_n * proj.k;
+        let mut h_unpacked = vec![0u8; total];
+        for i in 0..total {
+            let l = (h_lo4[i / 2] >> (4 * (i & 1))) & 0x0f;
+            let h = (h_hi2[i / 4] >> (2 * (i & 3))) & 0x03;
+            h_unpacked[i] = e2m3_to_e4m3(l, h);
+        }
+        let unpacked_w = stream.clone_htod(&h_unpacked)?;
+        Ok((lo4, hi2, scales_out, unpacked_w, target_n, proj.k, experts))
+    };
+
+    let (w13_lo, w13_hi, s13, w13_u8, n13, k13, n_exp) = pack_proj("gate_up", 2 * INTERMEDIATE)?;
+    let (w2_lo, w2_hi, s2, w2_u8, n2, k2, _) = pack_proj("down", HIDDEN)?;
+
+    let w13_8 = ExpertWeights {
+        format: ExpertFormat::Mxfp8,
+        weight: &w13_u8,
+        scales: &s13,
+        n: n13,
+        k: k13,
+    };
+    let w13_6 = ExpertWeights {
+        format: ExpertFormat::Mxfp6 { hi2: &w13_hi },
+        weight: &w13_lo,
+        scales: &s13,
+        n: n13,
+        k: k13,
+    };
+    let w2_8 = ExpertWeights {
+        format: ExpertFormat::Mxfp8,
+        weight: &w2_u8,
+        scales: &s2,
+        n: n2,
+        k: k2,
+    };
+    let w2_6 = ExpertWeights {
+        format: ExpertFormat::Mxfp6 { hi2: &w2_hi },
+        weight: &w2_lo,
+        scales: &s2,
+        n: n2,
+        k: k2,
+    };
+
+    let (indices_h, _) = fixture.i32("indices")?;
+    let (x13_h, _) = fixture.bf16("gate_up.x")?;
+    let (x2_h, _) = fixture.bf16("down.x")?;
+    let indices_gpu = stream.clone_htod(&indices_h)?;
+    let x13_gpu = stream.clone_htod(&x13_h)?;
+    let x2_gpu = stream.clone_htod(&x2_h)?;
+
+    let assert_bf16_eq = |label: &str, a: &CudaSlice<bf16>, b: &CudaSlice<bf16>| -> anyhow::Result<()> {
+        let ha = stream.clone_dtoh(a)?;
+        let hb = stream.clone_dtoh(b)?;
+        assert_eq!(ha.len(), hb.len(), "{label}: length mismatch");
+        for (i, (&x, &y)) in ha.iter().zip(&hb).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{label}: mismatch at {i}: mxfp6={x} ({:#06x}) vs mxfp8={y} ({:#06x})",
+                x.to_bits(),
+                y.to_bits()
+            );
+        }
+        Ok(())
+    };
+
+    // 1. expert_matvec (w13 and w2)
+    for (label, x, w8, w6, out_len) in [
+        ("matvec w13", &x13_gpu, &w13_8, &w13_6, indices_h.len() * n13),
+        ("matvec w2", &x2_gpu, &w2_8, &w2_6, indices_h.len() * n2),
+    ] {
+        let mut out8 = stream.alloc_zeros::<bf16>(out_len)?;
+        let mut out6 = stream.alloc_zeros::<bf16>(out_len)?;
+        s.experts.expert_matvec(stream, x, &indices_gpu, w8, &mut out8)?;
+        s.experts.expert_matvec(stream, x, &indices_gpu, w6, &mut out6)?;
+        assert_bf16_eq(label, &out6, &out8)?;
+    }
+
+    // 2. expert_mlp (decode)
+    let pairs = indices_h.len();
+    let mut act8 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+    let mut act6 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+    let mut out8 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    let mut out6 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    let mut sync = stream.alloc_zeros::<u32>(1 + pairs)?;
+    s.experts.expert_mlp(
+        stream, &x13_gpu, &indices_gpu, &w13_8, &w2_8, &mut act8, &mut out8, &mut sync,
+        GATE_SOFTCAP, UP_SOFTCAP, None,
+    )?;
+    s.experts.expert_mlp(
+        stream, &x13_gpu, &indices_gpu, &w13_6, &w2_6, &mut act6, &mut out6, &mut sync,
+        GATE_SOFTCAP, UP_SOFTCAP, None,
+    )?;
+    assert_bf16_eq("mlp act", &act6, &act8)?;
+    assert_bf16_eq("mlp out", &out6, &out8)?;
+
+    // 3. expert_mlp_rows across all tiers (m = 1, 4, 12, 40)
+    for m in [1usize, 4, 12, 40] {
+        let mut xm = Vec::with_capacity(m * HIDDEN);
+        let mut idm = Vec::with_capacity(m * SLOTS);
+        for r in 0..m {
+            let src = r % (x13_h.len() / HIDDEN);
+            xm.extend_from_slice(&x13_h[src * HIDDEN..(src + 1) * HIDDEN]);
+            for slot in 0..SLOTS {
+                idm.push(((r * 3 + slot) % n_exp) as i32);
+            }
+        }
+        let x_g = stream.clone_htod(&xm)?;
+        let id_g = stream.clone_htod(&idm)?;
+        let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+        let mut a6 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+        let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+        let mut o6 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+        let mut rsync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(m))?;
+        rows_ops.expert_mlp_rows(
+            stream, &x_g, &id_g, &w13_8, &w2_8, &mut a8, &mut o8, &mut rsync, GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        rows_ops.expert_mlp_rows(
+            stream, &x_g, &id_g, &w13_6, &w2_6, &mut a6, &mut o6, &mut rsync, GATE_SOFTCAP,
+            UP_SOFTCAP,
+        )?;
+        assert_bf16_eq(&format!("mlp_rows m={m} act"), &a6, &a8)?;
+        assert_bf16_eq(&format!("mlp_rows m={m} out"), &o6, &o8)?;
+    }
+
+    // 4. expert_matmul (BF16-act + FP8-act, plain + SwiGLU)
+    let m = 48usize;
+    let mut xm = Vec::with_capacity(m * HIDDEN);
+    let mut idm = Vec::with_capacity(m * SLOTS);
+    for r in 0..m {
+        let src = r % (x13_h.len() / HIDDEN);
+        xm.extend_from_slice(&x13_h[src * HIDDEN..(src + 1) * HIDDEN]);
+        for slot in 0..SLOTS {
+            idm.push(((r * 5 + slot) % n_exp) as i32);
+        }
+    }
+    let x_g = stream.clone_htod(&xm)?;
+    let id_g = stream.clone_htod(&idm)?;
+    let mut scratch = ExpertScratch::new(stream, m, n_exp)?;
+
+    // BF16-act SwiGLU + w2
+    s.experts.expert_group(stream, &id_g, n_exp, &mut scratch)?;
+    let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+    let mut a6 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+    s.experts.expert_matmul_swiglu_grouped(
+        stream, &x_g, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    s.experts.expert_matmul_swiglu_grouped(
+        stream, &x_g, &w13_6, &mut a6, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    assert_bf16_eq("gemm bf16 w13 swiglu", &a6, &a8)?;
+    let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+    let mut o6 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+    s.experts.expert_matmul_grouped(stream, &a8, &w2_8, &mut o8, &scratch)?;
+    s.experts.expert_matmul_grouped(stream, &a6, &w2_6, &mut o6, &scratch)?;
+    assert_bf16_eq("gemm bf16 w2", &o6, &o8)?;
+
+    // FP8-act SwiGLU + w2
+    s.experts.expert_group_quantized(stream, &id_g, n_exp, &mut scratch)?;
+    let mut xq = QuantizedRows::new(stream, m * SLOTS * HIDDEN, m * SLOTS)?;
+    if siphon_cuda::BLOCK_SCALED_MMA {
+        s.experts.quantize_rows_fp8(stream, &x_g, HIDDEN, w13_6.format, &mut xq)?;
+    } else {
+        s.experts.quantize_rows_fp8_per_row(stream, &x_g, HIDDEN, w13_6.format, &mut xq)?;
+    }
+    s.experts.expert_matmul_quantized_swiglu_grouped(
+        stream, &xq, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    s.experts.expert_matmul_quantized_swiglu_grouped(
+        stream, &xq, &w13_6, &mut a6, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+    )?;
+    assert_bf16_eq("gemm fp8 w13 swiglu", &a6, &a8)?;
+    if siphon_cuda::BLOCK_SCALED_MMA {
+        s.experts.quantize_rows_fp8(stream, &a6, INTERMEDIATE, w2_6.format, &mut xq)?;
+    } else {
+        s.experts.quantize_rows_fp8_per_row(stream, &a6, INTERMEDIATE, w2_6.format, &mut xq)?;
+    }
+    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_8, &mut o8, &scratch)?;
+    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_6, &mut o6, &scratch)?;
+    assert_bf16_eq("gemm fp8 w2", &o6, &o8)?;
     Ok(())
 }
