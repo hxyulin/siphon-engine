@@ -285,13 +285,16 @@ struct MoeConvInputs {
 // wrote, so they are read from L2. The conv follows conv_step::short_conv.
 __device__ __forceinline__ void moe_conv(const MoeConv& m, const MoeConvInputs& in,
                                          const __nv_bfloat16* down, int n, int c) {
+    float vals[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        vals[k] = __bfloat162float(__ldcg(down + size_t(k) * n + c));
+    }
     float total = 0.f;
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
         const float wk = in.weights[k];
-        if (wk != 0.f) {
-            total = __fadd_rn(total, __fmul_rn(__bfloat162float(__ldcg(down + size_t(k) * n + c)), wk));
-        }
+        total = wk != 0.f ? __fadd_rn(total, __fmul_rn(vals[k], wk)) : total;
     }
     const float x = conv_step::round_bf16(total);
     const auto* taps = reinterpret_cast<const __nv_bfloat16*>(&in.taps);
@@ -383,25 +386,22 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             const int row0 = task % kTiles13 * G13::kBlockRows + warp * G13::kRows;
             const int expert = indices[pair];
             const bool known = expert >= 0 && expert < experts;
-            if (!known) {
-                if (lane < G13::kRows && lane % 2 == 0) {
-                    act[size_t(pair) * kK2 + (row0 + lane) / 2] = __float2bfloat16(kNan);
-                }
-                continue;
-            }
-            WarpRows<kFp4, kK13> rows(w13, s13, expert, true, kN13, row0);
+            WarpRows<kFp4, kK13> rows(w13, s13, expert, known, kN13, row0);
 #pragma unroll
             for (int i = 0; i < kChunks; ++i) {
                 rows.load(i, lane);
             }
             float result = rows.dot(x + size_t(pair / 8) * kK13, lane);
-            result *= output_scale(kFp4, g13, expert);
+            if (known) {
+                result *= output_scale(kFp4, g13, expert);
+            }
             const float up = __shfl_down_sync(0xffffffffu, result, 1);
             if (lane < G13::kRows && lane % 2 == 0) {
                 const float gate_bf16 = __bfloat162float(__float2bfloat16(result));
                 const float up_bf16 = __bfloat162float(__float2bfloat16(up));
                 act[size_t(pair) * kK2 + (row0 + lane) / 2] =
-                    softcapped_swiglu(gate_bf16, up_bf16, gate_softcap, up_softcap);
+                    known ? softcapped_swiglu(gate_bf16, up_bf16, gate_softcap, up_softcap)
+                          : __float2bfloat16(kNan);
             }
             __syncthreads();
             if (threadIdx.x == 0) {
@@ -414,30 +414,26 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             const int row0 = int(tile) * G2::kBlockRows + warp * G2::kRows;
             const int expert = indices[pair];
             const bool known = expert >= 0 && expert < experts;
-            if (known) {
-                if (threadIdx.x == 0) {
-                    while (load_relaxed(&sync[1 + pair]) < kTiles13) {
-                        __nanosleep(32);
-                    }
-                    // With the barrier below, orders the block's activation loads after the
-                    // count, and so after the stores the count covers.
-                    __threadfence();
+            if (threadIdx.x == 0) {
+                while (load_relaxed(&sync[1 + pair]) < kTiles13) {
+                    __nanosleep(32);
                 }
-                __syncthreads();
-                // Loading weights before the wait was slower: 27.0 us instead of 24.6 per NVFP4
-                // layer visit with all nine chunks.
-                WarpRows<kFp4, kK2> rows(w2, s2, expert, true, n2, row0);
+                // With the barrier below, orders the block's activation loads after the
+                // count, and so after the stores the count covers.
+                __threadfence();
+            }
+            __syncthreads();
+            // Loading weights before the wait was slower: 27.0 us instead of 24.6 per NVFP4
+            // layer visit with all nine chunks.
+            WarpRows<kFp4, kK2> rows(w2, s2, expert, known, n2, row0);
 #pragma unroll
-                for (int i = 0; i < kChunks; ++i) {
-                    rows.load(i, lane);
-                }
-                float result = rows.dot(act + size_t(pair) * kK2, lane);
-                if (lane < G2::kRows) {
-                    result *= output_scale(kFp4, g2, expert);
-                    out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(result);
-                }
-            } else if (lane < G2::kRows) {
-                out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(kNan);
+            for (int i = 0; i < kChunks; ++i) {
+                rows.load(i, lane);
+            }
+            float result = rows.dot(act + size_t(pair) * kK2, lane);
+            if (lane < G2::kRows) {
+                result = known ? result * output_scale(kFp4, g2, expert) : kNan;
+                out[size_t(pair) * n2 + row0 + lane] = __float2bfloat16(result);
             }
             if (conv.hidden != nullptr) {
                 // The last pair's task of each row tile finishes the tile's channels once
