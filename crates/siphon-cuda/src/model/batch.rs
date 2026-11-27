@@ -31,7 +31,7 @@ use super::{
 use crate::{
     gpu::{PinnedBuf, sync_event},
     ops::{
-        attention::{KvCache, KvData},
+        attention::{KvCache, KvData, RingSlab},
         sample::SampleBuffers,
         spec::{
             BATCH_STATE_WORDS, BatchRows, RESULT_LEN, STATE_ROWS, STREAM_DIMS, VERIFY_ROWS,
@@ -40,6 +40,47 @@ use crate::{
     },
     vmm::PagePool,
 };
+
+/// Slots of each dummy verify buffer: enough for any verify width `1..=VERIFY_ROWS` at
+/// position 0, without touching the KV pool.
+const DUMMY_KV_SLOTS: usize = 16;
+/// Max bytes per KV slot across all supported cache formats (BF16: 1024 * 2 bytes).
+const DUMMY_KV_ROW_BYTES: usize = 1024 * 2;
+
+/// Tiny scratch KV + conv buffers for one inactive padded sequence in a bucketed
+/// [`Model::verify_batch`] launch. Consumes ~144 KiB and zero KV pool pages.
+struct DummyVerifySlot {
+    keys: CudaSlice<u8>,
+    values: CudaSlice<u8>,
+    conv: [CudaSlice<f32>; 4],
+}
+
+impl DummyVerifySlot {
+    fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let kv_bytes = DUMMY_KV_SLOTS * DUMMY_KV_ROW_BYTES;
+        Ok(Self {
+            keys: stream.alloc_zeros(kv_bytes)?,
+            values: stream.alloc_zeros(kv_bytes)?,
+            conv: [
+                stream.alloc_zeros(STATE_ROWS * STREAM_DIMS[0])?,
+                stream.alloc_zeros(STATE_ROWS * STREAM_DIMS[1])?,
+                stream.alloc_zeros(STATE_ROWS * STREAM_DIMS[2])?,
+                stream.alloc_zeros(STATE_ROWS * STREAM_DIMS[3])?,
+            ],
+        })
+    }
+
+    fn state_words(&self, stream: &CudaStream) -> [u64; BATCH_STATE_WORDS] {
+        [
+            self.keys.device_ptr(stream).0,
+            self.values.device_ptr(stream).0,
+            self.conv[0].device_ptr(stream).0,
+            self.conv[1].device_ptr(stream).0,
+            self.conv[2].device_ptr(stream).0,
+            self.conv[3].device_ptr(stream).0,
+        ]
+    }
+}
 
 /// Most sequences one batched step runs.
 pub use crate::ops::spec::{BATCH_ROWS, BATCH_VERIFY_MAX_ROWS};
@@ -88,13 +129,24 @@ pub(super) struct BatchVerifyState {
     pub(super) host_results: PinnedBuf<i32>,
     /// Rows per sequence of the active or last pass (`1..=VERIFY_ROWS`).
     pub(super) width: usize,
-    /// Sequences of the active or last pass.
+    /// Sequences of the active or last pass (unpadded real sequence count).
     pub(super) last_seqs: usize,
+    /// Padded sequence bucket count of the active or last pass (`>= last_seqs`).
+    pub(super) padded_seqs: usize,
     /// Whether a pass was launched and its verdicts not read yet.
     pub(super) pending: bool,
+    /// Scratch slots backing inactive padded sequences when `seqs < padded_seqs`.
+    dummy_slots: Vec<DummyVerifySlot>,
 }
 
 impl BatchVerifyState {
+    fn ensure_dummies(&mut self, stream: &Arc<CudaStream>, needed: usize) -> anyhow::Result<()> {
+        while self.dummy_slots.len() < needed {
+            self.dummy_slots.push(DummyVerifySlot::new(stream)?);
+        }
+        Ok(())
+    }
+
     fn new(
         stream: &Arc<CudaStream>,
         visits: &[VisitState],
@@ -150,7 +202,9 @@ impl BatchVerifyState {
             host_results: PinnedBuf::zeros(stream, max_seqs * RESULT_LEN)?,
             width: 1,
             last_seqs: 0,
+            padded_seqs: 0,
             pending: false,
+            dummy_slots: Vec::new(),
         })
     }
 }
@@ -159,6 +213,10 @@ impl BatchVerifyState {
 #[derive(Debug)]
 pub(super) struct Slot {
     pub(super) visits: Vec<VisitState>,
+    /// Contiguous VMM slab backing this slot's sliding rings when pooled.
+    /// Declared after `visits` so `KvCache::drop` leaks its slices before the slab frees
+    /// its virtual address range.
+    pub(super) ring_slab: Option<RingSlab>,
     pub(super) position: usize,
     /// The slot's [`Model::slot_sequence`], swapped with slot 0's while the slot stands in
     /// for it ([`Model::with_slot`]).
@@ -184,6 +242,8 @@ pub(super) struct BatchBuffers {
     host_tokens: PinnedBuf<i32>,
     /// Recorded on the stream after each async pinned H2D upload.
     h2d_done: CudaEvent,
+    /// Total sequence rows (`real + padded`) currently populated in `tables`.
+    padded_seqs: usize,
     /// Present for [`Model::verify_batch`]; `None` for [`Model::step_batch`].
     pub(super) verify: Option<BatchVerifyState>,
 }
@@ -212,6 +272,7 @@ impl BatchBuffers {
             host_positions: PinnedBuf::zeros(stream, max_seqs)?,
             host_tokens: PinnedBuf::zeros(stream, max_rows)?,
             h2d_done: sync_event(stream)?,
+            padded_seqs: 0,
             verify,
         })
     }
@@ -229,43 +290,75 @@ impl BatchBuffers {
     }
 }
 
-/// A visit's caches and conv states for a new sequence, of the sizes and formats of `v`,
-/// in pages of `pool` if `v`'s are pooled.
-fn empty_like(
+/// Allocates a full set of visits and optional shared sliding-ring slab matching `template`.
+fn empty_slot_visits(
     stream: &Arc<CudaStream>,
-    v: &VisitState,
+    template: &[VisitState],
     pool: Option<&PagePool>,
-) -> anyhow::Result<VisitState> {
-    let format = v.kv.format();
-    let pool = pool.filter(|_| v.kv.is_pooled());
-    let kv = match (v.kv.window(), pool) {
-        (Some(window), Some(pool)) => {
-            KvCache::sliding_pooled_with_format(stream, window, v.kv.slots(), format, pool)?
-        }
-        (Some(window), None) => {
-            KvCache::sliding_ring_with_format(stream, window, v.kv.slots(), format)?
-        }
-        (None, Some(pool)) => KvCache::global_pooled(stream, v.kv.slots(), format, pool)?,
-        (None, None) => KvCache::global_with_format(stream, v.kv.slots(), format)?,
+) -> anyhow::Result<(Vec<VisitState>, Option<RingSlab>)> {
+    let sliding_count = template
+        .iter()
+        .filter(|v| v.kv.window().is_some() && v.kv.is_pooled())
+        .count();
+    let ring_slab = if let (Some(pool), Some(first)) = (
+        pool,
+        template
+            .iter()
+            .find(|v| v.kv.window().is_some() && v.kv.is_pooled()),
+    ) && sliding_count > 0
+    {
+        Some(RingSlab::reserve(
+            pool,
+            sliding_count,
+            first.kv.slots(),
+            first.kv.format(),
+        )?)
+    } else {
+        None
     };
-    Ok(VisitState {
-        kv,
-        conv: [
-            stream.alloc_zeros(v.conv[0].len())?,
-            stream.alloc_zeros(v.conv[1].len())?,
-            stream.alloc_zeros(v.conv[2].len())?,
-            stream.alloc_zeros(v.conv[3].len())?,
-        ],
-        round: v.round,
-    })
+    let mut ring_idx = 0usize;
+    let visits = template
+        .iter()
+        .map(|v| {
+            let format = v.kv.format();
+            let v_pool = pool.filter(|_| v.kv.is_pooled());
+            let kv = match (v.kv.window(), v_pool, ring_slab.as_ref()) {
+                (Some(window), Some(_), Some(slab)) => {
+                    let idx = ring_idx;
+                    ring_idx += 1;
+                    KvCache::sliding_in_slab(stream, window, v.kv.slots(), format, slab, idx)?
+                }
+                (Some(window), Some(pool), None) => {
+                    KvCache::sliding_pooled_with_format(stream, window, v.kv.slots(), format, pool)?
+                }
+                (Some(window), None, _) => {
+                    KvCache::sliding_ring_with_format(stream, window, v.kv.slots(), format)?
+                }
+                (None, Some(pool), _) => KvCache::global_pooled(stream, v.kv.slots(), format, pool)?,
+                (None, None, _) => KvCache::global_with_format(stream, v.kv.slots(), format)?,
+            };
+            Ok(VisitState {
+                kv,
+                conv: [
+                    stream.alloc_zeros(v.conv[0].len())?,
+                    stream.alloc_zeros(v.conv[1].len())?,
+                    stream.alloc_zeros(v.conv[2].len())?,
+                    stream.alloc_zeros(v.conv[3].len())?,
+                ],
+                round: v.round,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok((visits, ring_slab))
 }
 
-/// Slot `slot`'s visit states, which must exist.
-fn slot_visits(m: &mut Model, slot: usize) -> &mut Vec<VisitState> {
+/// Slot `slot`'s visit states and optional ring slab, which must exist.
+fn slot_visits(m: &mut Model, slot: usize) -> (&mut Vec<VisitState>, Option<&mut RingSlab>) {
     if slot == 0 {
-        &mut m.visits
+        (&mut m.visits, m.ring_slab.as_mut())
     } else {
-        &mut m.slots[slot - 1].visits
+        let s = &mut m.slots[slot - 1];
+        (&mut s.visits, s.ring_slab.as_mut())
     }
 }
 
@@ -294,14 +387,11 @@ impl Model {
     pub fn add_slots(&mut self, count: usize) -> anyhow::Result<()> {
         let stream = Arc::clone(&self.ctx.stream);
         for _ in 0..count {
-            let visits = self
-                .visits
-                .iter()
-                .map(|v| empty_like(&stream, v, self.kv_pool.as_ref()))
-                .collect::<anyhow::Result<_>>()?;
+            let (visits, ring_slab) = empty_slot_visits(&stream, &self.visits, self.kv_pool.as_ref())?;
             let sequence = self.new_sequence();
             self.slots.push(Slot {
                 visits,
+                ring_slab,
                 position: 0,
                 sequence,
             });
@@ -355,6 +445,7 @@ impl Model {
         let swap = |m: &mut Self| {
             let s = &mut m.slots[slot - 1];
             std::mem::swap(&mut m.visits, &mut s.visits);
+            std::mem::swap(&mut m.ring_slab, &mut s.ring_slab);
             std::mem::swap(&mut m.position, &mut s.position);
             std::mem::swap(&mut m.sequence, &mut s.sequence);
         };
@@ -378,17 +469,44 @@ impl Model {
         let stream = Arc::clone(&self.ctx.stream);
         let position = self.slot_position(from)?;
         self.map_slot(to, position.max(1))?;
-        let (src, dst) = match (from, to) {
-            (0, t) => (&self.visits, &mut self.slots[t - 1].visits),
-            (f, 0) => (&self.slots[f - 1].visits, &mut self.visits),
+        let (src, src_slab, dst, dst_slab) = match (from, to) {
+            (0, t) => {
+                let d = &mut self.slots[t - 1];
+                (
+                    &self.visits,
+                    self.ring_slab.as_ref(),
+                    &mut d.visits,
+                    d.ring_slab.as_mut(),
+                )
+            }
+            (f, 0) => {
+                let s = &self.slots[f - 1];
+                (
+                    &s.visits,
+                    s.ring_slab.as_ref(),
+                    &mut self.visits,
+                    self.ring_slab.as_mut(),
+                )
+            }
             (f, t) if f < t => {
                 let (low, high) = self.slots.split_at_mut(t - 1);
-                (&low[f - 1].visits, &mut high[0].visits)
+                let (s, d) = (&low[f - 1], &mut high[0]);
+                (&s.visits, s.ring_slab.as_ref(), &mut d.visits, d.ring_slab.as_mut())
             }
             (f, t) => {
                 let (low, high) = self.slots.split_at_mut(f - 1);
-                (&high[0].visits, &mut low[t - 1].visits)
+                let (s, d) = (&high[0], &mut low[t - 1]);
+                (&s.visits, s.ring_slab.as_ref(), &mut d.visits, d.ring_slab.as_mut())
             }
+        };
+        let bulk_rings = match (src_slab, dst_slab) {
+            (Some(s), Some(d)) => {
+                if s.is_mapped() {
+                    s.copy_to(d, &stream)?;
+                }
+                true
+            }
+            _ => false,
         };
         for (s, d) in src.iter().zip(dst.iter_mut()) {
             // A ring whole, a global cache up to the position, but only what is mapped: an
@@ -396,7 +514,7 @@ impl Model {
             // entry to the pool, and the driver faults on a copy from
             // unmapped addresses. What it returned holds nothing an entry needs.
             let slots = if s.kv.window().is_some() {
-                if s.kv.mapped() < s.kv.slots() {
+                if bulk_rings || s.kv.mapped() < s.kv.slots() {
                     0
                 } else {
                     s.kv.slots()
@@ -463,20 +581,30 @@ impl Model {
         stream.synchronize()?;
         let position = self.slot_position(from)?;
         let mut moved = Vec::new();
-        for v in slot_visits(self, from).iter_mut() {
-            // Each reservation's pages: the keys' and the values', or a packed ring's.
-            let mut pages = Vec::new();
-            for b in v.kv.pooled_mut().into_iter().flatten() {
-                pages.push(b.pages().to_vec());
-                b.unmap_from(0)?;
+        let moved_rings = {
+            let (from_visits, from_slab) = slot_visits(self, from);
+            for v in from_visits.iter_mut() {
+                // Each reservation's pages: the keys' and the values', or a packed ring's.
+                let mut pages = Vec::new();
+                for b in v.kv.pooled_mut().into_iter().flatten() {
+                    pages.push(b.pages().to_vec());
+                    b.unmap_from(0)?;
+                }
+                moved.push(pages);
             }
-            moved.push(pages);
-        }
-        for (v, pages) in slot_visits(self, to).iter_mut().zip(&moved) {
-            // The slots' caches have the same shapes, so their reservations pair up.
-            for (b, p) in v.kv.pooled_mut().into_iter().flatten().zip(pages) {
-                b.unmap_from(0)?;
-                b.map_shared(p)?;
+            from_slab.map(RingSlab::take_pages).transpose()?
+        };
+        {
+            let (to_visits, to_slab) = slot_visits(self, to);
+            if let (Some(dst_slab), Some(ring_pages)) = (to_slab, moved_rings.as_deref()) {
+                dst_slab.map_shared_pages(ring_pages)?;
+            }
+            for (v, pages) in to_visits.iter_mut().zip(&moved) {
+                // The slots' caches have the same shapes, so their reservations pair up.
+                for (b, p) in v.kv.pooled_mut().into_iter().flatten().zip(pages) {
+                    b.unmap_from(0)?;
+                    b.map_shared(p)?;
+                }
             }
         }
         // Pooled rings moved with their pages; rings of fixed memory and the conv states
@@ -885,7 +1013,14 @@ impl Model {
             keeps.push(keep);
         }
 
-        self.ensure_batch_verify(seqs, total_rows)?;
+        let max_allowed = self
+            .slots()
+            .min(BATCH_ROWS)
+            .min(BATCH_VERIFY_MAX_ROWS / width);
+        let padded_seqs = siphon::memory::batch_seq_bucket(seqs, max_allowed);
+        let padded_rows = padded_seqs * width;
+
+        self.ensure_batch_verify(padded_seqs, padded_rows)?;
         let stream = Arc::clone(&self.ctx.stream);
         let p = self
             .batch_verify
@@ -901,8 +1036,9 @@ impl Model {
             .context("the batch verify state is missing")?;
         ensure!(!bv.pending, "the last batched verify's verdicts were not read");
         b.h2d_done.synchronize()?;
+        bv.ensure_dummies(&stream, padded_seqs - seqs)?;
 
-        if b.members.as_slice() != slots {
+        if b.members.as_slice() != slots || b.padded_seqs != padded_seqs {
             let table_len = self.visits.len() * b.max_seqs * BATCH_STATE_WORDS;
             {
                 let table = b.host_tables.as_mut_slice();
@@ -918,18 +1054,31 @@ impl Model {
                         table[at..at + BATCH_STATE_WORDS].copy_from_slice(&state_words(&stream, v));
                     }
                 }
+                for (d, dummy) in bv.dummy_slots[..padded_seqs - seqs].iter().enumerate() {
+                    let words = dummy.state_words(&stream);
+                    let r = seqs + d;
+                    for i in 0..self.visits.len() {
+                        let at = (i * b.max_seqs + r) * BATCH_STATE_WORDS;
+                        table[at..at + BATCH_STATE_WORDS].copy_from_slice(&words);
+                    }
+                }
             }
             b.host_tables
                 .copy_to_device(&stream, table_len, &mut b.tables)?;
             b.members = slots.to_vec();
+            b.padded_seqs = padded_seqs;
         }
 
-        b.host_positions.as_mut_slice()[..seqs].copy_from_slice(&positions);
+        if padded_seqs > seqs {
+            positions.resize(padded_seqs, 0);
+            keeps.resize(padded_seqs, u32::try_from(width)?);
+        }
+        b.host_positions.as_mut_slice()[..padded_seqs].copy_from_slice(&positions);
         b.host_positions
-            .copy_to_device(&stream, seqs, &mut b.positions.slice_mut(..seqs))?;
-        bv.host_keep.as_mut_slice()[..seqs].copy_from_slice(&keeps);
+            .copy_to_device(&stream, padded_seqs, &mut b.positions.slice_mut(..padded_seqs))?;
+        bv.host_keep.as_mut_slice()[..padded_seqs].copy_from_slice(&keeps);
         bv.host_keep
-            .copy_to_device(&stream, seqs, &mut bv.keep.slice_mut(..seqs))?;
+            .copy_to_device(&stream, padded_seqs, &mut bv.keep.slice_mut(..padded_seqs))?;
         match tokens {
             BatchVerifyTokens::Host(rows) => {
                 {
@@ -941,30 +1090,36 @@ impl Model {
                             idx += 1;
                         }
                     }
+                    ids[idx..padded_rows].fill(0);
                 }
                 b.host_tokens.copy_to_device(
                     &stream,
-                    total_rows,
-                    &mut p.tokens.slice_mut(..total_rows),
+                    padded_rows,
+                    &mut p.tokens.slice_mut(..padded_rows),
                 )?;
             }
             BatchVerifyTokens::Device { tokens: d, .. } => {
                 stream.memcpy_dtod(&d, &mut p.tokens.slice_mut(..total_rows))?;
+                if padded_rows > total_rows {
+                    stream.memset_zeros(&mut p.tokens.slice_mut(total_rows..padded_rows))?;
+                }
             }
         }
         b.h2d_done.record(&stream)?;
         if let Some(sample) = p.sample.as_mut() {
-            let mut settings = Vec::with_capacity(total_rows);
-            for (seq, &pos) in positions.iter().enumerate() {
+            let mut settings = Vec::with_capacity(padded_rows);
+            for (seq, &pos) in positions[..seqs].iter().enumerate() {
                 for j in 0..width {
                     settings.push((sampling[seq], pos as usize + j + 1));
                 }
             }
+            settings.resize(padded_rows, (Sampling::GREEDY, 1));
             sample.upload(&stream, &settings)?;
         }
         bv.width = width;
         bv.last_seqs = seqs;
-        self.launch_batch_verify(seqs, width)?;
+        bv.padded_seqs = padded_seqs;
+        self.launch_batch_verify(padded_seqs, width)?;
         self.batch_verify
             .as_mut()
             .and_then(|p| p.batch.as_mut())
@@ -1073,6 +1228,47 @@ impl Model {
         Ok(verdicts)
     }
 
+    /// Feature taps of the last batched verify including bucket-padded sequences, BF16
+    /// `[padded_seqs * width, taps, 2304]`.
+    pub fn batch_verify_taps_padded(&self) -> anyhow::Result<CudaView<'_, bf16>> {
+        let p = self
+            .batch_verify
+            .as_ref()
+            .context("no batched verify has run")?;
+        let bv = p
+            .batch
+            .as_ref()
+            .and_then(|b| b.verify.as_ref())
+            .context("the batch verify state is missing")?;
+        let taps = p.taps.as_ref().context("the taps buffer is missing")?;
+        let row_len = p.tap_layout.len() * self.ctx.hidden();
+        Ok(taps.slice(..bv.padded_seqs * bv.width * row_len))
+    }
+
+    /// Acceptance results of the last batched verify including bucket-padded sequences,
+    /// `[padded_seqs * RESULT_LEN]`.
+    pub fn batch_verify_results_padded(&self) -> anyhow::Result<CudaView<'_, i32>> {
+        let bv = self
+            .batch_verify
+            .as_ref()
+            .and_then(|p| p.batch.as_ref())
+            .and_then(|b| b.verify.as_ref())
+            .context("no batched verify has run")?;
+        Ok(bv.results.slice(..bv.padded_seqs * RESULT_LEN))
+    }
+
+    /// Next anchors of the last batched verify including bucket-padded sequences,
+    /// `[padded_seqs]`.
+    pub fn batch_verify_anchors_padded(&self) -> anyhow::Result<CudaView<'_, i32>> {
+        let bv = self
+            .batch_verify
+            .as_ref()
+            .and_then(|p| p.batch.as_ref())
+            .and_then(|b| b.verify.as_ref())
+            .context("no batched verify has run")?;
+        Ok(bv.anchors.slice(..bv.padded_seqs))
+    }
+
     /// Feature taps of the last batched verify, BF16 `[seqs * width, taps, 2304]`.
     pub fn batch_verify_taps(&self) -> anyhow::Result<CudaView<'_, bf16>> {
         let p = self
@@ -1124,6 +1320,12 @@ impl Model {
             .context("the batch verify state is missing")?;
         self.ctx
             .compute_capped_logits(&p.final_hidden, bv.last_seqs * bv.width)
+    }
+
+    /// Number of captured `(bucket_seqs, width)` batched verify CUDA graphs currently cached.
+    #[must_use]
+    pub fn batch_verify_graph_count(&self) -> usize {
+        self.batch_verify_graphs.len()
     }
 
     /// Reserves [`Model::verify_batch`] scratch and backup buffers for up to `max_seqs`

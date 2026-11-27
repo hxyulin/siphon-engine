@@ -661,6 +661,10 @@ mod cuda {
     /// one chunk of the pool, so that it decodes that far before it needs more.
     const HEADROOM: usize = MAP_POSITIONS;
 
+    /// Number of [`MAP_POSITIONS`] chunks to pre-map ahead when free KV pool pages allow,
+    /// avoiding mid-decode `cuMemSetAccess` stalls during batched speculation.
+    const PREMAP_GROW_CHUNKS: usize = 2;
+
     /// How long a request may wait before it goes ahead of shorter ones: until then the
     /// queue starts the shortest prompts first.
     const AGE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -1005,7 +1009,7 @@ mod cuda {
                 let captured = speculator.warmup_batch_spec(&mut model, spec_seqs, warmup[0])?;
                 eprintln!(
                     "batched DFlash 2 speculation enabled (up to {spec_seqs} sequences per verify, \
-                     pre-captured {captured} verify+draft graph pairs in {:.2} s)",
+                     pre-captured {captured} bucketed verify+draft graph pairs in {:.2} s)",
                     warmup_started.elapsed().as_secs_f64()
                 );
             }
@@ -1667,6 +1671,37 @@ mod cuda {
         }
     }
 
+    /// Pre-maps KV pages for `slot` past `position` (up to `PREMAP_GROW_CHUNKS` chunks ahead,
+    /// falling back to 1 chunk) when the pool has surplus free pages beyond `reserve_pages`,
+    /// coalescing multiple pages into one `cuMemSetAccess` per buffer and preventing
+    /// mid-decode VMM stalls.
+    fn premap_slot_headroom(
+        model: &mut Model,
+        slot: usize,
+        position: usize,
+        final_position: usize,
+        reserve_pages: usize,
+    ) {
+        let Some(pool) = model.kv_pool() else {
+            return;
+        };
+        let available = pool.free_pages().saturating_sub(reserve_pages);
+        for chunks in [PREMAP_GROW_CHUNKS, 1] {
+            let target =
+                memory::decode_premap_target(position, final_position, MAP_POSITIONS, chunks);
+            let Ok(need) = model.slot_pages_to(slot, target) else {
+                return;
+            };
+            if need == 0 {
+                return;
+            }
+            if need <= available {
+                let _ = model.map_slot(slot, target);
+                return;
+            }
+        }
+    }
+
     /// Returns the pages of idle slot `slot` that its prefix cache entry does not need to
     /// the KV pool. A failure goes to the log.
     fn release(model: &mut Model, speculator: &mut Speculator, slot: usize) {
@@ -2148,6 +2183,7 @@ mod cuda {
                 for to in [(end + HEADROOM).min(final_position).max(end), end] {
                     let pages = need(model, speculator, to);
                     if make_room(model, speculator, pages, &[0], Reclaim::Entries) {
+                        let _ = model.map_slot(0, to);
                         held = to;
                         return true;
                     }
@@ -2634,6 +2670,34 @@ mod cuda {
                     };
                     r.fail(&anyhow::anyhow!("the KV pool is full"));
                 }
+                // Pre-map ahead in bulk for any decoding request about to cross a KV chunk
+                // boundary, avoiding repeated single-page `cuMemSetAccess` stalls mid-decode.
+                let total_immediate: usize = active
+                    .iter()
+                    .filter(|r| !r.done && r.next.is_some())
+                    .map(|r| next_pages(model, r))
+                    .sum();
+                if total_immediate > 0 {
+                    let mut remaining_immediate = total_immediate;
+                    for r in active.iter().filter(|r| !r.done && r.next.is_some()) {
+                        let need = next_pages(model, r);
+                        if need > 0 {
+                            remaining_immediate = remaining_immediate.saturating_sub(need);
+                            let advance = if batch_spec && r.draft_ready {
+                                VERIFY_ROWS
+                            } else {
+                                1
+                            };
+                            premap_slot_headroom(
+                                model,
+                                r.slot,
+                                r.position() + advance,
+                                r.final_position(sched.capacity),
+                                remaining_immediate,
+                            );
+                        }
+                    }
+                }
                 let emitted = step_rows(
                     model,
                     speculator,
@@ -2861,6 +2925,7 @@ mod cuda {
                 };
                 encoded_images.push(imgs);
             }
+            let capacity = model.slot_capacity();
             let mut commit_draft = Vec::with_capacity(indices.len());
             let mut reset_draft = Vec::with_capacity(indices.len());
             let mut slices = Vec::with_capacity(indices.len());
@@ -2870,6 +2935,27 @@ mod cuda {
                 let r = &active[idx];
                 let len = r.job.prompt.len();
                 let end = (r.prefilled + chunk).min(len);
+                if end == len {
+                    // Pre-map prompt + decode headroom in one coalesced pass before prefill
+                    // so the subsequent decode rounds hit zero VMM mapping stalls, while
+                    // reserving pages for all other requests still prefilling.
+                    let other_reserve: usize = active
+                        .iter()
+                        .filter(|o| o.slot != r.slot && !o.done && o.next.is_none())
+                        .map(|o| {
+                            let o_end = (o.job.prompt.len() + HEADROOM).min(capacity);
+                            (model.pages_for(o_end) + model.ring_pages())
+                                .saturating_sub(model.slot_pages(o.slot).unwrap_or(0))
+                        })
+                        .sum();
+                    premap_slot_headroom(
+                        model,
+                        r.slot,
+                        end,
+                        r.final_position(capacity),
+                        other_reserve,
+                    );
+                }
                 total_processed += end - r.prefilled;
                 ends.push((idx, end, len));
                 commit_draft.push(batch_spec && r.draft_ready);
@@ -2935,9 +3021,29 @@ mod cuda {
 
         let i = i0;
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+        let capacity = model.slot_capacity();
+        let slot_i = active[i].slot;
+        let other_reserve: usize = active
+            .iter()
+            .filter(|o| o.slot != slot_i && !o.done && o.next.is_none())
+            .map(|o| {
+                let o_end = (o.job.prompt.len() + HEADROOM).min(capacity);
+                (model.pages_for(o_end) + model.ring_pages())
+                    .saturating_sub(model.slot_pages(o.slot).unwrap_or(0))
+            })
+            .sum();
         let r = &mut active[i];
         let len = r.job.prompt.len();
         let end = (r.prefilled + chunk).min(len);
+        if end == len {
+            premap_slot_headroom(
+                model,
+                r.slot,
+                end,
+                r.final_position(capacity),
+                other_reserve,
+            );
+        }
         let processed = end - r.prefilled;
         let boundary = len.saturating_sub(1) / chunk * chunk;
         model.set_sampling(r.sampling);

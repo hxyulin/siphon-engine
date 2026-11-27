@@ -906,12 +906,21 @@ impl Speculator {
             .ensure_batch_dflash2(model.stream(), max_seqs.min(MAX_BATCH_SEQS), max_slot)
     }
 
-    /// Pre-captures hot `(seqs, width)` target verify and DFlash 2 draft CUDA graph pairs
-    /// during startup warmup (bounded by `max_seqs`) so live requests avoid first-use
-    /// graph capture stalls. Returns the number of `(seqs, width)` pairs captured.
+    /// Number of captured `(single_stream, batched)` draft CUDA graphs currently cached.
+    #[must_use]
+    pub fn cached_draft_graph_counts(&self) -> (usize, usize) {
+        self.draft.cached_graph_counts()
+    }
+
+    /// Pre-captures every bucketed `(seqs, width)` target verify and DFlash 2 draft CUDA
+    /// graph pair (plus initial `commit_width = 0` draft graphs) for `1..=max_seqs` during
+    /// startup warmup. Combined with bucket-padding in `Model::start_verify_batch` and
+    /// `Draft::batch_*`, this eliminates live `cuGraphInstantiateWithFlags` stalls for every
+    /// concurrency level `1..=max_seqs` and adaptive verify width `{2, 4, 6, 8}`.
+    /// Returns the number of `(seqs, width)` verify+draft graph pairs captured.
     #[expect(
         clippy::too_many_lines,
-        reason = "pre-captures hot batched verify + draft graph pairs"
+        reason = "pre-captures bucketed batched verify + draft graph pairs"
     )]
     pub fn warmup_batch_spec(
         &mut self,
@@ -934,7 +943,7 @@ impl Speculator {
             self.draft.reset_slot(slot);
         }
         // Populate 1 committed position per slot in one packed forward pass so every
-        // `batch_draft_initial` / `verify_batch` shape has valid non-empty context.
+        // `batch_draft_initial` / `verify_batch` bucket has valid non-empty context.
         let tok_slice = [token];
         let slices: Vec<PackedPrefill<'_>> = (0..max_seqs)
             .map(|slot| PackedPrefill {
@@ -949,7 +958,7 @@ impl Speculator {
         self.prefill_packed_batch(model, &slices, &flags, &flags, max_seqs)?;
 
         let mut captured = 0usize;
-        for seqs in siphon::memory::hot_batch_spec_seqs(max_seqs) {
+        for seqs in siphon::memory::batch_seq_buckets(max_seqs) {
             let slots: Vec<usize> = (0..seqs).collect();
             let anchors = vec![token; seqs];
             let samplings = vec![Sampling::GREEDY; seqs];
@@ -1003,9 +1012,9 @@ impl Speculator {
                     model.draft_shared(),
                     &slots,
                     &starts,
-                    &model.batch_verify_taps()?,
-                    &model.batch_verify_results()?,
-                    &model.batch_verify_anchors()?,
+                    &model.batch_verify_taps_padded()?,
+                    &model.batch_verify_results_padded()?,
+                    &model.batch_verify_anchors_padded()?,
                     &samplings,
                     w,
                     STEPS,
@@ -1407,9 +1416,9 @@ impl Speculator {
             model.draft_shared(),
             slots,
             &starts,
-            &model.batch_verify_taps()?,
-            &model.batch_verify_results()?,
-            &model.batch_verify_anchors()?,
+            &model.batch_verify_taps_padded()?,
+            &model.batch_verify_results_padded()?,
+            &model.batch_verify_anchors_padded()?,
             &draft_samplings,
             verify_w,
             STEPS,

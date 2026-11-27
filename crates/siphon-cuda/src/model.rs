@@ -46,7 +46,7 @@ use crate::{
         Products,
         attention::{
             self, Attention, AttentionScratch, DecodeStep, KvCache, KvData, KvFormat, KvRounding,
-            MIN_SPLIT_SLOTS, ONE_TILE_SPLIT_SLOTS,
+            MIN_SPLIT_SLOTS, ONE_TILE_SPLIT_SLOTS, RingSlab,
         },
         conv::Conv,
         elementwise::Elementwise,
@@ -92,22 +92,38 @@ struct Kernels {
 /// chunk (see [`Model::map_slot`]).
 pub const MAP_POSITIONS: usize = prefill::DEFAULT_PREFILL_CHUNK;
 
-/// Maps the global caches of `visits` to hold every position below `end`, rounded up to
-/// [`MAP_POSITIONS`]. Does nothing for caches that are not pooled.
-fn map_visits(visits: &mut [VisitState], end: usize, stream: &CudaStream) -> anyhow::Result<()> {
+/// Maps the global caches of `visits` and its shared sliding-ring slab (if any) to hold
+/// every position below `end`, rounded up to [`MAP_POSITIONS`]. Does nothing for caches
+/// that are not pooled.
+fn map_visits(
+    visits: &mut [VisitState],
+    ring_slab: Option<&mut RingSlab>,
+    end: usize,
+    stream: &CudaStream,
+) -> anyhow::Result<()> {
     let end = end.next_multiple_of(MAP_POSITIONS);
-    let more = pages_to(visits, end);
+    let more = pages_to(visits, ring_slab.as_deref(), end);
     if more == 0 {
         return Ok(());
     }
-    let free = visits
-        .iter()
-        .find_map(|v| v.kv.pooled().map(|p| p[0].pool().free_pages()))
+    let free = ring_slab
+        .as_deref()
+        .map(|s| s.pool().free_pages())
+        .or_else(|| {
+            visits
+                .iter()
+                .find_map(|v| v.kv.pooled().map(|p| p[0].pool().free_pages()))
+        })
         .unwrap_or(0);
     ensure!(
         more <= free,
         "the KV pool is out of pages: {more} more needed to reach {end} positions, {free} free"
     );
+    if let Some(slab) = ring_slab
+        && slab.pages_needed() > 0
+    {
+        slab.map(stream)?;
+    }
     for v in visits.iter_mut() {
         let positions = if v.kv.window().is_some() {
             v.kv.slots()
@@ -121,18 +137,19 @@ fn map_visits(visits: &mut [VisitState], end: usize, stream: &CudaStream) -> any
 
 /// Pages that [`map_visits`] of `end` would take: the global caches' to `end`, and the
 /// rings' whole, which a slot maps as soon as it holds a sequence.
-fn pages_to(visits: &[VisitState], end: usize) -> usize {
+fn pages_to(visits: &[VisitState], ring_slab: Option<&RingSlab>, end: usize) -> usize {
     let end = end.next_multiple_of(MAP_POSITIONS);
-    visits
-        .iter()
-        .map(|v| {
-            if v.kv.window().is_some() {
-                v.kv.pages_to(v.kv.slots())
-            } else {
-                v.kv.pages_to(end)
-            }
-        })
-        .sum()
+    ring_slab.map_or(0, RingSlab::pages_needed)
+        + visits
+            .iter()
+            .map(|v| {
+                if v.kv.window().is_some() {
+                    v.kv.pages_to(v.kv.slots())
+                } else {
+                    v.kv.pages_to(end)
+                }
+            })
+            .sum::<usize>()
 }
 
 /// The caches one layer visit keeps across tokens.
@@ -392,6 +409,10 @@ pub struct Model {
     /// and been rounded to 4 bits ([`KvRounding::recent`]).
     rounded_below: usize,
     visits: Vec<VisitState>,
+    /// Contiguous VMM slab backing slot 0's sliding rings when `kv_pool` is present.
+    /// Declared after `visits` so `KvCache::drop` leaks its slices before the slab frees
+    /// its virtual address range.
+    ring_slab: Option<RingSlab>,
     scratch: Scratch,
     /// Rows of `scratch.blocks` a step can fill.
     max_blocks: usize,
@@ -596,18 +617,28 @@ impl Model {
         let hidden = config.hidden_size;
         let sliding_format = kv_format.sliding_format();
         let formats = config.cache_formats(passes, kv_format);
+        let visit_layers = config.visit_layers(passes);
+        let sliding_count = visit_layers.iter().filter(|&&l| config.is_sliding(l)).count();
+        let ring_slab = match (&kv_pool, sliding_count) {
+            (Some(pool), n) if n > 0 => Some(RingSlab::reserve(
+                pool,
+                n,
+                config.sliding_window_size,
+                sliding_format,
+            )?),
+            _ => None,
+        };
+        let mut ring_idx = 0usize;
         let mut visits: Vec<VisitState> = Vec::new();
-        for (v, layer) in config.visit_layers(passes).into_iter().enumerate() {
+        for (v, layer) in visit_layers.into_iter().enumerate() {
             let kv = if config.is_sliding(layer) {
                 let window = config.sliding_window_size;
-                match &kv_pool {
-                    Some(pool) => KvCache::sliding_pooled_with_format(
-                        &stream,
-                        window,
-                        window,
-                        sliding_format,
-                        pool,
-                    )?,
+                match ring_slab.as_ref() {
+                    Some(slab) => {
+                        let idx = ring_idx;
+                        ring_idx += 1;
+                        KvCache::sliding_in_slab(&stream, window, window, sliding_format, slab, idx)?
+                    }
                     None => {
                         KvCache::sliding_ring_with_format(&stream, window, window, sliding_format)?
                     }
@@ -677,6 +708,7 @@ impl Model {
             passes,
             rounded_below: 0,
             visits,
+            ring_slab,
             scratch,
             max_blocks,
             graph: None,
@@ -728,20 +760,22 @@ impl Model {
     pub fn map_slot(&mut self, slot: usize, end: usize) -> anyhow::Result<()> {
         let stream = Arc::clone(&self.ctx.stream);
         if slot == 0 {
-            return map_visits(&mut self.visits, end, &stream);
+            return map_visits(&mut self.visits, self.ring_slab.as_mut(), end, &stream);
         }
         self.slot_state(slot)?;
-        map_visits(&mut self.slots[slot - 1].visits, end, &stream)
+        let s = &mut self.slots[slot - 1];
+        map_visits(&mut s.visits, s.ring_slab.as_mut(), end, &stream)
     }
 
     /// Pages more that [`Model::map_slot`] of `end` would take.
     pub fn slot_pages_to(&self, slot: usize, end: usize) -> anyhow::Result<usize> {
-        let visits = if slot == 0 {
-            &self.visits
+        let (visits, ring_slab) = if slot == 0 {
+            (&self.visits, self.ring_slab.as_ref())
         } else {
-            &self.slot_state(slot)?.visits
+            let s = self.slot_state(slot)?;
+            (&s.visits, s.ring_slab.as_ref())
         };
-        Ok(pages_to(visits, end))
+        Ok(pages_to(visits, ring_slab, end))
     }
 
     /// Pages of the pool that one slot's rings take while it holds a sequence, and that a
@@ -756,31 +790,35 @@ impl Model {
     #[must_use]
     pub fn pages_for(&self, positions: usize) -> usize {
         let end = positions.next_multiple_of(MAP_POSITIONS);
-        self.visits
-            .iter()
-            .map(|v| {
-                let held = if v.kv.window().is_some() {
-                    v.kv.slots()
-                } else {
-                    end
-                };
-                v.kv.pages_for(held)
-            })
-            .sum()
+        self.ring_slab.as_ref().map_or(0, RingSlab::pages_total)
+            + self
+                .visits
+                .iter()
+                .map(|v| {
+                    let held = if v.kv.window().is_some() {
+                        v.kv.slots()
+                    } else {
+                        end
+                    };
+                    v.kv.pages_for(held)
+                })
+                .sum::<usize>()
     }
 
-    /// Pages of the pool that slot `slot`'s global caches hold.
+    /// Pages of the pool that slot `slot`'s global caches and rings hold.
     pub fn slot_pages(&self, slot: usize) -> anyhow::Result<usize> {
-        let visits = if slot == 0 {
-            &self.visits
+        let (visits, ring_slab) = if slot == 0 {
+            (&self.visits, self.ring_slab.as_ref())
         } else {
-            &self.slot_state(slot)?.visits
+            let s = self.slot_state(slot)?;
+            (&s.visits, s.ring_slab.as_ref())
         };
-        Ok(visits
-            .iter()
-            .filter_map(|v| v.kv.pooled())
-            .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
-            .sum())
+        Ok(ring_slab.map_or(0, RingSlab::held_pages)
+            + visits
+                .iter()
+                .filter_map(|v| v.kv.pooled())
+                .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
+                .sum::<usize>())
     }
 
     /// Positions of slot `slot`'s global caches that are mapped: the capacity unless
@@ -810,6 +848,9 @@ impl Model {
         self.ctx.stream.synchronize()?;
         self.with_slot(slot, |m| {
             let keep = positions.next_multiple_of(MAP_POSITIONS);
+            if let Some(slab) = m.ring_slab.as_mut() {
+                slab.unmap()?;
+            }
             for v in &mut m.visits {
                 // A ring is of use only while the slot decodes; an entry keeps a copy.
                 let keep = if v.kv.window().is_some() { 0 } else { keep };
@@ -839,6 +880,7 @@ impl Model {
                 )?;
             }
         }
+        self.ring_slab = None;
         self.graph = None;
         self.tap_graph = None;
         self.verify = None;
@@ -1105,8 +1147,16 @@ impl Model {
     }
 
     pub fn reset(&mut self) -> anyhow::Result<()> {
+        let bulk_rings = if let Some(slab) = self.ring_slab.as_ref() {
+            slab.zero(&self.ctx.stream)?;
+            true
+        } else {
+            false
+        };
         for visit in &mut self.visits {
-            visit.kv.clear(&self.ctx.stream)?;
+            if !(bulk_rings && visit.kv.window().is_some()) {
+                visit.kv.clear(&self.ctx.stream)?;
+            }
             for state in &mut visit.conv {
                 self.ctx.stream.memset_zeros(state)?;
             }
@@ -1229,7 +1279,7 @@ impl Model {
             state.visits.len(),
             self.visits.len()
         );
-        map_visits(&mut self.visits, state.position.max(1), stream)?;
+        map_visits(&mut self.visits, self.ring_slab.as_mut(), state.position.max(1), stream)?;
         for (v, (kv, conv)) in self.visits.iter_mut().zip(&state.visits) {
             // A ring is saved whole, a global cache up to the saved position.
             let ring = v.kv.window().is_some();
@@ -1272,6 +1322,7 @@ impl Model {
         );
         map_visits(
             &mut self.visits,
+            self.ring_slab.as_mut(),
             position + 1,
             &Arc::clone(&self.ctx.stream),
         )?;
@@ -1324,7 +1375,7 @@ impl Model {
             "the global KV caches are full at {position} tokens"
         );
         let stream = Arc::clone(&self.ctx.stream);
-        map_visits(&mut self.visits, position + 1, &stream)?;
+        map_visits(&mut self.visits, self.ring_slab.as_mut(), position + 1, &stream)?;
         let s = &mut self.scratch;
         stream.memcpy_htod(&[i32::try_from(token)?], &mut s.token)?;
         stream.memcpy_htod(

@@ -1378,3 +1378,120 @@ fn batch_wide_fp8_dense_and_wo_parity() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// After `Speculator::warmup_batch_spec`, bucketed batched speculation across changing
+/// `seqs` (including non-power-of-2 counts like 7, 5, 3) and adaptive verify widths must
+/// trigger zero additional verify or draft CUDA graph captures and remain bit-exact with
+/// single-sequence `greedy_by_verify`.
+#[test]
+#[ignore = "needs the checkpoint, DFlash 2 drafter, and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end bucketed graph + parity test")]
+fn bucketed_batch_spec_avoids_live_graph_captures_and_matches_greedy() -> anyhow::Result<()> {
+    let Some(drafter) = env::var_os("SIPHON_DFLASH").map(PathBuf::from) else {
+        println!("SIPHON_DFLASH not set; skipping");
+        return Ok(());
+    };
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let gpu = Gpu::new(0)?;
+    let config = TextConfig::load(&model_dir)?;
+    let passes = config.loop_config.num_passes;
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+    let mut model = Model::with_formats(
+        &gpu,
+        config,
+        weights,
+        passes,
+        CAPACITY,
+        KvFormat::Fp8,
+        WeightFormat::Fp8,
+    )?;
+    let max_seqs = 8;
+    model.add_slots(max_seqs - 1)?;
+    let draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Dflash(&drafter),
+        CAPACITY,
+        &DraftOptions::fast(),
+    )?;
+    ensure!(draft.is_dflash2(), "expected a DFlash 2 drafter");
+    let mut spec = Speculator::with_draft(&model, draft, Width::Fixed(7))?;
+    model.reserve_batch_verify(max_seqs)?;
+    spec.reserve_batch_spec(&model, max_seqs, max_seqs - 1)?;
+    let captured_pairs = spec.warmup_batch_spec(&mut model, max_seqs, 1)?;
+    let expected_pairs = siphon::memory::batch_spec_graph_shapes(max_seqs).len();
+    ensure!(
+        captured_pairs == expected_pairs,
+        "warmup captured {captured_pairs} pairs, expected {expected_pairs}"
+    );
+    let verify_graphs_after_warmup = model.batch_verify_graph_count();
+    let (_, draft_graphs_after_warmup) = spec.cached_draft_graph_counts();
+
+    let capture = capture_tokens()?;
+    let active_n = 7; // non-power-of-2, pads to bucket 8 then shrinks 7 -> 5 -> 3 -> 1
+    let prompts: Vec<&[u32]> = (0..active_n)
+        .map(|i| &capture[i * 120..i * 120 + 64 + i * 17])
+        .collect();
+    let mut want = Vec::with_capacity(active_n);
+    for prompt in &prompts {
+        model.reset()?;
+        let first = model.prefill(prompt, DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+        let mut seq = vec![first];
+        seq.extend(greedy_by_verify(&mut model, first, 24)?);
+        want.push(seq);
+    }
+
+    let mut anchors = Vec::with_capacity(active_n);
+    let mut got: Vec<Vec<u32>> = Vec::with_capacity(active_n);
+    for (slot, prompt) in prompts.iter().enumerate() {
+        model.reset_slot(slot)?;
+        let first = spec.prefill_slot_batch(
+            &mut model,
+            slot,
+            prompt,
+            None,
+            DEFAULT_PREFILL_CHUNK,
+            true,
+        )?;
+        anchors.push(first);
+        got.push(vec![first]);
+    }
+
+    // Drive shrinking non-bucket concurrency levels (7 -> 5 -> 3 -> 1) and varied max widths.
+    for (round, &count) in [7usize, 7, 5, 5, 3, 3, 1].iter().enumerate() {
+        let slots: Vec<usize> = (0..count).collect();
+        let round_anchors = anchors[..count].to_vec();
+        let samplings = vec![Sampling::GREEDY; count];
+        let max_w = [8usize, 4, 6, 2, 8, 4, 8][round];
+        let verdicts =
+            spec.speculate_batch_round(&mut model, &slots, &round_anchors, &samplings, max_w)?;
+        for (i, v) in verdicts.into_iter().enumerate() {
+            got[i].extend(v.emitted());
+            anchors[i] = v.next();
+        }
+    }
+
+    ensure!(
+        model.batch_verify_graph_count() == verify_graphs_after_warmup,
+        "live verify graph capture occurred: {} -> {}",
+        verify_graphs_after_warmup,
+        model.batch_verify_graph_count()
+    );
+    let (_, draft_graphs_after_live) = spec.cached_draft_graph_counts();
+    ensure!(
+        draft_graphs_after_live == draft_graphs_after_warmup,
+        "live batched draft graph capture occurred: {draft_graphs_after_warmup} -> {draft_graphs_after_live}"
+    );
+    for i in 0..active_n {
+        let check = got[i].len().min(want[i].len());
+        ensure!(
+            got[i][..check] == want[i][..check],
+            "sequence {i} diverged under bucket-padded batched speculation"
+        );
+    }
+    println!(
+        "bucketed batch spec matched greedy_by_verify bit-for-bit across seqs 7/5/3/1 with 0 live graph captures ({verify_graphs_after_warmup} verify, {draft_graphs_after_warmup} draft)"
+    );
+    Ok(())
+}

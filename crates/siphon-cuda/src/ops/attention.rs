@@ -23,13 +23,19 @@
 //! picks its kernels when they are launched, so a captured graph holds the variant of each
 //! cache and nothing branches when it replays.
 
-use std::{mem::ManuallyDrop, sync::Arc};
+use std::{
+    mem::ManuallyDrop,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, DevicePtr as _, LaunchConfig,
     PushKernelArg as _,
-    sys::{CUdevice_attribute, CUfunction_attribute},
+    sys::{self, CUdevice_attribute, CUfunction_attribute},
 };
 use half::bf16;
 
@@ -40,7 +46,7 @@ use crate::{
         norm::KvConvWeights,
         spec::{BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows, PACKED_SLICE_WORDS, PackedRows},
     },
-    vmm::{PagePool, Pooled},
+    vmm::{Page, PagePool, Pooled},
 };
 
 /// Query heads.
@@ -202,28 +208,194 @@ pub enum KvData {
 /// `KVCache` fed one token at a time.
 ///
 /// The cache does not count its tokens: append and attention take the position, and a
+/// One contiguous VMM reservation holding every sliding ring of a slot (or a prefix-cache
+/// `LocalState`), so mapping, zeroing, copying and unmapping all sliding rings takes a single
+/// `cuMemSetAccess` / `cuMemsetD8Async` / `cuMemcpyDtoDAsync_v2` / `cuMemUnmap` call instead
+/// of one per sliding visit.
+#[derive(Debug)]
+pub struct RingSlab {
+    pooled: Pooled,
+    mapped: Arc<AtomicBool>,
+    layout: siphon::memory::RingSlabLayout,
+}
+
+impl RingSlab {
+    /// Reserves one contiguous VMM range for `ring_count` sliding rings of `slots` positions
+    /// in `format` (`Bf16`, `Fp8`, or `Nvfp4`).
+    pub fn reserve(
+        pool: &PagePool,
+        ring_count: usize,
+        slots: usize,
+        format: KvFormat,
+    ) -> anyhow::Result<Self> {
+        ensure!(ring_count > 0, "a ring slab needs at least one ring");
+        ensure!(slots > 0, "a ring needs at least one slot");
+        let buffer_bytes = match format {
+            KvFormat::Bf16 => slots * KV_ROW * size_of::<bf16>(),
+            KvFormat::Fp8 => slots * KV_ROW,
+            KvFormat::Nvfp4 => slots * FP4_ROW,
+            KvFormat::Mixed | KvFormat::Nvfp4All => {
+                anyhow::bail!("sliding caches take a concrete format (BF16, FP8 or NVFP4)")
+            }
+        };
+        let layout = siphon::memory::RingSlabLayout::new(ring_count, buffer_bytes, pool.page_bytes());
+        let pooled = Pooled::reserve(pool, layout.total_bytes)?;
+        Ok(Self {
+            pooled,
+            mapped: Arc::new(AtomicBool::new(false)),
+            layout,
+        })
+    }
+
+    /// Device pointers `(keys, values)` for sliding ring `index` inside this slab.
+    #[must_use]
+    pub fn ring_ptrs(&self, index: usize) -> (u64, u64) {
+        let (k, v) = self.layout.ring_offsets(index);
+        (self.pooled.ptr() + k as u64, self.pooled.ptr() + v as u64)
+    }
+
+    /// Shared flag reflecting whether the slab's pages are currently mapped.
+    #[must_use]
+    pub fn mapped_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.mapped)
+    }
+
+    /// Whether every ring in the slab is currently backed by pages.
+    #[must_use]
+    pub fn is_mapped(&self) -> bool {
+        self.pooled.mapped_bytes() >= self.layout.total_bytes
+    }
+
+    /// Pages more that [`Self::map`] or [`Self::map_uninit`] would take from the pool.
+    #[must_use]
+    pub fn pages_needed(&self) -> usize {
+        self.pooled.pages_to(self.layout.total_bytes)
+    }
+
+    /// Total pages the slab takes when mapped.
+    #[must_use]
+    pub fn pages_total(&self) -> usize {
+        self.layout.pages
+    }
+
+    /// Pages currently held by this slab.
+    #[must_use]
+    pub fn held_pages(&self) -> usize {
+        self.pooled.pages().len()
+    }
+
+    #[must_use]
+    pub fn pool(&self) -> &PagePool {
+        self.pooled.pool()
+    }
+
+    /// Live byte span of all packed rings (`ring_count * 2 * buffer_bytes`).
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.layout.ring_count * self.layout.ring_stride
+    }
+
+    /// Maps the whole slab in one `cuMemSetAccess` and zeroes it in one `cuMemsetD8Async`.
+    pub fn map(&mut self, stream: &CudaStream) -> anyhow::Result<()> {
+        self.pooled.map_to(self.layout.total_bytes, stream)?;
+        self.mapped.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Maps the whole slab in one `cuMemSetAccess` without zeroing (for callers that
+    /// immediately overwrite every byte with `copy_to`).
+    pub fn map_uninit(&mut self) -> anyhow::Result<()> {
+        self.pooled.map_to_uninit(self.layout.total_bytes)?;
+        self.mapped.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Returns every page of the slab to the pool in one contiguous `cuMemUnmap`.
+    pub fn unmap(&mut self) -> anyhow::Result<()> {
+        self.pooled.unmap_from(0)?;
+        self.mapped.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Zeroes every mapped byte of the slab in one async memset.
+    pub fn zero(&self, stream: &CudaStream) -> anyhow::Result<()> {
+        self.pooled.zero_mapped(stream)
+    }
+
+    /// Copies all packed rings into `dst` in one async device-to-device transfer.
+    pub fn copy_to(&self, dst: &mut Self, stream: &CudaStream) -> anyhow::Result<()> {
+        ensure!(self.layout == dst.layout, "ring slab layouts differ");
+        ensure!(
+            self.is_mapped() && dst.is_mapped(),
+            "ring slabs must be mapped before copying"
+        );
+        let bytes = self.bytes();
+        if bytes == 0 {
+            return Ok(());
+        }
+        // SAFETY: both slabs are mapped for at least `bytes` and live across the copy.
+        unsafe {
+            sys::cuMemcpyDtoDAsync_v2(
+                dst.pooled.ptr(),
+                self.pooled.ptr(),
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .result()
+        .context("copying sliding ring slab")?;
+        Ok(())
+    }
+
+    /// Unmaps this slab and returns its physical pages so another slab can map them via
+    /// [`Self::map_shared_pages`].
+    pub fn take_pages(&mut self) -> anyhow::Result<Vec<Arc<Page>>> {
+        let pages = self.pooled.pages().to_vec();
+        self.unmap()?;
+        Ok(pages)
+    }
+
+    /// Replaces any mapped pages in this slab with `pages` in one `cuMemSetAccess`.
+    pub fn map_shared_pages(&mut self, pages: &[Arc<Page>]) -> anyhow::Result<()> {
+        self.unmap()?;
+        if !pages.is_empty() {
+            self.pooled.map_shared(pages)?;
+            self.mapped.store(self.is_mapped(), Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
+/// How a [`KvCache`]'s device memory is owned.
+#[derive(Debug)]
+enum KvBacking {
+    /// Ordinary `CudaSlice` allocations owned by `data`.
+    Owned,
+    /// Per-cache VMM reservations owned directly by this `KvCache`.
+    Pooled(Vec<Pooled>),
+    /// Contiguous VMM slab owned externally by a [`RingSlab`] (dropped after the cache).
+    Slab(Arc<AtomicBool>),
+}
+
 /// cache at position `p` holds the tokens at positions below `p`.
 #[derive(Debug)]
 pub struct KvCache {
-    /// The buffers. With `pooled`, their addresses are the pooled reservations', which own
-    /// the memory, and dropping the cache leaks them.
+    /// The buffers. With `Pooled` or `Slab`, their addresses come from VMM reservations,
+    /// which own the memory, and dropping the cache leaks them.
     data: ManuallyDrop<KvData>,
     slots: usize,
     window: Option<usize>,
-    /// For a cache in pooled memory, the reservations, of which the positions below
-    /// [`KvCache::mapped`] are backed: the keys' and the values', or for a packed ring one
-    /// that holds the keys and then the values ([`KvCache::sliding_pooled_with_format`]).
-    pooled: Option<Vec<Pooled>>,
+    backing: KvBacking,
 }
 
 impl Drop for KvCache {
     fn drop(&mut self) {
         // SAFETY: `data` is not used again.
         let data = unsafe { ManuallyDrop::take(&mut self.data) };
-        if self.pooled.is_none() {
+        if matches!(self.backing, KvBacking::Owned) {
             return;
         }
-        // The reservations own the addresses; they unmap and free them after this.
+        // The VMM reservation owns the addresses; it unmaps and frees them after this.
         match data {
             KvData::Bf16 { keys, values } => {
                 let _ = (keys.leak(), values.leak());
@@ -346,7 +518,54 @@ impl KvCache {
             data: ManuallyDrop::new(data),
             slots: capacity,
             window,
-            pooled: Some(pooled),
+            backing: KvBacking::Pooled(pooled),
+        })
+    }
+
+    /// A pooled sliding ring whose keys and values sit at slot `index` inside a shared
+    /// [`RingSlab`]. The caller must ensure `slab` outlives this `KvCache`.
+    pub fn sliding_in_slab(
+        stream: &Arc<CudaStream>,
+        window: usize,
+        slots: usize,
+        format: KvFormat,
+        slab: &RingSlab,
+        index: usize,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            slots >= window,
+            "a ring of {slots} slots cannot hold a window of {window}"
+        );
+        ensure!(
+            matches!(format, KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4),
+            "sliding caches take a concrete format (BF16, FP8 or NVFP4)"
+        );
+        u32::try_from(slots).context("too many KV cache slots")?;
+        let (keys, values) = slab.ring_ptrs(index);
+        // SAFETY: `keys` and `values` point into `slab`'s reservation, which outlives this
+        // cache; `Drop` leaks the slices so cudarc never frees them.
+        let data = unsafe {
+            match format {
+                KvFormat::Bf16 => KvData::Bf16 {
+                    keys: stream.upgrade_device_ptr(keys, slots * KV_ROW),
+                    values: stream.upgrade_device_ptr(values, slots * KV_ROW),
+                },
+                KvFormat::Fp8 => KvData::Fp8 {
+                    keys: stream.upgrade_device_ptr(keys, slots * KV_ROW),
+                    values: stream.upgrade_device_ptr(values, slots * KV_ROW),
+                },
+                KvFormat::Nvfp4 => KvData::Nvfp4 {
+                    keys: stream.upgrade_device_ptr(keys, slots * FP4_ROW),
+                    values: stream.upgrade_device_ptr(values, slots * FP4_ROW),
+                },
+                KvFormat::Mixed | KvFormat::Nvfp4All => unreachable!("refused above"),
+            }
+        };
+        Ok(Self {
+            data: ManuallyDrop::new(data),
+            slots,
+            window: Some(window),
+            backing: KvBacking::Slab(slab.mapped_flag()),
         })
     }
 
@@ -387,26 +606,36 @@ impl KvCache {
     /// ring's one reservation, both buffers whole, since its values follow its keys.
     fn pooled_bytes(&self, positions: usize) -> usize {
         let bytes = positions.min(self.slots) * self.row_bytes();
-        match self.pooled.as_deref() {
-            Some([_]) if bytes > 0 => 2 * self.slots * self.row_bytes(),
+        match &self.backing {
+            KvBacking::Pooled(p) if p.len() == 1 && bytes > 0 => 2 * self.slots * self.row_bytes(),
             _ => bytes,
         }
     }
 
-    /// Whether the cache's memory comes from a page pool.
+    /// Whether the cache's memory comes from a page pool (directly or via a [`RingSlab`]).
     #[must_use]
     pub fn is_pooled(&self) -> bool {
-        self.pooled.is_some()
+        !matches!(self.backing, KvBacking::Owned)
     }
 
     /// Positions whose memory is backed: every slot unless pooled.
     #[must_use]
     pub fn mapped(&self) -> usize {
-        match self.pooled.as_deref() {
-            Some([both]) if both.mapped_bytes() >= self.pooled_bytes(self.slots) => self.slots,
-            Some([_]) => 0,
-            Some([keys, ..]) => (keys.mapped_bytes() / self.row_bytes()).min(self.slots),
-            Some([]) | None => self.slots,
+        match &self.backing {
+            KvBacking::Pooled(p) => match p.as_slice() {
+                [both] if both.mapped_bytes() >= self.pooled_bytes(self.slots) => self.slots,
+                [_] => 0,
+                [keys, ..] => (keys.mapped_bytes() / self.row_bytes()).min(self.slots),
+                [] => self.slots,
+            },
+            KvBacking::Slab(mapped) => {
+                if mapped.load(Ordering::Acquire) {
+                    self.slots
+                } else {
+                    0
+                }
+            }
+            KvBacking::Owned => self.slots,
         }
     }
 
@@ -414,16 +643,17 @@ impl KvCache {
     #[must_use]
     pub fn pages_to(&self, positions: usize) -> usize {
         let bytes = self.pooled_bytes(positions);
-        self.pooled
-            .as_ref()
-            .map_or(0, |p| p.iter().map(|b| b.pages_to(bytes)).sum())
+        match &self.backing {
+            KvBacking::Pooled(p) => p.iter().map(|b| b.pages_to(bytes)).sum(),
+            KvBacking::Owned | KvBacking::Slab(_) => 0,
+        }
     }
 
     /// Backs the positions below `positions` (at most the capacity) with pages, zeroed on
-    /// `stream`. Does nothing for a cache that is not pooled.
+    /// `stream`. Does nothing for a cache that is not directly pooled.
     pub fn map(&mut self, positions: usize, stream: &CudaStream) -> anyhow::Result<()> {
         let bytes = self.pooled_bytes(positions);
-        if let Some(pooled) = &mut self.pooled {
+        if let KvBacking::Pooled(pooled) = &mut self.backing {
             let more: usize = pooled.iter().map(|b| b.pages_to(bytes)).sum();
             let free = pooled[0].pool().free_pages();
             ensure!(
@@ -439,10 +669,10 @@ impl KvCache {
     }
 
     /// Returns the pages past the first `positions` to the pool. Queued work must not
-    /// touch those positions any more. Does nothing for a cache that is not pooled.
+    /// touch those positions any more. Does nothing for a cache that is not directly pooled.
     pub fn unmap_from(&mut self, positions: usize) -> anyhow::Result<()> {
         let bytes = self.pooled_bytes(positions);
-        if let Some(pooled) = &mut self.pooled {
+        if let KvBacking::Pooled(pooled) = &mut self.backing {
             for b in pooled {
                 b.unmap_from(bytes)?;
             }
@@ -450,27 +680,35 @@ impl KvCache {
         Ok(())
     }
 
-    /// The pooled reservations: the keys' and the values', or a packed ring's one.
+    /// The directly pooled reservations: the keys' and the values', or a packed ring's one.
     #[must_use]
     pub fn pooled(&self) -> Option<&[Pooled]> {
-        self.pooled.as_deref()
+        match &self.backing {
+            KvBacking::Pooled(p) => Some(p.as_slice()),
+            KvBacking::Owned | KvBacking::Slab(_) => None,
+        }
     }
 
-    /// The pooled reservations, to map shared pages into.
+    /// The directly pooled reservations, to map shared pages into.
     pub fn pooled_mut(&mut self) -> Option<&mut [Pooled]> {
-        self.pooled.as_deref_mut()
+        match &mut self.backing {
+            KvBacking::Pooled(p) => Some(p.as_mut_slice()),
+            KvBacking::Owned | KvBacking::Slab(_) => None,
+        }
     }
 
     /// Pages of the pool that the cache takes while it holds the positions below
-    /// `positions`, 0 unless pooled.
+    /// `positions`, 0 unless directly pooled.
     #[must_use]
     pub fn pages_for(&self, positions: usize) -> usize {
         let bytes = self.pooled_bytes(positions);
-        self.pooled.as_ref().map_or(0, |p| {
-            p.iter()
+        match &self.backing {
+            KvBacking::Pooled(p) => p
+                .iter()
                 .map(|b| bytes.min(b.reserved_bytes()).div_ceil(b.page_bytes()))
-                .sum()
-        })
+                .sum(),
+            KvBacking::Owned | KvBacking::Slab(_) => 0,
+        }
     }
 
     fn new(
@@ -507,7 +745,7 @@ impl KvCache {
             data: ManuallyDrop::new(data),
             slots,
             window,
-            pooled: None,
+            backing: KvBacking::Owned,
         })
     }
 

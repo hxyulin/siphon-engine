@@ -63,39 +63,58 @@ pub const VERIFY_ROWS: usize = 8;
 pub const BATCH_ROWS: usize = 64;
 /// Most total rows (`seqs * width`) one batched verify takes.
 pub const BATCH_VERIFY_MAX_ROWS: usize = 256;
-/// Most sequences one batched DFlash 2 speculation round verifies at once.
+/// Most concurrent sequences one batched DFlash 2 speculation call handles.
 pub const MAX_BATCH_SPEC_SEQS: usize = 32;
-/// Adaptive verify widths considered by batched speculation.
+/// Adaptive batched verify widths chosen by `Speculator::choose_batch_width`.
 pub const BATCH_SPEC_WIDTHS: [usize; 4] = [2, 4, 6, 8];
+/// Tight padded sequence-count buckets for batched verify and batched DFlash 2 CUDA graphs.
+/// Uses step 1 for `1..=8` (0% padding) and step 2 for `10..=32` (at most 1 dummy slot,
+/// <= 5.9% overhead for `seqs >= 17`), bounding warmup graphs to at most 20 sequence
+/// counts across `1..=32` (12 for `C <= 16`) so changing concurrency never triggers live
+/// `cuGraphInstantiateWithFlags` stalls.
+pub const BATCH_SEQ_BUCKETS: [usize; 20] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32,
+];
 
-/// Hot batch sizes (`seqs`) to pre-capture during batched speculation warmup, bounded by
-/// `max_seqs` (`<= MAX_BATCH_SPEC_SEQS`): every size up to 8 plus key multiples up to
-/// `max_seqs`, so live requests avoid first-use CUDA graph capture stalls without
-/// exploding startup time.
+/// Smallest sequence-count bucket `>= seqs`, clamped to `max_seqs` (`max_seqs >= seqs`).
+/// When `seqs > 32` (e.g. a non-DFlash direct `verify_batch` with narrow width), rounds
+/// up to a multiple of 8 clamped to `max_seqs`.
 #[must_use]
-pub fn hot_batch_spec_seqs(max_seqs: usize) -> Vec<usize> {
-    let max_seqs = max_seqs.min(MAX_BATCH_SPEC_SEQS);
-    if max_seqs == 0 {
-        return Vec::new();
-    }
-    let mut seqs: Vec<usize> = (1..=max_seqs.min(8)).collect();
-    for s in [12usize, 16, 24, 32] {
-        if s <= max_seqs {
-            seqs.push(s);
+pub fn batch_seq_bucket(seqs: usize, max_seqs: usize) -> usize {
+    let cap = max_seqs.max(seqs);
+    for &b in &BATCH_SEQ_BUCKETS {
+        if b >= seqs {
+            return b.min(cap);
         }
     }
-    if *seqs.last().unwrap_or(&0) != max_seqs {
-        seqs.push(max_seqs);
-    }
-    seqs
+    seqs.next_multiple_of(8).min(cap)
 }
 
-/// Hot `(seqs, width)` verify+draft graph pairs to pre-capture during warmup for up to
-/// `max_seqs` concurrent sequences.
+/// All padded sequence-count buckets reachable for `1..=max_seqs` (capped at
+/// [`MAX_BATCH_SPEC_SEQS`]), ascending and deduplicated.
 #[must_use]
-pub fn hot_batch_spec_shapes(max_seqs: usize) -> Vec<(usize, usize)> {
+pub fn batch_seq_buckets(max_seqs: usize) -> Vec<usize> {
+    let cap = max_seqs.min(MAX_BATCH_SPEC_SEQS);
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<usize> = BATCH_SEQ_BUCKETS
+        .iter()
+        .copied()
+        .filter(|&b| b <= cap)
+        .collect();
+    if out.last().copied() != Some(cap) {
+        out.push(cap);
+    }
+    out
+}
+
+/// All `(bucket_seqs, width)` batched verify + draft CUDA graph shapes reachable for
+/// `1..=max_seqs` sequences under [`BATCH_SPEC_WIDTHS`].
+#[must_use]
+pub fn batch_spec_graph_shapes(max_seqs: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    for seqs in hot_batch_spec_seqs(max_seqs) {
+    for seqs in batch_seq_buckets(max_seqs) {
         let max_w = (BATCH_VERIFY_MAX_ROWS / seqs).min(VERIFY_ROWS);
         for w in BATCH_SPEC_WIDTHS {
             if w <= max_w {
@@ -106,10 +125,82 @@ pub fn hot_batch_spec_shapes(max_seqs: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// Fixed shortlist head capacity for `ranked` base+special tokens and `vocab` total tokens.
+/// Fixed shortlist head row capacity for `ranked` base+special tokens and `vocab` total
+/// tokens. Keeping the base-logit GEMM row count fixed at this capacity avoids CUDA graph
+/// invalidation as `note_tokens` appends context tokens.
 #[must_use]
 pub fn shortlist_capacity(ranked: usize, vocab: usize) -> usize {
     (ranked + SHORTLIST_CONTEXT_ROWS).min(vocab)
+}
+
+/// Contiguous virtual-address layout for packing all sliding rings of one slot (or one
+/// prefix-cache `LocalState`) into a single VMM reservation, so mapping, zeroing, and
+/// unmapping all `ring_count` rings requires one `cuMemSetAccess` / `cuMemUnmap` call
+/// instead of `ring_count` separate driver calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingSlabLayout {
+    /// Number of sliding rings packed into the slab.
+    pub ring_count: usize,
+    /// Bytes of one ring's key buffer (and equally its value buffer).
+    pub buffer_bytes: usize,
+    /// Stride in bytes between consecutive rings (`2 * buffer_bytes`, keys then values).
+    pub ring_stride: usize,
+    /// Total virtual reservation size in bytes, rounded up to whole `page_bytes`.
+    pub total_bytes: usize,
+    /// Physical pages of `page_bytes` backing the entire slab.
+    pub pages: usize,
+}
+
+impl RingSlabLayout {
+    /// Computes the contiguous slab layout for `ring_count` identical sliding rings, each
+    /// with `buffer_bytes` for keys and `buffer_bytes` for values, backed by VMM pages of
+    /// `page_bytes`.
+    #[must_use]
+    pub fn new(ring_count: usize, buffer_bytes: usize, page_bytes: usize) -> Self {
+        let ring_stride = 2 * buffer_bytes;
+        let raw_bytes = ring_count * ring_stride;
+        let total_bytes = if raw_bytes == 0 {
+            0
+        } else {
+            raw_bytes.next_multiple_of(page_bytes.max(1))
+        };
+        let pages = if raw_bytes == 0 {
+            0
+        } else {
+            total_bytes / page_bytes.max(1)
+        };
+        Self {
+            ring_count,
+            buffer_bytes,
+            ring_stride,
+            total_bytes,
+            pages,
+        }
+    }
+
+    /// Byte offsets `(keys_offset, values_offset)` of sliding ring `index` inside the slab.
+    #[must_use]
+    pub fn ring_offsets(&self, index: usize) -> (usize, usize) {
+        let keys = index * self.ring_stride;
+        (keys, keys + self.buffer_bytes)
+    }
+}
+
+/// Target position to pre-map a pooled slot up to so decoding avoids mid-round
+/// `cuMemSetAccess` boundary stalls: advances past `position` by `grow_chunks` multiples
+/// of `chunk`, capped at `final_position` (rounded up to `chunk`).
+#[must_use]
+pub fn decode_premap_target(
+    position: usize,
+    final_position: usize,
+    chunk: usize,
+    grow_chunks: usize,
+) -> usize {
+    let chunk = chunk.max(1);
+    let desired = position.saturating_add(chunk.saturating_mul(grow_chunks.max(1)));
+    desired
+        .min(final_position.max(position))
+        .next_multiple_of(chunk)
 }
 /// Draft tokens per round; a draft's capacity is the target's plus this and the anchor.
 pub const DRAFT_STEPS: usize = 7;
@@ -1352,28 +1443,85 @@ mod tests {
     }
 
     #[test]
-    fn hot_batch_spec_shapes_are_bounded_and_valid() {
-        assert_eq!(hot_batch_spec_seqs(0), Vec::<usize>::new());
-        assert_eq!(hot_batch_spec_shapes(0), Vec::<(usize, usize)>::new());
+    fn batch_seq_bucketing_covers_all_sizes_without_misses() {
+        assert_eq!(batch_seq_buckets(0), Vec::<usize>::new());
+        assert_eq!(batch_spec_graph_shapes(0), Vec::<(usize, usize)>::new());
 
-        for max_seqs in [1, 2, 4, 8, 12, 16, 20, 32, 64] {
-            let seqs = hot_batch_spec_seqs(max_seqs);
-            let cap = max_seqs.min(MAX_BATCH_SPEC_SEQS);
-            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
-            assert_eq!(seqs.first().copied(), Some(1));
-            assert_eq!(seqs.last().copied(), Some(cap));
-            for s in 1..=cap.min(8) {
-                assert!(seqs.contains(&s), "missing hot batch size {s} in {seqs:?}");
+        for max_seqs in [1, 2, 3, 4, 5, 8, 9, 10, 12, 16, 17, 20, 24, 32] {
+            let buckets = batch_seq_buckets(max_seqs);
+            assert!(buckets.windows(2).all(|w| w[0] < w[1]), "{buckets:?}");
+            assert_eq!(buckets.first().copied(), Some(1));
+            assert_eq!(buckets.last().copied(), Some(max_seqs));
+            // Every live seqs in 1..=max_seqs maps into the pre-captured bucket set.
+            for seqs in 1..=max_seqs {
+                let padded = batch_seq_bucket(seqs, max_seqs);
+                assert!(padded >= seqs && padded <= max_seqs);
+                // Step 1 for 1..=8 (0 dummy), step 2 for 9..=32 (at most 1 dummy slot).
+                assert!(
+                    padded - seqs <= usize::from(seqs > 8),
+                    "seqs={seqs} padded to {padded}"
+                );
+                assert!(
+                    buckets.contains(&padded),
+                    "seqs={seqs} (max={max_seqs}) mapped to {padded}, not in {buckets:?}"
+                );
             }
-
-            let shapes = hot_batch_spec_shapes(max_seqs);
-            assert!(shapes.len() <= 48, "warmup shapes unbounded: {}", shapes.len());
-            for &(s, w) in &shapes {
-                assert!((1..=cap).contains(&s));
-                assert!(BATCH_SPEC_WIDTHS.contains(&w));
-                assert!(s * w <= BATCH_VERIFY_MAX_ROWS);
+            let shapes = batch_spec_graph_shapes(max_seqs);
+            for seqs in 1..=max_seqs {
+                let padded = batch_seq_bucket(seqs, max_seqs);
+                for w in BATCH_SPEC_WIDTHS {
+                    if padded * w <= BATCH_VERIFY_MAX_ROWS {
+                        assert!(
+                            shapes.contains(&(padded, w)),
+                            "missing shape ({padded}, {w}) for seqs={seqs} max={max_seqs}"
+                        );
+                    }
+                }
             }
         }
+        // C=16: 12 tight buckets x 4 widths = 48 verify shapes for all seqs 1..=16.
+        assert_eq!(
+            batch_seq_buckets(16),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16]
+        );
+        assert_eq!(batch_spec_graph_shapes(16).len(), 48);
+        // C=32: 20 tight buckets x 4 widths = 80 verify shapes for all seqs 1..=32.
+        assert_eq!(
+            batch_seq_buckets(32),
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32
+            ]
+        );
+        assert_eq!(batch_spec_graph_shapes(32).len(), 80);
+    }
+
+    #[test]
+    fn ring_slab_coalesces_all_sliding_rings_without_extra_pages() {
+        let mib = 1 << 20;
+        // 40 FP8 sliding rings of 1 MiB K + 1 MiB V = 80 MiB = 40 pages in one slab.
+        let fp8 = RingSlabLayout::new(40, mib, KV_PAGE_BYTES);
+        assert_eq!(fp8.ring_stride, 2 * mib);
+        assert_eq!(fp8.total_bytes, 80 * mib);
+        assert_eq!(fp8.pages, 40);
+        assert_eq!(fp8.ring_offsets(0), (0, mib));
+        assert_eq!(fp8.ring_offsets(39), (78 * mib, 79 * mib));
+
+        // 40 BF16 sliding rings of 2 MiB K + 2 MiB V = 160 MiB = 80 pages in one slab.
+        let bf16 = RingSlabLayout::new(40, 2 * mib, KV_PAGE_BYTES);
+        assert_eq!(bf16.ring_stride, 4 * mib);
+        assert_eq!(bf16.total_bytes, 160 * mib);
+        assert_eq!(bf16.pages, 80);
+        assert_eq!(bf16.ring_offsets(1), (4 * mib, 6 * mib));
+
+        // 40 NVFP4 sliding rings of 576 KiB K + 576 KiB V = 45 MiB = 23 pages in one slab.
+        let nvfp4_buf = 1024 * KvFormat::Nvfp4All.sliding_format().row_bytes(1024);
+        let nvfp4 = RingSlabLayout::new(40, nvfp4_buf, KV_PAGE_BYTES);
+        assert_eq!(nvfp4.ring_stride, 2 * nvfp4_buf);
+        assert_eq!(nvfp4.pages, 23);
+
+        // Empty slab takes zero bytes and zero pages.
+        let empty = RingSlabLayout::new(0, mib, KV_PAGE_BYTES);
+        assert_eq!((empty.total_bytes, empty.pages), (0, 0));
     }
 
     #[test]
@@ -1398,5 +1546,15 @@ mod tests {
         let inv48 = invariant_scratch(&c, 48);
         let dense48 = 48 * (3 * c.hidden_size) + (48 * 3 * c.hidden_size) / 32;
         assert!(inv48 - inv47 > dense48);
+    }
+
+    #[test]
+    fn decode_premap_target_batches_chunks_and_caps_at_final_position() {
+        // Prompt 1900 + max_tokens 512 => final 2421; 2 chunks ahead from 1900 caps at 4096.
+        assert_eq!(decode_premap_target(1900, 2421, POOL_CHUNK, 2), 4096);
+        // Short request prompt 200 + max_tokens 256 => final 465; maps just 1 chunk (2048).
+        assert_eq!(decode_premap_target(200, 465, POOL_CHUNK, 2), 2048);
+        // Long request prompt 1000 + max_tokens 16384 => pre-maps 2 chunks ahead (6144).
+        assert_eq!(decode_premap_target(1000, 17384, POOL_CHUNK, 2), 6144);
     }
 }

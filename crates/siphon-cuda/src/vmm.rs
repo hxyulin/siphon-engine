@@ -248,11 +248,12 @@ impl Pooled {
     }
 
     /// Maps pages until at least the first `bytes` (at most the reserved size) are backed,
-    /// and zeroes the new pages on `stream`. Fails, mapping nothing, if the pool lacks them.
-    pub fn map_to(&mut self, bytes: usize, stream: &CudaStream) -> anyhow::Result<()> {
+    /// without zeroing the newly mapped pages. Returns the number of newly mapped bytes.
+    /// Fails, mapping nothing, if the pool lacks them.
+    pub fn map_to_uninit(&mut self, bytes: usize) -> anyhow::Result<usize> {
         let more = self.pages_to(bytes);
         if more == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let mut pages = Vec::with_capacity(more);
         for _ in 0..more {
@@ -265,16 +266,37 @@ impl Pooled {
             };
             pages.push(page);
         }
-        let start = self.mapped_bytes();
         self.map_pages(pages)?;
-        let page = self.pool.0.page;
+        Ok(more * self.pool.0.page)
+    }
+
+    /// Maps pages until at least the first `bytes` (at most the reserved size) are backed,
+    /// and zeroes the new pages on `stream`. Fails, mapping nothing, if the pool lacks them.
+    pub fn map_to(&mut self, bytes: usize, stream: &CudaStream) -> anyhow::Result<()> {
+        let start = self.mapped_bytes();
+        let added = self.map_to_uninit(bytes)?;
+        if added == 0 {
+            return Ok(());
+        }
         // SAFETY: the range was just mapped with read and write access, and work queued
         // on `stream` after this sees the zeros.
-        unsafe {
-            sys::cuMemsetD8Async(self.base + start as u64, 0, more * page, stream.cu_stream())
+        unsafe { sys::cuMemsetD8Async(self.base + start as u64, 0, added, stream.cu_stream()) }
+            .result()
+            .context("zeroing new pages")?;
+        Ok(())
+    }
+
+    /// Zeroes every currently mapped byte of this reservation in one async memset on
+    /// `stream`. Does nothing when no pages are mapped.
+    pub fn zero_mapped(&self, stream: &CudaStream) -> anyhow::Result<()> {
+        let mapped = self.mapped_bytes();
+        if mapped == 0 {
+            return Ok(());
         }
-        .result()
-        .context("zeroing new pages")?;
+        // SAFETY: `[self.base, self.base + mapped)` is currently mapped with RW access.
+        unsafe { sys::cuMemsetD8Async(self.base, 0, mapped, stream.cu_stream()) }
+            .result()
+            .context("zeroing mapped pages")?;
         Ok(())
     }
 
@@ -324,8 +346,8 @@ impl Pooled {
         Ok(())
     }
 
-    /// Unmaps every page past the first `bytes`, rounded up to a page. Queued work must
-    /// not touch them any more.
+    /// Unmaps every page past the first `bytes`, rounded up to a page, in one contiguous
+    /// `cuMemUnmap` call. Queued work must not touch them any more.
     pub fn unmap_from(&mut self, bytes: usize) -> anyhow::Result<()> {
         let keep = bytes.div_ceil(self.pool.0.page).min(self.pages.len());
         if keep == self.pages.len() {
@@ -333,12 +355,12 @@ impl Pooled {
         }
         self.pool.0.ctx.bind_to_thread()?;
         let page = self.pool.0.page;
-        for i in keep..self.pages.len() {
-            // SAFETY: page `i` is mapped, and the caller promises no queued work uses it.
-            unsafe { sys::cuMemUnmap(self.base + (i * page) as u64, page) }
-                .result()
-                .context("unmapping a page")?;
-        }
+        let count = self.pages.len() - keep;
+        // SAFETY: `[base + keep * page, base + len * page)` is contiguously mapped, and
+        // the caller promises no queued work uses it.
+        unsafe { sys::cuMemUnmap(self.base + (keep * page) as u64, count * page) }
+            .result()
+            .context("unmapping pages")?;
         self.pages.truncate(keep);
         Ok(())
     }

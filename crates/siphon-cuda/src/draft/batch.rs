@@ -79,12 +79,18 @@ fn check_distinct_slots(slots: &[usize]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Slots of each dummy DFlash 2 KV ring for inactive padded sequences (`control = [0, 0, 0]`
+/// only ever accesses slots `0..BLOCK`).
+const DUMMY_DRAFT_SLOTS: usize = 16;
+
 /// Per-slot sliding rings and batched intermediates for DFlash 2.
 pub(super) struct BatchDflash2 {
     /// Sliding rings for slots `1..` (slot 0 reuses `Draft::caches`).
     extra_slots: Vec<Vec<KvCache>>,
     /// Committed position of slots `1..` (slot 0 uses `Draft::committed`).
     extra_committed: Vec<usize>,
+    /// Tiny scratch rings backing inactive padded sequences when `seqs < padded_seqs`.
+    dummy_slots: Vec<Vec<KvCache>>,
     /// Whether the rings use FP8 E4M3 storage.
     fp8_kv: bool,
     /// Maximum sequences the scratch buffers hold (`<= MAX_BATCH_SEQS`).
@@ -101,6 +107,8 @@ pub(super) struct BatchDflash2 {
     last_races: Vec<u32>,
     /// Active slot list whose ring pointers `cache_table` holds.
     members: Vec<usize>,
+    /// Total sequence rows (`real + padded`) currently populated in `cache_table`.
+    padded_seqs: usize,
     /// `[max_seqs, layers, 2]` device addresses `(cache_k, cache_v)`.
     cache_table: CudaSlice<u64>,
     /// Persistent page-locked staging buffers for async H2D metadata uploads.
@@ -179,6 +187,7 @@ impl BatchDflash2 {
         Ok(Self {
             extra_slots: Vec::new(),
             extra_committed: Vec::new(),
+            dummy_slots: Vec::new(),
             fp8_kv,
             max_seqs,
             base_ld,
@@ -187,6 +196,7 @@ impl BatchDflash2 {
             races: stream.alloc_zeros(max_seqs * RACE_WORDS)?,
             last_races: vec![0; max_seqs * RACE_WORDS],
             members: Vec::new(),
+            padded_seqs: 0,
             cache_table: stream.alloc_zeros(max_seqs * layers * 2)?,
             host_controls: PinnedBuf::zeros(stream, max_seqs * CONTROL)?,
             host_starts: PinnedBuf::zeros(stream, max_seqs)?,
@@ -248,6 +258,21 @@ impl BatchDflash2 {
                 .collect::<anyhow::Result<Vec<_>>>()?;
             self.extra_slots.push(caches);
             self.extra_committed.push(0);
+        }
+        Ok(())
+    }
+
+    fn ensure_dummy_slots(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        layers: usize,
+        needed: usize,
+    ) -> anyhow::Result<()> {
+        while self.dummy_slots.len() < needed {
+            let caches = (0..layers)
+                .map(|_| KvCache::with_format(stream, DUMMY_DRAFT_SLOTS, self.fp8_kv))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            self.dummy_slots.push(caches);
         }
         Ok(())
     }
@@ -597,9 +622,16 @@ impl Draft {
         ensure!((1..=STEPS).contains(&steps), "{steps} drafts, expected 1 to {STEPS}");
         check_distinct_slots(slots)?;
         let max_slot = slots.iter().copied().max().unwrap_or(0);
-        self.ensure_batch_dflash2(stream, seqs, max_slot)?;
+        let cap = self
+            .batch
+            .as_ref()
+            .map_or(seqs, |b| b.max_seqs)
+            .max(seqs)
+            .min(MAX_BATCH_SEQS);
+        let padded_seqs = siphon::memory::batch_seq_bucket(seqs, cap);
+        self.ensure_batch_dflash2(stream, padded_seqs, max_slot)?;
         self.sync_shortlist(stream)?;
-        self.upload_batch_meta(stream, slots, samplings)?;
+        self.upload_batch_meta(stream, slots, padded_seqs, samplings)?;
         let committed_positions: Vec<i32> = slots
             .iter()
             .map(|&slot| {
@@ -615,13 +647,16 @@ impl Draft {
             controls[i * CONTROL + 1] = 0;
             controls[i * CONTROL + 2] = i32::try_from(anchor)?;
         }
+        if padded_seqs > seqs {
+            controls[seqs * CONTROL..padded_seqs * CONTROL].fill(0);
+        }
         b.host_controls.copy_to_device(
             stream,
-            seqs * CONTROL,
-            &mut b.controls.slice_mut(..seqs * CONTROL),
+            padded_seqs * CONTROL,
+            &mut b.controls.slice_mut(..padded_seqs * CONTROL),
         )?;
         b.h2d_done.record(stream)?;
-        self.launch_batch_graph(stream, shared, seqs, None, steps)
+        self.launch_batch_graph(stream, shared, padded_seqs, None, steps)
     }
 
     /// Commits each sequence's kept verify taps and drafts the next `draft_steps` (`1..=7`)
@@ -652,21 +687,35 @@ impl Draft {
         ensure!((1..=STEPS).contains(&draft_steps), "bad draft_steps {draft_steps}");
         check_distinct_slots(slots)?;
         let row_len = self.row_len();
+        let max_slot = slots.iter().copied().max().unwrap_or(0);
+        let cap = self
+            .batch
+            .as_ref()
+            .map_or(seqs, |b| b.max_seqs)
+            .max(seqs)
+            .min(MAX_BATCH_SEQS);
+        let padded_seqs = siphon::memory::batch_seq_bucket(seqs, cap);
+        let padded_taps_len = padded_seqs * verify_width * row_len;
+        let padded_results_len = padded_seqs * RESULT_LEN;
+        let use_padded = taps.len() == padded_taps_len
+            && results.len() == padded_results_len
+            && anchors.len() == padded_seqs;
+        let commit_seqs = if use_padded { padded_seqs } else { seqs };
         ensure!(
-            taps.len() == seqs * verify_width * row_len,
+            taps.len() == commit_seqs * verify_width * row_len,
             "taps has {} elements, expected {} x {row_len}",
             taps.len(),
-            seqs * verify_width
+            commit_seqs * verify_width
         );
         ensure!(
-            results.len() == seqs * RESULT_LEN,
+            results.len() == commit_seqs * RESULT_LEN,
             "results has {} elements, expected {}",
             results.len(),
-            seqs * RESULT_LEN
+            commit_seqs * RESULT_LEN
         );
         ensure!(
-            anchors.len() == seqs,
-            "anchors has {} elements, expected {seqs}",
+            anchors.len() == commit_seqs,
+            "anchors has {} elements, expected {commit_seqs}",
             anchors.len()
         );
         let mut starts_i32 = [0i32; MAX_BATCH_SEQS];
@@ -677,14 +726,19 @@ impl Draft {
             let _ = i32::try_from(end)?;
             *dst = i32::try_from(s)?;
         }
-        let max_slot = slots.iter().copied().max().unwrap_or(0);
-        self.ensure_batch_dflash2(stream, seqs, max_slot)?;
+        self.ensure_batch_dflash2(stream, commit_seqs, max_slot)?;
         self.sync_shortlist(stream)?;
-        self.upload_batch_meta(stream, slots, samplings)?;
+        self.upload_batch_meta(stream, slots, commit_seqs, samplings)?;
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
         b.host_starts.as_mut_slice()[..seqs].copy_from_slice(&starts_i32[..seqs]);
-        b.host_starts
-            .copy_to_device(stream, seqs, &mut b.starts.slice_mut(..seqs))?;
+        if commit_seqs > seqs {
+            b.host_starts.as_mut_slice()[seqs..commit_seqs].fill(0);
+        }
+        b.host_starts.copy_to_device(
+            stream,
+            commit_seqs,
+            &mut b.starts.slice_mut(..commit_seqs),
+        )?;
         b.h2d_done.record(stream)?;
         let commit = BatchCommitInputs {
             taps: taps.view(),
@@ -692,7 +746,7 @@ impl Draft {
             anchors: anchors.view(),
             width: verify_width,
         };
-        self.launch_batch_graph(stream, shared, seqs, Some(&commit), draft_steps)
+        self.launch_batch_graph(stream, shared, commit_seqs, Some(&commit), draft_steps)
     }
 
     /// Ready-to-verify tokens `[seqs * width]` produced by the last batched DFlash 2 round
@@ -732,22 +786,25 @@ impl Draft {
         Ok(stream.clone_dtoh(&b.confidence.slice(..seqs * steps))?)
     }
 
-    /// Uploads `cache_table` (when `slots` changed) and `races` (when `samplings` changed)
-    /// into stable device buffers using persistent page-locked staging buffers. Synchronizes
-    /// `h2d_done` first so the caller's subsequent pinned H2D (`controls` or `starts`) may
-    /// overwrite its staging buffer safely too.
+    /// Uploads `cache_table` (when `(slots, padded_seqs)` changed) and `races` (when
+    /// `samplings` changed) for the active and padded sequences into stable device buffers
+    /// using persistent page-locked staging buffers. Synchronizes `h2d_done` first so the
+    /// caller's subsequent pinned H2D (`controls` or `starts`) may overwrite its staging
+    /// buffer safely too.
     fn upload_batch_meta(
         &mut self,
         stream: &Arc<CudaStream>,
         slots: &[usize],
+        padded_seqs: usize,
         samplings: &[Sampling],
     ) -> anyhow::Result<()> {
         let seqs = slots.len();
         let layers = self.arch.layers();
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
         b.h2d_done.synchronize()?;
-        if b.members.as_slice() != slots {
-            let table_len = seqs * layers * 2;
+        b.ensure_dummy_slots(stream, layers, padded_seqs - seqs)?;
+        if b.members.as_slice() != slots || b.padded_seqs != padded_seqs {
+            let table_len = padded_seqs * layers * 2;
             let table = b.host_cache_table.as_mut_slice();
             let mut idx = 0;
             for &slot in slots {
@@ -762,11 +819,19 @@ impl Draft {
                     idx += 2;
                 }
             }
+            for dummy in &b.dummy_slots[..padded_seqs - seqs] {
+                for c in dummy {
+                    table[idx] = c.k.device_ptr(stream).0;
+                    table[idx + 1] = c.v.device_ptr(stream).0;
+                    idx += 2;
+                }
+            }
             b.host_cache_table
                 .copy_to_device(stream, table_len, &mut b.cache_table.slice_mut(..table_len))?;
             b.members = slots.to_vec();
+            b.padded_seqs = padded_seqs;
         }
-        let race_len = seqs * RACE_WORDS;
+        let race_len = padded_seqs * RACE_WORDS;
         {
             let races = b.host_races.as_mut_slice();
             for (i, &s) in samplings.iter().enumerate() {
@@ -776,6 +841,10 @@ impl Draft {
                     race_words(s.temperature, s.seed)
                 };
                 races[i * RACE_WORDS..(i + 1) * RACE_WORDS].copy_from_slice(&words);
+            }
+            let greedy = race_words(0.0, 0);
+            for i in seqs..padded_seqs {
+                races[i * RACE_WORDS..(i + 1) * RACE_WORDS].copy_from_slice(&greedy);
             }
         }
         if b.last_races[..race_len] != b.host_races.as_slice()[..race_len] {

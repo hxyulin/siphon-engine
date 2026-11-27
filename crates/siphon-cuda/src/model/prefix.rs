@@ -13,7 +13,7 @@ use anyhow::ensure;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _};
 
 use super::{Model, VisitState};
-use crate::ops::attention::{KvCache, KvData};
+use crate::ops::attention::{KvCache, KvData, RingSlab};
 
 /// A device buffer's address and length in bytes, for copies to and from host memory
 /// (the prefix cache's host tier, `spec::HostCache`).
@@ -93,8 +93,11 @@ fn visit_spans(visits: &[VisitState], stream: &CudaStream) -> Vec<DeviceSpan> {
 /// holds the sequence's global caches to that point.
 pub struct LocalState {
     /// Each visit's ring, `None` for a global cache, and its four conv states. With a KV
-    /// pool the rings take pages only while they hold a copy.
+    /// pool the rings share `ring_slab` and take pages only while they hold a copy.
+    /// Declared before `ring_slab` so `KvCache::drop` leaks its slices before the slab
+    /// frees the virtual address range.
     visits: Vec<(Option<KvCache>, Vec<CudaSlice<f32>>)>,
+    ring_slab: Option<RingSlab>,
     position: usize,
 }
 
@@ -130,20 +133,24 @@ impl LocalState {
     /// Whether the copies hold a state: saved, and not released since.
     #[must_use]
     pub fn holds(&self) -> bool {
-        self.visits
-            .iter()
-            .filter_map(|(ring, _)| ring.as_ref())
-            .all(|r| r.mapped() == r.slots())
+        self.ring_slab.as_ref().is_none_or(RingSlab::is_mapped)
+            && self
+                .visits
+                .iter()
+                .filter_map(|(ring, _)| ring.as_ref())
+                .all(|r| r.mapped() == r.slots())
     }
 
     /// Pages of the KV pool that the copies of the rings hold.
     #[must_use]
     pub fn pages(&self) -> usize {
-        self.visits
-            .iter()
-            .filter_map(|(ring, _)| ring.as_ref()?.pooled())
-            .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
-            .sum()
+        self.ring_slab.as_ref().map_or(0, RingSlab::held_pages)
+            + self
+                .visits
+                .iter()
+                .filter_map(|(ring, _)| ring.as_ref()?.pooled())
+                .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
+                .sum::<usize>()
     }
 
     /// Returns the pages of the copies of pooled rings to the pool, once `stream` has done
@@ -154,6 +161,9 @@ impl LocalState {
             return Ok(());
         }
         stream.synchronize()?;
+        if let Some(slab) = self.ring_slab.as_mut() {
+            slab.unmap()?;
+        }
         for ring in self.visits.iter_mut().filter_map(|(ring, _)| ring.as_mut()) {
             ring.unmap_from(0)?;
         }
@@ -253,19 +263,44 @@ impl Model {
     /// Allocates a [`LocalState`] for a slot's rings and conv states, holding nothing yet.
     pub fn local_state(&self) -> anyhow::Result<LocalState> {
         let stream = &self.ctx.stream;
+        let sliding_count = self
+            .visits
+            .iter()
+            .filter(|v| v.kv.window().is_some())
+            .count();
+        let ring_slab = if let (Some(pool), Some(first)) = (
+            self.kv_pool.as_ref(),
+            self.visits.iter().find(|v| v.kv.window().is_some()),
+        ) && sliding_count > 0
+        {
+            Some(RingSlab::reserve(
+                pool,
+                sliding_count,
+                first.kv.slots(),
+                first.kv.format(),
+            )?)
+        } else {
+            None
+        };
+        let mut ring_idx = 0usize;
         let visits = self
             .visits
             .iter()
             .map(|v| {
-                let ring = match (v.kv.window(), &self.kv_pool) {
+                let ring = match (v.kv.window(), ring_slab.as_ref()) {
                     (None, _) => None,
-                    (Some(window), Some(pool)) => Some(KvCache::sliding_pooled_with_format(
-                        stream,
-                        window,
-                        v.kv.slots(),
-                        v.kv.format(),
-                        pool,
-                    )?),
+                    (Some(window), Some(slab)) => {
+                        let idx = ring_idx;
+                        ring_idx += 1;
+                        Some(KvCache::sliding_in_slab(
+                            stream,
+                            window,
+                            v.kv.slots(),
+                            v.kv.format(),
+                            slab,
+                            idx,
+                        )?)
+                    }
                     (Some(window), None) => Some(KvCache::sliding_ring_with_format(
                         stream,
                         window,
@@ -283,6 +318,7 @@ impl Model {
             .collect::<anyhow::Result<_>>()?;
         Ok(LocalState {
             visits,
+            ring_slab,
             position: 0,
         })
     }
@@ -300,27 +336,41 @@ impl Model {
             state.visits.len(),
             self.visits.len()
         );
-        for (v, (ring, conv)) in self.visits.iter().zip(&mut state.visits) {
-            if let Some(ring) = ring.as_mut() {
-                ring.map(ring.slots(), stream)?;
+        if let Some(dst_slab) = state.ring_slab.as_mut() {
+            // One `cuMemSetAccess` for all sliding rings; no zeroing needed because the
+            // copy below immediately overwrites every byte.
+            dst_slab.map_uninit()?;
+        }
+        let bulk_copied = match (self.ring_slab.as_ref(), state.ring_slab.as_mut()) {
+            (Some(src), Some(dst)) => {
+                src.copy_to(dst, stream)?;
+                true
             }
-            match (v.kv.data(), ring.as_mut().map(KvCache::data_mut)) {
-                (_, None) => ensure!(v.kv.window().is_none(), "the state lacks a ring"),
-                (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
-                    ensure!(k.len() == keys.len(), "the ring sizes differ");
-                    stream.memcpy_dtod(keys, k)?;
-                    stream.memcpy_dtod(values, x)?;
+            _ => false,
+        };
+        for (v, (ring, conv)) in self.visits.iter().zip(&mut state.visits) {
+            if !bulk_copied {
+                if let Some(ring) = ring.as_mut() {
+                    ring.map(ring.slots(), stream)?;
                 }
-                (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
-                | (
-                    KvData::Nvfp4 { keys, values },
-                    Some(KvData::Nvfp4 { keys: k, values: x }),
-                ) => {
-                    ensure!(k.len() == keys.len(), "the ring sizes differ");
-                    stream.memcpy_dtod(keys, k)?;
-                    stream.memcpy_dtod(values, x)?;
+                match (v.kv.data(), ring.as_mut().map(KvCache::data_mut)) {
+                    (_, None) => ensure!(v.kv.window().is_none(), "the state lacks a ring"),
+                    (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
+                        ensure!(k.len() == keys.len(), "the ring sizes differ");
+                        stream.memcpy_dtod(keys, k)?;
+                        stream.memcpy_dtod(values, x)?;
+                    }
+                    (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
+                    | (
+                        KvData::Nvfp4 { keys, values },
+                        Some(KvData::Nvfp4 { keys: k, values: x }),
+                    ) => {
+                        ensure!(k.len() == keys.len(), "the ring sizes differ");
+                        stream.memcpy_dtod(keys, k)?;
+                        stream.memcpy_dtod(values, x)?;
+                    }
+                    _ => anyhow::bail!("the ring formats differ"),
                 }
-                _ => anyhow::bail!("the ring formats differ"),
             }
             for (src, dst) in v.conv.iter().zip(conv.iter_mut()) {
                 stream.memcpy_dtod(src, dst)?;
@@ -348,24 +398,33 @@ impl Model {
         );
         ensure!(state.holds(), "the saved state's copies were released");
         let stream = Arc::clone(&self.ctx.stream);
-        // A pooled ring of a slot that held no sequence takes its pages now.
-        super::map_visits(&mut self.visits, 0, &stream)?;
+        // A pooled ring slab of a slot that held no sequence takes its pages now.
+        super::map_visits(&mut self.visits, self.ring_slab.as_mut(), 0, &stream)?;
+        let bulk_copied = match (state.ring_slab.as_ref(), self.ring_slab.as_mut()) {
+            (Some(src), Some(dst)) => {
+                src.copy_to(dst, &stream)?;
+                true
+            }
+            _ => false,
+        };
         for (v, (ring, conv)) in self.visits.iter_mut().zip(&state.visits) {
-            match (v.kv.data_mut(), ring.as_ref().map(KvCache::data)) {
-                (_, None) => {}
-                (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
-                    stream.memcpy_dtod(k, keys)?;
-                    stream.memcpy_dtod(x, values)?;
+            if !bulk_copied {
+                match (v.kv.data_mut(), ring.as_ref().map(KvCache::data)) {
+                    (_, None) => {}
+                    (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
+                        stream.memcpy_dtod(k, keys)?;
+                        stream.memcpy_dtod(x, values)?;
+                    }
+                    (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
+                    | (
+                        KvData::Nvfp4 { keys, values },
+                        Some(KvData::Nvfp4 { keys: k, values: x }),
+                    ) => {
+                        stream.memcpy_dtod(k, keys)?;
+                        stream.memcpy_dtod(x, values)?;
+                    }
+                    _ => anyhow::bail!("the ring formats differ"),
                 }
-                (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
-                | (
-                    KvData::Nvfp4 { keys, values },
-                    Some(KvData::Nvfp4 { keys: k, values: x }),
-                ) => {
-                    stream.memcpy_dtod(k, keys)?;
-                    stream.memcpy_dtod(x, values)?;
-                }
-                _ => anyhow::bail!("the ring formats differ"),
             }
             for (src, dst) in conv.iter().zip(v.conv.iter_mut()) {
                 stream.memcpy_dtod(src, dst)?;
