@@ -108,7 +108,7 @@ mod linux {
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
-        weights::{OutputProjection, WeightFormat, Weights},
+        weights::{LmHeadFormat, OutputProjection, WeightFormat, Weights},
     };
 
     /// Bytes of weights one decode step reads.
@@ -141,6 +141,7 @@ mod linux {
         warmup: usize,
         kv: KvFormat,
         weights: WeightFormat,
+        lm_head: Option<LmHeadFormat>,
         output: OutputProjection,
         expert_activations: ExpertActivations,
         prefill_attention: PrefillAttention,
@@ -155,8 +156,10 @@ mod linux {
         spec: Option<usize>,
         /// The widths `--spec auto` picks from.
         widths: Vec<usize>,
-        /// The draft variant, shortlist ranking file and optional shortlist budgets.
+        /// The draft variant, weight override (`auto|bf16|fp8|nvfp4|nvfp4-backbone`),
+        /// shortlist ranking file and optional shortlist budgets.
         draft: String,
+        draft_weights: String,
         shortlist: Option<PathBuf>,
         draft_shortlist: Option<usize>,
         draft_context_rows: Option<usize>,
@@ -204,6 +207,7 @@ mod linux {
         let mut warmup = 10;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut lm_head = None;
         let mut output = OutputProjection::default();
         let mut expert_activations = ExpertActivations::Bf16;
         let mut prefill_attention = DEFAULT_PREFILL_ATTENTION;
@@ -215,6 +219,7 @@ mod linux {
         let mut spec = None;
         let mut widths = (1..=8).collect();
         let mut draft = "fast".to_owned();
+        let mut draft_weights = "auto".to_owned();
         let mut shortlist = None;
         let mut draft_shortlist = None;
         let mut draft_context_rows = None;
@@ -250,6 +255,7 @@ mod linux {
                 "--warmup" => warmup = value()?.parse()?,
                 "--kv" => kv = value()?.parse()?,
                 "--weights" => weights = value()?.parse()?,
+                "--lm-head" => lm_head = Some(value()?.parse()?),
                 "--output-projection" => output = value()?.parse()?,
                 "--expert-activations" => expert_activations = value()?.parse()?,
                 "--prefill-attention" => prefill_attention = value()?.parse()?,
@@ -262,6 +268,14 @@ mod linux {
                 }
                 "--widths" => widths = token_counts(&arg, &value()?)?,
                 "--draft" => draft = value()?,
+                "--draft-weights" => {
+                    draft_weights = value()?;
+                    ensure!(
+                        ["auto", "bf16", "fp8", "nvfp4", "nvfp4-backbone"]
+                            .contains(&draft_weights.as_str()),
+                        "--draft-weights takes auto, bf16, fp8, nvfp4 or nvfp4-backbone"
+                    );
+                }
                 "--shortlist" => shortlist = Some(PathBuf::from(value()?)),
                 "--draft-shortlist" => {
                     draft_shortlist = Some(validate_shortlist_rows(value()?.parse()?)?);
@@ -329,6 +343,7 @@ mod linux {
             warmup,
             kv,
             weights,
+            lm_head,
             output,
             expert_activations,
             prefill_attention,
@@ -340,6 +355,7 @@ mod linux {
             spec,
             widths,
             draft,
+            draft_weights,
             shortlist,
             draft_shortlist,
             draft_context_rows,
@@ -485,6 +501,7 @@ mod linux {
         let checkpoint = Checkpoint::open(&args.model)?;
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = args.output;
+        weights.lm_head_format = args.lm_head;
         let mut model = Model::with_formats(
             gpu,
             config,
@@ -616,6 +633,7 @@ mod linux {
         Ok(())
     }
 
+    #[expect(clippy::too_many_lines, reason = "top-level benchmark entry point")]
     pub fn main() -> anyhow::Result<()> {
         let mut args = args()?;
         if let Some(lengths) = args.prefill.take() {
@@ -665,6 +683,7 @@ mod linux {
         eprintln!("loading weights");
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = args.output;
+        weights.lm_head_format = args.lm_head;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -773,6 +792,7 @@ mod linux {
         eprintln!("loading weights");
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = args.output;
+        weights.lm_head_format = args.lm_head;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -789,8 +809,9 @@ mod linux {
         model.set_accept_margin(args.accept_margin)?;
         model.add_slots(largest - 1)?;
         let mut speculator = if args.follow {
-            let options = DraftOptions::fast()
+            let mut options = DraftOptions::fast()
                 .with_shortlist_budget(args.draft_shortlist, args.draft_context_rows)?;
+            options.apply_draft_weights(&args.draft_weights)?;
             let draft = load_draft(&mut model, &checkpoint, DraftSource::Bundled, capacity, &options)?;
             model.set_batch_taps(true);
             Some(Speculator::with_draft(
@@ -1087,6 +1108,7 @@ mod linux {
             let checkpoint = Checkpoint::open(&args.model)?;
             let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
             weights.output = args.output;
+            weights.lm_head_format = args.lm_head;
             let mut model = Model::with_formats(
                 &gpu,
                 config,
@@ -1119,15 +1141,19 @@ mod linux {
             } else {
                 String::new()
             };
+            let lm_head_note = args
+                .lm_head
+                .map_or_else(String::new, |h| format!(", lm_head {h}"));
             println!(
-                "passes {passes}, {} global KV cache, {} weights for decode, verify and the \
-                 draft's LM head, draft {} {}{margin_note}, prompt {} ({} tokens)\n",
+                "passes {passes}, {} global KV cache, {} weights{lm_head_note} for decode, verify and the \
+                 draft's LM head, draft {} {} (weights {}){margin_note}, prompt {} ({} tokens)\n",
                 args.kv,
                 args.weights,
                 args.drafter
                     .as_ref()
                     .map_or_else(|| "bundled".to_owned(), |d| d.display().to_string()),
                 args.draft,
+                args.draft_weights,
                 path.display(),
                 text.len()
             );
@@ -1136,8 +1162,9 @@ mod linux {
             }
             if let Some(k) = args.spec {
                 let ranking = args.shortlist.as_deref().map(read_ranking).transpose()?;
-                let options = DraftOptions::parse(&args.draft, ranking.as_deref())?
+                let mut options = DraftOptions::parse(&args.draft, ranking.as_deref())?
                     .with_shortlist_budget(args.draft_shortlist, args.draft_context_rows)?;
+                options.apply_draft_weights(&args.draft_weights)?;
                 let width = if k == 0 {
                     // Priced at each context before its run.
                     Width::Adaptive(WidthPolicy::new(&args.widths, [1.0; VERIFY_ROWS])?)

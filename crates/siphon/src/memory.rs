@@ -258,7 +258,9 @@ pub const KV_PAGE_BYTES: usize = 2 << 20;
 #[expect(clippy::struct_excessive_bools, reason = "one flag per approximation")]
 pub struct DraftApprox {
     pub fp8_backbone: bool,
+    pub nvfp4_backbone: bool,
     pub fp8_head: bool,
+    pub nvfp4_head: bool,
     pub fp8_fold: bool,
     pub fp8_kv: bool,
     pub shortlist: bool,
@@ -546,13 +548,15 @@ impl Planner {
                     + (2 * TAIL_ROWS + PLAIN_RUN_ROWS) * taps * hidden * 2;
                 // A device copy of the BF16 LM head for the exact base logits, which the
                 // target keeps in host memory with FP8 weights.
-                let head_copy =
-                    if inputs.weights == WeightFormat::Fp8 && !approx.fp8_head && !approx.shortlist
-                    {
-                        c.vocab_size * hidden * 2
-                    } else {
-                        0
-                    };
+                let head_copy = if inputs.weights == WeightFormat::Fp8
+                    && !approx.fp8_head
+                    && !approx.nvfp4_head
+                    && !approx.shortlist
+                {
+                    c.vocab_size * hidden * 2
+                } else {
+                    0
+                };
                 let kv_bytes = if approx.fp8_kv { 1 } else { 2 };
                 (
                     verify,
@@ -1043,8 +1047,14 @@ fn draft_ring_bytes(c: &TextConfig, d: &DraftShape) -> usize {
     (d.layers - d.global_layers) * d.ring_slots * 2 * kv_dims * 2
 }
 
+/// Bytes of one `Nvfp4Matrix` (`[padded_rows, k / 2 + k / 16 + 4]`).
+fn nvfp4_matrix(rows: usize, k: usize) -> usize {
+    let padded = rows.next_multiple_of(FP8_ROW_PAD);
+    padded * (k / 2 + k / 16 + 4)
+}
+
 /// The draft's bytes that do not grow with the capacity: its weights less the BF16
-/// projections that FP8 copies replace, the bundled draft's fold, the copies its
+/// projections that FP8/NVFP4 copies replace, the bundled draft's fold, the copies its
 /// approximations make, its rings and its larger buffers.
 fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usize {
     let hidden = c.hidden_size;
@@ -1052,8 +1062,8 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
     let vocab = c.unpadded_vocab_size;
     let padded = c.vocab_size;
     let mut bytes = d.weights;
-    if approx.fp8_backbone {
-        // The BF16 projections only the block reads, freed for their FP8 copies.
+    if approx.fp8_backbone || approx.nvfp4_backbone {
+        // The BF16 projections only the block reads, freed for their quantized copies.
         bytes -= d.layers * 2 * (2 * d.q_width * hidden + 3 * d.mlp_width * hidden);
     }
     bytes += match d.kind {
@@ -1065,7 +1075,21 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
         DraftKind::Dflash => padded * 2,
         DraftKind::Dflash2 => 0,
     };
-    if approx.fp8_backbone {
+    if approx.nvfp4_backbone {
+        let per_layer = nvfp4_matrix(d.q_width, hidden)
+            + 2 * nvfp4_matrix(kv_dims, hidden)
+            + nvfp4_matrix(hidden, d.q_width)
+            + 2 * nvfp4_matrix(d.mlp_width, hidden)
+            + nvfp4_matrix(hidden, d.mlp_width);
+        let context = match d.kind {
+            DraftKind::Bundled => 2 * nvfp4_matrix(kv_dims, hidden),
+            DraftKind::Dflash | DraftKind::Dflash2 => 0,
+        };
+        bytes += d.layers * (per_layer + context);
+        if d.kind != DraftKind::Bundled {
+            bytes += nvfp4_matrix(hidden, d.taps * hidden);
+        }
+    } else if approx.fp8_backbone {
         let per_layer = fp8_rows(d.q_width, hidden)
             + 2 * fp8_rows(kv_dims, hidden)
             + fp8_rows(hidden, d.q_width)
@@ -1083,7 +1107,9 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
     // The approximate head's copies of the LM head and fold rows.
     if approx.shortlist {
         let rows = SHORTLIST_ROWS + vocab.saturating_sub(FIRST_SPECIAL) + SHORTLIST_CONTEXT_ROWS;
-        bytes += if approx.fp8_head {
+        bytes += if approx.nvfp4_head {
+            nvfp4_matrix(rows, hidden)
+        } else if approx.fp8_head {
             fp8_rows(rows, hidden)
         } else {
             rows * hidden * 2
@@ -1097,7 +1123,9 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
         }
         bytes += rows * 4;
     } else {
-        if approx.fp8_head {
+        if approx.nvfp4_head {
+            bytes += nvfp4_matrix(vocab, hidden);
+        } else if approx.fp8_head {
             bytes += fp8_rows(vocab, hidden);
         }
         if approx.fp8_fold && d.markov {

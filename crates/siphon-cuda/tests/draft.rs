@@ -613,3 +613,230 @@ fn batch_helper_kernels_exact() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Parity and tolerance check for DFlash 2 with `--draft-weights nvfp4-backbone` and
+/// `--draft-weights nvfp4` against FP8:
+/// - Full-vocab base logits cosine similarity and top-1 agreement (`fp8` vs `nvfp4-backbone`)
+///   over real target hidden-state taps;
+/// - Batched DFlash 2 (`seqs = 4`, `m = 32 > 16`, CUDA-graph captured) with both
+///   `nvfp4-backbone` and `nvfp4` produces bit-identical draft tokens to single-stream.
+#[test]
+#[ignore = "needs SIPHON_MODEL, SIPHON_DFLASH (DFlash 2), and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end NVFP4 vs FP8 DFlash 2 parity test")]
+fn dflash2_nvfp4_parity_with_fp8() -> anyhow::Result<()> {
+    use std::{env, path::PathBuf};
+
+    use anyhow::{Context as _, ensure};
+    use siphon::{Checkpoint, TextConfig};
+    use siphon_cuda::{
+        draft::{DraftOptions, STEPS},
+        model::{Model, PrefillLogits, Sampling},
+        ops::{attention::KvFormat, linear::Linear},
+        spec::{DraftSource, load_draft},
+        weights::WeightFormat,
+    };
+
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let draft_dir = PathBuf::from(env::var_os("SIPHON_DFLASH").context("set SIPHON_DFLASH")?);
+
+    let gpu = Gpu::new(0)?;
+    let stream = Arc::clone(gpu.stream());
+    let config = TextConfig::load(&model_dir)?;
+    let vocab = config.unpadded_vocab_size;
+    let padded_vocab = config.vocab_size;
+    let passes = config.loop_config.num_passes;
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let weights = siphon_cuda::weights::Weights::load(&checkpoint, &config, &stream)?;
+    let capacity = 2048;
+    let mut model = Model::with_formats(
+        &gpu,
+        config,
+        weights,
+        passes,
+        capacity,
+        KvFormat::Fp8,
+        WeightFormat::Fp8,
+    )?;
+
+    let mut prompt = vec![1u32];
+    let mut tok = model.step(1, None)?;
+    prompt.push(tok);
+    for _ in 0..46 {
+        tok = model.step(tok, None)?;
+        prompt.push(tok);
+    }
+    model.reset()?;
+
+    let source = DraftSource::Dflash(&draft_dir);
+    let fp8_opts = DraftOptions::fp8();
+    let mut nvfp4_bb_opts = DraftOptions::fp8();
+    nvfp4_bb_opts.apply_draft_weights("nvfp4-backbone")?;
+    ensure!(nvfp4_bb_opts.nvfp4_backbone && !nvfp4_bb_opts.fp8_backbone && nvfp4_bb_opts.fp8_head);
+
+    let mut fp8_draft = load_draft(&mut model, &checkpoint, source, capacity, &fp8_opts)?;
+    ensure!(fp8_draft.is_dflash2(), "SIPHON_DFLASH must be a DFlash 2 drafter");
+    let layout = fp8_draft.tap_layout();
+    let row_len = layout.len() * HIDDEN;
+    let mut host_taps = vec![bf16::ZERO; prompt.len() * row_len];
+    {
+        let mut collect = |start: usize, taps: cudarc::driver::CudaView<'_, bf16>| {
+            let vals = stream.clone_dtoh(&taps)?;
+            host_taps[start * row_len..start * row_len + vals.len()].copy_from_slice(&vals);
+            Ok(())
+        };
+        model.prefill_with_taps(&prompt, 2048, PrefillLogits::Last, &mut collect)?;
+    }
+    let dev_taps = stream.clone_htod(&host_taps)?;
+    let linear = Linear::load(stream.context())?;
+    let prompt_i32: Vec<i32> = prompt
+        .iter()
+        .map(|&t| Ok(i32::try_from(t)?))
+        .collect::<anyhow::Result<_>>()?;
+    let mut anchor = stream.alloc_zeros::<i32>(1)?;
+
+    // 1. Full-vocab logit & draft comparison: FP8 backbone vs NVFP4 backbone (both with FP8 head).
+    let first = 16usize;
+    let anchors = 16usize;
+    ensure!(prompt.len() >= first + anchors + 1);
+
+    let mut fp8_ids = Vec::with_capacity(anchors * STEPS);
+    let mut fp8_logits = Vec::new();
+    {
+        let shared = model.draft_shared();
+        fp8_draft.commit(&stream, &linear, &dev_taps.slice(..first * row_len), 0)?;
+        for a in 0..anchors {
+            let p = first + a;
+            stream.memcpy_htod(&prompt_i32[p..=p], &mut anchor)?;
+            let commit_taps = if a == 0 {
+                dev_taps.slice(..0)
+            } else {
+                dev_taps.slice((p - 1) * row_len..p * row_len)
+            };
+            let commit_start = if a == 0 { p } else { p - 1 };
+            fp8_draft.set_round_inputs(&stream, &commit_taps, commit_start, &anchor)?;
+            fp8_draft.replay_round(&stream, &linear, shared, STEPS)?;
+            fp8_ids.extend(stream.clone_dtoh(fp8_draft.draft_ids())?);
+            if a < 4 {
+                fp8_logits.push(stream.clone_dtoh(fp8_draft.base_logits())?);
+            }
+        }
+    }
+    drop(fp8_draft);
+
+    let mut nvfp4_draft = load_draft(&mut model, &checkpoint, source, capacity, &nvfp4_bb_opts)?;
+    let mut nvfp4_ids = Vec::with_capacity(anchors * STEPS);
+    let mut nvfp4_logits = Vec::new();
+    {
+        let shared = model.draft_shared();
+        nvfp4_draft.commit(&stream, &linear, &dev_taps.slice(..first * row_len), 0)?;
+        for a in 0..anchors {
+            let p = first + a;
+            stream.memcpy_htod(&prompt_i32[p..=p], &mut anchor)?;
+            let commit_taps = if a == 0 {
+                dev_taps.slice(..0)
+            } else {
+                dev_taps.slice((p - 1) * row_len..p * row_len)
+            };
+            let commit_start = if a == 0 { p } else { p - 1 };
+            nvfp4_draft.set_round_inputs(&stream, &commit_taps, commit_start, &anchor)?;
+            nvfp4_draft.replay_round(&stream, &linear, shared, STEPS)?;
+            nvfp4_ids.extend(stream.clone_dtoh(nvfp4_draft.draft_ids())?);
+            if a < 4 {
+                nvfp4_logits.push(stream.clone_dtoh(nvfp4_draft.base_logits())?);
+            }
+        }
+    }
+    drop(nvfp4_draft);
+
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    let mut base_top1 = 0usize;
+    let mut base_total = 0usize;
+    for (fl, nl) in fp8_logits.iter().zip(&nvfp4_logits) {
+        for s in 0..STEPS {
+            let fr = &fl[s * padded_vocab..s * padded_vocab + vocab];
+            let nr = &nl[s * padded_vocab..s * padded_vocab + vocab];
+            let (mut best_fp8_id, mut best_fp8_val) = (0usize, f32::NEG_INFINITY);
+            let (mut best_nvfp4_id, mut best_nvfp4_val) = (0usize, f32::NEG_INFINITY);
+            for (j, (fv, nv)) in fr.iter().zip(nr).enumerate() {
+                let a = f64::from(fv.to_f32());
+                let b = f64::from(nv.to_f32());
+                dot += a * b;
+                norm_a += a * a;
+                norm_b += b * b;
+                if fv.to_f32() > best_fp8_val {
+                    best_fp8_val = fv.to_f32();
+                    best_fp8_id = j;
+                }
+                if nv.to_f32() > best_nvfp4_val {
+                    best_nvfp4_val = nv.to_f32();
+                    best_nvfp4_id = j;
+                }
+            }
+            base_top1 += usize::from(best_fp8_id == best_nvfp4_id);
+            base_total += 1;
+        }
+    }
+    let cosine = dot / (norm_a.sqrt() * norm_b.sqrt());
+    let base_top1_rate = base_top1 as f64 / base_total as f64;
+    let draft_agree = fp8_ids
+        .iter()
+        .zip(&nvfp4_ids)
+        .filter(|(a, b)| a == b)
+        .count();
+    let draft_agree_rate = draft_agree as f64 / fp8_ids.len() as f64;
+    eprintln!(
+        "DFlash 2 NVFP4-backbone vs FP8 (full vocab): logit cosine {cosine:.5}, base top-1 \
+         {base_top1}/{base_total} ({:.1}%), draft agreement {draft_agree}/{} ({:.1}%)",
+        100.0 * base_top1_rate,
+        fp8_ids.len(),
+        100.0 * draft_agree_rate
+    );
+    ensure!(cosine >= 0.98, "NVFP4 draft logit cosine {cosine:.5} < 0.98");
+    ensure!(
+        base_top1_rate >= 0.70,
+        "NVFP4 draft base top-1 agreement {base_top1_rate:.3} < 0.70"
+    );
+    ensure!(
+        draft_agree_rate >= 0.65,
+        "NVFP4 draft token agreement {draft_agree_rate:.3} < 0.65"
+    );
+
+    // 2. Fast (shortlist) single-stream vs batched (`seqs = 4`, `m = 32 > 16`, CUDA graph)
+    // bit-exact parity for both `nvfp4-backbone` and `nvfp4` (backbone + head).
+    for mode in ["nvfp4-backbone", "nvfp4"] {
+        let mut fast_opts = DraftOptions::parse("fast", None)?;
+        fast_opts.apply_draft_weights(mode)?;
+        ensure!(fast_opts.nvfp4_backbone && fast_opts.shortlist.is_some());
+
+        let mut d2 = load_draft(&mut model, &checkpoint, source, capacity, &fast_opts)?;
+        let shared = model.draft_shared();
+        d2.note_tokens(&stream, shared, &prompt_i32)?;
+        d2.commit(&stream, &linear, &dev_taps.slice(..first * row_len), 0)?;
+        stream.memcpy_htod(&prompt_i32[first..=first], &mut anchor)?;
+        d2.set_round_inputs(&stream, &dev_taps.slice(..0), first, &anchor)?;
+        d2.replay_round(&stream, &linear, shared, STEPS)?;
+        let single_ids = stream.clone_dtoh(d2.draft_ids())?;
+
+        let seqs = 4usize;
+        for slot in 1..seqs {
+            d2.copy_slot_rings(&stream, 0, slot)?;
+        }
+        let slots = [0, 1, 2, 3];
+        let anchors_batch = [prompt[first]; 4];
+        let samplings = [Sampling::GREEDY; 4];
+        d2.batch_draft_initial(&stream, shared, &slots, &anchors_batch, &samplings, STEPS)?;
+        let batch_tokens = stream.clone_dtoh(&d2.batch_verify_tokens(seqs, STEPS + 1)?)?;
+        for s in 0..seqs {
+            let got = &batch_tokens[s * (STEPS + 1) + 1..(s + 1) * (STEPS + 1)];
+            assert_eq!(
+                got,
+                single_ids.as_slice(),
+                "batched {mode} slot {s} (m = 32) differs from single-stream (m = 8)"
+            );
+        }
+        eprintln!("DFlash 2 {mode} fast: batched (m = 32) matches single-stream (m = 8) bit-exact");
+    }
+    Ok(())
+}

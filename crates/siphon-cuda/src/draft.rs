@@ -48,6 +48,7 @@ use crate::{
         },
         linear::{Gemm, Linear, MAX_PRODUCTS, Start},
         linear_fp8::LinearFp8,
+        linear_nvfp4::{LinearNvfp4, Nvfp4Matrix},
         linear_rows::{LinearRows, MAX_PRODUCTS as ROWS_MAX_PRODUCTS, RowsProduct},
         sample::Sampling,
     },
@@ -122,8 +123,14 @@ pub fn validate_context_rows(n: usize) -> anyhow::Result<usize> {
 pub struct DraftOptions {
     /// FP8 copies of the block's projections and of the round's context projections.
     pub fp8_backbone: bool,
+    /// NVFP4 (E2M1, Four Over Six) copies of the block's projections and of the round's
+    /// context projections, mutually exclusive with [`Self::fp8_backbone`].
+    pub nvfp4_backbone: bool,
     /// Base logits from an FP8 copy of the LM head (or of its shortlist rows).
     pub fp8_head: bool,
+    /// Base logits from an NVFP4 copy of the LM head (or of its shortlist rows), mutually
+    /// exclusive with [`Self::fp8_head`].
+    pub nvfp4_head: bool,
     /// An FP8 copy of the fold weight (or of its shortlist rows).
     pub fp8_fold: bool,
     /// E4M3 global caches, 2 KiB per position and layer instead of 4 KiB, without a
@@ -149,7 +156,9 @@ impl DraftOptions {
     pub fn fp8() -> Self {
         Self {
             fp8_backbone: true,
+            nvfp4_backbone: false,
             fp8_head: true,
+            nvfp4_head: false,
             fp8_fold: true,
             fp8_kv: true,
             shortlist: None,
@@ -164,12 +173,85 @@ impl DraftOptions {
     pub fn fast() -> Self {
         Self {
             fp8_backbone: true,
+            nvfp4_backbone: false,
             fp8_head: true,
+            nvfp4_head: false,
             fp8_fold: true,
             fp8_kv: true,
             shortlist: Some(counted_ranking()),
             shortlist_rows: None,
             context_rows: None,
+        }
+    }
+
+    /// [`Self::fast`] with an NVFP4 (E2M1) draft backbone while keeping the shortlist LM
+    /// head in FP8 for acceptance quality.
+    #[must_use]
+    pub fn fast_nvfp4_backbone() -> Self {
+        Self {
+            fp8_backbone: false,
+            nvfp4_backbone: true,
+            fp8_head: true,
+            nvfp4_head: false,
+            fp8_fold: true,
+            fp8_kv: true,
+            shortlist: Some(counted_ranking()),
+            shortlist_rows: None,
+            context_rows: None,
+        }
+    }
+
+    /// [`Self::fast`] with both an NVFP4 draft backbone and an NVFP4 shortlist LM head.
+    #[must_use]
+    pub fn fast_nvfp4() -> Self {
+        Self {
+            fp8_backbone: false,
+            nvfp4_backbone: true,
+            fp8_head: false,
+            nvfp4_head: true,
+            fp8_fold: true,
+            fp8_kv: true,
+            shortlist: Some(counted_ranking()),
+            shortlist_rows: None,
+            context_rows: None,
+        }
+    }
+
+    /// Applies `--draft-weights auto|bf16|fp8|nvfp4|nvfp4-backbone` on top of the parsed
+    /// variant. `auto` leaves the variant untouched (the default).
+    pub fn apply_draft_weights(&mut self, mode: &str) -> anyhow::Result<()> {
+        match mode {
+            "auto" => Ok(()),
+            "bf16" => {
+                self.fp8_backbone = false;
+                self.nvfp4_backbone = false;
+                self.nvfp4_head = false;
+                Ok(())
+            }
+            "fp8" => {
+                self.fp8_backbone = true;
+                self.nvfp4_backbone = false;
+                self.fp8_head = true;
+                self.nvfp4_head = false;
+                Ok(())
+            }
+            "nvfp4-backbone" => {
+                self.fp8_backbone = false;
+                self.nvfp4_backbone = true;
+                self.fp8_head = true;
+                self.nvfp4_head = false;
+                Ok(())
+            }
+            "nvfp4" => {
+                self.fp8_backbone = false;
+                self.nvfp4_backbone = true;
+                self.fp8_head = false;
+                self.nvfp4_head = true;
+                Ok(())
+            }
+            _ => anyhow::bail!(
+                "unknown --draft-weights {mode:?}; expected auto, bf16, fp8, nvfp4 or nvfp4-backbone"
+            ),
         }
     }
 
@@ -190,10 +272,9 @@ impl DraftOptions {
     }
 
     /// The options of a variant `spec`: `exact`, `fp8` ([`Self::fp8`]), `fast`
-    /// ([`Self::fast`]), or a `+`-joined set of `fp8-backbone`, `fp8-head`, `fp8-fold`,
-    /// `fp8-kv`, `shortlist`, `shortlist=<N>` and `context=<N>`. `shortlist` takes
-    /// `ranking`, or without one [`counted_ranking`]; `fp8` and `fast` with a `ranking`
-    /// use it as their shortlist.
+    /// ([`Self::fast`]), `fast-nvfp4-backbone`, `fast-nvfp4`, or a `+`-joined set of
+    /// `fp8-backbone`, `nvfp4-backbone`, `fp8-head`, `nvfp4-head`, `fp8-fold`, `fp8-kv`,
+    /// `shortlist`, `shortlist=<N>` and `context=<N>`.
     pub fn parse(spec: &str, ranking: Option<&[u32]>) -> anyhow::Result<Self> {
         let mut options = Self::default();
         for part in spec.split('+') {
@@ -211,8 +292,34 @@ impl DraftOptions {
                         options.shortlist = Some(r.to_vec());
                     }
                 }
-                "fp8-backbone" => options.fp8_backbone = true,
-                "fp8-head" => options.fp8_head = true,
+                "fast-nvfp4-backbone" => {
+                    options = Self::fast_nvfp4_backbone();
+                    if let Some(r) = ranking {
+                        options.shortlist = Some(r.to_vec());
+                    }
+                }
+                "fast-nvfp4" => {
+                    options = Self::fast_nvfp4();
+                    if let Some(r) = ranking {
+                        options.shortlist = Some(r.to_vec());
+                    }
+                }
+                "fp8-backbone" => {
+                    options.fp8_backbone = true;
+                    options.nvfp4_backbone = false;
+                }
+                "nvfp4-backbone" => {
+                    options.fp8_backbone = false;
+                    options.nvfp4_backbone = true;
+                }
+                "fp8-head" => {
+                    options.fp8_head = true;
+                    options.nvfp4_head = false;
+                }
+                "nvfp4-head" => {
+                    options.fp8_head = false;
+                    options.nvfp4_head = true;
+                }
                 "fp8-fold" => options.fp8_fold = true,
                 "fp8-kv" => options.fp8_kv = true,
                 "shortlist" => {
@@ -246,7 +353,9 @@ impl DraftOptions {
     pub fn approx(&self) -> siphon::memory::DraftApprox {
         siphon::memory::DraftApprox {
             fp8_backbone: self.fp8_backbone,
+            nvfp4_backbone: self.nvfp4_backbone,
             fp8_head: self.fp8_head,
+            nvfp4_head: self.nvfp4_head,
             fp8_fold: self.fp8_fold,
             fp8_kv: self.fp8_kv,
             shortlist: self.shortlist.is_some(),
@@ -313,6 +422,7 @@ pub struct Draft {
     kernels: DraftKernels,
     linear_rows: LinearRows,
     linear_fp8: LinearFp8,
+    linear_nvfp4: LinearNvfp4,
     /// Whether batched DFlash 2 projections with `m >= 32` dispatch to native FP8 tensor
     /// cores (`LinearFp8::gemm_raw`), synced from `Model::prefill_dense() == Products::Fp8`.
     fp8_dense: bool,
@@ -331,8 +441,8 @@ pub struct Draft {
     inputs: RoundInputs,
     /// The captured round per draft count, and the LM head it was captured with.
     graphs: [Option<RoundGraph>; STEPS],
-    /// FP8 copies of each layer's projections, with [`DraftOptions::fp8_backbone`].
-    backbone: Option<Vec<Fp8Layer>>,
+    /// Quantized copies of each layer's projections (FP8 or NVFP4).
+    backbone: Option<Backbone>,
     /// The approximate Markov head, or `None` for the exact one.
     head: Option<Head>,
     /// A device copy of the BF16 LM head for the base logits, when they read it and the
@@ -398,15 +508,15 @@ enum Arch {
         weights: DflashWeights,
         /// Zeros over the vocabulary: the vanilla head's bias has no constant term.
         zero_bias: CudaSlice<bf16>,
-        /// An FP8 copy of `fc`, with [`DraftOptions::fp8_backbone`].
-        fc_fp8: Option<Fp8Rows>,
+        /// Quantized copy of `fc` (FP8 or NVFP4), when quantized backbone is enabled.
+        fc_quant: Option<QuantizedFc>,
     },
     /// Inco AI's DFlash 2 drafter ([`Dflash2Weights`]): `fc` over the taps, sliding layers
     /// with block convolutions, and a candidate selector over the top 16 tokens.
     Dflash2 {
         weights: Dflash2Weights,
-        /// An FP8 copy of `fc`, with [`DraftOptions::fp8_backbone`].
-        fc_fp8: Option<Fp8Rows>,
+        /// Quantized copy of `fc` (FP8 or NVFP4), when quantized backbone is enabled.
+        fc_quant: Option<QuantizedFc>,
         /// The mask token's normed target embedding, BF16 `[2304]`.
         mask_embed: CudaSlice<bf16>,
     },
@@ -416,7 +526,7 @@ enum Arch {
 /// then each layer's `k_proj`, `v_proj` and key norm.
 struct ContextRefs<'a> {
     fc: &'a CudaSlice<bf16>,
-    fc_fp8: Option<&'a Fp8Rows>,
+    fc_quant: Option<QuantizedWeight<'a>>,
     hidden_norm: &'a CudaSlice<bf16>,
     /// Each layer's `(k, v, k_norm)`.
     layers: Vec<(
@@ -635,10 +745,10 @@ impl Arch {
         match self {
             Self::Stock { .. } => None,
             Self::Dflash {
-                weights, fc_fp8, ..
+                weights, fc_quant, ..
             } => Some(ContextRefs {
                 fc: &weights.fc,
-                fc_fp8: fc_fp8.as_ref(),
+                fc_quant: fc_quant.as_ref().map(QuantizedFc::as_weight),
                 hidden_norm: &weights.hidden_norm,
                 layers: weights
                     .layers
@@ -647,10 +757,10 @@ impl Arch {
                     .collect(),
             }),
             Self::Dflash2 {
-                weights, fc_fp8, ..
+                weights, fc_quant, ..
             } => Some(ContextRefs {
                 fc: &weights.fc,
-                fc_fp8: fc_fp8.as_ref(),
+                fc_quant: fc_quant.as_ref().map(QuantizedFc::as_weight),
                 hidden_norm: &weights.hidden_norm,
                 layers: weights
                     .layers
@@ -675,6 +785,28 @@ impl Arch {
     }
 }
 
+/// Borrowed reference to one quantized draft projection weight (FP8 or NVFP4).
+#[derive(Clone, Copy)]
+enum QuantizedWeight<'a> {
+    Fp8(&'a Fp8Rows),
+    Nvfp4(&'a Nvfp4Matrix),
+}
+
+/// Owned quantized copy of DFlash / DFlash 2's `fc` projection.
+enum QuantizedFc {
+    Fp8(Fp8Rows),
+    Nvfp4(Nvfp4Matrix),
+}
+
+impl QuantizedFc {
+    fn as_weight(&self) -> QuantizedWeight<'_> {
+        match self {
+            Self::Fp8(w) => QuantizedWeight::Fp8(w),
+            Self::Nvfp4(w) => QuantizedWeight::Nvfp4(w),
+        }
+    }
+}
+
 /// FP8 copies of one layer's projections. Only the stock draft has context projections.
 struct Fp8Layer {
     q: Fp8Rows,
@@ -688,9 +820,78 @@ struct Fp8Layer {
     v_ctx: Option<Fp8Rows>,
 }
 
+/// NVFP4 copies of one layer's projections. Only the stock draft has context projections.
+struct Nvfp4Layer {
+    q: Nvfp4Matrix,
+    k: Nvfp4Matrix,
+    v: Nvfp4Matrix,
+    o: Nvfp4Matrix,
+    gate: Nvfp4Matrix,
+    up: Nvfp4Matrix,
+    down: Nvfp4Matrix,
+    k_ctx: Option<Nvfp4Matrix>,
+    v_ctx: Option<Nvfp4Matrix>,
+}
+
+/// Borrowed quantized projections for one layer.
+#[derive(Clone, Copy)]
+struct BackboneLayer<'a> {
+    q: QuantizedWeight<'a>,
+    k: QuantizedWeight<'a>,
+    v: QuantizedWeight<'a>,
+    o: QuantizedWeight<'a>,
+    gate: QuantizedWeight<'a>,
+    up: QuantizedWeight<'a>,
+    down: QuantizedWeight<'a>,
+    k_ctx: Option<QuantizedWeight<'a>>,
+    v_ctx: Option<QuantizedWeight<'a>>,
+}
+
+/// Quantized draft backbone layers (either all FP8 or all NVFP4).
+enum Backbone {
+    Fp8(Vec<Fp8Layer>),
+    Nvfp4(Vec<Nvfp4Layer>),
+}
+
+impl Backbone {
+    fn layer(&self, layer: usize) -> BackboneLayer<'_> {
+        match self {
+            Self::Fp8(layers) => {
+                let l = &layers[layer];
+                BackboneLayer {
+                    q: QuantizedWeight::Fp8(&l.q),
+                    k: QuantizedWeight::Fp8(&l.k),
+                    v: QuantizedWeight::Fp8(&l.v),
+                    o: QuantizedWeight::Fp8(&l.o),
+                    gate: QuantizedWeight::Fp8(&l.gate),
+                    up: QuantizedWeight::Fp8(&l.up),
+                    down: QuantizedWeight::Fp8(&l.down),
+                    k_ctx: l.k_ctx.as_ref().map(QuantizedWeight::Fp8),
+                    v_ctx: l.v_ctx.as_ref().map(QuantizedWeight::Fp8),
+                }
+            }
+            Self::Nvfp4(layers) => {
+                let l = &layers[layer];
+                BackboneLayer {
+                    q: QuantizedWeight::Nvfp4(&l.q),
+                    k: QuantizedWeight::Nvfp4(&l.k),
+                    v: QuantizedWeight::Nvfp4(&l.v),
+                    o: QuantizedWeight::Nvfp4(&l.o),
+                    gate: QuantizedWeight::Nvfp4(&l.gate),
+                    up: QuantizedWeight::Nvfp4(&l.up),
+                    down: QuantizedWeight::Nvfp4(&l.down),
+                    k_ctx: l.k_ctx.as_ref().map(QuantizedWeight::Nvfp4),
+                    v_ctx: l.v_ctx.as_ref().map(QuantizedWeight::Nvfp4),
+                }
+            }
+        }
+    }
+}
+
 enum Matrix {
     Bf16(CudaSlice<bf16>),
     Fp8(Fp8Rows),
+    Nvfp4(Nvfp4Matrix),
 }
 
 /// An approximate Markov head: FP8 weights, a shortlist of tokens, or both.
@@ -941,6 +1142,7 @@ impl Draft {
         options: &DraftOptions,
     ) -> anyhow::Result<Self> {
         let kernels = DraftKernels::load(stream.context())?;
+        let linear_nvfp4 = LinearNvfp4::load(stream.context())?;
         check_lm_head(config, shared)?;
         let fold = fold(
             stream,
@@ -957,7 +1159,16 @@ impl Draft {
             fold,
             alpha,
         };
-        Self::build(stream, config, kernels, arch, shared, capacity, options)
+        Self::build(
+            stream,
+            config,
+            kernels,
+            linear_nvfp4,
+            arch,
+            shared,
+            capacity,
+            options,
+        )
     }
 
     /// A DFlash draft with DSpark heads ([`DflashWeights`]) in place of the bundled one,
@@ -973,21 +1184,31 @@ impl Draft {
         options: &DraftOptions,
     ) -> anyhow::Result<Self> {
         let kernels = DraftKernels::load(stream.context())?;
+        let linear_nvfp4 = LinearNvfp4::load(stream.context())?;
         check_lm_head(config, shared)?;
-        let fc_fp8 = if options.fp8_backbone {
-            let k = weights.taps.len() * HIDDEN;
-            let mut out = Fp8Rows::new(stream, HIDDEN, k)?;
-            kernels.quantize_rows(stream, &weights.fc, None, HIDDEN, 0, &mut out)?;
-            Some(out)
-        } else {
-            None
-        };
+        let fc_quant = quantize_fc(
+            stream,
+            &kernels,
+            &linear_nvfp4,
+            &weights.fc,
+            weights.taps.len() * HIDDEN,
+            options,
+        )?;
         let arch = Arch::Dflash {
             weights,
             zero_bias: stream.alloc_zeros(config.vocab_size)?,
-            fc_fp8,
+            fc_quant,
         };
-        Self::build(stream, config, kernels, arch, shared, capacity, options)
+        Self::build(
+            stream,
+            config,
+            kernels,
+            linear_nvfp4,
+            arch,
+            shared,
+            capacity,
+            options,
+        )
     }
 
     /// Inco AI's DFlash 2 drafter ([`Dflash2Weights`]) in place of the bundled draft,
@@ -1003,15 +1224,16 @@ impl Draft {
         options: &DraftOptions,
     ) -> anyhow::Result<Self> {
         let kernels = DraftKernels::load(stream.context())?;
+        let linear_nvfp4 = LinearNvfp4::load(stream.context())?;
         check_lm_head(config, shared)?;
-        let fc_fp8 = if options.fp8_backbone {
-            let k = weights.taps.len() * HIDDEN;
-            let mut out = Fp8Rows::new(stream, HIDDEN, k)?;
-            kernels.quantize_rows(stream, &weights.fc, None, HIDDEN, 0, &mut out)?;
-            Some(out)
-        } else {
-            None
-        };
+        let fc_quant = quantize_fc(
+            stream,
+            &kernels,
+            &linear_nvfp4,
+            &weights.fc,
+            weights.taps.len() * HIDDEN,
+            options,
+        )?;
         // The mask rows are the mask token's normed target embedding: row 0 of a block
         // anchored at the mask token.
         let mask = stream.clone_htod(&[i32::try_from(weights.mask_token)?])?;
@@ -1030,21 +1252,40 @@ impl Draft {
         stream.memcpy_dtod(&rows.slice(..HIDDEN), &mut mask_embed)?;
         let arch = Arch::Dflash2 {
             weights,
-            fc_fp8,
+            fc_quant,
             mask_embed,
         };
-        Self::build(stream, config, kernels, arch, shared, capacity, options)
+        Self::build(
+            stream,
+            config,
+            kernels,
+            linear_nvfp4,
+            arch,
+            shared,
+            capacity,
+            options,
+        )
     }
 
+    #[expect(clippy::too_many_arguments, reason = "constructs draft with loaded kernels and options")]
     fn build(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
         kernels: DraftKernels,
+        linear_nvfp4: LinearNvfp4,
         mut arch: Arch,
         shared: SharedWeights<'_>,
         capacity: usize,
         options: &DraftOptions,
     ) -> anyhow::Result<Self> {
+        ensure!(
+            !(options.fp8_backbone && options.nvfp4_backbone),
+            "fp8_backbone and nvfp4_backbone are mutually exclusive"
+        );
+        ensure!(
+            !(options.fp8_head && options.nvfp4_head),
+            "fp8_head and nvfp4_head are mutually exclusive"
+        );
         ensure!(
             capacity >= LOCAL_SLOTS,
             "capacity {capacity} is below the {LOCAL_SLOTS} positions of a window and a block"
@@ -1068,10 +1309,17 @@ impl Draft {
             .collect::<anyhow::Result<_>>()?;
         let s = Scratch::new(stream, config, &arch)?;
         let z = |n: usize| stream.alloc_zeros::<bf16>(n);
-        let backbone = options
-            .fp8_backbone
-            .then(|| quantize_backbone(stream, &kernels, &arch))
-            .transpose()?;
+        let backbone = if options.nvfp4_backbone {
+            Some(Backbone::Nvfp4(quantize_backbone_nvfp4(
+                stream,
+                &linear_nvfp4,
+                &arch,
+            )?))
+        } else if options.fp8_backbone {
+            Some(Backbone::Fp8(quantize_backbone(stream, &kernels, &arch)?))
+        } else {
+            None
+        };
         if backbone.is_some() {
             arch.release_block_bf16();
         }
@@ -1079,6 +1327,7 @@ impl Draft {
         let head = Head::new(
             stream,
             &kernels,
+            &linear_nvfp4,
             shared,
             arch.fold_rows(),
             config.unpadded_vocab_size,
@@ -1097,6 +1346,7 @@ impl Draft {
             kernels,
             linear_rows,
             linear_fp8,
+            linear_nvfp4,
             fp8_dense: false,
             arch,
             inv_freq: stream.clone_htod(&inv_freq)?,
@@ -1442,6 +1692,7 @@ impl Draft {
         head.gather_shortlist_range(
             stream,
             &self.kernels,
+            &self.linear_nvfp4,
             shared,
             self.arch.fold_rows(),
             first..new_used,
@@ -2060,7 +2311,7 @@ impl Draft {
                     let kv = layer * BLOCK * KV_WIDTH..(layer + 1) * BLOCK * KV_WIDTH;
                     let ck = s.round_k.slice_mut(kv.clone());
                     let cv = s.round_v.slice_mut(kv);
-                    let f = self.backbone.as_ref().map(|b| &b[layer]);
+                    let f = self.backbone.as_ref().map(|b| b.layer(layer));
                     project(
                         linear,
                         &self.linear_rows,
@@ -2068,8 +2319,8 @@ impl Draft {
                         stream,
                         &mixed,
                         &mut [
-                            (Some(&lw.k_ctx), f.and_then(|f| f.k_ctx.as_ref()), ck),
-                            (Some(&lw.v_ctx), f.and_then(|f| f.v_ctx.as_ref()), cv),
+                            (Some(&lw.k_ctx), f.and_then(|f| f.k_ctx), ck),
+                            (Some(&lw.v_ctx), f.and_then(|f| f.v_ctx), cv),
                         ],
                     )?;
                 }
@@ -2116,7 +2367,7 @@ impl Draft {
             &self.inputs.taps.slice(..),
             &mut [(
                 Some(context.fc),
-                context.fc_fp8,
+                context.fc_quant,
                 dfl.round_raw.slice_mut(..),
             )],
         )?;
@@ -2138,9 +2389,9 @@ impl Draft {
                 .chunks_exact_mut(layer_rows)
                 .zip(s.round_v.as_view_mut().chunks_exact_mut(layer_rows)),
         ) {
-            let fp8 = self.backbone.as_ref().map(|b| &b[layer]);
-            products.push((Some(lk), fp8.map(|f| &f.k), ck));
-            products.push((Some(lv), fp8.map(|f| &f.v), cv));
+            let q = self.backbone.as_ref().map(|b| b.layer(layer));
+            products.push((Some(lk), q.map(|f| f.k), ck));
+            products.push((Some(lv), q.map(|f| f.v), cv));
         }
         project(
             linear,
@@ -2194,7 +2445,7 @@ impl Draft {
             } else {
                 s.add_norm(k, stream, Sublayer::Mlp, pending, lw.input_norm, false)?;
             }
-            let f = self.backbone.as_ref().map(|b| &b[layer]);
+            let f = self.backbone.as_ref().map(|b| b.layer(layer));
             let use_rows = f.is_some();
             let (attention_conv, mlp_conv) = lw.convs.unzip();
             let input = sublayer_input(
@@ -2215,9 +2466,9 @@ impl Draft {
                 stream,
                 &input,
                 &mut [
-                    (lw.q, f.map(|f| &f.q), s.q.slice_mut(..)),
-                    (Some(lw.k), f.map(|f| &f.k), s.k.slice_mut(..)),
-                    (Some(lw.v), f.map(|f| &f.v), s.v.slice_mut(..)),
+                    (lw.q, f.map(|f| f.q), s.q.slice_mut(..)),
+                    (Some(lw.k), f.map(|f| f.k), s.k.slice_mut(..)),
+                    (Some(lw.v), f.map(|f| f.v), s.v.slice_mut(..)),
                 ],
             )?;
             attend(k, stream, arch, s, control, &self.inv_freq, layer, cache)?;
@@ -2227,7 +2478,7 @@ impl Draft {
                 k,
                 stream,
                 &s.attn.slice(..),
-                &mut [(lw.o, f.map(|f| &f.o), s.o.slice_mut(..))],
+                &mut [(lw.o, f.map(|f| f.o), s.o.slice_mut(..))],
             )?;
             s.add_norm(
                 k,
@@ -2255,8 +2506,8 @@ impl Draft {
                 stream,
                 &input,
                 &mut [
-                    (lw.gate, f.map(|f| &f.gate), s.gate.slice_mut(..)),
-                    (lw.up, f.map(|f| &f.up), s.up.slice_mut(..)),
+                    (lw.gate, f.map(|f| f.gate), s.gate.slice_mut(..)),
+                    (lw.up, f.map(|f| f.up), s.up.slice_mut(..)),
                 ],
             )?;
             k.silu_mul(stream, &s.gate, &s.up, &mut s.act)?;
@@ -2266,7 +2517,7 @@ impl Draft {
                 k,
                 stream,
                 &s.act.slice(..),
-                &mut [(lw.down, f.map(|f| &f.down), s.mlp.slice_mut(..))],
+                &mut [(lw.down, f.map(|f| f.down), s.mlp.slice_mut(..))],
             )?;
             pending = mlp_conv;
         }
@@ -2418,6 +2669,7 @@ impl Draft {
                     None => FoldRows::Bf16(&weights.w2),
                     Some(Matrix::Bf16(w)) => FoldRows::Bf16(w),
                     Some(Matrix::Fp8(w)) => FoldRows::Fp8(w),
+                    Some(Matrix::Nvfp4(_)) => anyhow::bail!("NVFP4 fold weights are not supported"),
                 },
                 h.fold_bias.as_ref().unwrap_or(zero_bias),
             ),
@@ -2789,6 +3041,18 @@ fn base_logits(
                 k.gemm_fp8(stream, &y, steps, &mut [fp8_rows(w, rows, base, ld)])?;
             }
         }
+        Some(Matrix::Nvfp4(w)) => {
+            let y = s.y.slice(HIDDEN..(steps + 1) * HIDDEN);
+            let out_rows = w.rows();
+            let mut base = s.base.slice_mut(..steps * out_rows);
+            linear_rows.run(
+                stream,
+                &mut [RowsProduct::nvfp4(w, &y, &mut base)],
+                steps,
+                Start::Early,
+            )?;
+            return Ok((rows, out_rows));
+        }
     }
     Ok((rows, ld))
 }
@@ -2854,6 +3118,28 @@ fn freed(w: Option<&CudaSlice<bf16>>) -> anyhow::Result<&CudaSlice<bf16>> {
     w.context("a BF16 projection was freed")
 }
 
+/// Quantizes DFlash / DFlash 2's `fc` projection to NVFP4 or FP8 according to `options`.
+fn quantize_fc(
+    stream: &Arc<CudaStream>,
+    kernels: &DraftKernels,
+    linear_nvfp4: &LinearNvfp4,
+    fc: &CudaSlice<bf16>,
+    k: usize,
+    options: &DraftOptions,
+) -> anyhow::Result<Option<QuantizedFc>> {
+    if options.nvfp4_backbone {
+        Ok(Some(QuantizedFc::Nvfp4(
+            linear_nvfp4.quantize_any(stream, fc, HIDDEN, k)?,
+        )))
+    } else if options.fp8_backbone {
+        let mut out = Fp8Rows::new(stream, HIDDEN, k)?;
+        kernels.quantize_rows(stream, fc, None, HIDDEN, 0, &mut out)?;
+        Ok(Some(QuantizedFc::Fp8(out)))
+    } else {
+        Ok(None)
+    }
+}
+
 /// FP8 copies of every layer's projections.
 fn quantize_backbone(
     stream: &Arc<CudaStream>,
@@ -2895,12 +3181,52 @@ fn quantize_backbone(
         .collect()
 }
 
+/// NVFP4 (Four Over Six) copies of every layer's projections.
+fn quantize_backbone_nvfp4(
+    stream: &Arc<CudaStream>,
+    linear_nvfp4: &LinearNvfp4,
+    arch: &Arch,
+) -> anyhow::Result<Vec<Nvfp4Layer>> {
+    let quantize = |w: &CudaSlice<bf16>, k: usize| -> anyhow::Result<Nvfp4Matrix> {
+        ensure!(w.len().is_multiple_of(k), "weight is not [rows, {k}]");
+        linear_nvfp4.quantize_any(stream, w, w.len() / k, k)
+    };
+    (0..arch.layers())
+        .map(|layer| {
+            let w = arch.layer(layer);
+            let (k_ctx, v_ctx) = match arch {
+                Arch::Stock { weights, .. } => {
+                    let c = &weights.layers[layer];
+                    (
+                        Some(quantize(&c.k_ctx, HIDDEN)?),
+                        Some(quantize(&c.v_ctx, HIDDEN)?),
+                    )
+                }
+                Arch::Dflash { .. } | Arch::Dflash2 { .. } => (None, None),
+            };
+
+            Ok(Nvfp4Layer {
+                q: quantize(freed(w.q)?, HIDDEN)?,
+                k: quantize(w.k, HIDDEN)?,
+                v: quantize(w.v, HIDDEN)?,
+                o: quantize(freed(w.o)?, arch.q_width())?,
+                gate: quantize(freed(w.gate)?, HIDDEN)?,
+                up: quantize(freed(w.up)?, HIDDEN)?,
+                down: quantize(freed(w.down)?, arch.mlp_width())?,
+                k_ctx,
+                v_ctx,
+            })
+        })
+        .collect()
+}
+
 impl Head {
     /// The approximate head `options` ask for, or `None` for the exact one. `fold` holds
     /// the fold weight and bias of a draft with a Markov head.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &DraftKernels,
+        linear_nvfp4: &LinearNvfp4,
         shared: SharedWeights<'_>,
         fold: Option<(&CudaSlice<bf16>, &CudaSlice<bf16>)>,
         vocab: usize,
@@ -2908,7 +3234,7 @@ impl Head {
     ) -> anyhow::Result<Option<Self>> {
         let fp8_fold = options.fp8_fold && fold.is_some();
         let Some(ranking) = &options.shortlist else {
-            if !options.fp8_head && !fp8_fold {
+            if !options.fp8_head && !options.nvfp4_head && !fp8_fold {
                 return Ok(None);
             }
             let quantize = |w: &CudaSlice<bf16>, k: usize| -> anyhow::Result<Matrix> {
@@ -2916,11 +3242,20 @@ impl Head {
                 kernels.quantize_rows(stream, w, None, vocab, 0, &mut out)?;
                 Ok(Matrix::Fp8(out))
             };
+            let lm = if options.nvfp4_head {
+                Some(Matrix::Nvfp4(linear_nvfp4.quantize_any(
+                    stream,
+                    &shared.lm_head.slice(..vocab * HIDDEN),
+                    vocab,
+                    HIDDEN,
+                )?))
+            } else if options.fp8_head {
+                Some(quantize(shared.lm_head, HIDDEN)?)
+            } else {
+                None
+            };
             return Ok(Some(Self {
-                lm: options
-                    .fp8_head
-                    .then(|| quantize(shared.lm_head, HIDDEN))
-                    .transpose()?,
+                lm,
                 fold: fold
                     .filter(|_| fp8_fold)
                     .map(|(w, _)| quantize(w, RANK))
@@ -2964,7 +3299,9 @@ impl Head {
         let pinned_context = PinnedBuf::zeros(stream, capacity - ranked)?;
         let h2d_done = sync_event(stream)?;
         let mut head = Self {
-            lm: Some(if options.fp8_head {
+            lm: Some(if options.nvfp4_head {
+                Matrix::Nvfp4(Nvfp4Matrix::alloc_zeros(stream, capacity, HIDDEN)?)
+            } else if options.fp8_head {
                 Matrix::Fp8(Fp8Rows::new(stream, capacity, HIDDEN)?)
             } else {
                 Matrix::Bf16(stream.alloc_zeros(capacity * HIDDEN)?)
@@ -2989,7 +3326,7 @@ impl Head {
                 stale: false,
             }),
         };
-        head.gather_shortlist_range(stream, kernels, shared, fold, 0..ranked)?;
+        head.gather_shortlist_range(stream, kernels, linear_nvfp4, shared, fold, 0..ranked)?;
         Ok(Some(head))
     }
 
@@ -2999,6 +3336,7 @@ impl Head {
         &mut self,
         stream: &CudaStream,
         kernels: &DraftKernels,
+        linear_nvfp4: &LinearNvfp4,
         shared: SharedWeights<'_>,
         fold: Option<(&CudaSlice<bf16>, &CudaSlice<bf16>)>,
         range: std::ops::Range<usize>,
@@ -3010,6 +3348,7 @@ impl Head {
         let copy = |src: &CudaSlice<bf16>, k: usize, dst: &mut Matrix| match dst {
             Matrix::Bf16(dst) => kernels.gather_rows(stream, src, k, &ids, first, dst),
             Matrix::Fp8(dst) => kernels.quantize_rows(stream, src, Some(&ids), rows, first, dst),
+            Matrix::Nvfp4(dst) => linear_nvfp4.quantize_indexed(stream, src, &ids, first, dst),
         };
         if let Some(lm) = self.lm.as_mut() {
             copy(shared.lm_head, HIDDEN, lm)?;
@@ -3027,17 +3366,17 @@ impl Head {
     }
 }
 
-/// One product of [`project`]: the BF16 weight, unless freed, its FP8 copy, if any, and
-/// the output.
+/// One product of [`project`]: the BF16 weight, unless freed, its quantized copy, if any,
+/// and the output.
 type Projection<'a> = (
     Option<&'a CudaSlice<bf16>>,
-    Option<&'a Fp8Rows>,
+    Option<QuantizedWeight<'a>>,
     CudaViewMut<'a, bf16>,
 );
 
-/// `out = x · weight^T` over the 8 block rows for each product `(weight, fp8, out)`:
-/// through the FP8 copies when every product has one, else through the BF16 weights,
-/// which must then all be there. As few launches as the kernels' product limits allow.
+/// `out = x · weight^T` over the 8 block rows for each product `(weight, quant, out)`:
+/// through the NVFP4 or FP8 copies when every product has one, else through the BF16
+/// weights, which must then all be there. As few launches as the kernels' product limits allow.
 fn project(
     linear: &Linear,
     linear_rows: &LinearRows,
@@ -3046,14 +3385,42 @@ fn project(
     x: &CudaView<'_, bf16>,
     products: &mut [Projection<'_>],
 ) -> anyhow::Result<()> {
-    if products.iter().all(|p| p.1.is_some()) {
+    let all_nvfp4 = products
+        .iter()
+        .all(|p| matches!(p.1, Some(QuantizedWeight::Nvfp4(_))));
+    if all_nvfp4 {
+        let width = x.len() / BLOCK;
+        ensure!(
+            linear_rows.supports(width),
+            "no NVFP4 multi-row product for k = {width}"
+        );
+        for chunk in products.chunks_mut(ROWS_MAX_PRODUCTS) {
+            let mut batch: Vec<RowsProduct<'_>> = chunk
+                .iter_mut()
+                .map(|p| {
+                    let Some(QuantizedWeight::Nvfp4(w)) = p.1 else {
+                        anyhow::bail!("NVFP4 weight missing");
+                    };
+                    Ok(RowsProduct::nvfp4(w, x, &mut p.2))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            linear_rows.run(stream, &mut batch, BLOCK, Start::Early)?;
+        }
+        return Ok(());
+    }
+    let all_fp8 = products
+        .iter()
+        .all(|p| matches!(p.1, Some(QuantizedWeight::Fp8(_))));
+    if all_fp8 {
         let width = x.len() / BLOCK;
         if linear_rows.supports(width) {
             for chunk in products.chunks_mut(ROWS_MAX_PRODUCTS) {
                 let mut batch: Vec<RowsProduct<'_>> = chunk
                     .iter_mut()
                     .map(|p| {
-                        let w = p.1.context("FP8 weight missing")?;
+                        let Some(QuantizedWeight::Fp8(w)) = p.1 else {
+                            anyhow::bail!("FP8 weight missing");
+                        };
                         Ok(RowsProduct::fp8_raw(
                             w.values.slice(..),
                             w.scales.slice(..),
@@ -3073,7 +3440,12 @@ fn project(
                 .iter_mut()
                 .filter_map(|p| {
                     let ld = p.2.len() / BLOCK;
-                    p.1.map(|w| fp8_rows(w, w.rows(), p.2.slice_mut(..), ld))
+                    match p.1 {
+                        Some(QuantizedWeight::Fp8(w)) => {
+                            Some(fp8_rows(w, w.rows(), p.2.slice_mut(..), ld))
+                        }
+                        _ => None,
+                    }
                 })
                 .collect();
             kernels.gemm_fp8(stream, x, BLOCK, &mut fp8)?;
@@ -3174,6 +3546,7 @@ impl StepArgmax<'_> {
             None => FoldRows::Bf16(&fold.weight),
             Some(Matrix::Bf16(w)) => FoldRows::Bf16(w),
             Some(Matrix::Fp8(w)) => FoldRows::Fp8(w),
+            Some(Matrix::Nvfp4(_)) => anyhow::bail!("NVFP4 fold weights are not supported"),
         };
         k.markov_fold_any(
             stream,

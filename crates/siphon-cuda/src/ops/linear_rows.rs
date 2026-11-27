@@ -1,10 +1,10 @@
-//! Dense products of 1 to 256 rows with BF16 or FP8 weights (`kernels/linear_rows.cu`).
+//! Dense products of 1 to 256 rows with BF16, FP8 or NVFP4 weights (`kernels/linear_rows.cu`
+//! and `kernels/linear_nvfp4_rows.cu`).
 //!
 //! [`LinearRows::run`] computes `out [m, n] = x [m, k] @ weight [n, k]^T` for a batch of
 //! products that share `k` and the weight format, streaming each weight from DRAM once for
-//! all `m` rows. It serves the projections of a step of a few rows, such as a speculative
-//! verify, with the checkpoint's BF16 weights or the FP8 copies of
-//! [`crate::ops::linear_fp8::LinearFp8::quantize`].
+//! all `m` rows. It serves the projections of a step of a few rows (speculative verify,
+//! batched decode, DFlash 2 draft) with BF16 weights, FP8 copies, or NVFP4 copies.
 //!
 //! Each output row depends on its input row only, bit for bit: it is the same for every
 //! `m` from 1 to 256, whatever the other rows hold. The sums run on tensor cores in F32, in
@@ -25,6 +25,7 @@ use crate::{
     ops::{
         linear::{Start, launch_by_value},
         linear_fp8::{Fp8Matrix, Mxfp8Matrix},
+        linear_nvfp4::Nvfp4Matrix,
     },
 };
 
@@ -42,22 +43,28 @@ pub const MAX_ROWS: usize = 256;
 const TILE_ROWS: usize = 16;
 /// Most warps per block, `kMaxWarps` in the kernel.
 const MAX_WARPS: usize = 8;
-/// Shared memory per warp: `kSlots` slots of 16 rows x 256 bytes.
+/// Shared memory per warp for BF16/FP8: `kSlots` slots of 16 rows x 256 bytes.
 const WARP_SMEM: usize = 3 * TILE_ROWS * 256;
-/// Bytes of each weight row one stage reads, `kStageBytes` in the kernel.
+/// Shared memory per warp for NVFP4: `kSlots` slots of 16 rows x (128 value + 16 scale bytes).
+const NVFP4_WARP_SMEM: usize = 3 * TILE_ROWS * (128 + 16);
+/// Bytes of each BF16/FP8 weight row one stage reads, `kStageBytes` in `linear_rows.cu`.
 const STAGE_BYTES: usize = 256;
+/// Elements of `k` one NVFP4 stage reads, `kKPerStage` in `linear_nvfp4_rows.cu`.
+const NVFP4_STAGE_K: usize = 256;
 /// Warps a launch aims for, by weight format: tiles split their k range over warps until
 /// the grid has this many. On one step's projections, 2048 beat 512 and 1024 with BF16
 /// weights (1.15 ms per step for the input projections against 1.24 and 1.21), and 1024
 /// beat 512 and 2048 with FP8 weights (0.68 ms against 0.74 and 0.71).
 const TARGET_WARPS_BF16: usize = 2048;
 const TARGET_WARPS_FP8: usize = 1024;
+const TARGET_WARPS_NVFP4: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WeightKind {
     Bf16,
     Fp8,
     Mxfp8,
+    Nvfp4,
 }
 
 /// The weight of one product.
@@ -75,6 +82,19 @@ pub enum RowsWeight<'a> {
     },
     /// E4M3 with one UE8M0 scale per 32 weights.
     Mxfp8(&'a Mxfp8Matrix),
+    /// NVFP4 (E2M1 + E4M3 block scales per 16 + F32 outer scale per row).
+    Nvfp4(&'a Nvfp4Matrix),
+}
+
+impl RowsWeight<'_> {
+    fn kind(&self) -> WeightKind {
+        match self {
+            Self::Bf16(_) => WeightKind::Bf16,
+            Self::Fp8(_) | Self::Fp8Raw { .. } => WeightKind::Fp8,
+            Self::Mxfp8(_) => WeightKind::Mxfp8,
+            Self::Nvfp4(_) => WeightKind::Nvfp4,
+        }
+    }
 }
 
 /// One product `out = x @ weight^T` of a batch, over `m` rows.
@@ -146,16 +166,21 @@ impl<'a> RowsProduct<'a> {
         }
     }
 
-    fn weight_kind(&self) -> WeightKind {
-        match self.weight {
-            RowsWeight::Bf16(_) => WeightKind::Bf16,
-            RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. } => WeightKind::Fp8,
-            RowsWeight::Mxfp8(_) => WeightKind::Mxfp8,
+    /// As [`Self::bf16`] with an NVFP4 weight of `weight.rows()` rows of `weight.k()`.
+    pub fn nvfp4(
+        weight: &'a Nvfp4Matrix,
+        x: &'a impl DeviceIn<bf16>,
+        out: &'a mut impl DeviceOut<bf16>,
+    ) -> Self {
+        Self {
+            weight: RowsWeight::Nvfp4(weight),
+            x: x.view(),
+            out: out.view_mut(),
         }
     }
 }
 
-/// Kernel parameter: one segment per product, as `Segment` in the kernel.
+/// Kernel parameter: one segment per BF16/FP8 product, as `Segment` in `linear_rows.cu`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Segment {
@@ -168,11 +193,36 @@ struct Segment {
     pair_end: i32,
 }
 
-/// Kernel parameter, as `Batch` in the kernel.
+/// Kernel parameter, as `Batch` in `linear_rows.cu`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Batch {
     seg: [Segment; MAX_PRODUCTS],
+    count: i32,
+    m: i32,
+    pdl: i32,
+}
+
+/// Kernel parameter: one segment per NVFP4 product, as `Segment` in `linear_nvfp4_rows.cu`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Nvfp4Segment {
+    w: u64,
+    scale: u64,
+    outer: u64,
+    x: u64,
+    out: u64,
+    n: i32,
+    tile_end: i32,
+    pair_end: i32,
+    _pad: i32,
+}
+
+/// Kernel parameter, as `Batch` in `linear_nvfp4_rows.cu`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Nvfp4Batch {
+    seg: [Nvfp4Segment; MAX_PRODUCTS],
     count: i32,
     m: i32,
     pdl: i32,
@@ -185,6 +235,7 @@ struct Batch {
 struct Entry {
     kind: WeightKind,
     k: usize,
+    warp_smem: usize,
     functions: Vec<CudaFunction>,
     pairs: Vec<CudaFunction>,
     chunk: CudaFunction,
@@ -210,9 +261,9 @@ impl Entry {
         if m > CHUNK_ROWS {
             let chunks = m.div_ceil(CHUNK_ROWS);
             if 2 * splits <= MAX_WARPS {
-                (&self.chunk_pair, (chunks, pairs), 2 * WARP_SMEM)
+                (&self.chunk_pair, (chunks, pairs), 2 * self.warp_smem)
             } else {
-                (&self.chunk, (chunks, tiles), WARP_SMEM)
+                (&self.chunk, (chunks, tiles), self.warp_smem)
             }
         } else {
             let column_tiles = m.div_ceil(TILE_COLUMNS);
@@ -220,10 +271,10 @@ impl Entry {
                 (
                     &self.pairs[column_tiles - PAIR_FROM_TILES],
                     (pairs, 1),
-                    2 * WARP_SMEM,
+                    2 * self.warp_smem,
                 )
             } else {
-                (&self.functions[column_tiles - 1], (tiles, 1), WARP_SMEM)
+                (&self.functions[column_tiles - 1], (tiles, 1), self.warp_smem)
             }
         }
     }
@@ -235,12 +286,12 @@ pub struct LinearRows {
     argmax_entries: Vec<Entry>,
 }
 
-/// Validates `weight` against `width` and returns `(w_ptr, scale_ptr, weight_rows)`.
+/// Validates `weight` against `width` and returns `(w_ptr, scale_ptr, outer_ptr, weight_rows)`.
 fn resolve_weight(
     stream: &CudaStream,
     weight: &RowsWeight<'_>,
     width: usize,
-) -> anyhow::Result<(u64, u64, usize)> {
+) -> anyhow::Result<(u64, u64, u64, usize)> {
     match weight {
         RowsWeight::Bf16(w) => {
             ensure!(
@@ -248,13 +299,14 @@ fn resolve_weight(
                 "weight has {} elements, not whole rows of {width}",
                 w.len()
             );
-            Ok((w.device_ptr(stream).0, 0u64, w.len() / width))
+            Ok((w.device_ptr(stream).0, 0u64, 0u64, w.len() / width))
         }
         RowsWeight::Fp8(w) => {
             ensure!(w.k() == width, "weight has k = {}, expected {width}", w.k());
             Ok((
                 w.values().device_ptr(stream).0,
                 w.scales().device_ptr(stream).0,
+                0u64,
                 w.rows(),
             ))
         }
@@ -272,6 +324,7 @@ fn resolve_weight(
             Ok((
                 values.device_ptr(stream).0,
                 scales.device_ptr(stream).0,
+                0u64,
                 *rows,
             ))
         }
@@ -280,6 +333,16 @@ fn resolve_weight(
             Ok((
                 w.values().device_ptr(stream).0,
                 w.scales().device_ptr(stream).0,
+                0u64,
+                w.rows(),
+            ))
+        }
+        RowsWeight::Nvfp4(w) => {
+            ensure!(w.k() == width, "weight has k = {}, expected {width}", w.k());
+            Ok((
+                w.values().device_ptr(stream).0,
+                w.scales().device_ptr(stream).0,
+                w.outer().device_ptr(stream).0,
                 w.rows(),
             ))
         }
@@ -287,12 +350,22 @@ fn resolve_weight(
 }
 
 impl LinearRows {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "loads BF16, FP8 and NVFP4 multi-row and argmax kernels"
+    )]
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "linear_rows", cubin!("linear_rows"))?;
-        let smem = i32::try_from(MAX_WARPS * WARP_SMEM)?;
-        let load_entry = |kind: WeightKind, k: usize, name: &str| -> anyhow::Result<Entry> {
+        let nvfp4_module = load_module(ctx, "linear_nvfp4_rows", cubin!("linear_nvfp4_rows"))?;
+        let load_entry = |m: &Arc<cudarc::driver::CudaModule>,
+                          kind: WeightKind,
+                          k: usize,
+                          warp_smem: usize,
+                          name: &str|
+         -> anyhow::Result<Entry> {
+            let smem = i32::try_from(MAX_WARPS * warp_smem)?;
             let load = |name: String| -> anyhow::Result<CudaFunction> {
-                let function = module.load_function(&name)?;
+                let function = m.load_function(&name)?;
                 function
                     .set_attribute(
                         CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -318,6 +391,7 @@ impl LinearRows {
             Ok(Entry {
                 kind,
                 k,
+                warp_smem,
                 functions,
                 pairs,
                 chunk,
@@ -340,11 +414,46 @@ impl LinearRows {
             (WeightKind::Bf16, 9216, "rows_bf16_k9216"),
             (WeightKind::Fp8, 9216, "rows_fp8_k9216"),
         ] {
-            entries.push(load_entry(kind, k, name)?);
+            entries.push(load_entry(&module, kind, k, WARP_SMEM, name)?);
+        }
+        for (k, name) in [
+            (2304, "rows_nvfp4_k2304"),
+            (3072, "rows_nvfp4_k3072"),
+            (4096, "rows_nvfp4_k4096"),
+            (4608, "rows_nvfp4_k4608"),
+            (6912, "rows_nvfp4_k6912"),
+            (9216, "rows_nvfp4_k9216"),
+        ] {
+            entries.push(load_entry(
+                &nvfp4_module,
+                WeightKind::Nvfp4,
+                k,
+                NVFP4_WARP_SMEM,
+                name,
+            )?);
         }
         let argmax_entries = vec![
-            load_entry(WeightKind::Bf16, 2304, "rows_bf16_k2304_argmax")?,
-            load_entry(WeightKind::Fp8, 2304, "rows_fp8_k2304_argmax")?,
+            load_entry(
+                &module,
+                WeightKind::Bf16,
+                2304,
+                WARP_SMEM,
+                "rows_bf16_k2304_argmax",
+            )?,
+            load_entry(
+                &module,
+                WeightKind::Fp8,
+                2304,
+                WARP_SMEM,
+                "rows_fp8_k2304_argmax",
+            )?,
+            load_entry(
+                &nvfp4_module,
+                WeightKind::Nvfp4,
+                2304,
+                NVFP4_WARP_SMEM,
+                "rows_nvfp4_k2304_argmax",
+            )?,
         ];
         Ok(Self {
             entries,
@@ -359,12 +468,11 @@ impl LinearRows {
     }
 
     /// Runs every product over `m` rows, 1 to [`MAX_ROWS`], in one launch: BF16 inputs and
-    /// outputs, F32 accumulation, and with FP8 weights each row's scale applied once to its
-    /// sum. Every output rounds to nearest even once.
+    /// outputs, F32 accumulation, and with FP8/NVFP4 weights each row's scale applied once
+    /// to its sum. Every output rounds to nearest even once.
     ///
     /// All products share `k`, one [`Self::supports`], and the weight format. Inputs and
-    /// BF16 weights start 16-byte aligned.
-    #[expect(clippy::too_many_lines, reason = "validates and launches batched products")]
+    /// weights start 16-byte aligned.
     pub fn run(
         &self,
         stream: &CudaStream,
@@ -381,7 +489,7 @@ impl LinearRows {
             (1..=MAX_ROWS).contains(&m),
             "m is {m}, expected 1 to {MAX_ROWS}"
         );
-        let kind = products[0].weight_kind();
+        let kind = products[0].weight.kind();
         ensure!(
             products[0].x.len().is_multiple_of(m),
             "input 0 has {} elements, not whole rows of {m}",
@@ -392,7 +500,11 @@ impl LinearRows {
             .entries
             .iter()
             .find(|e| e.kind == kind && e.k == width)
-            .with_context(|| format!("no multi-row product for {kind:?} k = {width}"))?;
+            .with_context(|| format!("no multi-row {kind:?} product for k = {width}"))?;
+
+        if kind == WeightKind::Nvfp4 {
+            return Self::run_nvfp4(stream, entry, products, m, width, start);
+        }
 
         let mut batch = Batch {
             count: i32::try_from(products.len())?,
@@ -404,7 +516,7 @@ impl LinearRows {
         let mut pairs = 0usize;
         for (i, p) in products.iter_mut().enumerate() {
             ensure!(
-                p.weight_kind() == kind,
+                p.weight.kind() == kind,
                 "product {i} has another weight format"
             );
             ensure!(
@@ -418,57 +530,11 @@ impl LinearRows {
                 p.out.len()
             );
             let out_rows = p.out.len() / m;
-            // Event tracking is off (see `Gpu`), so the guards do nothing.
-            let (w, scale) = match &p.weight {
-                RowsWeight::Bf16(w) => {
-                    ensure!(
-                        w.len() == out_rows * width,
-                        "product {i}: weight has {} elements, expected {out_rows} x {width}",
-                        w.len()
-                    );
-                    (w.device_ptr(stream).0, 0)
-                }
-                RowsWeight::Fp8(w) => {
-                    ensure!(
-                        w.rows() == out_rows && w.k() == width,
-                        "product {i}: weight is {} x {}, expected {out_rows} x {width}",
-                        w.rows(),
-                        w.k()
-                    );
-                    (
-                        w.values().device_ptr(stream).0,
-                        w.scales().device_ptr(stream).0,
-                    )
-                }
-                RowsWeight::Fp8Raw {
-                    values,
-                    scales,
-                    rows,
-                    k,
-                } => {
-                    ensure!(
-                        *rows == out_rows && *k == width,
-                        "product {i}: weight is {rows} x {k}, expected {out_rows} x {width}"
-                    );
-                    ensure!(
-                        values.len() >= out_rows * width && scales.len() >= out_rows,
-                        "product {i}: FP8 raw buffers too short for {out_rows} x {width}"
-                    );
-                    (values.device_ptr(stream).0, scales.device_ptr(stream).0)
-                }
-                RowsWeight::Mxfp8(w) => {
-                    ensure!(
-                        w.rows() == out_rows && w.k() == width,
-                        "product {i}: weight is {} x {}, expected {out_rows} x {width}",
-                        w.rows(),
-                        w.k()
-                    );
-                    (
-                        w.values().device_ptr(stream).0,
-                        w.scales().device_ptr(stream).0,
-                    )
-                }
-            };
+            let (w, scale, _, weight_rows) = resolve_weight(stream, &p.weight, width)?;
+            ensure!(
+                weight_rows == out_rows,
+                "product {i}: weight has {weight_rows} rows, expected {out_rows}"
+            );
             let x = p.x.device_ptr(stream).0;
             let out = p.out.device_ptr_mut(stream).0;
             ensure!(
@@ -512,6 +578,78 @@ impl LinearRows {
         unsafe { launch_by_value(stream, function, config, &batch, start == Start::Early) }
     }
 
+    fn run_nvfp4(
+        stream: &CudaStream,
+        entry: &Entry,
+        products: &mut [RowsProduct<'_>],
+        m: usize,
+        width: usize,
+        start: Start,
+    ) -> anyhow::Result<()> {
+        let mut batch = Nvfp4Batch {
+            count: i32::try_from(products.len())?,
+            m: i32::try_from(m)?,
+            pdl: i32::from(start == Start::Early),
+            ..Nvfp4Batch::default()
+        };
+        let mut tiles = 0usize;
+        let mut pairs = 0usize;
+        for (i, p) in products.iter_mut().enumerate() {
+            ensure!(
+                p.weight.kind() == WeightKind::Nvfp4,
+                "product {i} has another weight format"
+            );
+            ensure!(
+                p.x.len() == m * width,
+                "product {i}: input has {} elements, expected {m} x {width}",
+                p.x.len()
+            );
+            ensure!(
+                !p.out.is_empty() && p.out.len().is_multiple_of(m),
+                "product {i}: output has {} elements, not whole rows of {m}",
+                p.out.len()
+            );
+            let out_rows = p.out.len() / m;
+            let (w, scale, outer, weight_rows) = resolve_weight(stream, &p.weight, width)?;
+            ensure!(
+                weight_rows == out_rows,
+                "product {i}: weight has {weight_rows} rows, expected {out_rows}"
+            );
+            let x = p.x.device_ptr(stream).0;
+            let out = p.out.device_ptr_mut(stream).0;
+            ensure!(
+                (w | scale | x).is_multiple_of(16),
+                "product {i}: weight, scales and input must be 16-byte aligned"
+            );
+            tiles += out_rows.div_ceil(TILE_ROWS);
+            pairs += out_rows.div_ceil(TILE_ROWS).div_ceil(2);
+            batch.seg[i] = Nvfp4Segment {
+                w,
+                scale,
+                outer,
+                x,
+                out,
+                n: i32::try_from(out_rows).context("too many output rows")?,
+                tile_end: i32::try_from(tiles).context("too many tiles")?,
+                pair_end: i32::try_from(pairs).context("too many tiles")?,
+                _pad: 0,
+            };
+        }
+        let stages = width / NVFP4_STAGE_K;
+        let splits = TARGET_WARPS_NVFP4
+            .div_ceil(tiles)
+            .clamp(1, MAX_WARPS.min(stages));
+        let (function, (grid_x, grid_y), per_warp) = entry.shape(m, splits, tiles, pairs);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(grid_x)?, u32::try_from(grid_y)?, 1),
+            block_dim: (u32::try_from(32 * splits)?, 1, 1),
+            shared_mem_bytes: u32::try_from(splits * per_warp)?,
+        };
+        // SAFETY: `batch` has `linear_nvfp4_rows.cu`'s `Batch` layout, buffers are validated
+        // above, and before `pdl_wait` only read-only weight values and block scales are read.
+        unsafe { launch_by_value(stream, function, config, &batch, start == Start::Early) }
+    }
+
     /// Single-product LM head with a fused tile-argmax epilogue: computes `x @ weight^T`
     /// (BF16-rounded per element, masked to `0..vocab`) and writes one `(max_val, max_idx)`
     /// partial per `(row, tile)` into `partial_vals` and `partial_idxs`. Returns the number
@@ -545,19 +683,18 @@ impl LinearRows {
             x.len()
         );
         let width = x.len() / m;
-        let kind = match weight {
-            RowsWeight::Bf16(_) => WeightKind::Bf16,
-            RowsWeight::Fp8(_) | RowsWeight::Fp8Raw { .. } => WeightKind::Fp8,
-            RowsWeight::Mxfp8(_) => anyhow::bail!("fused argmax does not take MXFP8 weights"),
-        };
-        let fp8 = kind == WeightKind::Fp8;
+        let kind = weight.kind();
+        ensure!(
+            kind != WeightKind::Mxfp8,
+            "fused argmax does not take MXFP8 weights"
+        );
         let entry = self
             .argmax_entries
             .iter()
             .find(|e| e.kind == kind && e.k == width)
-            .with_context(|| format!("no fused argmax multi-row product for k = {width}"))?;
+            .with_context(|| format!("no fused argmax multi-row {kind:?} product for k = {width}"))?;
 
-        let (w_ptr, scale_ptr, weight_rows) = resolve_weight(stream, weight, width)?;
+        let (w_ptr, scale_ptr, outer_ptr, weight_rows) = resolve_weight(stream, weight, width)?;
         ensure!(
             vocab <= weight_rows,
             "vocab {vocab} exceeds weight rows {weight_rows}"
@@ -567,15 +704,21 @@ impl LinearRows {
             (w_ptr | x_ptr).is_multiple_of(16),
             "weight and input must be 16-byte aligned"
         );
+        if kind == WeightKind::Nvfp4 {
+            ensure!(
+                scale_ptr.is_multiple_of(16),
+                "NVFP4 scales must be 16-byte aligned"
+            );
+        }
 
         // Compute `splits` from `weight_rows` (padded vocab) so warp reduction order matches
         // `LinearRows::run` bit for bit, while launching tiles only up to `vocab`.
         let padded_tiles = weight_rows.div_ceil(TILE_ROWS);
-        let stages = width * if fp8 { 1 } else { 2 } / STAGE_BYTES;
-        let target = if fp8 {
-            TARGET_WARPS_FP8
-        } else {
-            TARGET_WARPS_BF16
+        let (stages, target) = match kind {
+            WeightKind::Bf16 => (width * 2 / STAGE_BYTES, TARGET_WARPS_BF16),
+            WeightKind::Fp8 => (width / STAGE_BYTES, TARGET_WARPS_FP8),
+            WeightKind::Nvfp4 => (width / NVFP4_STAGE_K, TARGET_WARPS_NVFP4),
+            WeightKind::Mxfp8 => unreachable!("rejected above"),
         };
         let splits = target
             .div_ceil(padded_tiles)
@@ -598,18 +741,21 @@ impl LinearRows {
             shared_mem_bytes: u32::try_from(splits * per_warp)?,
         };
         let mut args = KernelArgs::default();
-        args.u64(w_ptr)
-            .u64(scale_ptr)
-            .u64(x_ptr)
+        args.u64(w_ptr).u64(scale_ptr);
+        if kind == WeightKind::Nvfp4 {
+            args.u64(outer_ptr);
+        }
+        args.u64(x_ptr)
             .ptr_mut(&mut partial_vals, stream)
             .ptr_mut(&mut partial_idxs, stream)
             .i32(i32::try_from(m)?)
             .i32(i32::try_from(vocab).context("vocab too large")?)
             .i32(i32::try_from(partial_stride).context("partial_stride too large")?)
             .i32(i32::from(start == Start::Early));
-        // SAFETY: arguments match `rows_{bf16,fp8}_k2304_argmax*(const u8*, const float*,
-        // const bf16*, float*, int*, int, int, int, int)`. Buffers are validated above, the
-        // kernel reads only `weight` before `pdl_wait`, and writes only `[0..m, 0..partial_stride)`.
+        // SAFETY: arguments match `rows_{bf16,fp8}_k2304_argmax*` (9 args) or
+        // `rows_nvfp4_k2304_argmax*` (10 args with `outer`). Buffers are validated above,
+        // the kernel reads only read-only weights/scales before `pdl_wait`, and writes only
+        // `[0..m, 0..partial_stride)`.
         unsafe {
             if start == Start::Early {
                 args.launch_pdl(stream, function, config)?;

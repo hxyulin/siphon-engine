@@ -107,14 +107,20 @@ ADDRESS_TABLES: dict[str, set[str]] = {
 STRUCT_FIELDS = {
     ("linear.cu", "Batch"): (32, 256, {0: "seg.w", 8: "seg.x", 16: "seg.out"}),
     ("linear_fp8.cu", "Batch"): (40, 320, {0: "seg.w", 8: "seg.scale", 16: "seg.x", 24: "seg.out"}),
+    ("linear_nvfp4.cu", "Batch"): (
+        48, 384, {0: "seg.w", 8: "seg.scale", 16: "seg.outer", 24: "seg.x", 32: "seg.out"},
+    ),
     ("linear_rows.cu", "Batch"): (40, 320, {0: "seg.w", 8: "seg.scale", 16: "seg.x", 24: "seg.out"}),
+    ("linear_nvfp4_rows.cu", "Batch"): (
+        56, 448, {0: "seg.w", 8: "seg.scale", 16: "seg.outer", 24: "seg.x", 32: "seg.out"},
+    ),
     # message_gate_rows_2304: one gate_rows::Gate per gate slot.
     ("misc.cu", "GateRowsArgs"): (88, 264, {
         0: "g.down", 8: "g.down_scale", 16: "g.forget", 24: "g.gain", 32: "g.x_state",
         40: "g.x_message", 48: "g.h", 56: "g.probs", 64: "g.norm_weight", 72: "g.normed",
         80: "g.out"}),
 }
-READ_ONLY |= {"batch.seg.w", "batch.seg.scale"}
+READ_ONLY |= {"batch.seg.w", "batch.seg.scale", "batch.seg.outer", "outer"}
 READ_ONLY |= {f"args.g.{n}" for n in ("down", "down_scale", "forget", "gain", "norm_weight")}
 
 # The kernel parameters start at this constant bank 0 offset on sm_90 and later. The

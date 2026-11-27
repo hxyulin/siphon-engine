@@ -346,6 +346,8 @@ pub struct Options {
     /// Format of the attention output projection decode reads under `--weights fp8`:
     /// `bf16` (default), `fp8` (per-row E4M3), or `mxfp8` (per-32 UE8M0 block-scaled E4M3).
     pub output_projection: siphon::OutputProjection,
+    /// Optional override for the LM head's weight format (`bf16`, `fp8`, or `nvfp4`).
+    pub lm_head: Option<String>,
     /// The global KV cache format, as `KvFormat` parses it.
     pub kv: String,
     /// Verify widths the adaptive policy chooses among.
@@ -358,6 +360,8 @@ pub struct Options {
     pub drafter: Option<PathBuf>,
     /// The draft's approximations, as `DraftOptions::parse` takes them.
     pub draft: String,
+    /// Draft weight override (`auto|bf16|fp8|nvfp4|nvfp4-backbone`).
+    pub draft_weights: String,
     /// Optional shortlist ranked-token budget (`--draft-shortlist`).
     pub draft_shortlist: Option<usize>,
     /// Optional shortlist context-token budget (`--draft-context-rows`).
@@ -884,8 +888,9 @@ mod cuda {
         let (free, _) = gpu.context().mem_get_info()?;
         let checkpoint = Checkpoint::open(&options.model_dir)?;
         let (weight_format, kv) = formats(options)?;
-        let draft_options = DraftOptions::parse(&options.draft, None)?
+        let mut draft_options = DraftOptions::parse(&options.draft, None)?
             .with_shortlist_budget(options.draft_shortlist, options.draft_context_rows)?;
+        draft_options.apply_draft_weights(&options.draft_weights)?;
         let chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK);
         let kv_options = kv_options(options)?;
         let planner = Planner::new(&PlanInputs {
@@ -911,6 +916,7 @@ mod cuda {
         let capacity = plan(options, &planner, free, warmup.len())?;
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = output_projection(options);
+        weights.lm_head_format = options.lm_head.as_deref().map(str::parse).transpose()?;
         let (page, _) = granularity(gpu.context())?;
         if page != memory::KV_PAGE_BYTES {
             eprintln!(
@@ -1190,7 +1196,9 @@ mod cuda {
             "drafter": options.drafter.as_deref().map(weights_hash).transpose()?,
             "kv": options.kv,
             "weights": if options.fp8_weights { "fp8" } else { "bf16" },
+            "lm_head": options.lm_head,
             "draft": options.draft,
+            "draft_weights": options.draft_weights,
             "prefill_attention": options.prefill_attention,
             "prefill_dense": options.prefill_dense,
             "expert_activations": options.expert_activations,

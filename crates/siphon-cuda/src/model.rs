@@ -60,6 +60,7 @@ use crate::{
         linear_fp8::{
             Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8, Mxfp8Gemm, Mxfp8Gemv, Mxfp8Matrix,
         },
+        linear_nvfp4::{ARGMAX_MAX_BLOCKS as NVFP4_ARGMAX_MAX_BLOCKS, LinearNvfp4, Nvfp4Gemv},
         linear_rows::{self, LinearRows, RowsProduct},
         misc::{ArgmaxScratch, DepthGateSlot, Misc},
         norm::{KvConvWeights, Norm},
@@ -69,8 +70,8 @@ use crate::{
     },
     vmm::PagePool,
     weights::{
-        ExpertFormat, InputNorms, KvConv, LayerWeights, MessageGateWeights, OutputProjection,
-        WeightFormat, Weights,
+        ExpertFormat, InputNorms, KvConv, LayerWeights, LmHeadFormat, MessageGateWeights,
+        OutputProjection, WeightFormat, Weights,
     },
 };
 
@@ -86,6 +87,7 @@ struct Kernels {
     experts_rows: ExpertsRows,
     linear: Linear,
     linear_fp8: LinearFp8,
+    linear_nvfp4: LinearNvfp4,
     linear_rows: LinearRows,
     misc: Misc,
     norm: Norm,
@@ -282,6 +284,9 @@ struct Scratch {
     /// F32 logits after the softcap, `[unpadded_vocab]`.
     capped: CudaSlice<f32>,
     argmax: ArgmaxScratch,
+    /// Partials for fused `B = 1` NVFP4 LM-head argmax (`<= NVFP4_ARGMAX_MAX_BLOCKS`).
+    nvfp4_partials_vals: CudaSlice<f32>,
+    nvfp4_partials_idxs: CudaSlice<i32>,
 }
 
 /// Intermediates of `MessageGate`.
@@ -388,6 +393,8 @@ impl Scratch {
             logits: zeros(stream, cfg.vocab_size)?,
             capped: zeros(stream, cfg.unpadded_vocab_size)?,
             argmax: ArgmaxScratch::new(stream)?,
+            nvfp4_partials_vals: zeros(stream, NVFP4_ARGMAX_MAX_BLOCKS)?,
+            nvfp4_partials_idxs: zeros(stream, NVFP4_ARGMAX_MAX_BLOCKS)?,
         })
     }
 }
@@ -457,6 +464,10 @@ pub struct Model {
     sampler: bool,
     /// The settings of a step's or a prefill's draw.
     sample_one: SampleBuffers,
+    /// Whether `scratch.capped` holds the last step's/prefill's softcapped logits.
+    /// `false` after an untraced `B = 1` step with fused NVFP4 LM-head argmax until
+    /// materialized lazily for sampling or [`Model::logits`].
+    capped_valid: bool,
     /// The pages that back the global caches of every slot, if they are pooled.
     kv_pool: Option<PagePool>,
 }
@@ -602,6 +613,7 @@ impl Model {
             experts_rows: ExpertsRows::load(ctx)?,
             linear: Linear::load(ctx)?,
             linear_fp8: LinearFp8::load(ctx)?,
+            linear_nvfp4: LinearNvfp4::load(ctx)?,
             linear_rows: LinearRows::load(ctx)?,
             misc: Misc::load(ctx)?,
             norm: Norm::load(ctx)?,
@@ -609,9 +621,19 @@ impl Model {
             sample: Sample::load(ctx)?,
             spec: Spec::load(ctx)?,
         };
+        let lm_head_format = weights.lm_head_format.unwrap_or(match weight_format {
+            WeightFormat::Bf16 => LmHeadFormat::Bf16,
+            WeightFormat::Fp8 => LmHeadFormat::Fp8,
+        });
         if weight_format == WeightFormat::Fp8 {
             weights.quantize_fp8(&kernels.linear_fp8, &stream)?;
         }
+        weights.quantize_lm_head(
+            &kernels.linear_fp8,
+            &kernels.linear_nvfp4,
+            &stream,
+            lm_head_format,
+        )?;
         let history = config.sconv_kernel_size - 1;
         let kv_dims = config.num_key_value_heads * config.head_dim;
         let hidden = config.hidden_size;
@@ -732,6 +754,7 @@ impl Model {
             sampling: Sampling::GREEDY,
             sampler: false,
             sample_one,
+            capped_valid: true,
             kv_pool,
         })
     }
@@ -1338,7 +1361,34 @@ impl Model {
 
     /// The F32 logits of the last step after the softcap, `[unpadded_vocab]`.
     pub fn logits(&self) -> anyhow::Result<Vec<f32>> {
-        Ok(self.ctx.stream.clone_dtoh(&self.scratch.capped)?)
+        if self.capped_valid {
+            return Ok(self.ctx.stream.clone_dtoh(&self.scratch.capped)?);
+        }
+        let cfg = &self.ctx.config;
+        let lm_head = self
+            .ctx
+            .weights
+            .lm_head_nvfp4
+            .as_ref()
+            .context("NVFP4 LM head missing when materializing lazy step logits")?;
+        let mut tmp_logits = zeros::<bf16>(&self.ctx.stream, cfg.vocab_size)?;
+        let mut tmp_capped = zeros::<f32>(&self.ctx.stream, cfg.unpadded_vocab_size)?;
+        self.ctx.kernels.linear_nvfp4.gemv(
+            &self.ctx.stream,
+            &mut [Nvfp4Gemv::new(
+                lm_head,
+                &self.scratch.final_hidden,
+                &mut tmp_logits,
+            )],
+            Start::Serial,
+        )?;
+        self.ctx.kernels.elementwise.logit_softcap(
+            &self.ctx.stream,
+            &tmp_logits,
+            &mut tmp_capped,
+            cfg.final_logit_softcapping,
+        )?;
+        Ok(self.ctx.stream.clone_dtoh(&tmp_capped)?)
     }
 
     /// Runs one token and returns the next token, greedy or drawn with [`Self::sampling`].
@@ -1391,6 +1441,7 @@ impl Model {
         if let Some(trace) = trace {
             *trace = Trace::default();
             self.enqueue(Some(trace), false)?;
+            self.capped_valid = true;
         } else {
             let captured = if taps { &self.tap_graph } else { &self.graph };
             if captured.is_none() {
@@ -1407,6 +1458,7 @@ impl Model {
                 .context("the step graph is missing")?
                 .0
                 .launch()?;
+            self.capped_valid = self.ctx.weights.lm_head_nvfp4.is_none();
         }
         self.position += 1;
         self.next_token()
@@ -1490,6 +1542,26 @@ impl Model {
         let stream = Arc::clone(&self.ctx.stream);
         if !self.sampling.is_greedy() {
             let s = &mut self.scratch;
+            if !self.capped_valid {
+                let lm_head = self
+                    .ctx
+                    .weights
+                    .lm_head_nvfp4
+                    .as_ref()
+                    .context("NVFP4 LM head missing when materializing sampled logits")?;
+                self.ctx.kernels.linear_nvfp4.gemv(
+                    &stream,
+                    &mut [Nvfp4Gemv::new(lm_head, &s.final_hidden, &mut s.logits)],
+                    Start::Serial,
+                )?;
+                self.ctx.kernels.elementwise.logit_softcap(
+                    &stream,
+                    &s.logits,
+                    &mut s.capped,
+                    self.ctx.config.final_logit_softcapping,
+                )?;
+                self.capped_valid = true;
+            }
             self.sample_one
                 .upload(&stream, &[(self.sampling, self.position)])?;
             self.ctx.kernels.sample.run(
@@ -1707,6 +1779,44 @@ impl Model {
             ctx.eps(),
         )?;
         taps.final_hidden(ctx, &s.final_hidden)?;
+        if let Some(lm_head) = &ctx.weights.lm_head_nvfp4 {
+            if let Some(t) = trace {
+                ctx.kernels.linear_nvfp4.gemv(
+                    &ctx.stream,
+                    &mut [Nvfp4Gemv::new(lm_head, &s.final_hidden, &mut s.logits)],
+                    Start::Serial,
+                )?;
+                ctx.kernels.elementwise.logit_softcap(
+                    &ctx.stream,
+                    &s.logits,
+                    &mut s.capped,
+                    cfg.final_logit_softcapping,
+                )?;
+                ctx.kernels
+                    .misc
+                    .argmax_wide_f32(&ctx.stream, &s.capped, &mut s.next, &mut s.argmax)?;
+                t.logits = ctx.stream.clone_dtoh(&s.capped)?;
+            } else {
+                let n_partials = ctx.kernels.linear_nvfp4.gemv_argmax(
+                    &ctx.stream,
+                    lm_head,
+                    &s.final_hidden,
+                    cfg.unpadded_vocab_size,
+                    &mut s.nvfp4_partials_vals,
+                    &mut s.nvfp4_partials_idxs,
+                    Start::Early,
+                )?;
+                ctx.kernels.misc.argmax_partials(
+                    &ctx.stream,
+                    &s.nvfp4_partials_vals.slice(..n_partials),
+                    &s.nvfp4_partials_idxs.slice(..n_partials),
+                    &mut s.next,
+                    n_partials,
+                    n_partials,
+                )?;
+            }
+            return Ok(());
+        }
         if let Some(lm_head) = &ctx.weights.lm_head_fp8 {
             ctx.kernels.linear_fp8.gemv(
                 &ctx.stream,
@@ -2032,10 +2142,12 @@ impl Ctx {
         } else {
             // The last visit's experts leave DRAM bandwidth to spare for the start of the
             // LM head, which the step reads next.
-            let lm_head: &dyn Prefetch = match &self.weights.lm_head_fp8 {
-                Some(fp8) => fp8,
-                None => self.weights.lm_head.slice(),
-            };
+            let lm_head: &dyn Prefetch =
+                match (&self.weights.lm_head_nvfp4, &self.weights.lm_head_fp8) {
+                    (Some(nvfp4), _) => nvfp4,
+                    (_, Some(fp8)) => fp8,
+                    (None, None) => self.weights.lm_head.slice(),
+                };
             lm_head_start = PrefetchStart(lm_head, LM_HEAD_PREFETCH_BYTES);
             prefetch.push(&lm_head_start);
         }

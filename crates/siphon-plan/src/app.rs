@@ -119,7 +119,9 @@ impl App {
         // shortlist.
         let approx = DraftApprox {
             fp8_backbone: true,
+            nvfp4_backbone: false,
             fp8_head: true,
+            nvfp4_head: false,
             fp8_fold: true,
             fp8_kv: true,
             shortlist: true,

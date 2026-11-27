@@ -175,12 +175,14 @@ fn args() -> anyhow::Result<Args> {
     let mut prefill_chunk = None;
     let mut fp8_weights = true;
     let mut output_projection = siphon::OutputProjection::default();
+    let mut lm_head = None;
     let mut kv = "fp8".to_owned();
     let mut queue = 8;
     let mut streams = 1;
     let mut widths: Vec<usize> = (1..=8).collect();
     let mut drafter = None;
     let mut draft = "fast".to_owned();
+    let mut draft_weights = "auto".to_owned();
     let mut draft_shortlist = None;
     let mut draft_context_rows = None;
     let mut fallback = false;
@@ -223,6 +225,14 @@ fn args() -> anyhow::Result<Args> {
             "--prefill-chunk" => prefill_chunk = Some(chunk_rows(&value()?)?),
             "--weights" => fp8_weights = fp8(&value()?)?,
             "--output-projection" => output_projection = value()?.parse()?,
+            "--lm-head" => {
+                let v = value()?;
+                ensure!(
+                    ["bf16", "fp8", "nvfp4"].contains(&v.as_str()),
+                    "--lm-head takes bf16, fp8 or nvfp4"
+                );
+                lm_head = Some(v);
+            }
             "--kv" => {
                 kv = value()?;
                 ensure!(
@@ -237,6 +247,14 @@ fn args() -> anyhow::Result<Args> {
             }
             "--drafter" => drafter = Some(PathBuf::from(value()?)),
             "--draft" => draft = value()?,
+            "--draft-weights" => {
+                draft_weights = value()?;
+                ensure!(
+                    ["auto", "bf16", "fp8", "nvfp4", "nvfp4-backbone"]
+                        .contains(&draft_weights.as_str()),
+                    "--draft-weights takes auto, bf16, fp8, nvfp4 or nvfp4-backbone"
+                );
+            }
             "--draft-shortlist" => {
                 let n: usize = value()?
                     .parse()
@@ -390,12 +408,14 @@ fn args() -> anyhow::Result<Args> {
             prefill_chunk,
             fp8_weights,
             output_projection,
+            lm_head,
             kv,
             widths,
             queue,
             streams,
             drafter,
             draft,
+            draft_weights,
             draft_shortlist,
             draft_context_rows,
             fallback,

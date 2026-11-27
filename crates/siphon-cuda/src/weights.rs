@@ -31,6 +31,7 @@ use crate::{
     ops::{
         linear::Prefetch,
         linear_fp8::{Fp8Matrix, LinearFp8, Mxfp8Matrix},
+        linear_nvfp4::{LinearNvfp4, Nvfp4Matrix},
     },
 };
 
@@ -57,9 +58,13 @@ pub struct Weights {
     pub lm_head: Table,
     /// Per looped layer, F32 `[4, hidden]`: the query, key, value and MLP message queries.
     pub message_queries: Vec<CudaSlice<f32>>,
-    /// FP8 copy of `lm_head`, after [`Weights::quantize_fp8`], which every LM-head product
-    /// then reads.
+    /// FP8 copy of `lm_head`, after [`Weights::quantize_fp8`] or [`Weights::quantize_lm_head`],
+    /// which every LM-head product then reads (unless `lm_head_nvfp4` is set).
     pub lm_head_fp8: Option<Fp8Matrix>,
+    /// NVFP4 copy of `lm_head` (opt-in `--lm-head nvfp4`, ~261 MB vs 463 MB FP8).
+    pub lm_head_nvfp4: Option<Nvfp4Matrix>,
+    /// Optional override for the LM head's format (`None` follows [`WeightFormat`]).
+    pub lm_head_format: Option<LmHeadFormat>,
     /// The output projection's format in [`Weights::quantize_fp8`].
     pub output: OutputProjection,
 }
@@ -88,7 +93,7 @@ impl Table {
     }
 }
 
-pub use siphon::{OutputProjection, WeightFormat};
+pub use siphon::{LmHeadFormat, OutputProjection, WeightFormat};
 
 #[derive(Debug)]
 pub struct LayerWeights {
@@ -318,14 +323,17 @@ impl Weights {
             lm_head: Table::Device(loader.bf16("model.llm.unembed.weight", &[vocab, hidden])?),
             message_queries: load_message_queries(&loader, config)?,
             lm_head_fp8: None,
+            lm_head_nvfp4: None,
+            lm_head_format: None,
             output: OutputProjection::default(),
         })
     }
 
-    /// Quantizes every layer's attention input projections, its message gates and the LM
-    /// head to FP8 copies, and its output projection too with [`OutputProjection::Fp8`],
-    /// which decode then reads, and moves the BF16 LM head to mapped host memory. Returns
-    /// the bytes the copies take.
+    /// Quantizes every layer's attention input projections, its message gates and (unless
+    /// [`Self::lm_head_format`] overrides it) the LM head to FP8 copies, and its output
+    /// projection too with [`OutputProjection::Fp8`], which decode then reads, and moves
+    /// the BF16 LM head to mapped host memory when quantized. Returns the bytes the copies
+    /// take.
     pub fn quantize_fp8(
         &mut self,
         linear: &LinearFp8,
@@ -338,7 +346,7 @@ impl Weights {
         let hidden = self.embed_norm.len();
         let mut bytes = 0;
         ensure!(
-            self.lm_head_fp8.is_none(),
+            self.layers.first().is_none_or(|l| l.fp8.is_none()),
             "the weights are quantized already"
         );
         for layer in &mut self.layers {
@@ -374,15 +382,69 @@ impl Weights {
                 gate.fp8 = Some(copies);
             }
         }
-        let lm_head = quantize(self.lm_head.slice(), hidden)?;
-        bytes += lm_head.bytes();
-        self.lm_head_fp8 = Some(lm_head);
+        if self.lm_head_format.is_none_or(|f| f == LmHeadFormat::Fp8)
+            && self.lm_head_fp8.is_none()
+            && self.lm_head_nvfp4.is_none()
+        {
+            let lm_head = quantize(self.lm_head.slice(), hidden)?;
+            bytes += lm_head.bytes();
+            self.lm_head_fp8 = Some(lm_head);
+            self.move_lm_head_to_host(stream)?;
+        }
+        stream.synchronize()?;
+        Ok(bytes)
+    }
+
+    /// Quantizes `lm_head` to `format` (if not already quantized) and moves the BF16 original
+    /// to mapped host memory. Returns the bytes of any newly allocated quantized copy.
+    pub fn quantize_lm_head(
+        &mut self,
+        linear_fp8: &LinearFp8,
+        linear_nvfp4: &LinearNvfp4,
+        stream: &Arc<CudaStream>,
+        format: LmHeadFormat,
+    ) -> anyhow::Result<usize> {
+        let hidden = self.embed_norm.len();
+        let rows = self.lm_head.slice().len() / hidden;
+        ensure!(
+            self.lm_head.slice().len() == rows * hidden,
+            "lm_head is not [rows, {hidden}]"
+        );
+        let bytes = match format {
+            LmHeadFormat::Bf16 => 0,
+            LmHeadFormat::Fp8 => {
+                if self.lm_head_fp8.is_some() {
+                    return Ok(0);
+                }
+                let q = linear_fp8.quantize(stream, self.lm_head.slice(), rows, hidden)?;
+                let b = q.bytes();
+                self.lm_head_fp8 = Some(q);
+                self.move_lm_head_to_host(stream)?;
+                b
+            }
+            LmHeadFormat::Nvfp4 => {
+                if self.lm_head_nvfp4.is_some() {
+                    return Ok(0);
+                }
+                let q = linear_nvfp4.quantize(stream, self.lm_head.slice(), rows, hidden)?;
+                let b = q.bytes();
+                self.lm_head_nvfp4 = Some(q);
+                self.move_lm_head_to_host(stream)?;
+                b
+            }
+        };
+        if bytes > 0 {
+            stream.synchronize()?;
+        }
+        Ok(bytes)
+    }
+
+    fn move_lm_head_to_host(&mut self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
         if let Table::Device(head) = &self.lm_head {
             let host = stream.clone_dtoh(head)?;
             self.lm_head = Table::Host(HostMapped::new(stream, &host)?);
         }
-        stream.synchronize()?;
-        Ok(bytes)
+        Ok(())
     }
 }
 

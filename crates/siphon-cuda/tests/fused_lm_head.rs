@@ -27,8 +27,9 @@ use siphon_cuda::{
         elementwise::Elementwise,
         linear::Start,
         linear_fp8::{Fp8Gemm, Fp8Rows, GEMM_TILE, LinearFp8},
+        linear_nvfp4::{ARGMAX_MAX_BLOCKS as NVFP4_ARGMAX_MAX_BLOCKS, LinearNvfp4, Nvfp4Gemv},
         linear_rows::{LinearRows, RowsProduct, RowsWeight},
-        misc::Misc,
+        misc::{ArgmaxScratch, Misc},
         sample::{Sample, SampleBuffers, Sampling},
     },
 };
@@ -490,5 +491,197 @@ fn vectorized_logit_softcap_and_argmax_f32_alignment() -> anyhow::Result<()> {
         let got = stream.clone_dtoh(&out_dev)?;
         assert_eq!(got, expected, "argmax_f32 n = {n}");
     }
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "verifies both B=1 gemv_argmax and multi-row rows_argmax plus tie/mask cases"
+)]
+fn fused_nvfp4_gemv_and_rows_argmax_match_unfused() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.gpu.stream();
+    let nvfp4 = LinearNvfp4::load(s.gpu.context())?;
+
+    let mut w_host = synthetic_lm_head(61);
+    // Inject exact cross-tile ties (row 7 vs row 199_991) and intra-tile ties (row 2 vs row 10).
+    for c in 0..HIDDEN {
+        w_host[199_991 * HIDDEN + c] = w_host[7 * HIDDEN + c];
+        w_host[10 * HIDDEN + c] = w_host[2 * HIDDEN + c];
+    }
+    let w_dev = stream.clone_htod(&w_host)?;
+    let w_nvfp4 = nvfp4.quantize(stream, &w_dev, PADDED_VOCAB, HIDDEN)?;
+
+    // 1. B = 1 fused gemv_nvfp4_k2304_argmax -> argmax_partials vs gemv -> softcap -> argmax_wide_f32.
+    let x_host = synthetic_hidden(256, 73);
+    let x_dev = stream.clone_htod(&x_host)?;
+    let mut logits_b1 = stream.alloc_zeros::<bf16>(PADDED_VOCAB)?;
+    let mut capped_b1 = stream.alloc_zeros::<f32>(VOCAB)?;
+    let mut argmax_scratch = ArgmaxScratch::new(stream)?;
+    let mut want_b1 = stream.alloc_zeros::<i32>(1)?;
+    let mut got_b1 = stream.alloc_zeros::<i32>(1)?;
+    let mut p_vals_b1 = stream.alloc_zeros::<f32>(NVFP4_ARGMAX_MAX_BLOCKS)?;
+    let mut p_idxs_b1 = stream.alloc_zeros::<i32>(NVFP4_ARGMAX_MAX_BLOCKS)?;
+
+    for row in [0usize, 1, 7, 15] {
+        let x_row = x_dev.slice(row * HIDDEN..(row + 1) * HIDDEN);
+        nvfp4.gemv(
+            stream,
+            &mut [Nvfp4Gemv::new(&w_nvfp4, &x_row, &mut logits_b1)],
+            Start::Serial,
+        )?;
+        s.elementwise
+            .logit_softcap(stream, &logits_b1, &mut capped_b1, SOFTCAP)?;
+        s.misc
+            .argmax_wide_f32(stream, &capped_b1, &mut want_b1, &mut argmax_scratch)?;
+        let want = stream.clone_dtoh(&want_b1)?[0];
+
+        let n_partials = nvfp4.gemv_argmax(
+            stream,
+            &w_nvfp4,
+            &x_row,
+            VOCAB,
+            &mut p_vals_b1,
+            &mut p_idxs_b1,
+            Start::Early,
+        )?;
+        s.misc.argmax_partials(
+            stream,
+            &p_vals_b1.slice(..n_partials),
+            &p_idxs_b1.slice(..n_partials),
+            &mut got_b1,
+            n_partials,
+            n_partials,
+        )?;
+        let got = stream.clone_dtoh(&got_b1)?[0];
+        let vocab_i32 = i32::try_from(VOCAB)?;
+        assert_eq!(
+            got, want,
+            "gemv_nvfp4_k2304_argmax row {row} differs from unfused"
+        );
+        assert!(
+            (0..vocab_i32).contains(&got),
+            "gemv_nvfp4_k2304_argmax returned out-of-vocab token {got}"
+        );
+    }
+    eprintln!("gemv_nvfp4_k2304_argmax: 0-diff parity across 4 rows");
+
+    // 2. Multi-row rows_nvfp4_k2304_argmax -> argmax_partials vs rows_nvfp4 -> softcap -> argmax_f32.
+    let max_m = 256usize;
+    let max_partials = max_m * VOCAB.div_ceil(16);
+    let mut partial_vals = stream.alloc_zeros::<f32>(max_partials)?;
+    let mut partial_idxs = stream.alloc_zeros::<i32>(max_partials)?;
+    let mut got_dev = stream.alloc_zeros::<i32>(max_m)?;
+    let mut want_dev = stream.alloc_zeros::<i32>(max_m)?;
+    let mut ref_logits = stream.alloc_zeros::<bf16>(32 * PADDED_VOCAB)?;
+    let mut ref_capped = stream.alloc_zeros::<f32>(32 * VOCAB)?;
+
+    for &m in &[1usize, 4, 8, 32, 64, 256] {
+        let mut want = Vec::with_capacity(m);
+        for first in (0..m).step_by(32) {
+            let n = 32.min(m - first);
+            let x_slice = x_dev.slice(first * HIDDEN..(first + n) * HIDDEN);
+            let mut out_slice = ref_logits.slice_mut(..n * PADDED_VOCAB);
+            s.rows.run(
+                stream,
+                &mut [RowsProduct::nvfp4(&w_nvfp4, &x_slice, &mut out_slice)],
+                n,
+                Start::Serial,
+            )?;
+            s.elementwise.logit_softcap(
+                stream,
+                &ref_logits.slice(..n * PADDED_VOCAB),
+                &mut ref_capped.slice_mut(..n * VOCAB),
+                SOFTCAP,
+            )?;
+            s.misc.argmax_f32(
+                stream,
+                &ref_capped.slice(..n * VOCAB),
+                &mut want_dev.slice_mut(..n),
+                VOCAB,
+            )?;
+            want.extend(stream.clone_dtoh(&want_dev.slice(..n))?);
+        }
+
+        let n_partials = s.rows.run_argmax(
+            stream,
+            &RowsWeight::Nvfp4(&w_nvfp4),
+            &x_dev.slice(..m * HIDDEN),
+            VOCAB,
+            &mut partial_vals,
+            &mut partial_idxs,
+            m,
+            Start::Early,
+        )?;
+        s.misc.argmax_partials(
+            stream,
+            &partial_vals.slice(..m * n_partials),
+            &partial_idxs.slice(..m * n_partials),
+            &mut got_dev.slice_mut(..m),
+            n_partials,
+            n_partials,
+        )?;
+        let got = stream.clone_dtoh(&got_dev.slice(..m))?;
+        let vocab_i32 = i32::try_from(VOCAB)?;
+        assert_eq!(got, want, "nvfp4 rows_argmax m = {m} differs from unfused");
+        assert!(
+            got.iter().all(|&id| (0..vocab_i32).contains(&id)),
+            "nvfp4 rows_argmax m = {m}: returned out-of-vocab token"
+        );
+        eprintln!("nvfp4 rows_argmax m = {m}: 0-diff parity ({n_partials} partials/row)");
+    }
+
+    // 3. Explicit tie-breaking + padding masking for NVFP4 gemv_argmax and rows_argmax.
+    let mut w_tie = vec![bf16::ZERO; PADDED_VOCAB * HIDDEN];
+    w_tie[5 * HIDDEN] = bf16::from_f32(4.0);
+    w_tie[13 * HIDDEN] = bf16::from_f32(4.0);
+    w_tie[150_005 * HIDDEN] = bf16::from_f32(4.0);
+    w_tie[VOCAB * HIDDEN] = bf16::from_f32(32.0);
+    w_tie[(PADDED_VOCAB - 1) * HIDDEN] = bf16::from_f32(64.0);
+    let w_tie_dev = stream.clone_htod(&w_tie)?;
+    let w_tie_nvfp4 = nvfp4.quantize(stream, &w_tie_dev, PADDED_VOCAB, HIDDEN)?;
+    let mut x_tie = vec![bf16::ZERO; HIDDEN];
+    x_tie[0] = bf16::from_f32(1.0);
+    let x_tie_dev = stream.clone_htod(&x_tie)?;
+
+    let np = nvfp4.gemv_argmax(
+        stream,
+        &w_tie_nvfp4,
+        &x_tie_dev,
+        VOCAB,
+        &mut p_vals_b1,
+        &mut p_idxs_b1,
+        Start::Early,
+    )?;
+    s.misc.argmax_partials(
+        stream,
+        &p_vals_b1.slice(..np),
+        &p_idxs_b1.slice(..np),
+        &mut got_b1,
+        np,
+        np,
+    )?;
+    assert_eq!(stream.clone_dtoh(&got_b1)?[0], 5, "NVFP4 gemv_argmax tie/mask");
+
+    let np_r = s.rows.run_argmax(
+        stream,
+        &RowsWeight::Nvfp4(&w_tie_nvfp4),
+        &x_tie_dev,
+        VOCAB,
+        &mut partial_vals,
+        &mut partial_idxs,
+        1,
+        Start::Early,
+    )?;
+    s.misc.argmax_partials(
+        stream,
+        &partial_vals.slice(..np_r),
+        &partial_idxs.slice(..np_r),
+        &mut got_b1,
+        np_r,
+        np_r,
+    )?;
+    assert_eq!(stream.clone_dtoh(&got_b1)?[0], 5, "NVFP4 rows_argmax tie/mask");
     Ok(())
 }

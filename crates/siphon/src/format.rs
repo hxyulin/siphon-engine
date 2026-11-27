@@ -75,6 +75,41 @@ impl fmt::Display for OutputProjection {
     }
 }
 
+/// Optional override for the target model's LM head weight format (`--lm-head`).
+/// When omitted (`None`), the LM head follows [`WeightFormat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LmHeadFormat {
+    /// Keep the BF16 LM head on device.
+    Bf16,
+    /// Per-row E4M3 FP8 copy (~463 MB).
+    Fp8,
+    /// Per-16 Four Over Six NVFP4 copy (~261 MB, -44% bytes vs FP8).
+    Nvfp4,
+}
+
+impl FromStr for LmHeadFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "bf16" => Ok(Self::Bf16),
+            "fp8" => Ok(Self::Fp8),
+            "nvfp4" => Ok(Self::Nvfp4),
+            _ => bail!("unknown LM head format {s:?}; expected bf16, fp8 or nvfp4"),
+        }
+    }
+}
+
+impl fmt::Display for LmHeadFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+            Self::Nvfp4 => "nvfp4",
+        })
+    }
+}
+
 /// Element format of the KV caches. Under quantized settings (`Fp8`, `Nvfp4`, `Mixed`),
 /// sliding-window caches store E4M3 ([`KvFormat::sliding_format`]); under `Nvfp4All`, both
 /// global and sliding-window caches store NVFP4; under `Bf16` they stay BF16.

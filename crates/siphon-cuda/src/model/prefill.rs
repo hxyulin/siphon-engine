@@ -34,7 +34,7 @@ use crate::{
         experts::{self, ExpertActivations, ExpertScratch, QuantizedRows},
         linear::Start,
         linear_fp8::{self, Fp8GemmQuantized, Fp8Matrix, Fp8Rows},
-        linear_rows::{self, RowsWeight},
+        linear_rows::{self, RowsProduct, RowsWeight},
         misc::{GATE_SLOTS, GateNormQuant, GateRowsSlot, MessageMix},
         norm::{AttentionPostRows, AttentionPostRowsPacked, KvConvWeights},
         routing::{
@@ -939,6 +939,7 @@ impl Model {
             images,
         )?;
         self.position += m;
+        self.capped_valid = true;
         Ok(())
     }
 
@@ -2087,8 +2088,8 @@ impl Ctx {
         // weights the prefetch made every width slower, paced or not: at 10,674 tokens and
         // 1, 4 and 8 rows, 5.61, 7.68 and 9.89 ms with it against 5.38, 7.20 and 9.29
         // without.
-        let prefetch =
-            (p.verify.is_some() || p.batch.is_some()) && self.weights.lm_head_fp8.is_some();
+        let prefetch = (p.verify.is_some() || p.batch.is_some())
+            && self.weights.layers.first().is_some_and(|l| l.fp8.is_some());
         let plan = visit_plan(cfg, passes);
         if prefetch {
             let (layer, messages) = plan.first().context("no visits")?.0;
@@ -2345,20 +2346,17 @@ impl Ctx {
             return Ok(());
         }
 
-        // The last row's logits and greedy token, in the decode buffers. With FP8 weights
-        // the BF16 LM head is in host memory, so the head reads its FP8 copy through the
-        // verify pass's products: the token a one-row verify at that position would give.
-        let fp8 = self.weights.lm_head_fp8.as_ref();
-        self.gemm_rows(
-            &mut [RowProduct {
-                weight: self.weights.lm_head.slice(),
-                fp8,
-                mxfp8: None,
-                x: p.final_hidden.slice((m - 1) * hidden..mh),
-                out: s.logits.as_view_mut(),
-            }],
+        // The last row's logits and greedy token, in the decode buffers. With FP8/NVFP4
+        // LM head the BF16 LM head is in host memory, so the head reads its quantized copy
+        // through the verify pass's products: the token a one-row verify at that position
+        // would give.
+        let quantized_head =
+            self.weights.lm_head_nvfp4.is_some() || self.weights.lm_head_fp8.is_some();
+        self.lm_head_rows(
+            p.final_hidden.slice((m - 1) * hidden..mh),
+            s.logits.as_view_mut(),
             1,
-            fp8.is_some(),
+            quantized_head,
             None,
         )?;
         self.kernels.elementwise.logit_softcap(
@@ -2381,7 +2379,7 @@ impl Ctx {
         };
         ensure!(every > 0, "logits every 0 rows");
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
-        let step = if fp8.is_some() {
+        let step = if quantized_head {
             HEAD_ROWS.min(linear_rows::MAX_ROWS)
         } else {
             HEAD_ROWS
@@ -2400,16 +2398,11 @@ impl Ctx {
             if wanted.clone().next().is_none() {
                 continue;
             }
-            self.gemm_rows(
-                &mut [RowProduct {
-                    weight: self.weights.lm_head.slice(),
-                    fp8,
-                    mxfp8: None,
-                    x: p.final_hidden.slice(first * hidden..(first + n) * hidden),
-                    out: rows_mut(head_logits, n, padded),
-                }],
+            self.lm_head_rows(
+                p.final_hidden.slice(first * hidden..(first + n) * hidden),
+                rows_mut(head_logits, n, padded),
                 n,
-                fp8.is_some(),
+                quantized_head,
                 None,
             )?;
             self.kernels.elementwise.logit_softcap(
@@ -2438,15 +2431,51 @@ impl Ctx {
         Ok(())
     }
 
+    /// Multi-row LM head product (`out = x @ lm_head^T`) over `m` rows: dispatches to
+    /// `LinearRows` NVFP4 when `--lm-head nvfp4` is active, otherwise to `Ctx::gemm_rows`.
+    fn lm_head_rows(
+        &self,
+        x: CudaView<'_, bf16>,
+        mut out: CudaViewMut<'_, bf16>,
+        m: usize,
+        invariant: bool,
+        dense: Option<&mut Fp8Rows>,
+    ) -> anyhow::Result<()> {
+        if let Some(nvfp4) = self.weights.lm_head_nvfp4.as_ref() {
+            return self.kernels.linear_rows.run(
+                &self.stream,
+                &mut [RowsProduct::nvfp4(nvfp4, &x, &mut out)],
+                m,
+                Start::Early,
+            );
+        }
+        self.gemm_rows(
+            &mut [RowProduct {
+                weight: self.weights.lm_head.slice(),
+                fp8: self.weights.lm_head_fp8.as_ref(),
+                mxfp8: None,
+                x,
+                out,
+            }],
+            m,
+            invariant,
+            dense,
+        )
+    }
+
     /// Whether wide (`m > 32`) greedy LM heads can use the native FP8 tensor-core GEMM.
     pub(super) fn fp8_wide_head(&self) -> bool {
-        self.weights.lm_head_fp8.is_some() && crate::BLOCK_SCALED_MMA
+        self.weights.lm_head_nvfp4.is_none()
+            && self.weights.lm_head_fp8.is_some()
+            && crate::BLOCK_SCALED_MMA
     }
 
     /// Fused greedy LM head: computes each row's argmax over `0..unpadded_vocab_size`
     /// directly from `x` (`[m, hidden]`) into `out` (`[m]`) without writing `head_logits`
     /// or `head_capped`.
     ///
+    /// - NVFP4 LM head: `LinearRows::run_argmax` (`rows_nvfp4_k2304_argmax`) + PDL
+    ///   `argmax_partials`.
     /// - `m <= 32` (or BF16 weights / `sm_89`): `LinearRows::run_argmax` (0-ULP bit-exact
     ///   with `linear_rows -> logit_softcap_bf16_f32 -> argmax_f32`) + PDL `argmax_partials`.
     /// - `m > 32` with FP8 weights on `sm_120a`: native FP8 tensor-core `LinearFp8::gemm_argmax`
@@ -2460,7 +2489,18 @@ impl Ctx {
         out: &mut CudaViewMut<'_, i32>,
     ) -> anyhow::Result<()> {
         let vocab = self.config.unpadded_vocab_size;
-        let n_partials = if m > 32
+        let n_partials = if let Some(nvfp4) = self.weights.lm_head_nvfp4.as_ref() {
+            self.kernels.linear_rows.run_argmax(
+                &self.stream,
+                &RowsWeight::Nvfp4(nvfp4),
+                x,
+                vocab,
+                &mut partials.vals,
+                &mut partials.idxs,
+                m,
+                Start::Early,
+            )?
+        } else if m > 32
             && crate::BLOCK_SCALED_MMA
             && let (Some(fp8), Some(scratch)) = (self.weights.lm_head_fp8.as_ref(), head_fp8)
         {
@@ -2520,14 +2560,9 @@ impl Ctx {
         let mut out = vec![0.0f32; m * vocab];
         for first in (0..m).step_by(step) {
             let n = step.min(m - first);
-            self.gemm_rows(
-                &mut [RowProduct {
-                    weight: self.weights.lm_head.slice(),
-                    fp8: self.weights.lm_head_fp8.as_ref(),
-                    mxfp8: None,
-                    x: final_hidden.slice(first * hidden..(first + n) * hidden),
-                    out: rows_mut(&mut tmp_logits, n, padded),
-                }],
+            self.lm_head_rows(
+                final_hidden.slice(first * hidden..(first + n) * hidden),
+                rows_mut(&mut tmp_logits, n, padded),
                 n,
                 true,
                 None,
@@ -2570,14 +2605,9 @@ impl Ctx {
                 .head_capped
                 .as_mut()
                 .context("the head_capped buffer is missing")?;
-            self.gemm_rows(
-                &mut [RowProduct {
-                    weight: self.weights.lm_head.slice(),
-                    fp8: self.weights.lm_head_fp8.as_ref(),
-                    mxfp8: None,
-                    x: rows(&p.final_hidden, m, self.hidden()),
-                    out: rows_mut(head_logits, m, padded),
-                }],
+            self.lm_head_rows(
+                rows(&p.final_hidden, m, self.hidden()),
+                rows_mut(head_logits, m, padded),
                 m,
                 true,
                 None,
@@ -2621,14 +2651,9 @@ impl Ctx {
                     .head_logits
                     .as_mut()
                     .context("the head_logits buffer is missing")?;
-                self.gemm_rows(
-                    &mut [RowProduct {
-                        weight: self.weights.lm_head.slice(),
-                        fp8: self.weights.lm_head_fp8.as_ref(),
-                        mxfp8: None,
-                        x: rows(&p.final_hidden, m, self.hidden()),
-                        out: rows_mut(head_logits, m, padded),
-                    }],
+                self.lm_head_rows(
+                    rows(&p.final_hidden, m, self.hidden()),
+                    rows_mut(head_logits, m, padded),
                     m,
                     true,
                     None,
@@ -2753,14 +2778,9 @@ impl Ctx {
                 .head_capped
                 .as_mut()
                 .context("the head_capped buffer is missing")?;
-            self.gemm_rows(
-                &mut [RowProduct {
-                    weight: self.weights.lm_head.slice(),
-                    fp8: self.weights.lm_head_fp8.as_ref(),
-                    mxfp8: None,
-                    x: rows(&p.final_hidden, m, self.hidden()),
-                    out: rows_mut(head_logits, m, padded),
-                }],
+            self.lm_head_rows(
+                rows(&p.final_hidden, m, self.hidden()),
+                rows_mut(head_logits, m, padded),
                 m,
                 true,
                 Some(&mut p.gate.dense),
@@ -2791,14 +2811,9 @@ impl Ctx {
                 .head_logits
                 .as_mut()
                 .context("the head_logits buffer is missing")?;
-            self.gemm_rows(
-                &mut [RowProduct {
-                    weight: self.weights.lm_head.slice(),
-                    fp8: self.weights.lm_head_fp8.as_ref(),
-                    mxfp8: None,
-                    x: rows(&p.final_hidden, m, self.hidden()),
-                    out: rows_mut(head_logits, m, padded),
-                }],
+            self.lm_head_rows(
+                rows(&p.final_hidden, m, self.hidden()),
+                rows_mut(head_logits, m, padded),
                 m,
                 true,
                 Some(&mut p.gate.dense),
@@ -4398,9 +4413,10 @@ impl Ctx {
                 &mut p.out.slice_mut(k * hidden..(k + 1) * hidden),
             )?;
         }
-        let fp8 = self.weights.lm_head_fp8.as_ref();
+        let quantized_head =
+            self.weights.lm_head_nvfp4.is_some() || self.weights.lm_head_fp8.is_some();
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
-        let step = if fp8.is_some() {
+        let step = if quantized_head {
             HEAD_ROWS.min(linear_rows::MAX_ROWS)
         } else {
             HEAD_ROWS
@@ -4428,16 +4444,11 @@ impl Ctx {
                     .head_logits
                     .as_mut()
                     .context("the head_logits buffer is missing")?;
-                self.gemm_rows(
-                    &mut [RowProduct {
-                        weight: self.weights.lm_head.slice(),
-                        fp8,
-                        mxfp8: None,
-                        x: p.out.slice(first * hidden..(first + n) * hidden),
-                        out: rows_mut(head_logits, n, padded),
-                    }],
+                self.lm_head_rows(
+                    p.out.slice(first * hidden..(first + n) * hidden),
+                    rows_mut(head_logits, n, padded),
                     n,
-                    fp8.is_some(),
+                    quantized_head,
                     None,
                 )?;
                 for (j, &si) in finishing[first..first + n].iter().enumerate() {
@@ -5238,7 +5249,8 @@ impl Ctx {
         // 1. Batched LM head, sampling/fused greedy argmax, and (for verify) acceptance +
         //    rollback over rows `0..batch_rows`.
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
-        let fp8 = self.weights.lm_head_fp8.as_ref();
+        let quantized_head =
+            self.weights.lm_head_nvfp4.is_some() || self.weights.lm_head_fp8.is_some();
         {
             let b = batch_p
                 .batch
@@ -5254,14 +5266,9 @@ impl Ctx {
                     .head_capped
                     .as_mut()
                     .context("the head_capped buffer is missing")?;
-                self.gemm_rows(
-                    &mut [RowProduct {
-                        weight: self.weights.lm_head.slice(),
-                        fp8,
-                        mxfp8: None,
-                        x: p.final_hidden.slice(..batch_rows * hidden),
-                        out: rows_mut(head_logits, batch_rows, padded),
-                    }],
+                self.lm_head_rows(
+                    p.final_hidden.slice(..batch_rows * hidden),
+                    rows_mut(head_logits, batch_rows, padded),
                     batch_rows,
                     true,
                     Some(&mut batch_p.gate.dense),
@@ -5292,14 +5299,9 @@ impl Ctx {
                     .head_logits
                     .as_mut()
                     .context("the head_logits buffer is missing")?;
-                self.gemm_rows(
-                    &mut [RowProduct {
-                        weight: self.weights.lm_head.slice(),
-                        fp8,
-                        mxfp8: None,
-                        x: p.final_hidden.slice(..batch_rows * hidden),
-                        out: rows_mut(head_logits, batch_rows, padded),
-                    }],
+                self.lm_head_rows(
+                    p.final_hidden.slice(..batch_rows * hidden),
+                    rows_mut(head_logits, batch_rows, padded),
                     batch_rows,
                     true,
                     Some(&mut batch_p.gate.dense),
@@ -5409,7 +5411,7 @@ impl Ctx {
                 &mut p.out.slice_mut(k * hidden..(k + 1) * hidden),
             )?;
         }
-        let step = if fp8.is_some() {
+        let step = if quantized_head {
             HEAD_ROWS.min(linear_rows::MAX_ROWS)
         } else {
             HEAD_ROWS
@@ -5437,16 +5439,11 @@ impl Ctx {
                     .head_logits
                     .as_mut()
                     .context("the head_logits buffer is missing")?;
-                self.gemm_rows(
-                    &mut [RowProduct {
-                        weight: self.weights.lm_head.slice(),
-                        fp8,
-                        mxfp8: None,
-                        x: p.out.slice(first * hidden..(first + n) * hidden),
-                        out: rows_mut(head_logits, n, padded),
-                    }],
+                self.lm_head_rows(
+                    p.out.slice(first * hidden..(first + n) * hidden),
+                    rows_mut(head_logits, n, padded),
                     n,
-                    fp8.is_some(),
+                    quantized_head,
                     None,
                 )?;
                 for (j, &si) in finishing[first..first + n].iter().enumerate() {

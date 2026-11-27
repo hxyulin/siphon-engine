@@ -8,6 +8,7 @@ pub mod experts;
 pub mod experts_rows;
 pub mod linear;
 pub mod linear_fp8;
+pub mod linear_nvfp4;
 pub mod linear_rows;
 pub mod misc;
 pub mod norm;

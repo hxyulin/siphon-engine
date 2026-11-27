@@ -56,7 +56,7 @@ mod linux {
             PrefillAttention, PrefillLogits, VerifyTokens,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
-        weights::{OutputProjection, WeightFormat, Weights},
+        weights::{LmHeadFormat, OutputProjection, WeightFormat, Weights},
     };
 
     // Thresholds, from MLX's disagreement with itself between its chunked (multi-row)
@@ -83,6 +83,7 @@ mod linux {
         passes: Option<usize>,
         kv: KvFormat,
         weights: WeightFormat,
+        lm_head: Option<LmHeadFormat>,
         output: OutputProjection,
         dump: Option<PathBuf>,
         /// Chunk size for `Model::prefill`, or `None` to step token by token.
@@ -103,6 +104,7 @@ mod linux {
         let mut passes = None;
         let mut kv = KvFormat::Bf16;
         let mut weights = WeightFormat::Bf16;
+        let mut lm_head = None;
         let mut output = OutputProjection::default();
         let mut dump = None;
         let mut prefill = None;
@@ -124,6 +126,12 @@ mod linux {
                 kv = it.next().context("--kv needs bf16 or fp8")?.parse()?;
             } else if arg == "--weights" {
                 weights = it.next().context("--weights needs bf16 or fp8")?.parse()?;
+            } else if arg == "--lm-head" {
+                lm_head = Some(
+                    it.next()
+                        .context("--lm-head needs bf16, fp8 or nvfp4")?
+                        .parse()?,
+                );
             } else if arg == "--dump" {
                 dump = Some(PathBuf::from(it.next().context("--dump needs a file")?));
             } else if arg == "--output-projection" {
@@ -205,6 +213,7 @@ mod linux {
             passes,
             kv,
             weights,
+            lm_head,
             output,
             dump,
             prefill,
@@ -437,6 +446,7 @@ mod linux {
         let checkpoint = Checkpoint::open(&args.model)?;
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = args.output;
+        weights.lm_head_format = args.lm_head;
         gpu.stream().synchronize()?;
         eprintln!("loaded weights in {:.1} s", start.elapsed().as_secs_f64());
         let capacity = n + capture.continuation.len();

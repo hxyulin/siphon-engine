@@ -11,14 +11,14 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use super::{Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, STEPS};
+use super::{Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, QuantizedFc, QuantizedWeight, STEPS};
 use crate::{
     DeviceIn,
     gpu::{PinnedBuf, sync_event},
     model::Sampling,
     ops::{
         draft::{
-            BLOCK, BatchAttentionScratch, CONTROL, DFLASH2_MAX_SPLITS, Fp8Rows, KV_WIDTH, KvCache,
+            BLOCK, BatchAttentionScratch, CONTROL, DFLASH2_MAX_SPLITS, KV_WIDTH, KvCache,
             MAX_BATCH_SEQS, RACE_WORDS, TOP_K, TopkScratch, race_words,
         },
         linear::Start,
@@ -284,17 +284,17 @@ impl Drop for BatchDflash2 {
     }
 }
 
-/// One product entry for [`run_rows_products`]: optional BF16 weight, optional FP8 raw
-/// weight, and output slice.
+/// One product entry for [`run_rows_products`]: optional BF16 weight, optional quantized
+/// (FP8 or NVFP4) weight, and output slice.
 type BatchProduct<'a> = (
     Option<&'a CudaSlice<bf16>>,
-    Option<&'a Fp8Rows>,
+    Option<QuantizedWeight<'a>>,
     CudaViewMut<'a, bf16>,
 );
 
-/// Runs one or more `out = x @ W^T` products through `LinearFp8::gemm_raw` (when
-/// `fp8_dense` is set, `m >= 32`, and every product supplies an FP8 weight with `k % 128 == 0`)
-/// or `LinearRows` otherwise.
+/// Runs one or more `out = x @ W^T` products through `LinearRows` (NVFP4 / FP8 / BF16) or
+/// `LinearFp8::gemm_raw` (when `fp8_dense` is set, `m >= 48`, and every product supplies an
+/// FP8 weight with `k % 128 == 0`).
 #[expect(clippy::too_many_arguments, reason = "kernel handles, scratch, and product slice")]
 fn run_rows_products(
     linear_rows: &LinearRows,
@@ -306,21 +306,40 @@ fn run_rows_products(
     m: usize,
     products: &mut [BatchProduct<'_>],
 ) -> anyhow::Result<()> {
-    let use_fp8 = products.iter().all(|p| p.1.is_some());
+    let use_nvfp4 = products
+        .iter()
+        .all(|p| matches!(p.1, Some(QuantizedWeight::Nvfp4(_))));
+    let use_fp8 = !use_nvfp4
+        && products
+            .iter()
+            .all(|p| matches!(p.1, Some(QuantizedWeight::Fp8(_))));
     let use_fp8_tc = use_fp8
         && fp8_dense
         && crate::BLOCK_SCALED_MMA
         && m >= BATCH_FP8_DENSE_MIN_ROWS
-        && products
-            .first()
-            .and_then(|p| p.1)
-            .is_some_and(|w| w.k.is_multiple_of(128));
+        && matches!(
+            products.first().and_then(|p| p.1),
+            Some(QuantizedWeight::Fp8(w)) if w.k.is_multiple_of(128)
+        );
     for chunk in products.chunks_mut(ROWS_MAX_PRODUCTS) {
-        if use_fp8_tc {
+        if use_nvfp4 {
+            let mut batch: Vec<RowsProduct<'_>> = chunk
+                .iter_mut()
+                .map(|(_, quant, out)| {
+                    let Some(QuantizedWeight::Nvfp4(w)) = *quant else {
+                        anyhow::bail!("NVFP4 weight missing");
+                    };
+                    Ok(RowsProduct::nvfp4(w, x, out))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            linear_rows.run(stream, &mut batch, m, Start::Early)?;
+        } else if use_fp8_tc {
             let mut batch: Vec<Fp8RawGemm<'_>> = chunk
                 .iter_mut()
-                .map(|(_, fp8, out)| {
-                    let w = fp8.context("FP8 weight missing")?;
+                .map(|(_, quant, out)| {
+                    let Some(QuantizedWeight::Fp8(w)) = *quant else {
+                        anyhow::bail!("FP8 weight missing");
+                    };
                     Ok(Fp8RawGemm {
                         values: w.values.slice(..),
                         scales: w.scales.slice(..),
@@ -335,8 +354,10 @@ fn run_rows_products(
         } else if use_fp8 {
             let mut batch: Vec<RowsProduct<'_>> = chunk
                 .iter_mut()
-                .map(|(_, fp8, out)| {
-                    let w = fp8.context("FP8 weight missing")?;
+                .map(|(_, quant, out)| {
+                    let Some(QuantizedWeight::Fp8(w)) = *quant else {
+                        anyhow::bail!("FP8 weight missing");
+                    };
                     Ok(RowsProduct::fp8_raw(
                         w.values.slice(..),
                         w.scales.slice(..),
@@ -936,7 +957,7 @@ impl Draft {
     ) -> anyhow::Result<()> {
         let Arch::Dflash2 {
             weights,
-            fc_fp8,
+            fc_quant,
             mask_embed,
         } = &self.arch
         else {
@@ -977,7 +998,7 @@ impl Draft {
                 cm,
                 &mut [(
                     Some(&weights.fc),
-                    fc_fp8.as_ref(),
+                    fc_quant.as_ref().map(QuantizedFc::as_weight),
                     b.ctx_raw.slice_mut(..cm * HIDDEN),
                 )],
             )?;
@@ -1004,9 +1025,9 @@ impl Draft {
                 .enumerate()
             {
                 let lw = &weights.layers[l];
-                let fp8 = self.backbone.as_ref().map(|bb| &bb[l]);
-                prods.push((Some(&lw.k), fp8.map(|f| &f.k), ck));
-                prods.push((Some(&lw.v), fp8.map(|f| &f.v), cv));
+                let q = self.backbone.as_ref().map(|bb| bb.layer(l));
+                prods.push((Some(&lw.k), q.map(|f| f.k), ck));
+                prods.push((Some(&lw.v), q.map(|f| f.v), cv));
             }
             run_rows_products(lr, lfp8, &mut b.dense, fp8_dense, stream, &normed, cm, &mut prods)?;
             let k_norms: Vec<&CudaSlice<bf16>> =
@@ -1069,7 +1090,7 @@ impl Draft {
                     EPS,
                 )?;
             }
-            let f = self.backbone.as_ref().map(|bb| &bb[layer]);
+            let f = self.backbone.as_ref().map(|bb| bb.layer(layer));
             // Attention input conv.
             {
                 let h_view = b.h.slice(..bm * HIDDEN);
@@ -1109,9 +1130,9 @@ impl Draft {
                     &conv_in,
                     bm,
                     &mut [
-                        (lw.q.as_ref(), f.map(|f| &f.q), q_out),
-                        (Some(&lw.k), f.map(|f| &f.k), k_out),
-                        (Some(&lw.v), f.map(|f| &f.v), v_out),
+                        (lw.q.as_ref(), f.map(|f| f.q), q_out),
+                        (Some(&lw.k), f.map(|f| f.k), k_out),
+                        (Some(&lw.v), f.map(|f| f.v), v_out),
                     ],
                 )?;
             }
@@ -1163,7 +1184,7 @@ impl Draft {
                     stream,
                     &attn_in,
                     bm,
-                    &mut [(lw.o.as_ref(), f.map(|f| &f.o), o_out)],
+                    &mut [(lw.o.as_ref(), f.map(|f| f.o), o_out)],
                 )?;
             }
             // Attention output conv + residual + post_attention_norm.
@@ -1216,8 +1237,8 @@ impl Draft {
                     &conv_in,
                     bm,
                     &mut [
-                        (lw.gate.as_ref(), f.map(|f| &f.gate), gate_out),
-                        (lw.up.as_ref(), f.map(|f| &f.up), up_out),
+                        (lw.gate.as_ref(), f.map(|f| f.gate), gate_out),
+                        (lw.up.as_ref(), f.map(|f| f.up), up_out),
                     ],
                 )?;
             }
@@ -1238,7 +1259,7 @@ impl Draft {
                     stream,
                     &act_in,
                     bm,
-                    &mut [(lw.down.as_ref(), f.map(|f| &f.down), mlp_out)],
+                    &mut [(lw.down.as_ref(), f.map(|f| f.down), mlp_out)],
                 )?;
             }
             pending = Some(&lw.mlp_conv);
@@ -1326,6 +1347,14 @@ impl Draft {
                             Start::Early,
                         )?;
                     }
+                }
+                Some(Matrix::Nvfp4(w)) => {
+                    lr.run(
+                        stream,
+                        &mut [RowsProduct::nvfp4(w, &y_in, &mut base_out)],
+                        sm,
+                        Start::Early,
+                    )?;
                 }
             }
         }
