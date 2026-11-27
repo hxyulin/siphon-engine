@@ -151,39 +151,40 @@ With `--streams 8`, eight agent-like conversations at once, each growing from 15
 
 ### Context length
 
-The server plans its GPU memory from the config and the checkpoint headers before it loads anything. Without `--context` it takes the longest context that fits the free memory less a 0.25 GiB margin (`--margin`), up to the model's 1,048,576 positions. With 30.45 GiB free after the CUDA context, the longest contexts are:
+The server plans its GPU memory from the config and the checkpoint headers before it loads anything. Without `--context` it takes the longest context that fits the free memory less a 0.25 GiB margin (`--margin`), up to `--streams` times the model's 1,048,576 per-request limit (each individual request stays capped at 1,048,576). With 30.45 GiB free after the CUDA context on a 32 GB card, the longest single-stream contexts are:
 
 | Dense weights, KV cache | DSpark draft | DFlash 2 |
 | --- | ---: | ---: |
 | FP8, FP8 | 657,408 | 729,088 |
 | BF16, BF16 | 349,184 | 365,568 |
 
-`--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts to 679,936 and 754,688 for 6 to 7% of prefill speed.
+On a 96 GB RTX PRO 6000 Blackwell (`94.2 GiB` budget) with `--streams 32`, the shared KV pool scales to **4,665,344** positions with FP8 KV (`4,575,232` with prefix cache) and **8,292,352** positions with `--kv nvfp4` (`8,132,608` with prefix cache) while capping each individual request at `1,048,576`.
+
+`--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts on a 32 GB card to 679,936 and 754,688 for 6 to 7% of prefill speed.
 
 `siphon-plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
 
 ### RTX PRO 6000 Blackwell
 
-Main at 93ad984 on an RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver 595.84), with the Fast NVFP4 checkpoint and FP8 weights and cache. Plain decode, 100 steps:
+Measured on an RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver 595.84, empirical `1,645 GB/s` streaming read bandwidth), with the Fast NVFP4 checkpoint (`--weights fp8 --kv fp8`, 3 passes):
 
-| Context | Step | tok/s |
-| ---: | ---: | ---: |
-| 0 | 2.851 ms | 350.7 |
-| 4,096 | 3.004 ms | 332.9 |
-| 32,768 | 3.328 ms | 300.4 |
-
-The RTX 5090 took 2.810, 2.945 and 3.303 ms at the same commit. Prefill in chunks of 2,048 ran 22,759 tok/s at 2,048 tokens, 23,082 at 4,096 and 22,125 at 8,192. `--expert-activations quantized --prefill-dense fp8` raises that to 35,176, 35,027 and 33,862 tok/s, but fails the quality gate on some texts ([Features](#features)).
-
-DFlash 2 after the `anyhow` source at 10,674 tokens, 256 tokens: greedy speculation ran 851 tok/s, 2.64 times plain decode's 322, at 6.50 tokens per round. At temperature 0.6, three seeds ran 668 to 787 tok/s.
-
-Batched steps, tok/s in all with tok/s per stream in brackets:
+- **Plain decode** (`B=1`, `bench`, 100 steps): default BF16 `W_o` / FP8 head runs `2.851 ms` (`350.7 tok/s`) at ctx 0, `3.004 ms` (`332.9 tok/s`) at 4K, and `3.328 ms` (`300.4 tok/s`) at 32K (`93ad984`). With the fast profile (`--output-projection mxfp8 --lm-head nvfp4`), `B=1` decode reaches `352.1 tok/s` at 10.7K and `326.2 tok/s` at 32K (and on RTX 5090, `384.1 / 368.2 / 347.5 tok/s` at 0 / 4K / 16K).
+- **Prefill** (`--prefill-dense fp8 --expert-activations quantized --prefill-attention fp8`, adaptive `2560`-row chunking at >=16K): `36,053 tok/s` (`113.6 ms`) at 4K, `33,975 tok/s` (`482.2 ms`) at 16K, and `31,929 tok/s` (`1,026 ms`) at 32K (RTX 5090: `34,316 tok/s` at 4K, `32,669 tok/s` at 16K).
+- **Single-stream DFlash 2 speculation** (`anyhow` 10.7K / 32K, 256 tokens, fast profile + `--draft-weights nvfp4`):
+  - Greedy `--spec auto`: **`883.4 tok/s`** (`2.51x`) at 10.7K, **`797.5 tok/s`** (`2.44x`) at 32K (RTX 5090: **`884.6` / `816.6 tok/s`**).
+  - Sampled lossless (`--spec-beta 1.0`, 6-seed medians): `T=0.6, p=0.95` **`829.4`** / `732.5 tok/s`; `T=0.8, p=0.95` **`705.6`** / `743.6 tok/s`; `T=1.0, p=0.95, m=0.05` linear `585.9` / `591.0` → entropy-gated 2-branch tree (`--spec-tree`) **`647.7`** (`+10.5%`) / **`639.8 tok/s`** (`+8.3%`). On RTX 5090 (4-seed medians): `T=0.8` lossless tree **`714.5` / `602.3 tok/s`** (`--spec-beta 0.80`: **`805.1` / `717.5 tok/s`**), `T=1.0, m=0.05` lossless tree **`616.4` / `532.6 tok/s`**.
+- **Live `siphon-serve` batched DFlash 2 speculation** (`--streams 32 --no-prefix-cache`, 1.77K prompt → 200 tokens, `T=0.8, p=0.95`):
+  - Default FP8 + `--spec-beta 1.0`: `C=1` `375.2`, `C=8` `773.0`, `C=16` `900.6`, `C=32` `961.5 tok/s` (`p50 TTFT 2.13 s`).
+  - Fast profile + `--spec-beta 1.0` (lossless): `C=1` `389.9`, `C=8` `884.4`, `C=16` `1,133.6`, `C=32` **`1,232.3 tok/s`** (`p50 TTFT 1.35 s`).
+  - Fast profile + `--spec-beta 0.80`: `C=1` `437.0` (`p50 user 508.7 tok/s`), `C=8` `943.9`, `C=16` `1,168.7`, `C=32` **`1,314.4 tok/s`** (`p50 TTFT 1.31 s`).
+- **Batched plain steps** (`bench`, `tok/s` aggregate with per-stream in brackets):
 
 | Context of each stream | 1 stream | 16 streams | 32 streams | 64 streams |
 | ---: | ---: | ---: | ---: | ---: |
 | 0 | 306 | 1,449 (91) | 2,176 (68) | **3,462** (54) |
 | 4,096 | 285 | 1,230 (77) | 1,787 (56) | **2,622** (41) |
 
-With 95.1 GiB free, the planner gives one to four streams the model's full 1,048,576 positions with the FP8 cache. With `--host-cache`, a 330K-token conversation that left the GPU came back in 0.81 s instead of 38.9 s of prefill ([server.md](docs/server.md#prefix-cache)). [batching.md](docs/batching.md#against-vllm-and-sglang-on-an-rtx-pro-6000-workstation-edition) compares batched decode on this card with vLLM and SGLang.
+At `B=32, ctx=16,384` (fast profile), `--kv nvfp4` raises batched decode from `1,478` (`--kv fp8`) to **`1,632 tok/s`** (`+10.4%`), and `--kv nvfp4-all` reaches **`1,663 tok/s`** (`+12.5%`). With 94.2 GiB available, the shared KV pool holds **`4.67M`** FP8 or **`8.29M`** NVFP4 positions across `--streams 32` (tested live serving 8 concurrent 162K-token requests / `1.30M` simultaneous prompt tokens without swapping). With `--host-cache`, a 330K-token conversation that left the GPU came back in 0.81 s instead of 38.9 s of prefill ([server.md](docs/server.md#prefix-cache)). [batching.md](docs/batching.md#against-vllm-and-sglang-on-an-rtx-pro-6000-workstation-edition) compares batched decode on this card with vLLM and SGLang.
 
 ### RTX 4090
 
@@ -203,13 +204,13 @@ Context is the limit on this card: the weights take 16.8 GiB of its 23.13 GiB fr
 
 - **Server.** OpenAI chat completions and completions, with streaming, reasoning (`reasoning_content`), tool calls, `tool_choice`, stop strings, `reasoning_effort`, sampling and several choices per request (`n`) from one prefill. vLLM and TabbyAPI tokenizer routes, and vLLM's `return_token_ids`, `ignore_eos` and `continue_final_message`.
 - **Images.** `--vision` loads the vision tower and takes base64 PNG, JPEG, WebP and GIF images in OpenAI `image_url` parts and Anthropic `image` blocks. The prefix cache keys prompts by their images too ([docs/server.md](docs/server.md#images)).
-- **Scheduling.** Continuous batching of up to 32 requests. Speculation for a request that runs alone, and a prefix cache with an entry per stream, for batched and lone requests.
+- **Scheduling.** Continuous batching of up to 64 requests (`--streams 1..64`), with batched DFlash 2 speculation up to 32 concurrent sequences per verify pass, a shared VMM KV page pool scaling up to `streams × 1,048,576` aggregate positions, and a prefix cache with an entry per stream.
 - **Sampling.** Temperature, top-k, top-p and min-p on the GPU, applied in vLLM's order, with the checkpoint's `generation_config.json` for the fields a request leaves out (temperature 1). Each draw depends only on the logits, the request's seed and the token's position. `temperature: 0` or `--greedy` decodes greedily.
-- **Speculation.** The bundled DSpark draft by default, or Inco AI's DFlash 2 drafter or a 2DSD DFlash export with `--drafter DIR`. `--fallback` runs plain steps where the draft cannot predict the text. It speeds up free prose, but the output can then differ between runs.
-- **Formats.** FP8 dense weights (`--weights fp8`) and an FP8 global KV cache (`--kv fp8`) by default, BF16 for both on request. An NVFP4 global KV cache (`--kv nvfp4`) takes 9 KiB per position instead of 16, and `--kv mixed` 10.75 KiB at about FP8's quality ([engine.md](docs/engine.md#kv-cache-reduction)). Prefill can opt in to quantized expert activations and FP8 dense products, which are faster and fail the quality gate on some texts.
+- **Speculation.** The bundled DSpark draft by default, or Inco AI's DFlash 2 drafter or a 2DSD DFlash export with `--drafter DIR`. Supports coupled Gumbel-Max sampling (default), maximal-coupling / beta-relaxed rejection sampling (`--spec-beta 1.0` lossless or `<1.0` relaxed), entropy-gated without-replacement 2-branch speculative trees (`--spec-tree`), and `--fallback` for plain-step fallback on unpredictable prose.
+- **Formats.** FP8 dense weights (`--weights fp8`) and an FP8 global KV cache (`--kv fp8`) by default, BF16 for both on request. Optional MXFP8 output projections (`--output-projection mxfp8`), NVFP4 LM head (`--lm-head nvfp4`), and NVFP4 draft weights (`--draft-weights nvfp4`). Global KV cache formats include `--kv nvfp4` (9 KiB/pos), `--kv nvfp4-all` (global + sliding in NVFP4), and `--kv mixed` (10.75 KiB/pos). Prefill can opt in to `--expert-activations quantized` and `--prefill-dense fp8`.
 - **Memory planning.** The server checks the planned GPU memory against what it uses after warmup and after each job.
 
-Not yet: the presence, frequency and repetition penalties (accepted and ignored), speculation for more than one request at a time, prefix cache entries shared by prompts that agree only in their first tokens, and image URLs that the server fetches itself.
+Not yet: the presence, frequency and repetition penalties (accepted and ignored), prefix cache entries shared by prompts that agree only in their first tokens, and image URLs that the server fetches itself.
 
 ## Build from source
 
