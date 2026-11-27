@@ -106,7 +106,7 @@ On SIGTERM or Ctrl-C the server drains: it answers new requests with 503 and Ret
 /health turns 503, and it finishes the running and queued requests. After --drain-timeout
 seconds it ends what is left with an error. Then it saves --cache-dir and exits.
 --prefill-attention picks prefill's global attention products over an FP8 or NVFP4 cache. auto (the
-default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
+default) runs BF16 up to 2,048 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, fp8 runs FP8 throughout, and
 fp4 runs native Blackwell NVFP4 Q K^T + FP8 P V over NVFP4 caches (and FP8 over FP8 caches).
 --prefill-dense picks dense products in prefill and wide batched passes (>= 48 rows, including

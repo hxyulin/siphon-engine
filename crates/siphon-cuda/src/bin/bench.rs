@@ -105,6 +105,7 @@ mod linux {
         model::{
             Accept, BATCH_ROWS, DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK,
             MAX_PREFILL_CHUNK, Model, MoePruning, PrefillAttention, PrefillLogits, VerifyTokens,
+            recommended_prefill_chunk,
         },
         ops::{Products, attention::KvFormat, experts::ExpertActivations, spec::VERIFY_ROWS},
         spec::{DraftSource, Speculator, Width, load_draft},
@@ -149,7 +150,8 @@ mod linux {
         json: bool,
         /// Prompt lengths to time prefill at, instead of timing decode.
         prefill: Option<Vec<usize>>,
-        chunk: usize,
+        /// Explicit `--chunk` override, or `None` to use `recommended_prefill_chunk`.
+        chunk: Option<usize>,
         /// The capture whose tokens `--spec` and `--verify-widths` use.
         prompt: Option<PathBuf>,
         /// Drafts per round for speculative decoding, or 0 for an adaptive width.
@@ -218,7 +220,7 @@ mod linux {
         let mut prefill_dense = Products::Bf16;
         let mut json = false;
         let mut prefill = None;
-        let mut chunk = DEFAULT_PREFILL_CHUNK;
+        let mut chunk = None;
         let mut prompt = None;
         let mut spec = None;
         let mut widths = (1..=8).collect();
@@ -256,7 +258,7 @@ mod linux {
             match arg.as_str() {
                 "--contexts" => contexts = Some(token_counts(&arg, &value()?)?),
                 "--prefill" => prefill = Some(token_counts(&arg, &value()?)?),
-                "--chunk" => chunk = value()?.parse()?,
+                "--chunk" => chunk = Some(value()?.parse()?),
                 "--passes" => passes = Some(value()?.parse()?),
                 "--steps" => steps = value()?.parse()?,
                 "--warmup" => warmup = value()?.parse()?,
@@ -344,7 +346,7 @@ mod linux {
             "--top-p and --min-p need --temperature"
         );
         ensure!(
-            (1..=MAX_PREFILL_CHUNK).contains(&chunk),
+            chunk.is_none_or(|c| (1..=MAX_PREFILL_CHUNK).contains(&c)),
             "--chunk takes 1 to {MAX_PREFILL_CHUNK} rows"
         );
         ensure!(
@@ -553,27 +555,37 @@ mod linux {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "runs prefill benchmark and formats output")]
     fn bench_prefill(args: &Args, lengths: &[usize]) -> anyhow::Result<()> {
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let vocab = u32::try_from(config.unpadded_vocab_size)?;
         let gpu = Gpu::new(0)?;
         let before = gpu_state()?;
-        let longest = lengths.iter().copied().max().unwrap_or(0).max(args.chunk);
+        let chunk_for =
+            |tokens: usize| args.chunk.unwrap_or_else(|| recommended_prefill_chunk(tokens));
+        let max_chunk = lengths
+            .iter()
+            .copied()
+            .map(chunk_for)
+            .max()
+            .unwrap_or(DEFAULT_PREFILL_CHUNK);
+        let longest = lengths.iter().copied().max().unwrap_or(0).max(max_chunk);
         let mut model = prefill_model(args, &gpu, config, passes, longest)?;
         // Arbitrary ids spread over the vocabulary.
         let prompt: Vec<u32> = (0..longest as u32)
             .map(|i| (i.wrapping_mul(7919) + 13) % vocab)
             .collect();
 
-        // One chunk first, which allocates the prefill buffers.
-        model.prefill(&prompt[..args.chunk], args.chunk, PrefillLogits::Last)?;
+        // One chunk first, which allocates the prefill buffers at the largest chunk size.
+        model.prefill(&prompt[..max_chunk], max_chunk, PrefillLogits::Last)?;
         let mut rows = Vec::new();
         for &tokens in lengths {
+            let chunk = chunk_for(tokens);
             model.reset()?;
             gpu.stream().synchronize()?;
             let start = Instant::now();
-            model.prefill(&prompt[..tokens], args.chunk, PrefillLogits::Last)?;
+            model.prefill(&prompt[..tokens], chunk, PrefillLogits::Last)?;
             let seconds = start.elapsed().as_secs_f64();
             let after = gpu_state()?;
             rows.push(PrefillRow {
@@ -583,7 +595,7 @@ mod linux {
                 mem_mhz: after.mem_mhz,
             });
             if !args.json {
-                eprintln!("prefill {tokens} done");
+                eprintln!("prefill {tokens} done (chunk {chunk})");
             }
         }
 
@@ -593,9 +605,10 @@ mod linux {
                 .iter()
                 .map(|r| {
                     format!(
-                        "{{\"tokens\":{},\"ttft_ms\":{:.2},\"tok_per_s\":{:.1},\"sm_mhz\":{},\
+                        "{{\"tokens\":{},\"chunk\":{},\"ttft_ms\":{:.2},\"tok_per_s\":{:.1},\"sm_mhz\":{},\
                          \"mem_mhz\":{}}}",
                         r.tokens,
+                        chunk_for(r.tokens),
                         r.seconds * 1e3,
                         r.tokens as f64 / r.seconds,
                         quote(&r.sm_mhz),
@@ -616,7 +629,7 @@ mod linux {
                 quote(&args.expert_activations.to_string()),
                 quote(&args.prefill_attention.to_string()),
                 quote(&args.prefill_dense.to_string()),
-                args.chunk,
+                max_chunk,
                 args.moe_pruning.top_k,
                 args.moe_pruning.min_k,
                 args.moe_pruning.threshold,
@@ -642,7 +655,7 @@ mod linux {
                  | prompt tokens | time to first token ms | prefill tok/s | SM MHz | mem MHz |\n\
                  |---:|---:|---:|---:|---:|",
                 args.kv,
-                args.chunk,
+                max_chunk,
                 pruning_suffix(args.moe_pruning),
             );
             for r in &rows {

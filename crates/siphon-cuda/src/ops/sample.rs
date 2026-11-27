@@ -127,6 +127,8 @@ pub struct SampleBuffers {
     counters: CudaSlice<u32>,
     /// Per-row beta-rejection acceptance flag (`1` accepted, `0` rejected/bonus, `-1` greedy).
     accept_flag: CudaSlice<i32>,
+    /// Per-sequence first non-accepted local row (`0..width-1`) for `sample_race_beta_bf16`.
+    first_reject: CudaSlice<i32>,
     /// Shifted log residual weights `[rows, BETA_CAND_K]` for beta-rejection.
     r_log: CudaSlice<f32>,
     /// Fallback plain-distribution partials `[rows * RACE_BLOCKS]` for beta-rejection.
@@ -152,6 +154,7 @@ impl SampleBuffers {
             idxs: stream.alloc_zeros(rows * RACE_BLOCKS)?,
             counters: stream.alloc_zeros(rows)?,
             accept_flag: stream.alloc_zeros(rows)?,
+            first_reject: stream.alloc_zeros(rows)?,
             r_log: stream.alloc_zeros(rows * BETA_CAND_K)?,
             fb_scores: stream.alloc_zeros(rows * RACE_BLOCKS)?,
             fb_idxs: stream.alloc_zeros(rows * RACE_BLOCKS)?,
@@ -203,6 +206,7 @@ pub struct Sample {
     race: CudaFunction,
     race_bf16: CudaFunction,
     prepare_beta_bf16: CudaFunction,
+    first_reject_beta: CudaFunction,
     race_beta_bf16: CudaFunction,
     noise: CudaFunction,
 }
@@ -216,6 +220,7 @@ impl Sample {
             race: module.load_function("sample_race")?,
             race_bf16: module.load_function("sample_race_bf16")?,
             prepare_beta_bf16: module.load_function("sample_prepare_beta_bf16")?,
+            first_reject_beta: module.load_function("sample_first_reject_beta")?,
             race_beta_bf16: module.load_function("sample_race_beta_bf16")?,
             noise: module.load_function("sample_noise")?,
         })
@@ -408,9 +413,14 @@ impl Sample {
     /// Beta-relaxed / maximal-coupling rejection sampling over BF16 `logits`
     /// (`[seqs * width, stride]`, inline `softcap`) using 16-sparse draft distributions
     /// `(cand, q_probs)` laid out with stride `cand_steps_stride` steps per sequence.
-    /// Writes per-row acceptance flags into `buffers.accept_flags(rows)` and residual/bonus
-    /// (or greedy argmax) draws into `out` (`[rows]`).
-    #[expect(clippy::too_many_arguments, reason = "logits, draft dist, beta and buffers")]
+    /// Writes per-row acceptance flags into `buffers.accept_flags(rows)` and the first
+    /// non-accepted (or forced `keep`) row's residual/bonus draw (plus accepted/greedy rows)
+    /// into `out` (`[rows]`).
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "validates buffers and launches prepare + first_reject + race kernels"
+    )]
     pub fn run_beta_bf16(
         &self,
         stream: &CudaStream,
@@ -419,6 +429,7 @@ impl Sample {
         stride: usize,
         softcap: f32,
         tokens: &impl DeviceIn<i32>,
+        keep: &impl DeviceIn<u32>,
         width: usize,
         cand: &impl DeviceIn<i32>,
         q_probs: &impl DeviceIn<f32>,
@@ -427,9 +438,10 @@ impl Sample {
         buffers: &mut SampleBuffers,
         out: &mut impl DeviceOut<i32>,
     ) -> anyhow::Result<()> {
-        let (logits, tokens, cand, q_probs, mut out) = (
+        let (logits, tokens, keep, cand, q_probs, mut out) = (
             logits.view(),
             tokens.view(),
+            keep.view(),
             cand.view(),
             q_probs.view(),
             out.view_mut(),
@@ -459,6 +471,11 @@ impl Sample {
         );
         let seqs = rows / width;
         ensure!(
+            keep.len() >= seqs,
+            "keep has {} elements, need at least {seqs}",
+            keep.len()
+        );
+        ensure!(
             cand_steps_stride + 1 >= width,
             "cand_steps_stride {cand_steps_stride} too small for width {width}"
         );
@@ -478,6 +495,7 @@ impl Sample {
         );
         let n_arg = i32::try_from(n)?;
         let stride_arg = i32::try_from(stride)?;
+        let seqs_arg = i32::try_from(seqs)?;
         let width_arg = i32::try_from(width)?;
         let cand_stride_arg = i32::try_from(cand_steps_stride)?;
         let grid_rows = u32::try_from(rows)?;
@@ -507,6 +525,24 @@ impl Sample {
         // and `seqs * cand_steps_stride * 16`, and the kernel waits at `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.prepare_beta_bf16, config) }?;
 
+        let first_reject_config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&tokens, stream)
+            .ptr(&out, stream)
+            .ptr(&buffers.accept_flag, stream)
+            .ptr(&keep, stream)
+            .i32(seqs_arg)
+            .i32(width_arg)
+            .ptr_mut(&mut buffers.first_reject, stream);
+        // SAFETY: matches `sample_first_reject_beta`; `tokens`, `out`, `accept_flag` hold
+        // `seqs * width` elements, `keep` and `first_reject` hold at least `seqs`, and the
+        // kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.first_reject_beta, first_reject_config) }?;
+
         let config = LaunchConfig {
             grid_dim: (u32::try_from(RACE_BLOCKS)?, grid_rows, 1),
             block_dim: (RACE_THREADS, 1, 1),
@@ -523,6 +559,7 @@ impl Sample {
             .ptr(&cand, stream)
             .i32(cand_stride_arg)
             .ptr(&buffers.accept_flag, stream)
+            .ptr(&buffers.first_reject, stream)
             .ptr(&buffers.r_log, stream)
             .ptr_mut(&mut buffers.scores, stream)
             .ptr_mut(&mut buffers.idxs, stream)
@@ -531,7 +568,8 @@ impl Sample {
             .ptr_mut(&mut buffers.counters, stream)
             .ptr_mut(&mut out, stream);
         // SAFETY: matches `sample_race_beta_bf16`; partials and fallback partials hold
-        // `RACE_BLOCKS` per row, counters are zero between launches, and reads wait on PDL.
+        // `RACE_BLOCKS` per row, `first_reject` holds at least `seqs`, counters are zero
+        // between launches, and reads wait on PDL.
         unsafe { args.launch_pdl(stream, &self.race_beta_bf16, config) }
     }
 }

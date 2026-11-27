@@ -785,6 +785,7 @@ fn beta_rejection_exact_and_relaxed_distribution() -> anyhow::Result<()> {
                 vocab,
                 0.0,
                 &tokens_d,
+                &keep_d,
                 width,
                 &cand_d,
                 &q_d,
@@ -889,6 +890,7 @@ fn beta_rejection_exact_and_relaxed_distribution() -> anyhow::Result<()> {
         vocab,
         0.0,
         &g_tok_d,
+        &g_keep,
         width,
         &cand_d.slice(..BETA_CAND_K),
         &q_d.slice(..BETA_CAND_K),
@@ -908,5 +910,265 @@ fn beta_rejection_exact_and_relaxed_distribution() -> anyhow::Result<()> {
         &mut g_anc,
     )?;
     assert_eq!(stream.clone_dtoh(&g_res)?[0], 1, "greedy match should accept");
+    Ok(())
+}
+
+/// Verifies the fast `Z_kept` paths in `sample_prepare_beta_bf16` (`top_p < 1.0, min_p = 0`
+/// via `threshold()`'s `kept_mass`, and `top_p = 1.0, min_p = 0` via online softmax) plus
+/// multi-row (`width = 4`) `first_reject` early-exit in `sample_race_beta_bf16` (including
+/// `keep != 0` forced rows).
+#[test]
+#[expect(clippy::too_many_lines, reason = "tests both Z_kept fast paths and width=4 first_reject")]
+fn beta_fast_paths_z_kept_and_first_reject() -> anyhow::Result<()> {
+    use half::bf16;
+    use siphon_cuda::ops::{
+        sample::BETA_CAND_K,
+        spec::{RESULT_LEN, Spec},
+    };
+
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let spec = Spec::load(setup.gpu.context())?;
+
+    let vocab = 2048usize;
+    let synth_logits = logits(vocab, 1.4, 24, 54321);
+    let row_bf16: Vec<bf16> = synth_logits.iter().map(|&v| bf16::from_f32(v)).collect();
+    let quantized_f32: Vec<f32> = row_bf16.iter().map(|&b| b.to_f32()).collect();
+
+    let batch_seqs = 32usize;
+    let width = 4usize;
+    let steps_stride = width - 1;
+    let batches = 125usize;
+    let total_trials = batch_seqs * batches;
+
+    let mut logits_batch = Vec::with_capacity(batch_seqs * width * vocab);
+    for _ in 0..batch_seqs * width {
+        logits_batch.extend_from_slice(&row_bf16);
+    }
+    let logits_d = stream.clone_htod(&logits_batch)?;
+    let keep_d = stream.alloc_zeros::<u32>(batch_seqs)?;
+    let mut buffers = SampleBuffers::new(stream, batch_seqs * width)?;
+    let mut out_d = stream.alloc_zeros::<i32>(batch_seqs * width)?;
+    let mut results_d = stream.alloc_zeros::<i32>(batch_seqs * RESULT_LEN)?;
+    let mut anchors_d = stream.alloc_zeros::<i32>(batch_seqs)?;
+
+    for (label, sampling) in [
+        ("top_p=0.95 (threshold kept_mass)", Sampling::new(0.85, 0, 0.95, 0.0, 1)?),
+        ("pure T=0.85 (online softmax)", Sampling::new(0.85, 0, 1.0, 0.0, 1)?),
+    ] {
+        let target_p = filtered(&quantized_f32, sampling);
+        let mut order: Vec<usize> = (0..vocab).collect();
+        order.sort_by(|&a, &b| target_p[b].total_cmp(&target_p[a]));
+
+        let mut cand16 = [0i32; BETA_CAND_K];
+        let mut q16 = [0.0f32; BETA_CAND_K];
+        for k in 0..BETA_CAND_K {
+            cand16[k] = i32::try_from(order[k])?;
+            let factor = if k % 2 == 0 { 1.4 } else { 0.65 };
+            q16[k] = ((target_p[order[k]] * factor) as f32).max(0.005);
+        }
+        let q_sum: f32 = q16.iter().sum();
+        for v in &mut q16 {
+            *v /= q_sum;
+        }
+
+        let mut cand_batch = Vec::with_capacity(batch_seqs * steps_stride * BETA_CAND_K);
+        let mut q_batch = Vec::with_capacity(batch_seqs * steps_stride * BETA_CAND_K);
+        for _ in 0..batch_seqs * steps_stride {
+            cand_batch.extend_from_slice(&cand16);
+            q_batch.extend_from_slice(&q16);
+        }
+        let cand_d = stream.clone_htod(&cand_batch)?;
+        let q_d = stream.clone_htod(&q_batch)?;
+
+        let mut counts_pos0 = vec![0usize; vocab];
+        let mut accepted_sum = 0usize;
+        let mut bonus_hits = 0usize;
+        let mut oos_emitted = 0usize;
+        let mut rng_state = 0xfeed_face_cafe_beef_u64 ^ u64::from(sampling.top_p.to_bits());
+
+        for b in 0..batches {
+            let mut tokens_h = vec![0i32; batch_seqs * width];
+            let mut settings = Vec::with_capacity(batch_seqs * width);
+            for s in 0..batch_seqs {
+                tokens_h[s * width] = 0;
+                for j in 0..steps_stride {
+                    let u = (splitmix64(&mut rng_state) >> 11) as f64 / ((1u64 << 53) as f64);
+                    let mut cdf = 0.0f64;
+                    let mut picked = cand16[0];
+                    for k in 0..BETA_CAND_K {
+                        cdf += f64::from(q16[k]);
+                        if u < cdf {
+                            picked = cand16[k];
+                            break;
+                        }
+                    }
+                    tokens_h[s * width + 1 + j] = picked;
+                }
+                let trial_seed = (b * batch_seqs + s + 1) as u64;
+                let row_s = Sampling {
+                    seed: trial_seed,
+                    ..sampling
+                };
+                for j in 0..width {
+                    settings.push((row_s, 200 + j));
+                }
+            }
+            let tokens_d = stream.clone_htod(&tokens_h)?;
+            buffers.upload(stream, &settings)?;
+            setup.sample.run_beta_bf16(
+                stream,
+                &logits_d,
+                vocab,
+                vocab,
+                0.0,
+                &tokens_d,
+                &keep_d,
+                width,
+                &cand_d,
+                &q_d,
+                steps_stride,
+                1.0,
+                &mut buffers,
+                &mut out_d,
+            )?;
+            spec.accept_beta_batch(
+                stream,
+                &tokens_d,
+                &out_d,
+                &buffers.accept_flags(batch_seqs * width),
+                &keep_d.slice(..),
+                batch_seqs,
+                width,
+                &mut results_d.slice_mut(..),
+                &mut anchors_d.slice_mut(..),
+            )?;
+            let res_h = stream.clone_dtoh(&results_d)?;
+            let anc_h = stream.clone_dtoh(&anchors_d)?;
+            for s in 0..batch_seqs {
+                let r = &res_h[s * RESULT_LEN..(s + 1) * RESULT_LEN];
+                let acc = usize::try_from(r[0])?;
+                assert!(acc < width);
+                accepted_sum += acc;
+                if acc == width - 1 {
+                    bonus_hits += 1;
+                }
+                let next_tok = usize::try_from(anc_h[s])?;
+                assert_eq!(next_tok, usize::try_from(r[1 + 8 + acc])?);
+                if target_p[next_tok] == 0.0 {
+                    oos_emitted += 1;
+                }
+                let pos0_tok = if acc >= 1 {
+                    usize::try_from(r[2])?
+                } else {
+                    usize::try_from(r[1 + 8])?
+                };
+                if target_p[pos0_tok] == 0.0 {
+                    oos_emitted += 1;
+                }
+                counts_pos0[pos0_tok] += 1;
+            }
+        }
+
+        assert_eq!(oos_emitted, 0, "{label}: emitted out-of-support token");
+        assert!(bonus_hits > 0, "{label}: expected some all-accepted bonus draws");
+
+        let theory_p1: f64 = (0..BETA_CAND_K)
+            .map(|k| {
+                let idx = usize::try_from(cand16[k]).unwrap_or(0);
+                f64::from(q16[k]).min(target_p[idx])
+            })
+            .sum();
+        let theory_mean_acc = theory_p1 + theory_p1.powi(2) + theory_p1.powi(3);
+        let emp_mean_acc = accepted_sum as f64 / total_trials as f64;
+        assert!(
+            (emp_mean_acc - theory_mean_acc).abs() < 0.08,
+            "{label}: emp_mean_acc={emp_mean_acc:.4} vs theory={theory_mean_acc:.4}"
+        );
+
+        let mut chi2 = 0.0f64;
+        let mut df = 0usize;
+        let (mut tail_obs, mut tail_exp) = (0.0f64, 0.0f64);
+        for i in 0..vocab {
+            let exp = target_p[i] * total_trials as f64;
+            if exp >= 5.0 {
+                let d = counts_pos0[i] as f64 - exp;
+                chi2 += d * d / exp;
+                df += 1;
+            } else if exp > 0.0 {
+                tail_obs += counts_pos0[i] as f64;
+                tail_exp += exp;
+            }
+        }
+        if tail_exp >= 1.0 {
+            let d = tail_obs - tail_exp;
+            chi2 += d * d / tail_exp;
+            df += 1;
+        }
+        let df = (df.saturating_sub(1)).max(1) as f64;
+        let z = ((chi2 / df).cbrt() - (1.0 - 2.0 / (9.0 * df))) / (2.0 / (9.0 * df)).sqrt();
+        eprintln!(
+            "{label}: width=4 mean_acc={emp_mean_acc:.4} (theory {theory_mean_acc:.4}), bonus={bonus_hits}, z={z:.2}"
+        );
+        assert!(z < 4.0, "{label}: distribution mismatch z={z:.2}");
+    }
+
+    // Verify forced `keep = 2` (Accept::Rows(2)) draws row 1 even when row 0 is rejected.
+    let keep_forced = stream.clone_htod(&[2u32])?;
+    let tok_forced = stream.clone_htod(&[0i32, 0, 0, 0])?;
+    let logits_1 = stream.clone_htod(&[&row_bf16[..], &row_bf16[..], &row_bf16[..], &row_bf16[..]].concat())?;
+    let mut cand_1 = vec![0i32; steps_stride * BETA_CAND_K];
+    let mut q_1 = vec![0.0f32; steps_stride * BETA_CAND_K];
+    let sampling_p = Sampling::new(0.85, 0, 0.95, 0.0, 77)?;
+    let target_p = filtered(&quantized_f32, sampling_p);
+    let oos_tok = target_p
+        .iter()
+        .position(|&p| p == 0.0)
+        .ok_or_else(|| anyhow::anyhow!("expected out-of-support token"))?;
+    for step in 0..steps_stride {
+        cand_1[step * BETA_CAND_K] = i32::try_from(oos_tok)?;
+        q_1[step * BETA_CAND_K] = 1.0;
+    }
+    let cand_1_d = stream.clone_htod(&cand_1)?;
+    let q_1_d = stream.clone_htod(&q_1)?;
+    let mut b1 = SampleBuffers::new(stream, width)?;
+    b1.upload(
+        stream,
+        &(0..width).map(|j| (sampling_p, 50 + j)).collect::<Vec<_>>(),
+    )?;
+    let mut out_1 = stream.alloc_zeros::<i32>(width)?;
+    let mut res_1 = stream.alloc_zeros::<i32>(RESULT_LEN)?;
+    let mut anc_1 = stream.alloc_zeros::<i32>(1)?;
+    setup.sample.run_beta_bf16(
+        stream,
+        &logits_1,
+        vocab,
+        vocab,
+        0.0,
+        &tok_forced,
+        &keep_forced,
+        width,
+        &cand_1_d,
+        &q_1_d,
+        steps_stride,
+        1.0,
+        &mut b1,
+        &mut out_1,
+    )?;
+    spec.accept_beta(
+        stream,
+        &tok_forced,
+        &out_1,
+        &b1.accept_flags(width),
+        &keep_forced,
+        width,
+        &mut res_1,
+        &mut anc_1,
+    )?;
+    let anc_val = usize::try_from(stream.clone_dtoh(&anc_1)?[0])?;
+    assert!(
+        target_p[anc_val] > 0.0,
+        "forced keep=2 must draw valid in-support token for row 1, got {anc_val}"
+    );
     Ok(())
 }

@@ -57,8 +57,30 @@ pub const MAX_PREFILL_CHUNK: usize = attention::MAX_PREFILL_ROWS;
 const _: () = assert!(MAX_PREFILL_CHUNK == siphon::memory::MAX_PREFILL_CHUNK);
 /// The fastest chunk size measured: each expert weight read serves the most rows. Time to
 /// first token for 32K tokens was 2.93 s at 512 rows, 2.55 s at 1024 and 2.39 s at 2048.
+/// Also matches [`super::MAP_POSITIONS`] and [`siphon::memory::DEFAULT_PREFILL_CHUNK`] so
+/// VMM page mapping and prefix-cache boundaries stay power-of-2 aligned.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 const _: () = assert!(DEFAULT_PREFILL_CHUNK == siphon::memory::DEFAULT_PREFILL_CHUNK);
+/// Longer chunk size used for non-prefix-cached long prompts (`>= 2560` tokens) on Blackwell
+/// where 2560-row MoE and dense GEMMs amortize weight loads further without changing
+/// [`DEFAULT_PREFILL_CHUNK`] or [`super::MAP_POSITIONS`].
+pub const PREFILL_LONG_CHUNK: usize = 2560;
+const _: () = assert!(PREFILL_LONG_CHUNK <= MAX_PREFILL_CHUNK);
+
+/// Recommended non-cached prefill chunk size for a prompt of `tokens` tokens:
+/// [`PREFILL_LONG_CHUNK`] on Blackwell (`sm_120a`) whenever it strictly reduces the chunk
+/// count compared to [`DEFAULT_PREFILL_CHUNK`] (e.g., 16K and 32K, leaving 4K/8K at 2048),
+/// otherwise [`DEFAULT_PREFILL_CHUNK`].
+#[must_use]
+pub const fn recommended_prefill_chunk(tokens: usize) -> usize {
+    if crate::BLOCK_SCALED_MMA
+        && tokens.div_ceil(PREFILL_LONG_CHUNK) < tokens.div_ceil(DEFAULT_PREFILL_CHUNK)
+    {
+        PREFILL_LONG_CHUNK
+    } else {
+        DEFAULT_PREFILL_CHUNK
+    }
+}
 /// The attention products [`Model::prefill`] runs over an FP8 cache unless
 /// [`Model::set_prefill_attention`] says otherwise.
 pub const DEFAULT_PREFILL_ATTENTION: PrefillAttention = PrefillAttention::Auto;
@@ -2613,6 +2635,7 @@ impl Ctx {
                 padded,
                 cfg.final_logit_softcapping,
                 &rows(&p.tokens, m, 1),
+                &v.keep,
                 m,
                 &v.draft_cand,
                 &v.draft_q,
@@ -2830,6 +2853,7 @@ impl Ctx {
                 padded,
                 cfg.final_logit_softcapping,
                 &rows(&p.tokens, m, 1),
+                &bv.keep.slice(..seqs),
                 width,
                 &bv.draft_cand.slice(..cand_n),
                 &bv.draft_q.slice(..cand_n),
@@ -5835,6 +5859,7 @@ impl Ctx {
                     padded,
                     cfg.final_logit_softcapping,
                     &rows(&p.tokens, batch_rows, 1),
+                    &bv.keep.slice(..seqs),
                     width,
                     &bv.draft_cand.slice(..cand_n),
                     &bv.draft_q.slice(..cand_n),

@@ -548,6 +548,7 @@ struct BatchDraftedSlot {
     /// for batched `--spec-beta` rejection sampling.
     cand: CudaSlice<i32>,
     q_probs: CudaSlice<f32>,
+    has_dist: bool,
     confidences: Vec<f32>,
     valid: bool,
     tick: u64,
@@ -585,6 +586,7 @@ impl BatchSpecBuffers {
                 tokens: stream.alloc_zeros(BATCH_VERIFY_MAX_ROWS)?,
                 cand: stream.alloc_zeros(dist_elems)?,
                 q_probs: stream.alloc_zeros(dist_elems)?,
+                has_dist: false,
                 confidences: Vec::new(),
                 valid: false,
                 tick: 0,
@@ -1027,8 +1029,7 @@ impl Speculator {
                     .collect::<anyhow::Result<_>>()?;
                 {
                     let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
-                    let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
-                    let dist_n = src_cand.len();
+                    let spec_beta = model.spec_beta().is_some();
                     let bs = self
                         .batch_spec
                         .as_mut()
@@ -1040,8 +1041,14 @@ impl Speculator {
                         seqs,
                         w,
                     )?;
-                    stream.memcpy_dtod(&src_cand, &mut bs.cache[0].cand.slice_mut(..dist_n))?;
-                    stream.memcpy_dtod(&src_q, &mut bs.cache[0].q_probs.slice_mut(..dist_n))?;
+                    if spec_beta {
+                        let (src_cand, src_q) =
+                            self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+                        let dist_n = src_cand.len();
+                        stream.memcpy_dtod(&src_cand, &mut bs.cache[0].cand.slice_mut(..dist_n))?;
+                        stream.memcpy_dtod(&src_q, &mut bs.cache[0].q_probs.slice_mut(..dist_n))?;
+                    }
+                    bs.cache[0].has_dist = spec_beta;
                 }
                 if model.spec_beta().is_some() {
                     let dist_n = seqs * STEPS * crate::ops::sample::BETA_CAND_K;
@@ -1359,8 +1366,9 @@ impl Speculator {
             "mismatched hybrid prefill draft flags"
         );
         let stream = Arc::clone(model.stream());
+        let spec_beta = model.spec_beta().is_some();
         self.ensure_batch_spec(&stream)?;
-        self.resolve_pending_batch_draft(&stream, verify_slots, max_width)?;
+        self.resolve_pending_batch_draft(&stream, verify_slots, max_width, spec_beta)?;
         self.draft
             .set_fp8_dense(model.prefill_dense() == crate::ops::Products::Fp8)?;
         let starts: Vec<usize> = verify_slots
@@ -1374,7 +1382,10 @@ impl Speculator {
         };
         let cached_idx = self.batch_spec.as_ref().and_then(|bs| {
             bs.cache.iter().position(|e| {
-                e.valid && e.slots.as_slice() == verify_slots && e.width <= max_width
+                e.valid
+                    && e.slots.as_slice() == verify_slots
+                    && e.width <= max_width
+                    && (!spec_beta || e.has_dist)
             })
         });
         let accept = vec![Accept::Greedy; seqs];
@@ -1419,8 +1430,6 @@ impl Speculator {
             };
             let w = self.choose_batch_width(seqs, &init_conf, max_width);
             let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
-            let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
-            let dist_n = src_cand.len();
             let bs = self
                 .batch_spec
                 .as_mut()
@@ -1435,8 +1444,13 @@ impl Speculator {
                 seqs,
                 w,
             )?;
-            stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
-            stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
+            if spec_beta {
+                let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+                let dist_n = src_cand.len();
+                stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
+                stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
+            }
+            entry.has_dist = spec_beta;
             entry.slots = verify_slots.to_vec();
             entry.width = w;
             entry.confidences.clone_from(&init_conf);
@@ -1636,6 +1650,7 @@ impl Speculator {
         stream: &Arc<CudaStream>,
         next_slots: &[usize],
         next_max_width: usize,
+        spec_beta: bool,
     ) -> anyhow::Result<()> {
         let Some(pending) = self
             .batch_spec
@@ -1660,8 +1675,6 @@ impl Speculator {
         };
         let next_w = self.choose_batch_width(seqs, &next_conf, eff_max);
         let next_tokens = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
-        let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
-        let dist_n = src_cand.len();
         let bs = self
             .batch_spec
             .as_mut()
@@ -1675,8 +1688,13 @@ impl Speculator {
             seqs,
             next_w,
         )?;
-        stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
-        stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
+        if spec_beta {
+            let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+            let dist_n = src_cand.len();
+            stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
+            stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
+        }
+        entry.has_dist = spec_beta;
         entry.slots = pending.slots;
         entry.width = next_w;
         entry.confidences = next_conf;
@@ -1713,8 +1731,9 @@ impl Speculator {
             "mismatched batched speculation lengths"
         );
         let stream = Arc::clone(model.stream());
+        let spec_beta = model.spec_beta().is_some();
         self.ensure_batch_spec(&stream)?;
-        self.resolve_pending_batch_draft(&stream, slots, max_width)?;
+        self.resolve_pending_batch_draft(&stream, slots, max_width, spec_beta)?;
         self.draft
             .set_fp8_dense(model.prefill_dense() == crate::ops::Products::Fp8)?;
         let starts: Vec<usize> = slots
@@ -1726,14 +1745,14 @@ impl Speculator {
         } else {
             vec![Sampling::GREEDY; seqs]
         };
-        let cached_idx = self
-            .batch_spec
-            .as_ref()
-            .and_then(|bs| {
-                bs.cache
-                    .iter()
-                    .position(|e| e.valid && e.slots.as_slice() == slots && e.width <= max_width)
-            });
+        let cached_idx = self.batch_spec.as_ref().and_then(|bs| {
+            bs.cache.iter().position(|e| {
+                e.valid
+                    && e.slots.as_slice() == slots
+                    && e.width <= max_width
+                    && (!spec_beta || e.has_dist)
+            })
+        });
         let accept = vec![Accept::Greedy; seqs];
         let (verify_w, used_conf, slot_idx) = if let Some(idx) = cached_idx {
             let bs = self
@@ -1776,8 +1795,6 @@ impl Speculator {
             };
             let w = self.choose_batch_width(seqs, &init_conf, max_width);
             let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
-            let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
-            let dist_n = src_cand.len();
             let bs = self
                 .batch_spec
                 .as_mut()
@@ -1792,8 +1809,13 @@ impl Speculator {
                 seqs,
                 w,
             )?;
-            stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
-            stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
+            if spec_beta {
+                let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+                let dist_n = src_cand.len();
+                stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
+                stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
+            }
+            entry.has_dist = spec_beta;
             entry.slots = slots.to_vec();
             entry.width = w;
             entry.confidences.clone_from(&init_conf);
@@ -2404,6 +2426,10 @@ impl Speculator {
     /// position below which the model writes before the draft's first round and before
     /// each verify round or run of plain steps, so that it can free pages of the KV pool
     /// for them. Generation stops before the work when `room` returns false.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "main speculative generation loop with plain-step fallback"
+    )]
     pub fn generate_with_room(
         &mut self,
         model: &mut Model,
@@ -2436,6 +2462,7 @@ impl Speculator {
         let mut out = Vec::with_capacity(n + STEPS + 1);
         let mut run = FIRST_PLAIN_RUN;
         self.calibration = Calibration::default();
+        let sampling_active = model.sampling_enabled() && !model.sampling().is_greedy();
         let mut next = Next::Verify(proposals + 1);
         self.sync_draft_sampling(model)?;
         if drafts == Drafts::Dspark {
@@ -2448,7 +2475,7 @@ impl Speculator {
             )?;
             self.draft
                 .replay_round(&stream, &self.linear, model.draft_shared(), proposals)?;
-            next = self.next_round(&stream, 0, &mut run)?;
+            next = self.next_round(&stream, 0, &mut run, sampling_active)?;
         }
         // The anchor on the host, once a round or step has emitted it.
         let mut anchor = None;
@@ -2483,7 +2510,7 @@ impl Speculator {
                     next = match drafts {
                         Drafts::Dspark => {
                             self.stats.probes += 1;
-                            self.next_round(&stream, self.stats.rounds, &mut run)?
+                            self.next_round(&stream, self.stats.rounds, &mut run, sampling_active)?
                         }
                         Drafts::Random(_) => Next::Verify(self.next_width_blind(self.stats.rounds)),
                     };
@@ -2498,7 +2525,9 @@ impl Speculator {
                 break;
             }
             next = match drafts {
-                Drafts::Dspark => self.next_round(&stream, self.stats.rounds, &mut run)?,
+                Drafts::Dspark => {
+                    self.next_round(&stream, self.stats.rounds, &mut run, sampling_active)?
+                }
                 Drafts::Random(_) => self.next_blind(self.stats.rounds),
             };
         }
@@ -2902,6 +2931,7 @@ impl Speculator {
         stream: &Arc<CudaStream>,
         round: usize,
         run: &mut usize,
+        sampling_active: bool,
     ) -> anyhow::Result<Next> {
         let count = match &self.width {
             Width::Adaptive(policy) => policy.widest() - 1,
@@ -2923,7 +2953,12 @@ impl Speculator {
         let Width::Adaptive(policy) = &self.width else {
             unreachable!("checked above");
         };
-        Ok(match policy.decide(&confidence, &calibrated, *run) {
+        let decision = if sampling_active {
+            policy.decide(&calibrated, &calibrated, *run)
+        } else {
+            policy.decide(&confidence, &calibrated, *run)
+        };
+        Ok(match decision {
             None => {
                 let steps = *run;
                 *run = (*run * 2).min(MAX_PLAIN_RUN);
