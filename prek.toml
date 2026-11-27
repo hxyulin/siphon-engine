@@ -1,0 +1,51 @@
+default_install_hook_types = ["pre-commit", "commit-msg"]
+default_stages = ["pre-commit"]
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "fix-byte-order-marker" },
+    { id = "mixed-line-ending", args = ["--fix=lf"] },
+    # Preserve the exact whitespace of reference prompts used in model comparisons.
+    { id = "trailing-whitespace", args = ["--markdown-linebreak-ext=md"], exclude = '^reference/prompts/.*\.txt$' },
+    { id = "end-of-file-fixer" },
+    { id = "check-merge-conflict", args = ["--assume-in-merge"] },
+    { id = "check-case-conflict" },
+    { id = "check-symlinks" },
+    { id = "detect-private-key" },
+    { id = "check-json" },
+    { id = "check-toml" },
+    { id = "check-yaml" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "rustfmt"
+name = "Check formatting of Rust files"
+language = "system"
+entry = "rustfmt --edition 2024 --config skip_children=true --check --"
+types = ["rust"]
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "Check workspace formatting"
+language = "system"
+entry = "cargo fmt --all -- --check"
+stages = ["manual"]
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-check"
+name = "cargo check"
+language = "system"
+entry = "cargo check --locked --workspace --all-targets --all-features"
+files = '(^crates/|\.rs$|^Cargo\.(toml|lock)$|^\.cargo/)'
+pass_filenames = false
+
+[[repos]]
+repo = "https://github.com/compilerla/conventional-pre-commit"
+rev = "33b50eb042bee26eac0ee96ad84aa9c1b4dccdd8" # v4.5.0
+hooks = [{ id = "conventional-pre-commit", stages = ["commit-msg"] }]

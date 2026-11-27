@@ -63,6 +63,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 - [Engine internals](docs/engine.md) covers architecture, [batching](docs/batching.md), and [vision](docs/vision.md).
 - [Conversation archives](docs/archives.md) covers optional JSONL deduplication and compression.
 
+## Development
+
+Install [prek](https://prek.j178.dev/) and run `prek install` to enable the pre-commit and Conventional Commits hooks. If a hook fixes whitespace or line endings, stage the fixes before retrying the commit.
+
+The hooks check formatting on changed Rust files and type-check all workspace targets and features for the host when Rust sources or Cargo inputs change. Run `prek run --all-files` to audit all files or `prek run --stage manual cargo-fmt` to audit workspace formatting alone. On Linux, use `pixi run git commit` or `pixi run prek run --all-files` to put the CUDA toolkit on the hook's path.
+
 ## License
 
 Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option. Contributions are dual licensed under the same terms unless you state otherwise.
