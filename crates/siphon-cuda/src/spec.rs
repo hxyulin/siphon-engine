@@ -56,8 +56,9 @@ use crate::{
     draft::{Draft, DraftOptions, STEPS, WINDOW},
     gpu::{PinnedBuf, sync_event},
     model::{
-        Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, ImageSource, Model, PackedPrefill,
-        PrefillLogits, Sampling, SavedState, Verdict, VerifyTokens,
+        Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, HybridStepResult, HybridVerifyResult,
+        ImageSource, Model, PackedPrefill, PrefillLogits, Sampling, SavedState, Verdict,
+        VerifyTokens,
     },
     ops::{
         draft::MAX_BATCH_SEQS,
@@ -1181,6 +1182,339 @@ impl Speculator {
         } else {
             model.prefill_packed(slices, chunk)
         }
+    }
+
+    /// Runs a hybrid plain-decode + piggybacked-prefill pass via [`Model::step_hybrid`],
+    /// committing feature taps into each DFlash 2-ready prefill slot's sliding rings.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "batched decode rows + piggybacked prefill slices + draft flags"
+    )]
+    pub fn step_hybrid_batch(
+        &mut self,
+        model: &mut Model,
+        decode_rows: &[(usize, u32)],
+        decode_sampling: &[Sampling],
+        prefill_slices: &[PackedPrefill<'_>],
+        commit_prefill_draft: &[bool],
+        reset_prefill_draft: &[bool],
+        chunk: usize,
+    ) -> anyhow::Result<HybridStepResult> {
+        ensure!(
+            commit_prefill_draft.len() == prefill_slices.len()
+                && reset_prefill_draft.len() == prefill_slices.len(),
+            "mismatched hybrid prefill draft flags"
+        );
+        self.invalidate_batch_draft();
+        let stream = Arc::clone(model.stream());
+        let any_draft = commit_prefill_draft.iter().any(|&c| c);
+        if any_draft {
+            let mut noted = Vec::new();
+            let noted_cap = (self.draft.context_capacity() / 2).min(256);
+            let per_slice = if noted_cap == 0 {
+                0
+            } else {
+                (noted_cap / prefill_slices.len().max(1))
+                    .max(32)
+                    .min(noted_cap)
+            };
+            for ((s, &commit), &reset) in prefill_slices
+                .iter()
+                .zip(commit_prefill_draft)
+                .zip(reset_prefill_draft)
+            {
+                if !commit {
+                    continue;
+                }
+                if reset {
+                    self.draft.reset_slot(s.slot);
+                }
+                for &t in s.tokens.iter().rev().take(per_slice) {
+                    noted.push(i32::try_from(t)?);
+                }
+            }
+            if !noted.is_empty() {
+                self.draft
+                    .note_tokens(&stream, model.draft_shared(), &noted)?;
+            }
+            let Self { draft, linear, .. } = self;
+            let mut commit_fn = |slot: usize, start: usize, taps: CudaView<'_, bf16>| {
+                if let Some(pos) = prefill_slices.iter().position(|s| s.slot == slot)
+                    && commit_prefill_draft[pos]
+                {
+                    draft.commit_slot(&stream, linear, slot, &taps, start)?;
+                }
+                Ok(())
+            };
+            model.step_hybrid_with_taps(
+                decode_rows,
+                decode_sampling,
+                prefill_slices,
+                chunk,
+                Some(&mut commit_fn),
+            )
+        } else {
+            model.step_hybrid(decode_rows, decode_sampling, prefill_slices, chunk)
+        }
+    }
+
+    /// Runs one batched DFlash 2 speculation round for `verify_slots` while piggybacking
+    /// `prefill_slices` onto the same target forward pass, preserving the pre-drafted
+    /// `batch_spec` pipeline for `verify_slots` and committing DFlash 2 taps for each
+    /// draft-ready prefill slice on the same stream.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "pipelined adaptive batch verify + piggybacked prefill"
+    )]
+    pub fn speculate_hybrid_round(
+        &mut self,
+        model: &mut Model,
+        verify_slots: &[usize],
+        anchors: &[u32],
+        verify_samplings: &[Sampling],
+        max_width: usize,
+        prefill_slices: &[PackedPrefill<'_>],
+        commit_prefill_draft: &[bool],
+        reset_prefill_draft: &[bool],
+        chunk: usize,
+    ) -> anyhow::Result<HybridVerifyResult> {
+        let seqs = verify_slots.len();
+        ensure!(
+            (1..=MAX_BATCH_SEQS).contains(&seqs),
+            "batched speculation takes 1 to {MAX_BATCH_SEQS} sequences, not {seqs}"
+        );
+        ensure!(
+            (2..=VERIFY_ROWS).contains(&max_width) && seqs * max_width <= BATCH_VERIFY_MAX_ROWS,
+            "invalid batched verify shape {seqs} x {max_width}"
+        );
+        ensure!(
+            anchors.len() == seqs && verify_samplings.len() == seqs,
+            "mismatched batched speculation lengths"
+        );
+        ensure!(
+            commit_prefill_draft.len() == prefill_slices.len()
+                && reset_prefill_draft.len() == prefill_slices.len(),
+            "mismatched hybrid prefill draft flags"
+        );
+        let stream = Arc::clone(model.stream());
+        self.ensure_batch_spec(&stream)?;
+        self.resolve_pending_batch_draft(&stream, verify_slots, max_width)?;
+        self.draft
+            .set_fp8_dense(model.prefill_dense() == crate::ops::Products::Fp8)?;
+        let starts: Vec<usize> = verify_slots
+            .iter()
+            .map(|&s| model.slot_position(s))
+            .collect::<anyhow::Result<_>>()?;
+        let draft_samplings: Vec<Sampling> = if self.coupled && model.sampling_enabled() {
+            verify_samplings.to_vec()
+        } else {
+            vec![Sampling::GREEDY; seqs]
+        };
+        let cached_idx = self.batch_spec.as_ref().and_then(|bs| {
+            bs.cache.iter().position(|e| {
+                e.valid && e.slots.as_slice() == verify_slots && e.width <= max_width
+            })
+        });
+        let accept = vec![Accept::Greedy; seqs];
+        let (verify_w, used_conf, slot_idx) = if let Some(idx) = cached_idx {
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            let tick = bs.next_tick();
+            let entry = &mut bs.cache[idx];
+            entry.tick = tick;
+            (entry.width, entry.confidences.clone(), idx)
+        } else {
+            self.draft.batch_draft_initial(
+                &stream,
+                model.draft_shared(),
+                verify_slots,
+                anchors,
+                &draft_samplings,
+                STEPS,
+            )?;
+            self.sync_drafted.record(&stream)?;
+            self.copy_stream.wait(&self.sync_drafted)?;
+            {
+                let bs = self
+                    .batch_spec
+                    .as_mut()
+                    .context("batch spec buffers missing")?;
+                bs.pinned_conf.copy_from_device(
+                    &self.copy_stream,
+                    &self.draft.batch_confidences_device(seqs, STEPS)?,
+                )?;
+            }
+            self.conf_copied.record(&self.copy_stream)?;
+            self.conf_copied.synchronize()?;
+            let init_conf = {
+                let bs = self
+                    .batch_spec
+                    .as_ref()
+                    .context("batch spec buffers missing")?;
+                bs.pinned_conf.as_slice()[..seqs * STEPS].to_vec()
+            };
+            let w = self.choose_batch_width(seqs, &init_conf, max_width);
+            let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            let idx = bs.alloc_slot();
+            let tick = bs.next_tick();
+            let entry = &mut bs.cache[idx];
+            self.spec.pack_verify_tokens_batch(
+                &stream,
+                &src,
+                &mut entry.tokens.slice_mut(..seqs * w),
+                seqs,
+                w,
+            )?;
+            entry.slots = verify_slots.to_vec();
+            entry.width = w;
+            entry.confidences.clone_from(&init_conf);
+            entry.valid = true;
+            entry.tick = tick;
+            (w, init_conf, idx)
+        };
+        let any_prefill_draft = commit_prefill_draft.iter().any(|&c| c);
+        if any_prefill_draft {
+            for ((s, &commit), &reset) in prefill_slices
+                .iter()
+                .zip(commit_prefill_draft)
+                .zip(reset_prefill_draft)
+            {
+                if commit && reset {
+                    self.draft.reset_slot(s.slot);
+                }
+            }
+        }
+        let pending = {
+            let Self {
+                draft,
+                linear,
+                batch_spec,
+                ..
+            } = self;
+            let bs = batch_spec
+                .as_ref()
+                .context("batch spec buffers missing")?;
+            let tokens = bs.cache[slot_idx].tokens.slice(..seqs * verify_w);
+            if any_prefill_draft {
+                let mut commit_fn = |slot: usize, start: usize, taps: CudaView<'_, bf16>| {
+                    if let Some(pos) = prefill_slices.iter().position(|s| s.slot == slot)
+                        && commit_prefill_draft[pos]
+                    {
+                        draft.commit_slot(&stream, linear, slot, &taps, start)?;
+                    }
+                    Ok(())
+                };
+                model.start_verify_hybrid(
+                    verify_slots,
+                    BatchVerifyTokens::Device {
+                        tokens,
+                        width: verify_w,
+                    },
+                    &accept,
+                    verify_samplings,
+                    prefill_slices,
+                    chunk,
+                    Some(&mut commit_fn),
+                )?
+            } else {
+                model.start_verify_hybrid(
+                    verify_slots,
+                    BatchVerifyTokens::Device {
+                        tokens,
+                        width: verify_w,
+                    },
+                    &accept,
+                    verify_samplings,
+                    prefill_slices,
+                    chunk,
+                    None,
+                )?
+            }
+        };
+        // Pipeline commit + next-round draft for `verify_slots` on the GPU before syncing.
+        self.draft.batch_commit_and_draft(
+            &stream,
+            model.draft_shared(),
+            verify_slots,
+            &starts,
+            &model.batch_verify_taps()?,
+            &model.batch_verify_results()?,
+            &model.batch_verify_anchors()?,
+            &draft_samplings,
+            verify_w,
+            STEPS,
+        )?;
+        self.sync_drafted.record(&stream)?;
+        self.copy_stream.wait(&self.sync_drafted)?;
+        {
+            let bs = self
+                .batch_spec
+                .as_mut()
+                .context("batch spec buffers missing")?;
+            bs.pinned_conf.copy_from_device(
+                &self.copy_stream,
+                &self.draft.batch_confidences_device(seqs, STEPS)?,
+            )?;
+        }
+        self.conf_copied.record(&self.copy_stream)?;
+        // Single host synchronization for the whole hybrid verify + prefill round.
+        let result = model.finish_verify_hybrid(pending)?;
+        for (s, (&slot, (&start, v))) in verify_slots
+            .iter()
+            .zip(starts.iter().zip(&result.verdicts))
+            .enumerate()
+        {
+            self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+            self.batch_calibration.record_bounded(
+                &used_conf[s * STEPS..(s + 1) * STEPS],
+                verify_w,
+                v.accepted,
+            );
+        }
+        let mut noted: Vec<i32> = result
+            .verdicts
+            .iter()
+            .flat_map(Verdict::emitted)
+            .map(i32::try_from)
+            .collect::<Result<_, _>>()?;
+        if any_prefill_draft {
+            let noted_cap = (self.draft.context_capacity() / 2).min(256);
+            let per_slice = if noted_cap == 0 {
+                0
+            } else {
+                (noted_cap / prefill_slices.len().max(1))
+                    .max(32)
+                    .min(noted_cap)
+            };
+            for (s, &commit) in prefill_slices.iter().zip(commit_prefill_draft) {
+                if !commit {
+                    continue;
+                }
+                for &t in s.tokens.iter().rev().take(per_slice) {
+                    noted.push(i32::try_from(t)?);
+                }
+            }
+        }
+        if !noted.is_empty() {
+            self.draft
+                .note_tokens(&stream, model.draft_shared(), &noted)?;
+        }
+        if let Some(bs) = self.batch_spec.as_mut() {
+            bs.cache[slot_idx].valid = false;
+            bs.pending = Some(PendingBatchDraft {
+                slots: verify_slots.to_vec(),
+                max_width,
+                slot_idx,
+            });
+        }
+        Ok(result)
     }
 
     /// Chooses the verify width in `[2, 4, 6, 8]` (at most `max_width`) that maximizes

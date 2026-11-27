@@ -235,7 +235,7 @@ pub(super) struct BatchBuffers {
     /// Each row's token, greedy or drawn, `[max_total_rows]`.
     pub(super) argmax: CudaSlice<i32>,
     /// The slots whose addresses `tables` holds, by sequence index.
-    members: Vec<usize>,
+    pub(super) members: Vec<usize>,
     /// Persistent page-locked host staging buffers for async H2D uploads.
     host_tables: PinnedBuf<u64>,
     host_positions: PinnedBuf<u32>,
@@ -243,7 +243,7 @@ pub(super) struct BatchBuffers {
     /// Recorded on the stream after each async pinned H2D upload.
     h2d_done: CudaEvent,
     /// Total sequence rows (`real + padded`) currently populated in `tables`.
-    padded_seqs: usize,
+    pub(super) padded_seqs: usize,
     /// Present for [`Model::verify_batch`]; `None` for [`Model::step_batch`].
     pub(super) verify: Option<BatchVerifyState>,
 }
@@ -879,7 +879,7 @@ impl Model {
     /// Makes the batched step's buffers for one row per slot, or for at least `m` rows,
     /// unless large enough ones exist. New buffers drop the graphs, which hold the old
     /// ones' addresses.
-    fn ensure_batch(&mut self, m: usize) -> anyhow::Result<()> {
+    pub(super) fn ensure_batch(&mut self, m: usize) -> anyhow::Result<()> {
         let rows = self.slots().max(m).min(BATCH_ROWS);
         if self.batch.as_ref().is_some_and(|p| p.rows >= rows) {
             return Ok(());
@@ -1336,7 +1336,11 @@ impl Model {
         self.ensure_batch_verify(max_seqs, max_seqs * VERIFY_ROWS)
     }
 
-    fn ensure_batch_verify(&mut self, seqs: usize, total_rows: usize) -> anyhow::Result<()> {
+    pub(super) fn ensure_batch_verify(
+        &mut self,
+        seqs: usize,
+        total_rows: usize,
+    ) -> anyhow::Result<()> {
         let max_seqs = self.slots().max(seqs).min(BATCH_ROWS);
         let max_rows = (max_seqs * VERIFY_ROWS)
             .max(total_rows)

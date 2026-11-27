@@ -6,6 +6,7 @@ mod engine;
 mod metrics;
 mod openai;
 mod parse;
+mod piggyback;
 mod request;
 mod responses;
 #[cfg(test)]
@@ -46,7 +47,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8|fp4] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
-                     [--decode-floor 20] [--greedy] [--vision] \
+                     [--decode-floor 20] [--piggyback-prefill] [--piggyback-budget 256] [--greedy] [--vision] \
                      [--accept-margin 0.0] [--group-by-confidence] \
                      [--max-image-pixels 2073600] [--max-images 16] \
                      [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] [--moe-min-k 1..=8]
@@ -62,6 +63,11 @@ out to host memory and back. Up to --queue more requests wait.
 --decode-floor gives each decoding request at least that many tokens per second while
 another request's prompt prefills, by running more batched steps between its chunks of
 --prefill-chunk tokens. The prefill keeps at least half of the time. 0 runs one step per chunk.
+--piggyback-prefill (off by default) piggybacks bounded prefill chunks onto active decode or
+batched-verify forward passes instead of stalling active streams behind an exclusive prefill step.
+--piggyback-budget N sets the max prefill tokens piggybacked per step (1 to 2048, default 256;
+0 disables piggybacking). Piggybacked passes run the shared multi-row prefill GEMMs/MoE across
+decode and prefill rows.
 --memory caps the GPU memory the plan may use, the CUDA context included. Without it the
 plan may use the free memory at startup less --margin, 0.25 GiB by default.
 --prefill-chunk runs prompts in chunks of N rows, 1 to 2048. Its buffers grow with N: 0.85 GiB
@@ -189,6 +195,8 @@ fn args() -> anyhow::Result<Args> {
     let mut expert_activations = "bf16".to_owned();
     let mut greedy = false;
     let mut decode_floor = DECODE_FLOOR;
+    let mut piggyback_prefill = false;
+    let mut piggyback_budget = piggyback::DEFAULT_PIGGYBACK_BUDGET;
     let mut vision = false;
     let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
     let mut max_images = vision::DEFAULT_MAX_IMAGES;
@@ -308,6 +316,22 @@ fn args() -> anyhow::Result<Args> {
                     "--decode-floor takes 0 or more tokens per second"
                 );
             }
+            "--piggyback-prefill" => piggyback_prefill = true,
+            "--piggyback-budget" => {
+                let budget: usize = value()?
+                    .parse()
+                    .context("--piggyback-budget takes a token count")?;
+                if budget == 0 {
+                    piggyback_prefill = false;
+                } else {
+                    ensure!(
+                        PREFILL_CHUNK.contains(&budget),
+                        "--piggyback-budget takes 0 (off) or 1 to 2048"
+                    );
+                    piggyback_budget = budget;
+                    piggyback_prefill = true;
+                }
+            }
             "--kv-quant" | "--kv-quant-visits" => {
                 let v = value()?;
                 kv_args.extend([arg, v]);
@@ -386,6 +410,7 @@ fn args() -> anyhow::Result<Args> {
             expert_activations,
             greedy,
             decode_floor,
+            piggyback_budget: piggyback_prefill.then_some(piggyback_budget),
             vision: vision.then_some(engine::VisionOptions {
                 max_pixels: max_image_pixels,
             }),

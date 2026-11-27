@@ -19,12 +19,14 @@ use half::bf16;
 use siphon::TextConfig;
 
 use super::{
-    Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Sampling, Scratch, Upcoming, VisitState, Window,
+    Accept, BatchVerifyTokens, Blocks, Ctx, MESSAGE_SLOTS, Model, RowProduct, Sampling, Scratch,
+    Upcoming, Verdict, VisitState, Window,
     batch::{BatchBuffers, state_words},
     verify::VerifyBuffers,
     visit_plan, zeros,
 };
 use crate::{
+    DeviceIn,
     ops::{
         Products, QuantDest, QuantFormat,
         attention::{self, KV_HEADS, PREFILL_PACKED_MAX_BLOCKS, prefill_blocks},
@@ -171,6 +173,34 @@ pub struct PackedPrefill<'a> {
     pub need_first_token: bool,
     /// Sampling parameters used to draw the first token when `need_first_token` is true.
     pub sampling: Sampling,
+}
+
+/// Outputs of [`Model::step_hybrid`]: one next token per decode row (in input order) and
+/// an optional first token per piggybacked prefill slice (present iff `need_first_token`
+/// was set).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HybridStepResult {
+    pub decode_tokens: Vec<u32>,
+    pub prefill_tokens: Vec<Option<u32>>,
+}
+
+/// Outputs of [`Model::verify_hybrid`] / [`Model::finish_verify_hybrid`]: one speculative
+/// [`Verdict`] per verified sequence and an optional first token per piggybacked prefill
+/// slice (present iff `need_first_token` was set).
+#[derive(Clone, Debug)]
+pub struct HybridVerifyResult {
+    pub verdicts: Vec<Verdict>,
+    pub prefill_tokens: Vec<Option<u32>>,
+}
+
+/// A hybrid batched verify + piggybacked prefill pass that [`Model::start_verify_hybrid`]
+/// launched and whose outputs [`Model::finish_verify_hybrid`] has not read yet.
+#[must_use = "the slots' positions advance only in finish_verify_hybrid"]
+#[derive(Debug)]
+pub struct PendingHybridVerify {
+    verify_slots: Vec<(usize, usize)>,
+    width: usize,
+    prefill_slots: Vec<(usize, usize, usize, bool)>,
 }
 
 /// Callback receiving each packed slice's `(slot, start_position, taps)` on the model stream.
@@ -402,6 +432,9 @@ pub(super) struct PrefillScratch {
     pub(super) start: CudaSlice<u32>,
     /// Device metadata tables for [`Model::prefill_packed`], allocated lazily on first use.
     packed: Option<PackedBuffers>,
+    /// Starting positions of piggybacked prefill slices in [`Model::step_hybrid`] /
+    /// [`Model::verify_hybrid`], `[BATCH_ROWS]`.
+    packed_starts: CudaSlice<u32>,
     /// First-token argmax/sample outputs of [`Model::prefill_packed`], `[BATCH_ROWS]`.
     packed_argmax: CudaSlice<i32>,
     embedded: CudaSlice<bf16>,
@@ -533,6 +566,7 @@ impl PrefillScratch {
             tokens: zeros(stream, rows)?,
             start: zeros(stream, 1)?,
             packed: None,
+            packed_starts: zeros(stream, BATCH_ROWS)?,
             packed_argmax: zeros(stream, BATCH_ROWS)?,
             embedded: zeros(stream, rows * hidden)?,
             hidden: zeros(stream, rows * hidden)?,
@@ -1170,6 +1204,764 @@ impl Model {
             }
         }
         Ok(out)
+    }
+
+    /// Updates `self.batch` or `self.batch_verify`'s per-visit state address table when
+    /// `slots` changed since the last pass (or when the previous pass used bucket padding).
+    fn update_batch_tables(&mut self, slots: &[usize], verify: bool) -> anyhow::Result<()> {
+        let stream = Arc::clone(&self.ctx.stream);
+        let (needs_update, max_seqs) = {
+            let holder = if verify {
+                self.batch_verify.as_ref()
+            } else {
+                self.batch.as_ref()
+            };
+            let b = holder
+                .and_then(|p| p.batch.as_ref())
+                .context("the batch buffers are missing")?;
+            (
+                b.members.as_slice() != slots || b.padded_seqs != slots.len(),
+                b.max_seqs,
+            )
+        };
+        if !needs_update {
+            return Ok(());
+        }
+        let mut table = vec![0u64; self.visits.len() * max_seqs * BATCH_STATE_WORDS];
+        for (r, &slot) in slots.iter().enumerate() {
+            let visits = if slot == 0 {
+                &self.visits
+            } else {
+                &self.slots[slot - 1].visits
+            };
+            for (i, v) in visits.iter().enumerate() {
+                let at = (i * max_seqs + r) * BATCH_STATE_WORDS;
+                table[at..at + BATCH_STATE_WORDS].copy_from_slice(&state_words(&stream, v));
+            }
+        }
+        let holder = if verify {
+            self.batch_verify.as_mut()
+        } else {
+            self.batch.as_mut()
+        };
+        let b = holder
+            .and_then(|p| p.batch.as_mut())
+            .context("the batch buffers are missing")?;
+        stream.memcpy_htod(&table, &mut b.tables)?;
+        b.members = slots.to_vec();
+        b.padded_seqs = slots.len();
+        Ok(())
+    }
+
+    /// Runs `decode_rows` (`1..=BATCH_ROWS` single-token decode steps) and `prefill_slices`
+    /// (`1..=BATCH_ROWS` multi-token prompt chunks, all distinct slots) in ONE shared forward
+    /// pass of up to `chunk` (`<= MAX_PREFILL_CHUNK`) total rows.
+    ///
+    /// Dense projections, depth attention, message gates, relative bias, attention gate,
+    /// MoE router/experts, and final norm execute once across all `decode_rows.len() +
+    /// sum(prefill_slices)` rows. The decode rows run through the single-launch batched
+    /// attention and conv kernels (`attention_post_rows`, `attention_batch`,
+    /// `conv_residual_batch`, `moe_conv_residual_batch`), while each prefill slice runs its
+    /// causal short convs and flash prefill attention against its own slot's KV cache and
+    /// conv states. Copies the decode rows' final hidden states into `self.batch` so
+    /// [`Model::batch_logits`] returns their logits on demand.
+    pub fn step_hybrid(
+        &mut self,
+        decode_rows: &[(usize, u32)],
+        decode_sampling: &[Sampling],
+        prefill_slices: &[PackedPrefill<'_>],
+        chunk: usize,
+    ) -> anyhow::Result<HybridStepResult> {
+        self.step_hybrid_with_taps(decode_rows, decode_sampling, prefill_slices, chunk, None)
+    }
+
+    /// [`Self::step_hybrid`] that also records feature taps for every row, copying the
+    /// decode rows' taps into `self.batch` when [`Model::set_batch_taps`] is enabled and
+    /// invoking `prefill_taps` for each prefill slice on the model stream.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates decode + prefill slots, enqueues hybrid pass, reads tokens"
+    )]
+    pub(crate) fn step_hybrid_with_taps(
+        &mut self,
+        decode_rows: &[(usize, u32)],
+        decode_sampling: &[Sampling],
+        prefill_slices: &[PackedPrefill<'_>],
+        chunk: usize,
+        mut prefill_taps: Option<PackedTapsCallback<'_>>,
+    ) -> anyhow::Result<HybridStepResult> {
+        let decode_len = decode_rows.len();
+        ensure!(
+            (1..=BATCH_ROWS).contains(&decode_len),
+            "hybrid step takes 1 to {BATCH_ROWS} decode rows, not {decode_len}"
+        );
+        ensure!(
+            decode_sampling.len() == decode_len,
+            "one sampling per decode row"
+        );
+        ensure!(!prefill_slices.is_empty(), "no prefill slices to piggyback");
+        ensure!(
+            prefill_slices.len() <= BATCH_ROWS,
+            "at most {BATCH_ROWS} prefill slices can be piggybacked, got {}",
+            prefill_slices.len()
+        );
+        ensure!(
+            (1..=MAX_PREFILL_CHUNK).contains(&chunk),
+            "chunk is {chunk}, expected 1 to {MAX_PREFILL_CHUNK}"
+        );
+        ensure!(
+            self.ctx.kv_rounding.recent == 0,
+            "hybrid step does not support recent-window kv rounding"
+        );
+        ensure!(
+            self.sampler
+                || (decode_sampling.iter().all(Sampling::is_greedy)
+                    && prefill_slices
+                        .iter()
+                        .all(|s| !s.need_first_token || s.sampling.is_greedy())),
+            "sampling in a hybrid step needs enable_sampling"
+        );
+        let hidden = self.ctx.hidden();
+        let mut decode_positions = Vec::with_capacity(decode_len);
+        let mut decode_members = Vec::with_capacity(decode_len);
+        let mut ids = Vec::new();
+        for (i, &(slot, token)) in decode_rows.iter().enumerate() {
+            ensure!(
+                decode_rows[..i].iter().all(|&(s, _)| s != slot),
+                "slot {slot} appears twice in hybrid decode rows"
+            );
+            let pos = self.slot_position(slot)?;
+            ensure!(
+                self.visits.iter().all(|v| v.kv.holds(pos)),
+                "slot {slot}: the global KV caches are full at {pos} tokens"
+            );
+            self.map_slot(slot, pos + 1)?;
+            decode_positions.push(u32::try_from(pos).context("position does not fit the kernels")?);
+            decode_members.push(slot);
+            ids.push(i32::try_from(token)?);
+        }
+        let mut total_rows = decode_len;
+        let mut meta = Vec::with_capacity(prefill_slices.len());
+        let mut starts_u32 = Vec::with_capacity(prefill_slices.len());
+        for (i, s) in prefill_slices.iter().enumerate() {
+            ensure!(!s.tokens.is_empty(), "piggybacked slice {i} is empty");
+            ensure!(
+                !decode_members.contains(&s.slot),
+                "slot {} appears in both decode and prefill slices of hybrid step",
+                s.slot
+            );
+            ensure!(
+                prefill_slices[..i].iter().all(|prev| prev.slot != s.slot),
+                "slot {} appears twice in piggybacked prefill slices",
+                s.slot
+            );
+            let start = self.slot_position(s.slot)?;
+            let last = start + s.tokens.len() - 1;
+            ensure!(
+                self.visits.iter().all(|v| v.kv.holds(last)),
+                "slot {}: the global KV caches cannot hold position {last}",
+                s.slot
+            );
+            self.map_slot(s.slot, last + 1)?;
+            u32::try_from(last).context("position does not fit the kernels")?;
+            for run in &s.images {
+                ensure!(
+                    !run.rows.is_empty() && run.rows.len().is_multiple_of(hidden),
+                    "image rows hold {} values, not whole rows of {hidden}",
+                    run.rows.len()
+                );
+            }
+            starts_u32.push(u32::try_from(start)?);
+            meta.push(PackedSliceMeta {
+                slot: s.slot,
+                offset: total_rows,
+                len: s.tokens.len(),
+                start,
+                images: &s.images,
+                need_first_token: s.need_first_token,
+                sampling: s.sampling,
+            });
+            total_rows += s.tokens.len();
+            for &t in s.tokens {
+                ids.push(i32::try_from(t)?);
+            }
+        }
+        ensure!(
+            total_rows <= chunk,
+            "hybrid step has {total_rows} rows, exceeding chunk {chunk}"
+        );
+        self.reserve_prefill(total_rows)?;
+        self.ensure_batch(decode_len)?;
+        self.update_batch_tables(&decode_members, false)?;
+        let record_taps = prefill_taps.is_some() || self.batch_taps;
+        let stream = Arc::clone(&self.ctx.stream);
+        {
+            let p = self
+                .prefill
+                .as_mut()
+                .context("the prefill buffers are missing")?;
+            p.record_taps = record_taps;
+            if p.record_taps && (p.taps.is_none() || p.tap_layout != self.tap_layout) {
+                p.taps = None;
+                p.tap_layout = self.tap_layout.clone();
+                p.taps = Some(zeros(&stream, p.rows * p.tap_layout.len() * hidden)?);
+            }
+            stream.memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, total_rows, 1))?;
+            stream.memcpy_htod(
+                &starts_u32,
+                &mut p.packed_starts.slice_mut(..prefill_slices.len()),
+            )?;
+        }
+        {
+            let batch_p = self
+                .batch
+                .as_mut()
+                .context("the batch buffers are missing")?;
+            let b = batch_p
+                .batch
+                .as_mut()
+                .context("the batch buffers are missing")?;
+            stream.memcpy_htod(&decode_positions, &mut b.positions.slice_mut(..decode_len))?;
+            if let Some(sample) = batch_p.sample.as_mut() {
+                let settings: Vec<(Sampling, usize)> = decode_sampling
+                    .iter()
+                    .zip(&decode_positions)
+                    .map(|(&s, &pos)| (s, pos as usize + 1))
+                    .collect();
+                sample.upload(&stream, &settings)?;
+            }
+        }
+        let Self {
+            ctx,
+            passes,
+            visits,
+            slots,
+            max_blocks,
+            prefill,
+            batch,
+            sample_one,
+            sampler,
+            batch_taps,
+            ..
+        } = self;
+        let p = prefill
+            .as_mut()
+            .context("the prefill buffers are missing")?;
+        let batch_p = batch.as_mut().context("the batch buffers are missing")?;
+        let mut by_slice: Vec<Option<&mut [VisitState]>> =
+            (0..prefill_slices.len()).map(|_| None).collect();
+        if let Some(pos) = prefill_slices.iter().position(|s| s.slot == 0) {
+            by_slice[pos] = Some(visits.as_mut_slice());
+        }
+        for (idx, slot_state) in slots.iter_mut().enumerate() {
+            if let Some(pos) = prefill_slices.iter().position(|s| s.slot == idx + 1) {
+                by_slice[pos] = Some(slot_state.visits.as_mut_slice());
+            }
+        }
+        let mut slice_visits: Vec<&mut [VisitState]> = by_slice
+            .into_iter()
+            .map(|v| v.context("missing visit states for piggybacked slot"))
+            .collect::<anyhow::Result<_>>()?;
+        ctx.hybrid_enqueue(
+            p,
+            batch_p,
+            &mut slice_visits,
+            *passes,
+            *max_blocks,
+            decode_len,
+            &meta,
+            total_rows,
+            sample_one,
+            *sampler,
+        )?;
+        let row_len = p.tap_layout.len() * hidden;
+        if *batch_taps
+            && let (Some(src), Some(dst)) = (p.taps.as_ref(), batch_p.taps.as_mut())
+        {
+            stream.memcpy_dtod(
+                &src.slice(..decode_len * row_len),
+                &mut dst.slice_mut(..decode_len * row_len),
+            )?;
+        }
+        if let Some(taps) = prefill_taps.as_mut() {
+            let buffer = p.taps.as_ref().context("the taps buffer is missing")?;
+            for m_info in &meta {
+                let view =
+                    buffer.slice(m_info.offset * row_len..(m_info.offset + m_info.len) * row_len);
+                taps(m_info.slot, m_info.start, view)?;
+            }
+        }
+        for &(slot, _) in decode_rows {
+            if slot == 0 {
+                self.position += 1;
+            } else {
+                self.slots[slot - 1].position += 1;
+            }
+        }
+        for s in prefill_slices {
+            if s.slot == 0 {
+                self.position += s.tokens.len();
+            } else {
+                self.slots[s.slot - 1].position += s.tokens.len();
+            }
+        }
+        let b = self
+            .batch
+            .as_ref()
+            .and_then(|p| p.batch.as_ref())
+            .context("the batch buffers are missing")?;
+        let raw_decode = stream.clone_dtoh(&b.argmax.slice(..decode_len))?;
+        let decode_tokens: Vec<u32> = raw_decode
+            .into_iter()
+            .map(|t| u32::try_from(t).context("argmax returned a negative index"))
+            .collect::<anyhow::Result<_>>()?;
+        let finishing: Vec<usize> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.need_first_token)
+            .map(|(i, _)| i)
+            .collect();
+        let mut prefill_tokens = vec![None; prefill_slices.len()];
+        if !finishing.is_empty() {
+            let p = self
+                .prefill
+                .as_ref()
+                .context("the prefill buffers are missing")?;
+            let raw = stream.clone_dtoh(&p.packed_argmax.slice(..finishing.len()))?;
+            for (idx, tok) in finishing.into_iter().zip(raw) {
+                prefill_tokens[idx] =
+                    Some(u32::try_from(tok).context("argmax returned a negative index")?);
+            }
+        }
+        Ok(HybridStepResult {
+            decode_tokens,
+            prefill_tokens,
+        })
+    }
+
+    /// Runs a batched verify pass over `verify_slots` (`seqs * width <= BATCH_VERIFY_MAX_ROWS`)
+    /// with piggybacked `prefill_slices` in one forward pass, returning the verify verdicts
+    /// and finishing prefill first tokens.
+    pub fn verify_hybrid(
+        &mut self,
+        verify_slots: &[usize],
+        verify_tokens: BatchVerifyTokens<'_>,
+        accept: &[Accept],
+        verify_sampling: &[Sampling],
+        prefill_slices: &[PackedPrefill<'_>],
+        chunk: usize,
+    ) -> anyhow::Result<HybridVerifyResult> {
+        let pending = self.start_verify_hybrid(
+            verify_slots,
+            verify_tokens,
+            accept,
+            verify_sampling,
+            prefill_slices,
+            chunk,
+            None,
+        )?;
+        self.finish_verify_hybrid(pending)
+    }
+
+    /// Launches a hybrid batched verify + piggybacked prefill pass without synchronizing.
+    /// Copies the verified rows' feature taps into `self.batch_verify` so
+    /// [`Model::batch_verify_taps`], [`Model::batch_verify_results`] and
+    /// [`Model::batch_verify_anchors`] can feed `Draft::batch_commit_and_draft` directly on
+    /// the model stream, and invokes `prefill_taps` for each prefill slice on the stream.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "validates verify + prefill slots, uploads inputs and enqueues hybrid verify"
+    )]
+    pub(crate) fn start_verify_hybrid(
+        &mut self,
+        verify_slots: &[usize],
+        verify_tokens: BatchVerifyTokens<'_>,
+        accept: &[Accept],
+        verify_sampling: &[Sampling],
+        prefill_slices: &[PackedPrefill<'_>],
+        chunk: usize,
+        mut prefill_taps: Option<PackedTapsCallback<'_>>,
+    ) -> anyhow::Result<PendingHybridVerify> {
+        let seqs = verify_slots.len();
+        ensure!(
+            (1..=BATCH_ROWS).contains(&seqs),
+            "hybrid verify takes 1 to {BATCH_ROWS} verify sequences, not {seqs}"
+        );
+        ensure!(accept.len() == seqs, "one accept mode per verify sequence");
+        ensure!(
+            verify_sampling.len() == seqs,
+            "one sampling per verify sequence"
+        );
+        ensure!(!prefill_slices.is_empty(), "no prefill slices to piggyback");
+        ensure!(
+            prefill_slices.len() <= BATCH_ROWS,
+            "at most {BATCH_ROWS} prefill slices can be piggybacked, got {}",
+            prefill_slices.len()
+        );
+        ensure!(
+            (1..=MAX_PREFILL_CHUNK).contains(&chunk),
+            "chunk is {chunk}, expected 1 to {MAX_PREFILL_CHUNK}"
+        );
+        ensure!(
+            self.ctx.kv_rounding.recent == 0,
+            "hybrid verify does not support recent-window kv rounding"
+        );
+        ensure!(
+            self.sampler
+                || (verify_sampling.iter().all(Sampling::is_greedy)
+                    && prefill_slices
+                        .iter()
+                        .all(|s| !s.need_first_token || s.sampling.is_greedy())),
+            "sampling in a hybrid verify needs enable_sampling"
+        );
+        let width = match &verify_tokens {
+            BatchVerifyTokens::Host(rows) => {
+                ensure!(rows.len() == seqs, "one token slice per verify sequence");
+                let w = rows[0].len();
+                ensure!(
+                    rows.iter().all(|r| r.len() == w),
+                    "every sequence in a hybrid verify must have the same width"
+                );
+                w
+            }
+            BatchVerifyTokens::Device { tokens: d, width } => {
+                ensure!(
+                    d.len() == seqs * *width,
+                    "device tokens has {} elements, expected {seqs} x {width}",
+                    d.len()
+                );
+                *width
+            }
+        };
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&width),
+            "hybrid verify takes width 1 to {VERIFY_ROWS}, not {width}"
+        );
+        let verify_rows = seqs * width;
+        ensure!(
+            verify_rows <= BATCH_VERIFY_MAX_ROWS,
+            "{seqs} sequences x {width} rows = {verify_rows} exceeds {BATCH_VERIFY_MAX_ROWS}"
+        );
+        let hidden = self.ctx.hidden();
+        let mut verify_positions = Vec::with_capacity(seqs);
+        let mut slot_starts = Vec::with_capacity(seqs);
+        let mut keeps = Vec::with_capacity(seqs);
+        for (i, &slot) in verify_slots.iter().enumerate() {
+            ensure!(
+                verify_slots[..i].iter().all(|&s| s != slot),
+                "slot {slot} appears twice in hybrid verify"
+            );
+            let start = self.slot_position(slot)?;
+            let last = start + width - 1;
+            ensure!(
+                self.visits.iter().all(|v| v.kv.holds(last)),
+                "slot {slot}: the global KV caches cannot hold position {last}"
+            );
+            self.map_slot(slot, last + 1)?;
+            verify_positions
+                .push(u32::try_from(start).context("position does not fit the kernels")?);
+            slot_starts.push((slot, start));
+            let keep = match accept[i] {
+                Accept::Greedy => 0,
+                Accept::Rows(n) => {
+                    ensure!((1..=width).contains(&n), "cannot keep {n} of {width} rows");
+                    u32::try_from(n)?
+                }
+            };
+            keeps.push(keep);
+        }
+        let mut total_rows = verify_rows;
+        let mut meta = Vec::with_capacity(prefill_slices.len());
+        let mut starts_u32 = Vec::with_capacity(prefill_slices.len());
+        let mut prefill_ids = Vec::new();
+        let mut prefill_slots = Vec::with_capacity(prefill_slices.len());
+        for (i, s) in prefill_slices.iter().enumerate() {
+            ensure!(!s.tokens.is_empty(), "piggybacked slice {i} is empty");
+            ensure!(
+                !verify_slots.contains(&s.slot),
+                "slot {} appears in both verify and prefill slices of hybrid verify",
+                s.slot
+            );
+            ensure!(
+                prefill_slices[..i].iter().all(|prev| prev.slot != s.slot),
+                "slot {} appears twice in piggybacked prefill slices",
+                s.slot
+            );
+            let start = self.slot_position(s.slot)?;
+            let last = start + s.tokens.len() - 1;
+            ensure!(
+                self.visits.iter().all(|v| v.kv.holds(last)),
+                "slot {}: the global KV caches cannot hold position {last}",
+                s.slot
+            );
+            self.map_slot(s.slot, last + 1)?;
+            u32::try_from(last).context("position does not fit the kernels")?;
+            for run in &s.images {
+                ensure!(
+                    !run.rows.is_empty() && run.rows.len().is_multiple_of(hidden),
+                    "image rows hold {} values, not whole rows of {hidden}",
+                    run.rows.len()
+                );
+            }
+            starts_u32.push(u32::try_from(start)?);
+            prefill_slots.push((s.slot, start, s.tokens.len(), s.need_first_token));
+            meta.push(PackedSliceMeta {
+                slot: s.slot,
+                offset: total_rows,
+                len: s.tokens.len(),
+                start,
+                images: &s.images,
+                need_first_token: s.need_first_token,
+                sampling: s.sampling,
+            });
+            total_rows += s.tokens.len();
+            for &t in s.tokens {
+                prefill_ids.push(i32::try_from(t)?);
+            }
+        }
+        ensure!(
+            total_rows <= chunk,
+            "hybrid verify has {total_rows} rows, exceeding chunk {chunk}"
+        );
+        self.reserve_prefill(total_rows)?;
+        self.ensure_batch_verify(seqs, verify_rows)?;
+        {
+            let bv = self
+                .batch_verify
+                .as_ref()
+                .and_then(|p| p.batch.as_ref())
+                .and_then(|b| b.verify.as_ref())
+                .context("the batch verify state is missing")?;
+            ensure!(!bv.pending, "the last batched verify's verdicts were not read");
+        }
+        self.update_batch_tables(verify_slots, true)?;
+        let stream = Arc::clone(&self.ctx.stream);
+        {
+            let p = self
+                .prefill
+                .as_mut()
+                .context("the prefill buffers are missing")?;
+            p.record_taps = true;
+            if p.taps.is_none() || p.tap_layout != self.tap_layout {
+                p.taps = None;
+                p.tap_layout = self.tap_layout.clone();
+                p.taps = Some(zeros(&stream, p.rows * p.tap_layout.len() * hidden)?);
+            }
+            match verify_tokens {
+                BatchVerifyTokens::Host(rows) => {
+                    let mut ids = Vec::with_capacity(total_rows);
+                    for row in rows {
+                        for &tok in *row {
+                            ids.push(i32::try_from(tok)?);
+                        }
+                    }
+                    ids.extend_from_slice(&prefill_ids);
+                    stream.memcpy_htod(&ids, &mut rows_mut(&mut p.tokens, total_rows, 1))?;
+                }
+                BatchVerifyTokens::Device { tokens: d, .. } => {
+                    stream.memcpy_dtod(&d, &mut p.tokens.slice_mut(..verify_rows))?;
+                    stream.memcpy_htod(
+                        &prefill_ids,
+                        &mut p.tokens.slice_mut(verify_rows..total_rows),
+                    )?;
+                }
+            }
+            stream.memcpy_htod(
+                &starts_u32,
+                &mut p.packed_starts.slice_mut(..prefill_slices.len()),
+            )?;
+        }
+        {
+            let bv_p = self
+                .batch_verify
+                .as_mut()
+                .context("the batch verify buffers are missing")?;
+            let b = bv_p
+                .batch
+                .as_mut()
+                .context("the batch verify buffers are missing")?;
+            let bv = b
+                .verify
+                .as_mut()
+                .context("the batch verify state is missing")?;
+            stream.memcpy_htod(&verify_positions, &mut b.positions.slice_mut(..seqs))?;
+            stream.memcpy_htod(&keeps, &mut bv.keep.slice_mut(..seqs))?;
+            if let Some(sample) = bv_p.sample.as_mut() {
+                let mut settings = Vec::with_capacity(verify_rows);
+                for (seq, &pos) in verify_positions.iter().enumerate() {
+                    for j in 0..width {
+                        settings.push((verify_sampling[seq], pos as usize + j + 1));
+                    }
+                }
+                sample.upload(&stream, &settings)?;
+            }
+            bv.width = width;
+            bv.last_seqs = seqs;
+            bv.padded_seqs = seqs;
+        }
+        let Self {
+            ctx,
+            passes,
+            visits,
+            slots,
+            max_blocks,
+            prefill,
+            batch_verify,
+            sample_one,
+            sampler,
+            ..
+        } = self;
+        let p = prefill
+            .as_mut()
+            .context("the prefill buffers are missing")?;
+        let bv_p = batch_verify
+            .as_mut()
+            .context("the batch verify buffers are missing")?;
+        let mut by_slice: Vec<Option<&mut [VisitState]>> =
+            (0..prefill_slices.len()).map(|_| None).collect();
+        if let Some(pos) = prefill_slices.iter().position(|s| s.slot == 0) {
+            by_slice[pos] = Some(visits.as_mut_slice());
+        }
+        for (idx, slot_state) in slots.iter_mut().enumerate() {
+            if let Some(pos) = prefill_slices.iter().position(|s| s.slot == idx + 1) {
+                by_slice[pos] = Some(slot_state.visits.as_mut_slice());
+            }
+        }
+        let mut slice_visits: Vec<&mut [VisitState]> = by_slice
+            .into_iter()
+            .map(|v| v.context("missing visit states for piggybacked slot"))
+            .collect::<anyhow::Result<_>>()?;
+        ctx.hybrid_enqueue(
+            p,
+            bv_p,
+            &mut slice_visits,
+            *passes,
+            *max_blocks,
+            verify_rows,
+            &meta,
+            total_rows,
+            sample_one,
+            *sampler,
+        )?;
+        let row_len = p.tap_layout.len() * hidden;
+        if let (Some(src), Some(dst)) = (p.taps.as_ref(), bv_p.taps.as_mut()) {
+            stream.memcpy_dtod(
+                &src.slice(..verify_rows * row_len),
+                &mut dst.slice_mut(..verify_rows * row_len),
+            )?;
+        }
+        if let Some(taps) = prefill_taps.as_mut() {
+            let buffer = p.taps.as_ref().context("the taps buffer is missing")?;
+            for m_info in &meta {
+                let view =
+                    buffer.slice(m_info.offset * row_len..(m_info.offset + m_info.len) * row_len);
+                taps(m_info.slot, m_info.start, view)?;
+            }
+        }
+        bv_p.batch
+            .as_mut()
+            .and_then(|b| b.verify.as_mut())
+            .context("the batch verify state is missing")?
+            .pending = true;
+        Ok(PendingHybridVerify {
+            verify_slots: slot_starts,
+            width,
+            prefill_slots,
+        })
+    }
+
+    /// Waits for `pending`, reads every verified sequence's verdict and every finishing
+    /// piggybacked prefill slice's first token, and advances every slot's position.
+    pub fn finish_verify_hybrid(
+        &mut self,
+        pending: PendingHybridVerify,
+    ) -> anyhow::Result<HybridVerifyResult> {
+        let PendingHybridVerify {
+            verify_slots,
+            width,
+            prefill_slots,
+        } = pending;
+        let seqs = verify_slots.len();
+        for &(slot, start) in &verify_slots {
+            ensure!(
+                self.slot_position(slot)? == start,
+                "slot {slot}'s position moved before finish_verify_hybrid"
+            );
+        }
+        for &(slot, start, _, _) in &prefill_slots {
+            ensure!(
+                self.slot_position(slot)? == start,
+                "slot {slot}'s position moved before finish_verify_hybrid"
+            );
+        }
+        let stream = Arc::clone(&self.ctx.stream);
+        let bv = self
+            .batch_verify
+            .as_mut()
+            .and_then(|p| p.batch.as_mut())
+            .and_then(|b| b.verify.as_mut())
+            .context("the batch verify state is missing")?;
+        ensure!(
+            bv.pending && bv.last_seqs == seqs && bv.width == width,
+            "the verdicts belong to another batched verify"
+        );
+        bv.pending = false;
+        let raw = stream.clone_dtoh(&bv.results.slice(..seqs * RESULT_LEN))?;
+        let ids = |r: &[i32]| -> anyhow::Result<Vec<u32>> {
+            r.iter()
+                .map(|&t| u32::try_from(t).context("a negative token id"))
+                .collect()
+        };
+        let mut verdicts = Vec::with_capacity(seqs);
+        for (seq, &(slot, start)) in verify_slots.iter().enumerate() {
+            let result = &raw[seq * RESULT_LEN..(seq + 1) * RESULT_LEN];
+            let accepted = usize::try_from(result[0])?;
+            ensure!(
+                accepted < width,
+                "slot {slot}: accepted {accepted} of {} drafts",
+                width - 1
+            );
+            if slot == 0 {
+                self.position = start + accepted + 1;
+            } else {
+                self.slots[slot - 1].position = start + accepted + 1;
+            }
+            verdicts.push(Verdict {
+                accepted,
+                tokens: ids(&result[1..=width])?,
+                argmax: ids(&result[1 + VERIFY_ROWS..1 + VERIFY_ROWS + width])?,
+            });
+        }
+        let finishing: Vec<usize> = prefill_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, _, need))| *need)
+            .map(|(i, _)| i)
+            .collect();
+        let mut prefill_tokens = vec![None; prefill_slots.len()];
+        if !finishing.is_empty() {
+            let p = self
+                .prefill
+                .as_ref()
+                .context("the prefill buffers are missing")?;
+            let raw_prefill = stream.clone_dtoh(&p.packed_argmax.slice(..finishing.len()))?;
+            for (idx, tok) in finishing.into_iter().zip(raw_prefill) {
+                prefill_tokens[idx] =
+                    Some(u32::try_from(tok).context("argmax returned a negative index")?);
+            }
+        }
+        for &(slot, _, len, _) in &prefill_slots {
+            if slot == 0 {
+                self.position += len;
+            } else {
+                self.slots[slot - 1].position += len;
+            }
+        }
+        Ok(HybridVerifyResult {
+            verdicts,
+            prefill_tokens,
+        })
     }
 }
 
@@ -4054,6 +4846,1061 @@ impl Ctx {
                 ],
                 &packed_rows,
                 m,
+            )?;
+        }
+        std::mem::swap(&mut p.hidden, &mut p.out);
+        Ok(())
+    }
+
+    /// Hybrid forward pass combining `batch_rows` contiguous decode or batched-verify rows
+    /// (`0..batch_rows`, backed by `batch_p.batch`) with one or more piggybacked prefill
+    /// slices (`batch_rows..m`, backed by `slice_visits`).
+    #[expect(clippy::too_many_arguments, reason = "hybrid forward pass state and slices")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors prefill_packed_enqueue + batch_head top to bottom"
+    )]
+    fn hybrid_enqueue(
+        &self,
+        p: &mut PrefillScratch,
+        batch_p: &mut PrefillScratch,
+        slice_visits: &mut [&mut [VisitState]],
+        passes: usize,
+        max_blocks: usize,
+        batch_rows: usize,
+        meta: &[PackedSliceMeta<'_>],
+        m: usize,
+        sample_one: &mut SampleBuffers,
+        sampler: bool,
+    ) -> anyhow::Result<()> {
+        let cfg = &self.config;
+        let (core_start, core_end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
+        let hidden = self.hidden();
+        let mh = m * hidden;
+        let num_visits = slice_visits[0].len();
+
+        if let Some(b) = batch_p.batch.as_mut()
+            && let Some(bv) = b.verify.as_mut()
+        {
+            let width = bv.width;
+            let seqs = batch_rows / width;
+            self.kernels.spec.ring_backup_batch(
+                &self.stream,
+                &b.tables,
+                &bv.sliding_visits,
+                num_visits,
+                b.max_seqs,
+                seqs,
+                bv.ring_slots,
+                &b.positions.slice(..seqs),
+                width,
+                &mut bv.ring_backup,
+                bv.ring_row_bytes,
+            )?;
+        }
+
+        self.kernels.elementwise.embedding(
+            &self.stream,
+            &rows(&p.tokens, m, 1),
+            self.weights.embed.slice(),
+            &mut rows_mut(&mut p.embedded, m, hidden),
+        )?;
+        self.kernels.norm.rms_norm(
+            &self.stream,
+            &rows(&p.embedded, m, hidden),
+            &self.weights.embed_norm,
+            &mut rows_mut(&mut p.hidden, m, hidden),
+            self.eps(),
+        )?;
+        for s in meta {
+            for image in s.images {
+                let first = image.position.max(s.start);
+                let end = (image.position + image.len(hidden)).min(s.start + s.len);
+                if first < end {
+                    let from = (first - image.position) * hidden;
+                    let to = (s.offset + first - s.start) * hidden;
+                    let len = (end - first) * hidden;
+                    self.stream.memcpy_dtod(
+                        &image.rows.slice(from..from + len),
+                        &mut p.hidden.slice_mut(to..to + len),
+                    )?;
+                }
+            }
+        }
+        let mut blocks = Blocks {
+            len: 0,
+            max: max_blocks,
+        };
+        let mut visit_index = 0usize;
+        for layer in 0..core_start {
+            self.visit_hybrid_rows(
+                p,
+                batch_p,
+                slice_visits,
+                visit_index,
+                layer,
+                &mut blocks,
+                false,
+                batch_rows,
+                meta,
+                m,
+            )?;
+            visit_index += 1;
+        }
+        self.stream.memcpy_dtod(
+            &rows(&p.hidden, m, hidden),
+            &mut rows_mut(&mut p.prelude_hidden, m, hidden),
+        )?;
+        let prelude_blocks = blocks.len;
+        for pass in 0..passes {
+            if pass > 0 {
+                self.kernels.norm.unweighted_rms_norm_bf16(
+                    &self.stream,
+                    &rows(&p.hidden, m, hidden),
+                    &mut rows_mut(&mut p.bank_normed, m, hidden),
+                    self.eps(),
+                )?;
+                p.bank_rows = blocks.len.saturating_sub(prelude_blocks + 1);
+                ensure!(p.bank_rows > 0, "the message bank needs a block state");
+                ensure!(
+                    p.bank_rows < FUSED_MAX_CANDIDATES,
+                    "{} bank states; at most {} fit",
+                    p.bank_rows,
+                    FUSED_MAX_CANDIDATES - 1
+                );
+                self.stream.memcpy_dtod(
+                    &p.blocks.slice((prelude_blocks + 1) * mh..blocks.len * mh),
+                    &mut p.bank.slice_mut(..p.bank_rows * mh),
+                )?;
+                self.stream.memcpy_dtod(
+                    &rows(&p.prelude_hidden, m, hidden),
+                    &mut rows_mut(&mut p.hidden, m, hidden),
+                )?;
+                blocks.len = prelude_blocks;
+            }
+            for (i, layer) in (core_start..core_end).enumerate() {
+                if pass > 0 {
+                    let bank_rows = p.bank_rows;
+                    let dests = p.gate.inputs.each_mut().map(|x| {
+                        Some(NormDest {
+                            out: strided_mut(x, m, 2 * hidden, hidden, hidden),
+                            weight: None,
+                        })
+                    });
+                    self.kernels.routing.depth_attention_rows(
+                        &self.stream,
+                        DepthRows {
+                            blocks: p.bank.slice(..bank_rows * mh),
+                            partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
+                            normed_partial: None,
+                            queries: &self.weights.message_queries[i],
+                            out: None,
+                            probs: Some(rows_mut(
+                                &mut p.message_probs,
+                                m,
+                                MESSAGE_SLOTS * (bank_rows + 1),
+                            )),
+                            dests,
+                            dst_stride: 2 * hidden,
+                            rows: m,
+                        },
+                        self.eps(),
+                    )?;
+                }
+                self.visit_hybrid_rows(
+                    p,
+                    batch_p,
+                    slice_visits,
+                    visit_index,
+                    layer,
+                    &mut blocks,
+                    pass > 0,
+                    batch_rows,
+                    meta,
+                    m,
+                )?;
+                visit_index += 1;
+            }
+        }
+        for layer in core_end..cfg.num_hidden_layers {
+            self.visit_hybrid_rows(
+                p,
+                batch_p,
+                slice_visits,
+                visit_index,
+                layer,
+                &mut blocks,
+                false,
+                batch_rows,
+                meta,
+                m,
+            )?;
+            visit_index += 1;
+        }
+
+        // Final depth attention + norm across all `m` rows.
+        self.kernels.routing.depth_attention_rows(
+            &self.stream,
+            DepthRows {
+                blocks: blocks.rows(&p.blocks, mh)?,
+                partial: RowsPartial::Bf16(rows(&p.hidden, m, hidden)),
+                normed_partial: None,
+                queries: &self.weights.final_query,
+                out: None,
+                probs: None,
+                dests: [
+                    Some(NormDest {
+                        out: rows_mut(&mut p.final_hidden, m, hidden),
+                        weight: Some(&self.weights.norm),
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                dst_stride: hidden,
+                rows: m,
+            },
+            self.eps(),
+        )?;
+        if p.record_taps && p.tap_layout.final_hidden {
+            let count = p.tap_layout.len();
+            let taps = p.taps.as_mut().context("the taps buffer is missing")?;
+            self.kernels.spec.copy_tap(
+                &self.stream,
+                &rows(&p.final_hidden, m, hidden),
+                &mut rows_mut(taps, m, count * hidden),
+                count - 1,
+                count,
+            )?;
+        }
+
+        // Keep `batch_p.final_hidden` populated for rows `0..batch_rows` so
+        // `Model::batch_logits` / `Model::batch_verify_logits` can compute logits on demand.
+        self.stream.memcpy_dtod(
+            &p.final_hidden.slice(..batch_rows * hidden),
+            &mut batch_p.final_hidden.slice_mut(..batch_rows * hidden),
+        )?;
+
+        // 1. Batched LM head, sampling/fused greedy argmax, and (for verify) acceptance +
+        //    rollback over rows `0..batch_rows`.
+        let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
+        let fp8 = self.weights.lm_head_fp8.as_ref();
+        {
+            let b = batch_p
+                .batch
+                .as_mut()
+                .context("the batch buffers are missing")?;
+            let use_margin = b.verify.is_some() && self.accept_margin > 0.0;
+            if use_margin {
+                let head_logits = batch_p
+                    .head_logits
+                    .as_mut()
+                    .context("the head_logits buffer is missing")?;
+                let head_capped = batch_p
+                    .head_capped
+                    .as_mut()
+                    .context("the head_capped buffer is missing")?;
+                self.gemm_rows(
+                    &mut [RowProduct {
+                        weight: self.weights.lm_head.slice(),
+                        fp8,
+                        mxfp8: None,
+                        x: p.final_hidden.slice(..batch_rows * hidden),
+                        out: rows_mut(head_logits, batch_rows, padded),
+                    }],
+                    batch_rows,
+                    true,
+                    Some(&mut batch_p.gate.dense),
+                )?;
+                self.kernels.elementwise.logit_softcap(
+                    &self.stream,
+                    &rows(head_logits, batch_rows, padded),
+                    &mut rows_mut(head_capped, batch_rows, vocab),
+                    cfg.final_logit_softcapping,
+                )?;
+                match batch_p.sample.as_mut() {
+                    Some(sample) => self.kernels.sample.run(
+                        &self.stream,
+                        &rows(head_capped, batch_rows, vocab),
+                        vocab,
+                        sample,
+                        &mut b.argmax.slice_mut(..batch_rows),
+                    )?,
+                    None => self.kernels.misc.argmax_f32(
+                        &self.stream,
+                        &rows(head_capped, batch_rows, vocab),
+                        &mut b.argmax.slice_mut(..batch_rows),
+                        vocab,
+                    )?,
+                }
+            } else if let Some(sample) = batch_p.sample.as_mut() {
+                let head_logits = batch_p
+                    .head_logits
+                    .as_mut()
+                    .context("the head_logits buffer is missing")?;
+                self.gemm_rows(
+                    &mut [RowProduct {
+                        weight: self.weights.lm_head.slice(),
+                        fp8,
+                        mxfp8: None,
+                        x: p.final_hidden.slice(..batch_rows * hidden),
+                        out: rows_mut(head_logits, batch_rows, padded),
+                    }],
+                    batch_rows,
+                    true,
+                    Some(&mut batch_p.gate.dense),
+                )?;
+                self.kernels.sample.run_bf16(
+                    &self.stream,
+                    &rows(head_logits, batch_rows, padded),
+                    vocab,
+                    padded,
+                    cfg.final_logit_softcapping,
+                    sample,
+                    &mut b.argmax.slice_mut(..batch_rows),
+                )?;
+            } else {
+                let partials = batch_p
+                    .head_partials
+                    .as_mut()
+                    .context("the head_partials buffer is missing")?;
+                self.greedy_head_argmax(
+                    &p.final_hidden.slice(..batch_rows * hidden),
+                    batch_rows,
+                    partials,
+                    batch_p.head_fp8.as_mut(),
+                    &mut b.argmax.slice_mut(..batch_rows),
+                )?;
+            }
+            if let Some(bv) = b.verify.as_mut() {
+                let width = bv.width;
+                let seqs = batch_rows / width;
+                let spec = &self.kernels.spec;
+                let (tokens, argmax) = (rows(&p.tokens, batch_rows, 1), b.argmax.slice(..batch_rows));
+                let keep = bv.keep.slice(..seqs);
+                let mut results = bv.results.slice_mut(..seqs * RESULT_LEN);
+                let mut anchors = bv.anchors.slice_mut(..seqs);
+                if use_margin {
+                    let head_capped = batch_p
+                        .head_capped
+                        .as_ref()
+                        .context("the head_capped buffer is missing")?;
+                    spec.accept_margin_batch(
+                        &self.stream,
+                        &tokens,
+                        &argmax,
+                        &rows(head_capped, batch_rows, vocab),
+                        vocab,
+                        &keep,
+                        seqs,
+                        width,
+                        self.accept_margin,
+                        &mut results,
+                        &mut anchors,
+                    )?;
+                } else {
+                    spec.accept_greedy_batch(
+                        &self.stream,
+                        &tokens,
+                        &argmax,
+                        &keep,
+                        seqs,
+                        width,
+                        &mut results,
+                        &mut anchors,
+                    )?;
+                }
+                spec.conv_rollback_batch(
+                    &self.stream,
+                    &b.tables,
+                    num_visits,
+                    b.max_seqs,
+                    seqs,
+                    &bv.inputs,
+                    &bv.results.slice(..seqs * RESULT_LEN),
+                )?;
+                spec.ring_restore_batch(
+                    &self.stream,
+                    &b.tables,
+                    &bv.sliding_visits,
+                    num_visits,
+                    b.max_seqs,
+                    seqs,
+                    bv.ring_slots,
+                    &b.positions.slice(..seqs),
+                    width,
+                    &bv.ring_backup,
+                    &bv.results.slice(..seqs * RESULT_LEN),
+                    bv.ring_row_bytes,
+                )?;
+            }
+        }
+
+        // 2. Finishing prefill slices: gather last hidden row of each into `p.out` and run
+        //    fused greedy argmax or BF16 inline-softcap sampling into `p.packed_argmax`.
+        let finishing: Vec<usize> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.need_first_token)
+            .map(|(i, _)| i)
+            .collect();
+        if finishing.is_empty() {
+            return Ok(());
+        }
+        for (k, &si) in finishing.iter().enumerate() {
+            let last_row = meta[si].offset + meta[si].len - 1;
+            self.stream.memcpy_dtod(
+                &p.final_hidden
+                    .slice(last_row * hidden..(last_row + 1) * hidden),
+                &mut p.out.slice_mut(k * hidden..(k + 1) * hidden),
+            )?;
+        }
+        let step = if fp8.is_some() {
+            HEAD_ROWS.min(linear_rows::MAX_ROWS)
+        } else {
+            HEAD_ROWS
+        };
+        for first in (0..finishing.len()).step_by(step) {
+            let n = step.min(finishing.len() - first);
+            let all_greedy = !sampler
+                || finishing[first..first + n]
+                    .iter()
+                    .all(|&si| meta[si].sampling.is_greedy());
+            if all_greedy {
+                let partials = p
+                    .head_partials
+                    .as_mut()
+                    .context("the head_partials buffer is missing")?;
+                self.greedy_head_argmax(
+                    &p.out.slice(first * hidden..(first + n) * hidden),
+                    n,
+                    partials,
+                    None,
+                    &mut p.packed_argmax.slice_mut(first..first + n),
+                )?;
+            } else {
+                let head_logits = p
+                    .head_logits
+                    .as_mut()
+                    .context("the head_logits buffer is missing")?;
+                self.gemm_rows(
+                    &mut [RowProduct {
+                        weight: self.weights.lm_head.slice(),
+                        fp8,
+                        mxfp8: None,
+                        x: p.out.slice(first * hidden..(first + n) * hidden),
+                        out: rows_mut(head_logits, n, padded),
+                    }],
+                    n,
+                    fp8.is_some(),
+                    None,
+                )?;
+                for (j, &si) in finishing[first..first + n].iter().enumerate() {
+                    let s = &meta[si];
+                    let row_logits = head_logits.slice(j * padded..(j + 1) * padded);
+                    let mut dst = p.packed_argmax.slice_mut((first + j)..=(first + j));
+                    sample_one.upload(&self.stream, &[(s.sampling, s.start + s.len)])?;
+                    self.kernels.sample.run_bf16(
+                        &self.stream,
+                        &row_logits,
+                        vocab,
+                        padded,
+                        cfg.final_logit_softcapping,
+                        sample_one,
+                        &mut dst,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One decoder-layer visit for a hybrid decode/verify + piggybacked prefill pass.
+    #[expect(clippy::too_many_arguments, reason = "hybrid visit state")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors visit_packed_rows with single-launch batch kernels on rows 0..batch_rows"
+    )]
+    fn visit_hybrid_rows(
+        &self,
+        p: &mut PrefillScratch,
+        batch_p: &mut PrefillScratch,
+        slice_visits: &mut [&mut [VisitState]],
+        index: usize,
+        layer: usize,
+        blocks: &mut Blocks,
+        messages: bool,
+        batch_rows: usize,
+        meta: &[PackedSliceMeta<'_>],
+        m: usize,
+    ) -> anyhow::Result<()> {
+        let cfg = &self.config;
+        let layer_w = &self.weights.layers[layer];
+        let attn_w = &layer_w.attention;
+        let sliding = cfg.is_sliding(layer);
+        let hidden = self.hidden();
+        let heads = cfg.num_attention_heads;
+        let q_dims = heads * cfg.head_dim;
+        let kv_dims = cfg.num_key_value_heads * cfg.head_dim;
+        let rel_dims = heads * cfg.d_rel;
+        let bias_w = heads * cfg.rel_extent;
+        let taps_w = cfg.num_key_value_heads * cfg.sconv_kernel_size;
+        let mh = m * hidden;
+
+        if p.record_taps
+            && let Some(tap) = p.tap_layout.visits.iter().position(|&v| v == index)
+        {
+            let count = p.tap_layout.len();
+            let taps = p.taps.as_mut().context("the taps buffer is missing")?;
+            self.kernels.spec.copy_tap(
+                &self.stream,
+                &rows(&p.hidden, m, hidden),
+                &mut rows_mut(taps, m, count * hidden),
+                tap,
+                count,
+            )?;
+        }
+        let block_start = layer.is_multiple_of(cfg.n_layers_per_attn_res_block);
+        ensure!(
+            !block_start || blocks.len < blocks.max,
+            "more block states than planned"
+        );
+        let gates = if messages {
+            layer_w.message_gates.as_ref()
+        } else {
+            None
+        };
+        let loops = cfg.loop_config;
+        let looped = (
+            layer.saturating_sub(loops.core_start),
+            loops.core_end - loops.core_start,
+        );
+
+        let (states, mut rest) = p.blocks.split_at_mut(blocks.len * mh);
+        let normed = block_start.then(|| rest.slice_mut(..mh));
+        let (one_input, prequant_qkv) = self.attention_inputs_rows(
+            layer_w,
+            AttentionInputsRows {
+                x: rows(&p.hidden, m, hidden),
+                states: states.slice(..),
+                normed,
+                inputs: &mut p.attention_inputs,
+                qkv_in: &mut p.qkv_in,
+                gate: &mut p.gate,
+                messages: gates.map(|g| {
+                    (
+                        g,
+                        Messages::new(
+                            &p.bank,
+                            p.bank_rows,
+                            &p.bank_normed,
+                            &p.message_probs,
+                            p.message_x.as_ref(),
+                            m,
+                            hidden,
+                            looped,
+                        ),
+                    )
+                }),
+            },
+            sliding,
+            m,
+        )?;
+        if block_start {
+            blocks.len += 1;
+        }
+        let [q_in, k_in, v_in] = &p.qkv_in;
+        let (k_in, v_in) = if one_input {
+            (q_in, q_in)
+        } else {
+            (k_in, v_in)
+        };
+        let [q_in, k_in, v_in] = [q_in, k_in, v_in].map(|x| rows(x, m, hidden));
+
+        // 1. Attention input projections once across all `m` rows.
+        let attn = &mut p.attention;
+        if prequant_qkv {
+            self.attention_input_projections_quant(layer_w, attn, &p.gate.dense, one_input, m)?;
+        } else {
+            let fp8 = |i: usize| layer_w.fp8.as_ref().map(|f| &f.inputs[i]);
+            let mut products = vec![
+                RowProduct {
+                    weight: &attn_w.q,
+                    fp8: fp8(0),
+                    mxfp8: None,
+                    x: q_in.slice(..),
+                    out: rows_mut(&mut attn.q_raw, m, q_dims),
+                },
+                RowProduct {
+                    weight: &attn_w.r,
+                    fp8: fp8(1),
+                    mxfp8: None,
+                    x: q_in.slice(..),
+                    out: rows_mut(&mut attn.r_raw, m, rel_dims),
+                },
+                RowProduct {
+                    weight: &attn_w.gate,
+                    fp8: fp8(2),
+                    mxfp8: None,
+                    x: q_in.slice(..),
+                    out: rows_mut(&mut attn.gate, m, q_dims),
+                },
+                RowProduct {
+                    weight: &attn_w.sink,
+                    fp8: fp8(3),
+                    mxfp8: None,
+                    x: q_in.slice(..),
+                    out: rows_mut(&mut attn.sinks, m, heads),
+                },
+                RowProduct {
+                    weight: &attn_w.k,
+                    fp8: fp8(4),
+                    mxfp8: None,
+                    x: k_in.slice(..),
+                    out: rows_mut(&mut attn.k_raw, m, kv_dims),
+                },
+                RowProduct {
+                    weight: &attn_w.v,
+                    fp8: fp8(5),
+                    mxfp8: None,
+                    x: v_in.slice(..),
+                    out: rows_mut(&mut attn.v_raw, m, kv_dims),
+                },
+            ];
+            if let KvConv::Dynamic { k_proj, v_proj, .. } = &attn_w.kv_conv {
+                products.push(RowProduct {
+                    weight: k_proj,
+                    fp8: fp8(6),
+                    mxfp8: None,
+                    x: k_in.slice(..),
+                    out: rows_mut(&mut attn.k_dynamic, m, taps_w),
+                });
+                products.push(RowProduct {
+                    weight: v_proj,
+                    fp8: fp8(7),
+                    mxfp8: None,
+                    x: v_in.slice(..),
+                    out: rows_mut(&mut attn.v_dynamic, m, taps_w),
+                });
+            }
+            self.gemm_rows(&mut products, m, false, Some(&mut p.gate.dense))?;
+        }
+
+        // 2a. Batched attention_post_rows over rows `0..batch_rows` in one launch
+        //     (conv states for these rows are shifted in Step 8).
+        {
+            let batch_rows_ref = batch_p
+                .batch
+                .as_ref()
+                .context("the batch buffers are missing")?
+                .rows(index, batch_rows);
+            let like_state = &slice_visits[0][index];
+            let conv = match &attn_w.kv_conv {
+                KvConv::Static { k, v } => KvConvWeights::Static { k, v },
+                KvConv::Dynamic {
+                    k_static, v_static, ..
+                } => KvConvWeights::Dynamic {
+                    k_dynamic: attn.k_dynamic.slice(..batch_rows * taps_w),
+                    v_dynamic: attn.v_dynamic.slice(..batch_rows * taps_w),
+                    k_static,
+                    v_static,
+                },
+            };
+            self.kernels.norm.attention_post_rows(
+                &self.stream,
+                AttentionPostRows {
+                    k_raw: attn.k_raw.slice(..batch_rows * kv_dims),
+                    v_raw: attn.v_raw.slice(..batch_rows * kv_dims),
+                    conv,
+                    k_state: &like_state.conv[0],
+                    v_state: &like_state.conv[1],
+                    q_raw: attn.q_raw.slice(..batch_rows * q_dims),
+                    q_scale: &attn_w.q_clip_scale,
+                    r_raw: attn.r_raw.slice(..batch_rows * rel_dims),
+                    r_scale: &attn_w.rel_clip_scale,
+                    k: attn.k.slice_mut(..batch_rows * kv_dims),
+                    v: attn.v.slice_mut(..batch_rows * kv_dims),
+                    q: attn.q.slice_mut(..batch_rows * q_dims),
+                    r: attn.r.slice_mut(..batch_rows * rel_dims),
+                    log_scale: (!sliding).then_some((
+                        p.start.as_view(),
+                        cfg.log_scaling_alpha,
+                        cfg.log_scaling_n_floor as f32,
+                    )),
+                    qk_threshold: cfg.qk_l2_clip_threshold,
+                    rel_threshold: cfg.rel_l2_clip_threshold,
+                    eps: self.eps(),
+                    bias: None,
+                    batch: Some(&batch_rows_ref),
+                },
+                batch_rows,
+            )?;
+        }
+
+        // 2b. Per-slice attention_post_rows + K/V conv state shift for piggybacked prefills.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            let conv = match &attn_w.kv_conv {
+                KvConv::Static { k, v } => KvConvWeights::Static { k, v },
+                KvConv::Dynamic {
+                    k_static, v_static, ..
+                } => KvConvWeights::Dynamic {
+                    k_dynamic: attn.k_dynamic.slice(off * taps_w..(off + len) * taps_w),
+                    v_dynamic: attn.v_dynamic.slice(off * taps_w..(off + len) * taps_w),
+                    k_static,
+                    v_static,
+                },
+            };
+            self.kernels.norm.attention_post_rows(
+                &self.stream,
+                AttentionPostRows {
+                    k_raw: attn.k_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                    v_raw: attn.v_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                    conv,
+                    k_state: &state.conv[0],
+                    v_state: &state.conv[1],
+                    q_raw: attn.q_raw.slice(off * q_dims..(off + len) * q_dims),
+                    q_scale: &attn_w.q_clip_scale,
+                    r_raw: attn.r_raw.slice(off * rel_dims..(off + len) * rel_dims),
+                    r_scale: &attn_w.rel_clip_scale,
+                    k: attn.k.slice_mut(off * kv_dims..(off + len) * kv_dims),
+                    v: attn.v.slice_mut(off * kv_dims..(off + len) * kv_dims),
+                    q: attn.q.slice_mut(off * q_dims..(off + len) * q_dims),
+                    r: attn.r.slice_mut(off * rel_dims..(off + len) * rel_dims),
+                    log_scale: (!sliding).then_some((
+                        p.packed_starts.slice(si..=si),
+                        cfg.log_scaling_alpha,
+                        cfg.log_scaling_n_floor as f32,
+                    )),
+                    qk_threshold: cfg.qk_l2_clip_threshold,
+                    rel_threshold: cfg.rel_l2_clip_threshold,
+                    eps: self.eps(),
+                    bias: None,
+                    batch: None,
+                },
+                len,
+            )?;
+            let [k_state, v_state, ..] = &mut state.conv;
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &attn.k_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                k_state,
+                kv_dims,
+                len,
+            )?;
+            self.kernels.conv.shift_state(
+                &self.stream,
+                &attn.v_raw.slice(off * kv_dims..(off + len) * kv_dims),
+                v_state,
+                kv_dims,
+                len,
+            )?;
+        }
+
+        // 3. Relative bias and optional KV rounding once across all `m` rows.
+        self.kernels.attention.relative_bias_rows(
+            &self.stream,
+            &rows(&attn.r, m, rel_dims),
+            &attn_w.rel_table,
+            &mut rows_mut(&mut attn.bias, m, bias_w),
+        )?;
+        if slice_visits[0][index].round {
+            self.kernels.attention.round_rows(
+                &self.stream,
+                &mut rows_mut(&mut attn.k, m, kv_dims),
+                &mut rows_mut(&mut attn.v, m, kv_dims),
+                m,
+                self.kv_rounding,
+            )?;
+        }
+
+        // 4a. Batched decode/verify attention over rows `0..batch_rows` in one launch
+        //     (ungated so Step 5 gates all `m` rows uniformly).
+        {
+            let batch_rows_ref = batch_p
+                .batch
+                .as_ref()
+                .context("the batch buffers are missing")?
+                .rows(index, batch_rows);
+            let like_kv = &slice_visits[0][index].kv;
+            self.kernels.attention.attention_batch(
+                &self.stream,
+                &attn.q.slice(..batch_rows * q_dims),
+                &attn.k.slice(..batch_rows * kv_dims),
+                &attn.v.slice(..batch_rows * kv_dims),
+                like_kv,
+                &batch_rows_ref,
+                batch_rows,
+                &attn.bias.slice(..batch_rows * bias_w),
+                &attn.sinks.slice(..batch_rows * heads),
+                None,
+                &mut batch_p.attention.rows,
+                &mut attn.out.slice_mut(..batch_rows * q_dims),
+            )?;
+        }
+
+        // 4b. Per-slice flash prefill attention for piggybacked prefills.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            self.kernels.attention.prefill_attention(
+                &self.stream,
+                &attn.q.slice(off * q_dims..(off + len) * q_dims),
+                &attn.k.slice(off * kv_dims..(off + len) * kv_dims),
+                &attn.v.slice(off * kv_dims..(off + len) * kv_dims),
+                &mut state.kv,
+                &p.packed_starts.slice(si..=si),
+                len,
+                &attn.bias.slice(off * bias_w..(off + len) * bias_w),
+                &attn.sinks.slice(off * heads..(off + len) * heads),
+                &mut attn.partials,
+                &mut attn.out.slice_mut(off * q_dims..(off + len) * q_dims),
+                self.prefill_attention.products(slice.start + len),
+            )?;
+        }
+
+        // 5. Attention gate + output projection once across all `m` rows.
+        self.kernels.elementwise.attention_gate(
+            &self.stream,
+            &rows(&attn.out, m, q_dims),
+            &rows(&attn.gate, m, q_dims),
+            &mut rows_mut(&mut attn.gated, m, q_dims),
+        )?;
+        self.gemm_rows(
+            &mut [RowProduct {
+                weight: &attn_w.o,
+                fp8: layer_w.fp8.as_ref().and_then(|f| f.o.as_ref()),
+                mxfp8: layer_w.mxfp8_o.as_ref(),
+                x: rows(&attn.gated, m, q_dims),
+                out: rows_mut(&mut attn.proj, m, hidden),
+            }],
+            m,
+            false,
+            Some(&mut p.gate.dense),
+        )?;
+
+        // 6a. Batched post-attention conv + residual over rows `0..batch_rows`.
+        {
+            let batch_rows_ref = batch_p
+                .batch
+                .as_ref()
+                .context("the batch buffers are missing")?
+                .rows(index, batch_rows);
+            let hidden_batch = (!block_start).then(|| p.hidden.slice(..batch_rows * hidden));
+            self.kernels.conv.conv_residual_batch(
+                &self.stream,
+                &p.attention.proj.slice(..batch_rows * hidden),
+                &layer_w.post_attention_conv,
+                &batch_rows_ref.states,
+                hidden_batch.as_ref(),
+                &mut p.residual.slice_mut(..batch_rows * hidden),
+                batch_rows,
+                batch_rows_ref.rows_per_seq,
+            )?;
+        }
+
+        // 6b. Per-slice post-attention conv + residual (shifts conv[2]) for piggybacked prefills.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            let hidden_slice =
+                (!block_start).then(|| p.hidden.slice(off * hidden..(off + len) * hidden));
+            self.kernels.conv.short_conv_residual_rows(
+                &self.stream,
+                &p.attention.proj.slice(off * hidden..(off + len) * hidden),
+                &layer_w.post_attention_conv,
+                &mut state.conv[2],
+                hidden_slice.as_ref().map(|v| v as &dyn DeviceIn<bf16>),
+                &mut p.residual.slice_mut(off * hidden..(off + len) * hidden),
+                len,
+            )?;
+        }
+
+        // MLP depth attention + optional message gate once across all `m` rows.
+        let w13_quant =
+            (!p.moe.invariant && self.expert_activations != ExpertActivations::Bf16).then(|| {
+                let (w13, _) = self.expert_weights(layer_w);
+                experts::expert_quant_format(
+                    w13.format,
+                    self.expert_activations == ExpertActivations::Fp8,
+                )
+            });
+        if gates.is_none()
+            && let Some(qfmt) = w13_quant
+        {
+            let quant = p.moe.quantized.as_quant_dest(m, hidden, qfmt)?;
+            self.kernels.routing.depth_attention_rows_quant(
+                &self.stream,
+                DepthRowsQuant {
+                    blocks: blocks.rows(&p.blocks, mh)?,
+                    partial: RowsPartial::F32(rows(&p.residual, m, hidden)),
+                    normed_partial: None,
+                    queries: &layer_w.mlp_query,
+                    out: None,
+                    probs: None,
+                    dests: [
+                        Some(QuantNormDest {
+                            out: Some(rows_mut(&mut p.mlp_x, m, hidden)),
+                            weight: Some(&layer_w.mlp_norm),
+                            quant,
+                        }),
+                        None,
+                        None,
+                    ],
+                    dst_stride: hidden,
+                    rows: m,
+                },
+                self.eps(),
+            )?;
+            p.moe
+                .quantized
+                .mark_quantized(&self.stream, m, hidden, qfmt);
+        } else {
+            let (mlp_out, dests) = match gates {
+                Some(_) => (
+                    Some(rows_mut(&mut p.mlp_input, m, hidden)),
+                    [
+                        None,
+                        None,
+                        None,
+                        Some(NormDest {
+                            out: strided_mut(&mut p.gate.inputs[3], m, 2 * hidden, 0, hidden),
+                            weight: None,
+                        }),
+                    ],
+                ),
+                None => (
+                    None,
+                    [
+                        Some(NormDest {
+                            out: rows_mut(&mut p.mlp_x, m, hidden),
+                            weight: Some(&layer_w.mlp_norm),
+                        }),
+                        None,
+                        None,
+                        None,
+                    ],
+                ),
+            };
+            self.kernels.routing.depth_attention_rows(
+                &self.stream,
+                DepthRows {
+                    blocks: blocks.rows(&p.blocks, mh)?,
+                    partial: RowsPartial::F32(rows(&p.residual, m, hidden)),
+                    normed_partial: None,
+                    queries: &layer_w.mlp_query,
+                    out: mlp_out,
+                    probs: None,
+                    dests,
+                    dst_stride: if gates.is_some() { 2 * hidden } else { hidden },
+                    rows: m,
+                },
+                self.eps(),
+            )?;
+        }
+        if let Some(gates) = gates {
+            let norms = match w13_quant {
+                Some(qfmt) => GateNorms::Quant {
+                    weight: &layer_w.mlp_norm,
+                    normed: rows_mut(&mut p.mlp_x, m, hidden),
+                    quant: p.moe.quantized.as_quant_dest(m, hidden, qfmt)?,
+                },
+                None => GateNorms::Bf16(vec![(
+                    &layer_w.mlp_norm,
+                    rows_mut(&mut p.mlp_x, m, hidden),
+                )]),
+            };
+            self.message_gate_rows(
+                &gates[3..],
+                &mut p.gate,
+                3,
+                (rows(&p.mlp_input, m, hidden), hidden, 0),
+                &Messages::new(
+                    &p.bank,
+                    p.bank_rows,
+                    &p.bank_normed,
+                    &p.message_probs,
+                    p.message_x.as_ref(),
+                    m,
+                    hidden,
+                    looped,
+                ),
+                norms,
+                m,
+            )?;
+            if let Some(qfmt) = w13_quant {
+                p.moe
+                    .quantized
+                    .mark_quantized(&self.stream, m, hidden, qfmt);
+            }
+        }
+
+        // 7. MoE router + grouping + expert GEMMs once across all `m` rows.
+        self.moe_block_rows(layer_w, &mut p.moe, &p.mlp_x, w13_quant.is_some(), m)?;
+
+        // 8a. Batched post-MLP conv + residual + 4-stream conv state shift over `0..batch_rows`.
+        {
+            let b = batch_p
+                .batch
+                .as_mut()
+                .context("the batch buffers are missing")?;
+            let max_seqs = b.max_seqs;
+            let at = index * max_seqs * BATCH_STATE_WORDS;
+            if let Some(bv) = b.verify.as_mut() {
+                let width = bv.width;
+                let seqs = batch_rows / width;
+                let visit_len = max_seqs * VERIFY_ROWS * VISIT_CHANNELS;
+                self.kernels.conv.moe_conv_residual_batch_verify(
+                    &self.stream,
+                    &p.moe.down.slice(..batch_rows * 8 * hidden),
+                    &p.moe.weights.slice(..batch_rows * 8),
+                    &layer_w.post_mlp_conv,
+                    &p.residual.slice(..batch_rows * hidden),
+                    &mut p.out.slice_mut(..batch_rows * hidden),
+                    [
+                        p.attention.proj.slice(..batch_rows * hidden),
+                        p.attention.k_raw.slice(..batch_rows * kv_dims),
+                        p.attention.v_raw.slice(..batch_rows * kv_dims),
+                    ],
+                    &b.tables.slice(at..at + seqs * BATCH_STATE_WORDS),
+                    Some(bv.inputs.slice_mut(index * visit_len..(index + 1) * visit_len)),
+                    seqs,
+                    width,
+                )?;
+            } else {
+                self.kernels.conv.moe_conv_residual_batch(
+                    &self.stream,
+                    &p.moe.down.slice(..batch_rows * 8 * hidden),
+                    &p.moe.weights.slice(..batch_rows * 8),
+                    &layer_w.post_mlp_conv,
+                    &p.residual.slice(..batch_rows * hidden),
+                    &mut p.out.slice_mut(..batch_rows * hidden),
+                    [
+                        p.attention.proj.slice(..batch_rows * hidden),
+                        p.attention.k_raw.slice(..batch_rows * kv_dims),
+                        p.attention.v_raw.slice(..batch_rows * kv_dims),
+                    ],
+                    &b.tables.slice(at..at + batch_rows * BATCH_STATE_WORDS),
+                    batch_rows,
+                )?;
+            }
+        }
+
+        // 8b. Per-slice post-MLP conv + residual (shifts conv[3]) for piggybacked prefills.
+        for (si, slice) in meta.iter().enumerate() {
+            let (off, len) = (slice.offset, slice.len);
+            let state = &mut slice_visits[si][index];
+            self.kernels.conv.moe_conv_residual_rows(
+                &self.stream,
+                &p.moe.down.slice(off * 8 * hidden..(off + len) * 8 * hidden),
+                &p.moe.weights.slice(off * 8..(off + len) * 8),
+                &layer_w.post_mlp_conv,
+                &mut state.conv[3],
+                &p.residual.slice(off * hidden..(off + len) * hidden),
+                &mut p.moe.combined.slice_mut(off * hidden..(off + len) * hidden),
+                &mut p.out.slice_mut(off * hidden..(off + len) * hidden),
+                len,
             )?;
         }
         std::mem::swap(&mut p.hidden, &mut p.out);

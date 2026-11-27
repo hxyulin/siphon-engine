@@ -1379,6 +1379,274 @@ fn batch_wide_fp8_dense_and_wo_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// GPU parity test for `Model::step_hybrid` (Track E8): piggybacking chunked prefill slices
+/// (one short prompt completing mid-piggyback and one 1,500-token prompt spanning the 1,024
+/// sliding-window wrap across 6 chunks) onto active batched decode slots (mixed greedy +
+/// sampled, on both sides of the sliding window) must match separate `prefill_slot` +
+/// `step_batch_sampled` calls on emitted tokens and step logits.
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end hybrid piggyback parity test")]
+fn hybrid_step_matches_separate_fp8() -> anyhow::Result<()> {
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    model.enable_sampling()?;
+    let capture = capture_tokens()?;
+    let vocab = model.config().unpadded_vocab_size;
+
+    // 4 active decode slots (slots 0..4) + 2 piggybacked prefill slots (slots 4, 5).
+    let decode_specs: [(usize, usize, Sampling); 4] = [
+        (0, 64, Sampling::GREEDY),
+        (200, 1100, Sampling::GREEDY),
+        (600, 240, Sampling::new(0.8, 0, 0.95, 0.0, 42)?),
+        (1800, 1023, Sampling::GREEDY),
+    ];
+    let prefill_specs: [(usize, usize, Sampling); 2] = [
+        // Long prompt spanning sliding window boundary, chunked in 256-token piggyback slices.
+        (3000, 1500, Sampling::GREEDY),
+        // Short prompt completing on step 0 and joining decode on step 1.
+        (4600, 90, Sampling::new(0.7, 40, 0.9, 0.0, 99)?),
+    ];
+    let decode_n = decode_specs.len();
+    let total_slots = decode_n + prefill_specs.len();
+    model.add_slots(total_slots - 1)?;
+
+    // 1. Reference: separate `prefill_slot` + `step_batch_sampled` for 6 steps.
+    let mut ref_decode_tokens: Vec<Vec<u32>> = Vec::with_capacity(decode_n);
+    let mut ref_decode_logits: Vec<Vec<Vec<f32>>> = vec![Vec::new(); decode_n];
+    for (slot, &(first, len, sampling)) in decode_specs.iter().enumerate() {
+        model.reset_slot(slot)?;
+        model.set_sampling(sampling);
+        let first_tok = model.prefill_slot(slot, &capture[first..first + len], DEFAULT_PREFILL_CHUNK)?;
+        ref_decode_tokens.push(vec![first_tok]);
+    }
+    let decode_samplings: Vec<Sampling> = decode_specs.iter().map(|s| s.2).collect();
+    for _step in 0..6 {
+        let rows: Vec<(usize, u32)> = (0..decode_n)
+            .map(|slot| (slot, *ref_decode_tokens[slot].last().unwrap_or(&0)))
+            .collect();
+        let next = model.step_batch_sampled(&rows, &decode_samplings)?;
+        let logits = model.batch_logits(decode_n)?;
+        for slot in 0..decode_n {
+            ref_decode_tokens[slot].push(next[slot]);
+            ref_decode_logits[slot].push(logits[slot * vocab..(slot + 1) * vocab].to_vec());
+        }
+    }
+    let mut ref_prefill_first = Vec::with_capacity(prefill_specs.len());
+    let mut ref_prefill_step0_logits = Vec::with_capacity(prefill_specs.len());
+    for (i, &(first, len, sampling)) in prefill_specs.iter().enumerate() {
+        let slot = decode_n + i;
+        model.reset_slot(slot)?;
+        model.set_sampling(sampling);
+        let first_tok =
+            model.prefill_slot(slot, &capture[first..first + len], DEFAULT_PREFILL_CHUNK)?;
+        let _ = model.step_batch_sampled(&[(slot, first_tok)], &[sampling])?;
+        ref_prefill_first.push(first_tok);
+        ref_prefill_step0_logits.push(model.batch_logits(1)?);
+    }
+
+    // 2. Hybrid piggybacked pass: prefill decode slots 0..4, reset slots 4 & 5, then run
+    //    6 hybrid steps piggybacking 256-token chunks of slot 4 (plus 90-token slot 5 on step 0).
+    let mut got_decode_tokens: Vec<Vec<u32>> = Vec::with_capacity(decode_n);
+    for (slot, &(first, len, sampling)) in decode_specs.iter().enumerate() {
+        model.reset_slot(slot)?;
+        model.set_sampling(sampling);
+        let first_tok = model.prefill_slot(slot, &capture[first..first + len], DEFAULT_PREFILL_CHUNK)?;
+        got_decode_tokens.push(vec![first_tok]);
+    }
+    model.reset_slot(4)?;
+    model.reset_slot(5)?;
+
+    let long_prompt = &capture[prefill_specs[0].0..prefill_specs[0].0 + prefill_specs[0].1];
+    let short_prompt = &capture[prefill_specs[1].0..prefill_specs[1].0 + prefill_specs[1].1];
+    let mut long_done = 0usize;
+    let mut got_short_first = None;
+    let mut got_long_first = None;
+    let mut got_short_step0_logits = None;
+    let mut near_tie_flips = 0usize;
+
+    for step in 0..6 {
+        let mut decode_rows: Vec<(usize, u32)> = (0..decode_n)
+            .map(|slot| (slot, *got_decode_tokens[slot].last().unwrap_or(&0)))
+            .collect();
+        let mut step_samplings = decode_samplings.clone();
+        if let Some(short_tok) = got_short_first
+            && step == 1
+        {
+            decode_rows.push((5, short_tok));
+            step_samplings.push(prefill_specs[1].2);
+        }
+        let long_end = (long_done + 256).min(long_prompt.len());
+        let mut slices = vec![PackedPrefill {
+            slot: 4,
+            tokens: &long_prompt[long_done..long_end],
+            images: Vec::new(),
+            need_first_token: long_end == long_prompt.len(),
+            sampling: prefill_specs[0].2,
+        }];
+        if step == 0 {
+            slices.push(PackedPrefill {
+                slot: 5,
+                tokens: short_prompt,
+                images: Vec::new(),
+                need_first_token: true,
+                sampling: prefill_specs[1].2,
+            });
+        }
+        let res = model.step_hybrid(&decode_rows, &step_samplings, &slices, DEFAULT_PREFILL_CHUNK)?;
+        let logits = model.batch_logits(decode_rows.len())?;
+        for slot in 0..decode_n {
+            let want_tok = ref_decode_tokens[slot][step + 1];
+            let got_tok = res.decode_tokens[slot];
+            let got_row = &logits[slot * vocab..(slot + 1) * vocab];
+            let want_row = &ref_decode_logits[slot][step];
+            let mut max_diff = 0.0f32;
+            let mut sum_diff = 0.0f64;
+            for (&g, &w) in got_row.iter().zip(want_row) {
+                let d = (g - w).abs();
+                max_diff = max_diff.max(d);
+                sum_diff += f64::from(d);
+            }
+            let mean_diff = sum_diff / vocab as f64;
+            ensure!(
+                max_diff < 3.0 && mean_diff < 0.6,
+                "step {step} decode slot {slot} logits drifted: max_diff={max_diff:.4}, mean_diff={mean_diff:.5}"
+            );
+            if got_tok != want_tok {
+                // `step_hybrid` runs BF16 dense GEMM (`m > 64`) while `step_batch_sampled`
+                // uses FP8 decode weights; allow rare top-1 flips only on genuine near-ties
+                // (small reference margin + small logit diff) and teacher-force the next input.
+                let ref_margin =
+                    (want_row[want_tok as usize] - want_row[got_tok as usize]).abs();
+                println!(
+                    "step {step} decode slot {slot} BF16-hybrid vs FP8-decode near-tie: \
+                     got {got_tok}, want {want_tok}, ref_margin={ref_margin:.4}, \
+                     max_diff={max_diff:.4}, mean_diff={mean_diff:.5}"
+                );
+                ensure!(
+                    ref_margin < 1.0 && max_diff < 1.5,
+                    "step {step} decode slot {slot} diverged beyond near-tie: \
+                     got {got_tok}, want {want_tok} (ref_margin={ref_margin:.4}, max_diff={max_diff:.4})"
+                );
+                near_tie_flips += 1;
+            }
+            got_decode_tokens[slot].push(want_tok);
+        }
+        if step == 1 {
+            got_short_step0_logits = Some(logits[decode_n * vocab..(decode_n + 1) * vocab].to_vec());
+        }
+        long_done = long_end;
+        if step == 0 {
+            ensure!(
+                res.prefill_tokens[0].is_none(),
+                "partial long prefill slice unexpectedly returned a token"
+            );
+            got_short_first = Some(
+                res.prefill_tokens[1].context("short piggybacked prefill missing first token")?,
+            );
+        } else if long_end == long_prompt.len() {
+            got_long_first = Some(
+                res.prefill_tokens[0].context("finishing long piggybacked prefill missing token")?,
+            );
+        } else {
+            ensure!(
+                res.prefill_tokens[0].is_none(),
+                "mid-chunk long prefill slice unexpectedly returned a token"
+            );
+        }
+    }
+    ensure!(
+        near_tie_flips <= 2,
+        "too many BF16-hybrid vs FP8-decode near-tie flips: {near_tie_flips} > 2"
+    );
+    ensure!(long_done == long_prompt.len(), "long prompt did not finish");
+    let short_first = got_short_first.context("missing short first token")?;
+    let long_first = got_long_first.context("missing long first token")?;
+    ensure!(
+        short_first == ref_prefill_first[1],
+        "short piggybacked first token diverged: got {short_first}, want {}",
+        ref_prefill_first[1]
+    );
+    ensure!(
+        long_first == ref_prefill_first[0],
+        "long piggybacked first token diverged: got {long_first}, want {}",
+        ref_prefill_first[0]
+    );
+
+    // Check slot 4's KV cache & conv state after 6-chunk hybrid prefill via 1 decode step,
+    // plus slot 5's step-0 logits decoded inside step_hybrid on step 1.
+    let _ = model.step_batch_sampled(&[(4, long_first)], &[prefill_specs[0].2])?;
+    let long_step0_logits = model.batch_logits(1)?;
+    let short_got = got_short_step0_logits
+        .as_ref()
+        .context("missing short step0 logits")?;
+    let argmax = |v: &[f32]| -> (usize, f32) {
+        v.iter()
+            .copied()
+            .enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            })
+    };
+    let kl_and_cosine = |want_row: &[f32], got_row: &[f32]| -> (f64, f64) {
+        let want_max = want_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let got_max = got_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let want_logz = want_row
+            .iter()
+            .map(|&v| f64::from(v - want_max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(want_max);
+        let got_logz = got_row
+            .iter()
+            .map(|&v| f64::from(v - got_max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(got_max);
+        let (mut kl, mut dot, mut want_sq, mut got_sq) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&want_elem, &got_elem) in want_row.iter().zip(got_row) {
+            let want_f64 = f64::from(want_elem);
+            let got_f64 = f64::from(got_elem);
+            let want_lp = want_f64 - want_logz;
+            let got_lp = got_f64 - got_logz;
+            kl += want_lp.exp() * (want_lp - got_lp);
+            dot += want_f64 * got_f64;
+            want_sq += want_f64 * want_f64;
+            got_sq += got_f64 * got_f64;
+        }
+        (kl, dot / (want_sq.sqrt() * got_sq.sqrt()))
+    };
+    for (name, got_row, want_row) in [
+        ("long(1500)", &long_step0_logits, &ref_prefill_step0_logits[0]),
+        ("short(90)", short_got, &ref_prefill_step0_logits[1]),
+    ] {
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f64;
+        for (&g, &w) in got_row.iter().zip(want_row) {
+            let d = (g - w).abs();
+            max_diff = max_diff.max(d);
+            sum_diff += f64::from(d);
+        }
+        let mean_diff = sum_diff / vocab as f64;
+        let (want_idx, want_val) = argmax(want_row);
+        let (got_idx, got_val) = argmax(got_row);
+        let (kl, cosine) = kl_and_cosine(want_row, got_row);
+        println!(
+            "hybrid piggyback {name}: top1 want=({want_idx}, {want_val:.3}) got=({got_idx}, \
+             {got_val:.3}), KL={kl:.5}, cosine={cosine:.5}, max_diff={max_diff:.4}, \
+             mean_diff={mean_diff:.5}"
+        );
+        ensure!(
+            want_idx == got_idx,
+            "hybrid piggyback {name} step0 top-1 diverged: got {got_idx}, want {want_idx}"
+        );
+        ensure!(
+            kl < 0.005 && cosine > 0.95,
+            "hybrid piggyback {name} distribution drifted: KL={kl:.5}, cosine={cosine:.5}"
+        );
+    }
+    Ok(())
+}
+
 /// After `Speculator::warmup_batch_spec`, bucketed batched speculation across changing
 /// `seqs` (including non-power-of-2 counts like 7, 5, 3) and adaptive verify widths must
 /// trigger zero additional verify or draft CUDA graph captures and remain bit-exact with
@@ -1492,6 +1760,124 @@ fn bucketed_batch_spec_avoids_live_graph_captures_and_matches_greedy() -> anyhow
     }
     println!(
         "bucketed batch spec matched greedy_by_verify bit-for-bit across seqs 7/5/3/1 with 0 live graph captures ({verify_graphs_after_warmup} verify, {draft_graphs_after_warmup} draft)"
+    );
+    Ok(())
+}
+
+/// GPU parity test for `Speculator::speculate_hybrid_round` (batched DFlash 2 verify +
+/// piggybacked chunked prefill): verifies 3 decoding slots with DFlash 2 while piggybacking
+/// a 4th prompt in 256-token chunks, then hands off the 4th slot into `speculate_batch_round`
+/// alongside the original 3 slots.
+#[test]
+#[ignore = "needs the checkpoint, SIPHON_DFLASH (DFlash 2), and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end hybrid DFlash 2 verify + prefill parity test")]
+fn hybrid_verify_matches_separate_dflash2() -> anyhow::Result<()> {
+    let Some(dflash_dir) = env::var_os("SIPHON_DFLASH") else {
+        println!("SIPHON_DFLASH is not set; skipped");
+        return Ok(());
+    };
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    model.enable_sampling()?;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Dflash(std::path::Path::new(&dflash_dir)),
+        CAPACITY,
+        &DraftOptions::fast(),
+    )?;
+    let mut spec = Speculator::with_draft(&model, draft, Width::Fixed(4))?;
+    let capture = capture_tokens()?;
+    let prompts: [&[u32]; 4] = [
+        &capture[0..128],
+        &capture[200..260],
+        &capture[600..1100],
+        &capture[2200..2712], // 512 tokens, piggybacked in two 256-token chunks
+    ];
+    let samplings = [Sampling::GREEDY; 4];
+    model.add_slots(3)?;
+    model.reserve_batch_verify(4)?;
+    spec.reserve_batch_spec(&model, 4, 3)?;
+
+    // Reference: prefill slot 3 separately and check its first token + 8 greedy verify tokens.
+    model.reset_slot(0)?;
+    let ref_first3 = model.prefill_slot(0, prompts[3], DEFAULT_PREFILL_CHUNK)?;
+    let ref_gen3 = greedy_by_verify(&mut model, ref_first3, 8)?;
+
+    // Hybrid run: prefill slots 0..3 with DFlash 2 taps, then piggyback slot 3 onto two
+    // batched DFlash 2 verify rounds of slots 0..3.
+    let mut anchors = Vec::with_capacity(4);
+    for (slot, &prompt) in prompts.iter().enumerate().take(3) {
+        model.reset_slot(slot)?;
+        let first =
+            spec.prefill_slot_batch(&mut model, slot, prompt, None, DEFAULT_PREFILL_CHUNK, true)?;
+        anchors.push(first);
+    }
+    model.reset_slot(3)?;
+    let verify_slots = [0usize, 1, 2];
+    let mut done3 = 0usize;
+    let mut got_first3 = None;
+    for round in 0..2 {
+        let end = (done3 + 256).min(prompts[3].len());
+        let slices = [PackedPrefill {
+            slot: 3,
+            tokens: &prompts[3][done3..end],
+            images: Vec::new(),
+            need_first_token: end == prompts[3].len(),
+            sampling: samplings[3],
+        }];
+        let res = spec.speculate_hybrid_round(
+            &mut model,
+            &verify_slots,
+            &anchors[..3],
+            &samplings[..3],
+            4,
+            &slices,
+            &[true],
+            &[round == 0],
+            DEFAULT_PREFILL_CHUNK,
+        )?;
+        for (i, v) in res.verdicts.iter().enumerate() {
+            anchors[i] = v.next();
+        }
+        done3 = end;
+        if end == prompts[3].len() {
+            got_first3 = res.prefill_tokens[0];
+        } else {
+            ensure!(res.prefill_tokens[0].is_none(), "unexpected early first token");
+        }
+    }
+    let first3 = got_first3.context("missing first token for piggybacked DFlash 2 slot")?;
+    ensure!(
+        first3 == ref_first3,
+        "hybrid verify piggybacked first token diverged: got {first3}, want {ref_first3}"
+    );
+    ensure!(
+        spec.slot_draft_committed(3) == prompts[3].len(),
+        "slot 3 DFlash 2 committed {} != {}",
+        spec.slot_draft_committed(3),
+        prompts[3].len()
+    );
+
+    // Now slot 3 joins slots 0..3 in `speculate_batch_round` seamlessly!
+    anchors.push(first3);
+    let all_slots = [0usize, 1, 2, 3];
+    let mut got_gen3 = Vec::new();
+    while got_gen3.len() < ref_gen3.len() {
+        let verdicts = spec.speculate_batch_round(&mut model, &all_slots, &anchors, &samplings, 4)?;
+        for (i, v) in verdicts.iter().enumerate() {
+            anchors[i] = v.next();
+        }
+        got_gen3.extend(verdicts[3].emitted());
+    }
+    println!(
+        "hybrid DFlash 2 handoff: first want={ref_first3} got={first3}, gen want={ref_gen3:?} got={:?}",
+        &got_gen3[..ref_gen3.len()]
+    );
+    ensure!(
+        got_gen3[..ref_gen3.len()] == ref_gen3[..],
+        "slot 3 diverged after hybrid verify piggyback -> batched DFlash 2 handoff"
     );
     Ok(())
 }

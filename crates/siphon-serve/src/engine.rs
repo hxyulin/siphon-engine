@@ -386,6 +386,9 @@ pub struct Options {
     /// Tokens per second that each decoding request gets at least while another prefills,
     /// with `streams` above 1, or 0 for one batched step per prefill chunk.
     pub decode_floor: f64,
+    /// Max prefill tokens piggybacked onto one active decode/verify forward pass, or `None`
+    /// when `--piggyback-prefill` is off.
+    pub piggyback_budget: Option<usize>,
     /// The vision tower, with `--vision`.
     pub vision: Option<VisionOptions>,
     /// Opt-in logit margin for speculative acceptance (`0.0` for exact lossless acceptance).
@@ -557,8 +560,8 @@ mod cuda {
         draft::DraftOptions,
         kv_options::KvOptions,
         model::{
-            BATCH_VERIFY_MAX_ROWS, DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS, Model,
-            MoePruning, PackedPrefill, Sampling as ModelSampling,
+            BATCH_ROWS, BATCH_VERIFY_MAX_ROWS, DEFAULT_PREFILL_CHUNK, ImageRows, MAP_POSITIONS,
+            Model, MoePruning, PackedPrefill, Sampling as ModelSampling,
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
@@ -571,7 +574,10 @@ mod cuda {
     };
 
     use super::{Control, Engine, Event, Finish, Job, Options, starts_with_chained};
-    use crate::vision::{ImageStats, PromptImage};
+    use crate::{
+        piggyback::{self, PiggybackSlice, PrefillCandidate, TurnPlan},
+        vision::{ImageStats, PromptImage},
+    };
 
     /// The vision tower, with `--vision`.
     type Tower = Option<VisionTower>;
@@ -1011,6 +1017,12 @@ mod cuda {
                     "batched DFlash 2 speculation enabled (up to {spec_seqs} sequences per verify, \
                      pre-captured {captured} bucketed verify+draft graph pairs in {:.2} s)",
                     warmup_started.elapsed().as_secs_f64()
+                );
+            }
+            if let Some(budget) = options.piggyback_budget {
+                eprintln!(
+                    "hybrid piggyback prefill enabled (up to {budget} prefill tokens per \
+                     decode/verify step)"
                 );
             }
             eprintln!("serving up to {} requests at once", options.streams);
@@ -1479,6 +1491,8 @@ mod cuda {
         greedy: bool,
         /// Tokens per second each decoding request gets at least while another prefills.
         floor: f64,
+        /// Max prefill tokens piggybacked onto one active decode/verify step, or `None` when off.
+        piggyback_budget: Option<usize>,
         /// Positions of the KV pool: the most one request may hold.
         capacity: usize,
         /// Split mixed-confidence batched DFlash 2 rounds into high/low micro-batches.
@@ -1505,6 +1519,7 @@ mod cuda {
             streams: options.streams,
             greedy: options.greedy,
             floor: options.decode_floor,
+            piggyback_budget: options.piggyback_budget,
             capacity,
             group_by_confidence: options.group_by_confidence,
         };
@@ -2575,6 +2590,130 @@ mod cuda {
                 }
                 continue;
             }
+            // When `--piggyback-prefill` is enabled and both decoders and prefillers are
+            // active, carve a bounded prefill chunk to ride along with the active decode or
+            // batched-verify forward pass instead of stalling active streams behind an
+            // exclusive prefill step.
+            if sched.piggyback_budget.is_some()
+                && active.iter().any(|r| !r.done && r.next.is_some())
+                && active.iter().any(|r| !r.done && r.next.is_none())
+            {
+                for r in &mut active {
+                    if r.next.is_some() || r.done {
+                        continue;
+                    }
+                    if r.job.events.is_closed() {
+                        r.done = true;
+                    } else if r.job.cancelled() {
+                        r.fail(&anyhow::anyhow!(CANCELLED));
+                    }
+                }
+                retire(model, speculator, &mut active);
+                let batch_spec = speculator.supports_batch_spec();
+                let next_pages = |m: &Model, r: &Request| {
+                    let advance = if batch_spec && r.draft_ready {
+                        VERIFY_ROWS
+                    } else {
+                        1
+                    };
+                    m.slot_pages_to(r.slot, r.position() + advance).unwrap_or(0)
+                };
+                while !room_for(
+                    model,
+                    speculator,
+                    &mut active,
+                    &mut parked,
+                    None,
+                    true,
+                    |m, a| {
+                        a.iter()
+                            .filter(|r| !r.done && r.next.is_some())
+                            .map(|r| next_pages(m, r))
+                            .sum()
+                    },
+                ) {
+                    let Some(r) = active
+                        .iter_mut()
+                        .filter(|r| !r.done && r.next.is_some() && next_pages(model, r) > 0)
+                        .max_by_key(|r| r.since)
+                    else {
+                        break;
+                    };
+                    r.fail(&anyhow::anyhow!("the KV pool is full"));
+                }
+                retire(model, speculator, &mut active);
+                let spec_count = active
+                    .iter()
+                    .filter(|r| !r.done && r.next.is_some() && batch_spec && r.draft_ready)
+                    .count();
+                let plain_count = active
+                    .iter()
+                    .filter(|r| !r.done && r.next.is_some() && !(batch_spec && r.draft_ready))
+                    .count();
+                let carrier_rows = if spec_count > 0 {
+                    let chunk_len = spec_count.min(speculator.max_batch_spec_seqs());
+                    let max_w = (BATCH_VERIFY_MAX_ROWS / chunk_len).min(VERIFY_ROWS);
+                    chunk_len * max_w
+                } else {
+                    plain_count
+                };
+                let now = Instant::now();
+                let mut queued_order: Vec<usize> = (0..active.len()).collect();
+                queued_order.sort_by_key(|&i| active[i].job.queued);
+                let mut arrival_ranks = vec![0usize; active.len()];
+                for (rank, &idx) in queued_order.iter().enumerate() {
+                    arrival_ranks[idx] = rank;
+                }
+                let candidates: Vec<PrefillCandidate> = active
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| PrefillCandidate {
+                        index: i,
+                        slot: r.slot,
+                        group: r.job.group,
+                        prefilled: r.prefilled,
+                        prompt_len: r.job.prompt.len(),
+                        aged: now.duration_since(r.job.queued) >= AGE_LIMIT,
+                        arrival_rank: arrival_ranks[i],
+                        is_prefilling: r.next.is_none(),
+                        alive: !r.done,
+                    })
+                    .collect();
+                let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+                let mut pages_needed: usize = active
+                    .iter()
+                    .filter(|r| !r.done && r.next.is_some())
+                    .map(|r| next_pages(model, r))
+                    .sum();
+                let plan = piggyback::plan_piggyback(
+                    &candidates,
+                    carrier_rows,
+                    speculator.prefill_chunk(),
+                    sched.piggyback_budget,
+                    BATCH_ROWS,
+                    |c, end| {
+                        let extra = model.slot_pages_to(c.slot, end).unwrap_or(0);
+                        if make_room(
+                            model,
+                            speculator,
+                            pages_needed + extra,
+                            &busy,
+                            Reclaim::Draft,
+                        ) {
+                            pages_needed += extra;
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                );
+                if let TurnPlan::Piggyback { slices, .. } = plan {
+                    step_rows_hybrid(model, speculator, tower, &mut active, &slices, stop);
+                    retire(model, speculator, &mut active);
+                    synced = Instant::now();
+                    continue;
+                }
+            }
             // Drain short prefills up to one full prefill-chunk token budget per turn so a
             // burst of short prompts doesn't stall behind per-request decode rounds and graph
             // size churn.
@@ -3340,6 +3479,299 @@ mod cuda {
         } else {
             min_emitted.max(1)
         }
+    }
+
+    /// Commits progress for piggybacked prefill slices after a hybrid decode/verify pass:
+    /// advances `prefilled`, saves prefix cache entries at chunk boundaries, and hands off
+    /// finishing prompts into decode/verify state.
+    fn finish_piggybacked_prefills(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        active: &mut [Request],
+        slices: &[PiggybackSlice],
+        tokens: &[Option<u32>],
+        chunk: usize,
+        stop: &[u32],
+    ) {
+        let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+        for (s, &first) in slices.iter().zip(tokens) {
+            active[s.index].prefilled = s.end;
+            if s.hits_prefix_boundary && s.end > active[s.index].cached {
+                if make_room(model, speculator, model.ring_pages(), &busy, Reclaim::Draft) {
+                    let key = active[s.index].job.key();
+                    if let Err(e) = speculator.save_prefix(model, s.slot, key, chunk, &busy) {
+                        eprintln!("keeping a prompt in the prefix cache failed: {e:#}");
+                    }
+                } else {
+                    eprintln!("no room in the KV pool to keep a prompt in the prefix cache");
+                }
+            }
+            if s.finishes_prompt
+                && let Some(first) = first
+            {
+                let r = &mut active[s.index];
+                r.kept = None;
+                r.prefill_s = r.started.elapsed().as_secs_f64();
+                r.send_images();
+                r.next = Some(first);
+                r.done = r.take(&[first], stop).is_break();
+            }
+        }
+    }
+
+    /// Runs one hybrid decode/verify step with `slices` piggybacked onto the primary active
+    /// decode or batched-verify pass (followed by any overflow verify micro-batches or
+    /// secondary plain-decode rows).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "encodes images, dispatches hybrid verify or hybrid decode, handles overflow"
+    )]
+    fn step_rows_hybrid(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        tower: &mut Tower,
+        active: &mut [Request],
+        slices: &[PiggybackSlice],
+        stop: &[u32],
+    ) {
+        let batch_spec = speculator.supports_batch_spec();
+        let mut spec_indices = Vec::new();
+        let mut plain_indices = Vec::new();
+        for (idx, r) in active.iter().enumerate() {
+            if r.done || r.next.is_none() {
+                continue;
+            }
+            if batch_spec && r.draft_ready {
+                spec_indices.push(idx);
+            } else {
+                plain_indices.push(idx);
+            }
+        }
+        if spec_indices.is_empty() && plain_indices.is_empty() {
+            return;
+        }
+        let hidden = model.config().hidden_size;
+        let mut live_slices = Vec::with_capacity(slices.len());
+        let mut encoded_images = Vec::with_capacity(slices.len());
+        for &s in slices {
+            let r = &mut active[s.index];
+            if r.done || r.next.is_some() {
+                continue;
+            }
+            let imgs = if r.job.images.is_empty() {
+                Vec::new()
+            } else {
+                match image_rows(
+                    tower,
+                    hidden,
+                    &r.job.images,
+                    &mut r.kept,
+                    &mut r.encodes,
+                    (s.start, s.end),
+                ) {
+                    Ok(imgs) => imgs,
+                    Err(e) => {
+                        r.fail(&e);
+                        continue;
+                    }
+                }
+            };
+            live_slices.push(s);
+            encoded_images.push(imgs);
+        }
+        if live_slices.is_empty() {
+            let _ = step_rows(model, speculator, active, stop);
+            return;
+        }
+        let chunk = speculator.prefill_chunk();
+        let mut commit_draft = Vec::with_capacity(live_slices.len());
+        let mut reset_draft = Vec::with_capacity(live_slices.len());
+        let mut packed_slices = Vec::with_capacity(live_slices.len());
+        for (&s, imgs) in live_slices.iter().zip(encoded_images) {
+            let r = &active[s.index];
+            commit_draft.push(batch_spec && r.draft_ready);
+            reset_draft.push(s.start == 0);
+            packed_slices.push(PackedPrefill {
+                slot: s.slot,
+                tokens: &r.job.prompt[s.start..s.end],
+                images: imgs,
+                need_first_token: s.finishes_prompt,
+                sampling: r.sampling,
+            });
+        }
+        if spec_indices.is_empty() {
+            let rows: Vec<(usize, u32)> = plain_indices
+                .iter()
+                .map(|&i| (active[i].slot, active[i].next.unwrap_or_default()))
+                .collect();
+            let sampling: Vec<ModelSampling> =
+                plain_indices.iter().map(|&i| active[i].sampling).collect();
+            let result = speculator.step_hybrid_batch(
+                model,
+                &rows,
+                &sampling,
+                &packed_slices,
+                &commit_draft,
+                &reset_draft,
+                chunk,
+            );
+            drop(packed_slices);
+            match result {
+                Ok(res) => {
+                    for (row, (&idx, token)) in
+                        plain_indices.iter().zip(res.decode_tokens).enumerate()
+                    {
+                        let r = &mut active[idx];
+                        if r.followed
+                            && let Err(e) = speculator.keep_batched(model, row, token)
+                        {
+                            eprintln!("the draft stops following a request: {e:#}");
+                            speculator.forget();
+                            r.followed = false;
+                        }
+                        r.batched += 1;
+                        r.next = Some(token);
+                        r.done = r.take(&[token], stop).is_break();
+                    }
+                    finish_piggybacked_prefills(
+                        model,
+                        speculator,
+                        active,
+                        &live_slices,
+                        &res.prefill_tokens,
+                        chunk,
+                        stop,
+                    );
+                }
+                Err(e) => {
+                    for &idx in &plain_indices {
+                        active[idx].fail(&e);
+                    }
+                    for &s in &live_slices {
+                        active[s.index].fail(&e);
+                    }
+                }
+            }
+        } else {
+            let max_seqs = speculator.max_batch_spec_seqs();
+            let (first_chunk, rest_spec) =
+                spec_indices.split_at(spec_indices.len().min(max_seqs));
+            let width = (BATCH_VERIFY_MAX_ROWS / first_chunk.len()).min(VERIFY_ROWS);
+            let slots: Vec<usize> = first_chunk.iter().map(|&i| active[i].slot).collect();
+            let anchors: Vec<u32> = first_chunk
+                .iter()
+                .map(|&i| active[i].next.unwrap_or_default())
+                .collect();
+            let samplings: Vec<ModelSampling> =
+                first_chunk.iter().map(|&i| active[i].sampling).collect();
+            let result = speculator.speculate_hybrid_round(
+                model,
+                &slots,
+                &anchors,
+                &samplings,
+                width,
+                &packed_slices,
+                &commit_draft,
+                &reset_draft,
+                chunk,
+            );
+            drop(packed_slices);
+            match result {
+                Ok(res) => {
+                    for (&idx, verdict) in first_chunk.iter().zip(res.verdicts) {
+                        let r = &mut active[idx];
+                        let emitted = verdict.emitted();
+                        r.speculated += emitted.len();
+                        let _ = r.job.events.send(Event::Round);
+                        r.next = Some(verdict.next());
+                        r.done = r.take(&emitted, stop).is_break();
+                    }
+                    finish_piggybacked_prefills(
+                        model,
+                        speculator,
+                        active,
+                        &live_slices,
+                        &res.prefill_tokens,
+                        chunk,
+                        stop,
+                    );
+                }
+                Err(e) => {
+                    speculator.invalidate_batch_draft();
+                    for &idx in first_chunk {
+                        active[idx].fail(&e);
+                    }
+                    for &s in &live_slices {
+                        active[s.index].fail(&e);
+                    }
+                }
+            }
+            for extra in rest_spec.chunks(max_seqs) {
+                let extra_w = (BATCH_VERIFY_MAX_ROWS / extra.len()).min(VERIFY_ROWS);
+                let extra_slots: Vec<usize> = extra.iter().map(|&i| active[i].slot).collect();
+                let extra_anchors: Vec<u32> = extra
+                    .iter()
+                    .map(|&i| active[i].next.unwrap_or_default())
+                    .collect();
+                let extra_samplings: Vec<ModelSampling> =
+                    extra.iter().map(|&i| active[i].sampling).collect();
+                match speculator.speculate_batch_round(
+                    model,
+                    &extra_slots,
+                    &extra_anchors,
+                    &extra_samplings,
+                    extra_w,
+                ) {
+                    Ok(verdicts) => {
+                        for (&idx, verdict) in extra.iter().zip(verdicts) {
+                            let r = &mut active[idx];
+                            let emitted = verdict.emitted();
+                            r.speculated += emitted.len();
+                            let _ = r.job.events.send(Event::Round);
+                            r.next = Some(verdict.next());
+                            r.done = r.take(&emitted, stop).is_break();
+                        }
+                    }
+                    Err(e) => {
+                        speculator.invalidate_batch_draft();
+                        for &idx in extra {
+                            active[idx].fail(&e);
+                        }
+                    }
+                }
+            }
+            if !plain_indices.is_empty() {
+                let rows: Vec<(usize, u32)> = plain_indices
+                    .iter()
+                    .map(|&i| (active[i].slot, active[i].next.unwrap_or_default()))
+                    .collect();
+                let sampling: Vec<ModelSampling> =
+                    plain_indices.iter().map(|&i| active[i].sampling).collect();
+                match model.step_batch_sampled(&rows, &sampling) {
+                    Ok(next) => {
+                        for (row, (&idx, token)) in plain_indices.iter().zip(next).enumerate() {
+                            let r = &mut active[idx];
+                            if r.followed
+                                && let Err(e) = speculator.keep_batched(model, row, token)
+                            {
+                                eprintln!("the draft stops following a request: {e:#}");
+                                speculator.forget();
+                                r.followed = false;
+                            }
+                            r.batched += 1;
+                            r.next = Some(token);
+                            r.done = r.take(&[token], stop).is_break();
+                        }
+                    }
+                    Err(e) => {
+                        for &idx in &plain_indices {
+                            active[idx].fail(&e);
+                        }
+                    }
+                }
+            }
+        }
+        log_host(speculator);
     }
 }
 
