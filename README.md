@@ -13,9 +13,11 @@ Rust host code, CUDA kernels written for this model and `sm_120a` (`sm_89` for t
 [![Model: Inkling 2 Mini](https://img.shields.io/badge/model-Inkling%202%20Mini-FFD21E?logo=huggingface)](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 [![Image](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml/badge.svg)](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml)
 
-| 875 · 507 tok/s | 999 tok/s | 81–88% | 633,856 | 0.10 s |
-| :---: | :---: | :---: | :---: | :---: |
-| one stream, speculative, on Rust<br>source: greedy · temperature 1 | 8 streams together | of the DRAM floor<br>in plain decode | tokens of context<br>on a 32 GB card | to first token of a<br>103K-token follow-up |
+| GPU | Speculative code<br>greedy · T=0.8 lossless | Speculative prose<br>greedy · sampled | Plain decode<br>ctx 0 · 32K | Prefill<br>4K · 16K | Batched<br>16 · 32 streams | Max context<br>FP8 · NVFP4 | Recipes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **RTX PRO 6000 Blackwell**<br>`96 GB · 1.79 TB/s · sm_120a` | **883 · 706** tok/s | — | 352 · 326 | **36,053 · 33,975** | 1,449 · 2,176 *(3,462 @ 64)* | 1M · 1M *(8.3M pool)* | [Recipes](docs/recipes.md#rtx-pro-6000-blackwell) |
+| **RTX 5090**<br>`32 GB · 1.79 TB/s · sm_120a` | **885 · 715** tok/s | **629 · 395** tok/s | **384 · 310** | **34,316 · 32,669** | 1,452 · 2,145 *(3,237 @ 64)* | 729K · 1M | [Recipes](docs/recipes.md#rtx-5090) |
+| **RTX 4090**<br>`24 GB · 1.01 TB/s · sm_89` | **479 · 375** tok/s | **395 · 254** tok/s | **226 · 194** | **14,457 · 14,324** | **814 · 1,208** | 248K · 506K | [Recipes](docs/recipes.md#rtx-4090) |
 
 </div>
 
@@ -54,15 +56,15 @@ Siphon also runs [`hxyulin/Inkling-2-Mini-Fast-NVFP4`](https://huggingface.co/hx
 
 ## GPUs
 
-The same kernels serve the RTX 5090 and the RTX PRO 6000 Blackwell (`sm_120a`). The RTX 4090 runs an `sm_89` build. Decode reads the weights once per token, so it runs about as fast on the two Blackwell cards, which have the same memory bandwidth. The PRO 6000's 96 GB hold the model's full context and more streams, and it prefills about 37% faster. Plain decode and batched steps with FP8 weights and cache, from `bench`, tok/s:
+The same kernels serve the RTX 5090 and the RTX PRO 6000 Blackwell (`sm_120a`). The RTX 4090 runs an `sm_89` build with native Ada FP8 Tensor Core prefill attention, dense GEMMs, and MoE grouped GEMMs. Decode reads the weights once per token, so it runs about as fast on the two Blackwell cards, which have the same memory bandwidth. The PRO 6000's 96 GB hold the model's full context and up to 32 speculative streams, and it prefills fastest. Headline numbers across the three cards (tok/s, fast FP8/MXFP8/NVFP4 profile with DFlash 2 where noted; default BF16 `W_o` numbers are in the sections below):
 
-| GPU | Memory | Plain decode, context 0 · 32K | Prefill, 8,192 tokens | Batched steps, 16 · 32 · 64 streams | Longest context, 1 stream |
-| --- | --- | ---: | ---: | ---: | ---: |
-| RTX 5090 | 32 GB, 1.79 TB/s, 600 W | 356 · 303 | 16,203 | 1,452 · 2,145 · 3,237 | 661,504 |
-| RTX PRO 6000 Blackwell Workstation Edition | 96 GB, 1.79 TB/s, 600 W | 351 · 300 | 22,125 | 1,449 · 2,176 · 3,462 | 1,048,576 |
-| RTX 4090 | 24 GB, 1.01 TB/s, 450 W | 204 · 166 | 9,672 | not measured | 235,520 |
+| GPU | Memory & Arch | Speculative code<br>greedy · T=0.8 | Plain decode<br>ctx 0 · 32K | Prefill<br>4K · 16K | Batched steps<br>16 · 32 · 64 streams | Longest context<br>1 stream (FP8 · NVFP4) | Recipes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| **RTX 5090** | 32 GB, 1.79 TB/s, `sm_120a` | 885 · 715 | 384 · 310 | 34,316 · 32,669 | 1,452 · 2,145 · 3,237 | 729,088 · 1,048,576 | [RTX 5090](docs/recipes.md#rtx-5090) |
+| **RTX PRO 6000 Blackwell** | 96 GB, 1.79 TB/s, `sm_120a` | 883 · 706 | 352 · 326 | 36,053 · 33,975 | 1,449 · 2,176 · 3,462 | 1,048,576 · 1,048,576 | [RTX PRO 6000](docs/recipes.md#rtx-pro-6000-blackwell) |
+| **RTX 4090** | 24 GB, 1.01 TB/s, `sm_89` | 479 · 375 | 226 · 194 | 14,457 · 14,324 | 814 · 1,208 · — | 247,808 · 505,856 | [RTX 4090](docs/recipes.md#rtx-4090) |
 
-The RTX 5090 and RTX PRO 6000 rows ran main at 93ad984, with the BF16 output projection that `--weights fp8` keeps by default; the PRO 6000 ran the [Fast NVFP4 checkpoint](https://huggingface.co/hxyulin/Inkling-2-Mini-Fast-NVFP4), whose weights have the same formats and sizes as the official one. The RTX 4090 row ran an earlier commit with `--output-projection fp8`. Its context is the planned one with the bundled draft; `--kv nvfp4` with DFlash 2 reaches 516,096 positions ([RTX 4090](#rtx-4090)). [RTX PRO 6000 Blackwell](#rtx-pro-6000-blackwell) and [RTX 4090](#rtx-4090) below have more of each card's numbers.
+See [docs/recipes.md](docs/recipes.md) for copy-pasteable `siphon-serve` commands per card (single-user coding, multi-user serving, relaxed speculation, and max context). [RTX PRO 6000 Blackwell](#rtx-pro-6000-blackwell) and [RTX 4090](#rtx-4090) below have full breakdowns.
 
 ## Performance
 
@@ -188,17 +190,22 @@ At `B=32, ctx=16,384` (fast profile), `--kv nvfp4` raises batched decode from `1
 
 ### RTX 4090
 
-The `sm_89` build ([Build from source](#build-from-source)) with FP8 weights and cache and `--output-projection fp8`, plain decode from `bench`:
+Measured on an RTX 4090 (24 GB, 450 W, driver 620.70.10) with the `sm_89` build ([Build from source](#build-from-source)) and the Fast NVFP4 checkpoint (`--weights fp8 --output-projection mxfp8 --lm-head nvfp4`, [RTX 4090 recipes](docs/recipes.md#rtx-4090)):
 
-| Context | FP8 weights and cache | BF16 weights and cache |
+- **Plain decode** (`B=1`, `bench`, 100 steps):
+
+| Context | FP8 KV | NVFP4 KV |
 | ---: | ---: | ---: |
-| 0 | 204.4 tok/s | 148.9 tok/s |
-| 4,096 | 196.5 tok/s | |
-| 32,768 | 165.8 tok/s | 113.4 tok/s |
+| 0 | 225.7 tok/s | 224.8 tok/s |
+| 32,768 | 193.6 tok/s | 200.7 tok/s |
+| 131,072 | 144.8 tok/s *(84.7% DRAM floor)* | **159.1 tok/s** |
 
-Prefill ran 9,672 tok/s at 8,192 tokens and 8,950 at 32,768. Through `siphon-serve`, with the Fast NVFP4 checkpoint and greedy decoding, one stream decoded code at 349 tok/s with the bundled draft and 390 with DFlash 2, JSON at 411 and 442, and prose at 235 to 263. Two concurrent requests ran 262 tok/s in all, and four ran 341.
-
-Context is the limit on this card: the weights take 16.8 GiB of its 23.13 GiB free, so the planner gives one stream 235,520 positions with the FP8 cache, 331,776 with `--kv mixed` and 385,024 with `--kv nvfp4`. NVFP4 with DFlash 2, `--prefill-chunk 1024` and `--margin 0.1` plans 516,096. A 478,195-token prompt prefilled in 138.5 s there and decoded at 207 tok/s, on a plan 8,192 to 18,432 positions shorter than today's. [server.md](docs/server.md#serving-on-an-rtx-4090) has the recommended configurations and [engine.md](docs/engine.md#rtx-4090-sm_89) the build's differences.
+- **Prefill** (`--prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8`, native Ada FP8 Tensor Cores, `--chunk 2560`): **`14,457 tok/s`** at 4K, **`14,356 tok/s`** at 8K, **`14,324 tok/s`** at 16K, and **`13,832 tok/s`** at 32K (`+31%` to `+39%` over BF16 prefill, within `<= 0.41%` PPL on `eval`).
+- **Single-stream speculation** (`bench --spec auto`, 256 tokens, DFlash 2 with `--draft-weights nvfp4`, 4-seed medians for sampled runs with `--spec-tree`):
+  - **Code (`anyhow`, 10.7K / 32K):** greedy **`479.3`** (`2.30x`) / **`458.1 tok/s`** (`2.37x`, bundled DSpark `460.2` / `413.4`); sampled lossless (`--spec-beta 1.0`) `T=0.8, p=0.95` **`375.3 tok/s`** (`449.0 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`346.7 tok/s`**.
+  - **Prose (`regex-readme`, 2.3K / 32K):** greedy **`394.8`** (`1.79x`) / **`385.4 tok/s`** (`1.99x`, bundled DSpark `339.4` / `362.3`); sampled lossless (`--spec-beta 1.0 --fallback`) `T=0.8, p=0.95` **`254.0 tok/s`** (`280.5 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`249.1 tok/s`**.
+- **Batched plain decode** (`bench`, FP8 KV, `ctx 0 / 4,096`): `B=8` `563 / 502`, `B=16` **`814 / 709`**, `B=24` **`1,009 / 869`**, `B=32` **`1,208 / 1,016 tok/s`**.
+- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8` and DFlash 2, the planner gives one stream `247,808` positions with FP8 KV (`229,376` DSpark), `370,688` with `--kv mixed`, and `440,320` with `--kv nvfp4` (reaching **`505,856`** with `--prefill-chunk 1024 --margin 0.1`, or `618,496` without a drafter). See [docs/recipes.md](docs/recipes.md#rtx-4090) and [server.md](docs/server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](docs/engine.md#rtx-4090-sm_89) for architectural details.
 
 ## Features
 
@@ -231,7 +238,7 @@ target/release/bench <model-dir> --prompt <capture> --spec auto --weights fp8 --
 target/release/bench <model-dir> --batch 1,2,4,8 --prompt <capture> --contexts 0 --weights fp8 --kv fp8
 ```
 
-For an RTX 4090, build with `SIPHON_CUDA_ARCH=sm_89`. That build has no FP8 prefill attention, quantized or FP8 expert activations or FP8 dense products, since Ada lacks the block-scaled MMA. Its logits differ from the RTX 5090's by tensor-core rounding, and it scores the same on the quality gate. [engine.md](docs/engine.md#rtx-4090-sm_89) lists what else differs and how fast it runs.
+For an RTX 4090, build with `SIPHON_CUDA_ARCH=sm_89`. That build uses native Ada `m16n8k32` FP8 Tensor Cores for prefill attention (`--prefill-attention fp8`), dense GEMMs (`--prefill-dense fp8`), and MoE grouped GEMMs (`--expert-activations fp8`, with overflow-proof 660 TFLOP/s `f16`-accumulated MMA on NVFP4 layers and 330 TFLOP/s `f32`-accumulated MMA on MXFP8 layers); `--expert-activations quantized` and `--prefill-attention fp4` stay Blackwell-only since Ada lacks block-scaled `mxf4`/`mxf8` MMA. Its logits differ from the RTX 5090's by tensor-core rounding, and it scores the same on the quality gate. [docs/recipes.md](docs/recipes.md#rtx-4090) has ready-to-run commands and [engine.md](docs/engine.md#rtx-4090-sm_89) lists what else differs.
 
 On macOS, `siphon-cuda` compiles to an empty crate, so the tests run but the server cannot serve. `scripts/remote.sh <ssh-host> <remote-dir> <command>` syncs the workspace to a Linux host and runs the command there.
 
@@ -245,6 +252,7 @@ On macOS, `siphon-cuda` compiles to an empty crate, so the tests run but the ser
 | `crates/siphon-plan` | `siphon-plan`, a terminal view of the memory plan |
 | `reference` | MLX-LM captures and kernel fixtures, run on a Mac with uv |
 | `scripts` | Remote sync, the PDL read-order audit and profiling scripts |
+| [`docs/recipes.md`](docs/recipes.md) | Copy-pasteable `siphon-serve` recipes per GPU (RTX 5090, RTX PRO 6000 Blackwell, RTX 4090) |
 | [`docs/server.md`](docs/server.md) | Server options, routes and request fields |
 | [`docs/engine.md`](docs/engine.md) | How the engine works, how it is tested and measured, and its formats |
 | [`docs/batching.md`](docs/batching.md) | The design of batched decode |
