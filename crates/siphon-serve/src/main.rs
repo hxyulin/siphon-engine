@@ -52,9 +52,10 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--max-image-pixels 2073600] [--max-images 16] \
                      [--moe-top-k 1..=8] [--moe-prune 0.0..1.0] [--moe-min-k 1..=8]
 --context sets the positions of the KV cache pool: the prompts and generated tokens of every
-running request together. One request may take all of them, up to the model's limit of
-1,048,576. Without it the server takes the most that fit in GPU memory. Either way it plans
-the memory before loading the weights and stops if the plan does not fit.
+running request together, up to --streams times the model's 1,048,576 per-request limit. One
+request may take up to 1,048,576 of them. Without it the server takes the most that fit in GPU
+memory. Either way it plans the memory before loading the weights and stops if the plan does not
+fit.
 --streams runs up to N requests at once (1 to 64), as many as the pool holds; each stream
 costs its sliding rings and prefix cache entry, about 0.33 GiB. A request alone speculates;
 once another arrives, all run batched plain decode. Either way a request gets the same

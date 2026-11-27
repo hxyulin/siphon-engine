@@ -768,6 +768,15 @@ mod cuda {
         );
         let capacity = match options.capacity {
             Some(capacity) => {
+                let pool_limit = planner.max_pool_positions();
+                anyhow::ensure!(
+                    capacity <= pool_limit,
+                    "--context {capacity} exceeds the pool limit of {pool_limit} positions \
+                     ({} stream{} × {} per-request model limit)",
+                    options.streams,
+                    if options.streams == 1 { "" } else { "s" },
+                    planner.max_positions()
+                );
                 let plan = planner.plan(capacity);
                 anyhow::ensure!(
                     plan.total() <= budget,
@@ -784,8 +793,9 @@ mod cuda {
                 )
             })?,
         };
+        let slot_capacity = capacity.min(planner.max_positions());
         anyhow::ensure!(
-            capacity > warmup + 128 + MARGIN,
+            slot_capacity > warmup + 128 + MARGIN,
             "a context of {capacity} is too small"
         );
         eprintln!("memory plan: {}", planner.plan(capacity));
@@ -918,6 +928,10 @@ mod cuda {
             vision: vision_inputs(options)?,
         })?;
         let capacity = plan(options, &planner, free, warmup.len())?;
+        // Each individual sequence is capped at the model's `model_max_length` (1,048,576),
+        // while the shared KV page pool can hold up to `streams * model_max_length` aggregate
+        // positions across concurrent requests.
+        let slot_capacity = capacity.min(config.model_max_length);
         let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
         weights.output = output_projection(options);
         weights.lm_head_format = options.lm_head.as_deref().map(str::parse).transpose()?;
@@ -933,7 +947,7 @@ mod cuda {
         let pool = PagePool::new(gpu.context(), planner.plan(capacity).kv.div_ceil(page))?;
         eprintln!(
             "KV pool: {} pages of {} MiB ({} GiB) in {:.2} s, for {capacity} positions over \
-             up to {} streams",
+             up to {} streams (up to {slot_capacity} per request)",
             pool.total_pages(),
             page >> 20,
             gib(pool.total_pages() * page),
@@ -945,7 +959,7 @@ mod cuda {
             config,
             weights,
             passes,
-            capacity,
+            slot_capacity,
             kv,
             weight_format,
             Some(pool),
@@ -982,7 +996,7 @@ mod cuda {
             .drafter
             .as_deref()
             .map_or(DraftSource::Bundled, DraftSource::Dflash);
-        let draft = load_draft(&mut model, &checkpoint, source, capacity, &draft_options)?;
+        let draft = load_draft(&mut model, &checkpoint, source, slot_capacity, &draft_options)?;
         let mut speculator = Speculator::with_draft(&model, draft, width)?;
         speculator.set_draft_temp_scale(options.draft_temp_scale)?;
         if options.spec_tree {
@@ -1075,7 +1089,7 @@ mod cuda {
             .kv_pool()
             .map_or(0, |p| p.total_pages() * p.page_bytes());
         let check = MemoryCheck::new(gpu, planner.plan(capacity).total(), free, kv_pool)?;
-        Ok((model, speculator, tower, capacity, check))
+        Ok((model, speculator, tower, slot_capacity, check))
     }
 
     /// Loads the vision tower with `--vision`, on the model's stream, with its buffers for

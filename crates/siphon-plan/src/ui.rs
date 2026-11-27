@@ -62,7 +62,7 @@ pub fn draw(app: &App, area: Rect, buf: &mut Buffer) {
     ])
     .areas(area);
     let [table, side] =
-        Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)]).areas(middle);
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(middle);
     let [config, contexts] =
         Layout::vertical([Constraint::Length(8), Constraint::Min(8)]).areas(side);
 
@@ -500,7 +500,12 @@ fn draw_config(app: &App, area: Rect, buf: &mut Buffer) {
             Span::raw(format!("{:<10}", "Position")).fg(DIM),
             Span::raw(format!("{} KiB", per_position.div_ceil(1024))).bold(),
             Span::raw(format!(
-                "  model limit {}",
+                "  {} {}",
+                if app.streams > 1 {
+                    "per-seq limit"
+                } else {
+                    "model limit"
+                },
                 thousands(config.planner.max_positions())
             ))
             .fg(DIM),
@@ -540,11 +545,11 @@ fn draw_contexts(app: &App, area: Rect, buf: &mut Buffer) {
         })
         .collect();
     let widths = std::iter::once(Constraint::Length(12))
-        .chain(app.drafts.iter().map(|_| Constraint::Length(9)))
+        .chain(app.drafts.iter().map(|_| Constraint::Length(10)))
         .collect::<Vec<_>>();
     Table::new(rows, widths)
         .header(header)
-        .column_spacing(2)
+        .column_spacing(1)
         .block(block("Longest context").padding(ratatui::widgets::Padding::horizontal(1)))
         .render(area, buf);
 }

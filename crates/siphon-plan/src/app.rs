@@ -206,7 +206,7 @@ impl App {
     /// Handles a key; returns false to quit.
     pub fn key(&mut self, code: KeyCode) -> bool {
         let (context, _) = self.context();
-        let limit = self.config().planner.max_positions();
+        let limit = self.config().planner.max_pool_positions();
         let step = |by: isize| {
             let moved = context.saturating_add_signed(by);
             Some(moved.clamp(memory::CAPACITY_STEP, limit))

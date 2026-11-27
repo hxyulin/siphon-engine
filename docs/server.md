@@ -8,7 +8,7 @@ SIPHON_API_KEY=<key> target/release/siphon-serve <model-dir> --port 8000
 
 ## Startup
 
-Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. The global KV caches of every stream share one pool of pages ([Concurrent requests](#concurrent-requests)). Without `--context`, the pool takes the free memory less `--margin` (0.25 GiB by default) and what the weights and buffers need, up to the model's 1,048,576 positions. With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
+Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. The global KV caches of every stream share one pool of pages ([Concurrent requests](#concurrent-requests)). Without `--context`, the pool takes the free memory less `--margin` (0.25 GiB by default) and what the weights and buffers need, up to `--streams` times the model's 1,048,576 per-request limit (each individual request stays capped at 1,048,576). With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
 
 It then loads the model, prices each verify width on a short prompt, and serves. After warmup it compares the memory the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the module images and CUDA graphs from the change in free memory. After each job it checks the pool's peak again and warns if the peak went past the plan.
 

@@ -685,7 +685,7 @@ impl Planner {
         if let Some(pool) = &self.pool {
             return Plan {
                 capacity,
-                kv: Self::pool_bytes(capacity, pool) + pool.rings,
+                kv: self.pool_bytes(capacity, pool) + pool.rings,
                 ..self.fixed
             };
         }
@@ -698,11 +698,13 @@ impl Planner {
     }
 
     /// The global caches' part of the pool: `capacity` positions of target caches, in
-    /// whole chunks, and the draft's caches for one sequence of that length. Sequences map
-    /// whole chunks, so several together hold up to a chunk each less than `capacity`.
-    fn pool_bytes(capacity: usize, pool: &PoolShape) -> usize {
+    /// whole chunks, and the draft's caches for one sequence (at most
+    /// [`Self::max_positions`]). Sequences map whole chunks, so several together hold up to
+    /// a chunk each less than `capacity`.
+    fn pool_bytes(&self, capacity: usize, pool: &PoolShape) -> usize {
+        let draft_capacity = capacity.min(self.max_positions);
         PoolShape::pages_bytes(&pool.target_rows, capacity)
-            + PoolShape::pages_bytes(&pool.draft_rows, capacity + DRAFT_STEPS + 1)
+            + PoolShape::pages_bytes(&pool.draft_rows, draft_capacity + DRAFT_STEPS + 1)
     }
 
     /// Pages of [`KV_PAGE_BYTES`] in the plan's pool, 0 without one.
@@ -724,29 +726,44 @@ impl Planner {
         }
     }
 
-    /// The model's longest sequence (`model_max_length`).
+    /// The model's longest single sequence (`model_max_length`).
     #[must_use]
     pub fn max_positions(&self) -> usize {
         self.max_positions
     }
 
+    /// The largest total capacity this configuration can use: for a pooled multi-stream
+    /// cache, up to `streams * max_positions` (each individual sequence stays capped at
+    /// [`Self::max_positions`]); otherwise [`Self::max_positions`].
+    #[must_use]
+    pub fn max_pool_positions(&self) -> usize {
+        if self.pool.is_some() {
+            self.max_positions
+                .saturating_mul(self.fixed.streams.max(1))
+        } else {
+            self.max_positions
+        }
+    }
+
     /// The largest capacity whose plan fits `budget` bytes: a multiple of
-    /// [`CAPACITY_STEP`], at most [`Self::max_positions`], or `None` if not even one step
-    /// fits.
+    /// [`CAPACITY_STEP`], at most [`Self::max_pool_positions`], or `None` if not even one
+    /// step fits.
     #[must_use]
     pub fn max_capacity(&self, budget: usize) -> Option<usize> {
-        let room = budget.checked_sub(self.fixed.total())?;
-        let mut capacity = (room / self.bytes_per_position())
-            .min(self.max_positions)
-            .next_multiple_of(CAPACITY_STEP);
-        // `next_multiple_of` rounded up, and a pool adds a chunk per stream; step back to
-        // a multiple that fits.
-        while capacity > 0
-            && (capacity > self.max_positions || self.plan(capacity).total() > budget)
-        {
-            capacity -= CAPACITY_STEP;
+        let max_steps = self.max_pool_positions() / CAPACITY_STEP;
+        if max_steps == 0 || self.plan(CAPACITY_STEP).total() > budget {
+            return None;
         }
-        (capacity > 0).then_some(capacity)
+        let (mut lo, mut hi) = (1usize, max_steps);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if self.plan(mid * CAPACITY_STEP).total() <= budget {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Some(lo * CAPACITY_STEP)
     }
 }
 
@@ -1585,6 +1602,92 @@ mod tests {
         let inv48 = invariant_scratch(&c, 48);
         let dense48 = 48 * (3 * c.hidden_size) + (48 * 3 * c.hidden_size) / 32;
         assert!(inv48 - inv47 > dense48);
+    }
+
+    #[test]
+    fn pooled_multi_stream_capacity_scales_past_model_max_length() {
+        let dir = checkpoint("pool-multi", &[("model.llm.norm.weight", Dtype::BF16, &[25])]);
+        let checkpoint = Checkpoint::open(&dir).expect("opening");
+        let c = config();
+        let make = |streams, pooled, kv, draft| {
+            Planner::new(&PlanInputs {
+                config: &c,
+                checkpoint: &checkpoint,
+                weights: WeightFormat::Fp8,
+                output: OutputProjection::default(),
+                prefill_dense_fp8: false,
+                kv,
+                draft,
+                prefill_chunk: 2048,
+                streams,
+                pooled,
+                prefix_entries: 0,
+                sms: 188,
+                vision: None,
+            })
+            .expect("a plan")
+        };
+
+        let budget_96g = 94usize << 30;
+        let single_pooled = make(1, true, KvFormat::Fp8, DraftChoice::None);
+        assert_eq!(single_pooled.max_positions(), 1 << 20);
+        assert_eq!(single_pooled.max_pool_positions(), 1 << 20);
+        assert_eq!(single_pooled.max_capacity(budget_96g), Some(1 << 20));
+
+        // 2 pooled streams can use up to 2 * model_max_length, fitting in 94 GiB FP8.
+        let two_pooled = make(2, true, KvFormat::Fp8, DraftChoice::None);
+        assert_eq!(two_pooled.max_positions(), 1 << 20);
+        assert_eq!(two_pooled.max_pool_positions(), 2 << 20);
+        assert_eq!(two_pooled.max_capacity(budget_96g), Some(2 << 20));
+
+        // 32 pooled streams scale to fill the 94 GiB budget well past 1M positions.
+        let many_pooled = make(32, true, KvFormat::Fp8, DraftChoice::None);
+        assert_eq!(many_pooled.max_pool_positions(), 32 << 20);
+        let cap32 = many_pooled.max_capacity(budget_96g).expect("fits");
+        assert!(cap32 > (4 << 20), "expected >4M FP8 positions, got {cap32}");
+        assert_eq!(cap32 % CAPACITY_STEP, 0);
+        assert!(many_pooled.plan(cap32).total() <= budget_96g);
+        assert!(many_pooled.plan(cap32 + CAPACITY_STEP).total() > budget_96g);
+
+        // NVFP4 pooled streams reach >8M positions on a 94 GiB budget.
+        let nvfp4_pooled = make(32, true, KvFormat::Nvfp4, DraftChoice::None);
+        let cap_nvfp4 = nvfp4_pooled.max_capacity(budget_96g).expect("fits");
+        assert!(
+            cap_nvfp4 > (8 << 20),
+            "expected >8M NVFP4 positions, got {cap_nvfp4}"
+        );
+        assert!(nvfp4_pooled.plan(cap_nvfp4).total() <= budget_96g);
+        assert!(nvfp4_pooled.plan(cap_nvfp4 + CAPACITY_STEP).total() > budget_96g);
+
+        // Unpooled multi-stream stays capped at model_max_length per stream.
+        let unpooled = make(4, false, KvFormat::Fp8, DraftChoice::None);
+        assert_eq!(unpooled.max_pool_positions(), 1 << 20);
+        assert_eq!(unpooled.max_capacity(usize::MAX / 2), Some(1 << 20));
+
+        // Draft global KV in a pooled multi-stream plan caps at max_positions + DRAFT_STEPS + 1.
+        let draft_planner = Planner {
+            fixed: Plan {
+                streams: 4,
+                pooled: true,
+                weights: 16 << 30,
+                runtime: RUNTIME_BYTES,
+                ..Plan::default()
+            },
+            kv_per_position: 16 << 10,
+            draft_kv_per_position: 2 << 10,
+            max_positions: 1 << 20,
+            pool: Some(PoolShape {
+                target_rows: vec![1024; 16],
+                draft_rows: vec![1024; 2],
+                rings: 320 << 20,
+            }),
+        };
+        let at_1m = draft_planner.plan(1 << 20).kv;
+        let at_2m = draft_planner.plan(2 << 20).kv;
+        // Going from 1M to 2M adds only 1M target positions (16 GiB), not draft KV.
+        assert_eq!(at_2m - at_1m, 16 << 30);
+
+        std::fs::remove_dir_all(dir).expect("cleaning up");
     }
 
     #[test]
