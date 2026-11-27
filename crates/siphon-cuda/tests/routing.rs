@@ -26,8 +26,8 @@ use siphon_cuda::{
         norm::Norm,
         routing::{
             DepthRows, DepthStep, EXPERTS, FUSED_MAX_CANDIDATES, MoePruning, NormDest, Partial,
-            RouterMatmul, RouterRowsScratch, Routing, RowsPartial, STEP_ROUTER_ROWS, StepPartial,
-            TOP_K,
+            RouterMatmul, RouterRowsScratch, Routing, RowsBatch, RowsPartial, STEP_ROUTER_ROWS,
+            StepPartial, TOP_K,
         },
     },
 };
@@ -1860,5 +1860,107 @@ fn moe_pruning_matches_reference_across_routers() -> anyhow::Result<()> {
     }
     let sum: f32 = r_w_h.iter().sum();
     assert!((sum - ROUTE_SCALE).abs() < 1e-5);
+    Ok(())
+}
+
+/// `depth_attention_rows_batch` with 16 query sets (2D grid `(count, rows)` sharing rows in L2)
+/// matches 16 individual `depth_attention_rows` calls bit-for-bit on `probs` and `dests`.
+#[test]
+fn depth_attention_rows_batch_matches_single() -> anyhow::Result<()> {
+    const ROWS: usize = 64;
+    const COUNT: usize = 16;
+    const NB: usize = 3;
+    const NQ: usize = 4;
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let blocks = stream.clone_htod(&pseudo_random(NB * ROWS * HIDDEN, 1400, 1.0))?;
+    let partial = stream.clone_htod(&pseudo_random(ROWS * HIDDEN, 1401, 1.0))?;
+    let queries_host = pseudo_random(COUNT * NQ * HIDDEN, 1402, 1.0);
+    let queries_all = stream.clone_htod(&queries_host)?;
+
+    let probs_set = ROWS * NQ * (NB + 1);
+    let mut probs_batch = stream.alloc_zeros::<f32>(COUNT * probs_set)?;
+    let mut dests_batch: Vec<CudaSlice<bf16>> = (0..4)
+        .map(|_| Ok(stream.alloc_zeros::<bf16>(COUNT * ROWS * HIDDEN)?))
+        .collect::<anyhow::Result<_>>()?;
+    let [bd0, bd1, bd2, bd3] = &mut dests_batch[..] else {
+        unreachable!()
+    };
+    routing.depth_attention_rows_batch(
+        stream,
+        DepthRows {
+            blocks: blocks.as_view(),
+            partial: RowsPartial::Normalized(partial.as_view()),
+            normed_partial: None,
+            queries: &queries_all,
+            out: None,
+            probs: Some(probs_batch.as_view_mut()),
+            dests: [
+                Some(norm_dest(bd0, None)),
+                Some(norm_dest(bd1, None)),
+                Some(norm_dest(bd2, None)),
+                Some(norm_dest(bd3, None)),
+            ],
+            dst_stride: HIDDEN,
+            rows: ROWS,
+        },
+        RowsBatch {
+            count: COUNT,
+            probs_stride: probs_set,
+            dst_stride: ROWS * HIDDEN,
+        },
+        EPS,
+    )?;
+    let probs_batch = stream.clone_dtoh(&probs_batch)?;
+    let dests_batch: Vec<Vec<bf16>> = dests_batch
+        .iter()
+        .map(|d| Ok(stream.clone_dtoh(d)?))
+        .collect::<anyhow::Result<_>>()?;
+
+    for s in 0..COUNT {
+        let q = stream.clone_htod(&queries_host[s * NQ * HIDDEN..(s + 1) * NQ * HIDDEN])?;
+        let mut probs_one = stream.alloc_zeros::<f32>(probs_set)?;
+        let mut dests_one: Vec<CudaSlice<bf16>> = (0..4)
+            .map(|_| Ok(stream.alloc_zeros::<bf16>(ROWS * HIDDEN)?))
+            .collect::<anyhow::Result<_>>()?;
+        let [sd0, sd1, sd2, sd3] = &mut dests_one[..] else {
+            unreachable!()
+        };
+        routing.depth_attention_rows(
+            stream,
+            DepthRows {
+                blocks: blocks.as_view(),
+                partial: RowsPartial::Normalized(partial.as_view()),
+                normed_partial: None,
+                queries: &q,
+                out: None,
+                probs: Some(probs_one.as_view_mut()),
+                dests: [
+                    Some(norm_dest(sd0, None)),
+                    Some(norm_dest(sd1, None)),
+                    Some(norm_dest(sd2, None)),
+                    Some(norm_dest(sd3, None)),
+                ],
+                dst_stride: HIDDEN,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+        assert_f32_within_ulps(
+            &format!("rows_batch set {s}: probs"),
+            &probs_batch[s * probs_set..(s + 1) * probs_set],
+            &stream.clone_dtoh(&probs_one)?,
+            0,
+        );
+        for (k, sd) in dests_one.iter().enumerate() {
+            assert_bf16_close(
+                &format!("rows_batch set {s} dest {k}"),
+                &dests_batch[k][s * ROWS * HIDDEN..(s + 1) * ROWS * HIDDEN],
+                &stream.clone_dtoh(sd)?,
+                0,
+            );
+        }
+    }
     Ok(())
 }

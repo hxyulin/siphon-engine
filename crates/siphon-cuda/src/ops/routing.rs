@@ -5,8 +5,7 @@ use std::{mem::size_of, sync::Arc};
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
-    PushKernelArg as _,
-    sys::{CUdevice_attribute, CUfunction_attribute},
+    PushKernelArg as _, sys::CUfunction_attribute,
 };
 use half::bf16;
 
@@ -115,6 +114,8 @@ const LOGITS_THREADS: u32 = 256;
 const ROUTING_THREADS: u32 = 256;
 /// Threads per row of `depth_attention_2304`, which fixes its summation order.
 const DEPTH_THREADS: u32 = 288;
+/// Threads per block of `depth_attention_rows_2304_<nb>_<nq>`: one float4 per thread.
+const ROWS_DEPTH_THREADS: u32 = 576;
 /// Candidates and queries `depth_attention_fused_2304` holds in registers.
 pub const FUSED_MAX_CANDIDATES: usize = 6;
 const _: () = assert!(FUSED_MAX_CANDIDATES == siphon::memory::FUSED_MAX_CANDIDATES);
@@ -343,19 +344,15 @@ pub struct Routing {
     depth_attention_step_2304: CudaFunction,
     moe_router_step_2304: CudaFunction,
     moe_router_step_rows_2304: CudaFunction,
-    /// `depth_attention_rows_2304_<nb>_<nq>` at `[nq index][nb - 1]`, with the most blocks
-    /// that run at once.
-    depth_attention_rows_2304: Vec<Vec<(CudaFunction, u32)>>,
+    /// `depth_attention_rows_2304_<nb>_<nq>` at `[nq index][nb - 1]`.
+    depth_attention_rows_2304: Vec<Vec<CudaFunction>>,
     /// `depth_attention_rows_quant_2304_<nb>_<nq>` at `[nq index][nb - 1]` for `nq` in `[1, 3]`.
-    depth_attention_rows_quant_2304: Vec<Vec<(CudaFunction, u32)>>,
+    depth_attention_rows_quant_2304: Vec<Vec<CudaFunction>>,
 }
 
 impl Routing {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "routing", cubin!("routing"))?;
-        let sms = u32::try_from(
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-        )?;
         Ok(Self {
             router_logits_2304: module.load_function("router_logits_2304")?,
             expert_routing_128_top8: module.load_function("expert_routing_128_top8")?,
@@ -392,36 +389,22 @@ impl Routing {
                 .map(|nq| {
                     (1..FUSED_MAX_CANDIDATES)
                         .map(|nb| {
-                            let f = module
-                                .load_function(&format!("depth_attention_rows_2304_{nb}_{nq}"))?;
-                            let per_sm = f.occupancy_max_active_blocks_per_multiprocessor(
-                                DEPTH_THREADS,
-                                0,
-                                None,
-                            )?;
-                            Ok((f, per_sm.max(1) * sms))
+                            module.load_function(&format!("depth_attention_rows_2304_{nb}_{nq}"))
                         })
-                        .collect::<anyhow::Result<Vec<_>>>()
+                        .collect::<Result<Vec<_>, _>>()
                 })
-                .collect::<anyhow::Result<_>>()?,
+                .collect::<Result<_, _>>()?,
             depth_attention_rows_quant_2304: ROWS_QUANT_QUERY_COUNTS
                 .iter()
                 .map(|nq| {
                     (1..FUSED_MAX_CANDIDATES)
                         .map(|nb| {
-                            let f = module.load_function(&format!(
-                                "depth_attention_rows_quant_2304_{nb}_{nq}"
-                            ))?;
-                            let per_sm = f.occupancy_max_active_blocks_per_multiprocessor(
-                                DEPTH_THREADS,
-                                0,
-                                None,
-                            )?;
-                            Ok((f, per_sm.max(1) * sms))
+                            module
+                                .load_function(&format!("depth_attention_rows_quant_2304_{nb}_{nq}"))
                         })
-                        .collect::<anyhow::Result<Vec<_>>>()
+                        .collect::<Result<Vec<_>, _>>()
                 })
-                .collect::<anyhow::Result<_>>()?,
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -1030,23 +1013,23 @@ impl Routing {
         for dest in &dests {
             args.opt(dest.as_ref().and_then(|d| d.weight), stream);
         }
+        let count_u32 = u32::try_from(count).context("too many sets")?;
         let rows_u32 = u32::try_from(rows).context("too many rows")?;
         args.f32(eps)
             .f32((HIDDEN as f32).sqrt().recip())
-            .i32(i32::try_from(rows)?)
+            .i32(i32::try_from(count).context("too many sets")?)
             .i32(i32::try_from(b.probs_stride).context("probs stride too large")?)
             .i32(i32::try_from(b.dst_stride).context("destination stride too large")?);
-        let (function, resident) = &self.depth_attention_rows_2304[q_index][nb - 1];
+        let function = &self.depth_attention_rows_2304[q_index][nb - 1];
         let config = LaunchConfig {
-            grid_dim: (rows_u32.min(*resident), u32::try_from(count)?, 1),
-            block_dim: (DEPTH_THREADS, 1, 1),
+            grid_dim: (count_u32, rows_u32, 1),
+            block_dim: (ROWS_DEPTH_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `depth_attention_rows_2304_<nb>_<nq>`'s signature,
         // every non-null pointer comes from a live buffer that holds the rows of every set
-        // checked above, the blocks loop over the rows and the grid's y dimension covers
-        // the sets, and the kernel reads only weights (queries, norm weights, conv taps)
-        // before `pdl_wait`.
+        // checked above, each block covers one (set, row) pair of the 2D grid, and the kernel
+        // reads only query 0 before `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
@@ -1161,7 +1144,7 @@ impl Routing {
         let rows_u32 = u32::try_from(rows).context("too many rows")?;
         args.f32(eps)
             .f32((HIDDEN as f32).sqrt().recip())
-            .i32(i32::try_from(rows)?)
+            .i32(1)
             .i32(0)
             .i32(0);
         for dest in &mut dests {
@@ -1174,15 +1157,16 @@ impl Routing {
             args.opt_mut(dest.as_mut().and_then(|d| d.quant.outer.as_mut()), stream);
         }
         args.i32(q_mode);
-        let (function, resident) = &self.depth_attention_rows_quant_2304[q_index][nb - 1];
+        let function = &self.depth_attention_rows_quant_2304[q_index][nb - 1];
         let config = LaunchConfig {
-            grid_dim: (rows_u32.min(*resident), 1, 1),
-            block_dim: (DEPTH_THREADS, 1, 1),
+            grid_dim: (1, rows_u32, 1),
+            block_dim: (ROWS_DEPTH_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `depth_attention_rows_quant_2304_<nb>_<nq>`'s signature,
         // every non-null pointer comes from a live buffer sized for `rows` as checked above,
-        // and the kernel reads only read-only weights (queries, conv taps) before `pdl_wait`.
+        // each block covers one row of the 2D grid, and the kernel reads only query 0 before
+        // `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 
