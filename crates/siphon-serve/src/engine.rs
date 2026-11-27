@@ -2713,7 +2713,16 @@ mod cuda {
                     },
                 );
                 if let TurnPlan::Piggyback { slices, .. } = plan {
-                    step_rows_hybrid(model, speculator, tower, &mut active, &slices, stop);
+                    step_rows_hybrid(
+                        model,
+                        speculator,
+                        tower,
+                        &mut active,
+                        &slices,
+                        stop,
+                        sched.group_by_confidence,
+                        &mut scratch,
+                    );
                     retire(model, speculator, &mut active);
                     synced = Instant::now();
                     continue;
@@ -3528,6 +3537,7 @@ mod cuda {
     /// decode or batched-verify pass (followed by any overflow verify micro-batches or
     /// secondary plain-decode rows).
     #[expect(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "encodes images, dispatches hybrid verify or hybrid decode, handles overflow"
     )]
@@ -3538,6 +3548,8 @@ mod cuda {
         active: &mut [Request],
         slices: &[PiggybackSlice],
         stop: &[u32],
+        group_by_confidence: bool,
+        scratch: &mut StepScratch,
     ) {
         let batch_spec = speculator.supports_batch_spec();
         let mut spec_indices = Vec::new();
@@ -3585,7 +3597,14 @@ mod cuda {
             encoded_images.push(imgs);
         }
         if live_slices.is_empty() {
-            let _ = step_rows(model, speculator, active, stop);
+            let _ = step_rows(
+                model,
+                speculator,
+                active,
+                stop,
+                group_by_confidence,
+                scratch,
+            );
             return;
         }
         let chunk = speculator.prefill_chunk();
