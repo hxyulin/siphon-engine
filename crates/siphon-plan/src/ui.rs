@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Rows a printed frame takes.
-const HEIGHT: u16 = 30;
+const HEIGHT: u16 = 31;
 
 /// Rows of a printed frame: one more for the vision tower's part.
 pub fn height(app: &App) -> u16 {
@@ -62,7 +62,7 @@ pub fn draw(app: &App, area: Rect, buf: &mut Buffer) {
     ])
     .areas(area);
     let [table, side] =
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(middle);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(middle);
     let [config, contexts] =
         Layout::vertical([Constraint::Length(8), Constraint::Min(8)]).areas(side);
 
@@ -544,7 +544,7 @@ fn draw_contexts(app: &App, area: Rect, buf: &mut Buffer) {
                 .collect::<Row>()
         })
         .collect();
-    let widths = std::iter::once(Constraint::Length(12))
+    let widths = std::iter::once(Constraint::Length(15))
         .chain(app.drafts.iter().map(|_| Constraint::Length(10)))
         .collect::<Vec<_>>();
     Table::new(rows, widths)

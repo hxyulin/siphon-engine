@@ -41,8 +41,10 @@ const DECODE_FLOOR: f64 = 20.0;
 
 const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 8000] \
                      [--context N] [--memory GiB] [--margin GiB] [--prefill-chunk 2048] [--weights fp8|bf16] \
-                     [--output-projection bf16|fp8|mxfp8] [--kv fp8|bf16|nvfp4|nvfp4-all|mixed] [--streams 1] \
+                     [--output-projection bf16|fp8|mxfp8] [--lm-head bf16|fp8|nvfp4] \
+                     [--kv fp8|bf16|nvfp4|nvfp4-all|mixed] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
+                     [--draft-weights auto|bf16|fp8|nvfp4|nvfp4-backbone] \
                      [--draft-shortlist N] [--draft-context-rows N] \
                      [--fallback] [--spec-tree] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8|fp4] \

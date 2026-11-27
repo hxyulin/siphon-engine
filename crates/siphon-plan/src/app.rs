@@ -17,12 +17,13 @@ const LARGE_STEP: usize = 64 * 1024;
 
 /// The weight and KV formats: the first four in the order the keys cycle through them,
 /// then the NVFP4 and mixed caches, which only the table of longest contexts shows.
-pub const FORMATS: [(WeightFormat, KvFormat); 7] = [
+pub const FORMATS: [(WeightFormat, KvFormat); 8] = [
     (WeightFormat::Fp8, KvFormat::Fp8),
     (WeightFormat::Fp8, KvFormat::Bf16),
     (WeightFormat::Bf16, KvFormat::Fp8),
     (WeightFormat::Bf16, KvFormat::Bf16),
     (WeightFormat::Fp8, KvFormat::Nvfp4),
+    (WeightFormat::Fp8, KvFormat::Nvfp4All),
     (WeightFormat::Bf16, KvFormat::Nvfp4),
     (WeightFormat::Fp8, KvFormat::Mixed),
 ];
@@ -68,6 +69,12 @@ pub struct Settings {
     pub vision: Option<VisionInputs>,
     /// `--output-projection`.
     pub output: OutputProjection,
+    /// `--lm-head`.
+    pub lm_head: Option<siphon::LmHeadFormat>,
+    /// `--prefill-dense fp8`.
+    pub prefill_dense_fp8: bool,
+    /// `--draft-weights`.
+    pub draft_weights: String,
 }
 
 pub struct App {
@@ -94,6 +101,48 @@ pub struct App {
     pub vision: bool,
 }
 
+fn draft_approx(draft_weights: &str) -> anyhow::Result<DraftApprox> {
+    // siphon-serve's default draft options: FP8 backbone, head, fold and cache, and a
+    // shortlist, overridden by `--draft-weights` when given.
+    let mut approx = DraftApprox {
+        fp8_backbone: true,
+        nvfp4_backbone: false,
+        fp8_head: true,
+        nvfp4_head: false,
+        fp8_fold: true,
+        fp8_kv: true,
+        shortlist: true,
+    };
+    match draft_weights {
+        "auto" => {}
+        "bf16" => {
+            approx.fp8_backbone = false;
+            approx.nvfp4_backbone = false;
+            approx.nvfp4_head = false;
+        }
+        "fp8" => {
+            approx.fp8_backbone = true;
+            approx.nvfp4_backbone = false;
+            approx.fp8_head = true;
+            approx.nvfp4_head = false;
+        }
+        "nvfp4-backbone" => {
+            approx.fp8_backbone = false;
+            approx.nvfp4_backbone = true;
+            approx.fp8_head = true;
+            approx.nvfp4_head = false;
+        }
+        "nvfp4" => {
+            approx.fp8_backbone = false;
+            approx.nvfp4_backbone = true;
+            approx.fp8_head = false;
+            approx.nvfp4_head = true;
+        }
+        other => anyhow::bail!("unknown --draft-weights {other:?}"),
+    }
+    Ok(approx)
+}
+
 impl App {
     pub fn new(
         model_dir: &Path,
@@ -101,7 +150,7 @@ impl App {
         device: Device,
         settings: &Settings,
     ) -> anyhow::Result<Self> {
-        let &Settings {
+        let Settings {
             limit,
             margin,
             prefill_chunk,
@@ -109,23 +158,37 @@ impl App {
             streams,
             vision,
             output,
+            lm_head,
+            prefill_dense_fp8,
+            draft_weights,
         } = settings;
+        let (
+            limit,
+            margin,
+            prefill_chunk,
+            context,
+            streams,
+            vision,
+            output,
+            lm_head,
+            prefill_dense_fp8,
+        ) = (
+            *limit,
+            *margin,
+            *prefill_chunk,
+            *context,
+            *streams,
+            *vision,
+            *output,
+            *lm_head,
+            *prefill_dense_fp8,
+        );
         let config = TextConfig::load(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir)?;
         let mut drafts = vec![Draft::Bundled];
         drafts.extend(drafter.map(|d| Draft::Dflash(d.to_owned())));
         drafts.push(Draft::None);
-        // siphon-serve's default draft options: FP8 backbone, head, fold and cache, and a
-        // shortlist.
-        let approx = DraftApprox {
-            fp8_backbone: true,
-            nvfp4_backbone: false,
-            fp8_head: true,
-            nvfp4_head: false,
-            fp8_fold: true,
-            fp8_kv: true,
-            shortlist: true,
-        };
+        let approx = draft_approx(draft_weights)?;
         let configs = drafts
             .iter()
             .map(|draft| {
@@ -137,7 +200,9 @@ impl App {
                             checkpoint: &checkpoint,
                             weights,
                             output,
-                            prefill_dense_fp8: false,
+                            lm_head,
+                            prefill_dense_fp8,
+                            block_scaled_mma: device.block_scaled_mma,
                             kv,
                             draft: match draft {
                                 Draft::Bundled => DraftChoice::Bundled(approx),

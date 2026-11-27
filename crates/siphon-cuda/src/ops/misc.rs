@@ -73,8 +73,8 @@ pub struct GateSlot<'a> {
 /// One gate of [`Misc::message_gate_step`]: its weights, its down projection's input, and
 /// optionally the weight of the norm after it and the normalized output.
 pub struct GateStep<'a> {
-    /// `[64, 4608]`.
-    pub down_weight: &'a CudaSlice<bf16>,
+    /// `[64, 4608]`, required when `fp8` is `None`.
+    pub down_weight: Option<&'a CudaSlice<bf16>>,
     /// The normalized state and message side by side, BF16 `[4608]`.
     pub input: CudaView<'a, bf16>,
     pub forget: &'a CudaSlice<bf16>,
@@ -87,8 +87,8 @@ pub struct GateStep<'a> {
 
 /// One gate of [`Misc::message_gate_rows`].
 pub struct GateRowsSlot<'a> {
-    /// `[64, 4608]`.
-    pub down: &'a CudaSlice<bf16>,
+    /// `[64, 4608]`, required when `down_fp8` is `None`.
+    pub down: Option<&'a CudaSlice<bf16>>,
     /// The down weight's FP8 copy, which the gate reads instead. Every gate of a launch has
     /// one or none does.
     pub down_fp8: Option<&'a Fp8Matrix>,
@@ -135,7 +135,10 @@ impl GateRowsSlot<'_> {
             x_strides,
             h_stride,
         } = *shape;
-        check_len("down weight", self.down.len(), GATE_RANK * 2 * HIDDEN)?;
+        if self.down_fp8.is_none() {
+            let down = self.down.context("BF16 down weight missing")?;
+            check_len("down weight", down.len(), GATE_RANK * 2 * HIDDEN)?;
+        }
         check_len("forget", self.forget.len(), HIDDEN * GATE_RANK)?;
         check_len("gain", self.gain.len(), HIDDEN * GATE_RANK)?;
         for (name, x, stride) in [
@@ -172,7 +175,10 @@ impl GateRowsSlot<'_> {
                     w.scales().device_ptr(stream).0,
                 )
             }
-            None => (self.down.device_ptr(stream).0, 0),
+            None => (
+                self.down.context("BF16 down weight missing")?.device_ptr(stream).0,
+                0,
+            ),
         };
         let x_state = self.x_state.device_ptr(stream).0;
         let x_message = self.x_message.device_ptr(stream).0;
@@ -277,8 +283,8 @@ pub struct GateNormQuant<'a> {
 /// the precomputed normalized message half (`[2304]` BF16) of its down projection's input,
 /// and its trailing weighted RMSNorm weight and output (`[2304]` BF16).
 pub struct DepthGateSlot<'a> {
-    /// `[64, 4608]`.
-    pub down_weight: &'a CudaSlice<bf16>,
+    /// `[64, 4608]`, required when `fp8` is `None`.
+    pub down_weight: Option<&'a CudaSlice<bf16>>,
     /// Precomputed normalized message half, BF16 `[2304]`.
     pub input_msg: CudaView<'a, bf16>,
     pub forget: &'a CudaSlice<bf16>,
@@ -735,11 +741,10 @@ impl Misc {
             check_len("down", down.len(), n * GATE_RANK)?;
         }
         for gate in &*gates {
-            check_len(
-                "down weight",
-                gate.down_weight.len(),
-                GATE_RANK * 2 * HIDDEN,
-            )?;
+            if gate.fp8.is_none() {
+                let down = gate.down_weight.context("BF16 down weight missing")?;
+                check_len("down weight", down.len(), GATE_RANK * 2 * HIDDEN)?;
+            }
             check_len("input", gate.input.len(), 2 * HIDDEN)?;
             check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
             check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
@@ -846,7 +851,10 @@ impl Misc {
                 gate.fp8.is_some() == fp8,
                 "every gate of a launch has FP8 weights or none does"
             );
-            check_len("down weight", gate.down_weight.len(), GATE_RANK * 2 * HIDDEN)?;
+            if !fp8 {
+                let down = gate.down_weight.context("BF16 down weight missing")?;
+                check_len("down weight", down.len(), GATE_RANK * 2 * HIDDEN)?;
+            }
             check_len("input_msg", gate.input_msg.len(), HIDDEN)?;
             check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
             check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
@@ -890,7 +898,7 @@ impl Misc {
             }
         } else {
             for g in gates.iter() {
-                args.ptr(g.down_weight, stream);
+                args.ptr(g.down_weight.context("BF16 down weight missing")?, stream);
             }
             for g in gates.iter() {
                 args.ptr(&g.input_msg, stream);
@@ -961,7 +969,10 @@ impl Misc {
         }
         check_len("residual", residual.len(), HIDDEN)?;
         check_len("query", query.len(), HIDDEN)?;
-        check_len("down weight", gate.down_weight.len(), GATE_RANK * 2 * HIDDEN)?;
+        if gate.fp8.is_none() {
+            let down = gate.down_weight.context("BF16 down weight missing")?;
+            check_len("down weight", down.len(), GATE_RANK * 2 * HIDDEN)?;
+        }
         check_len("input_msg", gate.input_msg.len(), HIDDEN)?;
         check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
         check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
@@ -1004,7 +1015,7 @@ impl Misc {
                 .ptr(&gain.values(), stream)
                 .ptr(&gain.scales(), stream);
         } else {
-            args.ptr(gate.down_weight, stream)
+            args.ptr(gate.down_weight.context("BF16 down weight missing")?, stream)
                 .ptr(&gate.input_msg, stream)
                 .ptr(gate.forget, stream)
                 .ptr(gate.gain, stream);
@@ -1638,7 +1649,10 @@ fn push_gate_weights(
         }
     } else {
         for k in 0..GATE_SLOTS {
-            args.ptr(slot(k).down_weight, stream);
+            args.ptr(
+                slot(k).down_weight.context("BF16 down weight missing")?,
+                stream,
+            );
         }
         for k in 0..GATE_SLOTS {
             args.ptr(&slot(k).input, stream);

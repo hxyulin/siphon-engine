@@ -38,8 +38,10 @@ use crate::{
 };
 
 const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory GiB] [--margin GiB] \
-                     [--prefill-chunk N] [--output-projection bf16|fp8|mxfp8] [--free GiB] [--context N] \
-                     [--streams N] [--vision] [--max-image-pixels N] [--print]
+                     [--prefill-chunk N] [--output-projection bf16|fp8|mxfp8] \
+                     [--lm-head bf16|fp8|nvfp4] [--prefill-dense bf16|fp8] \
+                     [--draft-weights auto|bf16|fp8|nvfp4|nvfp4-backbone] \
+                     [--free GiB] [--context N] [--streams N] [--vision] [--max-image-pixels N] [--print]
 --drafter adds a DFlash drafter's plan beside the bundled draft's.
 --memory caps the GPU memory the plan may use, the CUDA context included, as siphon-serve's
 --memory does.
@@ -49,6 +51,11 @@ const USAGE: &str = "usage: siphon-plan <model-dir> [--drafter DIR] [--memory Gi
 does (2048 by default).
 --output-projection plans the attention output projection decode reads with FP8 weights, as
 siphon-serve's --output-projection does (bf16 by default).
+--lm-head plans the LM head format (bf16, fp8, or nvfp4), as siphon-serve's --lm-head does.
+--prefill-dense plans dense prefill products (bf16 or fp8; fp8 frees unused BF16 weights under
+FP8 weights), as siphon-serve's --prefill-dense does (bf16 by default).
+--draft-weights plans draft weight precision (auto, bf16, fp8, nvfp4, or nvfp4-backbone), as
+siphon-serve's --draft-weights does (auto by default).
 --free sets the free memory right after creating the CUDA context instead of asking
 nvidia-smi. Without either, the plan assumes an idle 32 GB RTX 5090.
 --context starts at N positions instead of the most that fit.
@@ -69,6 +76,9 @@ struct Args {
     margin: usize,
     prefill_chunk: usize,
     output: siphon::OutputProjection,
+    lm_head: Option<siphon::LmHeadFormat>,
+    prefill_dense_fp8: bool,
+    draft_weights: String,
     free: Option<usize>,
     context: Option<usize>,
     streams: usize,
@@ -98,6 +108,9 @@ fn args() -> anyhow::Result<Args> {
     let mut margin = memory::DEFAULT_MARGIN;
     let mut prefill_chunk = memory::DEFAULT_PREFILL_CHUNK;
     let mut output = siphon::OutputProjection::default();
+    let mut lm_head = None;
+    let mut prefill_dense_fp8 = false;
+    let mut draft_weights = "auto".to_owned();
     let mut free = None;
     let mut context = None;
     let mut streams = 1;
@@ -123,6 +136,23 @@ fn args() -> anyhow::Result<Args> {
                 );
             }
             "--output-projection" => output = value()?.parse()?,
+            "--lm-head" => lm_head = Some(value()?.parse()?),
+            "--prefill-dense" => {
+                let v = value()?;
+                prefill_dense_fp8 = match v.as_str() {
+                    "bf16" => false,
+                    "fp8" => true,
+                    _ => bail!("unknown --prefill-dense {v:?}; expected bf16 or fp8"),
+                };
+            }
+            "--draft-weights" => {
+                let v = value()?;
+                ensure!(
+                    ["auto", "bf16", "fp8", "nvfp4", "nvfp4-backbone"].contains(&v.as_str()),
+                    "unknown --draft-weights {v:?}; expected auto, bf16, fp8, nvfp4, or nvfp4-backbone"
+                );
+                draft_weights = v;
+            }
             "--free" => free = Some(gib_arg(&value()?, "--free")?),
             "--context" => context = Some(value()?.parse().context("--context takes positions")?),
             "--streams" => {
@@ -156,6 +186,9 @@ fn args() -> anyhow::Result<Args> {
         margin,
         prefill_chunk,
         output,
+        lm_head,
+        prefill_dense_fp8,
+        draft_weights,
         free,
         context,
         streams,
@@ -190,6 +223,9 @@ fn main() -> anyhow::Result<()> {
             streams: args.streams,
             vision,
             output: args.output,
+            lm_head: args.lm_head,
+            prefill_dense_fp8: args.prefill_dense_fp8,
+            draft_weights: args.draft_weights,
         },
     )?;
     if args.print || !io::stdout().is_terminal() {

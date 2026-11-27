@@ -16,7 +16,9 @@ use std::{fmt, path::Path};
 use anyhow::{Context as _, ensure};
 use safetensors::Dtype;
 
-use crate::{Checkpoint, KvFormat, OutputProjection, TextConfig, VisionFormat, WeightFormat};
+use crate::{
+    Checkpoint, KvFormat, LmHeadFormat, OutputProjection, TextConfig, VisionFormat, WeightFormat,
+};
 
 /// Device memory the CUDA context takes, rounded up: 507 MiB on an RTX 5090 with driver
 /// 620, measured as `nvidia-smi`'s free memory before `siphon-serve` started less the free
@@ -306,8 +308,16 @@ pub struct PlanInputs<'a> {
     pub weights: WeightFormat,
     /// The output projection's format under [`WeightFormat::Fp8`].
     pub output: OutputProjection,
-    /// Whether opt-in `--prefill-dense fp8` is enabled (adds per-layer MXFP8 copies of `W_o`).
+    /// Optional override for the LM head's format (`None` follows [`Self::weights`]).
+    pub lm_head: Option<LmHeadFormat>,
+    /// Whether opt-in `--prefill-dense fp8` is enabled. Under [`WeightFormat::Fp8`], every
+    /// code path then reads the FP8 attention input projections and message-gate `down`
+    /// projections (plus `W_o` when its quantized copy covers prefill too), so the BF16
+    /// copies of those matrices are freed during load.
     pub prefill_dense_fp8: bool,
+    /// Whether the target GPU supports block-scaled MMA (`sm_120a` Blackwell = `true`,
+    /// `sm_89` Ada = `false`). Controls whether MXFP8 `W_o` runs in prefill.
+    pub block_scaled_mma: bool,
     pub kv: KvFormat,
     pub draft: DraftChoice<'a>,
     /// Rows of the largest prefill chunk, or 0 if nothing prefills.
@@ -538,6 +548,10 @@ impl Planner {
                 + inputs.prefill_chunk * taps * hidden * 2
                 + dense_scratch(c, inputs.prefill_chunk)
         };
+        let lm_head = inputs.lm_head.unwrap_or(match inputs.weights {
+            WeightFormat::Bf16 => LmHeadFormat::Bf16,
+            WeightFormat::Fp8 => LmHeadFormat::Fp8,
+        });
         let (verify, draft_bytes, draft_kv_per_position) = match &draft {
             None => (0, 0, 0),
             Some((d, approx)) => {
@@ -547,8 +561,8 @@ impl Planner {
                     // The speculator's prompt tail, twice, and its run of plain steps.
                     + (2 * TAIL_ROWS + PLAIN_RUN_ROWS) * taps * hidden * 2;
                 // A device copy of the BF16 LM head for the exact base logits, which the
-                // target keeps in host memory with FP8 weights.
-                let head_copy = if inputs.weights == WeightFormat::Fp8
+                // target keeps in host memory whenever the LM head is quantized.
+                let head_copy = if lm_head != LmHeadFormat::Bf16
                     && !approx.fp8_head
                     && !approx.nvfp4_head
                     && !approx.shortlist
@@ -586,12 +600,16 @@ impl Planner {
                 }
                 None => Vec::new(),
             },
-            // Every active stream's rings plus one prefix cache entry's copies of them. A
-            // ring whose buffers are not whole pages packs its keys and values together, so
-            // an FP8 ring of two 1 MiB buffers takes one page.
+            // Every active stream's sliding-ring slab plus one prefix cache entry's slab.
+            // Each slab packs all `sliding_visits` rings contiguously into whole VMM pages
+            // (`RingSlabLayout`), so 40 NVFP4 rings take 23 pages (46 MiB) instead of 40.
             rings: (streams + 1)
-                * sliding_visits
-                * (2 * c.sliding_window_size * ring_row_bytes).next_multiple_of(KV_PAGE_BYTES),
+                * RingSlabLayout::new(
+                    sliding_visits,
+                    c.sliding_window_size * ring_row_bytes,
+                    KV_PAGE_BYTES,
+                )
+                .total_bytes,
         });
         // The batched step's chunk buffers for one row per stream, its state tables,
         // positions and tokens, and its rows' taps for the draft. With a DFlash 2 drafter,
@@ -626,7 +644,9 @@ impl Planner {
             0
         };
         let prefix = match &draft {
-            Some((d, _)) => inputs.prefix_entries * (fixed_rings + draft_ring_bytes(c, d)),
+            Some((d, approx)) => {
+                inputs.prefix_entries * (fixed_rings + draft_ring_bytes(c, d, approx.fp8_kv))
+            }
             _ => 0,
         };
         // Prefill holds the rows of the images that overlap its chunk: the chunk's rows, and
@@ -637,22 +657,23 @@ impl Planner {
             vision_bytes(v.format, tokens * v.patches_per_token)
                 + (inputs.prefill_chunk + tokens) * hidden * 2
         });
+        let release_bf16 = inputs.weights == WeightFormat::Fp8 && inputs.prefill_dense_fp8;
+        let release_bf16_o = release_bf16
+            && (inputs.output == OutputProjection::Fp8
+                || (inputs.output == OutputProjection::Mxfp8 && inputs.block_scaled_mma));
         let fixed = Plan {
             capacity: 0,
             pooled: inputs.pooled,
             streams,
-            weights: target_weight_bytes(inputs.checkpoint, inputs.weights),
-            fp8_copies: match inputs.weights {
-                WeightFormat::Bf16 => 0,
-                WeightFormat::Fp8 => {
-                    fp8_copy_bytes(c, inputs.output)
-                        + if inputs.prefill_dense_fp8 && inputs.output != OutputProjection::Mxfp8 {
-                            mxfp8_output_bytes(c)
-                        } else {
-                            0
-                        }
-                }
-            },
+            weights: target_weight_bytes(inputs.checkpoint, lm_head, release_bf16, release_bf16_o),
+            fp8_copies: quantized_copy_bytes(
+                c,
+                inputs.weights,
+                inputs.output,
+                lm_head,
+                inputs.prefill_dense_fp8,
+                inputs.block_scaled_mma,
+            ),
             kv: 0,
             rings,
             batch,
@@ -767,20 +788,48 @@ impl Planner {
     }
 }
 
-/// Tensors the target keeps in mapped host memory: the embedding table, and with FP8
-/// weights the BF16 LM head, whose FP8 copy every product reads.
-fn host_tensor(name: &str, weights: WeightFormat) -> bool {
+/// Tensors the target keeps in mapped host memory: the embedding table, and when the LM
+/// head is quantized (`Fp8` or `Nvfp4`), the BF16 LM head.
+fn host_tensor(name: &str, lm_head: LmHeadFormat) -> bool {
     name == "model.llm.embed.weight"
-        || (weights == WeightFormat::Fp8 && name == "model.llm.unembed.weight")
+        || (lm_head != LmHeadFormat::Bf16 && name == "model.llm.unembed.weight")
 }
 
-/// Device bytes of the target's text model as uploaded: every `model.llm.` tensor but those
-/// in host memory ([`host_tensor`]), with the BF16 tensors the loader widens to F32 counted
-/// twice. The vision tower and the draft's tensors are not the target's.
-fn target_weight_bytes(checkpoint: &Checkpoint, weights: WeightFormat) -> usize {
+/// Whether `name` is a BF16 attention input projection or message-gate `down` projection
+/// freed once its FP8 copy covers every code path (`WeightFormat::Fp8` + `--prefill-dense fp8`).
+fn released_bf16_input_tensor(name: &str) -> bool {
+    [
+        ".attn.wq_du.weight",
+        ".attn.wk_dv.weight",
+        ".attn.wv_dv.weight",
+        ".attn.wr_du.weight",
+        ".attn.gate_attn.weight",
+        ".attn.attn_sink_proj.weight",
+        ".attn.k_sconv.weight_proj",
+        ".attn.v_sconv.weight_proj",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+        || (name.contains(".controllers.") && name.ends_with(".down_weight"))
+}
+
+/// Device bytes of the target's text model kept on GPU: every `model.llm.` tensor except
+/// those in host memory ([`host_tensor`]) and BF16 projections freed after quantization,
+/// with the BF16 tensors the loader widens to F32 counted twice. The vision tower and the
+/// draft's tensors are not the target's.
+fn target_weight_bytes(
+    checkpoint: &Checkpoint,
+    lm_head: LmHeadFormat,
+    release_bf16_inputs: bool,
+    release_bf16_o: bool,
+) -> usize {
     checkpoint
         .tensors()
-        .filter(|(name, _)| name.starts_with("model.llm.") && !host_tensor(name, weights))
+        .filter(|(name, _)| {
+            let released = (release_bf16_inputs && released_bf16_input_tensor(name))
+                || (release_bf16_o && name.ends_with(".attn.wo_ud.weight"));
+            name.starts_with("model.llm.") && !host_tensor(name, lm_head) && !released
+        })
         .map(|(name, entry)| {
             let widened = [
                 "attn_res.",
@@ -816,46 +865,84 @@ fn fp8_rows(rows: usize, k: usize) -> usize {
     rows * k + 4 * rows
 }
 
-/// `Weights::quantize_fp8`: every layer's attention input projections, its output
-/// projection with [`OutputProjection::Fp8`], the looped layers' message gates and the LM
-/// head.
-fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
+/// Quantized copies of the target's dense matrices: every layer's attention input
+/// projections, message gates and output projection (under [`WeightFormat::Fp8`]), plus
+/// the quantized LM head ([`LmHeadFormat::Fp8`] or [`LmHeadFormat::Nvfp4`]).
+fn quantized_copy_bytes(
+    c: &TextConfig,
+    weights: WeightFormat,
+    output: OutputProjection,
+    lm_head: LmHeadFormat,
+    prefill_dense_fp8: bool,
+    block_scaled_mma: bool,
+) -> usize {
     let hidden = c.hidden_size;
     let q_dims = c.num_attention_heads * c.head_dim;
     let kv_dims = c.num_key_value_heads * c.head_dim;
     let rank = c.loop_config.gate_rank;
-    let layers: usize = (0..c.num_hidden_layers)
-        .map(|layer| {
-            let mut inputs = vec![
-                q_dims,
-                c.num_attention_heads * c.d_rel,
-                q_dims,
-                c.num_attention_heads,
-                kv_dims,
-                kv_dims,
-            ];
-            if !c.is_sliding(layer) {
-                inputs.extend([c.num_key_value_heads * c.sconv_kernel_size; 2]);
-            }
-            let looped = (c.loop_config.core_start..c.loop_config.core_end).contains(&layer);
-            let gates = if looped {
-                4 * (fp8_matrix(rank, 2 * hidden) + 2 * fp8_matrix(hidden, rank))
-            } else {
-                0
-            };
-            inputs
-                .iter()
-                .map(|&rows| fp8_matrix(rows, hidden))
-                .sum::<usize>()
-                + match output {
+    let layers: usize = if weights == WeightFormat::Fp8 {
+        (0..c.num_hidden_layers)
+            .map(|layer| {
+                let mut inputs = vec![
+                    q_dims,
+                    c.num_attention_heads * c.d_rel,
+                    q_dims,
+                    c.num_attention_heads,
+                    kv_dims,
+                    kv_dims,
+                ];
+                if !c.is_sliding(layer) {
+                    inputs.extend([c.num_key_value_heads * c.sconv_kernel_size; 2]);
+                }
+                let looped = (c.loop_config.core_start..c.loop_config.core_end).contains(&layer);
+                let gates = if looped {
+                    4 * (fp8_matrix(rank, 2 * hidden) + 2 * fp8_matrix(hidden, rank))
+                } else {
+                    0
+                };
+                let out_copy = match output {
                     OutputProjection::Fp8 => fp8_matrix(hidden, q_dims),
                     OutputProjection::Mxfp8 => mxfp8_matrix(hidden, q_dims),
                     OutputProjection::Bf16 => 0,
-                }
-                + gates
-        })
-        .sum();
-    layers + fp8_matrix(c.vocab_size, hidden)
+                };
+                let prefill_mxfp8 = if prefill_dense_fp8
+                    && block_scaled_mma
+                    && output != OutputProjection::Mxfp8
+                {
+                    mxfp8_matrix(hidden, q_dims)
+                } else {
+                    0
+                };
+                inputs
+                    .iter()
+                    .map(|&rows| fp8_matrix(rows, hidden))
+                    .sum::<usize>()
+                    + out_copy
+                    + prefill_mxfp8
+                    + gates
+            })
+            .sum()
+    } else {
+        0
+    };
+    let head = match lm_head {
+        LmHeadFormat::Bf16 => 0,
+        LmHeadFormat::Fp8 => fp8_matrix(c.vocab_size, hidden),
+        LmHeadFormat::Nvfp4 => nvfp4_matrix(c.vocab_size, hidden),
+    };
+    layers + head
+}
+
+#[cfg(test)]
+fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
+    quantized_copy_bytes(
+        c,
+        WeightFormat::Fp8,
+        output,
+        LmHeadFormat::Fp8,
+        false,
+        true,
+    )
 }
 
 /// Device bytes of the per-layer MXFP8 block-32 copies of the attention output projection
@@ -1060,10 +1147,16 @@ fn dflash_shape(dir: &Path, hidden: usize) -> anyhow::Result<DraftShape> {
     })
 }
 
-/// The draft's sliding rings.
-fn draft_ring_bytes(c: &TextConfig, d: &DraftShape) -> usize {
+/// The draft's sliding rings. DFlash 2 stores its rings in E4M3 when `fp8_kv` is set;
+/// the bundled draft keeps its local rings in BF16.
+fn draft_ring_bytes(c: &TextConfig, d: &DraftShape, fp8_kv: bool) -> usize {
     let kv_dims = c.num_key_value_heads * c.head_dim;
-    (d.layers - d.global_layers) * d.ring_slots * 2 * kv_dims * 2
+    let elem = if fp8_kv && d.kind == DraftKind::Dflash2 {
+        1
+    } else {
+        2
+    };
+    (d.layers - d.global_layers) * d.ring_slots * 2 * kv_dims * elem
 }
 
 /// Bytes of one `Nvfp4Matrix` (`[padded_rows, k / 2 + k / 16 + 4]`).
@@ -1082,8 +1175,21 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
     let padded = c.vocab_size;
     let mut bytes = d.weights;
     if approx.fp8_backbone || approx.nvfp4_backbone {
-        // The BF16 projections only the block reads, freed for their quantized copies.
-        bytes -= d.layers * 2 * (2 * d.q_width * hidden + 3 * d.mlp_width * hidden);
+        // Every BF16 projection replaced by its quantized copy (`q, k, v, o, gate, up, down`,
+        // plus `k_ctx, v_ctx` for the bundled draft, and `fc` for 4-tap DFlash / DFlash 2).
+        bytes -= d.layers
+            * 2
+            * (2 * d.q_width * hidden + 2 * kv_dims * hidden + 3 * d.mlp_width * hidden);
+        match d.kind {
+            DraftKind::Bundled => {
+                bytes -= d.layers * 2 * (2 * kv_dims * hidden);
+            }
+            DraftKind::Dflash | DraftKind::Dflash2 => {
+                if d.taps == DRAFT_TAPS {
+                    bytes -= 2 * hidden * (d.taps * hidden);
+                }
+            }
+        }
     }
     bytes += match d.kind {
         // The fold, its bias, its E4M3 copy and the copy's error bounds.
@@ -1151,7 +1257,7 @@ fn draft_fixed_bytes(c: &TextConfig, d: &DraftShape, approx: DraftApprox) -> usi
             bytes += fp8_rows(vocab, MARKOV_RANK);
         }
     }
-    bytes += draft_ring_bytes(c, d);
+    bytes += draft_ring_bytes(c, d, approx.fp8_kv);
     // Base logits, the commit's mixes and context keys and values, and a DFlash draft's
     // context rows.
     bytes += DRAFT_STEPS * padded * 2 + COMMIT_ROWS * (hidden + 2 * kv_dims) * 2;
@@ -1344,14 +1450,75 @@ mod tests {
         );
         let checkpoint = Checkpoint::open(&dir).expect("opening");
         assert_eq!(
-            target_weight_bytes(&checkpoint, WeightFormat::Bf16),
+            target_weight_bytes(&checkpoint, LmHeadFormat::Bf16, false, false),
             200 + 40 + 1000 + 50
         );
         assert_eq!(
-            target_weight_bytes(&checkpoint, WeightFormat::Fp8),
+            target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, false, false),
+            50 + 40 + 1000
+        );
+        assert_eq!(
+            target_weight_bytes(&checkpoint, LmHeadFormat::Nvfp4, false, false),
             50 + 40 + 1000
         );
         assert_eq!(bundled_shape(&checkpoint).expect("a draft").weights, 600);
+        std::fs::remove_dir_all(dir).expect("cleaning up");
+    }
+
+    #[test]
+    fn prefill_dense_fp8_releases_bf16_inputs_gate_down_and_quantized_output() {
+        let dir = checkpoint(
+            "release-bf16",
+            &[
+                ("model.llm.embed.weight", Dtype::BF16, &[100]),
+                ("model.llm.unembed.weight", Dtype::BF16, &[100]),
+                ("model.llm.layers.0.attn.wq_du.weight", Dtype::BF16, &[500]),
+                ("model.llm.layers.0.attn.wk_dv.weight", Dtype::BF16, &[200]),
+                ("model.llm.layers.0.attn.wv_dv.weight", Dtype::BF16, &[200]),
+                ("model.llm.layers.0.attn.wr_du.weight", Dtype::BF16, &[100]),
+                ("model.llm.layers.0.attn.gate_attn.weight", Dtype::BF16, &[500]),
+                ("model.llm.layers.0.attn.attn_sink_proj.weight", Dtype::BF16, &[20]),
+                ("model.llm.layers.5.attn.k_sconv.weight_proj", Dtype::BF16, &[30]),
+                ("model.llm.layers.5.attn.v_sconv.weight_proj", Dtype::BF16, &[30]),
+                ("model.llm.layers.0.attn.wo_ud.weight", Dtype::BF16, &[400]),
+                ("model.llm.layers.6.controllers.attn.down_weight", Dtype::BF16, &[80]),
+                ("model.llm.layers.6.controllers.attn.forget_weight", Dtype::BF16, &[80]),
+                ("model.llm.layers.6.controllers.attn.gain_weight", Dtype::BF16, &[80]),
+                ("model.llm.layers.0.mlp.experts.w13_weight", Dtype::U8, &[1000]),
+            ],
+        );
+        let checkpoint = Checkpoint::open(&dir).expect("opening");
+        let keep_all = target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, false, false);
+        let drop_inputs = target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, true, false);
+        let drop_inputs_and_o = target_weight_bytes(&checkpoint, LmHeadFormat::Fp8, true, true);
+        // Dropped input projections + gate down = 2 * (500+200+200+100+500+20+30+30+80) = 3320 B.
+        assert_eq!(keep_all - drop_inputs, 3320);
+        // Dropping W_o frees an additional 2 * 400 = 800 B; forget/gain/experts stay.
+        assert_eq!(drop_inputs - drop_inputs_and_o, 800);
+        assert_eq!(drop_inputs_and_o, 1000 + 2 * 80 + 2 * 80);
+
+        // NVFP4 LM head replaces FP8 LM head copy (never keeps both).
+        let c = config();
+        let fp8_head = quantized_copy_bytes(
+            &c,
+            WeightFormat::Fp8,
+            OutputProjection::Mxfp8,
+            LmHeadFormat::Fp8,
+            true,
+            false,
+        );
+        let nvfp4_head = quantized_copy_bytes(
+            &c,
+            WeightFormat::Fp8,
+            OutputProjection::Mxfp8,
+            LmHeadFormat::Nvfp4,
+            true,
+            false,
+        );
+        assert_eq!(
+            fp8_head - nvfp4_head,
+            fp8_matrix(c.vocab_size, c.hidden_size) - nvfp4_matrix(c.vocab_size, c.hidden_size)
+        );
         std::fs::remove_dir_all(dir).expect("cleaning up");
     }
 
@@ -1389,7 +1556,9 @@ mod tests {
                 checkpoint: &checkpoint,
                 weights: WeightFormat::Fp8,
                 output: OutputProjection::default(),
+                lm_head: None,
                 prefill_dense_fp8: false,
+                block_scaled_mma: true,
                 kv: KvFormat::Fp8,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
@@ -1428,7 +1597,9 @@ mod tests {
                 checkpoint: &checkpoint,
                 weights: WeightFormat::Fp8,
                 output: OutputProjection::default(),
+                lm_head: None,
                 prefill_dense_fp8: false,
+                block_scaled_mma: true,
                 kv,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
@@ -1458,10 +1629,18 @@ mod tests {
             pool(KvFormat::Mixed).plan(6144).kv - rings,
             (4 * 6 + 12 * 4) * mib
         );
-        // NVFP4-all: 40 packed NVFP4 rings of 1.125 MiB each also share one 2 MiB page each.
-        assert_eq!(pool(KvFormat::Nvfp4All).plan(0).kv, rings);
-        assert_eq!(pool(KvFormat::Nvfp4All).plan(4096).kv - rings, 16 * 4 * mib);
-        assert_eq!(pool(KvFormat::Nvfp4All).plan(6144).kv - rings, 16 * 4 * mib);
+        // NVFP4-all: 40 packed NVFP4 rings of 1.125 MiB each coalesce into one 23-page
+        // (46 MiB) RingSlab per stream+prefix entry, taking 92 MiB instead of 160 MiB.
+        let nvfp4_all_rings = 2 * 23 * 2 * mib;
+        assert_eq!(pool(KvFormat::Nvfp4All).plan(0).kv, nvfp4_all_rings);
+        assert_eq!(
+            pool(KvFormat::Nvfp4All).plan(4096).kv - nvfp4_all_rings,
+            16 * 4 * mib
+        );
+        assert_eq!(
+            pool(KvFormat::Nvfp4All).plan(6144).kv - nvfp4_all_rings,
+            16 * 4 * mib
+        );
         assert_eq!(pool(KvFormat::Nvfp4All).bytes_per_position(), 9 << 10);
         assert_eq!(pool(KvFormat::Nvfp4).bytes_per_position(), 9 << 10);
         std::fs::remove_dir_all(dir).expect("cleaning up");
@@ -1615,7 +1794,9 @@ mod tests {
                 checkpoint: &checkpoint,
                 weights: WeightFormat::Fp8,
                 output: OutputProjection::default(),
+                lm_head: None,
                 prefill_dense_fp8: false,
+                block_scaled_mma: true,
                 kv,
                 draft,
                 prefill_chunk: 2048,

@@ -320,6 +320,7 @@ mod linux {
                         let attn = &weights.layers[layer].attention;
                         let fp8w = weights.layers[layer].fp8.as_ref();
                         attn.input_projections()
+                            .expect("BF16 input projections")
                             .into_iter()
                             .enumerate()
                             .map(|(i, bf)| (bf, fp8w.map(|fp8w| &fp8w.inputs[i]), hidden))
@@ -331,10 +332,11 @@ mod linux {
                     .map(|&(layer, _)| {
                         let attn = &weights.layers[layer].attention;
                         let fp8w = weights.layers[layer].fp8.as_ref();
+                        let o = attn.o.as_ref().expect("BF16 W_o");
                         vec![(
-                            &attn.o,
+                            o,
                             fp8w.and_then(|fp8w| fp8w.o.as_ref()),
-                            attn.o.len() / hidden,
+                            o.len() / hidden,
                         )]
                     })
                     .collect(),
@@ -348,7 +350,7 @@ mod linux {
                             .expect("looped layer");
                         let one = |i: usize| {
                             (
-                                &gates[i].down,
+                                gates[i].down.as_ref().expect("BF16 gate down"),
                                 gates[i].fp8.as_ref().map(|fp8w| &fp8w[0]),
                                 2 * hidden,
                             )

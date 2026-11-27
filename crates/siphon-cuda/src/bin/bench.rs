@@ -532,9 +532,17 @@ mod linux {
     ) -> anyhow::Result<Model> {
         eprintln!("loading weights");
         let checkpoint = Checkpoint::open(&args.model)?;
-        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-        weights.output = args.output;
-        weights.lm_head_format = args.lm_head;
+        let weights = Weights::load_with_options(
+            &checkpoint,
+            &config,
+            gpu,
+            siphon_cuda::weights::LoadOptions {
+                weights: args.weights,
+                output: args.output,
+                lm_head: args.lm_head,
+                prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+            },
+        )?;
         let mut model = Model::with_formats(
             gpu,
             config,
@@ -710,7 +718,9 @@ mod linux {
             checkpoint: &checkpoint,
             weights: args.weights,
             output: args.output,
+            lm_head: args.lm_head,
             prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+            block_scaled_mma: siphon_cuda::BLOCK_SCALED_MMA,
             kv: args.kv,
             draft: DraftChoice::None,
             prefill_chunk: 0,
@@ -725,9 +735,17 @@ mod linux {
             .take()
             .unwrap_or_else(|| default_contexts(&planner, free, tail));
         eprintln!("loading weights");
-        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-        weights.output = args.output;
-        weights.lm_head_format = args.lm_head;
+        let weights = Weights::load_with_options(
+            &checkpoint,
+            &config,
+            &gpu,
+            siphon_cuda::weights::LoadOptions {
+                weights: args.weights,
+                output: args.output,
+                lm_head: args.lm_head,
+                prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+            },
+        )?;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -834,9 +852,17 @@ mod linux {
         let before = gpu_state()?;
         let checkpoint = Checkpoint::open(&args.model)?;
         eprintln!("loading weights");
-        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-        weights.output = args.output;
-        weights.lm_head_format = args.lm_head;
+        let weights = Weights::load_with_options(
+            &checkpoint,
+            &config,
+            &gpu,
+            siphon_cuda::weights::LoadOptions {
+                weights: args.weights,
+                output: args.output,
+                lm_head: args.lm_head,
+                prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+            },
+        )?;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -1150,9 +1176,17 @@ mod linux {
             let before = gpu_state()?;
             eprintln!("loading weights");
             let checkpoint = Checkpoint::open(&args.model)?;
-            let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-            weights.output = args.output;
-            weights.lm_head_format = args.lm_head;
+            let weights = Weights::load_with_options(
+                &checkpoint,
+                &config,
+                &gpu,
+                siphon_cuda::weights::LoadOptions {
+                    weights: args.weights,
+                    output: args.output,
+                    lm_head: args.lm_head,
+                    prefill_dense_fp8: args.prefill_dense == siphon_cuda::ops::Products::Fp8,
+                },
+            )?;
             let mut model = Model::with_formats(
                 &gpu,
                 config,

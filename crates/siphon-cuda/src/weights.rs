@@ -27,6 +27,7 @@ use safetensors::Dtype;
 use siphon::{Checkpoint, TextConfig};
 
 use crate::{
+    Gpu,
     gpu::HostMapped,
     ops::{
         linear::Prefetch,
@@ -95,6 +96,21 @@ impl Table {
 
 pub use siphon::{LmHeadFormat, OutputProjection, WeightFormat};
 
+/// Options for [`Weights::load_with_options`]: streaming layer-by-layer quantization that
+/// drops unused BF16 weights as each layer is quantized and loads quantized LM heads
+/// directly from mapped host memory to avoid startup VRAM spikes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadOptions {
+    pub weights: WeightFormat,
+    pub output: OutputProjection,
+    pub lm_head: Option<LmHeadFormat>,
+    /// When true under [`WeightFormat::Fp8`], every path reads the FP8 attention input
+    /// projections and message-gate `down` projections (and `W_o` when its quantized copy
+    /// covers prefill too), so their BF16 originals are dropped per layer right after
+    /// quantization.
+    pub prefill_dense_fp8: bool,
+}
+
 #[derive(Debug)]
 pub struct LayerWeights {
     /// Depth-attention queries for the attention input, F32 `[1 or 3, hidden]`.
@@ -147,14 +163,14 @@ pub enum InputNorms {
 
 #[derive(Debug)]
 pub struct AttentionWeights {
-    pub q: CudaSlice<bf16>,
-    pub k: CudaSlice<bf16>,
-    pub v: CudaSlice<bf16>,
+    pub q: Option<CudaSlice<bf16>>,
+    pub k: Option<CudaSlice<bf16>>,
+    pub v: Option<CudaSlice<bf16>>,
     /// Relative-feature projection `[heads * d_rel, hidden]`.
-    pub r: CudaSlice<bf16>,
-    pub o: CudaSlice<bf16>,
-    pub gate: CudaSlice<bf16>,
-    pub sink: CudaSlice<bf16>,
+    pub r: Option<CudaSlice<bf16>>,
+    pub o: Option<CudaSlice<bf16>>,
+    pub gate: Option<CudaSlice<bf16>>,
+    pub sink: Option<CudaSlice<bf16>>,
     /// `[heads, head_dim]`.
     pub q_clip_scale: CudaSlice<bf16>,
     /// `[heads, d_rel]`.
@@ -172,12 +188,13 @@ pub enum KvConv {
         v: CudaSlice<bf16>,
     },
     /// Global layers: F32 static weights `[4, kv_dims]` plus a BF16 projection
-    /// `[kv_heads * 4, hidden]` to per-token weights, for keys and values.
+    /// `[kv_heads * 4, hidden]` to per-token weights, for keys and values (dropped when
+    /// FP8 copies cover every path).
     Dynamic {
         k_static: CudaSlice<f32>,
-        k_proj: CudaSlice<bf16>,
+        k_proj: Option<CudaSlice<bf16>>,
         v_static: CudaSlice<f32>,
-        v_proj: CudaSlice<bf16>,
+        v_proj: Option<CudaSlice<bf16>>,
     },
 }
 
@@ -206,8 +223,8 @@ pub enum ExpertFormat {
 
 #[derive(Debug)]
 pub struct MessageGateWeights {
-    /// `[rank, 2 * hidden]`.
-    pub down: CudaSlice<bf16>,
+    /// `[rank, 2 * hidden]`, dropped when FP8 copies cover every path.
+    pub down: Option<CudaSlice<bf16>>,
     /// `[hidden, rank]`, multiplied with an F32 input.
     pub forget: CudaSlice<bf16>,
     /// `[hidden, rank]`, multiplied with an F32 input.
@@ -329,6 +346,133 @@ impl Weights {
         })
     }
 
+    /// Loads the checkpoint with streaming per-layer quantization according to `options`:
+    ///
+    /// - Under [`WeightFormat::Fp8`], quantizes each layer's attention projections and
+    ///   message gates right after uploading that layer; when `options.prefill_dense_fp8`
+    ///   is also set, immediately drops the BF16 attention input projections, message-gate
+    ///   `down` projections, and (when its quantized copy covers prefill too) `attention.o`
+    ///   before moving to the next layer so peak VRAM stays near the final footprint.
+    /// - Whenever the effective LM head format is `Fp8` or `Nvfp4`, loads
+    ///   `model.llm.unembed.weight` directly into mapped host memory and quantizes from
+    ///   there, avoiding the 885 MiB BF16 LM-head device peak.
+    pub fn load_with_options(
+        checkpoint: &Checkpoint,
+        config: &TextConfig,
+        gpu: &Gpu,
+        options: LoadOptions,
+    ) -> anyhow::Result<Self> {
+        let stream = gpu.stream();
+        let loader = Loader { checkpoint, stream };
+        let hidden = config.hidden_size;
+        let vocab = config.vocab_size;
+        let q_dims = config.num_attention_heads * config.head_dim;
+        let effective_lm_head = options.lm_head.unwrap_or(match options.weights {
+            WeightFormat::Bf16 => LmHeadFormat::Bf16,
+            WeightFormat::Fp8 => LmHeadFormat::Fp8,
+        });
+        let linear_fp8 =
+            (options.weights == WeightFormat::Fp8 || effective_lm_head == LmHeadFormat::Fp8)
+                .then(|| LinearFp8::load(gpu.context()))
+                .transpose()?;
+        let linear_nvfp4 = (effective_lm_head == LmHeadFormat::Nvfp4)
+            .then(|| LinearNvfp4::load(gpu.context()))
+            .transpose()?;
+        let release_inputs = options.weights == WeightFormat::Fp8 && options.prefill_dense_fp8;
+        let release_o = release_inputs
+            && (options.output == OutputProjection::Fp8
+                || (options.output == OutputProjection::Mxfp8 && crate::BLOCK_SCALED_MMA));
+        let need_mxfp8_o = options.weights == WeightFormat::Fp8
+            && (options.output == OutputProjection::Mxfp8
+                || (options.prefill_dense_fp8 && crate::BLOCK_SCALED_MMA));
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_idx in 0..config.num_hidden_layers {
+            let mut layer = LayerWeights::load(&loader, config, layer_idx)
+                .with_context(|| format!("loading layer {layer_idx}"))?;
+            if options.weights == WeightFormat::Fp8 {
+                let linear = linear_fp8.as_ref().context("LinearFp8 missing")?;
+                quantize_layer_fp8(
+                    &mut layer,
+                    linear,
+                    stream,
+                    hidden,
+                    q_dims,
+                    options.output,
+                    need_mxfp8_o,
+                )?;
+                if release_inputs {
+                    layer.attention.release_input_bf16();
+                    for gate in layer.message_gates.iter_mut().flatten() {
+                        gate.down = None;
+                    }
+                }
+                if release_o {
+                    layer.attention.o = None;
+                }
+            }
+            layers.push(layer);
+        }
+
+        let (lm_head, lm_head_fp8, lm_head_nvfp4) = match effective_lm_head {
+            LmHeadFormat::Bf16 => (
+                Table::Device(loader.bf16("model.llm.unembed.weight", &[vocab, hidden])?),
+                None,
+                None,
+            ),
+            LmHeadFormat::Fp8 => {
+                let mapped = loader.bf16_mapped("model.llm.unembed.weight", &[vocab, hidden])?;
+                let linear = linear_fp8.as_ref().context("LinearFp8 missing")?;
+                let fp8 = linear.quantize(stream, mapped.slice(), vocab, hidden)?;
+                (Table::Host(mapped), Some(fp8), None)
+            }
+            LmHeadFormat::Nvfp4 => {
+                let mapped = loader.bf16_mapped("model.llm.unembed.weight", &[vocab, hidden])?;
+                let linear = linear_nvfp4.as_ref().context("LinearNvfp4 missing")?;
+                let nvfp4 = linear.quantize(stream, mapped.slice(), vocab, hidden)?;
+                (Table::Host(mapped), None, Some(nvfp4))
+            }
+        };
+
+        let weights = Self {
+            embed: loader.bf16_mapped("model.llm.embed.weight", &[vocab, hidden])?,
+            embed_norm: loader.bf16("model.llm.embed_norm.weight", &[hidden])?,
+            layers,
+            final_query: loader.f32("model.llm.attn_res.output_query", &[hidden])?,
+            norm: loader.bf16("model.llm.norm.weight", &[hidden])?,
+            lm_head,
+            message_queries: load_message_queries(&loader, config)?,
+            lm_head_fp8,
+            lm_head_nvfp4,
+            lm_head_format: options.lm_head,
+            output: options.output,
+        };
+        stream.synchronize()?;
+        if release_inputs || effective_lm_head != LmHeadFormat::Bf16 {
+            gpu.trim_mem_pool()?;
+        }
+        Ok(weights)
+    }
+
+    /// Whether every layer still retains its BF16 attention input projections and
+    /// message-gate `down` projections.
+    #[must_use]
+    pub fn has_bf16_inputs(&self) -> bool {
+        self.layers.iter().all(|l| {
+            l.attention.has_bf16_inputs()
+                && l.message_gates
+                    .iter()
+                    .flatten()
+                    .all(|g| g.down.is_some())
+        })
+    }
+
+    /// Whether every layer still retains its BF16 attention output projection `W_o`.
+    #[must_use]
+    pub fn has_bf16_output(&self) -> bool {
+        self.layers.iter().all(|l| l.attention.o.is_some())
+    }
+
     /// Quantizes every layer's attention input projections, its message gates and (unless
     /// [`Self::lm_head_format`] overrides it) the LM head to FP8 copies, and its output
     /// projection too with [`OutputProjection::Fp8`], which decode then reads, and moves
@@ -339,54 +483,39 @@ impl Weights {
         linear: &LinearFp8,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<usize> {
-        let quantize = |w: &CudaSlice<bf16>, k: usize| {
-            ensure!(w.len().is_multiple_of(k), "weight is not [rows, {k}]");
-            linear.quantize(stream, w, w.len() / k, k)
-        };
         let hidden = self.embed_norm.len();
         let mut bytes = 0;
         ensure!(
             self.layers.first().is_none_or(|l| l.fp8.is_none()),
             "the weights are quantized already"
         );
+        let q_dims = self
+            .layers
+            .first()
+            .and_then(|l| l.attention.o.as_ref().map(|o| o.len() / hidden))
+            .context("BF16 attention output projection missing")?;
+        let need_mxfp8_o = self.output == OutputProjection::Mxfp8;
         for layer in &mut self.layers {
-            let a = &layer.attention;
-            let inputs = a
-                .input_projections()
-                .into_iter()
-                .map(|w| quantize(w, hidden))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let q_dims = a.o.len() / hidden;
-            let o = match self.output {
-                OutputProjection::Fp8 => Some(quantize(&a.o, q_dims)?),
-                OutputProjection::Bf16 | OutputProjection::Mxfp8 => None,
-            };
-            if self.output == OutputProjection::Mxfp8 && layer.mxfp8_o.is_none() {
-                let mxfp8 = linear.quantize_mxfp8(stream, &a.o, hidden, q_dims)?;
-                bytes += mxfp8.bytes();
-                layer.mxfp8_o = Some(mxfp8);
-            }
-            bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>()
-                + o.as_ref().map_or(0, Fp8Matrix::bytes);
-            layer.fp8 = Some(Fp8Projections { inputs, o });
-            for gate in layer.message_gates.iter_mut().flatten() {
-                let quantize_gate =
-                    |w: &CudaSlice<bf16>, k: usize| linear.quantize_any(stream, w, w.len() / k, k);
-                let rank = gate.forget.len() / hidden;
-                let copies = [
-                    quantize_gate(&gate.down, 2 * hidden)?,
-                    quantize_gate(&gate.forget, rank)?,
-                    quantize_gate(&gate.gain, rank)?,
-                ];
-                bytes += copies.iter().map(Fp8Matrix::bytes).sum::<usize>();
-                gate.fp8 = Some(copies);
-            }
+            bytes += quantize_layer_fp8(
+                layer,
+                linear,
+                stream,
+                hidden,
+                q_dims,
+                self.output,
+                need_mxfp8_o,
+            )?;
         }
         if self.lm_head_format.is_none_or(|f| f == LmHeadFormat::Fp8)
             && self.lm_head_fp8.is_none()
             && self.lm_head_nvfp4.is_none()
         {
-            let lm_head = quantize(self.lm_head.slice(), hidden)?;
+            let rows = self.lm_head.slice().len() / hidden;
+            ensure!(
+                self.lm_head.slice().len() == rows * hidden,
+                "lm_head is not [rows, {hidden}]"
+            );
+            let lm_head = linear.quantize(stream, self.lm_head.slice(), rows, hidden)?;
             bytes += lm_head.bytes();
             self.lm_head_fp8 = Some(lm_head);
             self.move_lm_head_to_host(stream)?;
@@ -446,6 +575,63 @@ impl Weights {
         }
         Ok(())
     }
+}
+
+/// Quantizes one layer's attention input projections, output projection (according to
+/// `output` and `need_mxfp8_o`), and message gates to FP8 / MXFP8.
+fn quantize_layer_fp8(
+    layer: &mut LayerWeights,
+    linear: &LinearFp8,
+    stream: &Arc<CudaStream>,
+    hidden: usize,
+    q_dims: usize,
+    output: OutputProjection,
+    need_mxfp8_o: bool,
+) -> anyhow::Result<usize> {
+    let quantize = |w: &CudaSlice<bf16>, k: usize| {
+        ensure!(w.len().is_multiple_of(k), "weight is not [rows, {k}]");
+        linear.quantize(stream, w, w.len() / k, k)
+    };
+    let a = &layer.attention;
+    let inputs = a
+        .input_projections()?
+        .into_iter()
+        .map(|w| quantize(w, hidden))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let o_bf16 = a
+        .o
+        .as_ref()
+        .context("BF16 attention output projection was released")?;
+    let o = match output {
+        OutputProjection::Fp8 => Some(quantize(o_bf16, q_dims)?),
+        OutputProjection::Bf16 | OutputProjection::Mxfp8 => None,
+    };
+    let mut bytes = 0;
+    if need_mxfp8_o && layer.mxfp8_o.is_none() {
+        let mxfp8 = linear.quantize_mxfp8(stream, o_bf16, hidden, q_dims)?;
+        bytes += mxfp8.bytes();
+        layer.mxfp8_o = Some(mxfp8);
+    }
+    bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>()
+        + o.as_ref().map_or(0, Fp8Matrix::bytes);
+    layer.fp8 = Some(Fp8Projections { inputs, o });
+    for gate in layer.message_gates.iter_mut().flatten() {
+        let quantize_gate =
+            |w: &CudaSlice<bf16>, k: usize| linear.quantize_any(stream, w, w.len() / k, k);
+        let rank = gate.forget.len() / hidden;
+        let down = gate
+            .down
+            .as_ref()
+            .context("BF16 message gate down projection was released")?;
+        let copies = [
+            quantize_gate(down, 2 * hidden)?,
+            quantize_gate(&gate.forget, rank)?,
+            quantize_gate(&gate.gain, rank)?,
+        ];
+        bytes += copies.iter().map(Fp8Matrix::bytes).sum::<usize>();
+        gate.fp8 = Some(copies);
+    }
+    Ok(bytes)
 }
 
 /// The checkpoint stores `[query, mlp]` and `[key, value]` rows per looped layer; MLX-LM
@@ -537,14 +723,54 @@ impl LayerWeights {
 }
 
 impl AttentionWeights {
-    /// The projections of the attention inputs, in the runner's launch order.
+    /// Whether every BF16 attention input projection is still present on device.
     #[must_use]
-    pub fn input_projections(&self) -> Vec<&CudaSlice<bf16>> {
-        let mut weights = vec![&self.q, &self.r, &self.gate, &self.sink, &self.k, &self.v];
-        if let KvConv::Dynamic { k_proj, v_proj, .. } = &self.kv_conv {
-            weights.extend([k_proj, v_proj]);
+    pub fn has_bf16_inputs(&self) -> bool {
+        self.q.is_some()
+            && self.r.is_some()
+            && self.gate.is_some()
+            && self.sink.is_some()
+            && self.k.is_some()
+            && self.v.is_some()
+            && match &self.kv_conv {
+                KvConv::Static { .. } => true,
+                KvConv::Dynamic { k_proj, v_proj, .. } => k_proj.is_some() && v_proj.is_some(),
+            }
+    }
+
+    /// Drops the BF16 attention input projections (`q, r, gate, sink, k, v` and dynamic
+    /// `k_proj, v_proj`) once their FP8 copies cover every code path.
+    pub fn release_input_bf16(&mut self) {
+        self.q = None;
+        self.k = None;
+        self.v = None;
+        self.r = None;
+        self.gate = None;
+        self.sink = None;
+        if let KvConv::Dynamic { k_proj, v_proj, .. } = &mut self.kv_conv {
+            *k_proj = None;
+            *v_proj = None;
         }
-        weights
+    }
+
+    /// The projections of the attention inputs, in the runner's launch order.
+    pub fn input_projections(&self) -> anyhow::Result<Vec<&CudaSlice<bf16>>> {
+        let missing = "BF16 attention input projections were released for FP8 copies";
+        let mut weights = vec![
+            self.q.as_ref().context(missing)?,
+            self.r.as_ref().context(missing)?,
+            self.gate.as_ref().context(missing)?,
+            self.sink.as_ref().context(missing)?,
+            self.k.as_ref().context(missing)?,
+            self.v.as_ref().context(missing)?,
+        ];
+        if let KvConv::Dynamic { k_proj, v_proj, .. } = &self.kv_conv {
+            weights.extend([
+                k_proj.as_ref().context(missing)?,
+                v_proj.as_ref().context(missing)?,
+            ]);
+        }
+        Ok(weights)
     }
 
     fn load(
@@ -570,22 +796,22 @@ impl AttentionWeights {
             let proj_shape = [kv_heads * conv_k, hidden];
             KvConv::Dynamic {
                 k_static: loader.f32(&format!("{a}.k_sconv.static_w"), &[conv_k, kv_dim])?,
-                k_proj: loader.bf16(&format!("{a}.k_sconv.weight_proj"), &proj_shape)?,
+                k_proj: Some(loader.bf16(&format!("{a}.k_sconv.weight_proj"), &proj_shape)?),
                 v_static: loader.f32(&format!("{a}.v_sconv.static_w"), &[conv_k, kv_dim])?,
-                v_proj: loader.bf16(&format!("{a}.v_sconv.weight_proj"), &proj_shape)?,
+                v_proj: Some(loader.bf16(&format!("{a}.v_sconv.weight_proj"), &proj_shape)?),
             }
         };
         Ok(Self {
-            q: loader.bf16(&format!("{a}.wq_du.weight"), &[q_dim, hidden])?,
-            k: loader.bf16(&format!("{a}.wk_dv.weight"), &[kv_dim, hidden])?,
-            v: loader.bf16(&format!("{a}.wv_dv.weight"), &[kv_dim, hidden])?,
-            r: loader.bf16(
+            q: Some(loader.bf16(&format!("{a}.wq_du.weight"), &[q_dim, hidden])?),
+            k: Some(loader.bf16(&format!("{a}.wk_dv.weight"), &[kv_dim, hidden])?),
+            v: Some(loader.bf16(&format!("{a}.wv_dv.weight"), &[kv_dim, hidden])?),
+            r: Some(loader.bf16(
                 &format!("{a}.wr_du.weight"),
                 &[heads * config.d_rel, hidden],
-            )?,
-            o: loader.bf16(&format!("{a}.wo_ud.weight"), &[hidden, q_dim])?,
-            gate: loader.bf16(&format!("{a}.gate_attn.weight"), &[q_dim, hidden])?,
-            sink: loader.bf16(&format!("{a}.attn_sink_proj.weight"), &[heads, hidden])?,
+            )?),
+            o: Some(loader.bf16(&format!("{a}.wo_ud.weight"), &[hidden, q_dim])?),
+            gate: Some(loader.bf16(&format!("{a}.gate_attn.weight"), &[q_dim, hidden])?),
+            sink: Some(loader.bf16(&format!("{a}.attn_sink_proj.weight"), &[heads, hidden])?),
             q_clip_scale: loader.bf16(&format!("{a}.q_l2_clip.scale"), &[heads, head_dim])?,
             rel_clip_scale: loader
                 .bf16(&format!("{a}.rel_l2_clip.scale"), &[heads, config.d_rel])?,
@@ -669,28 +895,45 @@ impl ExpertWeights {
 
 impl MessageGateWeights {
     /// The down, forget and gain weights, in the order the gate reads them.
-    #[must_use]
-    pub fn matrices(&self) -> [&CudaSlice<bf16>; 3] {
-        [&self.down, &self.forget, &self.gain]
+    pub fn matrices(&self) -> anyhow::Result<[&CudaSlice<bf16>; 3]> {
+        let down = self
+            .down
+            .as_ref()
+            .context("BF16 message gate down projection was released")?;
+        Ok([down, &self.forget, &self.gain])
     }
 
     /// The matrices decode reads, in the order the gate reads them: the FP8 copies if
     /// there are any.
     #[must_use]
-    pub fn decode_matrices(&self) -> [&dyn Prefetch; 3] {
-        match &self.fp8 {
-            Some([down, forget, gain]) => [down, forget, gain],
-            None => [&self.down, &self.forget, &self.gain],
+    pub fn decode_matrices(&self) -> Vec<&dyn Prefetch> {
+        if let Some([down, forget, gain]) = &self.fp8 {
+            vec![down, forget, gain]
+        } else {
+            let mut v: Vec<&dyn Prefetch> = Vec::with_capacity(3);
+            if let Some(down) = &self.down {
+                v.push(down);
+            }
+            v.push(&self.forget);
+            v.push(&self.gain);
+            v
         }
     }
 
     /// The matrices a verify pass reads, in the order the gate reads them: the FP8 copy of
     /// the down projection if there is one, and the BF16 forget and gain weights.
     #[must_use]
-    pub fn rows_matrices(&self) -> [&dyn Prefetch; 3] {
-        match &self.fp8 {
-            Some([down, ..]) => [down, &self.forget, &self.gain],
-            None => [&self.down, &self.forget, &self.gain],
+    pub fn rows_matrices(&self) -> Vec<&dyn Prefetch> {
+        if let Some([down, ..]) = &self.fp8 {
+            vec![down, &self.forget, &self.gain]
+        } else {
+            let mut v: Vec<&dyn Prefetch> = Vec::with_capacity(3);
+            if let Some(down) = &self.down {
+                v.push(down);
+            }
+            v.push(&self.forget);
+            v.push(&self.gain);
+            v
         }
     }
 
@@ -698,7 +941,7 @@ impl MessageGateWeights {
         let hidden = config.hidden_size;
         let rank = config.loop_config.gate_rank;
         Ok(Self {
-            down: loader.bf16(&format!("{p}.down_weight"), &[rank, 2 * hidden])?,
+            down: Some(loader.bf16(&format!("{p}.down_weight"), &[rank, 2 * hidden])?),
             forget: loader.bf16(&format!("{p}.forget_weight"), &[hidden, rank])?,
             gain: loader.bf16(&format!("{p}.gain_weight"), &[hidden, rank])?,
             fp8: None,

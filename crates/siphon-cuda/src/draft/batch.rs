@@ -995,7 +995,7 @@ impl Draft {
                 &c.taps,
                 cm,
                 &mut [(
-                    Some(&weights.fc),
+                    weights.fc.as_ref(),
                     fc_quant.as_ref().map(QuantizedFc::as_weight),
                     b.ctx_raw.slice_mut(..cm * HIDDEN),
                 )],
@@ -1024,8 +1024,8 @@ impl Draft {
             {
                 let lw = &weights.layers[l];
                 let q = self.backbone.as_ref().map(|bb| bb.layer(l));
-                prods.push((Some(&lw.k), q.map(|f| f.k), ck));
-                prods.push((Some(&lw.v), q.map(|f| f.v), cv));
+                prods.push((lw.k.as_ref(), q.map(|f| f.k), ck));
+                prods.push((lw.v.as_ref(), q.map(|f| f.v), cv));
             }
             run_rows_products(lr, lfp8, &mut b.dense, fp8_dense, stream, &normed, cm, &mut prods)?;
             let k_norms: Vec<&CudaSlice<bf16>> =
@@ -1129,8 +1129,8 @@ impl Draft {
                     bm,
                     &mut [
                         (lw.q.as_ref(), f.map(|f| f.q), q_out),
-                        (Some(&lw.k), f.map(|f| f.k), k_out),
-                        (Some(&lw.v), f.map(|f| f.v), v_out),
+                        (lw.k.as_ref(), f.map(|f| f.k), k_out),
+                        (lw.v.as_ref(), f.map(|f| f.v), v_out),
                     ],
                 )?;
             }

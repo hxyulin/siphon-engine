@@ -67,6 +67,8 @@ pub struct Device {
     pub free: usize,
     /// Streaming multiprocessors.
     pub sms: usize,
+    /// Whether the device supports Blackwell's block-scaled MMA (`sm_120+`).
+    pub block_scaled_mma: bool,
     pub source: Source,
 }
 
@@ -81,6 +83,7 @@ impl Device {
             context: CONTEXT_BYTES,
             free: RTX_5090_TOTAL - RTX_5090_IDLE_HELD - CONTEXT_BYTES,
             sms: sms("RTX 5090"),
+            block_scaled_mma: true,
             source: Source::Assumed,
         });
         match free {
@@ -95,11 +98,11 @@ impl Device {
     }
 }
 
-/// Asks nvidia-smi for the first GPU's name and memory, in MiB.
+/// Asks nvidia-smi for the first GPU's name, memory (in MiB), and compute capability.
 fn query() -> Option<Device> {
     let out = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.total,memory.reserved,memory.used,memory.free",
+            "--query-gpu=name,memory.total,memory.reserved,memory.used,memory.free,compute_cap",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -119,9 +122,14 @@ fn query() -> Option<Device> {
     let reserved = mib(fields.next())?;
     let used = mib(fields.next())?;
     let free = mib(fields.next())?;
+    let block_scaled_mma = fields
+        .next()
+        .and_then(|s| s.trim().split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 12);
     Some(Device {
         name: name.to_owned(),
         sms: sms(name),
+        block_scaled_mma,
         total,
         others: reserved + used,
         context: context(name),

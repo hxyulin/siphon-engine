@@ -907,12 +907,21 @@ mod cuda {
         draft_options.apply_draft_weights(&options.draft_weights)?;
         let chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK);
         let kv_options = kv_options(options)?;
+        let output = output_projection(options);
+        let lm_head: Option<siphon::LmHeadFormat> = options
+            .lm_head
+            .as_deref()
+            .map(str::parse)
+            .transpose()?;
+        let prefill_dense_fp8 = options.prefill_dense == "fp8";
         let planner = Planner::new(&PlanInputs {
             config: &config,
             checkpoint: &checkpoint,
             weights: weight_format,
-            output: output_projection(options),
-            prefill_dense_fp8: options.prefill_dense == "fp8",
+            output,
+            lm_head,
+            prefill_dense_fp8,
+            block_scaled_mma: siphon_cuda::BLOCK_SCALED_MMA,
             kv,
             draft: options
                 .drafter
@@ -932,9 +941,17 @@ mod cuda {
         // while the shared KV page pool can hold up to `streams * model_max_length` aggregate
         // positions across concurrent requests.
         let slot_capacity = capacity.min(config.model_max_length);
-        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-        weights.output = output_projection(options);
-        weights.lm_head_format = options.lm_head.as_deref().map(str::parse).transpose()?;
+        let weights = Weights::load_with_options(
+            &checkpoint,
+            &config,
+            &gpu,
+            siphon_cuda::weights::LoadOptions {
+                weights: weight_format,
+                output,
+                lm_head,
+                prefill_dense_fp8,
+            },
+        )?;
         let (page, _) = granularity(gpu.context())?;
         if page != memory::KV_PAGE_BYTES {
             eprintln!(

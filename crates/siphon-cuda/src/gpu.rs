@@ -72,6 +72,20 @@ impl Gpu {
         &self.stream
     }
 
+    /// Returns unused cached blocks in the device's default memory pool to the CUDA driver
+    /// so subsequent VMM (`PagePool`) or other allocations see every freed byte.
+    pub fn trim_mem_pool(&self) -> anyhow::Result<()> {
+        self.ctx.bind_to_thread()?;
+        // SAFETY: the device comes from a live context.
+        let pool = unsafe { cudarc::driver::result::device::get_mem_pool(self.ctx.cu_device()) }?;
+        // SAFETY: `pool` is the device's default memory pool; trimming to 0 releases only
+        // memory not currently in use.
+        unsafe { sys::cuMemPoolTrimTo(pool, 0) }
+            .result()
+            .context("trimming the CUDA memory pool")?;
+        Ok(())
+    }
+
     /// The device's free memory and what this process's buffers take from the memory pool
     /// that every allocation comes from (cudarc allocates with `cuMemAllocAsync`). The pool
     /// leaves out the CUDA context, the module images and the CUDA graphs.

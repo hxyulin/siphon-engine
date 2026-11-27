@@ -629,7 +629,7 @@ impl Model {
             WeightFormat::Bf16 => LmHeadFormat::Bf16,
             WeightFormat::Fp8 => LmHeadFormat::Fp8,
         });
-        if weight_format == WeightFormat::Fp8 {
+        if weight_format == WeightFormat::Fp8 && weights.layers.iter().any(|l| l.fp8.is_none()) {
             weights.quantize_fp8(&kernels.linear_fp8, &stream)?;
         }
         weights.quantize_lm_head(
@@ -709,6 +709,19 @@ impl Model {
         }
         let sample_one = SampleBuffers::new(&stream, 1)?;
         let has_nvfp4 = visits.iter().any(|v| v.kv.format() == KvFormat::Nvfp4);
+        let prefill_dense = if weights.has_bf16_inputs() {
+            Products::Bf16
+        } else {
+            Products::Fp8
+        };
+        let prefill_dense_o = if prefill_dense == Products::Fp8
+            && crate::BLOCK_SCALED_MMA
+            && weights.layers.iter().all(|l| l.mxfp8_o.is_some())
+        {
+            Products::Fp8
+        } else {
+            Products::Bf16
+        };
         Ok(Self {
             ctx: Ctx {
                 config,
@@ -718,8 +731,8 @@ impl Model {
                 expert_activations: ExpertActivations::Bf16,
                 prefill_attention: DEFAULT_PREFILL_ATTENTION,
                 chunk_attention: Products::Bf16,
-                prefill_dense: Products::Bf16,
-                prefill_dense_o: Products::Bf16,
+                prefill_dense,
+                prefill_dense_o,
                 kv_rounding: if has_nvfp4 {
                     KvRounding {
                         quant: KvQuant::Nvfp4,
@@ -1045,6 +1058,10 @@ impl Model {
             "dense prefill products are bf16 or fp8, not fp4"
         );
         ensure!(
+            products != Products::Bf16 || self.ctx.weights.has_bf16_inputs(),
+            "BF16 dense prefill products are unavailable: BF16 weights were released on load"
+        );
+        ensure!(
             products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
             "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"
         );
@@ -1062,9 +1079,14 @@ impl Model {
             let mut quantized = false;
             for layer in &mut self.ctx.weights.layers {
                 if layer.mxfp8_o.is_none() {
+                    let o = layer
+                        .attention
+                        .o
+                        .as_ref()
+                        .context("BF16 W_o was released; cannot quantize MXFP8 W_o")?;
                     layer.mxfp8_o = Some(self.ctx.kernels.linear_fp8.quantize_mxfp8(
                         &self.ctx.stream,
-                        &layer.attention.o,
+                        o,
                         hidden,
                         q_dims,
                     )?);
@@ -1074,7 +1096,9 @@ impl Model {
             if quantized {
                 self.ctx.stream.synchronize()?;
             }
-        } else if self.ctx.weights.output != OutputProjection::Mxfp8 {
+        } else if self.ctx.weights.output != OutputProjection::Mxfp8
+            && self.ctx.weights.has_bf16_output()
+        {
             for layer in &mut self.ctx.weights.layers {
                 layer.mxfp8_o = None;
             }
@@ -1097,15 +1121,31 @@ impl Model {
             crate::BLOCK_SCALED_MMA || products == Products::Bf16,
             "MXFP8 output projection needs the block-scaled MMA, which this sm_89 build lacks"
         );
+        ensure!(
+            products != Products::Bf16
+                || self.ctx.weights.has_bf16_output()
+                || self
+                    .ctx
+                    .weights
+                    .layers
+                    .iter()
+                    .all(|l| l.fp8.as_ref().is_some_and(|f| f.o.is_some())),
+            "BF16 W_o is unavailable: BF16 output projection was released on load"
+        );
         if self.ctx.prefill_dense_o != products {
             if products == Products::Fp8 && self.ctx.prefill_dense == Products::Fp8 {
                 let hidden = self.ctx.hidden();
                 let q_dims = self.ctx.config.num_attention_heads * self.ctx.config.head_dim;
                 for layer in &mut self.ctx.weights.layers {
                     if layer.mxfp8_o.is_none() {
+                        let o = layer
+                            .attention
+                            .o
+                            .as_ref()
+                            .context("BF16 W_o was released; cannot quantize MXFP8 W_o")?;
                         layer.mxfp8_o = Some(self.ctx.kernels.linear_fp8.quantize_mxfp8(
                             &self.ctx.stream,
-                            &layer.attention.o,
+                            o,
                             hidden,
                             q_dims,
                         )?);
@@ -1114,6 +1154,7 @@ impl Model {
                 self.ctx.stream.synchronize()?;
             } else if products == Products::Bf16
                 && self.ctx.weights.output != OutputProjection::Mxfp8
+                && self.ctx.weights.has_bf16_output()
             {
                 for layer in &mut self.ctx.weights.layers {
                     layer.mxfp8_o = None;
@@ -2072,7 +2113,9 @@ impl Blocks {
 
 /// One product of [`Ctx::gemm_rows`]: `out [m, n] = x [m, k] @ weight [n, k]^T`.
 struct RowProduct<'a> {
-    weight: &'a CudaSlice<bf16>,
+    /// BF16 weight matrix, or `None` when released because a quantized copy covers every
+    /// code path.
+    weight: Option<&'a CudaSlice<bf16>>,
     /// The weight's per-row FP8 copy, which the multi-row kernel (or FP8 GEMM) reads
     /// instead when every product of a batch has one.
     fp8: Option<&'a Fp8Matrix>,
@@ -2123,12 +2166,8 @@ impl Ctx {
         let a = &w.attention;
         if let Some(fp8) = &w.fp8 {
             weights.extend(fp8.inputs.iter().map(|m| m as &dyn Prefetch));
-        } else {
-            weights.extend(
-                a.input_projections()
-                    .into_iter()
-                    .map(|m| m as &dyn Prefetch),
-            );
+        } else if let Ok(projs) = a.input_projections() {
+            weights.extend(projs.into_iter().map(|m| m as &dyn Prefetch));
         }
         weights
             .extend([&a.q_clip_scale, &a.rel_clip_scale, &a.rel_table].map(|m| m as &dyn Prefetch));
@@ -2159,8 +2198,10 @@ impl Ctx {
             && let Some(o) = w.mxfp8_o.as_ref()
         {
             vec![o]
+        } else if let Some(o) = w.attention.o.as_ref() {
+            vec![o]
         } else {
-            vec![&w.attention.o]
+            Vec::new()
         };
         if let Some(gates) = w.message_gates.as_ref().filter(|_| gated) {
             prefetch.extend(if rows {
@@ -2293,7 +2334,7 @@ impl Ctx {
             let msg_in_row = i * 2 * hidden + hidden..i * 2 * hidden + 2 * hidden;
             let g = &gates[3];
             let mut slot = DepthGateSlot {
-                down_weight: &g.down,
+                down_weight: g.down.as_ref(),
                 input_msg: s.gate.inputs[3].slice(msg_in_row),
                 forget: &g.forget,
                 gain: &g.gain,
@@ -2429,7 +2470,7 @@ impl Ctx {
             let message = looped * MESSAGE_SLOTS * hidden;
             let mut slots = [
                 DepthGateSlot {
-                    down_weight: &gates[0].down,
+                    down_weight: gates[0].down.as_ref(),
                     input_msg: g0.slice(msg_in_row.clone()),
                     forget: &gates[0].forget,
                     gain: &gates[0].gain,
@@ -2438,7 +2479,7 @@ impl Ctx {
                     normed: q0.as_view_mut(),
                 },
                 DepthGateSlot {
-                    down_weight: &gates[1].down,
+                    down_weight: gates[1].down.as_ref(),
                     input_msg: g1.slice(msg_in_row.clone()),
                     forget: &gates[1].forget,
                     gain: &gates[1].gain,
@@ -2447,7 +2488,7 @@ impl Ctx {
                     normed: q1.as_view_mut(),
                 },
                 DepthGateSlot {
-                    down_weight: &gates[2].down,
+                    down_weight: gates[2].down.as_ref(),
                     input_msg: g2.slice(msg_in_row),
                     forget: &gates[2].forget,
                     gain: &gates[2].gain,
@@ -2555,7 +2596,7 @@ impl Ctx {
                 .gemv(&self.stream, &mut products, Start::Early)?;
         } else {
             let mut products: Vec<_> = a
-                .input_projections()
+                .input_projections()?
                 .into_iter()
                 .zip(&mut outs)
                 .map(|(weight, (x, out))| Gemv::new(weight, *x, *out))
@@ -2640,9 +2681,13 @@ impl Ctx {
                 Start::Early,
             )
         } else {
+            let o = a
+                .o
+                .as_ref()
+                .context("BF16 W_o was released; quantized copy required")?;
             self.kernels.linear.gemv_bf16(
                 &self.stream,
-                &mut [Gemv::new(&a.o, &t.gated, &mut t.proj)],
+                &mut [Gemv::new(o, &t.gated, &mut t.proj)],
                 Start::Early,
             )
         }
@@ -2812,7 +2857,12 @@ impl Ctx {
         let use_wide_bf16_gemm = invariant
             && self.prefill_dense == Products::Fp8
             && m >= prefill::BATCH_BF16_GEMM_MIN_ROWS;
-        if invariant && !use_wide_bf16_gemm {
+        let use_linear_rows = (invariant && !use_wide_bf16_gemm)
+            || (!invariant
+                && m <= linear_rows::MAX_ROWS
+                && ((m == 1 && self.prefill_dense == Products::Fp8)
+                    || products.iter().any(|p| p.weight.is_none())));
+        if use_linear_rows {
             ensure!(
                 m <= linear_rows::MAX_ROWS,
                 "{m} rows; the invariant products take at most {}",
@@ -2824,11 +2874,16 @@ impl Ctx {
             let mut rows: Vec<RowsProduct<'_>> = products
                 .iter_mut()
                 .map(|p| match (p.mxfp8, p.fp8) {
-                    (Some(q), _) if mxfp8 => RowsProduct::mxfp8(q, &p.x, &mut p.out),
-                    (_, Some(q)) if fp8 => RowsProduct::fp8(q, &p.x, &mut p.out),
-                    _ => RowsProduct::bf16(p.weight, &p.x, &mut p.out),
+                    (Some(q), _) if mxfp8 => Ok(RowsProduct::mxfp8(q, &p.x, &mut p.out)),
+                    (_, Some(q)) if fp8 => Ok(RowsProduct::fp8(q, &p.x, &mut p.out)),
+                    _ => {
+                        let w = p
+                            .weight
+                            .context("BF16 weight was released; quantized copy required")?;
+                        Ok(RowsProduct::bf16(w, &p.x, &mut p.out))
+                    }
                 })
-                .collect();
+                .collect::<anyhow::Result<_>>()?;
             return self
                 .kernels
                 .linear_rows
@@ -2836,8 +2891,13 @@ impl Ctx {
         }
         let mut gemms: Vec<Gemm<'_, bf16>> = products
             .iter_mut()
-            .map(|p| Gemm::new(p.weight, &p.x, &mut p.out))
-            .collect();
+            .map(|p| {
+                let w = p
+                    .weight
+                    .context("BF16 weight was released; quantized copy required")?;
+                Ok(Gemm::new(w, &p.x, &mut p.out))
+            })
+            .collect::<anyhow::Result<_>>()?;
         self.kernels.linear.gemm_bf16(&self.stream, &mut gemms, m)?;
         Ok(())
     }

@@ -57,7 +57,7 @@ pub struct Dflash2Weights {
     /// The token whose normed target embedding fills rows 1 to 7 of a block.
     pub mask_token: usize,
     /// `[2304, taps * 2304]`.
-    pub fc: CudaSlice<bf16>,
+    pub fc: Option<CudaSlice<bf16>>,
     pub hidden_norm: CudaSlice<bf16>,
     /// Final norm of the decoder.
     pub norm: CudaSlice<bf16>,
@@ -73,8 +73,8 @@ pub struct Dflash2LayerWeights {
     /// `[4096, 2304]`.
     pub q: Option<CudaSlice<bf16>>,
     /// `[1024, 2304]` each.
-    pub k: CudaSlice<bf16>,
-    pub v: CudaSlice<bf16>,
+    pub k: Option<CudaSlice<bf16>>,
+    pub v: Option<CudaSlice<bf16>>,
     /// `[128]` each.
     pub q_norm: CudaSlice<bf16>,
     pub k_norm: CudaSlice<bf16>,
@@ -129,7 +129,7 @@ impl Dflash2Weights {
         };
         let vocab = config.vocab_size;
         Ok(Self {
-            fc: loader.bf16("fc.weight", &[HIDDEN, taps.len() * HIDDEN])?,
+            fc: Some(loader.bf16("fc.weight", &[HIDDEN, taps.len() * HIDDEN])?),
             hidden_norm: loader.bf16("hidden_norm.weight", &[HIDDEN])?,
             norm: loader.bf16("norm.weight", &[HIDDEN])?,
             layers: (0..layers)
@@ -175,8 +175,8 @@ impl Dflash2LayerWeights {
             post_attention_norm: loader
                 .bf16(&format!("{p}post_attention_layernorm.weight"), &[HIDDEN])?,
             q: Some(loader.bf16(&format!("{attn}q_proj.weight"), &[q, HIDDEN])?),
-            k: loader.bf16(&format!("{attn}k_proj.weight"), &[kv, HIDDEN])?,
-            v: loader.bf16(&format!("{attn}v_proj.weight"), &[kv, HIDDEN])?,
+            k: Some(loader.bf16(&format!("{attn}k_proj.weight"), &[kv, HIDDEN])?),
+            v: Some(loader.bf16(&format!("{attn}v_proj.weight"), &[kv, HIDDEN])?),
             q_norm: loader.bf16(&format!("{attn}q_norm.weight"), &[HEAD_DIM])?,
             k_norm: loader.bf16(&format!("{attn}k_norm.weight"), &[HEAD_DIM])?,
             o: Some(loader.bf16(&format!("{attn}o_proj.weight"), &[HIDDEN, q])?),

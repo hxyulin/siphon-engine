@@ -631,7 +631,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
         };
         let mut gates = [
             GateStep {
-                down_weight: &downs[0],
+                down_weight: Some(&downs[0]),
                 input: inputs[0].as_view(),
                 forget: &forgets[0],
                 gain: &gains[0],
@@ -639,7 +639,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
                 norm: Some((&norm_weights[0], n0.as_view_mut())),
             },
             GateStep {
-                down_weight: &downs[1],
+                down_weight: Some(&downs[1]),
                 input: inputs[1].as_view(),
                 forget: &forgets[1],
                 gain: &gains[1],
@@ -647,7 +647,7 @@ fn message_gate_step_matches_gemv_and_gate_out() -> anyhow::Result<()> {
                 norm: Some((&norm_weights[1], n1.as_view_mut())),
             },
             GateStep {
-                down_weight: &downs[2],
+                down_weight: Some(&downs[2]),
                 input: inputs[2].as_view(),
                 forget: &forgets[2],
                 gain: &gains[2],
@@ -849,7 +849,7 @@ fn message_gate_step_fp8_matches_reference() -> anyhow::Result<()> {
         let mut normed = stream.alloc_zeros::<bf16>(HIDDEN)?;
         let mut gates: Vec<GateStep<'_>> = (0..GATES)
             .map(|k| GateStep {
-                down_weight: &bf16_weights[k][0],
+                down_weight: Some(&bf16_weights[k][0]),
                 input: input_dev[k].as_view(),
                 forget: &bf16_weights[k][1],
                 gain: &bf16_weights[k][2],
@@ -1048,7 +1048,7 @@ fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
         let [rq0, rq1, rq2] = &mut ref_qkv;
         let mut ref_steps = [
             GateStep {
-                down_weight: &down_w[0],
+                down_weight: Some(&down_w[0]),
                 input: rg0.as_view(),
                 forget: &forget_w[0],
                 gain: &gain_w[0],
@@ -1056,7 +1056,7 @@ fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
                 norm: Some((&norm_w[0], rq0.as_view_mut())),
             },
             GateStep {
-                down_weight: &down_w[1],
+                down_weight: Some(&down_w[1]),
                 input: rg1.as_view(),
                 forget: &forget_w[1],
                 gain: &gain_w[1],
@@ -1064,7 +1064,7 @@ fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
                 norm: Some((&norm_w[1], rq1.as_view_mut())),
             },
             GateStep {
-                down_weight: &down_w[2],
+                down_weight: Some(&down_w[2]),
                 input: rg2.as_view(),
                 forget: &forget_w[2],
                 gain: &gain_w[2],
@@ -1094,7 +1094,7 @@ fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
         let [gq0, gq1, gq2] = &mut got_qkv;
         let mut slots = [
             DepthGateSlot {
-                down_weight: &down_w[0],
+                down_weight: Some(&down_w[0]),
                 input_msg: msg_half[0].as_view(),
                 forget: &forget_w[0],
                 gain: &gain_w[0],
@@ -1103,7 +1103,7 @@ fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
                 normed: gq0.as_view_mut(),
             },
             DepthGateSlot {
-                down_weight: &down_w[1],
+                down_weight: Some(&down_w[1]),
                 input_msg: msg_half[1].as_view(),
                 forget: &forget_w[1],
                 gain: &gain_w[1],
@@ -1112,7 +1112,7 @@ fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
                 normed: gq1.as_view_mut(),
             },
             DepthGateSlot {
-                down_weight: &down_w[2],
+                down_weight: Some(&down_w[2]),
                 input_msg: msg_half[2].as_view(),
                 forget: &forget_w[2],
                 gain: &gain_w[2],
@@ -1237,7 +1237,7 @@ fn depth_gate_mlp_step_matches_separate_kernels() -> anyhow::Result<()> {
         let mut ref_gated = stream.alloc_zeros::<f32>(HIDDEN)?;
         let mut ref_mlp_x = stream.alloc_zeros::<bf16>(HIDDEN)?;
         let mut ref_steps = [GateStep {
-            down_weight: &down_w,
+            down_weight: Some(&down_w),
             input: ref_gate_in.as_view(),
             forget: &forget_w,
             gain: &gain_w,
@@ -1261,7 +1261,7 @@ fn depth_gate_mlp_step_matches_separate_kernels() -> anyhow::Result<()> {
         let mut got_gated = stream.alloc_zeros::<f32>(HIDDEN)?;
         let mut got_mlp_x = stream.alloc_zeros::<bf16>(HIDDEN)?;
         let mut slot = DepthGateSlot {
-            down_weight: &down_w,
+            down_weight: Some(&down_w),
             input_msg: msg_half.as_view(),
             forget: &forget_w,
             gain: &gain_w,

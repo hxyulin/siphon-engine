@@ -444,9 +444,17 @@ mod linux {
         let gpu = Gpu::new(0)?;
         let start = Instant::now();
         let checkpoint = Checkpoint::open(&args.model)?;
-        let mut weights = Weights::load(&checkpoint, &config, gpu.stream())?;
-        weights.output = args.output;
-        weights.lm_head_format = args.lm_head;
+        let weights = Weights::load_with_options(
+            &checkpoint,
+            &config,
+            &gpu,
+            siphon_cuda::weights::LoadOptions {
+                weights: args.weights,
+                output: args.output,
+                lm_head: args.lm_head,
+                prefill_dense_fp8: args.prefill_dense == Products::Fp8,
+            },
+        )?;
         gpu.stream().synchronize()?;
         eprintln!("loaded weights in {:.1} s", start.elapsed().as_secs_f64());
         let capacity = n + capture.continuation.len();

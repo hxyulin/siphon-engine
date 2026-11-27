@@ -2469,7 +2469,7 @@ impl Ctx {
         }
         self.gemm_rows(
             &mut [RowProduct {
-                weight: self.weights.lm_head.slice(),
+                weight: Some(self.weights.lm_head.slice()),
                 fp8: self.weights.lm_head_fp8.as_ref(),
                 mxfp8: None,
                 x,
@@ -3749,7 +3749,7 @@ impl Ctx {
         )?;
         self.gemm_rows(
             &mut [RowProduct {
-                weight: &w.attention.o,
+                weight: w.attention.o.as_ref(),
                 fp8: w.fp8.as_ref().and_then(|f| f.o.as_ref()),
                 mxfp8: w.mxfp8_o.as_ref(),
                 x: rows(&t.gated, m, q_dims),
@@ -4115,7 +4115,7 @@ impl Ctx {
         shift_kv: bool,
     ) -> anyhow::Result<()> {
         fn product<'a>(
-            (weight, fp8): (&'a CudaSlice<bf16>, Option<&'a Fp8Matrix>),
+            (weight, fp8): (Option<&'a CudaSlice<bf16>>, Option<&'a Fp8Matrix>),
             x: &'a CudaView<'_, bf16>,
             out: CudaViewMut<'a, bf16>,
         ) -> RowProduct<'a> {
@@ -4146,21 +4146,45 @@ impl Ctx {
             let fp8 = |i: usize| w.fp8.as_ref().map(|f| &f.inputs[i]);
 
             let mut products = vec![
-                product((&a.q, fp8(0)), &q_in, rows_mut(&mut t.q_raw, m, q_dims)),
-                product((&a.r, fp8(1)), &q_in, rows_mut(&mut t.r_raw, m, rel_dims)),
-                product((&a.gate, fp8(2)), &q_in, rows_mut(&mut t.gate, m, q_dims)),
-                product((&a.sink, fp8(3)), &q_in, rows_mut(&mut t.sinks, m, heads)),
-                product((&a.k, fp8(4)), &k_in, rows_mut(&mut t.k_raw, m, kv_dims)),
-                product((&a.v, fp8(5)), &v_in, rows_mut(&mut t.v_raw, m, kv_dims)),
+                product(
+                    (a.q.as_ref(), fp8(0)),
+                    &q_in,
+                    rows_mut(&mut t.q_raw, m, q_dims),
+                ),
+                product(
+                    (a.r.as_ref(), fp8(1)),
+                    &q_in,
+                    rows_mut(&mut t.r_raw, m, rel_dims),
+                ),
+                product(
+                    (a.gate.as_ref(), fp8(2)),
+                    &q_in,
+                    rows_mut(&mut t.gate, m, q_dims),
+                ),
+                product(
+                    (a.sink.as_ref(), fp8(3)),
+                    &q_in,
+                    rows_mut(&mut t.sinks, m, heads),
+                ),
+                product(
+                    (a.k.as_ref(), fp8(4)),
+                    &k_in,
+                    rows_mut(&mut t.k_raw, m, kv_dims),
+                ),
+                product(
+                    (a.v.as_ref(), fp8(5)),
+                    &v_in,
+                    rows_mut(&mut t.v_raw, m, kv_dims),
+                ),
             ];
             if let KvConv::Dynamic { k_proj, v_proj, .. } = &a.kv_conv {
                 products.push(product(
-                    (k_proj, fp8(6)),
+                    (k_proj.as_ref(), fp8(6)),
                     &k_in,
                     rows_mut(&mut t.k_dynamic, m, taps),
                 ));
                 products.push(product(
-                    (v_proj, fp8(7)),
+                    (v_proj.as_ref(), fp8(7)),
                     &v_in,
                     rows_mut(&mut t.v_dynamic, m, taps),
                 ));
@@ -4325,7 +4349,7 @@ impl Ctx {
         }
         self.gemm_rows(
             &mut [RowProduct {
-                weight: &a.o,
+                weight: a.o.as_ref(),
                 fp8: w.fp8.as_ref().and_then(|f| f.o.as_ref()),
                 mxfp8: w.mxfp8_o.as_ref(),
                 x: rows(&t.gated, m, q_dims),
@@ -4455,7 +4479,7 @@ impl Ctx {
             match n {
                 1 => self.gemm_rows(
                     &mut [RowProduct {
-                        weight: &weights[0].down,
+                        weight: weights[0].down.as_ref(),
                         fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
                         mxfp8: None,
                         x: rows(&t.inputs[first], m, 2 * hidden),
@@ -4472,21 +4496,21 @@ impl Ctx {
                     self.gemm_rows(
                         &mut [
                             RowProduct {
-                                weight: &weights[0].down,
+                                weight: weights[0].down.as_ref(),
                                 fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
                                 mxfp8: None,
                                 x: x0,
                                 out: d0,
                             },
                             RowProduct {
-                                weight: &weights[1].down,
+                                weight: weights[1].down.as_ref(),
                                 fp8: weights[1].fp8.as_ref().map(|f| &f[0]),
                                 mxfp8: None,
                                 x: x1,
                                 out: d1,
                             },
                             RowProduct {
-                                weight: &weights[2].down,
+                                weight: weights[2].down.as_ref(),
                                 fp8: weights[2].fp8.as_ref().map(|f| &f[0]),
                                 mxfp8: None,
                                 x: x2,
@@ -4736,7 +4760,7 @@ impl Ctx {
             .map(|(i, ((w, norm), out))| {
                 let slot = first + i;
                 GateRowsSlot {
-                    down: &w.down,
+                    down: w.down.as_ref(),
                     down_fp8: w.fp8.as_ref().filter(|_| fp8).map(|f| &f[0]),
                     forget: &w.forget,
                     gain: &w.gain,
@@ -5235,42 +5259,42 @@ impl Ctx {
             let fp8 = |i: usize| layer_w.fp8.as_ref().map(|f| &f.inputs[i]);
             let mut products = vec![
                 RowProduct {
-                    weight: &attn_w.q,
+                    weight: attn_w.q.as_ref(),
                     fp8: fp8(0),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.q_raw, m, q_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.r,
+                    weight: attn_w.r.as_ref(),
                     fp8: fp8(1),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.r_raw, m, rel_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.gate,
+                    weight: attn_w.gate.as_ref(),
                     fp8: fp8(2),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.gate, m, q_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.sink,
+                    weight: attn_w.sink.as_ref(),
                     fp8: fp8(3),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.sinks, m, heads),
                 },
                 RowProduct {
-                    weight: &attn_w.k,
+                    weight: attn_w.k.as_ref(),
                     fp8: fp8(4),
                     mxfp8: None,
                     x: k_in.slice(..),
                     out: rows_mut(&mut attn.k_raw, m, kv_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.v,
+                    weight: attn_w.v.as_ref(),
                     fp8: fp8(5),
                     mxfp8: None,
                     x: v_in.slice(..),
@@ -5279,14 +5303,14 @@ impl Ctx {
             ];
             if let KvConv::Dynamic { k_proj, v_proj, .. } = &attn_w.kv_conv {
                 products.push(RowProduct {
-                    weight: k_proj,
+                    weight: k_proj.as_ref(),
                     fp8: fp8(6),
                     mxfp8: None,
                     x: k_in.slice(..),
                     out: rows_mut(&mut attn.k_dynamic, m, taps_w),
                 });
                 products.push(RowProduct {
-                    weight: v_proj,
+                    weight: v_proj.as_ref(),
                     fp8: fp8(7),
                     mxfp8: None,
                     x: v_in.slice(..),
@@ -6281,42 +6305,42 @@ impl Ctx {
             let fp8 = |i: usize| layer_w.fp8.as_ref().map(|f| &f.inputs[i]);
             let mut products = vec![
                 RowProduct {
-                    weight: &attn_w.q,
+                    weight: attn_w.q.as_ref(),
                     fp8: fp8(0),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.q_raw, m, q_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.r,
+                    weight: attn_w.r.as_ref(),
                     fp8: fp8(1),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.r_raw, m, rel_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.gate,
+                    weight: attn_w.gate.as_ref(),
                     fp8: fp8(2),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.gate, m, q_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.sink,
+                    weight: attn_w.sink.as_ref(),
                     fp8: fp8(3),
                     mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.sinks, m, heads),
                 },
                 RowProduct {
-                    weight: &attn_w.k,
+                    weight: attn_w.k.as_ref(),
                     fp8: fp8(4),
                     mxfp8: None,
                     x: k_in.slice(..),
                     out: rows_mut(&mut attn.k_raw, m, kv_dims),
                 },
                 RowProduct {
-                    weight: &attn_w.v,
+                    weight: attn_w.v.as_ref(),
                     fp8: fp8(5),
                     mxfp8: None,
                     x: v_in.slice(..),
@@ -6325,14 +6349,14 @@ impl Ctx {
             ];
             if let KvConv::Dynamic { k_proj, v_proj, .. } = &attn_w.kv_conv {
                 products.push(RowProduct {
-                    weight: k_proj,
+                    weight: k_proj.as_ref(),
                     fp8: fp8(6),
                     mxfp8: None,
                     x: k_in.slice(..),
                     out: rows_mut(&mut attn.k_dynamic, m, taps_w),
                 });
                 products.push(RowProduct {
-                    weight: v_proj,
+                    weight: v_proj.as_ref(),
                     fp8: fp8(7),
                     mxfp8: None,
                     x: v_in.slice(..),

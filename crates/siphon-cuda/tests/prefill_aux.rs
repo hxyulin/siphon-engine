@@ -202,7 +202,7 @@ fn message_gate_rows_persistent_cluster_parity() -> anyhow::Result<()> {
                 .zip(outs.iter_mut())
                 .zip(normeds.iter_mut())
                 .map(|((g, out), normed)| GateRowsSlot {
-                    down: &downs[g],
+                    down: Some(&downs[g]),
                     down_fp8: use_fp8.then_some(&downs_fp8[g]),
                     forget: &forgets[g],
                     gain: &gains[g],
@@ -248,7 +248,7 @@ fn message_gate_rows_persistent_cluster_parity() -> anyhow::Result<()> {
                     .zip(ref_outs.iter_mut())
                     .zip(ref_normeds.iter_mut())
                     .map(|((g, out), normed)| GateRowsSlot {
-                        down: &downs[g],
+                        down: Some(&downs[g]),
                         down_fp8: use_fp8.then_some(&downs_fp8[g]),
                         forget: &forgets[g],
                         gain: &gains[g],

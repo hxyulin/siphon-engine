@@ -526,29 +526,32 @@ enum Arch {
     },
 }
 
+/// One layer's `(k, v, k_norm)` context projections.
+type ContextLayerRefs<'a> = (
+    Option<&'a CudaSlice<bf16>>,
+    Option<&'a CudaSlice<bf16>>,
+    &'a CudaSlice<bf16>,
+);
+
 /// The context rows of a DFlash or DFlash 2 draft: `fc` and `hidden_norm` of the taps,
 /// then each layer's `k_proj`, `v_proj` and key norm.
 struct ContextRefs<'a> {
-    fc: &'a CudaSlice<bf16>,
+    fc: Option<&'a CudaSlice<bf16>>,
     fc_quant: Option<QuantizedWeight<'a>>,
     hidden_norm: &'a CudaSlice<bf16>,
     /// Each layer's `(k, v, k_norm)`.
-    layers: Vec<(
-        &'a CudaSlice<bf16>,
-        &'a CudaSlice<bf16>,
-        &'a CudaSlice<bf16>,
-    )>,
+    layers: Vec<ContextLayerRefs<'a>>,
 }
 
 /// The weights of one decoder layer's block forward, which both architectures share.
-/// The projections only the block reads are `None` once [`Arch::release_block_bf16`]
-/// has freed them for their FP8 copies.
+/// The projections are `None` once [`Arch::release_layer_bf16`] has freed them for their
+/// quantized copies.
 struct LayerRefs<'a> {
     input_norm: &'a CudaSlice<bf16>,
     post_attention_norm: &'a CudaSlice<bf16>,
     q: Option<&'a CudaSlice<bf16>>,
-    k: &'a CudaSlice<bf16>,
-    v: &'a CudaSlice<bf16>,
+    k: Option<&'a CudaSlice<bf16>>,
+    v: Option<&'a CudaSlice<bf16>>,
     o: Option<&'a CudaSlice<bf16>>,
     q_norm: &'a CudaSlice<bf16>,
     k_norm: &'a CudaSlice<bf16>,
@@ -565,8 +568,8 @@ impl<'a> From<&'a DraftLayerWeights> for LayerRefs<'a> {
             input_norm: &w.input_norm,
             post_attention_norm: &w.post_attention_norm,
             q: w.q.as_ref(),
-            k: &w.k,
-            v: &w.v,
+            k: w.k.as_ref(),
+            v: w.v.as_ref(),
             o: w.o.as_ref(),
             q_norm: &w.q_norm,
             k_norm: &w.k_norm,
@@ -584,8 +587,8 @@ impl<'a> From<&'a DflashLayerWeights> for LayerRefs<'a> {
             input_norm: &w.input_norm,
             post_attention_norm: &w.post_attention_norm,
             q: w.q.as_ref(),
-            k: &w.k,
-            v: &w.v,
+            k: w.k.as_ref(),
+            v: w.v.as_ref(),
             o: w.o.as_ref(),
             q_norm: &w.q_norm,
             k_norm: &w.k_norm,
@@ -603,8 +606,8 @@ impl<'a> From<&'a Dflash2LayerWeights> for LayerRefs<'a> {
             input_norm: &w.input_norm,
             post_attention_norm: &w.post_attention_norm,
             q: w.q.as_ref(),
-            k: &w.k,
-            v: &w.v,
+            k: w.k.as_ref(),
+            v: w.v.as_ref(),
             o: w.o.as_ref(),
             q_norm: &w.q_norm,
             k_norm: &w.k_norm,
@@ -625,25 +628,35 @@ impl Arch {
         }
     }
 
-    /// Frees every layer's BF16 projections that only the block reads (queries, output,
-    /// gate, up and down), once the FP8 copies of [`DraftOptions::fp8_backbone`] stand in
-    /// for them. The commit keeps reading the BF16 keys, values and context projections.
-    fn release_block_bf16(&mut self) {
+    /// Frees layer `layer`'s BF16 linear projections once their quantized copies stand in
+    /// for them (both block forward and context commit read the quantized copies).
+    fn release_layer_bf16(&mut self, layer: usize) {
         macro_rules! release {
-            ($layers:expr) => {
-                for w in $layers {
-                    w.q = None;
-                    w.o = None;
-                    w.gate = None;
-                    w.up = None;
-                    w.down = None;
-                }
+            ($w:expr) => {
+                $w.q = None;
+                $w.k = None;
+                $w.v = None;
+                $w.o = None;
+                $w.gate = None;
+                $w.up = None;
+                $w.down = None;
             };
         }
         match self {
-            Self::Stock { weights, .. } => release!(&mut weights.layers),
-            Self::Dflash { weights, .. } => release!(&mut weights.layers),
-            Self::Dflash2 { weights, .. } => release!(&mut weights.layers),
+            Self::Stock { weights, .. } => {
+                let w = &mut weights.layers[layer];
+                release!(w);
+                w.k_ctx = None;
+                w.v_ctx = None;
+            }
+            Self::Dflash { weights, .. } => {
+                let w = &mut weights.layers[layer];
+                release!(w);
+            }
+            Self::Dflash2 { weights, .. } => {
+                let w = &mut weights.layers[layer];
+                release!(w);
+            }
         }
     }
 
@@ -751,25 +764,25 @@ impl Arch {
             Self::Dflash {
                 weights, fc_quant, ..
             } => Some(ContextRefs {
-                fc: &weights.fc,
+                fc: weights.fc.as_ref(),
                 fc_quant: fc_quant.as_ref().map(QuantizedFc::as_weight),
                 hidden_norm: &weights.hidden_norm,
                 layers: weights
                     .layers
                     .iter()
-                    .map(|l| (&l.k, &l.v, &l.k_norm))
+                    .map(|l| (l.k.as_ref(), l.v.as_ref(), &l.k_norm))
                     .collect(),
             }),
             Self::Dflash2 {
                 weights, fc_quant, ..
             } => Some(ContextRefs {
-                fc: &weights.fc,
+                fc: weights.fc.as_ref(),
                 fc_quant: fc_quant.as_ref().map(QuantizedFc::as_weight),
                 hidden_norm: &weights.hidden_norm,
                 layers: weights
                     .layers
                     .iter()
-                    .map(|l| (&l.k, &l.v, &l.k_norm))
+                    .map(|l| (l.k.as_ref(), l.v.as_ref(), &l.k_norm))
                     .collect(),
             }),
         }
@@ -1188,7 +1201,7 @@ impl Draft {
     pub fn dflash(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
-        weights: DflashWeights,
+        mut weights: DflashWeights,
         shared: SharedWeights<'_>,
         capacity: usize,
         options: &DraftOptions,
@@ -1196,14 +1209,18 @@ impl Draft {
         let kernels = DraftKernels::load(stream.context())?;
         let linear_nvfp4 = LinearNvfp4::load(stream.context())?;
         check_lm_head(config, shared)?;
+        let fc_k = weights.taps.len() * HIDDEN;
         let fc_quant = quantize_fc(
             stream,
             &kernels,
             &linear_nvfp4,
-            &weights.fc,
-            weights.taps.len() * HIDDEN,
+            freed(weights.fc.as_ref())?,
+            fc_k,
             options,
         )?;
+        if fc_quant.is_some() && matches!(fc_k, 2304 | 4608 | 6912 | 9216) {
+            weights.fc = None;
+        }
         let arch = Arch::Dflash {
             weights,
             zero_bias: stream.alloc_zeros(config.vocab_size)?,
@@ -1228,7 +1245,7 @@ impl Draft {
     pub fn dflash2(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
-        weights: Dflash2Weights,
+        mut weights: Dflash2Weights,
         shared: SharedWeights<'_>,
         capacity: usize,
         options: &DraftOptions,
@@ -1236,14 +1253,18 @@ impl Draft {
         let kernels = DraftKernels::load(stream.context())?;
         let linear_nvfp4 = LinearNvfp4::load(stream.context())?;
         check_lm_head(config, shared)?;
+        let fc_k = weights.taps.len() * HIDDEN;
         let fc_quant = quantize_fc(
             stream,
             &kernels,
             &linear_nvfp4,
-            &weights.fc,
-            weights.taps.len() * HIDDEN,
+            freed(weights.fc.as_ref())?,
+            fc_k,
             options,
         )?;
+        if fc_quant.is_some() && matches!(fc_k, 2304 | 4608 | 6912 | 9216) {
+            weights.fc = None;
+        }
         // The mask rows are the mask token's normed target embedding: row 0 of a block
         // anchored at the mask token.
         let mask = stream.clone_htod(&[i32::try_from(weights.mask_token)?])?;
@@ -1323,16 +1344,15 @@ impl Draft {
             Some(Backbone::Nvfp4(quantize_backbone_nvfp4(
                 stream,
                 &linear_nvfp4,
-                &arch,
+                &mut arch,
             )?))
         } else if options.fp8_backbone {
-            Some(Backbone::Fp8(quantize_backbone(stream, &kernels, &arch)?))
+            Some(Backbone::Fp8(quantize_backbone(
+                stream, &kernels, &mut arch,
+            )?))
         } else {
             None
         };
-        if backbone.is_some() {
-            arch.release_block_bf16();
-        }
         let round_taps = z(BLOCK * arch.tap_count() * HIDDEN)?;
         let head = Head::new(
             stream,
@@ -2175,14 +2195,28 @@ impl Draft {
                         let mixed = s.mixed.slice(..n * HIDDEN);
                         let mut k = s.ctx_k.slice_mut(..n * KV_WIDTH);
                         let mut v = s.ctx_v.slice_mut(..n * KV_WIDTH);
-                        linear.gemm_bf16(
-                            stream,
-                            &mut [
-                                Gemm::new(&w.k_ctx, &mixed, &mut k),
-                                Gemm::new(&w.v_ctx, &mixed, &mut v),
-                            ],
-                            n,
-                        )?;
+                        if let Some(bb) = self.backbone.as_ref() {
+                            let quant = bb.layer(layer);
+                            project_quant_rows(
+                                &self.linear_rows,
+                                stream,
+                                &mixed,
+                                n,
+                                &mut [
+                                    (quant.k_ctx.context("quantized k_ctx missing")?, k),
+                                    (quant.v_ctx.context("quantized v_ctx missing")?, v),
+                                ],
+                            )?;
+                        } else {
+                            linear.gemm_bf16(
+                                stream,
+                                &mut [
+                                    Gemm::new(freed(w.k_ctx.as_ref())?, &mixed, &mut k),
+                                    Gemm::new(freed(w.v_ctx.as_ref())?, &mixed, &mut v),
+                                ],
+                                n,
+                            )?;
+                        }
                         self.kernels.head_norm_rope(
                             stream,
                             &mut s.ctx_k,
@@ -2254,7 +2288,17 @@ impl Draft {
             let chunk = taps.slice(offset * row_len..(offset + n) * row_len);
             let position = start + offset;
             let mut raw = dfl.raw.slice_mut(..n * HIDDEN);
-            linear.gemm_bf16(stream, &mut [Gemm::new(context.fc, &chunk, &mut raw)], n)?;
+            if let Some(fc_q) = context.fc_quant
+                && self.linear_rows.supports(row_len)
+            {
+                project_quant_rows(&self.linear_rows, stream, &chunk, n, &mut [(fc_q, raw)])?;
+            } else {
+                linear.gemm_bf16(
+                    stream,
+                    &mut [Gemm::new(freed(context.fc)?, &chunk, &mut raw)],
+                    n,
+                )?;
+            }
             self.kernels.add_rms_norm(
                 stream,
                 None,
@@ -2264,17 +2308,30 @@ impl Draft {
                 EPS,
             )?;
             let normed = dfl.normed.slice(..n * HIDDEN);
-            for (&(k, v, k_norm), cache) in context.layers.iter().zip(&mut self.caches) {
+            for (layer, (&(k, v, k_norm), cache)) in
+                context.layers.iter().zip(&mut self.caches).enumerate()
+            {
                 let mut ck = s.ctx_k.slice_mut(..n * KV_WIDTH);
                 let mut cv = s.ctx_v.slice_mut(..n * KV_WIDTH);
-                linear.gemm_bf16(
-                    stream,
-                    &mut [
-                        Gemm::new(k, &normed, &mut ck),
-                        Gemm::new(v, &normed, &mut cv),
-                    ],
-                    n,
-                )?;
+                if let Some(bb) = self.backbone.as_ref() {
+                    let q = bb.layer(layer);
+                    project_quant_rows(
+                        &self.linear_rows,
+                        stream,
+                        &normed,
+                        n,
+                        &mut [(q.k, ck), (q.v, cv)],
+                    )?;
+                } else {
+                    linear.gemm_bf16(
+                        stream,
+                        &mut [
+                            Gemm::new(freed(k)?, &normed, &mut ck),
+                            Gemm::new(freed(v)?, &normed, &mut cv),
+                        ],
+                        n,
+                    )?;
+                }
                 self.kernels.head_norm_rope_table(
                     stream,
                     &mut s.ctx_k,
@@ -2417,8 +2474,8 @@ impl Draft {
                         stream,
                         &mixed,
                         &mut [
-                            (Some(&lw.k_ctx), f.and_then(|f| f.k_ctx), ck),
-                            (Some(&lw.v_ctx), f.and_then(|f| f.v_ctx), cv),
+                            (lw.k_ctx.as_ref(), f.and_then(|f| f.k_ctx), ck),
+                            (lw.v_ctx.as_ref(), f.and_then(|f| f.v_ctx), cv),
                         ],
                     )?;
                 }
@@ -2463,11 +2520,7 @@ impl Draft {
             k,
             stream,
             &self.inputs.taps.slice(..),
-            &mut [(
-                Some(context.fc),
-                context.fc_quant,
-                dfl.round_raw.slice_mut(..),
-            )],
+            &mut [(context.fc, context.fc_quant, dfl.round_raw.slice_mut(..))],
         )?;
         k.add_rms_norm(
             stream,
@@ -2488,8 +2541,8 @@ impl Draft {
                 .zip(s.round_v.as_view_mut().chunks_exact_mut(layer_rows)),
         ) {
             let q = self.backbone.as_ref().map(|b| b.layer(layer));
-            products.push((Some(lk), q.map(|f| f.k), ck));
-            products.push((Some(lv), q.map(|f| f.v), cv));
+            products.push((lk, q.map(|f| f.k), ck));
+            products.push((lv, q.map(|f| f.v), cv));
         }
         project(
             linear,
@@ -2565,8 +2618,8 @@ impl Draft {
                 &input,
                 &mut [
                     (lw.q, f.map(|f| f.q), s.q.slice_mut(..)),
-                    (Some(lw.k), f.map(|f| f.k), s.k.slice_mut(..)),
-                    (Some(lw.v), f.map(|f| f.v), s.v.slice_mut(..)),
+                    (lw.k, f.map(|f| f.k), s.k.slice_mut(..)),
+                    (lw.v, f.map(|f| f.v), s.v.slice_mut(..)),
                 ],
             )?;
             attend(k, stream, arch, s, control, &self.inv_freq, layer, cache)?;
@@ -3240,11 +3293,12 @@ fn quantize_fc(
     }
 }
 
-/// FP8 copies of every layer's projections.
+/// FP8 copies of every layer's projections, releasing each layer's BF16 weights right
+/// after quantizing that layer so peak VRAM stays low.
 fn quantize_backbone(
     stream: &Arc<CudaStream>,
     kernels: &DraftKernels,
-    arch: &Arch,
+    arch: &mut Arch,
 ) -> anyhow::Result<Vec<Fp8Layer>> {
     let quantize = |w: &CudaSlice<bf16>, k: usize| -> anyhow::Result<Fp8Rows> {
         let rows = w.len() / k;
@@ -3252,72 +3306,79 @@ fn quantize_backbone(
         kernels.quantize_rows(stream, w, None, rows, 0, &mut out)?;
         Ok(out)
     };
-    (0..arch.layers())
-        .map(|layer| {
+    let mut out = Vec::with_capacity(arch.layers());
+    for layer in 0..arch.layers() {
+        let quantized = {
             let w = arch.layer(layer);
-            let (k_ctx, v_ctx) = match arch {
+            let (k_ctx, v_ctx) = match &*arch {
                 Arch::Stock { weights, .. } => {
                     let c = &weights.layers[layer];
                     (
-                        Some(quantize(&c.k_ctx, HIDDEN)?),
-                        Some(quantize(&c.v_ctx, HIDDEN)?),
+                        Some(quantize(freed(c.k_ctx.as_ref())?, HIDDEN)?),
+                        Some(quantize(freed(c.v_ctx.as_ref())?, HIDDEN)?),
                     )
                 }
                 Arch::Dflash { .. } | Arch::Dflash2 { .. } => (None, None),
             };
-
-            Ok(Fp8Layer {
+            Fp8Layer {
                 q: quantize(freed(w.q)?, HIDDEN)?,
-                k: quantize(w.k, HIDDEN)?,
-                v: quantize(w.v, HIDDEN)?,
+                k: quantize(freed(w.k)?, HIDDEN)?,
+                v: quantize(freed(w.v)?, HIDDEN)?,
                 o: quantize(freed(w.o)?, arch.q_width())?,
                 gate: quantize(freed(w.gate)?, HIDDEN)?,
                 up: quantize(freed(w.up)?, HIDDEN)?,
                 down: quantize(freed(w.down)?, arch.mlp_width())?,
                 k_ctx,
                 v_ctx,
-            })
-        })
-        .collect()
+            }
+        };
+        arch.release_layer_bf16(layer);
+        out.push(quantized);
+    }
+    Ok(out)
 }
 
-/// NVFP4 (Four Over Six) copies of every layer's projections.
+/// NVFP4 (Four Over Six) copies of every layer's projections, releasing each layer's BF16
+/// weights right after quantizing that layer so peak VRAM stays low.
 fn quantize_backbone_nvfp4(
     stream: &Arc<CudaStream>,
     linear_nvfp4: &LinearNvfp4,
-    arch: &Arch,
+    arch: &mut Arch,
 ) -> anyhow::Result<Vec<Nvfp4Layer>> {
     let quantize = |w: &CudaSlice<bf16>, k: usize| -> anyhow::Result<Nvfp4Matrix> {
         ensure!(w.len().is_multiple_of(k), "weight is not [rows, {k}]");
         linear_nvfp4.quantize_any(stream, w, w.len() / k, k)
     };
-    (0..arch.layers())
-        .map(|layer| {
+    let mut out = Vec::with_capacity(arch.layers());
+    for layer in 0..arch.layers() {
+        let quantized = {
             let w = arch.layer(layer);
-            let (k_ctx, v_ctx) = match arch {
+            let (k_ctx, v_ctx) = match &*arch {
                 Arch::Stock { weights, .. } => {
                     let c = &weights.layers[layer];
                     (
-                        Some(quantize(&c.k_ctx, HIDDEN)?),
-                        Some(quantize(&c.v_ctx, HIDDEN)?),
+                        Some(quantize(freed(c.k_ctx.as_ref())?, HIDDEN)?),
+                        Some(quantize(freed(c.v_ctx.as_ref())?, HIDDEN)?),
                     )
                 }
                 Arch::Dflash { .. } | Arch::Dflash2 { .. } => (None, None),
             };
-
-            Ok(Nvfp4Layer {
+            Nvfp4Layer {
                 q: quantize(freed(w.q)?, HIDDEN)?,
-                k: quantize(w.k, HIDDEN)?,
-                v: quantize(w.v, HIDDEN)?,
+                k: quantize(freed(w.k)?, HIDDEN)?,
+                v: quantize(freed(w.v)?, HIDDEN)?,
                 o: quantize(freed(w.o)?, arch.q_width())?,
                 gate: quantize(freed(w.gate)?, HIDDEN)?,
                 up: quantize(freed(w.up)?, HIDDEN)?,
                 down: quantize(freed(w.down)?, arch.mlp_width())?,
                 k_ctx,
                 v_ctx,
-            })
-        })
-        .collect()
+            }
+        };
+        arch.release_layer_bf16(layer);
+        out.push(quantized);
+    }
+    Ok(out)
 }
 
 impl Head {
@@ -3473,6 +3534,48 @@ type Projection<'a> = (
     Option<QuantizedWeight<'a>>,
     CudaViewMut<'a, bf16>,
 );
+
+/// `out = x · weight^T` over `rows` commit rows through [`LinearRows`] in chunks of
+/// [`crate::ops::linear_rows::MAX_ROWS`], using quantized FP8 or NVFP4 copies when the
+/// BF16 weights have been released.
+fn project_quant_rows(
+    linear_rows: &LinearRows,
+    stream: &CudaStream,
+    x: &CudaView<'_, bf16>,
+    rows: usize,
+    products: &mut [(QuantizedWeight<'_>, CudaViewMut<'_, bf16>)],
+) -> anyhow::Result<()> {
+    let k = x.len() / rows;
+    for sub in (0..rows).step_by(crate::ops::linear_rows::MAX_ROWS) {
+        let m = crate::ops::linear_rows::MAX_ROWS.min(rows - sub);
+        let x_sub = x.slice(sub * k..(sub + m) * k);
+        let mut slices: Vec<(QuantizedWeight<'_>, CudaViewMut<'_, bf16>)> = products
+            .iter_mut()
+            .map(|(w, out)| {
+                let n = out.len() / rows;
+                (*w, out.slice_mut(sub * n..(sub + m) * n))
+            })
+            .collect();
+        for chunk in slices.chunks_mut(ROWS_MAX_PRODUCTS) {
+            let mut batch: Vec<RowsProduct<'_>> = chunk
+                .iter_mut()
+                .map(|(w, out)| match *w {
+                    QuantizedWeight::Nvfp4(q) => RowsProduct::nvfp4(q, &x_sub, out),
+                    QuantizedWeight::Fp8(q) => RowsProduct::fp8_raw(
+                        q.values.slice(..),
+                        q.scales.slice(..),
+                        q.rows(),
+                        q.k,
+                        &x_sub,
+                        out,
+                    ),
+                })
+                .collect();
+            linear_rows.run(stream, &mut batch, m, Start::Early)?;
+        }
+    }
+    Ok(())
+}
 
 /// `out = x · weight^T` over the 8 block rows for each product `(weight, quant, out)`:
 /// through the NVFP4 or FP8 copies when every product has one, else through the BF16
