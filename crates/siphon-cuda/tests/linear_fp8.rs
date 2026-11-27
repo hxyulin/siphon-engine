@@ -250,6 +250,10 @@ fn per_row_fp8_rows(x: &[bf16], k: usize) -> Vec<f64> {
 /// products that share an input and that do not, partial row and column tiles, and k of
 /// the attention inputs, the output projection and the message gates.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "tests shared and unshared FP8 GEMM batches across sm_120a and sm_89"
+)]
 fn gemm_matches_reference() -> anyhow::Result<()> {
     // (m, k, [(n, input)]): products with the same input index share x.
     type Case = (usize, usize, &'static [(usize, usize)]);

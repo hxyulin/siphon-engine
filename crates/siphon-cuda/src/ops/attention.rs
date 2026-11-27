@@ -2301,7 +2301,7 @@ impl Attention {
             crate::BLOCK_SCALED_MMA
                 || !matches!(
                     (&*cache.data, products),
-                    (KvData::Fp8 { .. }, Products::Fp4) | (KvData::Nvfp4 { .. }, Products::Fp4)
+                    (KvData::Fp8 { .. } | KvData::Nvfp4 { .. }, Products::Fp4)
                 ),
             "{products} prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
         );

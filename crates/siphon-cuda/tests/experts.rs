@@ -1890,6 +1890,76 @@ fn decode_nvfp4_sm89(table: &[f64], host: &HostProjection<'_>, expert: usize) ->
     decoded
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test reference helper mirrors check_reference_with_mma_err plus E4M3 table"
+)]
+fn check_nvfp4_sm89_reference(
+    case: &str,
+    table: &[f64],
+    host: &HostProjection<'_>,
+    x64: &[f64],
+    indices: &[i32],
+    inputs_per_row: usize,
+    got: &[bf16],
+    mma_err: f64,
+) -> f64 {
+    let (n, k) = (host.n, host.k);
+    let expert_of = |pair: usize| usize::try_from(indices[pair]).ok();
+    let mut experts: Vec<usize> = (0..indices.len()).filter_map(expert_of).collect();
+    experts.sort_unstable();
+    experts.dedup();
+    std::thread::scope(|scope| {
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                let experts = &experts;
+                scope.spawn(move || {
+                    let mut worst = 0.0f64;
+                    for &expert in experts.iter().skip(thread).step_by(threads) {
+                        let decoded = decode_nvfp4_sm89(table, host, expert);
+                        let scale = host.output_scale(expert);
+                        for pair in (0..indices.len()).filter(|&p| expert_of(p) == Some(expert)) {
+                            let input = if inputs_per_row == 1 {
+                                pair / SLOTS
+                            } else {
+                                pair
+                            };
+                            let xin = &x64[input * k..(input + 1) * k];
+                            for col in 0..n {
+                                let (mut dot, mut sum) = (0.0f64, 0.0f64);
+                                let row = &decoded[col * k..(col + 1) * k];
+                                for (xi, wi) in xin.iter().zip(row) {
+                                    let product = xi * wi;
+                                    dot += product;
+                                    sum += product.abs();
+                                }
+                                let want = dot * scale;
+                                let bound = 2f64.powi(-8) * want.abs() + mma_err * sum * scale;
+                                let value = f64::from(got[pair * n + col].to_f32());
+                                let err = (value - want).abs();
+                                assert!(
+                                    err <= bound,
+                                    "{case}: pair {pair} (expert {expert}) col {col}: \
+                                     got {value}, want {want}, bound {bound}"
+                                );
+                                if bound > 0.0 {
+                                    worst = worst.max(err / bound);
+                                }
+                            }
+                        }
+                    }
+                    worst
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("reference thread panicked"))
+            .fold(0.0, f64::max)
+    })
+}
+
 /// `expert_matmul_quantized_grouped` against the F64 reference on the dequantized inputs,
 /// with every output written and two runs equal. With `fp8`, the inputs are MXFP8 (sm_120a)
 /// or per-row E4M3 (sm_89) for both weight formats.
@@ -1980,68 +2050,16 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
                 2f64.powi(-14)
             };
             let worst = if sm89_per_row && fp4 {
-                // Compare against sm_89's single-pass E4M3-rounded weight table.
-                let expert_of = |pair: usize| usize::try_from(indices[pair]).ok();
-                let mut experts: Vec<usize> = (0..indices.len()).filter_map(expert_of).collect();
-                experts.sort_unstable();
-                experts.dedup();
-                std::thread::scope(|scope| {
-                    let threads = std::thread::available_parallelism().map_or(1, usize::from);
-                    let handles: Vec<_> = (0..threads)
-                        .map(|thread| {
-                            let experts = &experts;
-                            let table = &table;
-                            let x64 = &x64;
-                            let indices = &indices;
-                            let host = &host;
-                            let case_ref = &case;
-                            scope.spawn(move || {
-                                let mut worst = 0.0f64;
-                                for &expert in experts.iter().skip(thread).step_by(threads) {
-                                    let decoded = decode_nvfp4_sm89(table, host, expert);
-                                    let scale = host.output_scale(expert);
-                                    for pair in
-                                        (0..indices.len()).filter(|&p| expert_of(p) == Some(expert))
-                                    {
-                                        let input = if inputs_per_row == 1 {
-                                            pair / SLOTS
-                                        } else {
-                                            pair
-                                        };
-                                        let xin = &x64[input * k..(input + 1) * k];
-                                        for col in 0..n {
-                                            let (mut dot, mut sum) = (0.0f64, 0.0f64);
-                                            let row = &decoded[col * k..(col + 1) * k];
-                                            for (xi, wi) in xin.iter().zip(row) {
-                                                let product = xi * wi;
-                                                dot += product;
-                                                sum += product.abs();
-                                            }
-                                            let want = dot * scale;
-                                            let bound = 2f64.powi(-8) * want.abs()
-                                                + mma_err * sum * scale;
-                                            let value = f64::from(got[pair * n + col].to_f32());
-                                            let err = (value - want).abs();
-                                            assert!(
-                                                err <= bound,
-                                                "{case_ref}: pair {pair} (expert {expert}) col {col}: \
-                                                 got {value}, want {want}, bound {bound}"
-                                            );
-                                            if bound > 0.0 {
-                                                worst = worst.max(err / bound);
-                                            }
-                                        }
-                                    }
-                                }
-                                worst
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("reference thread panicked"))
-                        .fold(0.0, f64::max)
-                })
+                check_nvfp4_sm89_reference(
+                    &case,
+                    &table,
+                    &host,
+                    &x64,
+                    &indices,
+                    inputs_per_row,
+                    got,
+                    mma_err,
+                )
             } else {
                 check_reference_with_mma_err(&case, &host, &x64, &indices, inputs_per_row, got, mma_err)
             };
