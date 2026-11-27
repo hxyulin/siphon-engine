@@ -314,6 +314,44 @@ impl Fp8Rows {
             .chunks_exact_mut(slot_scales);
         Ok(vals.zip(scales).collect())
     }
+
+    /// Splits slots `first .. first + count` of `rows * stride` values into disjoint mutable
+    /// `(values, scales)` views for strided fused MXFP8 epilogues such as message-gate
+    /// half-inputs (`stride = 4608`).
+    pub fn split_slots_range_mut(
+        &mut self,
+        rows: usize,
+        stride: usize,
+        first: usize,
+        count: usize,
+    ) -> anyhow::Result<Vec<(CudaViewMut<'_, u8>, CudaViewMut<'_, u8>)>> {
+        ensure!(rows > 0, "no rows");
+        ensure!(count > 0, "need at least one slot");
+        ensure!(
+            stride > 0 && stride.is_multiple_of(32),
+            "stride = {stride} is not a multiple of 32"
+        );
+        let slot_vals = rows * stride;
+        let slot_scales = slot_vals / 32;
+        let start_val = first * slot_vals;
+        let end_val = (first + count) * slot_vals;
+        let start_scl = first * slot_scales;
+        let end_scl = (first + count) * slot_scales;
+        ensure!(
+            end_val <= self.values.len() && end_scl <= self.scales.len(),
+            "the FP8 scratch holds {} values, need {end_val}",
+            self.values.len()
+        );
+        let vals = self
+            .values
+            .slice_mut(start_val..end_val)
+            .chunks_exact_mut(slot_vals);
+        let scales = self
+            .scales
+            .slice_mut(start_scl..end_scl)
+            .chunks_exact_mut(slot_scales);
+        Ok(vals.zip(scales).collect())
+    }
 }
 
 /// One product `out [m, n] = x [m, k] @ weight [n, k]^T` of [`LinearFp8::gemm`].
@@ -327,6 +365,14 @@ pub struct Fp8Gemm<'a> {
 /// whose MXFP8 input is already stored in [`Fp8Rows`] at value offset `x_offset`.
 pub struct Fp8GemmQuantized<'a> {
     pub weight: &'a Fp8Matrix,
+    pub x_offset: usize,
+    pub out: CudaViewMut<'a, bf16>,
+}
+
+/// One product `out [m, n] = x_q [m, k] @ weight [n, k]^T` of [`LinearFp8::gemm_mxfp8_quantized`]
+/// with MXFP8 block-32 weights and an MXFP8 input already stored in [`Fp8Rows`] at `x_offset`.
+pub struct Mxfp8GemmQuantized<'a> {
+    pub weight: &'a Mxfp8Matrix,
     pub x_offset: usize,
     pub out: CudaViewMut<'a, bf16>,
 }
@@ -357,6 +403,17 @@ struct RawProduct<'a> {
     rows: usize,
     k: usize,
     x: CudaView<'a, bf16>,
+    out: CudaViewMut<'a, bf16>,
+}
+
+/// Internal descriptor shared by [`LinearFp8::gemm_quantized`] and
+/// [`LinearFp8::gemm_mxfp8_quantized`].
+struct RawQuantizedProduct<'a> {
+    w_ptr: u64,
+    w_scale_ptr: u64,
+    rows: usize,
+    k: usize,
+    x_offset: usize,
     out: CudaViewMut<'a, bf16>,
 }
 /// Kernel parameter: one product, as `gemm8::Product` in the kernel.
@@ -763,13 +820,67 @@ impl LinearFp8 {
         m: usize,
         scratch: &Fp8Rows,
     ) -> anyhow::Result<()> {
+        let mut raw: Vec<RawQuantizedProduct<'_>> = products
+            .iter_mut()
+            .map(|p| {
+                let (w_ptr, _) = p.weight.data.device_ptr(stream);
+                let scale_off = u64::try_from(p.weight.padded_rows() * p.weight.k)?;
+                Ok(RawQuantizedProduct {
+                    w_ptr,
+                    w_scale_ptr: w_ptr + scale_off,
+                    rows: p.weight.rows,
+                    k: p.weight.k,
+                    x_offset: p.x_offset,
+                    out: p.out.slice_mut(..),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        self.launch_gemm_quantized(&self.gemm, stream, &mut raw, m, scratch)
+    }
+
+    /// [`Self::gemm_quantized`] for MXFP8 block-scaled weights (`gemm_mxfp8_*`), reading
+    /// pre-quantized MXFP8 activations directly from `scratch` (e.g. from
+    /// [`crate::ops::elementwise::Elementwise::attention_gate_quant_mxfp8`]).
+    pub fn gemm_mxfp8_quantized(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Mxfp8GemmQuantized<'_>],
+        m: usize,
+        scratch: &Fp8Rows,
+    ) -> anyhow::Result<()> {
+        let mut raw: Vec<RawQuantizedProduct<'_>> = products
+            .iter_mut()
+            .map(|p| {
+                let (w_ptr, _) = p.weight.values().device_ptr(stream);
+                let (w_scale_ptr, _) = p.weight.scales().device_ptr(stream);
+                RawQuantizedProduct {
+                    w_ptr,
+                    w_scale_ptr,
+                    rows: p.weight.rows,
+                    k: p.weight.k,
+                    x_offset: p.x_offset,
+                    out: p.out.slice_mut(..),
+                }
+            })
+            .collect();
+        self.launch_gemm_quantized(&self.gemm_mxfp8, stream, &mut raw, m, scratch)
+    }
+
+    fn launch_gemm_quantized(
+        &self,
+        family: &GemmFamily,
+        stream: &CudaStream,
+        products: &mut [RawQuantizedProduct<'_>],
+        m: usize,
+        scratch: &Fp8Rows,
+    ) -> anyhow::Result<()> {
         ensure!(
             (1..=MAX_PRODUCTS).contains(&products.len()),
             "{} products, expected 1 to {MAX_PRODUCTS}",
             products.len()
         );
         ensure!(m > 0, "no rows");
-        let k = products[0].weight.k;
+        let k = products[0].k;
         ensure!(
             k.is_multiple_of(GEMM_K),
             "the FP8 GEMM needs k a multiple of {GEMM_K}, not {k}"
@@ -777,27 +888,21 @@ impl LinearFp8 {
         let tiles_128: usize = m.div_ceil(GEMM_TILE)
             * products
                 .iter()
-                .map(|p| p.weight.rows.div_ceil(GEMM_TILE))
+                .map(|p| p.rows.div_ceil(GEMM_TILE))
                 .sum::<usize>();
         let (function, tile_m, tile_n, threads, shared) = if m <= GEMM_THIN_M {
             (
-                &self.gemm.thin,
+                &family.thin,
                 GEMM_THIN_M,
                 GEMM_THIN_N,
                 GEMM_SMALL_THREADS,
                 GEMM_THIN_SHARED,
             )
         } else if m > GEMM_SMALL_TILE && tiles_128 >= self.sms {
-            (
-                &self.gemm.large,
-                GEMM_TILE,
-                GEMM_TILE,
-                GEMM_THREADS,
-                GEMM_SHARED,
-            )
+            (&family.large, GEMM_TILE, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
         } else {
             (
-                &self.gemm.small,
+                &family.small,
                 GEMM_SMALL_TILE,
                 GEMM_SMALL_TILE,
                 GEMM_SMALL_THREADS,
@@ -814,12 +919,8 @@ impl LinearFp8 {
         let (scales_base, _) = scratch.scales.device_ptr(stream);
         let mut tiles = 0usize;
         for (i, p) in products.iter_mut().enumerate() {
-            let n = p.weight.rows;
-            ensure!(
-                p.weight.k == k,
-                "product {i} has k = {}, expected {k}",
-                p.weight.k
-            );
+            let n = p.rows;
+            ensure!(p.k == k, "product {i} has k = {}, expected {k}", p.k);
             ensure!(
                 p.out.len() == m * n,
                 "product {i}: out has {} elements, expected {m} x {n}",
@@ -833,11 +934,10 @@ impl LinearFp8 {
                 scratch.values.len()
             );
             tiles += m.div_ceil(tile_m) * n.div_ceil(tile_n);
-            let (w_ptr, _) = p.weight.data.device_ptr(stream);
             let (out_ptr, _) = p.out.device_ptr_mut(stream);
             batch.p[i] = GemmProduct {
-                w: w_ptr,
-                w_scale: w_ptr + u64::try_from(p.weight.padded_rows() * k)?,
+                w: p.w_ptr,
+                w_scale: p.w_scale_ptr,
                 x: values_base + u64::try_from(p.x_offset)?,
                 x_scale: scales_base + u64::try_from(p.x_offset / 32)?,
                 out: out_ptr,
@@ -852,8 +952,8 @@ impl LinearFp8 {
         };
         // SAFETY: `batch` has the kernel's `gemm8::Batch` layout. Each product's `x_offset`
         // points to `m * k` MXFP8 values and `m * k / 32` scales inside `scratch` written on
-        // this stream; each weight holds `padded_rows` rows of `k` bytes and their scales,
-        // and `out` holds `m * n` BF16 values. `k` is a multiple of 128.
+        // this stream; each weight holds at least `n` rows of `k` bytes and its per-row or
+        // per-32 scales, and `out` holds `m * n` BF16 values. `k` is a multiple of 128.
         unsafe { launch_by_value(stream, function, config, &batch, false) }
     }
 

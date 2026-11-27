@@ -920,11 +920,11 @@ fn invariant_rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
     rows_scratch_core(c, rows, sms) + invariant_scratch(c, rows)
 }
 
-/// The MXFP8 inputs of a prefill chunk's FP8 dense products (`GateRows::dense`): three
-/// inputs of `2 * hidden` values per row and a scale byte per 32 values. Invariant chunks
-/// allocate none.
+/// The MXFP8 inputs of a prefill chunk's FP8 dense products (`GateRows::dense`): four
+/// inputs of `2 * hidden` values per row (slots 0..3 for attention message gates and slot 3
+/// for the MLP message gate) and a scale byte per 32 values. Invariant chunks allocate none.
 fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
-    let values = rows * 3 * 2 * c.hidden_size;
+    let values = rows * 4 * 2 * c.hidden_size;
     values + values / 32
 }
 

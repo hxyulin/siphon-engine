@@ -17,9 +17,18 @@ use half::bf16;
 use siphon_cuda::{
     Gpu,
     ops::{
+        QuantDest, QuantFormat,
         conv::Conv,
-        linear_fp8::{Fp8Matrix, LinearFp8},
+        elementwise::Elementwise,
+        linear_fp8::{
+            Fp8Gemm, Fp8GemmQuantized, Fp8Matrix, Fp8Rows, LinearFp8, Mxfp8Gemm,
+            Mxfp8GemmQuantized,
+        },
         misc::{GATE_SLOTS, GateRowsSlot, Misc},
+        routing::{
+            DepthRows, DepthRowsQuant, EXPERTS, NormDest, QuantNormDest, RouterRowsScratch,
+            Routing, RowsPartial,
+        },
     },
 };
 
@@ -284,5 +293,432 @@ fn message_gate_rows_persistent_cluster_parity() -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// 2-term BF16 tensor-core `moe_router_logits_tc_rows_2304` + warp bitonic
+/// `moe_router_route_rows_2304` match single-row `moe_router` across adaptive K-splits
+/// (`rows = 64, 65, 512, 2048`), including exact tie-breaking on duplicated expert weights.
+#[test]
+fn moe_router_rows_tc_parity() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+
+    let mut router_host = pseudo_random(EXPERTS * HIDDEN, 901, 0.03);
+    // Duplicate pairs of expert weights so ties exercise exact lower-index tie-breaking.
+    for e in [3usize, 10, 20, 40] {
+        let partner = e ^ 64;
+        router_host.copy_within(e * HIDDEN..(e + 1) * HIDDEN, partner * HIDDEN);
+    }
+    let mut bias_host = pseudo_random(EXPERTS, 902, 0.05);
+    for e in [3usize, 10, 20, 40] {
+        bias_host[e ^ 64] = bias_host[e];
+    }
+    let router = stream.clone_htod(&router_host)?;
+    let bias = stream.clone_htod(&bias_host)?;
+
+    for &rows in &[64usize, 65, 512, 2048] {
+        let x_host = pseudo_random_bf16(rows * HIDDEN, 910 + rows as u32, 1.0, 0.0);
+        let x_dev = stream.clone_htod(&x_host)?;
+        let mut logits_dev = stream.alloc_zeros::<f32>(rows * EXPERTS)?;
+        let mut indices_dev = stream.alloc_zeros::<i32>(rows * TOP_K)?;
+        let mut weights_dev = stream.alloc_zeros::<f32>(rows * TOP_K)?;
+        let mut scratch = RouterRowsScratch::new(stream, rows)?;
+        routing.moe_router_rows(
+            stream,
+            &x_dev,
+            &router,
+            &bias,
+            &mut logits_dev,
+            &mut indices_dev,
+            &mut weights_dev,
+            &mut scratch,
+            8.0,
+            rows,
+        )?;
+        let got_logits = stream.clone_dtoh(&logits_dev)?;
+        let got_indices = stream.clone_dtoh(&indices_dev)?;
+        let got_weights = stream.clone_dtoh(&weights_dev)?;
+
+        // Check representative rows (start, tile boundaries, end) against single-row F32 router.
+        let sample_rows: Vec<usize> = [0, 1, 31, 63, rows / 2, rows - 1]
+            .into_iter()
+            .filter(|&r| r < rows)
+            .collect();
+        for r in sample_rows {
+            // Reference logits via router_logits F32 + expert_routing directly on the same x_host.
+            let x_row_bf16 = stream.clone_htod(&x_host[r * HIDDEN..(r + 1) * HIDDEN])?;
+            let mut ref_logits_dev = stream.alloc_zeros::<f32>(EXPERTS)?;
+            routing.router_logits(
+                stream,
+                &x_row_bf16,
+                &router,
+                &mut ref_logits_dev,
+                siphon_cuda::ops::routing::RouterMatmul::F32,
+            )?;
+            let mut ref_idx_dev = stream.alloc_zeros::<i32>(TOP_K)?;
+            let mut ref_w_dev = stream.alloc_zeros::<f32>(TOP_K)?;
+            routing.expert_routing(
+                stream,
+                &ref_logits_dev,
+                &bias,
+                &mut ref_idx_dev,
+                &mut ref_w_dev,
+                8.0,
+            )?;
+            let ref_logits = stream.clone_dtoh(&ref_logits_dev)?;
+            let ref_idx = stream.clone_dtoh(&ref_idx_dev)?;
+            let ref_w = stream.clone_dtoh(&ref_w_dev)?;
+
+            let gl = &got_logits[r * EXPERTS..(r + 1) * EXPERTS];
+            for (e, (&g, &w)) in gl.iter().zip(&ref_logits).enumerate() {
+                let err = (g - w).abs();
+                assert!(
+                    err <= 1e-5,
+                    "router_tc rows={rows} row={r} expert={e}: got {g:e}, want {w:e} (err {err:e})"
+                );
+            }
+            let gi = &got_indices[r * TOP_K..(r + 1) * TOP_K];
+            let gw = &got_weights[r * TOP_K..(r + 1) * TOP_K];
+            let mut gp: Vec<(i32, f32)> = gi.iter().copied().zip(gw.iter().copied()).collect();
+            let mut wp: Vec<(i32, f32)> = ref_idx.iter().copied().zip(ref_w.iter().copied()).collect();
+            gp.sort_by_key(|&(e, _)| e);
+            wp.sort_by_key(|&(e, _)| e);
+            for k in 0..TOP_K {
+                assert_eq!(
+                    gp[k].0, wp[k].0,
+                    "router_tc rows={rows} row={r}: expert mismatch got={gi:?} want={ref_idx:?}"
+                );
+                let werr = (gp[k].1 - wp[k].1).abs();
+                assert!(
+                    werr <= 2e-6,
+                    "router_tc rows={rows} row={r} slot={k}: weight got {} want {} (err {werr:e})",
+                    gp[k].1,
+                    wp[k].1
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fused `attention_gate_quant_mxfp8` + `gemm_mxfp8_quantized` matches unfused
+/// `attention_gate` + `gemm_mxfp8` bit for bit (0 ULP).
+#[test]
+fn attention_gate_quant_mxfp8_parity() -> anyhow::Result<()> {
+    const Q_DIMS: usize = 24 * 128;
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        return Ok(());
+    }
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let elem = Elementwise::load(gpu.context())?;
+    let fp8 = LinearFp8::load(gpu.context())?;
+
+    let wo_bf16 = stream.clone_htod(&pseudo_random_bf16(HIDDEN * Q_DIMS, 950, 0.05, 0.0))?;
+    let wo_mxfp8 = fp8.quantize_mxfp8(stream, &wo_bf16, HIDDEN, Q_DIMS)?;
+
+    for &rows in &[2usize, 33, 130, 512] {
+        let attn = stream.clone_htod(&pseudo_random_bf16(rows * Q_DIMS, 951 + rows as u32, 2.0, 0.0))?;
+        let gate = stream.clone_htod(&pseudo_random_bf16(rows * Q_DIMS, 961 + rows as u32, 3.0, 0.0))?;
+
+        let mut gated = stream.alloc_zeros::<bf16>(rows * Q_DIMS)?;
+        let mut ref_out = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        let mut ref_scratch = Fp8Rows::new(stream, rows * Q_DIMS)?;
+        elem.attention_gate(stream, &attn, &gate, &mut gated)?;
+        fp8.gemm_mxfp8(
+            stream,
+            &mut [Mxfp8Gemm {
+                weight: &wo_mxfp8,
+                x: gated.as_view(),
+                out: ref_out.as_view_mut(),
+            }],
+            rows,
+            &mut ref_scratch,
+        )?;
+
+        let mut got_out = stream.alloc_zeros::<bf16>(rows * HIDDEN)?;
+        let mut got_scratch = Fp8Rows::new(stream, rows * Q_DIMS)?;
+        {
+            let mut slots = got_scratch.split_slots_mut(rows, Q_DIMS, 1)?;
+            let (mut vals, mut scls) = slots.pop().expect("1 slot");
+            elem.attention_gate_quant_mxfp8(stream, &attn, &gate, &mut vals, &mut scls)?;
+        }
+        fp8.gemm_mxfp8_quantized(
+            stream,
+            &mut [Mxfp8GemmQuantized {
+                weight: &wo_mxfp8,
+                x_offset: 0,
+                out: got_out.as_view_mut(),
+            }],
+            rows,
+            &got_scratch,
+        )?;
+
+        assert_eq!(
+            stream.clone_dtoh(got_scratch.values())?,
+            stream.clone_dtoh(ref_scratch.values())?,
+            "attention_gate_quant_mxfp8 rows={rows}: MXFP8 values"
+        );
+        assert_eq!(
+            stream.clone_dtoh(got_scratch.scales())?,
+            stream.clone_dtoh(ref_scratch.scales())?,
+            "attention_gate_quant_mxfp8 rows={rows}: MXFP8 scales"
+        );
+        assert_bf16_close(
+            &format!("attention_gate_quant_mxfp8 rows={rows}: gemm_mxfp8 out"),
+            &stream.clone_dtoh(&got_out)?,
+            &stream.clone_dtoh(&ref_out)?,
+            0,
+        );
+    }
+    Ok(())
+}
+
+/// Fused strided `depth_attention_rows_quant` (`NQ = 4` message halves at col 2304 + `NQ = 3`
+/// state halves at col 0, `dst_stride = 4608`) + `gemm_quantized` matches unfused
+/// `depth_attention_rows` -> BF16 `[rows, 4608]` -> `gemm` bit for bit (0 ULP).
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "end-to-end unfused vs fused strided NQ=4+NQ=3 message-gate parity"
+)]
+fn depth_attention_rows_quant_strided_nq4_parity() -> anyhow::Result<()> {
+    const ROWS: usize = 130;
+    const NB: usize = 2;
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        return Ok(());
+    }
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let routing = Routing::load(gpu.context())?;
+    let fp8 = LinearFp8::load(gpu.context())?;
+
+    let blocks = stream.clone_htod(&pseudo_random(NB * ROWS * HIDDEN, 970, 1.5))?;
+    let bank_normed = stream.clone_htod(&pseudo_random(ROWS * HIDDEN, 971, 1.5))?;
+    let partial_bf16 = stream.clone_htod(&pseudo_random_bf16(ROWS * HIDDEN, 972, 1.5, 0.0))?;
+    let q4 = stream.clone_htod(&pseudo_random(4 * HIDDEN, 973, 0.5))?;
+    let q3 = stream.clone_htod(&pseudo_random(3 * HIDDEN, 974, 0.5))?;
+    let downs_fp8: Vec<Fp8Matrix> = (0..4u32)
+        .map(|g| {
+            let w = stream.clone_htod(&pseudo_random_bf16(
+                GATE_RANK * 2 * HIDDEN,
+                980 + g,
+                0.05,
+                0.0,
+            ))?;
+            fp8.quantize_any(stream, &w, GATE_RANK, 2 * HIDDEN)
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // Reference: unfused BF16 strided writes + LinearFp8::gemm.
+    let mut ref_inputs: [CudaSlice<bf16>; 4] = [
+        stream.alloc_zeros(ROWS * 2 * HIDDEN)?,
+        stream.alloc_zeros(ROWS * 2 * HIDDEN)?,
+        stream.alloc_zeros(ROWS * 2 * HIDDEN)?,
+        stream.alloc_zeros(ROWS * 2 * HIDDEN)?,
+    ];
+    let mut ref_probs = stream.alloc_zeros::<f32>(ROWS * 4 * (NB + 1))?;
+    {
+        let dests = ref_inputs.each_mut().map(|x| {
+            let end = (ROWS - 1) * (2 * HIDDEN) + HIDDEN + HIDDEN;
+            Some(NormDest {
+                out: x.slice_mut(HIDDEN..end),
+                weight: None,
+            })
+        });
+        routing.depth_attention_rows(
+            stream,
+            DepthRows {
+                blocks: blocks.as_view(),
+                partial: RowsPartial::Normalized(bank_normed.as_view()),
+                normed_partial: None,
+                queries: &q4,
+                out: None,
+                probs: Some(ref_probs.as_view_mut()),
+                dests,
+                dst_stride: 2 * HIDDEN,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+    }
+    {
+        let [g0, g1, g2, _] = &mut ref_inputs;
+        let end = (ROWS - 1) * (2 * HIDDEN) + HIDDEN;
+        let [d0, d1, d2] = [g0, g1, g2].map(|g| {
+            Some(NormDest {
+                out: g.slice_mut(..end),
+                weight: None,
+            })
+        });
+        routing.depth_attention_rows(
+            stream,
+            DepthRows {
+                blocks: blocks.as_view(),
+                partial: RowsPartial::Bf16(partial_bf16.as_view()),
+                normed_partial: None,
+                queries: &q3,
+                out: None,
+                probs: None,
+                dests: [d0, d1, d2, None],
+                dst_stride: 2 * HIDDEN,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+    }
+    let mut ref_down = stream.alloc_zeros::<bf16>(3 * ROWS * GATE_RANK)?;
+    let mut ref_dense = Fp8Rows::new(stream, 4 * ROWS * 2 * HIDDEN)?;
+    {
+        let (d0, mut rest) = ref_down.split_at_mut(ROWS * GATE_RANK);
+        let (d1, d2) = rest.split_at_mut(ROWS * GATE_RANK);
+        fp8.gemm(
+            stream,
+            &mut [
+                Fp8Gemm {
+                    weight: &downs_fp8[0],
+                    x: ref_inputs[0].as_view(),
+                    out: d0,
+                },
+                Fp8Gemm {
+                    weight: &downs_fp8[1],
+                    x: ref_inputs[1].as_view(),
+                    out: d1,
+                },
+                Fp8Gemm {
+                    weight: &downs_fp8[2],
+                    x: ref_inputs[2].as_view(),
+                    out: d2,
+                },
+            ],
+            ROWS,
+            &mut ref_dense,
+        )?;
+    }
+
+    // Fused: strided depth_attention_rows_quant directly into Fp8Rows + gemm_quantized.
+    let mut got_dense = Fp8Rows::new(stream, 4 * ROWS * 2 * HIDDEN)?;
+    let mut got_probs = stream.alloc_zeros::<f32>(ROWS * 4 * (NB + 1))?;
+    {
+        let [s0, s1, s2, s3]: [_; 4] = got_dense
+            .split_slots_range_mut(ROWS, 2 * HIDDEN, 0, 4)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected 4 slots"))?;
+        let dests = [s0, s1, s2, s3].map(|(values, scales)| {
+            Some(QuantNormDest {
+                out: None,
+                weight: None,
+                quant: QuantDest {
+                    format: QuantFormat::Mxfp8,
+                    values,
+                    scales,
+                    outer: None,
+                },
+            })
+        });
+        routing.depth_attention_rows_quant(
+            stream,
+            DepthRowsQuant {
+                blocks: blocks.as_view(),
+                partial: RowsPartial::Normalized(bank_normed.as_view()),
+                normed_partial: None,
+                queries: &q4,
+                out: None,
+                probs: Some(got_probs.as_view_mut()),
+                dests,
+                dst_stride: 2 * HIDDEN,
+                quant_col_offset: HIDDEN,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+    }
+    {
+        let [s0, s1, s2]: [_; 3] = got_dense
+            .split_slots_range_mut(ROWS, 2 * HIDDEN, 0, 3)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected 3 slots"))?;
+        let [d0, d1, d2] = [s0, s1, s2].map(|(values, scales)| {
+            Some(QuantNormDest {
+                out: None,
+                weight: None,
+                quant: QuantDest {
+                    format: QuantFormat::Mxfp8,
+                    values,
+                    scales,
+                    outer: None,
+                },
+            })
+        });
+        routing.depth_attention_rows_quant(
+            stream,
+            DepthRowsQuant {
+                blocks: blocks.as_view(),
+                partial: RowsPartial::Bf16(partial_bf16.as_view()),
+                normed_partial: None,
+                queries: &q3,
+                out: None,
+                probs: None,
+                dests: [d0, d1, d2, None],
+                dst_stride: 2 * HIDDEN,
+                quant_col_offset: 0,
+                rows: ROWS,
+            },
+            EPS,
+        )?;
+    }
+    let mut got_down = stream.alloc_zeros::<bf16>(3 * ROWS * GATE_RANK)?;
+    {
+        let (d0, mut rest) = got_down.split_at_mut(ROWS * GATE_RANK);
+        let (d1, d2) = rest.split_at_mut(ROWS * GATE_RANK);
+        let slot_vals = ROWS * 2 * HIDDEN;
+        fp8.gemm_quantized(
+            stream,
+            &mut [
+                Fp8GemmQuantized {
+                    weight: &downs_fp8[0],
+                    x_offset: 0,
+                    out: d0,
+                },
+                Fp8GemmQuantized {
+                    weight: &downs_fp8[1],
+                    x_offset: slot_vals,
+                    out: d1,
+                },
+                Fp8GemmQuantized {
+                    weight: &downs_fp8[2],
+                    x_offset: 2 * slot_vals,
+                    out: d2,
+                },
+            ],
+            ROWS,
+            &got_dense,
+        )?;
+    }
+
+    assert_f32_within_ulps(
+        "depth_attention_rows_quant strided nq4 probs",
+        &stream.clone_dtoh(&got_probs)?,
+        &stream.clone_dtoh(&ref_probs)?,
+        0,
+    );
+    assert_eq!(
+        &stream.clone_dtoh(got_dense.values())?[..3 * ROWS * 2 * HIDDEN],
+        &stream.clone_dtoh(ref_dense.values())?[..3 * ROWS * 2 * HIDDEN],
+        "depth_attention_rows_quant strided nq4 values"
+    );
+    assert_eq!(
+        &stream.clone_dtoh(got_dense.scales())?[..3 * ROWS * 2 * HIDDEN / 32],
+        &stream.clone_dtoh(ref_dense.scales())?[..3 * ROWS * 2 * HIDDEN / 32],
+        "depth_attention_rows_quant strided nq4 scales"
+    );
+    assert_bf16_close(
+        "depth_attention_rows_quant strided nq4 down",
+        &stream.clone_dtoh(&got_down)?,
+        &stream.clone_dtoh(&ref_down)?,
+        0,
+    );
     Ok(())
 }

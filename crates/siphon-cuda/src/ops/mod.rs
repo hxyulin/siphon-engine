@@ -104,6 +104,43 @@ impl QuantDest<'_> {
         }
         Ok(())
     }
+
+    pub(crate) fn check_strided(
+        &self,
+        rows: usize,
+        k: usize,
+        dst_stride: usize,
+        col_offset: usize,
+    ) -> anyhow::Result<()> {
+        if dst_stride == k && col_offset == 0 {
+            return self.check(rows, k);
+        }
+        ensure!(
+            matches!(self.format, QuantFormat::Mxfp8 | QuantFormat::Mxfp8Paired),
+            "strided quantized destinations ({dst_stride}, offset {col_offset}) are only supported for MXFP8"
+        );
+        ensure!(
+            dst_stride >= k && dst_stride.is_multiple_of(32),
+            "quantized dst_stride {dst_stride} must be >= {k} and a multiple of 32"
+        );
+        ensure!(
+            col_offset + k <= dst_stride && col_offset.is_multiple_of(32),
+            "quantized col_offset {col_offset} + {k} must be <= {dst_stride} and a multiple of 32"
+        );
+        let need_vals = (rows - 1) * dst_stride + col_offset + k;
+        let need_scales = (rows - 1) * (dst_stride / 32) + (col_offset + k) / 32;
+        ensure!(
+            self.values.len() >= need_vals,
+            "strided quantized values has {} bytes, need at least {need_vals}",
+            self.values.len()
+        );
+        ensure!(
+            self.scales.len() >= need_scales,
+            "strided quantized scales has {} bytes, need at least {need_scales}",
+            self.scales.len()
+        );
+        Ok(())
+    }
 }
 
 /// How prefill multiplies its attention and dense products: in BF16 (F16 for attention's

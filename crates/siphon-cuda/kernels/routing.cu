@@ -999,24 +999,267 @@ moe_router_logits_rows_2304(const __nv_bfloat16* x, const float* __restrict__ ro
     }
 }
 
+namespace {
+
+__device__ __forceinline__ uint32_t router_smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void router_cp16_z(void* dst, const void* src, int src_bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :
+                 : "r"(router_smem_addr(dst)), "l"(src), "r"(src_bytes)
+                 : "memory");
+}
+
+__device__ __forceinline__ void router_ldmatrix_x4(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(router_smem_addr(p)));
+}
+
+__device__ __forceinline__ void mma_bf16_16816(float (&c)[4], const uint32_t (&a)[4],
+                                               uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Splits 4 F32 weights into 2 packed BF16 pairs (hi = bf16_rn(w), lo = bf16_rn(w - hi)).
+__device__ __forceinline__ void split_f32x4_bf16x2(float4 v, uint32_t& hi0, uint32_t& hi1,
+                                                   uint32_t& lo0, uint32_t& lo1) {
+    const __nv_bfloat162 h0 = __floats2bfloat162_rn(v.x, v.y);
+    const __nv_bfloat162 h1 = __floats2bfloat162_rn(v.z, v.w);
+    const float2 hf0 = __bfloat1622float2(h0);
+    const float2 hf1 = __bfloat1622float2(h1);
+    const __nv_bfloat162 l0 = __floats2bfloat162_rn(v.x - hf0.x, v.y - hf0.y);
+    const __nv_bfloat162 l1 = __floats2bfloat162_rn(v.z - hf1.x, v.w - hf1.y);
+    hi0 = *reinterpret_cast<const uint32_t*>(&h0);
+    hi1 = *reinterpret_cast<const uint32_t*>(&h1);
+    lo0 = *reinterpret_cast<const uint32_t*>(&l0);
+    lo1 = *reinterpret_cast<const uint32_t*>(&l1);
+}
+
+__device__ __forceinline__ uint32_t float_to_ordered(float f) {
+    const float norm = (f == 0.f) ? 0.f : f;
+    const uint32_t u = __float_as_uint(norm);
+    const uint32_t mask = (u & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    return u ^ mask;
+}
+
+// Sorts 32 (key, val) pairs across a warp in descending key order (15 shuffles).
+__device__ __forceinline__ void warp_bitonic_sort_desc(uint64_t& key, float& val) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1) {
+        const bool dir = (lane & k) == 0;
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const uint64_t o_key = __shfl_xor_sync(0xffffffffu, key, j);
+            const float o_val = __shfl_xor_sync(0xffffffffu, val, j);
+            const bool want_max = ((lane & j) == 0) == dir;
+            if (want_max ? (o_key > key) : (o_key < key)) {
+                key = o_key;
+                val = o_val;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+// Tensor-core router logits: partials[s, row, e] = sum over k in slice s of
+// F32(x[row, k]) * router[e, k] using 2-term BF16 MMA (w = w_hi + w_lo split once during
+// SMEM staging -> 16-bit mantissa precision, < 1e-5 vs F32, 0 inner-loop conversions,
+// 4x tensor-core throughput of TF32). `slice` must be a multiple of 32. Grid:
+// (ceil(rows / 64), 2304 / slice), 256 threads (4 M-warps x 2 N-warps).
+extern "C" __global__ void __launch_bounds__(256)
+moe_router_logits_tc_rows_2304(const __nv_bfloat16* x, const float* __restrict__ router,
+                               float* partials, int rows, int slice) {
+    constexpr int kBm = 64;
+    constexpr int kBk = 32;
+    // Swizzled 16-byte chunks: chunk `c ^ ((row >> 1) & 3)` gives 0-conflict ldmatrix.x4.
+    // Total SMEM: 2 * (64 + 128 + 128) * 64 = 40,960 bytes (fits 2 blocks/SM).
+    __shared__ __align__(16) uint4 xs[2][kBm][4];
+    __shared__ __align__(16) uint4 ws_hi[2][kExperts][4];
+    __shared__ __align__(16) uint4 ws_lo[2][kExperts][4];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int warp_m = warp >> 1;
+    const int warp_n = warp & 1;
+    const int m_base = warp_m * 16;
+    const int n_base = warp_n * 64;
+
+    const int r0 = int(blockIdx.x) * kBm;
+    const int k0 = int(blockIdx.y) * slice;
+    const int tiles = slice / kBk;
+
+    // Loader roles:
+    // - x: 256 threads = 64 rows x 4 chunks of 8 BF16 (1 cp.async.16 per thread).
+    // - router: 256 threads = 64 expert pairs (e, e + 64) x 4 chunks of 8 F32 (4 float4/thread).
+    const int xr = tid >> 2;
+    const int xc = tid & 3;
+    const int xc_swz = xc ^ ((xr >> 1) & 3);
+    const bool x_valid = r0 + xr < rows;
+    const int x_bytes = x_valid ? 16 : 0;
+    const __nv_bfloat16* x_row = x + size_t(x_valid ? r0 + xr : 0) * kHidden;
+
+    const int we = tid >> 2;
+    const int wc = tid & 3;
+    const int wc_swz = wc ^ ((we >> 1) & 3);
+    const float* w_ptr0 = router + size_t(we) * kHidden + wc * 8;
+    const float* w_ptr1 = router + size_t(we + 64) * kHidden + wc * 8;
+
+    auto load_w = [&](int k_off, float4& a0, float4& a1, float4& b0, float4& b1) {
+        a0 = *reinterpret_cast<const float4*>(w_ptr0 + k_off);
+        a1 = *reinterpret_cast<const float4*>(w_ptr0 + k_off + 4);
+        b0 = *reinterpret_cast<const float4*>(w_ptr1 + k_off);
+        b1 = *reinterpret_cast<const float4*>(w_ptr1 + k_off + 4);
+    };
+    auto store_w = [&](int buf, float4 a0, float4 a1, float4 b0, float4 b1) {
+        uint4 h0, l0, h1, l1;
+        split_f32x4_bf16x2(a0, h0.x, h0.y, l0.x, l0.y);
+        split_f32x4_bf16x2(a1, h0.z, h0.w, l0.z, l0.w);
+        split_f32x4_bf16x2(b0, h1.x, h1.y, l1.x, l1.y);
+        split_f32x4_bf16x2(b1, h1.z, h1.w, l1.z, l1.w);
+        ws_hi[buf][we][wc_swz] = h0;
+        ws_lo[buf][we][wc_swz] = l0;
+        ws_hi[buf][we + 64][wc_swz] = h1;
+        ws_lo[buf][we + 64][wc_swz] = l1;
+    };
+
+    // Issue read-only router stage 0 loads before pdl_wait(); x loads start after wait.
+    float4 wa0, wa1, wb0, wb1;
+    load_w(k0, wa0, wa1, wb0, wb1);
+    if (rows > 0) {
+        pdl_wait();
+    }
+    router_cp16_z(&xs[0][xr][xc_swz], x_row + k0 + xc * 8, x_bytes);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    store_w(0, wa0, wa1, wb0, wb1);
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+
+    float acc[8][4] = {};
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int buf = tile & 1;
+        if (tile + 1 < tiles) {
+            const int next_k = k0 + (tile + 1) * kBk;
+            router_cp16_z(&xs[buf ^ 1][xr][xc_swz], x_row + next_k + xc * 8, x_bytes);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            load_w(next_k, wa0, wa1, wb0, wb1);
+        }
+
+#pragma unroll
+        for (int kh = 0; kh < 2; ++kh) {
+            uint32_t a[4];
+            const int ar = m_base + (lane & 15);
+            const int ac = (2 * kh + (lane >> 4)) ^ ((ar >> 1) & 3);
+            router_ldmatrix_x4(a, &xs[buf][ar][ac]);
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const int nr = n_base + pair * 16 + ((lane >> 4) * 8) + (lane & 7);
+                const int nc = (2 * kh + ((lane >> 3) & 1)) ^ ((nr >> 1) & 3);
+                uint32_t bh[4];
+                uint32_t bl[4];
+                router_ldmatrix_x4(bh, &ws_hi[buf][nr][nc]);
+                router_ldmatrix_x4(bl, &ws_lo[buf][nr][nc]);
+                mma_bf16_16816(acc[2 * pair], a, bh[0], bh[1]);
+                mma_bf16_16816(acc[2 * pair], a, bl[0], bl[1]);
+                mma_bf16_16816(acc[2 * pair + 1], a, bh[2], bh[3]);
+                mma_bf16_16816(acc[2 * pair + 1], a, bl[2], bl[3]);
+            }
+        }
+
+        if (tile + 1 < tiles) {
+            store_w(buf ^ 1, wa0, wa1, wb0, wb1);
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+        }
+    }
+
+    // Trigger successor right before writing partials so route_rows overlaps bias loads with stores.
+    pdl_trigger();
+
+    float* out = partials + size_t(blockIdx.y) * rows * kExperts;
+    const int row0 = r0 + m_base + g;
+    const int row1 = r0 + m_base + g + 8;
+    if (row0 < rows) {
+        float* o0 = out + size_t(row0) * kExperts + n_base + 2 * t;
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            *reinterpret_cast<float2*>(o0 + ni * 8) = make_float2(acc[ni][0], acc[ni][1]);
+        }
+    }
+    if (row1 < rows) {
+        float* o1 = out + size_t(row1) * kExperts + n_base + 2 * t;
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            *reinterpret_cast<float2*>(o1 + ni * 8) = make_float2(acc[ni][2], acc[ni][3]);
+        }
+    }
+}
+
 // For each row (blockIdx.x), logits[row, e] = the sum of the `splits` partials in order,
-// then moe_router_2304's top-8 routing into indices and weights ([rows, 8]). 128 threads.
+// then exact top-8 routing via 2-level warp bitonic sort (1 __syncthreads(), no __ldcg
+// round-trip) into indices and weights ([rows, 8]). 128 threads (4 warps).
 extern "C" __global__ void __launch_bounds__(kExperts)
 moe_router_route_rows_2304(const float* partials, int splits, const float* __restrict__ bias,
                            float* logits, int32_t* indices, float* weights, int rows, float route_scale,
                            int max_k, int min_k, float prune_threshold) {
+    __shared__ uint64_t top_key[32];
+    __shared__ float top_val[32];
     const size_t row = blockIdx.x;
     const int e = threadIdx.x;
+    const int warp = e >> 5;
+    const int lane = e & 31;
+
+    // Load read-only bias before pdl_wait().
+    const float b = bias[e];
     pdl_trigger();
-    pdl_wait();
+    if (rows > 0) {
+        pdl_wait();
+    }
     float total = 0.f;
     for (int s = 0; s < splits; ++s) {
         total += partials[(size_t(s) * rows + row) * kExperts + e];
     }
     logits[row * kExperts + e] = total;
-    // route_top8 reads each logit back in the thread that wrote it.
-    route_top8(logits + row * kExperts, bias, indices + row * kTopK, weights + row * kTopK, route_scale,
-               max_k, min_k, prune_threshold);
+
+    // Metal's form of the sigmoid: exp of |x| cannot overflow to inf/inf.
+    const float y = 1.f / (1.f + expf(fabsf(total)));
+    const float sc = total < 0.f ? y : 1.f - y;
+    const float bs = sc + b;
+    uint64_t key = (uint64_t(float_to_ordered(bs)) << 32) | uint32_t(kExperts - 1 - e);
+    float val = sc;
+    warp_bitonic_sort_desc(key, val);
+    if (lane < kTopK) {
+        top_key[warp * kTopK + lane] = key;
+        top_val[warp * kTopK + lane] = val;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        key = top_key[lane];
+        val = top_val[lane];
+        warp_bitonic_sort_desc(key, val);
+        float top[kTopK];
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            top[k] = __shfl_sync(0xffffffffu, val, k);
+        }
+        if (lane < kTopK) {
+            int32_t* row_idx = indices + row * kTopK;
+            row_idx[lane] = (kExperts - 1) - int(key & 0xffffffffu);
+            finalize_top8(top, row_idx, weights + row * kTopK, lane, route_scale, max_k, min_k,
+                          prune_threshold);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1944,8 +2187,9 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
                      const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3,
                      float eps, float scale, int batch_count, int probs_batch, int dst_batch,
                      uint8_t* q_val0 = nullptr, uint8_t* q_val1 = nullptr, uint8_t* q_val2 = nullptr,
-                     uint8_t* q_scl0 = nullptr, uint8_t* q_scl1 = nullptr, uint8_t* q_scl2 = nullptr,
-                     float* q_out0 = nullptr, float* q_out1 = nullptr, float* q_out2 = nullptr,
+                     uint8_t* q_val3 = nullptr, uint8_t* q_scl0 = nullptr, uint8_t* q_scl1 = nullptr,
+                     uint8_t* q_scl2 = nullptr, uint8_t* q_scl3 = nullptr, float* q_out0 = nullptr,
+                     float* q_out1 = nullptr, float* q_out2 = nullptr, float* q_out3 = nullptr,
                      int q_mode = 0) {
     constexpr int kCandidates = NB + 1;
     // Per-query slot width in warp reduction: NB + 1 candidates + 1 squares slot (query 0).
@@ -1983,9 +2227,9 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
         dst0 != nullptr ? dst0 + batch * dst_batch : nullptr, dst1 != nullptr ? dst1 + batch * dst_batch : nullptr,
         dst2 != nullptr ? dst2 + batch * dst_batch : nullptr, dst3 != nullptr ? dst3 + batch * dst_batch : nullptr};
     const __nv_bfloat16* const weight[kDests] = {weight0, weight1, weight2, weight3};
-    uint8_t* const q_val[kDests] = {q_val0, q_val1, q_val2, nullptr};
-    uint8_t* const q_scl[kDests] = {q_scl0, q_scl1, q_scl2, nullptr};
-    float* const q_out[kDests] = {q_out0, q_out1, q_out2, nullptr};
+    uint8_t* const q_val[kDests] = {q_val0, q_val1, q_val2, q_val3};
+    uint8_t* const q_scl[kDests] = {q_scl0, q_scl1, q_scl2, q_scl3};
+    float* const q_out[kDests] = {q_out0, q_out1, q_out2, q_out3};
     unsigned normed_rows = 0;
 #pragma unroll
     for (int k = 0; k < kDests; ++k) {
@@ -2228,8 +2472,8 @@ depth_attention_rows(const float* blocks, int block_stride, const float* partial
                     if (q_mode == quant_epilogue::kQuantMxfp8 ||
                         q_mode == quant_epilogue::kQuantMxfp8Paired) {
                         const bool paired = q_mode == quant_epilogue::kQuantMxfp8Paired;
-                        uint8_t* qv = q_val[k] + size_t(row) * kHidden;
-                        uint8_t* qs = q_scl[k] + size_t(row) * (kHidden / 32);
+                        uint8_t* qv = q_val[k] + size_t(row) * dst_stride;
+                        uint8_t* qs = q_scl[k] + size_t(row) * (dst_stride / 32);
                         quant_epilogue::quantize_vec4_mxfp8(qa, t / 8, lane % 8, paired, qv, qs);
                     } else if (q_mode == quant_epilogue::kQuantNvfp4) {
                         float local_max = 0.f;
@@ -2312,8 +2556,9 @@ DEPTH_ATTENTION_ROWS_Q(3)
 DEPTH_ATTENTION_ROWS_Q(4)
 
 // depth_attention_rows_quant_2304_<NB>_<NQ>: depth_attention_rows with fused MXFP8 / NVFP4
-// quantization in the RMSNorm epilogue for up to 3 destinations (NQ = 1 or 3), writing
-// quantized activations directly from registers and BF16 only when dst_k is non-null.
+// quantization in the RMSNorm epilogue for up to 4 destinations (NQ = 1, 3 or 4), writing
+// quantized activations directly from registers (at row stride `dst_stride` for MXFP8) and
+// BF16 only when dst_k is non-null.
 #define DEPTH_ATTENTION_ROWS_QUANT(NB, NQ)                                                                      \
     extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) depth_attention_rows_quant_2304_##NB##_##NQ( \
         const float* blocks, int block_stride, const float* partial_f32,                                       \
@@ -2325,13 +2570,14 @@ DEPTH_ATTENTION_ROWS_Q(4)
         const __nv_bfloat16* __restrict__ weight0, const __nv_bfloat16* __restrict__ weight1,                  \
         const __nv_bfloat16* __restrict__ weight2, const __nv_bfloat16* __restrict__ weight3, float eps,       \
         float scale, int batch_count, int probs_batch, int dst_batch, uint8_t* q_val0, uint8_t* q_val1,        \
-        uint8_t* q_val2, uint8_t* q_scl0, uint8_t* q_scl1, uint8_t* q_scl2, float* q_out0, float* q_out1,      \
-        float* q_out2, int q_mode) {                                                                            \
+        uint8_t* q_val2, uint8_t* q_val3, uint8_t* q_scl0, uint8_t* q_scl1, uint8_t* q_scl2, uint8_t* q_scl3,  \
+        float* q_out0, float* q_out1, float* q_out2, float* q_out3, int q_mode) {                              \
         depth_attention_rows<NB, NQ, true>(                                                                     \
             blocks, block_stride, partial_f32, partial_bf16, mode, conv_weight, conv_state, conv_hidden,        \
             residual, conv_states, rows_per_seq, normed_partial, queries, out, probs, dst0, dst1, dst2, dst3,   \
             dst_stride, weight0, weight1, weight2, weight3, eps, scale, batch_count, probs_batch, dst_batch,    \
-            q_val0, q_val1, q_val2, q_scl0, q_scl1, q_scl2, q_out0, q_out1, q_out2, q_mode);                    \
+            q_val0, q_val1, q_val2, q_val3, q_scl0, q_scl1, q_scl2, q_scl3, q_out0, q_out1, q_out2, q_out3,    \
+            q_mode);                                                                                            \
     }
 
 #define DEPTH_ATTENTION_ROWS_QUANT_Q(NQ) \
@@ -2343,3 +2589,4 @@ DEPTH_ATTENTION_ROWS_Q(4)
 
 DEPTH_ATTENTION_ROWS_QUANT_Q(1)
 DEPTH_ATTENTION_ROWS_QUANT_Q(3)
+DEPTH_ATTENTION_ROWS_QUANT_Q(4)

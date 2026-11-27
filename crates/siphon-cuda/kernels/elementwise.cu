@@ -21,6 +21,7 @@
 
 #include "mlx_ops.cuh"
 #include "pdl.cuh"
+#include "quant_epilogue.cuh"
 
 namespace {
 
@@ -93,6 +94,36 @@ extern "C" __global__ void attention_gate_bf16(const __nv_bfloat16* attn,
         }
         reinterpret_cast<uint4*>(out)[v] = o;
     }
+}
+
+// Fused `attention_gate_bf16` + `quantize_rows_mxfp8_dense`: computes
+// `y = bf16(f32(attn) * sigmoid(f32(gate)))` and immediately quantizes each 32-element
+// block directly from registers to MXFP8 (`values` E4M3, `scales` UE8M0) without writing
+// the BF16 intermediate. Matches `attention_gate_bf16` + `quantize_rows_mxfp8_dense`
+// bit for bit. `total_blocks32 = (rows * width) / 32`; 32 sub-warps of 8 lanes per
+// 256-thread block, each lane handling 4 consecutive elements.
+extern "C" __global__ void __launch_bounds__(256)
+attention_gate_quant_mxfp8(const __nv_bfloat16* attn, const __nv_bfloat16* gate,
+                           uint8_t* values, uint8_t* scales, int total_blocks32) {
+    pdl_trigger();
+    pdl_wait();
+    const int sub8 = threadIdx.x & 7;
+    const int block32 = int(blockIdx.x) * 32 + (threadIdx.x >> 3);
+    if (block32 >= total_blocks32) {
+        return;
+    }
+    const size_t base = size_t(block32) * 32 + size_t(sub8) * 4;
+    const uint2 a = *reinterpret_cast<const uint2*>(attn + base);
+    const uint2 g = *reinterpret_cast<const uint2*>(gate + base);
+    const auto* av = reinterpret_cast<const __nv_bfloat16*>(&a);
+    const auto* gv = reinterpret_cast<const __nv_bfloat16*>(&g);
+    float x[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat16 y = to_bf16(fmul(__bfloat162float(av[i]), mlx_sigmoid(__bfloat162float(gv[i]))));
+        x[i] = __bfloat162float(y);
+    }
+    quant_epilogue::quantize_vec4_mxfp8(x, block32, sub8, false, values, scales);
 }
 
 // In-place x = bf16(f32(x) * tau) for rows at positions *start, *start + 1, ..., with

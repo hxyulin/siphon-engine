@@ -35,6 +35,7 @@ pub struct Elementwise {
     embedding_bf16_2304: CudaFunction,
     softcapped_swiglu_bf16: CudaFunction,
     attention_gate_bf16: CudaFunction,
+    attention_gate_quant_mxfp8: CudaFunction,
     log_scale_bf16: CudaFunction,
     add_bf16_bf16_f32: CudaFunction,
     add_f32_bf16_bf16: CudaFunction,
@@ -68,6 +69,7 @@ impl Elementwise {
             embedding_bf16_2304: module.load_function("embedding_bf16_2304")?,
             softcapped_swiglu_bf16: module.load_function("softcapped_swiglu_bf16")?,
             attention_gate_bf16: module.load_function("attention_gate_bf16")?,
+            attention_gate_quant_mxfp8: module.load_function("attention_gate_quant_mxfp8")?,
             log_scale_bf16: module.load_function("log_scale_bf16")?,
             add_bf16_bf16_f32: module.load_function("add_bf16_bf16_f32")?,
             add_f32_bf16_bf16: module.load_function("add_f32_bf16_bf16")?,
@@ -170,6 +172,53 @@ impl Elementwise {
         // 3072), cudarc allocations are 256-byte aligned and rows keep 16-byte alignment, and
         // the kernel reads nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.attention_gate_bf16, grid_stride(n / 8)) }
+    }
+
+    /// Fused [`Self::attention_gate`] + MXFP8 block-32 quantization directly into
+    /// `(values, scales)` (`[rows, 3072]` E4M3 and `[rows, 96]` UE8M0), skipping the BF16
+    /// intermediate and standalone `quantize_rows_mxfp8_dense`. Bit-for-bit identical.
+    pub fn attention_gate_quant_mxfp8(
+        &self,
+        stream: &CudaStream,
+        attn: &impl DeviceIn<bf16>,
+        gate: &impl DeviceIn<bf16>,
+        values: &mut impl DeviceOut<u8>,
+        scales: &mut impl DeviceOut<u8>,
+    ) -> anyhow::Result<()> {
+        let (attn, gate) = (attn.view(), gate.view());
+        let (mut values, mut scales) = (values.view_mut(), scales.view_mut());
+        ensure_rows("attn", attn.len(), ATTENTION_WIDTH)?;
+        let n = attn.len();
+        ensure!(
+            gate.len() == n,
+            "attn and gate have {n} and {} elements",
+            gate.len()
+        );
+        ensure!(
+            values.len() == n && scales.len() == n / 32,
+            "values/scales have {}/{} bytes, expected {n}/{}",
+            values.len(),
+            scales.len(),
+            n / 32
+        );
+        let total_blocks32 = n / 32;
+        let blocks = total_blocks32.div_ceil(32);
+        let mut args = KernelArgs::default();
+        args.ptr(&attn, stream)
+            .ptr(&gate, stream)
+            .ptr_mut(&mut values, stream)
+            .ptr_mut(&mut scales, stream)
+            .i32(i32::try_from(total_blocks32).context("too many blocks")?);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(blocks).context("too many blocks")?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `attention_gate_quant_mxfp8(const bf16*, const bf16*,
+        // u8*, u8*, int)`, `attn` and `gate` hold `total_blocks32 * 32` elements (8-byte
+        // aligned for every 4-element lane load), `values` holds `n` bytes and `scales`
+        // `n / 32` bytes, and the kernel reads nothing before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.attention_gate_quant_mxfp8, config) }
     }
 
     /// Multiplies each `row_width`-element row of `x` in place by the log-scaling factor

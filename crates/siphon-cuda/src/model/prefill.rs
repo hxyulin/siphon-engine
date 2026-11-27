@@ -33,7 +33,7 @@ use crate::{
         conv::{MOE_CONV_ROWS, MOE_PACKED_MAX_TILES, VisitConvs},
         experts::{self, ExpertActivations, ExpertScratch, QuantizedRows},
         linear::Start,
-        linear_fp8::{self, Fp8GemmQuantized, Fp8Matrix, Fp8Rows},
+        linear_fp8::{self, Fp8GemmQuantized, Fp8Matrix, Fp8Rows, Mxfp8GemmQuantized},
         linear_rows::{self, RowsProduct, RowsWeight},
         misc::{GATE_SLOTS, GateNormQuant, GateRowsSlot, MessageMix},
         norm::{AttentionPostRows, AttentionPostRowsPacked, KvConvWeights},
@@ -680,10 +680,11 @@ impl PrefillScratch {
 }
 
 /// The first `rows` rows of `width` elements.
-/// Values of [`GateRows::dense`] for `rows` rows: three inputs of `2 * hidden`, the most
-/// one FP8 dense call takes (three message gates).
+/// Values of [`GateRows::dense`] for `rows` rows: four inputs of `2 * hidden` (slots 0..3
+/// for the attention message gates and slot 3 for the MLP message gate, kept live across
+/// attention's QKV and `W_o` uses of the leading slots).
 pub(crate) fn dense_values(rows: usize, hidden: usize) -> usize {
-    rows * 3 * 2 * hidden
+    rows * 4 * 2 * hidden
 }
 
 fn rows<T>(x: &CudaSlice<T>, rows: usize, width: usize) -> CudaView<'_, T> {
@@ -2259,33 +2260,7 @@ impl Ctx {
             }
             for (i, layer) in (core_start..core_end).enumerate() {
                 if pass > 0 && p.message_x.is_none() {
-                    // The messages' weights, and their normalized halves of the gate inputs.
-                    let bank_rows = p.bank_rows;
-                    let dests = p.gate.inputs.each_mut().map(|x| {
-                        Some(NormDest {
-                            out: strided_mut(x, m, 2 * hidden, hidden, hidden),
-                            weight: None,
-                        })
-                    });
-                    self.kernels.routing.depth_attention_rows(
-                        &self.stream,
-                        DepthRows {
-                            blocks: p.bank.slice(..bank_rows * mh),
-                            partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
-                            normed_partial: None,
-                            queries: &self.weights.message_queries[i],
-                            out: None,
-                            probs: Some(rows_mut(
-                                &mut p.message_probs,
-                                m,
-                                MESSAGE_SLOTS * (bank_rows + 1),
-                            )),
-                            dests,
-                            dst_stride: 2 * hidden,
-                            rows: m,
-                        },
-                        self.eps(),
-                    )?;
+                    self.message_bank_inputs_rows(p, i, m)?;
                 }
                 self.visit_rows(p, next_visit()?, layer, &mut blocks, pass > 0, m)?;
             }
@@ -3109,8 +3084,10 @@ impl Ctx {
                         }),
                         None,
                         None,
+                        None,
                     ],
                     dst_stride: hidden,
+                    quant_col_offset: 0,
                     rows: m,
                 },
                 self.eps(),
@@ -3118,6 +3095,42 @@ impl Ctx {
             p.moe
                 .quantized
                 .mark_quantized(&self.stream, m, hidden, qfmt);
+        } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
+            let mut slots = p
+                .gate
+                .dense
+                .split_slots_range_mut(m, 2 * hidden, 3, 1)?;
+            let (values, scales) = slots.pop().context("missing mlp gate dense slot")?;
+            self.kernels.routing.depth_attention_rows_quant(
+                &self.stream,
+                DepthRowsQuant {
+                    blocks: blocks.rows(&p.blocks, mh)?,
+                    partial,
+                    normed_partial: None,
+                    queries: &w.mlp_query,
+                    out: Some(rows_mut(&mut p.mlp_input, m, hidden)),
+                    probs: None,
+                    dests: [
+                        None,
+                        None,
+                        None,
+                        Some(QuantNormDest {
+                            out: None,
+                            weight: None,
+                            quant: QuantDest {
+                                format: QuantFormat::Mxfp8,
+                                values,
+                                scales,
+                                outer: None,
+                            },
+                        }),
+                    ],
+                    dst_stride: 2 * hidden,
+                    quant_col_offset: 0,
+                    rows: m,
+                },
+                self.eps(),
+            )?;
         } else {
             let (mlp_out, dests) = match gates {
                 Some(_) => (
@@ -3336,6 +3349,184 @@ impl Ctx {
         Ok(())
     }
 
+    /// Whether non-invariant FP8 prefill can fuse MXFP8 quantization of both halves of all 4
+    /// message-gate inputs directly into `depth_attention_rows_quant` -> `GateRows::dense`.
+    fn prequant_message_gates(&self, invariant: bool, m: usize) -> bool {
+        let loops = self.config.loop_config;
+        !invariant
+            && self.prefill_dense == Products::Fp8
+            && crate::BLOCK_SCALED_MMA
+            && m > 1
+            && self.weights.layers[loops.core_start..loops.core_end]
+                .iter()
+                .all(|l| {
+                    l.message_gates
+                        .as_ref()
+                        .is_some_and(|g| g.iter().all(|mg| mg.fp8.is_some()))
+                })
+    }
+
+    /// Computes a looped layer's 4 message weights and normalized message halves (offset
+    /// `hidden` of each `2 * hidden` row), fusing MXFP8 quantization directly into
+    /// `p.gate.dense` slots `0..4` when `prequant_message_gates` is active.
+    fn message_bank_inputs_rows(
+        &self,
+        p: &mut PrefillScratch,
+        layer_idx: usize,
+        m: usize,
+    ) -> anyhow::Result<()> {
+        let hidden = self.hidden();
+        let mh = m * hidden;
+        let bank_rows = p.bank_rows;
+        if self.prequant_message_gates(p.gate.invariant, m) {
+            let [s0, s1, s2, s3]: [_; 4] = p
+                .gate
+                .dense
+                .split_slots_range_mut(m, 2 * hidden, 0, MESSAGE_SLOTS)?
+                .try_into()
+                .ok()
+                .context("expected 4 message gate dense slots")?;
+            let dests = [s0, s1, s2, s3].map(|(values, scales)| {
+                Some(QuantNormDest {
+                    out: None,
+                    weight: None,
+                    quant: QuantDest {
+                        format: QuantFormat::Mxfp8,
+                        values,
+                        scales,
+                        outer: None,
+                    },
+                })
+            });
+            return self.kernels.routing.depth_attention_rows_quant(
+                &self.stream,
+                DepthRowsQuant {
+                    blocks: p.bank.slice(..bank_rows * mh),
+                    partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
+                    normed_partial: None,
+                    queries: &self.weights.message_queries[layer_idx],
+                    out: None,
+                    probs: Some(rows_mut(
+                        &mut p.message_probs,
+                        m,
+                        MESSAGE_SLOTS * (bank_rows + 1),
+                    )),
+                    dests,
+                    dst_stride: 2 * hidden,
+                    quant_col_offset: hidden,
+                    rows: m,
+                },
+                self.eps(),
+            );
+        }
+        let dests = p.gate.inputs.each_mut().map(|x| {
+            Some(NormDest {
+                out: strided_mut(x, m, 2 * hidden, hidden, hidden),
+                weight: None,
+            })
+        });
+        self.kernels.routing.depth_attention_rows(
+            &self.stream,
+            DepthRows {
+                blocks: p.bank.slice(..bank_rows * mh),
+                partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
+                normed_partial: None,
+                queries: &self.weights.message_queries[layer_idx],
+                out: None,
+                probs: Some(rows_mut(
+                    &mut p.message_probs,
+                    m,
+                    MESSAGE_SLOTS * (bank_rows + 1),
+                )),
+                dests,
+                dst_stride: 2 * hidden,
+                rows: m,
+            },
+            self.eps(),
+        )
+    }
+
+    /// Runs `attention_gate` + `W_o` output projection for non-invariant prefill, fusing
+    /// `attention_gate_quant_mxfp8` directly into `dense` slot 0 when `W_o` uses FP8/MXFP8
+    /// tensor cores.
+    fn attention_gate_and_output_rows(
+        &self,
+        w: &LayerWeights,
+        t: &mut AttentionRows,
+        dense: &mut Fp8Rows,
+        m: usize,
+    ) -> anyhow::Result<()> {
+        let q_dims = self.config.num_attention_heads * self.config.head_dim;
+        let hidden = self.hidden();
+        let use_fp8_o =
+            self.prefill_dense == Products::Fp8 && crate::BLOCK_SCALED_MMA && m > 1;
+        if use_fp8_o
+            && self.prefill_dense_o == Products::Fp8
+            && let Some(mxfp8_o) = w.mxfp8_o.as_ref()
+        {
+            let mut slots = dense.split_slots_mut(m, q_dims, 1)?;
+            let (mut values, mut scales) = slots.pop().context("missing dense slot")?;
+            self.kernels.elementwise.attention_gate_quant_mxfp8(
+                &self.stream,
+                &rows(&t.out, m, q_dims),
+                &rows(&t.gate, m, q_dims),
+                &mut values,
+                &mut scales,
+            )?;
+            return self.kernels.linear_fp8.gemm_mxfp8_quantized(
+                &self.stream,
+                &mut [Mxfp8GemmQuantized {
+                    weight: mxfp8_o,
+                    x_offset: 0,
+                    out: rows_mut(&mut t.proj, m, hidden),
+                }],
+                m,
+                dense,
+            );
+        }
+        if use_fp8_o
+            && let Some(fp8_o) = w.fp8.as_ref().and_then(|f| f.o.as_ref())
+        {
+            let mut slots = dense.split_slots_mut(m, q_dims, 1)?;
+            let (mut values, mut scales) = slots.pop().context("missing dense slot")?;
+            self.kernels.elementwise.attention_gate_quant_mxfp8(
+                &self.stream,
+                &rows(&t.out, m, q_dims),
+                &rows(&t.gate, m, q_dims),
+                &mut values,
+                &mut scales,
+            )?;
+            return self.kernels.linear_fp8.gemm_quantized(
+                &self.stream,
+                &mut [Fp8GemmQuantized {
+                    weight: fp8_o,
+                    x_offset: 0,
+                    out: rows_mut(&mut t.proj, m, hidden),
+                }],
+                m,
+                dense,
+            );
+        }
+        self.kernels.elementwise.attention_gate(
+            &self.stream,
+            &rows(&t.out, m, q_dims),
+            &rows(&t.gate, m, q_dims),
+            &mut rows_mut(&mut t.gated, m, q_dims),
+        )?;
+        self.gemm_rows(
+            &mut [RowProduct {
+                weight: &w.attention.o,
+                fp8: w.fp8.as_ref().and_then(|f| f.o.as_ref()),
+                mxfp8: w.mxfp8_o.as_ref(),
+                x: rows(&t.gated, m, q_dims),
+                out: rows_mut(&mut t.proj, m, hidden),
+            }],
+            m,
+            false,
+            Some(dense),
+        )
+    }
+
     /// [`Ctx::attention_inputs`] for a chunk of `m` rows. Returns `(one_input, prequant_qkv)`:
     /// when `prequant_qkv` is true, MXFP8 attention inputs are already written into
     /// `a.gate.dense` slots `0..` (1 slot when `one_input`, 3 otherwise) directly from the
@@ -3420,6 +3611,7 @@ impl Ctx {
                     }),
                     None,
                     None,
+                    None,
                 ]
             } else {
                 let [s0, s1, s2]: [_; 3] = a
@@ -3429,18 +3621,20 @@ impl Ctx {
                     .try_into()
                     .ok()
                     .context("expected 3 dense slots")?;
-                [(s0, norms[0]), (s1, norms[1]), (s2, norms[2])].map(|((values, scales), norm)| {
-                    Some(QuantNormDest {
-                        out: None,
-                        weight: Some(norm),
-                        quant: QuantDest {
-                            format: QuantFormat::Mxfp8,
-                            values,
-                            scales,
-                            outer: None,
-                        },
-                    })
-                })
+                let [d0, d1, d2] =
+                    [(s0, norms[0]), (s1, norms[1]), (s2, norms[2])].map(|((values, scales), norm)| {
+                        Some(QuantNormDest {
+                            out: None,
+                            weight: Some(norm),
+                            quant: QuantDest {
+                                format: QuantFormat::Mxfp8,
+                                values,
+                                scales,
+                                outer: None,
+                            },
+                        })
+                    });
+                [d0, d1, d2, None]
             };
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
@@ -3453,66 +3647,105 @@ impl Ctx {
                     probs: None,
                     dests,
                     dst_stride: hidden,
+                    quant_col_offset: 0,
                     rows: m,
                 },
                 self.eps(),
             )?;
             return Ok((shared, true));
         }
-        let [g0, g1, g2, _] = &mut a.gate.inputs;
-        let [q0, q1, q2] = &mut *a.qkv_in;
-        let (dests, dst_stride) = if a.messages.is_some() {
-            (
-                [g0, g1, g2].map(|g| {
-                    Some(NormDest {
-                        out: strided_mut(g, m, 2 * hidden, 0, hidden),
-                        weight: None,
-                    })
-                }),
-                2 * hidden,
-            )
-        } else if shared {
-            (
-                [
-                    Some(NormDest {
-                        out: q0.slice_mut(..mh),
-                        weight: Some(norms[0]),
-                    }),
-                    None,
-                    None,
-                ],
-                hidden,
-            )
+        if a.messages.is_some() && self.prequant_message_gates(a.gate.invariant, m) {
+            let [s0, s1, s2]: [_; 3] = a
+                .gate
+                .dense
+                .split_slots_range_mut(m, 2 * hidden, 0, GATE_SLOTS)?
+                .try_into()
+                .ok()
+                .context("expected 3 attention gate dense slots")?;
+            let [d0, d1, d2] = [s0, s1, s2].map(|(values, scales)| {
+                Some(QuantNormDest {
+                    out: None,
+                    weight: None,
+                    quant: QuantDest {
+                        format: QuantFormat::Mxfp8,
+                        values,
+                        scales,
+                        outer: None,
+                    },
+                })
+            });
+            self.kernels.routing.depth_attention_rows_quant(
+                &self.stream,
+                DepthRowsQuant {
+                    blocks: a.states,
+                    partial: RowsPartial::Bf16(a.x),
+                    normed_partial: a.normed,
+                    queries: query,
+                    out: Some(a.inputs.slice_mut(..m * count * hidden)),
+                    probs: None,
+                    dests: [d0, d1, d2, None],
+                    dst_stride: 2 * hidden,
+                    quant_col_offset: 0,
+                    rows: m,
+                },
+                self.eps(),
+            )?;
         } else {
-            (
-                [(q0, norms[0]), (q1, norms[1]), (q2, norms[2])].map(|(q, norm)| {
-                    Some(NormDest {
-                        out: q.slice_mut(..mh),
-                        weight: Some(norm),
-                    })
-                }),
-                hidden,
-            )
-        };
-        let [d0, d1, d2] = dests;
-        self.kernels.routing.depth_attention_rows(
-            &self.stream,
-            DepthRows {
-                blocks: a.states,
-                partial: RowsPartial::Bf16(a.x),
-                normed_partial: a.normed,
-                queries: query,
-                out: a
-                    .messages
-                    .is_some()
-                    .then(|| a.inputs.slice_mut(..m * count * hidden)),
-                probs: None,
-                dests: [d0, d1, d2, None],
-                dst_stride,
-                rows: m,
-            },
-            self.eps(),
-        )?;
+            let [g0, g1, g2, _] = &mut a.gate.inputs;
+            let [q0, q1, q2] = &mut *a.qkv_in;
+            let (dests, dst_stride) = if a.messages.is_some() {
+                (
+                    [g0, g1, g2].map(|g| {
+                        Some(NormDest {
+                            out: strided_mut(g, m, 2 * hidden, 0, hidden),
+                            weight: None,
+                        })
+                    }),
+                    2 * hidden,
+                )
+            } else if shared {
+                (
+                    [
+                        Some(NormDest {
+                            out: q0.slice_mut(..mh),
+                            weight: Some(norms[0]),
+                        }),
+                        None,
+                        None,
+                    ],
+                    hidden,
+                )
+            } else {
+                (
+                    [(q0, norms[0]), (q1, norms[1]), (q2, norms[2])].map(|(q, norm)| {
+                        Some(NormDest {
+                            out: q.slice_mut(..mh),
+                            weight: Some(norm),
+                        })
+                    }),
+                    hidden,
+                )
+            };
+            let [d0, d1, d2] = dests;
+            self.kernels.routing.depth_attention_rows(
+                &self.stream,
+                DepthRows {
+                    blocks: a.states,
+                    partial: RowsPartial::Bf16(a.x),
+                    normed_partial: a.normed,
+                    queries: query,
+                    out: a
+                        .messages
+                        .is_some()
+                        .then(|| a.inputs.slice_mut(..m * count * hidden)),
+                    probs: None,
+                    dests: [d0, d1, d2, None],
+                    dst_stride,
+                    rows: m,
+                },
+                self.eps(),
+            )?;
+        }
         let Some((gates, messages)) = a.messages else {
             return Ok((shared, false));
         };
@@ -3851,12 +4084,7 @@ impl Ctx {
                 &mut t.partials,
                 &mut rows_mut(&mut t.out, m, q_dims),
             )?;
-            self.kernels.elementwise.attention_gate(
-                &self.stream,
-                &rows(&t.out, m, q_dims),
-                &rows(&t.gate, m, q_dims),
-                &mut rows_mut(&mut t.gated, m, q_dims),
-            )?;
+            return self.attention_gate_and_output_rows(w, t, dense, m);
         }
         self.gemm_rows(
             &mut [RowProduct {
@@ -3914,53 +4142,118 @@ impl Ctx {
             );
         }
         let mut down = t.down.slice_mut(first * mr..(first + n) * mr);
-        match n {
-            1 => self.gemm_rows(
-                &mut [RowProduct {
-                    weight: &weights[0].down,
-                    fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
-                    mxfp8: None,
-                    x: rows(&t.inputs[first], m, 2 * hidden),
-                    out: down.slice_mut(..),
-                }],
-                m,
-                invariant,
-                Some(&mut t.dense),
-            )?,
-            3 => {
-                let (d0, mut rest) = down.split_at_mut(mr);
-                let (d1, d2) = rest.split_at_mut(mr);
-                let [x0, x1, x2] = [0, 1, 2].map(|i| rows(&t.inputs[first + i], m, 2 * hidden));
-                self.gemm_rows(
-                    &mut [
-                        RowProduct {
-                            weight: &weights[0].down,
-                            fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
-                            mxfp8: None,
-                            x: x0,
-                            out: d0,
-                        },
-                        RowProduct {
-                            weight: &weights[1].down,
-                            fp8: weights[1].fp8.as_ref().map(|f| &f[0]),
-                            mxfp8: None,
-                            x: x1,
-                            out: d1,
-                        },
-                        RowProduct {
-                            weight: &weights[2].down,
-                            fp8: weights[2].fp8.as_ref().map(|f| &f[0]),
-                            mxfp8: None,
-                            x: x2,
-                            out: d2,
-                        },
-                    ],
+        if self.prequant_message_gates(invariant, m) {
+            let slot_vals = m * 2 * hidden;
+            match n {
+                1 => {
+                    let weight = weights[0]
+                        .fp8
+                        .as_ref()
+                        .map(|f| &f[0])
+                        .context("prequantized message gate needs FP8 down weight")?;
+                    self.kernels.linear_fp8.gemm_quantized(
+                        &self.stream,
+                        &mut [Fp8GemmQuantized {
+                            weight,
+                            x_offset: first * slot_vals,
+                            out: down.slice_mut(..),
+                        }],
+                        m,
+                        &t.dense,
+                    )?;
+                }
+                3 => {
+                    let (d0, mut rest) = down.split_at_mut(mr);
+                    let (d1, d2) = rest.split_at_mut(mr);
+                    let w0 = weights[0]
+                        .fp8
+                        .as_ref()
+                        .map(|f| &f[0])
+                        .context("prequantized message gate 0 needs FP8 down weight")?;
+                    let w1 = weights[1]
+                        .fp8
+                        .as_ref()
+                        .map(|f| &f[0])
+                        .context("prequantized message gate 1 needs FP8 down weight")?;
+                    let w2 = weights[2]
+                        .fp8
+                        .as_ref()
+                        .map(|f| &f[0])
+                        .context("prequantized message gate 2 needs FP8 down weight")?;
+                    self.kernels.linear_fp8.gemm_quantized(
+                        &self.stream,
+                        &mut [
+                            Fp8GemmQuantized {
+                                weight: w0,
+                                x_offset: first * slot_vals,
+                                out: d0,
+                            },
+                            Fp8GemmQuantized {
+                                weight: w1,
+                                x_offset: (first + 1) * slot_vals,
+                                out: d1,
+                            },
+                            Fp8GemmQuantized {
+                                weight: w2,
+                                x_offset: (first + 2) * slot_vals,
+                                out: d2,
+                            },
+                        ],
+                        m,
+                        &t.dense,
+                    )?;
+                }
+                _ => anyhow::bail!("{n} gates; one or three run at once"),
+            }
+        } else {
+            match n {
+                1 => self.gemm_rows(
+                    &mut [RowProduct {
+                        weight: &weights[0].down,
+                        fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
+                        mxfp8: None,
+                        x: rows(&t.inputs[first], m, 2 * hidden),
+                        out: down.slice_mut(..),
+                    }],
                     m,
                     invariant,
                     Some(&mut t.dense),
-                )?;
+                )?,
+                3 => {
+                    let (d0, mut rest) = down.split_at_mut(mr);
+                    let (d1, d2) = rest.split_at_mut(mr);
+                    let [x0, x1, x2] = [0, 1, 2].map(|i| rows(&t.inputs[first + i], m, 2 * hidden));
+                    self.gemm_rows(
+                        &mut [
+                            RowProduct {
+                                weight: &weights[0].down,
+                                fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
+                                mxfp8: None,
+                                x: x0,
+                                out: d0,
+                            },
+                            RowProduct {
+                                weight: &weights[1].down,
+                                fp8: weights[1].fp8.as_ref().map(|f| &f[0]),
+                                mxfp8: None,
+                                x: x1,
+                                out: d1,
+                            },
+                            RowProduct {
+                                weight: &weights[2].down,
+                                fp8: weights[2].fp8.as_ref().map(|f| &f[0]),
+                                mxfp8: None,
+                                x: x2,
+                                out: d2,
+                            },
+                        ],
+                        m,
+                        invariant,
+                        Some(&mut t.dense),
+                    )?;
+                }
+                _ => anyhow::bail!("{n} gates; one or three run at once"),
             }
-            _ => anyhow::bail!("{n} gates; one or three run at once"),
         }
         // One gate at a time, so that every gate rewrites the same output rows in L2.
         let candidates = messages.bank.len() / (m * hidden) + 1;
@@ -4304,32 +4597,7 @@ impl Ctx {
             }
             for (i, layer) in (core_start..core_end).enumerate() {
                 if pass > 0 {
-                    let bank_rows = p.bank_rows;
-                    let dests = p.gate.inputs.each_mut().map(|x| {
-                        Some(NormDest {
-                            out: strided_mut(x, m, 2 * hidden, hidden, hidden),
-                            weight: None,
-                        })
-                    });
-                    self.kernels.routing.depth_attention_rows(
-                        &self.stream,
-                        DepthRows {
-                            blocks: p.bank.slice(..bank_rows * mh),
-                            partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
-                            normed_partial: None,
-                            queries: &self.weights.message_queries[i],
-                            out: None,
-                            probs: Some(rows_mut(
-                                &mut p.message_probs,
-                                m,
-                                MESSAGE_SLOTS * (bank_rows + 1),
-                            )),
-                            dests,
-                            dst_stride: 2 * hidden,
-                            rows: m,
-                        },
-                        self.eps(),
-                    )?;
+                    self.message_bank_inputs_rows(p, i, m)?;
                 }
                 self.visit_packed_rows(
                     p,
@@ -4820,24 +5088,7 @@ impl Ctx {
         }
 
         // 5. Attention gate + output projection once across all `m` rows.
-        self.kernels.elementwise.attention_gate(
-            &self.stream,
-            &rows(&attn.out, m, q_dims),
-            &rows(&attn.gate, m, q_dims),
-            &mut rows_mut(&mut attn.gated, m, q_dims),
-        )?;
-        self.gemm_rows(
-            &mut [RowProduct {
-                weight: &attn_w.o,
-                fp8: layer_w.fp8.as_ref().and_then(|f| f.o.as_ref()),
-                mxfp8: layer_w.mxfp8_o.as_ref(),
-                x: rows(&attn.gated, m, q_dims),
-                out: rows_mut(&mut attn.proj, m, hidden),
-            }],
-            m,
-            false,
-            Some(&mut p.gate.dense),
-        )?;
+        self.attention_gate_and_output_rows(layer_w, attn, &mut p.gate.dense, m)?;
 
         // 6. Ragged packed post-attention conv + residual add across all `m` rows in 1 launch,
         //    then one depth_attention_rows over all `m` rows.
@@ -4888,8 +5139,10 @@ impl Ctx {
                         }),
                         None,
                         None,
+                        None,
                     ],
                     dst_stride: hidden,
+                    quant_col_offset: 0,
                     rows: m,
                 },
                 self.eps(),
@@ -4897,6 +5150,42 @@ impl Ctx {
             p.moe
                 .quantized
                 .mark_quantized(&self.stream, m, hidden, qfmt);
+        } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
+            let mut slots = p
+                .gate
+                .dense
+                .split_slots_range_mut(m, 2 * hidden, 3, 1)?;
+            let (values, scales) = slots.pop().context("missing mlp gate dense slot")?;
+            self.kernels.routing.depth_attention_rows_quant(
+                &self.stream,
+                DepthRowsQuant {
+                    blocks: blocks.rows(&p.blocks, mh)?,
+                    partial: RowsPartial::F32(rows(&p.residual, m, hidden)),
+                    normed_partial: None,
+                    queries: &layer_w.mlp_query,
+                    out: Some(rows_mut(&mut p.mlp_input, m, hidden)),
+                    probs: None,
+                    dests: [
+                        None,
+                        None,
+                        None,
+                        Some(QuantNormDest {
+                            out: None,
+                            weight: None,
+                            quant: QuantDest {
+                                format: QuantFormat::Mxfp8,
+                                values,
+                                scales,
+                                outer: None,
+                            },
+                        }),
+                    ],
+                    dst_stride: 2 * hidden,
+                    quant_col_offset: 0,
+                    rows: m,
+                },
+                self.eps(),
+            )?;
         } else {
             let (mlp_out, dests) = match gates {
                 Some(_) => (
@@ -5145,32 +5434,7 @@ impl Ctx {
             }
             for (i, layer) in (core_start..core_end).enumerate() {
                 if pass > 0 {
-                    let bank_rows = p.bank_rows;
-                    let dests = p.gate.inputs.each_mut().map(|x| {
-                        Some(NormDest {
-                            out: strided_mut(x, m, 2 * hidden, hidden, hidden),
-                            weight: None,
-                        })
-                    });
-                    self.kernels.routing.depth_attention_rows(
-                        &self.stream,
-                        DepthRows {
-                            blocks: p.bank.slice(..bank_rows * mh),
-                            partial: RowsPartial::Normalized(rows(&p.bank_normed, m, hidden)),
-                            normed_partial: None,
-                            queries: &self.weights.message_queries[i],
-                            out: None,
-                            probs: Some(rows_mut(
-                                &mut p.message_probs,
-                                m,
-                                MESSAGE_SLOTS * (bank_rows + 1),
-                            )),
-                            dests,
-                            dst_stride: 2 * hidden,
-                            rows: m,
-                        },
-                        self.eps(),
-                    )?;
+                    self.message_bank_inputs_rows(p, i, m)?;
                 }
                 self.visit_hybrid_rows(
                     p,
@@ -5812,24 +6076,7 @@ impl Ctx {
         }
 
         // 5. Attention gate + output projection once across all `m` rows.
-        self.kernels.elementwise.attention_gate(
-            &self.stream,
-            &rows(&attn.out, m, q_dims),
-            &rows(&attn.gate, m, q_dims),
-            &mut rows_mut(&mut attn.gated, m, q_dims),
-        )?;
-        self.gemm_rows(
-            &mut [RowProduct {
-                weight: &attn_w.o,
-                fp8: layer_w.fp8.as_ref().and_then(|f| f.o.as_ref()),
-                mxfp8: layer_w.mxfp8_o.as_ref(),
-                x: rows(&attn.gated, m, q_dims),
-                out: rows_mut(&mut attn.proj, m, hidden),
-            }],
-            m,
-            false,
-            Some(&mut p.gate.dense),
-        )?;
+        self.attention_gate_and_output_rows(layer_w, attn, &mut p.gate.dense, m)?;
 
         // 6a. Batched post-attention conv + residual over rows `0..batch_rows`.
         {
@@ -5898,8 +6145,10 @@ impl Ctx {
                         }),
                         None,
                         None,
+                        None,
                     ],
                     dst_stride: hidden,
+                    quant_col_offset: 0,
                     rows: m,
                 },
                 self.eps(),
@@ -5907,6 +6156,42 @@ impl Ctx {
             p.moe
                 .quantized
                 .mark_quantized(&self.stream, m, hidden, qfmt);
+        } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
+            let mut slots = p
+                .gate
+                .dense
+                .split_slots_range_mut(m, 2 * hidden, 3, 1)?;
+            let (values, scales) = slots.pop().context("missing mlp gate dense slot")?;
+            self.kernels.routing.depth_attention_rows_quant(
+                &self.stream,
+                DepthRowsQuant {
+                    blocks: blocks.rows(&p.blocks, mh)?,
+                    partial: RowsPartial::F32(rows(&p.residual, m, hidden)),
+                    normed_partial: None,
+                    queries: &layer_w.mlp_query,
+                    out: Some(rows_mut(&mut p.mlp_input, m, hidden)),
+                    probs: None,
+                    dests: [
+                        None,
+                        None,
+                        None,
+                        Some(QuantNormDest {
+                            out: None,
+                            weight: None,
+                            quant: QuantDest {
+                                format: QuantFormat::Mxfp8,
+                                values,
+                                scales,
+                                outer: None,
+                            },
+                        }),
+                    ],
+                    dst_stride: 2 * hidden,
+                    quant_col_offset: 0,
+                    rows: m,
+                },
+                self.eps(),
+            )?;
         } else {
             let (mlp_out, dests) = match gates {
                 Some(_) => (

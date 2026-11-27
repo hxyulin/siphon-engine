@@ -4,8 +4,8 @@ use std::{mem::size_of, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
-    PushKernelArg as _, sys::CUfunction_attribute,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut as _,
+    LaunchConfig, PushKernelArg as _, sys::CUfunction_attribute,
 };
 use half::bf16;
 
@@ -135,7 +135,11 @@ const ROUTER_TILE_THREADS: u32 = 256;
 /// Query counts with a `depth_attention_rows_2304_<nb>_<nq>` kernel.
 const ROWS_QUERY_COUNTS: [usize; 3] = [1, 3, 4];
 /// Query counts with a `depth_attention_rows_quant_2304_<nb>_<nq>` kernel.
-const ROWS_QUANT_QUERY_COUNTS: [usize; 2] = [1, 3];
+const ROWS_QUANT_QUERY_COUNTS: [usize; 3] = [1, 3, 4];
+/// Minimum row count for dispatching `moe_router_logits_tc_rows_2304` (2-term TF32 MMA).
+const ROUTER_TC_MIN_ROWS: usize = 64;
+/// Valid K-splits for `moe_router_logits_tc_rows_2304` (divisors of 2304 with slice % 32 == 0).
+const ROUTER_TC_SPLITS: [usize; 7] = [1, 2, 3, 4, 6, 8, 9];
 
 /// The partial candidate of [`Routing::depth_attention_fused`].
 pub enum Partial<'a> {
@@ -289,15 +293,17 @@ pub struct DepthRowsQuant<'a> {
     pub partial: RowsPartial<'a>,
     /// Receives the partial as used, F32 `[rows, 2304]`.
     pub normed_partial: Option<CudaViewMut<'a, f32>>,
-    /// The `nq` (1 or 3) queries, F32 `[nq, 2304]`.
+    /// The `nq` (1, 3 or 4) queries, F32 `[nq, 2304]`.
     pub queries: &'a CudaSlice<f32>,
     /// Receives the output rows, F32 `[rows, nq, 2304]`.
     pub out: Option<CudaViewMut<'a, f32>>,
     /// Receives the weights of each output, F32 `[rows, nq, nb + 1]`.
     pub probs: Option<CudaViewMut<'a, f32>>,
-    /// Destinations `0..3`, all using the same [`crate::ops::QuantFormat`].
-    pub dests: [Option<QuantNormDest<'a>>; 3],
+    /// Destinations `0..4`, all using the same [`crate::ops::QuantFormat`].
+    pub dests: [Option<QuantNormDest<'a>>; 4],
     pub dst_stride: usize,
+    /// Column offset within each `dst_stride`-wide MXFP8 destination row (a multiple of 32).
+    pub quant_col_offset: usize,
     pub rows: usize,
 }
 
@@ -340,13 +346,14 @@ pub struct Routing {
     depth_attention_fused_2304: CudaFunction,
     moe_router_2304: CudaFunction,
     moe_router_logits_rows_2304: CudaFunction,
+    moe_router_logits_tc_rows_2304: CudaFunction,
     moe_router_route_rows_2304: CudaFunction,
     depth_attention_step_2304: CudaFunction,
     moe_router_step_2304: CudaFunction,
     moe_router_step_rows_2304: CudaFunction,
     /// `depth_attention_rows_2304_<nb>_<nq>` at `[nq index][nb - 1]`.
     depth_attention_rows_2304: Vec<Vec<CudaFunction>>,
-    /// `depth_attention_rows_quant_2304_<nb>_<nq>` at `[nq index][nb - 1]` for `nq` in `[1, 3]`.
+    /// `depth_attention_rows_quant_2304_<nb>_<nq>` at `[nq index][nb - 1]` for `nq` in `[1, 3, 4]`.
     depth_attention_rows_quant_2304: Vec<Vec<CudaFunction>>,
 }
 
@@ -360,6 +367,7 @@ impl Routing {
             depth_attention_fused_2304: module.load_function("depth_attention_fused_2304")?,
             moe_router_2304: module.load_function("moe_router_2304")?,
             moe_router_logits_rows_2304: module.load_function("moe_router_logits_rows_2304")?,
+            moe_router_logits_tc_rows_2304: module.load_function("moe_router_logits_tc_rows_2304")?,
             moe_router_route_rows_2304: module.load_function("moe_router_route_rows_2304")?,
             depth_attention_step_2304: module.load_function("depth_attention_step_2304")?,
             moe_router_step_2304: {
@@ -1057,6 +1065,7 @@ impl Routing {
             mut probs,
             mut dests,
             dst_stride,
+            quant_col_offset,
             rows,
         } = d;
         ensure!(rows > 0, "no rows");
@@ -1110,7 +1119,8 @@ impl Routing {
                 dest.weight.is_none_or(|w| w.len() == HIDDEN),
                 "norm weights must hold {HIDDEN} elements"
             );
-            dest.quant.check(rows, HIDDEN)?;
+            dest.quant
+                .check_strided(rows, HIDDEN, dst_stride, quant_col_offset)?;
             let mode = dest.quant.format.mode();
             if q_mode == 0 {
                 q_mode = mode;
@@ -1133,14 +1143,10 @@ impl Routing {
         for dest in &mut dests {
             args.opt_mut(dest.as_mut().and_then(|d| d.out.as_mut()), stream);
         }
-        // dst3 is always null for the quant variant.
-        args.u64(0)
-            .i32(i32::try_from(dst_stride).context("dst_stride too large")?);
+        args.i32(i32::try_from(dst_stride).context("dst_stride too large")?);
         for dest in &dests {
             args.opt(dest.as_ref().and_then(|d| d.weight), stream);
         }
-        // weight3 is always null for the quant variant.
-        args.u64(0);
         let rows_u32 = u32::try_from(rows).context("too many rows")?;
         args.f32(eps)
             .f32((HIDDEN as f32).sqrt().recip())
@@ -1148,10 +1154,20 @@ impl Routing {
             .i32(0)
             .i32(0);
         for dest in &mut dests {
-            args.opt_mut(dest.as_mut().map(|d| &mut d.quant.values), stream);
+            if let Some(d) = dest.as_mut() {
+                let (ptr, _) = d.quant.values.device_ptr_mut(stream);
+                args.u64(ptr + u64::try_from(quant_col_offset)?);
+            } else {
+                args.u64(0);
+            }
         }
         for dest in &mut dests {
-            args.opt_mut(dest.as_mut().map(|d| &mut d.quant.scales), stream);
+            if let Some(d) = dest.as_mut() {
+                let (ptr, _) = d.quant.scales.device_ptr_mut(stream);
+                args.u64(ptr + u64::try_from(quant_col_offset / 32)?);
+            } else {
+                args.u64(0);
+            }
         }
         for dest in &mut dests {
             args.opt_mut(dest.as_mut().and_then(|d| d.quant.outer.as_mut()), stream);
@@ -1432,7 +1448,18 @@ impl Routing {
             "scratch holds {} rows, not {rows}",
             scratch.rows
         );
-        let mut partials = scratch.partials.slice_mut(..ROUTER_SPLITS * rows * EXPERTS);
+        let row_tiles = rows.div_ceil(ROUTER_TILE_ROWS);
+        let use_tc = rows >= ROUTER_TC_MIN_ROWS;
+        let splits = if use_tc {
+            ROUTER_TC_SPLITS
+                .iter()
+                .copied()
+                .find(|&s| row_tiles * s >= 188)
+                .unwrap_or(ROUTER_SPLITS)
+        } else {
+            ROUTER_SPLITS
+        };
+        let mut partials = scratch.partials.slice_mut(..splits * rows * EXPERTS);
         let rows_i32 = i32::try_from(rows).context("too many rows")?;
 
         let mut args = KernelArgs::default();
@@ -1440,25 +1467,31 @@ impl Routing {
             .ptr(router, stream)
             .ptr_mut(&mut partials, stream)
             .i32(rows_i32)
-            .i32(i32::try_from(HIDDEN / ROUTER_SPLITS)?);
+            .i32(i32::try_from(HIDDEN / splits)?);
         let config = LaunchConfig {
             grid_dim: (
-                u32::try_from(rows.div_ceil(ROUTER_TILE_ROWS))?,
-                u32::try_from(ROUTER_SPLITS)?,
+                u32::try_from(row_tiles)?,
+                u32::try_from(splits)?,
                 1,
             ),
             block_dim: (ROUTER_TILE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: the arguments match `moe_router_logits_rows_2304(const bf16*, const float*,
-        // float*, int, int)`, x holds `rows` rows and partials 9 x `rows` x 128 floats, the
+        let logits_fn = if use_tc {
+            &self.moe_router_logits_tc_rows_2304
+        } else {
+            &self.moe_router_logits_rows_2304
+        };
+        // SAFETY: the arguments match `moe_router_logits[_tc]_rows_2304(const bf16*, const float*,
+        // float*, int, int)`, x holds `rows` rows and partials `splits` x `rows` x 128 floats, the
         // grid covers the rows in tiles of 64 (the kernel skips rows past `rows`) and the
-        // columns in 9 slices of 256, and the kernel reads only the router before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.moe_router_logits_rows_2304, config) }?;
+        // columns in `splits` slices of `2304 / splits` (a multiple of 32 for TC, 16 for scalar),
+        // and the kernel reads only the router before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, logits_fn, config) }?;
 
         let mut args = KernelArgs::default();
         args.ptr(&partials, stream)
-            .i32(i32::try_from(ROUTER_SPLITS)?)
+            .i32(i32::try_from(splits)?)
             .ptr(bias, stream)
             .ptr_mut(&mut logits, stream)
             .ptr_mut(&mut indices, stream)
@@ -1476,7 +1509,7 @@ impl Routing {
         // SAFETY: the arguments match `moe_router_route_rows_2304(const float*, int, const
         // float*, float*, int*, float*, int, float, int, int, float)`, every buffer holds
         // `rows` rows as checked above, the grid has one block of 128 threads per row, and
-        // the kernel reads nothing before `pdl_wait`.
+        // the kernel reads only `bias` before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.moe_router_route_rows_2304, config) }
     }
 }
