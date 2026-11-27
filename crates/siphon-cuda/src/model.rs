@@ -59,7 +59,7 @@ use crate::{
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
         linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8, Mxfp8Gemm, Mxfp8Matrix},
         linear_rows::{self, LinearRows, RowsProduct},
-        misc::{ArgmaxScratch, GATE_SLOTS, GateStep, Misc},
+        misc::{ArgmaxScratch, DepthGateSlot, Misc},
         norm::{KvConvWeights, Norm},
         routing::{DepthStep, NormDest, Routing, StepPartial},
         sample::{Sample, SampleBuffers},
@@ -267,17 +267,11 @@ struct Scratch {
     messages: CudaSlice<f32>,
     /// The normalized visit input, when it does not start a block state.
     normed_residual: CudaSlice<f32>,
-    /// Depth attention for the attention inputs, F32 `[1 or 3, hidden]`.
-    attention_inputs: CudaSlice<f32>,
-    /// The message gates' outputs, F32 `[3, hidden]`: the attention gates', then the MLP
-    /// gate's in the first row.
-    gated: CudaSlice<f32>,
     gate: GateScratch,
     /// Normalized query, key and value inputs of attention. Layer 0 uses only the first.
     qkv_in: [CudaSlice<bf16>; 3],
     attention: AttentionTemps,
     residual: CudaSlice<f32>,
-    mlp_input: CudaSlice<f32>,
     mlp_x: CudaSlice<bf16>,
     moe: MoeScratch,
     final_hidden: CudaSlice<bf16>,
@@ -350,8 +344,6 @@ impl Scratch {
             message_queries: zeros(stream, looped * MESSAGE_SLOTS * hidden)?,
             messages: zeros(stream, looped * MESSAGE_SLOTS * hidden)?,
             normed_residual: zeros(stream, hidden)?,
-            attention_inputs: zeros(stream, 3 * hidden)?,
-            gated: zeros(stream, GATE_SLOTS * hidden)?,
             gate: GateScratch {
                 inputs: [
                     zeros(stream, looped * 2 * hidden)?,
@@ -379,7 +371,6 @@ impl Scratch {
                 proj: zeros(stream, hidden)?,
             },
             residual: zeros(stream, hidden)?,
-            mlp_input: zeros(stream, hidden)?,
             mlp_x: zeros(stream, hidden)?,
             moe: MoeScratch {
                 logits: zeros(stream, cfg.n_routed_experts)?,
@@ -1943,11 +1934,8 @@ struct AttentionInputs<'a> {
     states: CudaView<'a, f32>,
     /// Receives the normalized visit input.
     normed: CudaViewMut<'a, f32>,
-    /// Depth attention's output rows, F32 `[1 or 3, hidden]`, written only for the gates.
-    inputs: &'a mut CudaSlice<f32>,
     qkv_in: &'a mut [CudaSlice<bf16>; 3],
     gate: &'a mut GateScratch,
-    gated: &'a mut CudaSlice<f32>,
     /// On looped passes after the first: the layer's message gates, its index among the
     /// looped layers, and every looped layer's messages.
     messages: Option<(
@@ -2017,8 +2005,9 @@ impl Ctx {
                 gates[3].decode_matrices()
             });
         }
-        if rows {
-            // The verify router loads its F32 weights only once its previous kernel ends.
+        if rows || w.fp8.is_some() {
+            // Prefetch F32 router weights for verify passes and FP8 decode so
+            // moe_router_step_2304 hits L2 while overlapping the fused pre-MLP kernel.
             prefetch.push(&w.router);
         }
         let lm_head_start;
@@ -2106,10 +2095,8 @@ impl Ctx {
                 x: &s.hidden,
                 states: states.slice(..),
                 normed,
-                inputs: &mut s.attention_inputs,
                 qkv_in: &mut s.qkv_in,
                 gate: &mut s.gate,
-                gated: &mut s.gated,
                 messages: gates.map(|(g, i)| (g, i, &s.messages)),
             },
             sliding,
@@ -2131,52 +2118,65 @@ impl Ctx {
             sliding,
             [q_in, k_in, v_in],
         )?;
-        // The post-attention conv and residual add, then depth attention for the MLP input.
-        // Without a gate, the kernel also applies the MoE input norm. With one, it writes
-        // the MLP state's normalized half of the gate input, and the gate applies the norm.
-        let gate_row = gates.map(|(_, i)| i * 2 * hidden..i * 2 * hidden + hidden);
-        let mlp_dest = match &gate_row {
-            Some(row) => NormDest {
-                out: s.gate.inputs[3].slice_mut(row.clone()),
-                weight: None,
-            },
-            None => NormDest {
+        // The post-attention conv and residual add, depth attention for the MLP input,
+        // optional MLP message gate, and MoE router.
+        let [.., conv_state, _] = &mut state.conv;
+        let fused_end = w.fp8.is_some();
+        if let Some((gates, i)) = gates {
+            let msg_off = (i * MESSAGE_SLOTS + 3) * hidden;
+            let msg_in_row = i * 2 * hidden + hidden..i * 2 * hidden + 2 * hidden;
+            let g = &gates[3];
+            let mut slot = DepthGateSlot {
+                down_weight: &g.down,
+                input_msg: s.gate.inputs[3].slice(msg_in_row),
+                forget: &g.forget,
+                gain: &g.gain,
+                fp8: g.fp8.as_ref(),
+                norm_weight: &w.mlp_norm,
+                normed: s.mlp_x.as_view_mut(),
+            };
+            let block_rows = blocks.rows(&s.blocks, hidden)?;
+            let proj_view = s.attention.proj.as_view();
+            let hid_view = (!block_start).then(|| s.hidden.as_view());
+            let mlp_q_view = w.mlp_query.as_view();
+            self.kernels.misc.depth_gate_mlp_step(
+                &self.stream,
+                &block_rows,
+                &proj_view,
+                &w.post_attention_conv,
+                conv_state.as_view_mut(),
+                hid_view.as_ref(),
+                s.residual.as_view_mut(),
+                &mlp_q_view,
+                &mut slot,
+                &s.messages.slice(msg_off..msg_off + hidden),
+                None,
+                self.eps(),
+            )?;
+        } else {
+            let mlp_dest = NormDest {
                 out: s.mlp_x.as_view_mut(),
                 weight: Some(&w.mlp_norm),
-            },
-        };
-        let [.., conv_state, _] = &mut state.conv;
-        self.kernels.routing.depth_attention_step(
-            &self.stream,
-            DepthStep {
-                blocks: blocks.rows(&s.blocks, hidden)?,
-                partial: StepPartial::ConvResidual {
-                    x: s.attention.proj.as_view(),
-                    weight: &w.post_attention_conv,
-                    state: conv_state.as_view_mut(),
-                    hidden: (!block_start).then(|| s.hidden.as_view()),
-                    residual: s.residual.as_view_mut(),
+            };
+            self.kernels.routing.depth_attention_step(
+                &self.stream,
+                DepthStep {
+                    blocks: blocks.rows(&s.blocks, hidden)?,
+                    partial: StepPartial::ConvResidual {
+                        x: s.attention.proj.as_view(),
+                        weight: &w.post_attention_conv,
+                        state: conv_state.as_view_mut(),
+                        hidden: (!block_start).then(|| s.hidden.as_view()),
+                        residual: s.residual.as_view_mut(),
+                    },
+                    normed_partial: None,
+                    queries: w.mlp_query.as_view(),
+                    batch: 1,
+                    out: None,
+                    dests: [None, None, None, Some(mlp_dest)],
+                    dst_stride: 0,
                 },
-                normed_partial: None,
-                queries: w.mlp_query.as_view(),
-                batch: 1,
-                out: gates.is_some().then(|| s.mlp_input.as_view_mut()),
-                dests: [None, None, None, Some(mlp_dest)],
-                dst_stride: 0,
-            },
-            self.eps(),
-        )?;
-        if let Some((gates, i)) = gates {
-            let message = (i * MESSAGE_SLOTS + 3) * hidden;
-            self.message_gates(
-                &gates[3..],
-                &mut s.gate,
-                3,
-                i,
-                (&s.mlp_input, 0),
-                &s.messages.slice(message..message + hidden),
-                &mut s.gated,
-                vec![Some((&w.mlp_norm, s.mlp_x.as_view_mut()))],
+                self.eps(),
             )?;
         }
         // With FP8 weights the expert kernel also runs the MoE combine, the post-MLP conv and
@@ -2184,7 +2184,7 @@ impl Ctx {
         // step took 2.862 instead of 2.883 ms at context 0. With BF16 weights the step waits
         // on the prefetch, which forks after the expert kernel, and the fused end delayed it:
         // 3.752 instead of 3.715 ms.
-        let fused = w.fp8.is_some();
+        let fused = fused_end;
         self.moe(
             w,
             &mut s.moe,
@@ -2228,6 +2228,7 @@ impl Ctx {
     /// `_self_attention` in MLX-LM's sliding and full decoder layers, and the normalized
     /// visit input into `a.normed`. Returns whether the layer has one shared input, in
     /// `a.qkv_in[0]`.
+    #[expect(clippy::too_many_lines, reason = "fused and unfused attention-input paths")]
     fn attention_inputs(
         &self,
         w: &LayerWeights,
@@ -2257,17 +2258,56 @@ impl Ctx {
         );
         let [g0, g1, g2, _] = &mut a.gate.inputs;
         let [q0, q1, q2] = &mut *a.qkv_in;
-        // Without messages, the depth-attention kernel applies the input norms. With them, it
-        // writes the normalized states into the gate inputs, and each gate applies its norm.
-        let dests = if let Some((_, looped, _)) = a.messages {
-            let row = looped * 2 * hidden;
-            [g0, g1, g2].map(|g| {
-                Some(NormDest {
-                    out: g.slice_mut(row..row + hidden),
-                    weight: None,
-                })
-            })
-        } else if shared {
+        if let Some((gates, looped, messages)) = a.messages {
+            let msg_in_row = looped * 2 * hidden + hidden..looped * 2 * hidden + 2 * hidden;
+            let message = looped * MESSAGE_SLOTS * hidden;
+            let mut slots = [
+                DepthGateSlot {
+                    down_weight: &gates[0].down,
+                    input_msg: g0.slice(msg_in_row.clone()),
+                    forget: &gates[0].forget,
+                    gain: &gates[0].gain,
+                    fp8: gates[0].fp8.as_ref(),
+                    norm_weight: norms[0],
+                    normed: q0.as_view_mut(),
+                },
+                DepthGateSlot {
+                    down_weight: &gates[1].down,
+                    input_msg: g1.slice(msg_in_row.clone()),
+                    forget: &gates[1].forget,
+                    gain: &gates[1].gain,
+                    fp8: gates[1].fp8.as_ref(),
+                    norm_weight: norms[1],
+                    normed: q1.as_view_mut(),
+                },
+                DepthGateSlot {
+                    down_weight: &gates[2].down,
+                    input_msg: g2.slice(msg_in_row),
+                    forget: &gates[2].forget,
+                    gain: &gates[2].gain,
+                    fp8: gates[2].fp8.as_ref(),
+                    norm_weight: norms[2],
+                    normed: q2.as_view_mut(),
+                },
+            ];
+            let x_view = a.x.as_view();
+            let q_view = query.as_view();
+            self.kernels.misc.depth_gate_step(
+                &self.stream,
+                &a.states,
+                &x_view,
+                Some(a.normed),
+                &q_view,
+                if shared { 0 } else { hidden },
+                &mut slots,
+                &messages.slice(message..message + 3 * hidden),
+                None,
+                self.eps(),
+            )?;
+            return Ok(false);
+        }
+        // Without messages, the depth-attention kernel applies the input norms directly.
+        let dests = if shared {
             [
                 Some(NormDest {
                     out: q0.as_view_mut(),
@@ -2293,36 +2333,13 @@ impl Ctx {
                 normed_partial: Some(a.normed),
                 queries: query.as_view(),
                 batch: 1,
-                out: a
-                    .messages
-                    .is_some()
-                    .then(|| a.inputs.slice_mut(..count * hidden)),
+                out: None,
                 dests: [d0, d1, d2, None],
                 dst_stride: 0,
             },
             self.eps(),
         )?;
-        let Some((gates, looped, messages)) = a.messages else {
-            return Ok(shared);
-        };
-        // The three gates in one launch; with a shared input they all read its one row.
-        let message = looped * MESSAGE_SLOTS * hidden;
-        let [q0, q1, q2] = &mut *a.qkv_in;
-        self.message_gates(
-            &gates[..3],
-            &mut *a.gate,
-            0,
-            looped,
-            (&*a.inputs, if shared { 0 } else { hidden }),
-            &messages.slice(message..message + 3 * hidden),
-            &mut *a.gated,
-            [q0, q1, q2]
-                .into_iter()
-                .zip(norms)
-                .map(|(q, norm)| Some((norm, q.as_view_mut())))
-                .collect(),
-        )?;
-        Ok(false)
+        Ok(shared)
     }
 
     /// Attention from the normalized query, key and value inputs to the output projection
@@ -2451,52 +2468,6 @@ impl Ctx {
                 Start::Early,
             )
         }
-    }
-
-    /// MLX-LM's `MessageGate` for the gates `gates` of message slots `first_slot..`, in one
-    /// launch. Depth attention has already written each slot's normalized state and
-    /// message into row `looped` of `t.inputs[slot]`. Gate `k` mixes `messages[k]` into the
-    /// F32 state `h[k * h_stride..]`, into `out[k]`; with `norms[k]`, it also writes
-    /// `bf16(rms_norm(out[k]) * weight)`.
-    #[expect(clippy::too_many_arguments, reason = "the gates' inputs and outputs")]
-    fn message_gates(
-        &self,
-        gates: &[MessageGateWeights],
-        t: &mut GateScratch,
-        first_slot: usize,
-        looped: usize,
-        (h, h_stride): (&impl DeviceIn<f32>, usize),
-        messages: &impl DeviceIn<f32>,
-        out: &mut CudaSlice<f32>,
-        norms: Vec<Option<(&CudaSlice<bf16>, CudaViewMut<'_, bf16>)>>,
-    ) -> anyhow::Result<()> {
-        let n = gates.len();
-        let hidden = self.hidden();
-        ensure!(norms.len() == n, "one norm entry per gate");
-        let row = looped * 2 * hidden..(looped + 1) * 2 * hidden;
-        let mut steps: Vec<GateStep<'_>> = gates
-            .iter()
-            .zip(&t.inputs[first_slot..first_slot + n])
-            .zip(norms)
-            .map(|((g, input), norm)| GateStep {
-                down_weight: &g.down,
-                input: input.slice(row.clone()),
-                forget: &g.forget,
-                gain: &g.gain,
-                fp8: g.fp8.as_ref(),
-                norm,
-            })
-            .collect();
-        self.kernels.misc.message_gate_step(
-            &self.stream,
-            &mut steps,
-            h,
-            h_stride,
-            messages,
-            &mut out.slice_mut(..n * hidden),
-            None,
-            self.eps(),
-        )
     }
 
     /// MLX-LM's `SparseMoeBlock` for one row from its normalized BF16 input `x`, up to the

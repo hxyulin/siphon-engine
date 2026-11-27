@@ -11,7 +11,12 @@ use half::bf16;
 
 use crate::{
     gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
-    ops::{QuantDest, linear::launch_by_value, linear_fp8::Fp8Matrix},
+    ops::{
+        QuantDest,
+        linear::launch_by_value,
+        linear_fp8::Fp8Matrix,
+        routing::FUSED_MAX_CANDIDATES,
+    },
 };
 
 /// Threads per block for the elementwise kernels.
@@ -268,6 +273,22 @@ pub struct GateNormQuant<'a> {
     pub quant: QuantDest<'a>,
 }
 
+/// One gate of [`Misc::depth_gate_step`] or [`Misc::depth_gate_mlp_step`]: its weights,
+/// the precomputed normalized message half (`[2304]` BF16) of its down projection's input,
+/// and its trailing weighted RMSNorm weight and output (`[2304]` BF16).
+pub struct DepthGateSlot<'a> {
+    /// `[64, 4608]`.
+    pub down_weight: &'a CudaSlice<bf16>,
+    /// Precomputed normalized message half, BF16 `[2304]`.
+    pub input_msg: CudaView<'a, bf16>,
+    pub forget: &'a CudaSlice<bf16>,
+    pub gain: &'a CudaSlice<bf16>,
+    /// FP8 copies of the down, forget and gain weights.
+    pub fp8: Option<&'a [Fp8Matrix; 3]>,
+    pub norm_weight: &'a CudaSlice<bf16>,
+    pub normed: CudaViewMut<'a, bf16>,
+}
+
 #[derive(Debug)]
 pub struct Misc {
     message_gate_combine_f32: CudaFunction,
@@ -282,6 +303,10 @@ pub struct Misc {
     argmax_wide_f32: CudaFunction,
     message_gate_step_2304: CudaFunction,
     message_gate_step_fp8_2304: CudaFunction,
+    depth_gate_step_2304: CudaFunction,
+    depth_gate_step_fp8_2304: CudaFunction,
+    depth_gate_mlp_step_2304: CudaFunction,
+    depth_gate_mlp_step_fp8_2304: CudaFunction,
     message_gate_rows_2304: CudaFunction,
     message_gate_rows_fp8_2304: CudaFunction,
     decode_prologue_2304: CudaFunction,
@@ -347,6 +372,13 @@ impl Misc {
             argmax_wide_f32: module.load_function("argmax_wide_f32")?,
             message_gate_step_2304: cluster_function(&module, "message_gate_step_2304")?,
             message_gate_step_fp8_2304: cluster_function(&module, "message_gate_step_fp8_2304")?,
+            depth_gate_step_2304: cluster_function(&module, "depth_gate_step_2304")?,
+            depth_gate_step_fp8_2304: cluster_function(&module, "depth_gate_step_fp8_2304")?,
+            depth_gate_mlp_step_2304: cluster_function(&module, "depth_gate_mlp_step_2304")?,
+            depth_gate_mlp_step_fp8_2304: cluster_function(
+                &module,
+                "depth_gate_mlp_step_fp8_2304",
+            )?,
             message_gate_rows_2304: gate_rows_function(
                 &module,
                 "message_gate_rows_2304",
@@ -687,6 +719,235 @@ impl Misc {
         // for the `n` gates of the grid's y dimension, the grid is one cluster of 16 blocks
         // per gate as the kernel is compiled, a null `normed` makes a gate skip the norm, and
         // the kernel reads only weights before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// Fused pre-attention depth attention + 3 message gates (Q, K, V) + weighted RMSNorms
+    /// for B=1 decode, in one `(16, 3, 1)` cluster launch. Eliminates the intermediate global
+    /// writes/reads of `attention_inputs`, the state halves of `gate.inputs`, and `gated`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the fused kernel signature")]
+    #[expect(clippy::too_many_lines, reason = "validates buffers and mirrors the kernel signature")]
+    pub fn depth_gate_step(
+        &self,
+        stream: &CudaStream,
+        blocks: &CudaView<'_, f32>,
+        partial_bf16: &CudaView<'_, bf16>,
+        mut normed_partial: Option<CudaViewMut<'_, f32>>,
+        queries: &CudaView<'_, f32>,
+        q_stride: usize,
+        gates: &mut [DepthGateSlot<'_>; GATE_SLOTS],
+        m: &impl DeviceIn<f32>,
+        mut out: Option<CudaViewMut<'_, f32>>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let m = m.view();
+        ensure!(
+            blocks.len().is_multiple_of(HIDDEN),
+            "blocks has {} elements, not a multiple of {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / HIDDEN;
+        ensure!(
+            nb < FUSED_MAX_CANDIDATES,
+            "{nb} blocks; at most {} fit",
+            FUSED_MAX_CANDIDATES - 1
+        );
+        check_len("partial_bf16", partial_bf16.len(), HIDDEN)?;
+        if let Some(np) = &normed_partial {
+            check_len("normed_partial", np.len(), HIDDEN)?;
+        }
+        ensure!(
+            queries.len() >= (GATE_SLOTS - 1) * q_stride + HIDDEN,
+            "queries has {} elements, too few for {GATE_SLOTS} slots {q_stride} apart",
+            queries.len()
+        );
+        check_len("m", m.len(), GATE_SLOTS * HIDDEN)?;
+        if let Some(out) = &out {
+            check_len("out", out.len(), GATE_SLOTS * HIDDEN)?;
+        }
+        let fp8 = gates[0].fp8.is_some();
+        for gate in gates.iter() {
+            ensure!(
+                gate.fp8.is_some() == fp8,
+                "every gate of a launch has FP8 weights or none does"
+            );
+            check_len("down weight", gate.down_weight.len(), GATE_RANK * 2 * HIDDEN)?;
+            check_len("input_msg", gate.input_msg.len(), HIDDEN)?;
+            check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
+            check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
+            check_len("norm weight", gate.norm_weight.len(), HIDDEN)?;
+            check_len("normed", gate.normed.len(), HIDDEN)?;
+            if let Some([down, forget, gain]) = gate.fp8 {
+                ensure!(
+                    (down.rows(), down.k()) == (GATE_RANK, 2 * HIDDEN)
+                        && [forget, gain]
+                            .iter()
+                            .all(|w| (w.rows(), w.k()) == (HIDDEN, GATE_RANK)),
+                    "FP8 gate weight shapes"
+                );
+            }
+        }
+        let config = LaunchConfig {
+            grid_dim: (GATE_CLUSTER, GATE_SLOTS as u32, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(blocks, stream)
+            .i32(i32::try_from(nb)?)
+            .ptr(partial_bf16, stream)
+            .opt_mut(normed_partial.as_mut(), stream)
+            .ptr(queries, stream)
+            .i32(i32::try_from(q_stride)?);
+        if fp8 {
+            for matrix in 0..3 {
+                for g in gates.iter() {
+                    args.ptr(&g.fp8.context("FP8 gate")?[matrix].values(), stream);
+                }
+                for g in gates.iter() {
+                    args.ptr(&g.fp8.context("FP8 gate")?[matrix].scales(), stream);
+                }
+                if matrix == 0 {
+                    for g in gates.iter() {
+                        args.ptr(&g.input_msg, stream);
+                    }
+                }
+            }
+        } else {
+            for g in gates.iter() {
+                args.ptr(g.down_weight, stream);
+            }
+            for g in gates.iter() {
+                args.ptr(&g.input_msg, stream);
+            }
+            for g in gates.iter() {
+                args.ptr(g.forget, stream);
+            }
+            for g in gates.iter() {
+                args.ptr(g.gain, stream);
+            }
+        }
+        args.ptr(&m, stream).opt_mut(out.as_mut(), stream);
+        for g in gates.iter() {
+            args.ptr(g.norm_weight, stream);
+        }
+        for g in gates.iter_mut() {
+            args.ptr_mut(&mut g.normed, stream);
+        }
+        args.f32(eps).f32((HIDDEN as f32).sqrt().recip());
+        let function = if fp8 {
+            &self.depth_gate_step_fp8_2304
+        } else {
+            &self.depth_gate_step_2304
+        };
+        // SAFETY: the arguments match `depth_gate_step[_fp8]_2304`, every buffer has the
+        // length checked above, the grid is 3 clusters of 16 blocks, and the kernel reads
+        // only read-only weights before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// Fused pre-MLP micro-chain for gated B=1 decode visits WITHOUT router:
+    /// post-attention `short_conv_residual`, 1-query depth attention, MLP message gate, and
+    /// weighted RMSNorm into `gate.normed` (`mlp_x`) in one 16-block cluster, leaving
+    /// `moe_router_step_2304` separate so its router weight loads overlap via PDL.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the fused kernel signature")]
+    pub fn depth_gate_mlp_step(
+        &self,
+        stream: &CudaStream,
+        blocks: &CudaView<'_, f32>,
+        partial_x: &CudaView<'_, bf16>,
+        conv_weight: &CudaSlice<bf16>,
+        mut conv_state: CudaViewMut<'_, f32>,
+        conv_hidden: Option<&CudaView<'_, bf16>>,
+        mut residual: CudaViewMut<'_, f32>,
+        query: &CudaView<'_, f32>,
+        gate: &mut DepthGateSlot<'_>,
+        m: &impl DeviceIn<f32>,
+        mut out: Option<CudaViewMut<'_, f32>>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        let m = m.view();
+        ensure!(
+            blocks.len().is_multiple_of(HIDDEN),
+            "blocks has {} elements, not a multiple of {HIDDEN}",
+            blocks.len()
+        );
+        let nb = blocks.len() / HIDDEN;
+        ensure!(
+            nb < FUSED_MAX_CANDIDATES,
+            "{nb} blocks; at most {} fit",
+            FUSED_MAX_CANDIDATES - 1
+        );
+        check_len("partial_x", partial_x.len(), HIDDEN)?;
+        check_len("conv_weight", conv_weight.len(), 4 * HIDDEN)?;
+        check_len("conv_state", conv_state.len(), 3 * HIDDEN)?;
+        if let Some(h) = conv_hidden {
+            check_len("conv_hidden", h.len(), HIDDEN)?;
+        }
+        check_len("residual", residual.len(), HIDDEN)?;
+        check_len("query", query.len(), HIDDEN)?;
+        check_len("down weight", gate.down_weight.len(), GATE_RANK * 2 * HIDDEN)?;
+        check_len("input_msg", gate.input_msg.len(), HIDDEN)?;
+        check_len("forget", gate.forget.len(), HIDDEN * GATE_RANK)?;
+        check_len("gain", gate.gain.len(), HIDDEN * GATE_RANK)?;
+        check_len("norm weight", gate.norm_weight.len(), HIDDEN)?;
+        check_len("normed", gate.normed.len(), HIDDEN)?;
+        check_len("m", m.len(), HIDDEN)?;
+        if let Some(out) = &out {
+            check_len("out", out.len(), HIDDEN)?;
+        }
+        if let Some([down, forget, gain]) = gate.fp8 {
+            ensure!(
+                (down.rows(), down.k()) == (GATE_RANK, 2 * HIDDEN)
+                    && [forget, gain]
+                        .iter()
+                        .all(|w| (w.rows(), w.k()) == (HIDDEN, GATE_RANK)),
+                "FP8 gate weight shapes"
+            );
+        }
+        let config = LaunchConfig {
+            grid_dim: (GATE_CLUSTER, 1, 1),
+            block_dim: (GATE_OUT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(blocks, stream)
+            .i32(i32::try_from(nb)?)
+            .ptr(partial_x, stream)
+            .ptr(conv_weight, stream)
+            .ptr_mut(&mut conv_state, stream)
+            .opt(conv_hidden, stream)
+            .ptr_mut(&mut residual, stream)
+            .ptr(query, stream);
+        let fp8 = gate.fp8.is_some();
+        if let Some([down, forget, gain]) = gate.fp8 {
+            args.ptr(&down.values(), stream)
+                .ptr(&down.scales(), stream)
+                .ptr(&gate.input_msg, stream)
+                .ptr(&forget.values(), stream)
+                .ptr(&forget.scales(), stream)
+                .ptr(&gain.values(), stream)
+                .ptr(&gain.scales(), stream);
+        } else {
+            args.ptr(gate.down_weight, stream)
+                .ptr(&gate.input_msg, stream)
+                .ptr(gate.forget, stream)
+                .ptr(gate.gain, stream);
+        }
+        args.ptr(&m, stream)
+            .opt_mut(out.as_mut(), stream)
+            .ptr(gate.norm_weight, stream)
+            .ptr_mut(&mut gate.normed, stream)
+            .f32(eps)
+            .f32((HIDDEN as f32).sqrt().recip());
+        let function = if fp8 {
+            &self.depth_gate_mlp_step_fp8_2304
+        } else {
+            &self.depth_gate_mlp_step_2304
+        };
+        // SAFETY: the arguments match `depth_gate_mlp_step[_fp8]_2304`, every buffer has the
+        // length checked above, the grid is one cluster of 16 blocks, and the kernel reads
+        // only read-only weights before `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 

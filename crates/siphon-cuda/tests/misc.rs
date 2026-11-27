@@ -17,8 +17,9 @@ use siphon_cuda::{
         elementwise::Elementwise,
         linear::{Gemv, Linear, Start},
         linear_fp8::{Fp8Matrix, LinearFp8},
-        misc::{ArgmaxScratch, GATE_SLOTS, GateSlot, GateStep, Misc},
+        misc::{ArgmaxScratch, DepthGateSlot, GATE_SLOTS, GateSlot, GateStep, Misc},
         norm::Norm,
+        routing::{DepthStep, NormDest, Routing, StepPartial},
     },
 };
 
@@ -943,6 +944,371 @@ fn decode_prologue_matches_separate_kernels() -> anyhow::Result<()> {
             bits16(stream.clone_dtoh(&input)?),
             bits16(stream.clone_dtoh(&input_want)?),
             "token {token}: input"
+        );
+    }
+    Ok(())
+}
+
+/// Fused pre-attention `depth_gate_step` matches separate `depth_attention_step` +
+/// `message_gate_step` for both BF16 and FP8 weights, both shared (1 query) and separate
+/// (3 queries) attention inputs, across block counts.
+#[test]
+#[expect(clippy::too_many_lines, reason = "tests BF16 and FP8, shared and separate queries")]
+fn depth_gate_step_matches_separate_kernels() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let misc = Misc::load(gpu.context())?;
+    let routing = Routing::load(gpu.context())?;
+    let linear_fp8 = LinearFp8::load(gpu.context())?;
+
+    let down_w: Vec<CudaSlice<bf16>> = (0..3)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(GATE_RANK * 2 * HIDDEN, 800 + k, 0.1, 0.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let forget_w: Vec<CudaSlice<bf16>> = (0..3)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, 810 + k, 0.1, 0.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let gain_w: Vec<CudaSlice<bf16>> = (0..3)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, 820 + k, 0.1, 0.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let fp8_w: Vec<[Fp8Matrix; 3]> = (0..3)
+        .map(|k| {
+            Ok([
+                linear_fp8.quantize_any(stream, &down_w[k], GATE_RANK, 2 * HIDDEN)?,
+                linear_fp8.quantize_any(stream, &forget_w[k], HIDDEN, GATE_RANK)?,
+                linear_fp8.quantize_any(stream, &gain_w[k], HIDDEN, GATE_RANK)?,
+            ])
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let norm_w: Vec<CudaSlice<bf16>> = (0..3)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN, 830 + k, 0.5, 1.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let msg_half: Vec<CudaSlice<bf16>> = (0..3)
+        .map(|k| Ok(stream.clone_htod(&pseudo_random_bf16(HIDDEN, 840 + k, 0.6, 0.0))?))
+        .collect::<anyhow::Result<_>>()?;
+    let m_buf = stream.clone_htod(&pseudo_random(3 * HIDDEN, 850, 0.7))?;
+    let partial_bf16 = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 851, 0.8, 0.0))?;
+
+    for &(nb, shared, use_fp8) in &[
+        (2usize, true, false),
+        (3, true, true),
+        (4, false, false),
+        (5, false, true),
+    ] {
+        let nq = if shared { 1 } else { 3 };
+        let blocks = stream.clone_htod(&pseudo_random(nb * HIDDEN, 860 + nb as u32, 0.5))?;
+        let queries = stream.clone_htod(&pseudo_random(nq * HIDDEN, 870 + nq as u32, 0.4))?;
+
+        // Reference: depth_attention_step -> message_gate_step.
+        let mut ref_normed_partial = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut ref_attn_in = stream.alloc_zeros::<f32>(nq * HIDDEN)?;
+        let mut ref_gate_in: Vec<CudaSlice<bf16>> = (0..3)
+            .map(|k| {
+                let mut buf = stream.alloc_zeros::<bf16>(2 * HIDDEN)?;
+                stream.memcpy_dtod(&msg_half[k], &mut buf.slice_mut(HIDDEN..))?;
+                Ok(buf)
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let [rg0, rg1, rg2] = &mut ref_gate_in[..] else {
+            unreachable!()
+        };
+        routing.depth_attention_step(
+            stream,
+            DepthStep {
+                blocks: blocks.as_view(),
+                partial: StepPartial::Bf16(partial_bf16.as_view()),
+                normed_partial: Some(ref_normed_partial.as_view_mut()),
+                queries: queries.as_view(),
+                batch: 1,
+                out: Some(ref_attn_in.as_view_mut()),
+                dests: [
+                    Some(NormDest {
+                        out: rg0.slice_mut(..HIDDEN),
+                        weight: None,
+                    }),
+                    Some(NormDest {
+                        out: rg1.slice_mut(..HIDDEN),
+                        weight: None,
+                    }),
+                    Some(NormDest {
+                        out: rg2.slice_mut(..HIDDEN),
+                        weight: None,
+                    }),
+                    None,
+                ],
+                dst_stride: 0,
+            },
+            EPS,
+        )?;
+        let mut ref_out = stream.alloc_zeros::<f32>(3 * HIDDEN)?;
+        let mut ref_qkv: [CudaSlice<bf16>; 3] = [
+            stream.alloc_zeros(HIDDEN)?,
+            stream.alloc_zeros(HIDDEN)?,
+            stream.alloc_zeros(HIDDEN)?,
+        ];
+        let [rq0, rq1, rq2] = &mut ref_qkv;
+        let mut ref_steps = [
+            GateStep {
+                down_weight: &down_w[0],
+                input: rg0.as_view(),
+                forget: &forget_w[0],
+                gain: &gain_w[0],
+                fp8: use_fp8.then_some(&fp8_w[0]),
+                norm: Some((&norm_w[0], rq0.as_view_mut())),
+            },
+            GateStep {
+                down_weight: &down_w[1],
+                input: rg1.as_view(),
+                forget: &forget_w[1],
+                gain: &gain_w[1],
+                fp8: use_fp8.then_some(&fp8_w[1]),
+                norm: Some((&norm_w[1], rq1.as_view_mut())),
+            },
+            GateStep {
+                down_weight: &down_w[2],
+                input: rg2.as_view(),
+                forget: &forget_w[2],
+                gain: &gain_w[2],
+                fp8: use_fp8.then_some(&fp8_w[2]),
+                norm: Some((&norm_w[2], rq2.as_view_mut())),
+            },
+        ];
+        misc.message_gate_step(
+            stream,
+            &mut ref_steps,
+            &ref_attn_in,
+            if shared { 0 } else { HIDDEN },
+            &m_buf,
+            &mut ref_out,
+            None,
+            EPS,
+        )?;
+
+        // Fused kernel.
+        let mut got_normed_partial = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut got_out = stream.alloc_zeros::<f32>(3 * HIDDEN)?;
+        let mut got_qkv: [CudaSlice<bf16>; 3] = [
+            stream.alloc_zeros(HIDDEN)?,
+            stream.alloc_zeros(HIDDEN)?,
+            stream.alloc_zeros(HIDDEN)?,
+        ];
+        let [gq0, gq1, gq2] = &mut got_qkv;
+        let mut slots = [
+            DepthGateSlot {
+                down_weight: &down_w[0],
+                input_msg: msg_half[0].as_view(),
+                forget: &forget_w[0],
+                gain: &gain_w[0],
+                fp8: use_fp8.then_some(&fp8_w[0]),
+                norm_weight: &norm_w[0],
+                normed: gq0.as_view_mut(),
+            },
+            DepthGateSlot {
+                down_weight: &down_w[1],
+                input_msg: msg_half[1].as_view(),
+                forget: &forget_w[1],
+                gain: &gain_w[1],
+                fp8: use_fp8.then_some(&fp8_w[1]),
+                norm_weight: &norm_w[1],
+                normed: gq1.as_view_mut(),
+            },
+            DepthGateSlot {
+                down_weight: &down_w[2],
+                input_msg: msg_half[2].as_view(),
+                forget: &forget_w[2],
+                gain: &gain_w[2],
+                fp8: use_fp8.then_some(&fp8_w[2]),
+                norm_weight: &norm_w[2],
+                normed: gq2.as_view_mut(),
+            },
+        ];
+        let blocks_view = blocks.as_view();
+        let pb_view = partial_bf16.as_view();
+        let q_view = queries.as_view();
+        misc.depth_gate_step(
+            stream,
+            &blocks_view,
+            &pb_view,
+            Some(got_normed_partial.as_view_mut()),
+            &q_view,
+            if shared { 0 } else { HIDDEN },
+            &mut slots,
+            &m_buf,
+            Some(got_out.as_view_mut()),
+            EPS,
+        )?;
+
+        let label = format!("depth_gate_step(nb={nb}, shared={shared}, fp8={use_fp8})");
+        assert_f32_exact(
+            &format!("{label}: normed_partial"),
+            &stream.clone_dtoh(&got_normed_partial)?,
+            &stream.clone_dtoh(&ref_normed_partial)?,
+        );
+        assert_f32_exact(
+            &format!("{label}: out"),
+            &stream.clone_dtoh(&got_out)?,
+            &stream.clone_dtoh(&ref_out)?,
+        );
+        for k in 0..3 {
+            assert_bf16_close(
+                &format!("{label}: qkv[{k}]"),
+                &stream.clone_dtoh(&got_qkv[k])?,
+                &stream.clone_dtoh(&ref_qkv[k])?,
+                0,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fused pre-MLP `depth_gate_mlp_step` matches separate `depth_attention_step` +
+/// `message_gate_step` bit-for-bit (0-ULP) for both BF16 and FP8 weights, with and without
+/// `conv_hidden`, across block counts.
+#[test]
+#[expect(clippy::too_many_lines, reason = "tests BF16 and FP8 pre-MLP fused chain")]
+fn depth_gate_mlp_step_matches_separate_kernels() -> anyhow::Result<()> {
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let misc = Misc::load(gpu.context())?;
+    let routing = Routing::load(gpu.context())?;
+    let linear_fp8 = LinearFp8::load(gpu.context())?;
+
+    let down_w = stream.clone_htod(&pseudo_random_bf16(GATE_RANK * 2 * HIDDEN, 900, 0.1, 0.0))?;
+    let forget_w = stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, 901, 0.1, 0.0))?;
+    let gain_w = stream.clone_htod(&pseudo_random_bf16(HIDDEN * GATE_RANK, 902, 0.1, 0.0))?;
+    let fp8_w = [
+        linear_fp8.quantize_any(stream, &down_w, GATE_RANK, 2 * HIDDEN)?,
+        linear_fp8.quantize_any(stream, &forget_w, HIDDEN, GATE_RANK)?,
+        linear_fp8.quantize_any(stream, &gain_w, HIDDEN, GATE_RANK)?,
+    ];
+    let norm_w = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 903, 0.5, 1.0))?;
+    let msg_half = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 904, 0.6, 0.0))?;
+    let m_buf = stream.clone_htod(&pseudo_random(HIDDEN, 905, 0.7))?;
+    let conv_w = stream.clone_htod(&pseudo_random_bf16(4 * HIDDEN, 906, 0.3, 0.0))?;
+    let query = stream.clone_htod(&pseudo_random(HIDDEN, 907, 0.4))?;
+    let partial_x = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 908, 0.8, 0.0))?;
+    let conv_hidden_buf = stream.clone_htod(&pseudo_random_bf16(HIDDEN, 909, 0.8, 0.0))?;
+    let conv_state_init = pseudo_random(3 * HIDDEN, 910, 0.6);
+
+    for (idx, (nb, with_hidden, use_fp8)) in [
+        (2usize, false, false),
+        (3, true, true),
+        (4, false, true),
+        (5, true, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let blocks = stream.clone_htod(&pseudo_random(nb * HIDDEN, 920 + idx as u32, 0.5))?;
+
+        // Reference: depth_attention_step -> message_gate_step.
+        let mut ref_conv_state = stream.clone_htod(&conv_state_init)?;
+        let mut ref_residual = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut ref_mlp_in = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut ref_gate_in = stream.alloc_zeros::<bf16>(2 * HIDDEN)?;
+        stream.memcpy_dtod(&msg_half, &mut ref_gate_in.slice_mut(HIDDEN..))?;
+        routing.depth_attention_step(
+            stream,
+            DepthStep {
+                blocks: blocks.as_view(),
+                partial: StepPartial::ConvResidual {
+                    x: partial_x.as_view(),
+                    weight: &conv_w,
+                    state: ref_conv_state.as_view_mut(),
+                    hidden: with_hidden.then(|| conv_hidden_buf.as_view()),
+                    residual: ref_residual.as_view_mut(),
+                },
+                normed_partial: None,
+                queries: query.as_view(),
+                batch: 1,
+                out: Some(ref_mlp_in.as_view_mut()),
+                dests: [
+                    None,
+                    None,
+                    None,
+                    Some(NormDest {
+                        out: ref_gate_in.slice_mut(..HIDDEN),
+                        weight: None,
+                    }),
+                ],
+                dst_stride: 0,
+            },
+            EPS,
+        )?;
+        let mut ref_gated = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut ref_mlp_x = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut ref_steps = [GateStep {
+            down_weight: &down_w,
+            input: ref_gate_in.as_view(),
+            forget: &forget_w,
+            gain: &gain_w,
+            fp8: use_fp8.then_some(&fp8_w),
+            norm: Some((&norm_w, ref_mlp_x.as_view_mut())),
+        }];
+        misc.message_gate_step(
+            stream,
+            &mut ref_steps,
+            &ref_mlp_in,
+            0,
+            &m_buf,
+            &mut ref_gated,
+            None,
+            EPS,
+        )?;
+
+        // Fused kernel.
+        let mut got_conv_state = stream.clone_htod(&conv_state_init)?;
+        let mut got_residual = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut got_gated = stream.alloc_zeros::<f32>(HIDDEN)?;
+        let mut got_mlp_x = stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut slot = DepthGateSlot {
+            down_weight: &down_w,
+            input_msg: msg_half.as_view(),
+            forget: &forget_w,
+            gain: &gain_w,
+            fp8: use_fp8.then_some(&fp8_w),
+            norm_weight: &norm_w,
+            normed: got_mlp_x.as_view_mut(),
+        };
+        let blocks_view = blocks.as_view();
+        let px_view = partial_x.as_view();
+        let hid_view = with_hidden.then(|| conv_hidden_buf.as_view());
+        let q_view = query.as_view();
+        misc.depth_gate_mlp_step(
+            stream,
+            &blocks_view,
+            &px_view,
+            &conv_w,
+            got_conv_state.as_view_mut(),
+            hid_view.as_ref(),
+            got_residual.as_view_mut(),
+            &q_view,
+            &mut slot,
+            &m_buf,
+            Some(got_gated.as_view_mut()),
+            EPS,
+        )?;
+
+        let label = format!("depth_gate_mlp_step(nb={nb}, hidden={with_hidden}, fp8={use_fp8})");
+        assert_f32_exact(
+            &format!("{label}: residual"),
+            &stream.clone_dtoh(&got_residual)?,
+            &stream.clone_dtoh(&ref_residual)?,
+        );
+        assert_f32_exact(
+            &format!("{label}: conv_state"),
+            &stream.clone_dtoh(&got_conv_state)?,
+            &stream.clone_dtoh(&ref_conv_state)?,
+        );
+        assert_f32_exact(
+            &format!("{label}: gated"),
+            &stream.clone_dtoh(&got_gated)?,
+            &stream.clone_dtoh(&ref_gated)?,
+        );
+        assert_bf16_close(
+            &format!("{label}: mlp_x"),
+            &stream.clone_dtoh(&got_mlp_x)?,
+            &stream.clone_dtoh(&ref_mlp_x)?,
+            0,
         );
     }
     Ok(())

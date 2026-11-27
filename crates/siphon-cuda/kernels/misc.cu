@@ -654,7 +654,8 @@ __device__ __forceinline__ uint32_t gate_cluster_rank() {
 #if SIPHON_SM89
 // Every block's static shared memory: message_gate_step's 3 clusters, and
 // gate_rows::run's 4 clusters for each of 3 gates.
-__device__ sm89::Mailboxes<3 * kGateCluster, 12288> gate_step_mail;
+__device__ sm89::Mailboxes<3 * kGateCluster, 16384> gate_step_mail;
+__device__ sm89::BarrierState gate_step_barriers[3];
 __device__ sm89::Mailboxes<12 * kGateCluster, 4096> gate_rows_mail;
 __device__ sm89::BarrierState gate_rows_barriers[12];
 #else
@@ -1024,6 +1025,734 @@ message_gate_step_fp8_2304(const uint8_t* __restrict__ down0, const uint8_t* __r
     }
     message_gate_step<true>(wt, input, h + size_t(g) * h_stride, m + size_t(g) * kHidden,
                             out + size_t(g) * kHidden, norm_weight, normed, down, eps);
+}
+
+// ---------------------------------------------------------------------------
+// Fused B=1 decode micro-chains:
+//   - depth_gate_step[_fp8]_2304 (Pre-Attention WITH 3 message gates, grid (16, 3, 1)):
+//     1-query depth attention per gate cluster + unweighted RMSNorm + MessageGate +
+//     weighted RMSNorm into qkv_in[0..3] (and normed_partial from cluster 0).
+//   - depth_gate_mlp_step[_fp8]_2304 (Pre-MLP WITH 1 message gate, grid (16, 1, 1)):
+//     post-attention short_conv_residual + 1-query depth attention + unweighted RMSNorm +
+//     MessageGate + weighted RMSNorm into mlp_x (leaving moe_router_step_2304 separate
+//     so its router weight loads overlap via PDL).
+// ---------------------------------------------------------------------------
+
+namespace depth_gate {
+
+constexpr int kDaBlocks = 5;
+constexpr int kDaPartial = kDaBlocks;
+constexpr int kChPerBlock = kHidden / kGateCluster;  // 144
+constexpr float kShortConvDivisor = static_cast<float>(2.23606797749979);
+
+static_assert(kChPerBlock == kDownCols, "each block covers 144 channels in both phases");
+static_assert(kChPerBlock % 8 == 0, "144 channels is 18 uint4s");
+
+__device__ __forceinline__ float round_to_bf16(float v) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+
+__device__ __forceinline__ float div_short_conv(float x) {
+    const float r = 1.f / kShortConvDivisor;
+    const float q = __fmul_rn(x, r);
+    return copysignf(fmaf(fmaf(-q, kShortConvDivisor, x), r, q), x);
+}
+
+__device__ __forceinline__ float inv_rms_f32(float sum_squares, float eps) {
+#if SIPHON_FAST_MATH
+    return rsqrtf(sum_squares / static_cast<float>(kHidden) + eps);
+#else
+    return 1.f / sqrtf(sum_squares / static_cast<float>(kHidden) + eps);
+#endif
+}
+
+__device__ __forceinline__ float fast_exp(float x) {
+#if SIPHON_FAST_MATH
+    return __expf(x);
+#else
+    return exp2f(__fmul_rn(x, 1.4426950408889634f));
+#endif
+}
+
+// Bit-exact with depth_attention_step_2304's warp_transpose_sum(float[32]) for 8 values.
+__device__ __forceinline__ float warp_transpose_sum8_exact(float (&v)[8]) {
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        v[k] += __shfl_xor_sync(0xffffffffu, v[k], 16);
+        v[k] += __shfl_xor_sync(0xffffffffu, v[k], 8);
+    }
+#pragma unroll
+    for (int half = 4; half >= 1; half /= 2) {
+        const bool upper = (lane & half) != 0;
+#pragma unroll
+        for (int k = 0; k < half; ++k) {
+            const float send = upper ? v[k] : v[k + half];
+            const float keep = upper ? v[k + half] : v[k];
+            v[k] = keep + __shfl_xor_sync(0xffffffffu, send, half);
+        }
+    }
+    return v[0];
+}
+
+__device__ __forceinline__ void load4_f32(const float* p, float (&v)[4]) {
+    const float4 t = *reinterpret_cast<const float4*>(p);
+    v[0] = t.x;
+    v[1] = t.y;
+    v[2] = t.z;
+    v[3] = t.w;
+}
+
+__device__ __forceinline__ void load8_f32(const float* p, int ca, int cb, float (&v)[8]) {
+    const float4 a = *reinterpret_cast<const float4*>(p + ca);
+    const float4 b = *reinterpret_cast<const float4*>(p + cb);
+    v[0] = a.x;
+    v[1] = a.y;
+    v[2] = a.z;
+    v[3] = a.w;
+    v[4] = b.x;
+    v[5] = b.y;
+    v[6] = b.z;
+    v[7] = b.w;
+}
+
+__device__ __forceinline__ void unpack_bf16x4(uint2 packed, float* v) {
+    const auto* vals = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = __bfloat162float(vals[i]);
+    }
+}
+
+__device__ __forceinline__ uint2 pack_bf16x4(const float (&v)[4]) {
+    uint2 packed;
+    auto* vals = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        vals[i] = __float2bfloat16(v[i]);
+    }
+    return packed;
+}
+
+// Replicated 1-query depth attention (0-ULP bit-exact with depth_attention_step_2304, ZERO
+// Phase-1 DSMEM hops) + MessageGate (exact message_gate_step[_fp8]_2304).
+template <bool kFp8, bool kConvResidual>
+__device__ __forceinline__ void run(
+    const float* blocks, int nb, const __nv_bfloat16* partial_bf16,
+    const __nv_bfloat16* __restrict__ conv_weight, float* conv_state, const __nv_bfloat16* conv_hidden,
+    float* residual, float* normed_partial, const float* __restrict__ query,
+    const GateWeights<kFp8>& wt, const __nv_bfloat16* input_msg, const float* m, float* out,
+    const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* normed, float eps, float scale) {
+    // Only Phase 2 (3 barriers) uses st.async; ZERO Phase-1 DSMEM hops!
+    struct MailSmem {
+        __align__(16) float gathered[kGateBlocks][kGateRowsPerRank];  // 512 B
+        __align__(16) __nv_bfloat16 down_s[kGateRank];                // 128 B
+        __align__(16) float norm_parts[kGateBlocks];                  // 128 B
+        __align__(8) uint64_t arrived[3];                             // 24 B
+    };
+    __shared__ MailSmem mail;
+    __shared__ float red[kGateWarps][8];
+    __shared__ float red_norm[kGateWarps];
+    __shared__ __align__(16) float h_smem[kChPerBlock];
+    __shared__ __align__(16) float conv_upd[kConvResidual ? 3 : 1][kConvResidual ? kChPerBlock : 1];
+    __shared__ __align__(16) __nv_bfloat16 x_down_smem[2 * kDownCols];
+    __shared__ __align__(16) float mine[kGateHalves * kGateRank];
+    __shared__ float warp_ss[kGateHalves][kGateWarps];
+
+    union Phase12 {
+        struct {
+            uint4 conv_taps[kConvResidual ? 4 : 1][kConvResidual ? kGateThreads : 1];
+            float q_s[8][kGateThreads];
+        } pre;
+        float item_sums[kGateHalves][kDownItems];
+    };
+    __shared__ __align__(16) Phase12 p23;
+
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const int sub = lane % kLanesPerRow;
+    const int ca = 4 * t;
+    const int cb = 4 * (t + kGateThreads);
+    const uint32_t rank = gate_cluster_rank();
+
+    const uint32_t gather_barrier = gate_smem_addr(&mail.arrived[0]);
+    const uint32_t down_barrier = gate_smem_addr(&mail.arrived[1]);
+    const uint32_t norm_barrier = gate_smem_addr(&mail.arrived[2]);
+
+#if !SIPHON_SM89
+    if (t == 0) {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(gate_smem_addr(&mail.arrived[i])) : "memory");
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        gate_expect(gather_barrier, sizeof(mail.gathered));
+        gate_expect(down_barrier, sizeof(mail.down_s));
+        gate_expect(norm_barrier, sizeof(mail.norm_parts));
+    }
+    if constexpr (!kConvResidual) {
+        asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    }
+#endif
+
+    // Preload all read-only weights before pdl_wait; stage q and conv_taps in SMEM
+    // (reusing Phase 2 item_sums) so register count stays <= 112 regs/thread for
+    // cluster co-residency with gemv_bf16_l32_v12 and prefetch_l2_paced on Blackwell.
+    {
+        float q_pre[8];
+        load8_f32(query, ca, cb, q_pre);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            p23.pre.q_s[e][t] = q_pre[e];
+        }
+    }
+    if constexpr (kConvResidual) {
+        const uint4* cwa = reinterpret_cast<const uint4*>(conv_weight + 4 * ca);
+        const uint4* cwb = reinterpret_cast<const uint4*>(conv_weight + 4 * cb);
+        p23.pre.conv_taps[0][t] = cwa[0];
+        p23.pre.conv_taps[1][t] = cwa[1];
+        p23.pre.conv_taps[2][t] = cwb[0];
+        p23.pre.conv_taps[3][t] = cwb[1];
+    }
+
+    DownChunk<kFp8> dw[kGateHalves][kDownPerThread];
+    RowChunk<kFp8> fw[kGateHalves][kGateSteps];
+    RowChunk<kFp8> gw[kGateHalves][kGateSteps];
+    float forget_scale[kGateHalves];
+    float gain_scale[kGateHalves];
+    float nw[kGateHalves];
+    int rows[kGateHalves];
+    const int ch0 = int(rank) * kChPerBlock;
+#pragma unroll
+    for (int half = 0; half < kGateHalves; ++half) {
+        const int blk = int(rank) * kGateHalves + half;
+        const int col0 = blk * kDownCols;
+#pragma unroll
+        for (int i = 0; i < kDownPerThread; ++i) {
+            const int item = t + i * kGateThreads;
+            const int k = item / kDownChunks;
+            const int ch = item % kDownChunks;
+            dw[half][i] = *reinterpret_cast<const DownChunk<kFp8>*>(wt.down + size_t(k) * 2 * kHidden + col0 + 8 * ch);
+        }
+        rows[half] = blk * kGateRowsPerBlock + warp * kRowsPerWarp + lane / kLanesPerRow;
+#pragma unroll
+        for (int i = 0; i < kGateSteps; ++i) {
+            const int col = i * 4 * kLanesPerRow + sub * 4;
+            fw[half][i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.forget + size_t(rows[half]) * kGateRank + col);
+            gw[half][i] = *reinterpret_cast<const RowChunk<kFp8>*>(wt.gain + size_t(rows[half]) * kGateRank + col);
+        }
+        forget_scale[half] = 1.f;
+        gain_scale[half] = 1.f;
+        if constexpr (kFp8) {
+            forget_scale[half] = wt.forget_scale[rows[half]];
+            gain_scale[half] = wt.gain_scale[rows[half]];
+        }
+        nw[half] = __bfloat162float(norm_weight[rows[half]]);
+    }
+    float down_scale = 1.f;
+    if constexpr (kFp8) {
+        if (t < kGateRowsPerRank) {
+            down_scale = wt.down_scale[int(rank) * kGateRowsPerRank + t];
+        }
+    }
+
+    pdl_trigger();
+    pdl_wait();
+
+    // Phase 1: exact 1-query depth_attention_step_2304 (ZERO DSMEM hops!).
+    // Compute p[8] first, then stream blocks[i] once into s[5][8].
+    const bool own_a = int(rank) < 8 && (t / 36) == int(rank);
+    const bool own_b = int(rank) >= 8 && (t / 36) == int(rank) - 8;
+
+    float p[8];
+    if constexpr (kConvResidual) {
+        const uint4 conv_taps[4] = {
+            p23.pre.conv_taps[0][t], p23.pre.conv_taps[1][t], p23.pre.conv_taps[2][t], p23.pre.conv_taps[3][t]};
+        const auto* cw = reinterpret_cast<const __nv_bfloat16*>(conv_taps);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int col = half == 0 ? ca : cb;
+            const bool own = half == 0 ? own_a : own_b;
+            float xh[4];
+            unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + col), xh);
+            float w0[4], w1[4], w2[4];
+            load4_f32(conv_state + col, w0);
+            load4_f32(conv_state + kHidden + col, w1);
+            load4_f32(conv_state + 2 * kHidden + col, w2);
+            float hid[4];
+            if (conv_hidden != nullptr) {
+                unpack_bf16x4(*reinterpret_cast<const uint2*>(conv_hidden + col), hid);
+            }
+            const int base = 4 * half;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                float acc = 0.f;
+                acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(w0[e]), __bfloat162float(cw[4 * (base + e) + 0])));
+                acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(w1[e]), __bfloat162float(cw[4 * (base + e) + 1])));
+                acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(w2[e]), __bfloat162float(cw[4 * (base + e) + 2])));
+                acc = __fadd_rn(acc, __fmul_rn(round_to_bf16(xh[e]), __bfloat162float(cw[4 * (base + e) + 3])));
+                const float y = round_to_bf16(div_short_conv(__fadd_rn(round_to_bf16(acc), xh[e])));
+                p[base + e] = conv_hidden != nullptr ? __fadd_rn(hid[e], y) : y;
+            }
+            if (own) {
+                *reinterpret_cast<float4*>(residual + col) =
+                    make_float4(p[base], p[base + 1], p[base + 2], p[base + 3]);
+                const int off = col - ch0;
+                *reinterpret_cast<float4*>(conv_upd[0] + off) = make_float4(w1[0], w1[1], w1[2], w1[3]);
+                *reinterpret_cast<float4*>(conv_upd[1] + off) = make_float4(w2[0], w2[1], w2[2], w2[3]);
+                *reinterpret_cast<float4*>(conv_upd[2] + off) = make_float4(xh[0], xh[1], xh[2], xh[3]);
+            }
+        }
+        // Order all blocks' conv_state reads (and mbarrier.init) before any block writes conv_state
+        // after barrier.cluster.wait below — zero extra cluster barriers!
+        __syncthreads();
+#if !SIPHON_SM89
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+#endif
+    } else {
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + ca), p);
+        unpack_bf16x4(*reinterpret_cast<const uint2*>(partial_bf16 + cb), p + 4);
+    }
+
+    float q[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        q[e] = p23.pre.q_s[e][t];
+    }
+    float s[kDaBlocks][8];
+    float v[8] = {};
+#pragma unroll
+    for (int i = 0; i < kDaBlocks; ++i) {
+        if (i < nb) {
+            load8_f32(blocks + size_t(i) * kHidden, ca, cb, s[i]);
+            float acc = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                acc = fmaf(s[i][e], q[e], acc);
+            }
+            v[i] = acc;
+        }
+    }
+    {
+        float acc_q = 0.f;
+        float acc_s = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            acc_q = fmaf(p[e], q[e], acc_q);
+            acc_s = fmaf(p[e], p[e], acc_s);
+        }
+        v[kDaPartial] = acc_q;
+        v[kDaPartial + 1] = acc_s;
+    }
+    const float wdot = warp_transpose_sum8_exact(v);
+    if (lane < 8) {
+        red[warp][lane] = wdot;
+    }
+    __syncthreads();
+    float tot = 0.f;
+    if (lane < 8) {
+#pragma unroll
+        for (int w = 0; w < kGateWarps; ++w) {
+            tot += red[w][lane];
+        }
+    }
+    const float squares = __shfl_sync(0xffffffffu, tot, kDaPartial + 1);
+    const float inv_p = inv_rms_f32(squares, eps);
+
+    if constexpr (!kConvResidual) {
+        if (normed_partial != nullptr && blockIdx.y == 0) {
+            if (own_a) {
+                *reinterpret_cast<float4*>(normed_partial + ca) =
+                    make_float4(p[0] * inv_p, p[1] * inv_p, p[2] * inv_p, p[3] * inv_p);
+            }
+            if (own_b) {
+                *reinterpret_cast<float4*>(normed_partial + cb) =
+                    make_float4(p[4] * inv_p, p[5] * inv_p, p[6] * inv_p, p[7] * inv_p);
+            }
+        }
+    }
+
+    const bool valid = lane < nb || lane == kDaPartial;
+    const float logit_da = valid ? (lane == kDaPartial ? tot * inv_p : tot) * scale : -INFINITY;
+    float mx = logit_da;
+#pragma unroll
+    for (int offset = 1; offset < 8; offset *= 2) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, offset));
+    }
+    const float ex = valid ? fast_exp(logit_da - mx) : 0.f;
+    float z = ex;
+#pragma unroll
+    for (int offset = 1; offset < 8; offset *= 2) {
+        z += __shfl_xor_sync(0xffffffffu, z, offset);
+    }
+    const float prob = valid ? ex / z : 0.f;
+    float pr[kDaBlocks + 1];
+#pragma unroll
+    for (int i = 0; i <= kDaBlocks; ++i) {
+        pr[i] = __shfl_sync(0xffffffffu, prob, i);
+    }
+
+    float h_vec[8];
+    const float pp = pr[kDaPartial] * inv_p;
+    float h_acc = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < kDaBlocks; ++i) {
+            if (i < nb) {
+                acc = fmaf(pr[i], s[i][e], acc);
+            }
+        }
+        h_vec[e] = fmaf(pp, p[e], acc);
+        h_acc = fmaf(h_vec[e], h_vec[e], h_acc);
+    }
+    // Stage this block's 144 channels of `h` directly into local SMEM.
+    if (own_a) {
+        *reinterpret_cast<float4*>(h_smem + (ca - ch0)) =
+            make_float4(h_vec[0], h_vec[1], h_vec[2], h_vec[3]);
+    }
+    if (own_b) {
+        *reinterpret_cast<float4*>(h_smem + (cb - ch0)) =
+            make_float4(h_vec[4], h_vec[5], h_vec[6], h_vec[7]);
+    }
+    h_acc = warp_sum(h_acc);
+    if (lane == 0) {
+        red_norm[warp] = h_acc;
+    }
+    __syncthreads();
+
+    // Ranks 0..7 stage their 288 BF16 `h_norm` channels directly into local SMEM `x_down_smem`.
+    if (rank < kGateCluster / 2) {
+        float h_sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < kGateWarps; ++w) {
+            h_sum += red_norm[w];
+        }
+        const float inv_h = inv_rms_f32(h_sum, eps);
+        const int d0 = int(rank) * 2 * kDownCols;
+        if (rank < 4 && (t / 72) == int(rank)) {
+            const float hn[4] = {h_vec[0] * inv_h, h_vec[1] * inv_h, h_vec[2] * inv_h, h_vec[3] * inv_h};
+            *reinterpret_cast<uint2*>(x_down_smem + (ca - d0)) = pack_bf16x4(hn);
+        } else if (rank >= 4 && (t / 72) == int(rank) - 4) {
+            const float hn[4] = {h_vec[4] * inv_h, h_vec[5] * inv_h, h_vec[6] * inv_h, h_vec[7] * inv_h};
+            *reinterpret_cast<uint2*>(x_down_smem + (cb - d0)) = pack_bf16x4(hn);
+        }
+        __syncthreads();
+    }
+
+    // Phase 2: MessageGate (exact message_gate_step_2304 / message_gate_step_fp8_2304).
+    float hv[kGateHalves] = {};
+    float mv[kGateHalves] = {};
+    if (sub == 0) {
+#pragma unroll
+        for (int half = 0; half < kGateHalves; ++half) {
+            hv[half] = h_smem[rows[half] - ch0];
+            mv[half] = m[rows[half]];
+        }
+    }
+    if (rank < kGateCluster / 2) {
+#pragma unroll
+        for (int half = 0; half < kGateHalves; ++half) {
+#pragma unroll
+            for (int i = 0; i < kDownPerThread; ++i) {
+                const int item = t + i * kGateThreads;
+                const int ch = item % kDownChunks;
+                const uint4 x = *reinterpret_cast<const uint4*>(x_down_smem + half * kDownCols + 8 * ch);
+                p23.item_sums[half][item] = dot8(dw[half][i], x);
+            }
+        }
+    } else {
+        const int msg_base = (int(rank) - kGateCluster / 2) * kGateHalves * kDownCols;
+#pragma unroll
+        for (int half = 0; half < kGateHalves; ++half) {
+            const int col0 = msg_base + half * kDownCols;
+#pragma unroll
+            for (int i = 0; i < kDownPerThread; ++i) {
+                const int item = t + i * kGateThreads;
+                const int ch = item % kDownChunks;
+                const uint4 x = *reinterpret_cast<const uint4*>(input_msg + col0 + 8 * ch);
+                p23.item_sums[half][item] = dot8(dw[half][i], x);
+            }
+        }
+    }
+    __syncthreads();
+    if (t < kGateHalves * kGateRank) {
+        const int half = t / kGateRank;
+        const int r = t % kGateRank;
+        float acc = 0.f;
+#pragma unroll
+        for (int ch = 0; ch < kDownChunks; ++ch) {
+            acc += p23.item_sums[half][r * kDownChunks + ch];
+        }
+        mine[t] = acc;
+    }
+    __syncthreads();
+#if SIPHON_SM89
+    if constexpr (kConvResidual) {
+        sm89::barrier(gate_step_barriers, 3, kGateCluster);
+    }
+#else
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
+    if (t < kGateCluster * kGateHalves) {
+        const uint32_t dst_rank = uint32_t(t / kGateHalves);
+        const int half = t % kGateHalves;
+        const float4 v4 = reinterpret_cast<const float4*>(mine + half * kGateRank)[dst_rank];
+#if SIPHON_SM89
+        gate_step_mail.send<4>(kGateCluster, int(dst_rank),
+                               gate_smem_addr(&mail.gathered[int(rank) * kGateHalves + half][0]), gather_barrier,
+                               {__float_as_uint(v4.x), __float_as_uint(v4.y), __float_as_uint(v4.z),
+                                __float_as_uint(v4.w)});
+#else
+        const uint32_t dst =
+            gate_cluster_addr(gate_smem_addr(&mail.gathered[int(rank) * kGateHalves + half][0]), dst_rank);
+        asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                     ::"r"(dst), "r"(__float_as_uint(v4.x)), "r"(__float_as_uint(v4.y)), "r"(__float_as_uint(v4.z)),
+                     "r"(__float_as_uint(v4.w)), "r"(gate_cluster_addr(gather_barrier, dst_rank))
+                     : "memory");
+#endif
+    }
+    if constexpr (kConvResidual) {
+        // Warps 1..2 write this rank's 144 conv_state channels hidden behind warp 0's gather_barrier wait.
+        if (t >= 32 && t < 32 + kChPerBlock / 4) {
+            const int off = 4 * (t - 32);
+            const int col = ch0 + off;
+            *reinterpret_cast<float4*>(conv_state + col) =
+                *reinterpret_cast<const float4*>(conv_upd[0] + off);
+            *reinterpret_cast<float4*>(conv_state + kHidden + col) =
+                *reinterpret_cast<const float4*>(conv_upd[1] + off);
+            *reinterpret_cast<float4*>(conv_state + 2 * kHidden + col) =
+                *reinterpret_cast<const float4*>(conv_upd[2] + off);
+        }
+    }
+    if (warp == 0) {
+        gate_wait<false, false>(gather_barrier, mail.gathered, sizeof(mail.gathered));
+        float acc = 0.f;
+        if (lane < kGateRowsPerRank) {
+#pragma unroll 8
+            for (int b = 0; b < kGateBlocks; ++b) {
+                acc += mail.gathered[b][lane];
+            }
+        }
+        const __nv_bfloat16 d = __float2bfloat16(kFp8 ? down_scale * acc : acc);
+        const uint32_t bits = __bfloat16_as_ushort(d);
+        const uint32_t b1 = __shfl_sync(0xffffffffu, bits, 1);
+        const uint32_t b2 = __shfl_sync(0xffffffffu, bits, 2);
+        const uint32_t b3 = __shfl_sync(0xffffffffu, bits, 3);
+        const uint32_t b0 = __shfl_sync(0xffffffffu, bits, 0);
+        if (lane < kGateCluster) {
+#if SIPHON_SM89
+            gate_step_mail.send<2>(kGateCluster, lane, gate_smem_addr(mail.down_s + int(rank) * kGateRowsPerRank),
+                                   down_barrier, {b0 | (b1 << 16), b2 | (b3 << 16)});
+#else
+            const uint32_t dst =
+                gate_cluster_addr(gate_smem_addr(mail.down_s + int(rank) * kGateRowsPerRank), uint32_t(lane));
+            asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];"
+                         ::"r"(dst), "r"(b0 | (b1 << 16)), "r"(b2 | (b3 << 16)),
+                         "r"(gate_cluster_addr(down_barrier, uint32_t(lane)))
+                         : "memory");
+#endif
+        }
+    }
+    gate_wait<true, false>(down_barrier, mail.down_s, sizeof(mail.down_s));
+
+    float o[kGateHalves];
+#pragma unroll
+    for (int half = 0; half < kGateHalves; ++half) {
+        float f = 0.f;
+        float gg = 0.f;
+#pragma unroll
+        for (int i = 0; i < kGateSteps; ++i) {
+            const int col = i * 4 * kLanesPerRow + sub * 4;
+            const uint2 packed = *reinterpret_cast<const uint2*>(mail.down_s + col);
+            const auto* xv = reinterpret_cast<const __nv_bfloat16*>(&packed);
+            float fv[4];
+            float gv[4];
+            unpack4(fw[half][i], fv);
+            unpack4(gw[half][i], gv);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float x = __bfloat162float(xv[k]);
+                f = ffma(fv[k], x, f);
+                gg = ffma(gv[k], x, gg);
+            }
+        }
+#pragma unroll
+        for (int offset = kLanesPerRow / 2; offset > 0; offset /= 2) {
+            f = fadd(f, __shfl_down_sync(0xffffffffu, f, offset));
+            gg = fadd(gg, __shfl_down_sync(0xffffffffu, gg, offset));
+        }
+        if constexpr (kFp8) {
+            f = fmul(forget_scale[half], f);
+            gg = fmul(gain_scale[half], gg);
+        }
+        o[half] = 0.f;
+        if (sub == 0) {
+            o[half] = fadd(fmul(fsub(1.f, tanhf(f)), hv[half]), fmul(tanhf(gg), mv[half]));
+            if (out != nullptr) {
+                out[rows[half]] = o[half];
+            }
+        }
+    }
+#pragma unroll
+    for (int half = 0; half < kGateHalves; ++half) {
+        const float ss = warp_sum(o[half] * o[half]);
+        if (lane == 0) {
+            warp_ss[half][warp] = ss;
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float acc = 0.f;
+        if (lane < kGateHalves) {
+#pragma unroll
+            for (int w = 0; w < kGateWarps; ++w) {
+                acc += warp_ss[lane][w];
+            }
+        }
+        const float s0 = __shfl_sync(0xffffffffu, acc, 0);
+        const float s1 = __shfl_sync(0xffffffffu, acc, 1);
+        if (lane < kGateCluster) {
+#if SIPHON_SM89
+            gate_step_mail.send<2>(kGateCluster, lane, gate_smem_addr(mail.norm_parts + int(rank) * kGateHalves),
+                                   norm_barrier, {__float_as_uint(s0), __float_as_uint(s1)});
+#else
+            const uint32_t dst =
+                gate_cluster_addr(gate_smem_addr(mail.norm_parts + int(rank) * kGateHalves), uint32_t(lane));
+            asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];"
+                         ::"r"(dst), "r"(__float_as_uint(s0)), "r"(__float_as_uint(s1)),
+                         "r"(gate_cluster_addr(norm_barrier, uint32_t(lane)))
+                         : "memory");
+#endif
+        }
+    }
+    gate_wait<true, false>(norm_barrier, mail.norm_parts, sizeof(mail.norm_parts));
+    const float total = warp_sum(mail.norm_parts[lane]);
+    const float inv = inv_rms_f32(total, eps);
+    if (sub == 0) {
+#pragma unroll
+        for (int half = 0; half < kGateHalves; ++half) {
+            normed[rows[half]] = __float2bfloat16((o[half] * inv) * nw[half]);
+        }
+    }
+}
+
+}  // namespace depth_gate
+
+// Pre-attention depth attention + 3 message gates (BF16 weights), grid (16, 3, 1), 288 threads.
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
+depth_gate_step_2304(const float* blocks, int nb, const __nv_bfloat16* partial_bf16, float* normed_partial,
+                     const float* __restrict__ queries, int q_stride,
+                     const __nv_bfloat16* __restrict__ down_weight0,
+                     const __nv_bfloat16* __restrict__ down_weight1,
+                     const __nv_bfloat16* __restrict__ down_weight2, const __nv_bfloat16* input0,
+                     const __nv_bfloat16* input1, const __nv_bfloat16* input2,
+                     const __nv_bfloat16* __restrict__ forget0, const __nv_bfloat16* __restrict__ forget1,
+                     const __nv_bfloat16* __restrict__ forget2, const __nv_bfloat16* __restrict__ gain0,
+                     const __nv_bfloat16* __restrict__ gain1, const __nv_bfloat16* __restrict__ gain2,
+                     const float* m, float* out, const __nv_bfloat16* __restrict__ norm_weight0,
+                     const __nv_bfloat16* __restrict__ norm_weight1,
+                     const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
+                     __nv_bfloat16* normed1, __nv_bfloat16* normed2, float eps, float scale) {
+    const int g = blockIdx.y;
+    GateWeights<false> wt{down_weight0, nullptr, forget0, nullptr, gain0, nullptr};
+    const __nv_bfloat16* input_msg = input0;
+    const __nv_bfloat16* norm_weight = norm_weight0;
+    __nv_bfloat16* normed = normed0;
+    if (g == 1) {
+        wt = {down_weight1, nullptr, forget1, nullptr, gain1, nullptr};
+        input_msg = input1;
+        norm_weight = norm_weight1;
+        normed = normed1;
+    } else if (g == 2) {
+        wt = {down_weight2, nullptr, forget2, nullptr, gain2, nullptr};
+        input_msg = input2;
+        norm_weight = norm_weight2;
+        normed = normed2;
+    }
+    float* out_g = out != nullptr ? out + size_t(g) * kHidden : nullptr;
+    depth_gate::run<false, false>(blocks, nb, partial_bf16, nullptr, nullptr, nullptr, nullptr, normed_partial,
+                                  queries + size_t(g) * q_stride, wt, input_msg, m + size_t(g) * kHidden,
+                                  out_g, norm_weight, normed, eps, scale);
+}
+
+// Pre-attention depth attention + 3 message gates (FP8 weights), grid (16, 3, 1), 288 threads.
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
+depth_gate_step_fp8_2304(const float* blocks, int nb, const __nv_bfloat16* partial_bf16,
+                         float* normed_partial, const float* __restrict__ queries, int q_stride,
+                         const uint8_t* __restrict__ down_weight0, const uint8_t* __restrict__ down_weight1,
+                         const uint8_t* __restrict__ down_weight2, const float* __restrict__ down_scale0,
+                         const float* __restrict__ down_scale1, const float* __restrict__ down_scale2,
+                         const __nv_bfloat16* input0, const __nv_bfloat16* input1,
+                         const __nv_bfloat16* input2, const uint8_t* __restrict__ forget0,
+                         const uint8_t* __restrict__ forget1, const uint8_t* __restrict__ forget2,
+                         const float* __restrict__ forget_scale0, const float* __restrict__ forget_scale1,
+                         const float* __restrict__ forget_scale2, const uint8_t* __restrict__ gain0,
+                         const uint8_t* __restrict__ gain1, const uint8_t* __restrict__ gain2,
+                         const float* __restrict__ gain_scale0, const float* __restrict__ gain_scale1,
+                         const float* __restrict__ gain_scale2, const float* m, float* out,
+                         const __nv_bfloat16* __restrict__ norm_weight0,
+                         const __nv_bfloat16* __restrict__ norm_weight1,
+                         const __nv_bfloat16* __restrict__ norm_weight2, __nv_bfloat16* normed0,
+                         __nv_bfloat16* normed1, __nv_bfloat16* normed2, float eps, float scale) {
+    const int g = blockIdx.y;
+    GateWeights<true> wt{down_weight0, down_scale0, forget0, forget_scale0, gain0, gain_scale0};
+    const __nv_bfloat16* input_msg = input0;
+    const __nv_bfloat16* norm_weight = norm_weight0;
+    __nv_bfloat16* normed = normed0;
+    if (g == 1) {
+        wt = {down_weight1, down_scale1, forget1, forget_scale1, gain1, gain_scale1};
+        input_msg = input1;
+        norm_weight = norm_weight1;
+        normed = normed1;
+    } else if (g == 2) {
+        wt = {down_weight2, down_scale2, forget2, forget_scale2, gain2, gain_scale2};
+        input_msg = input2;
+        norm_weight = norm_weight2;
+        normed = normed2;
+    }
+    float* out_g = out != nullptr ? out + size_t(g) * kHidden : nullptr;
+    depth_gate::run<true, false>(blocks, nb, partial_bf16, nullptr, nullptr, nullptr, nullptr, normed_partial,
+                                 queries + size_t(g) * q_stride, wt, input_msg, m + size_t(g) * kHidden,
+                                 out_g, norm_weight, normed, eps, scale);
+}
+
+// Pre-MLP short_conv_residual + depth attention + message gate (BF16), grid (16, 1, 1),
+// 288 threads. Leaves moe_router_step_2304 separate so its router weight loads overlap via PDL.
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
+depth_gate_mlp_step_2304(const float* blocks, int nb, const __nv_bfloat16* partial_bf16,
+                         const __nv_bfloat16* __restrict__ conv_weight, float* conv_state,
+                         const __nv_bfloat16* conv_hidden, float* residual,
+                         const float* __restrict__ queries,
+                         const __nv_bfloat16* __restrict__ down_weight0, const __nv_bfloat16* input0,
+                         const __nv_bfloat16* __restrict__ forget0,
+                         const __nv_bfloat16* __restrict__ gain0, const float* m, float* out,
+                         const __nv_bfloat16* __restrict__ norm_weight0, __nv_bfloat16* normed0,
+                         float eps, float scale) {
+    GateWeights<false> wt{down_weight0, nullptr, forget0, nullptr, gain0, nullptr};
+    depth_gate::run<false, true>(blocks, nb, partial_bf16, conv_weight, conv_state, conv_hidden, residual,
+                                 nullptr, queries, wt, input0, m, out, norm_weight0, normed0, eps, scale);
+}
+
+// Pre-MLP short_conv_residual + depth attention + message gate (FP8), grid (16, 1, 1),
+// 288 threads. Leaves moe_router_step_2304 separate so its router weight loads overlap via PDL.
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kGateCluster) __launch_bounds__(kGateThreads)
+depth_gate_mlp_step_fp8_2304(const float* blocks, int nb, const __nv_bfloat16* partial_bf16,
+                             const __nv_bfloat16* __restrict__ conv_weight, float* conv_state,
+                             const __nv_bfloat16* conv_hidden, float* residual,
+                             const float* __restrict__ queries,
+                             const uint8_t* __restrict__ down_weight0,
+                             const float* __restrict__ down_scale0, const __nv_bfloat16* input0,
+                             const uint8_t* __restrict__ forget0,
+                             const float* __restrict__ forget_scale0, const uint8_t* __restrict__ gain0,
+                             const float* __restrict__ gain_scale0, const float* m, float* out,
+                             const __nv_bfloat16* __restrict__ norm_weight0, __nv_bfloat16* normed0,
+                             float eps, float scale) {
+    GateWeights<true> wt{down_weight0, down_scale0, forget0, forget_scale0, gain0, gain_scale0};
+    depth_gate::run<true, true>(blocks, nb, partial_bf16, conv_weight, conv_state, conv_hidden, residual,
+                                nullptr, queries, wt, input0, m, out, norm_weight0, normed0, eps, scale);
 }
 
 // ---------------------------------------------------------------------------
