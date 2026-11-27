@@ -369,3 +369,40 @@ fn rows_against_decode_and_prefill() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn pruned_slots_are_skipped_across_all_tiers() -> anyhow::Result<()> {
+    let s = Setup::new()?;
+    let stream = s.stream();
+    let mut sync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(MAX_ROWS))?;
+    for fp4 in [true, false] {
+        let l = layer(&s, fp4)?;
+        let x = common::pseudo_random_bf16(48 * HIDDEN, 23, 1.0, 0.0);
+        let full_ids = routing(48, 29);
+        let (full_act, full_out) = run_rows(&s, &l, &x, &full_ids, &mut sync)?;
+        for &m in &[1usize, 4, 16, 48] {
+            let mut pruned_ids = full_ids[..m * SLOTS].to_vec();
+            for r in 0..m {
+                pruned_ids[r * SLOTS + 6] = -1;
+                pruned_ids[r * SLOTS + 7] = -1;
+            }
+            let (act, out) = run_rows(&s, &l, &x[..m * HIDDEN], &pruned_ids, &mut sync)?;
+            for r in 0..m {
+                for slot in 0..6 {
+                    let pair = r * SLOTS + slot;
+                    let a_range = pair * INTERMEDIATE..(pair + 1) * INTERMEDIATE;
+                    let o_range = pair * HIDDEN..(pair + 1) * HIDDEN;
+                    assert!(
+                        same(&act[a_range.clone()], &full_act[a_range]),
+                        "fp4={fp4} m={m} row={r} slot={slot}: active act changed with pruning"
+                    );
+                    assert!(
+                        same(&out[o_range.clone()], &full_out[o_range]),
+                        "fp4={fp4} m={m} row={r} slot={slot}: active out changed with pruning"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

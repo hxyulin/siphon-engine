@@ -28,6 +28,8 @@ use crate::{
 
 /// Most rows one call takes.
 pub const MAX_ROWS: usize = 256;
+/// Most rows the 8-pair single-group inline kernel takes (`kSingleMaxRows` in the kernel).
+const SINGLE_MAX_ROWS: usize = 8;
 /// Most rows the single-kernel shared-memory path takes (`kMaxRows` in the kernel).
 const INLINE_MAX_ROWS: usize = 32;
 /// `u32` words of `ExpertRowsMeta`'s fixed header (`offsetof(ExpertRowsMeta, pair_list) / 4`).
@@ -58,10 +60,14 @@ const fn smem(ring: usize) -> usize {
 
 #[derive(Debug)]
 pub struct ExpertsRows {
-    /// By ring ([`RINGS`]), then NVFP4 and MXFP8 (for `m <= 32`).
+    /// By ring ([`RINGS`]), then NVFP4 and MXFP8 (for `m <= 8`).
     kernels: [[CudaFunction; 2]; 2],
-    /// Blocks of each inline kernel that fit on the GPU at once.
+    /// Blocks of each single-group kernel that fit on the GPU at once.
     blocks: [[usize; 2]; 2],
+    /// Inline multi-group 8-pair MLP kernels (`9 <= m <= 32`), NVFP4 and MXFP8.
+    multi_kernels: [CudaFunction; 2],
+    /// Blocks of each multi-group kernel that fit on the GPU at once.
+    multi_blocks: [usize; 2],
     /// 1-block grouping kernel for `m > 32`.
     group: CudaFunction,
     /// Resident wide MLP kernels (`m > 32`), NVFP4 and MXFP8.
@@ -111,6 +117,10 @@ impl ExpertsRows {
         };
         let (shallow, shallow_blocks) = load_ring(RINGS[0])?;
         let (deep, deep_blocks) = load_ring(RINGS[1])?;
+        let (multi_nvfp4, multi_nvfp4_blocks) =
+            load("expert_mlp_rows_multi_nvfp4_3", smem(RINGS[0]))?;
+        let (multi_mxfp8, multi_mxfp8_blocks) =
+            load("expert_mlp_rows_multi_mxfp8_3", smem(RINGS[0]))?;
         let group = module.load_function("expert_group_rows")?;
         let (wide_nvfp4, wide_nvfp4_blocks) =
             load("expert_mlp_rows_wide_nvfp4_3", smem(RINGS[0]))?;
@@ -119,6 +129,8 @@ impl ExpertsRows {
         Ok(Self {
             kernels: [shallow, deep],
             blocks: [shallow_blocks, deep_blocks],
+            multi_kernels: [multi_nvfp4, multi_mxfp8],
+            multi_blocks: [multi_nvfp4_blocks, multi_mxfp8_blocks],
             group,
             wide_kernels: [wide_nvfp4, wide_mxfp8],
             wide_blocks: [wide_nvfp4_blocks, wide_mxfp8_blocks],
@@ -283,7 +295,20 @@ impl ExpertsRows {
             return unsafe { args.launch_pdl(stream, &self.wide_kernels[format], config) };
         }
 
-        let ring = usize::from(m <= DEEP_RING_ROWS);
+        let (kernel, grid_blocks, ring_slots) = if m <= SINGLE_MAX_ROWS {
+            let ring = usize::from(m <= DEEP_RING_ROWS);
+            (
+                &self.kernels[ring][format],
+                self.blocks[ring][format],
+                RINGS[ring],
+            )
+        } else {
+            (
+                &self.multi_kernels[format],
+                self.multi_blocks[format],
+                RINGS[0],
+            )
+        };
         let mut args = KernelArgs::default();
         args.ptr(&x, stream)
             .ptr(&indices, stream)
@@ -299,15 +324,11 @@ impl ExpertsRows {
             .f32(up_softcap)
             .ptr_mut(&mut sync, stream);
         let config = LaunchConfig {
-            grid_dim: (
-                u32::try_from(self.blocks[ring][format]).context("grid")?,
-                1,
-                1,
-            ),
+            grid_dim: (u32::try_from(grid_blocks).context("grid")?, 1, 1),
             block_dim: (u32::try_from(WARPS * 32)?, 1, 1),
-            shared_mem_bytes: u32::try_from(smem(RINGS[ring]))?,
+            shared_mem_bytes: u32::try_from(smem(ring_slots))?,
         };
-        // SAFETY: the arguments match `expert_mlp_rows_*(const bf16*, const int*, int,
+        // SAFETY: the arguments match `expert_mlp_rows[_multi]_*(const bf16*, const int*, int,
         // const u8*, const u8*, const float*, const u8*, const u8*, const float*, bf16*,
         // bf16*, float, float, unsigned*)`. The checks above give `x` m rows of 2304, `act`
         // and `out` 8 m pairs of 1152 and 2304, the weights the kernel's shapes for every
@@ -315,7 +336,7 @@ impl ExpertsRows {
         // leaves them. The grid holds only blocks that fit on the GPU at once with the
         // ring's shared memory, which the kernel's waits need. Only the NVFP4 kernels read
         // the global scales. The kernel reads nothing before `pdl_wait`.
-        unsafe { args.launch_pdl(stream, &self.kernels[ring][format], config) }
+        unsafe { args.launch_pdl(stream, kernel, config) }
     }
 }
 
