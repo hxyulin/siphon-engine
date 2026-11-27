@@ -2592,7 +2592,46 @@ impl Ctx {
             .as_mut()
             .context("the verify buffers are missing")?;
         let spec = &self.kernels.spec;
-        if self.accept_margin > 0.0 && !v.tree_active {
+        if let (Some(beta), false, Some(sample)) =
+            (self.spec_beta, v.tree_active, p.sample.as_mut())
+        {
+            let head_logits = p
+                .head_logits
+                .as_mut()
+                .context("the head_logits buffer is missing")?;
+            self.lm_head_rows(
+                rows(&p.final_hidden, m, self.hidden()),
+                rows_mut(head_logits, m, padded),
+                m,
+                true,
+                None,
+            )?;
+            self.kernels.sample.run_beta_bf16(
+                &self.stream,
+                &rows(head_logits, m, padded),
+                vocab,
+                padded,
+                cfg.final_logit_softcapping,
+                &rows(&p.tokens, m, 1),
+                m,
+                &v.draft_cand,
+                &v.draft_q,
+                crate::draft::STEPS,
+                beta,
+                sample,
+                &mut v.argmax.slice_mut(..m),
+            )?;
+            spec.accept_beta(
+                &self.stream,
+                &rows(&p.tokens, m, 1),
+                &v.argmax.slice(..m),
+                &sample.accept_flags(m),
+                &v.keep,
+                m,
+                &mut v.result,
+                &mut v.anchor,
+            )?;
+        } else if self.accept_margin > 0.0 && !v.tree_active {
             let head_logits = p
                 .head_logits
                 .as_mut()
@@ -2764,8 +2803,42 @@ impl Ctx {
         let cfg = &self.config;
         let (vocab, padded) = (cfg.unpadded_vocab_size, cfg.vocab_size);
         let b = p.batch.as_mut().context("the batch buffers are missing")?;
+        let use_beta = b.verify.is_some() && self.spec_beta.is_some() && p.sample.is_some();
         let use_margin = b.verify.is_some() && self.accept_margin > 0.0;
-        if use_margin {
+        if use_beta {
+            let beta = self.spec_beta.context("spec_beta missing")?;
+            let width = b.verify.as_ref().context("verify state missing")?.width;
+            let seqs = m / width;
+            let cand_n = seqs * crate::draft::STEPS * crate::ops::sample::BETA_CAND_K;
+            let head_logits = p
+                .head_logits
+                .as_mut()
+                .context("the head_logits buffer is missing")?;
+            self.lm_head_rows(
+                rows(&p.final_hidden, m, self.hidden()),
+                rows_mut(head_logits, m, padded),
+                m,
+                true,
+                Some(&mut p.gate.dense),
+            )?;
+            let bv = b.verify.as_ref().context("verify state missing")?;
+            let sample = p.sample.as_mut().context("sample buffers missing")?;
+            self.kernels.sample.run_beta_bf16(
+                &self.stream,
+                &rows(head_logits, m, padded),
+                vocab,
+                padded,
+                cfg.final_logit_softcapping,
+                &rows(&p.tokens, m, 1),
+                width,
+                &bv.draft_cand.slice(..cand_n),
+                &bv.draft_q.slice(..cand_n),
+                crate::draft::STEPS,
+                beta,
+                sample,
+                &mut b.argmax.slice_mut(..m),
+            )?;
+        } else if use_margin {
             let head_logits = p
                 .head_logits
                 .as_mut()
@@ -2844,7 +2917,20 @@ impl Ctx {
             let keep = bv.keep.slice(..seqs);
             let mut results = bv.results.slice_mut(..seqs * RESULT_LEN);
             let mut anchors = bv.anchors.slice_mut(..seqs);
-            if use_margin {
+            if use_beta {
+                let sample = p.sample.as_ref().context("sample buffers missing")?;
+                spec.accept_beta_batch(
+                    &self.stream,
+                    &tokens,
+                    &argmax,
+                    &sample.accept_flags(m),
+                    &keep,
+                    seqs,
+                    width,
+                    &mut results,
+                    &mut anchors,
+                )?;
+            } else if use_margin {
                 let head_capped = p
                     .head_capped
                     .as_ref()
@@ -5721,8 +5807,43 @@ impl Ctx {
                 .batch
                 .as_mut()
                 .context("the batch buffers are missing")?;
+            let use_beta =
+                b.verify.is_some() && self.spec_beta.is_some() && batch_p.sample.is_some();
             let use_margin = b.verify.is_some() && self.accept_margin > 0.0;
-            if use_margin {
+            if use_beta {
+                let beta = self.spec_beta.context("spec_beta missing")?;
+                let width = b.verify.as_ref().context("verify state missing")?.width;
+                let seqs = batch_rows / width;
+                let cand_n = seqs * crate::draft::STEPS * crate::ops::sample::BETA_CAND_K;
+                let head_logits = batch_p
+                    .head_logits
+                    .as_mut()
+                    .context("the head_logits buffer is missing")?;
+                self.lm_head_rows(
+                    p.final_hidden.slice(..batch_rows * hidden),
+                    rows_mut(head_logits, batch_rows, padded),
+                    batch_rows,
+                    true,
+                    Some(&mut batch_p.gate.dense),
+                )?;
+                let bv = b.verify.as_ref().context("verify state missing")?;
+                let sample = batch_p.sample.as_mut().context("sample buffers missing")?;
+                self.kernels.sample.run_beta_bf16(
+                    &self.stream,
+                    &rows(head_logits, batch_rows, padded),
+                    vocab,
+                    padded,
+                    cfg.final_logit_softcapping,
+                    &rows(&p.tokens, batch_rows, 1),
+                    width,
+                    &bv.draft_cand.slice(..cand_n),
+                    &bv.draft_q.slice(..cand_n),
+                    crate::draft::STEPS,
+                    beta,
+                    sample,
+                    &mut b.argmax.slice_mut(..batch_rows),
+                )?;
+            } else if use_margin {
                 let head_logits = batch_p
                     .head_logits
                     .as_mut()
@@ -5801,7 +5922,20 @@ impl Ctx {
                 let keep = bv.keep.slice(..seqs);
                 let mut results = bv.results.slice_mut(..seqs * RESULT_LEN);
                 let mut anchors = bv.anchors.slice_mut(..seqs);
-                if use_margin {
+                if use_beta {
+                    let sample = batch_p.sample.as_ref().context("sample buffers missing")?;
+                    spec.accept_beta_batch(
+                        &self.stream,
+                        &tokens,
+                        &argmax,
+                        &sample.accept_flags(batch_rows),
+                        &keep,
+                        seqs,
+                        width,
+                        &mut results,
+                        &mut anchors,
+                    )?;
+                } else if use_margin {
                     let head_capped = batch_p
                         .head_capped
                         .as_ref()

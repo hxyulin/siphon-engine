@@ -436,3 +436,477 @@ fn sampling_cost() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Verifies P0 (`draft_select` & `draft_select_batch` in-register `top_k`/`top_p`/`min_p`
+/// filtering + `temp_scale` sharpening + exact `q_probs` output) against host F64 vLLM
+/// filtering and `siphon::race`.
+#[test]
+#[expect(clippy::too_many_lines, reason = "exercises both single and batched draft_select")]
+fn draft_select_filter_and_q_probs_exact() -> anyhow::Result<()> {
+    use half::bf16;
+    use siphon_cuda::{
+        ops::draft::{BLOCK, DraftKernels, RACE_WORDS, TOP_K, race_words_sampling},
+        weights::draft::RANK,
+    };
+
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let draft = DraftKernels::load(setup.gpu.context())?;
+    let vocab = 64usize;
+    let steps = 4usize;
+    let softcap = 30.0f32;
+
+    // Zero predecessor/successor/hp so selector scores equal softcap * tanh(unary / softcap).
+    let pred = stream.alloc_zeros::<bf16>(vocab * RANK)?;
+    let succ = stream.alloc_zeros::<bf16>(vocab * RANK)?;
+    let hp = stream.alloc_zeros::<bf16>((BLOCK - 1) * RANK)?;
+
+    let mut cand_host = vec![0i32; (BLOCK - 1) * TOP_K];
+    let mut unary_host = vec![0.0f32; (BLOCK - 1) * TOP_K];
+    for e in 0..steps {
+        for c in 0..TOP_K {
+            cand_host[e * TOP_K + c] = i32::try_from((e * 11 + c) % vocab)?;
+            // Include a deliberate tie at c=1,2 on step 1.
+            unary_host[e * TOP_K + c] = if e == 1 && (c == 1 || c == 2) {
+                3.5
+            } else {
+                5.0 - c as f32 * 0.45 + (e as f32) * 0.1
+            };
+        }
+    }
+    let cand = stream.clone_htod(&cand_host)?;
+    let unary = stream.clone_htod(&unary_host)?;
+    let control = stream.clone_htod(&[10i32, 1, 0])?;
+
+    let mut ids = stream.alloc_zeros::<i32>(steps)?;
+    let mut conf = stream.alloc_zeros::<f32>(steps)?;
+    let mut q_probs = stream.alloc_zeros::<f32>((BLOCK - 1) * TOP_K)?;
+
+    let cases = [
+        (Sampling::new(0.8, 0, 0.90, 0.05, 42)?, 0.85f32),
+        (Sampling::new(1.0, 4, 0.95, 0.0, 77)?, 0.85f32),
+        (Sampling::new(0.6, 0, 1.0, 0.10, 99)?, 1.0f32),
+        (Sampling::GREEDY, 0.85f32),
+    ];
+
+    for (sampling, alpha) in cases {
+        let words = race_words_sampling(sampling, alpha);
+        let race_dev = stream.clone_htod(&words)?;
+        draft.select(
+            stream,
+            &cand,
+            &unary,
+            &hp,
+            &pred,
+            &succ,
+            &control,
+            steps,
+            softcap,
+            &mut ids,
+            &mut conf,
+            Some(&mut q_probs),
+            &race_dev,
+        )?;
+        let gpu_ids = stream.clone_dtoh(&ids)?;
+        let gpu_q = stream.clone_dtoh(&q_probs)?;
+
+        // Also check batched select_batch (seqs=2, identical inputs) matches bit-for-bit.
+        let mut cand_b = Vec::with_capacity(2 * steps * TOP_K);
+        let mut unary_b = Vec::with_capacity(2 * steps * TOP_K);
+        for _ in 0..2 {
+            cand_b.extend_from_slice(&cand_host[..steps * TOP_K]);
+            unary_b.extend_from_slice(&unary_host[..steps * TOP_K]);
+        }
+        let cand_bd = stream.clone_htod(&cand_b)?;
+        let unary_bd = stream.clone_htod(&unary_b)?;
+        let hp_bd = stream.alloc_zeros::<bf16>(2 * steps * RANK)?;
+        let ctrl_bd = stream.clone_htod(&[10i32, 1, 0, 10, 1, 0])?;
+        let mut races_b = Vec::with_capacity(2 * RACE_WORDS);
+        races_b.extend_from_slice(&words);
+        races_b.extend_from_slice(&words);
+        let races_bd = stream.clone_htod(&races_b)?;
+        let mut ids_b = stream.alloc_zeros::<i32>(2 * steps)?;
+        let mut conf_b = stream.alloc_zeros::<f32>(2 * steps)?;
+        let mut q_b = stream.alloc_zeros::<f32>(2 * steps * TOP_K)?;
+        draft.select_batch(
+            stream,
+            &cand_bd,
+            &unary_bd,
+            &hp_bd,
+            &pred,
+            &succ,
+            &ctrl_bd,
+            2,
+            steps,
+            softcap,
+            &mut ids_b,
+            &mut conf_b,
+            Some(q_b.slice_mut(..)),
+            None,
+            &races_bd,
+        )?;
+        let gpu_ids_b = stream.clone_dtoh(&ids_b)?;
+        let gpu_q_b = stream.clone_dtoh(&q_b)?;
+        assert_eq!(&gpu_ids_b[..steps], &gpu_ids[..]);
+        assert_eq!(&gpu_ids_b[steps..], &gpu_ids[..]);
+        for i in 0..steps * TOP_K {
+            assert!((gpu_q_b[i] - gpu_q[i]).abs() <= 1e-6);
+            assert!((gpu_q_b[steps * TOP_K + i] - gpu_q[i]).abs() <= 1e-6);
+        }
+
+        for e in 0..steps {
+            let scores: Vec<f32> = (0..TOP_K)
+                .map(|c| softcap * (unary_host[e * TOP_K + c] / softcap).tanh())
+                .collect();
+            let q_slice = &gpu_q[e * TOP_K..(e + 1) * TOP_K];
+            if sampling.is_greedy() {
+                assert_eq!(gpu_ids[e], cand_host[e * TOP_K]);
+                assert!((q_slice[0] - 1.0).abs() <= f32::EPSILON);
+                assert!(q_slice[1..].iter().all(|&v| v == 0.0));
+                continue;
+            }
+            let eff = Sampling::new(
+                sampling.temperature * alpha,
+                sampling.top_k,
+                sampling.top_p,
+                sampling.min_p,
+                sampling.seed,
+            )?;
+            let want_q = filtered(&scores, eff);
+            let sum_gpu: f32 = q_slice.iter().sum();
+            assert!((sum_gpu - 1.0).abs() < 1e-5, "step {e}: sum={sum_gpu}");
+            for c in 0..TOP_K {
+                assert!(
+                    (f64::from(q_slice[c]) - want_q[c]).abs() < 2e-5,
+                    "step {e} c={c} ({sampling:?}, alpha={alpha}): gpu={} want={}",
+                    q_slice[c],
+                    want_q[c]
+                );
+            }
+            let pos = u32::try_from(10 + 1 + e + 1)?;
+            let key = race::draw_key(sampling.seed, pos);
+            let inv_t = 1.0 / (sampling.temperature * alpha);
+            let mut best = (f32::NEG_INFINITY, usize::MAX);
+            for c in 0..TOP_K {
+                if want_q[c] > 0.0 {
+                    let cid = cand_host[e * TOP_K + c].cast_unsigned();
+                    let sc = race::score(scores[c], inv_t, key, cid);
+                    if sc > best.0 || (sc.to_bits() == best.0.to_bits() && c < best.1) {
+                        best = (sc, c);
+                    }
+                }
+            }
+            assert_eq!(
+                gpu_ids[e],
+                cand_host[e * TOP_K + best.1],
+                "step {e} ({sampling:?}, alpha={alpha}) race pick mismatch"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Verifies `accept_margin` and `accept_margin_batch` enforce two-sided `|Δlogit| <= margin`:
+/// greedy (where target is argmax) behaves identically to before, while sampling rejects a
+/// draft whose logit exceeds the sampled non-argmax target by more than `margin`.
+#[test]
+fn accept_margin_two_sided_prevents_argmax_collapse() -> anyhow::Result<()> {
+    use siphon_cuda::ops::spec::{RESULT_LEN, Spec};
+
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let spec = Spec::load(setup.gpu.context())?;
+    let vocab = 8usize;
+    let m = 4usize;
+
+    let mut logits = vec![0.0f32; m * vocab];
+    logits[1] = 7.0;
+    logits[2] = 5.0;
+    logits[vocab + 3] = 5.0;
+    logits[vocab + 4] = 4.95;
+    logits[2 * vocab] = 5.0;
+    logits[2 * vocab + 5] = 0.0;
+
+    let tokens = stream.clone_htod(&[0i32, 1, 4, 5])?;
+    let argmax = stream.clone_htod(&[2i32, 3, 0, 0])?;
+    let logits_d = stream.clone_htod(&logits)?;
+    let keep = stream.alloc_zeros::<u32>(1)?;
+    let mut result = stream.alloc_zeros::<i32>(RESULT_LEN)?;
+    let mut anchor = stream.alloc_zeros::<i32>(1)?;
+
+    spec.accept_margin(
+        stream, &tokens, &argmax, &logits_d, vocab, &keep, m, 0.1, &mut result, &mut anchor,
+    )?;
+    let r = stream.clone_dtoh(&result)?;
+    assert_eq!(r[0], 0, "two-sided margin must reject +2.0 logit overshoot");
+
+    logits[1] = 5.08;
+    logits[vocab + 4] = 4.92;
+    let logits_d2 = stream.clone_htod(&logits)?;
+    spec.accept_margin(
+        stream, &tokens, &argmax, &logits_d2, vocab, &keep, m, 0.1, &mut result, &mut anchor,
+    )?;
+    let r2 = stream.clone_dtoh(&result)?;
+    assert_eq!(
+        r2[0], 2,
+        "two-sided margin should accept |Δ| <= 0.1 on both sides"
+    );
+
+    let mut res_b = stream.alloc_zeros::<i32>(RESULT_LEN)?;
+    let mut anc_b = stream.alloc_zeros::<i32>(1)?;
+    spec.accept_margin_batch(
+        stream,
+        &tokens,
+        &argmax,
+        &logits_d,
+        vocab,
+        &keep.slice(..),
+        1,
+        m,
+        0.1,
+        &mut res_b.slice_mut(..),
+        &mut anc_b.slice_mut(..),
+    )?;
+    assert_eq!(stream.clone_dtoh(&res_b)?[0], 0);
+    Ok(())
+}
+
+/// Statistical proof that `Sample::run_beta_bf16` + `Spec::accept_beta` preserves the exact
+/// filtered target distribution at `beta = 1.0` (0 out-of-support tokens, theoretical
+/// acceptance rate, chi-square z-score < 4.0) and matches theoretical relaxed acceptance at
+/// `beta = 0.80` with 0 out-of-support tokens and greedy/batch parity.
+#[test]
+#[expect(clippy::too_many_lines, reason = "8,000-seed statistical verification + greedy check")]
+fn beta_rejection_exact_and_relaxed_distribution() -> anyhow::Result<()> {
+    use half::bf16;
+    use siphon_cuda::ops::{
+        sample::BETA_CAND_K,
+        spec::{RESULT_LEN, Spec},
+    };
+
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let spec = Spec::load(setup.gpu.context())?;
+
+    let vocab = 1024usize;
+    let synth_logits = logits(vocab, 1.5, 16, 12345);
+    let row_bf16: Vec<bf16> = synth_logits.iter().map(|&v| bf16::from_f32(v)).collect();
+    let quantized_f32: Vec<f32> = row_bf16.iter().map(|&b| b.to_f32()).collect();
+
+    let sampling = Sampling::new(0.9, 0, 0.95, 0.05, 1)?;
+    let target_p = filtered(&quantized_f32, sampling);
+
+    let mut order: Vec<usize> = (0..vocab).collect();
+    order.sort_by(|&a, &b| target_p[b].total_cmp(&target_p[a]));
+    let mut cand16 = [0i32; BETA_CAND_K];
+    let mut q16 = [0.0f32; BETA_CAND_K];
+    for k in 0..14 {
+        cand16[k] = i32::try_from(order[k])?;
+        let factor = if k % 2 == 0 { 1.6 } else { 0.55 };
+        q16[k] = ((target_p[order[k]] * factor) as f32).max(0.01);
+    }
+    let oos: Vec<usize> = order
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&i| target_p[i] == 0.0)
+        .take(2)
+        .collect();
+    assert_eq!(oos.len(), 2);
+    cand16[14] = i32::try_from(oos[0])?;
+    cand16[15] = i32::try_from(oos[1])?;
+    q16[14] = 0.08;
+    q16[15] = 0.07;
+    let q_sum: f32 = q16.iter().sum();
+    for v in &mut q16 {
+        *v /= q_sum;
+    }
+
+    let batch_seqs = 64usize;
+    let width = 2usize;
+    let batches = 125usize;
+    let total_trials = batch_seqs * batches;
+
+    let mut logits_batch = Vec::with_capacity(batch_seqs * width * vocab);
+    for _ in 0..batch_seqs * width {
+        logits_batch.extend_from_slice(&row_bf16);
+    }
+    let logits_d = stream.clone_htod(&logits_batch)?;
+    let mut cand_batch = Vec::with_capacity(batch_seqs * BETA_CAND_K);
+    let mut q_batch = Vec::with_capacity(batch_seqs * BETA_CAND_K);
+    for _ in 0..batch_seqs {
+        cand_batch.extend_from_slice(&cand16);
+        q_batch.extend_from_slice(&q16);
+    }
+    let cand_d = stream.clone_htod(&cand_batch)?;
+    let q_d = stream.clone_htod(&q_batch)?;
+    let keep_d = stream.alloc_zeros::<u32>(batch_seqs)?;
+    let mut buffers = SampleBuffers::new(stream, batch_seqs * width)?;
+    let mut out_d = stream.alloc_zeros::<i32>(batch_seqs * width)?;
+    let mut results_d = stream.alloc_zeros::<i32>(batch_seqs * RESULT_LEN)?;
+    let mut anchors_d = stream.alloc_zeros::<i32>(batch_seqs)?;
+
+    for beta in [1.0f32, 0.80f32] {
+        let mut counts = vec![0usize; vocab];
+        let mut accepted_total = 0usize;
+        let mut oos_emitted = 0usize;
+        let mut rng_state = 0x1234_5678_9abc_def0u64 ^ u64::from(beta.to_bits());
+
+        for b in 0..batches {
+            let mut tokens_h = vec![0i32; batch_seqs * width];
+            let mut settings = Vec::with_capacity(batch_seqs * width);
+            for s in 0..batch_seqs {
+                let u = (splitmix64(&mut rng_state) >> 11) as f64 / ((1u64 << 53) as f64);
+                let mut cdf = 0.0f64;
+                let mut picked = cand16[0];
+                for k in 0..BETA_CAND_K {
+                    cdf += f64::from(q16[k]);
+                    if u < cdf {
+                        picked = cand16[k];
+                        break;
+                    }
+                }
+                tokens_h[s * width] = 0;
+                tokens_h[s * width + 1] = picked;
+                let trial_seed = (b * batch_seqs + s + 1) as u64;
+                let row_s = Sampling {
+                    seed: trial_seed,
+                    ..sampling
+                };
+                settings.push((row_s, 100));
+                settings.push((row_s, 101));
+            }
+            let tokens_d = stream.clone_htod(&tokens_h)?;
+            buffers.upload(stream, &settings)?;
+            setup.sample.run_beta_bf16(
+                stream,
+                &logits_d,
+                vocab,
+                vocab,
+                0.0,
+                &tokens_d,
+                width,
+                &cand_d,
+                &q_d,
+                1,
+                beta,
+                &mut buffers,
+                &mut out_d,
+            )?;
+            spec.accept_beta_batch(
+                stream,
+                &tokens_d,
+                &out_d,
+                &buffers.accept_flags(batch_seqs * width),
+                &keep_d.slice(..),
+                batch_seqs,
+                width,
+                &mut results_d.slice_mut(..),
+                &mut anchors_d.slice_mut(..),
+            )?;
+            let res_h = stream.clone_dtoh(&results_d)?;
+            for s in 0..batch_seqs {
+                let r = &res_h[s * RESULT_LEN..(s + 1) * RESULT_LEN];
+                let acc = usize::try_from(r[0])?;
+                let emitted_tok = if acc == 1 {
+                    accepted_total += 1;
+                    usize::try_from(r[2])?
+                } else {
+                    usize::try_from(r[1 + 8])?
+                };
+                if target_p[emitted_tok] == 0.0 {
+                    oos_emitted += 1;
+                }
+                counts[emitted_tok] += 1;
+            }
+        }
+
+        assert_eq!(oos_emitted, 0, "beta={beta}: emitted out-of-support tokens");
+
+        let theory_acc: f64 = (0..BETA_CAND_K)
+            .map(|k| {
+                let idx = usize::try_from(cand16[k]).unwrap_or(0);
+                f64::from(q16[k]).min(target_p[idx] / f64::from(beta))
+            })
+            .sum();
+        let emp_acc = accepted_total as f64 / total_trials as f64;
+        let se = (theory_acc * (1.0 - theory_acc) / total_trials as f64).sqrt();
+        assert!(
+            (emp_acc - theory_acc).abs() <= 4.0 * se,
+            "beta={beta}: emp_acc={emp_acc:.4} vs theory={theory_acc:.4} (se={se:.4})"
+        );
+
+        if (beta - 1.0).abs() < 1e-6 {
+            let mut chi2 = 0.0f64;
+            let mut df = 0usize;
+            let (mut tail_obs, mut tail_exp) = (0.0f64, 0.0f64);
+            for i in 0..vocab {
+                let exp = target_p[i] * total_trials as f64;
+                if exp >= 5.0 {
+                    let d = counts[i] as f64 - exp;
+                    chi2 += d * d / exp;
+                    df += 1;
+                } else if exp > 0.0 {
+                    tail_obs += counts[i] as f64;
+                    tail_exp += exp;
+                }
+            }
+            if tail_exp >= 1.0 {
+                let d = tail_obs - tail_exp;
+                chi2 += d * d / tail_exp;
+                df += 1;
+            }
+            let df = (df.saturating_sub(1)).max(1) as f64;
+            let z = ((chi2 / df).cbrt() - (1.0 - 2.0 / (9.0 * df))) / (2.0 / (9.0 * df)).sqrt();
+            eprintln!(
+                "beta=1.0: emp_acc={emp_acc:.4} (theory {theory_acc:.4}), chi2={chi2:.2}, df={df:.0}, z={z:.2}"
+            );
+            assert!(
+                z < 4.0,
+                "beta=1.0 distribution mismatch: chi2={chi2:.2}, df={df:.0}, z={z:.2}"
+            );
+        } else {
+            eprintln!("beta={beta:.2}: emp_acc={emp_acc:.4} (theory {theory_acc:.4}), oos=0");
+        }
+    }
+
+    // Verify greedy row inside run_beta_bf16 + accept_beta works cleanly.
+    let greedy_argmax = i32::try_from(order[0])?;
+    let mut g_tokens = vec![0i32; width];
+    g_tokens[1] = greedy_argmax;
+    let g_tok_d = stream.clone_htod(&g_tokens)?;
+    let g_logits_d = stream.clone_htod(&[&row_bf16[..], &row_bf16[..]].concat())?;
+    let mut g_buf = SampleBuffers::new(stream, width)?;
+    g_buf.upload(stream, &[(Sampling::GREEDY, 0), (Sampling::GREEDY, 1)])?;
+    let mut g_out = stream.alloc_zeros::<i32>(width)?;
+    let mut g_res = stream.alloc_zeros::<i32>(RESULT_LEN)?;
+    let mut g_anc = stream.alloc_zeros::<i32>(1)?;
+    let g_keep = stream.alloc_zeros::<u32>(1)?;
+    setup.sample.run_beta_bf16(
+        stream,
+        &g_logits_d,
+        vocab,
+        vocab,
+        0.0,
+        &g_tok_d,
+        width,
+        &cand_d.slice(..BETA_CAND_K),
+        &q_d.slice(..BETA_CAND_K),
+        1,
+        0.8,
+        &mut g_buf,
+        &mut g_out,
+    )?;
+    spec.accept_beta(
+        stream,
+        &g_tok_d,
+        &g_out,
+        &g_buf.accept_flags(width),
+        &g_keep,
+        width,
+        &mut g_res,
+        &mut g_anc,
+    )?;
+    assert_eq!(stream.clone_dtoh(&g_res)?[0], 1, "greedy match should accept");
+    Ok(())
+}

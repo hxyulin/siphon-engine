@@ -283,6 +283,10 @@ pub(super) struct VerifyBuffers {
     pub tree: Option<TreeVerifyBuffers>,
     /// True while capturing or running a tree-verify pass through `prefill_enqueue`.
     pub tree_active: bool,
+    /// Fixed-address 16-sparse DFlash 2 draft candidates `[7 * 16]` and normalized filtered
+    /// probabilities `[7 * 16]` for `--spec-beta` rejection sampling inside captured graphs.
+    pub draft_cand: CudaSlice<i32>,
+    pub draft_q: CudaSlice<f32>,
 }
 
 impl Drop for VerifyBuffers {
@@ -357,11 +361,41 @@ impl VerifyBuffers {
             pending: false,
             tree: None,
             tree_active: false,
+            draft_cand: zeros(
+                stream,
+                crate::draft::STEPS * crate::ops::sample::BETA_CAND_K,
+            )?,
+            draft_q: zeros(
+                stream,
+                crate::draft::STEPS * crate::ops::sample::BETA_CAND_K,
+            )?,
         })
     }
 }
 
 impl Model {
+    /// Copies DFlash 2's per-step 16-candidate ids and normalized filtered probabilities
+    /// (`[7 * 16]` each) into fixed-address verify scratch for `--spec-beta` rejection
+    /// sampling inside captured verify graphs.
+    pub fn set_verify_draft_dist(
+        &mut self,
+        cand: &CudaView<'_, i32>,
+        q_probs: &CudaView<'_, f32>,
+    ) -> anyhow::Result<()> {
+        let expected = crate::draft::STEPS * crate::ops::sample::BETA_CAND_K;
+        ensure!(
+            cand.len() == expected && q_probs.len() == expected,
+            "draft dist len ({}, {}), expected {expected}",
+            cand.len(),
+            q_probs.len()
+        );
+        self.ensure_verify()?;
+        let stream = Arc::clone(&self.ctx.stream);
+        let v = self.verify_buffers_mut()?;
+        stream.memcpy_dtod(cand, &mut v.draft_cand)?;
+        stream.memcpy_dtod(q_probs, &mut v.draft_q)?;
+        Ok(())
+    }
     /// Runs the anchor and drafts in `tokens` at the current position as one verify pass of
     /// their count, 1 to [`VERIFY_ROWS`] rows, keeps the rows `accept` chooses and rolls back
     /// the rest. Advances the position past the kept rows. The next anchor stays on the

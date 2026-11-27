@@ -351,6 +351,128 @@ fn speculation_keeps_the_distribution() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Full-model distribution test for DFlash 2 P0 (filtered + alpha=0.85 coupled race) and
+/// P1 (`--spec-beta 1.0` exact maximal-coupling rejection) against plain `Model::step`
+/// decoding over `SIPHON_SAMPLING_SEEDS` (default 1000) independent seeds on the highest-
+/// entropy prefix of `regex-readme`. Also verifies P0 matches batched steps bit-for-bit.
+#[test]
+#[ignore = "needs SIPHON_MODEL, SIPHON_DFLASH2, captures and about 21 GB of GPU memory"]
+#[expect(clippy::too_many_lines, reason = "tests exact batch parity + 1000-seed chi-square for P0 and beta=1.0")]
+fn speculation_dflash2_p0_and_beta1_keep_distribution() -> anyhow::Result<()> {
+    let dflash2 = PathBuf::from(env::var_os("SIPHON_DFLASH2").context("set SIPHON_DFLASH2")?);
+    let (_gpu, mut model) = load_model(1)?;
+    let mut speculator = speculator_for(&mut model, DraftSource::Dflash(&dflash2), &DraftOptions::fast())?;
+    let readme = capture("regex-readme")?;
+    let prompt = &readme[..open_cut(&mut model, &readme)?];
+    let seeds = seeds();
+
+    // Prefill once and snapshot so 1000 seeds run in seconds.
+    model.set_sampling(Sampling::GREEDY);
+    model.reset()?;
+    let first_greedy = speculator.prefill(&mut model, prompt, DEFAULT_PREFILL_CHUNK)?;
+    let saved = model.save_state()?;
+
+    let settings = [
+        ("T=0.8, p=0.95, m=0.05", 0.8f32, 0.95f32, 0.05f32),
+        ("T=1.0, p=0.95, m=0.00", 1.0f32, 0.95f32, 0.0f32),
+    ];
+    let mut worst: f64 = f64::MIN;
+
+    for (setting_idx, (name, temperature, top_p, min_p)) in (0u64..).zip(settings) {
+        let make_s = |tag: u64, seed: u64| {
+            Sampling::new(
+                temperature,
+                0,
+                top_p,
+                min_p,
+                (setting_idx << 40) | (tag << 32) | seed,
+            )
+        };
+        // 1. P0 default coupled race matches batched steps bit-for-bit for the same seed.
+        model.set_spec_beta(None)?;
+        for seed in 0..EXACT_SEEDS {
+            let sampling = make_s(0, seed)?;
+            model.set_sampling(sampling);
+            model.restore_state(&saved)?;
+            speculator.restart(&mut model, first_greedy)?;
+            let mut a = vec![first_greedy];
+            a.extend(speculator.generate(&mut model, EXACT_TOKENS - 1, Drafts::Dspark)?);
+            a.truncate(EXACT_TOKENS);
+
+            model.set_sampling(sampling);
+            model.reset_slot(1)?;
+            let _ = model.prefill_slot(1, prompt, DEFAULT_PREFILL_CHUNK)?;
+            let mut b = vec![first_greedy];
+            let mut tok = first_greedy;
+            while b.len() < EXACT_TOKENS {
+                tok = model.step_batch_sampled(&[(1, tok)], &[sampling])?[0];
+                b.push(tok);
+            }
+            let differ = a.iter().zip(&b).position(|(x, y)| x != y);
+            ensure!(
+                differ.is_none(),
+                "DFlash2 P0 {name}, seed {seed}: differs from batched at {differ:?}"
+            );
+        }
+        println!("DFlash2 P0 {name}: matches batched bit-for-bit ({EXACT_SEEDS} seeds x {EXACT_TOKENS} tok)");
+
+        // 2. Collect plain `Model::step` reference sample (DRAWN tokens starting after first_greedy).
+        let mut plain = Vec::with_capacity(usize::try_from(seeds)?);
+        for seed in 0..seeds {
+            let sampling = make_s(1, seed)?;
+            model.set_sampling(sampling);
+            model.restore_state(&saved)?;
+            let mut tok = first_greedy;
+            let mut seq = Vec::with_capacity(DRAWN);
+            for _ in 0..DRAWN {
+                tok = model.step(tok, None)?;
+                seq.push(tok);
+            }
+            plain.push(seq);
+        }
+
+        // 3. Compare both P0 default (`beta = None`) and P1 lossless (`beta = Some(1.0)`).
+        for (mode_idx, (label, beta)) in [(2u64, ("P0 race_f", None)), (3u64, ("P1 beta=1.0", Some(1.0)))] {
+            model.set_spec_beta(beta)?;
+            let mut spec = Vec::with_capacity(usize::try_from(seeds)?);
+            let (mut rounds, mut emitted) = (0usize, 0usize);
+            for seed in 0..seeds {
+                let sampling = make_s(mode_idx, seed)?;
+                model.set_sampling(sampling);
+                model.restore_state(&saved)?;
+                speculator.restart(&mut model, first_greedy)?;
+                let mut seq = speculator.generate(&mut model, DRAWN, Drafts::Dspark)?;
+                rounds += speculator.stats().rounds;
+                emitted += speculator.stats().emitted;
+                seq.truncate(DRAWN);
+                spec.push(seq);
+            }
+            let mut tests = Vec::new();
+            for j in 0..DRAWN {
+                let a: Vec<u32> = spec.iter().map(|t| t[j]).collect();
+                let b: Vec<u32> = plain.iter().map(|t| t[j]).collect();
+                tests.push((format!("token {}", j + 1), compare(&a, &b)));
+            }
+            let pairs = |v: &[Vec<u32>]| -> Vec<(u32, u32)> { v.iter().map(|t| (t[0], t[1])).collect() };
+            tests.push(("tokens 1-2".to_owned(), compare(&pairs(&spec), &pairs(&plain))));
+            tests.push(("tokens 1-4".to_owned(), compare(&spec, &plain)));
+            println!(
+                "DFlash2 {label} ({name}): {seeds} seeds, {:.3} tok/rd",
+                emitted as f64 / rounds.max(1) as f64
+            );
+            for (what, (z, dof)) in &tests {
+                println!("  {what}: chi-square z {z:.2} over {dof} dof");
+                worst = worst.max(*z);
+            }
+        }
+    }
+    ensure!(
+        worst < 4.5,
+        "DFlash2 P0 / beta=1.0 distribution differs from plain step (worst z {worst:.2})"
+    );
+    Ok(())
+}
+
 /// vLLM's filtered distribution over one row of logits, for measurements: tokens more than
 /// 30 nats below the largest are left out, which changes no probability by more than 1e-7.
 fn filtered(logits: &[f32], s: Sampling) -> Vec<(usize, f64)> {

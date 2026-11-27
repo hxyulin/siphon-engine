@@ -399,6 +399,10 @@ pub struct Options {
     pub vision: Option<VisionOptions>,
     /// Opt-in logit margin for speculative acceptance (`0.0` for exact lossless acceptance).
     pub accept_margin: f32,
+    /// Opt-in beta-relaxed / maximal-coupling rejection sampling parameter (`(0, 1]`).
+    pub spec_beta: Option<f32>,
+    /// Draft temperature scale `alpha = T_draft / T_target` for DFlash 2 (default `0.85`).
+    pub draft_temp_scale: f32,
     /// Split mixed-confidence batched DFlash 2 rounds into high/low confidence micro-batches.
     pub group_by_confidence: bool,
     /// The KV options of `siphon_cuda::kv_options` as given on the command line.
@@ -969,6 +973,10 @@ mod cuda {
                 options.accept_margin
             );
         }
+        model.set_spec_beta(options.spec_beta)?;
+        if let Some(beta) = options.spec_beta {
+            eprintln!("speculative beta rejection enabled (beta {beta:.2})");
+        }
         let width = Width::Adaptive(WidthPolicy::new(&options.widths, [1.0; VERIFY_ROWS])?);
         let source = options
             .drafter
@@ -976,6 +984,7 @@ mod cuda {
             .map_or(DraftSource::Bundled, DraftSource::Dflash);
         let draft = load_draft(&mut model, &checkpoint, source, capacity, &draft_options)?;
         let mut speculator = Speculator::with_draft(&model, draft, width)?;
+        speculator.set_draft_temp_scale(options.draft_temp_scale)?;
         if options.spec_tree {
             speculator.set_spec_tree(siphon_cuda::spec::SpecTreeConfig::two_branch())?;
         }

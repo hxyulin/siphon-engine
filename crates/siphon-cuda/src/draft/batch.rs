@@ -19,7 +19,7 @@ use crate::{
     ops::{
         draft::{
             BLOCK, BatchAttentionScratch, CONTROL, DFLASH2_MAX_SPLITS, KV_WIDTH, KvCache,
-            MAX_BATCH_SEQS, RACE_WORDS, TOP_K, TopkScratch, race_words,
+            MAX_BATCH_SEQS, RACE_WORDS, TOP_K, TopkScratch, race_words, race_words_sampling,
         },
         linear::Start,
         linear_fp8::{Fp8RawGemm, Fp8Rows as Fp8GemmScratch, LinearFp8},
@@ -146,6 +146,7 @@ pub(super) struct BatchDflash2 {
     topk: TopkScratch,
     cand: CudaSlice<i32>,
     unary: CudaSlice<f32>,
+    q_probs: CudaSlice<f32>,
     hp: CudaSlice<bf16>,
     ids: CudaSlice<i32>,
     confidence: CudaSlice<f32>,
@@ -234,6 +235,7 @@ impl BatchDflash2 {
             topk: TopkScratch::new_for_rows(stream, max_steps)?,
             cand: zi(max_steps * TOP_K)?,
             unary: zf(max_steps * TOP_K)?,
+            q_probs: zf(max_steps * TOP_K)?,
             hp: z(max_steps * RANK)?,
             ids: zi(max_steps)?,
             confidence: zf(max_steps)?,
@@ -853,14 +855,11 @@ impl Draft {
             b.padded_seqs = padded_seqs;
         }
         let race_len = padded_seqs * RACE_WORDS;
+        let temp_scale = self.temp_scale;
         {
             let races = b.host_races.as_mut_slice();
             for (i, &s) in samplings.iter().enumerate() {
-                let words = if s.is_greedy() {
-                    race_words(0.0, 0)
-                } else {
-                    race_words(s.temperature, s.seed)
-                };
+                let words = race_words_sampling(s, temp_scale);
                 races[i * RACE_WORDS..(i + 1) * RACE_WORDS].copy_from_slice(&words);
             }
             let greedy = race_words(0.0, 0);
@@ -1397,8 +1396,28 @@ impl Draft {
             self.softcap,
             &mut b.ids.slice_mut(..sm),
             &mut b.confidence.slice_mut(..sm),
+            Some(b.q_probs.slice_mut(..sm * TOP_K)),
             Some(b.verify_tokens.slice_mut(..seqs * (draft_steps + 1))),
             &b.races.slice(..seqs * RACE_WORDS),
         )
+    }
+
+    /// Batched DFlash 2 candidate ids (`[seqs * STEPS * 16]`) and normalized filtered
+    /// probabilities (`[seqs * STEPS * 16]`) from the most recent batched round.
+    pub fn batch_dflash2_distributions(
+        &self,
+        seqs: usize,
+        steps: usize,
+    ) -> anyhow::Result<(CudaView<'_, i32>, CudaView<'_, f32>)> {
+        let b = self
+            .batch
+            .as_ref()
+            .context("batched DFlash 2 state not initialized")?;
+        ensure!(
+            seqs > 0 && seqs <= b.max_seqs && (1..=STEPS).contains(&steps),
+            "invalid batch_dflash2_distributions dims: seqs={seqs}, steps={steps}"
+        );
+        let n = seqs * steps * TOP_K;
+        Ok((b.cand.slice(..n), b.q_probs.slice(..n)))
     }
 }

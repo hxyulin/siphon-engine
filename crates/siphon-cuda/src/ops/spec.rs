@@ -132,11 +132,13 @@ pub struct Spec {
     ring_restore: CudaFunction,
     accept_greedy: CudaFunction,
     accept_margin: CudaFunction,
+    accept_beta: CudaFunction,
     conv_rollback_batch: CudaFunction,
     ring_backup_batch: CudaFunction,
     ring_restore_batch: CudaFunction,
     accept_greedy_batch: CudaFunction,
     accept_margin_batch: CudaFunction,
+    accept_beta_batch: CudaFunction,
     pack_verify_tokens_batch: CudaFunction,
     accept_tree: CudaFunction,
     kv_commit_tree: CudaFunction,
@@ -155,11 +157,13 @@ impl Spec {
             ring_restore: f("ring_restore")?,
             accept_greedy: f("accept_greedy")?,
             accept_margin: f("accept_margin")?,
+            accept_beta: f("accept_beta")?,
             conv_rollback_batch: f("conv_rollback_batch")?,
             ring_backup_batch: f("ring_backup_batch")?,
             ring_restore_batch: f("ring_restore_batch")?,
             accept_greedy_batch: f("accept_greedy_batch")?,
             accept_margin_batch: f("accept_margin_batch")?,
+            accept_beta_batch: f("accept_beta_batch")?,
             pack_verify_tokens_batch: f("pack_verify_tokens_batch")?,
             accept_tree: f("accept_tree")?,
             kv_commit_tree: f("kv_commit_tree")?,
@@ -390,6 +394,45 @@ impl Spec {
         // (`rows * vocab` floats), and writes at most `RESULT_LEN` results and one anchor.
         unsafe { launch.launch(one_block(1)) }?;
         Ok(())
+    }
+
+    /// Beta-relaxed / maximal-coupling acceptance of a verify of `rows` rows: accepts the
+    /// longest prefix where `accept_flag[j] == 1` (sampling accepted) or (`accept_flag[j] < 0`
+    /// and `tokens[j + 1] == argmax[j]` for greedy rows).
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_beta(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        accept_flag: &impl DeviceIn<i32>,
+        keep: &CudaSlice<u32>,
+        rows: usize,
+        result: &mut CudaSlice<i32>,
+        anchor: &mut CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax, accept_flag) = (tokens.view(), argmax.view(), accept_flag.view());
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        check_len("tokens", tokens.len(), rows)?;
+        check_len("argmax", argmax.len(), rows)?;
+        check_len("accept_flag", accept_flag.len(), rows)?;
+        check_len("keep", keep.len(), 1)?;
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("anchor", anchor.len(), 1)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&tokens, stream)
+            .ptr(&argmax, stream)
+            .ptr(&accept_flag, stream)
+            .ptr(keep, stream)
+            .i32(i32::try_from(rows)?)
+            .ptr_mut(result, stream)
+            .ptr_mut(anchor, stream);
+        // SAFETY: matches `accept_beta(const int*, const int*, const int*, const unsigned*,
+        // int, int*, int*)`; reads `rows` entries after `pdl_wait()`.
+        unsafe { args.launch_pdl(stream, &self.accept_beta, one_block(1)) }
     }
 
     /// Batched [`Self::conv_rollback`]: shifts every `(visit, seq)` conv state in place from
@@ -626,6 +669,50 @@ impl Spec {
         // own slice of each buffer and bounds-checks token indices against `vocab`.
         unsafe { launch.launch(config) }?;
         Ok(())
+    }
+
+    /// Batched [`Self::accept_beta`] for `seqs` sequences, each verifying `rows` tokens.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_beta_batch(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        accept_flags: &impl DeviceIn<i32>,
+        keep: &CudaView<'_, u32>,
+        seqs: usize,
+        rows: usize,
+        results: &mut CudaViewMut<'_, i32>,
+        anchors: &mut CudaViewMut<'_, i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax, accept_flags) = (tokens.view(), argmax.view(), accept_flags.view());
+        ensure!(seqs > 0, "no sequences");
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        check_len("tokens", tokens.len(), seqs * rows)?;
+        check_len("argmax", argmax.len(), seqs * rows)?;
+        check_len("accept_flags", accept_flags.len(), seqs * rows)?;
+        check_len("keep", keep.len(), seqs)?;
+        check_len("results", results.len(), seqs * RESULT_LEN)?;
+        check_len("anchors", anchors.len(), seqs)?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(seqs)?, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&tokens, stream)
+            .ptr(&argmax, stream)
+            .ptr(&accept_flags, stream)
+            .ptr(keep, stream)
+            .i32(i32::try_from(rows)?)
+            .ptr_mut(results, stream)
+            .ptr_mut(anchors, stream);
+        // SAFETY: matches `accept_beta_batch(const int*, const int*, const int*, const
+        // unsigned*, int, int*, int*)`; block `seq` accesses its slice after `pdl_wait()`.
+        unsafe { args.launch_pdl(stream, &self.accept_beta_batch, config) }
     }
 
     /// Packs `[seqs, VERIFY_ROWS]` drafted verify tokens in `src` into contiguous

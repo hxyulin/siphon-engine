@@ -544,6 +544,10 @@ struct BatchDraftedSlot {
     width: usize,
     /// Pre-allocated device scratch (`BATCH_VERIFY_MAX_ROWS` ints) reused across cache misses.
     tokens: CudaSlice<i32>,
+    /// Cached 16-sparse draft candidates and filtered probabilities (`[MAX_BATCH_SEQS * 7 * 16]`)
+    /// for batched `--spec-beta` rejection sampling.
+    cand: CudaSlice<i32>,
+    q_probs: CudaSlice<f32>,
     confidences: Vec<f32>,
     valid: bool,
     tick: u64,
@@ -572,11 +576,15 @@ struct BatchSpecBuffers {
 impl BatchSpecBuffers {
     fn new(stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
         let mut slots_vec = Vec::with_capacity(BATCH_DRAFT_CACHE_SLOTS);
+        let dist_elems =
+            crate::ops::draft::MAX_BATCH_SEQS * STEPS * crate::ops::sample::BETA_CAND_K;
         for _ in 0..BATCH_DRAFT_CACHE_SLOTS {
             slots_vec.push(BatchDraftedSlot {
                 slots: Vec::new(),
                 width: 0,
                 tokens: stream.alloc_zeros(BATCH_VERIFY_MAX_ROWS)?,
+                cand: stream.alloc_zeros(dist_elems)?,
+                q_probs: stream.alloc_zeros(dist_elems)?,
                 confidences: Vec::new(),
                 valid: false,
                 tick: 0,
@@ -736,6 +744,12 @@ pub fn load_draft(
 }
 
 impl Speculator {
+    /// Sets DFlash 2's draft temperature calibration multiplier `alpha = T_draft / T_target`
+    /// (`> 0.0`, default `0.85`).
+    pub fn set_draft_temp_scale(&mut self, scale: f32) -> anyhow::Result<()> {
+        self.draft.set_temp_scale(scale)
+    }
+
     /// Loads the draft from `checkpoint` for `model`, with room for `capacity` positions,
     /// verifying `k` drafts per round (1 to 7), with the approximations of
     /// [`DraftOptions::fast`].
@@ -1013,6 +1027,8 @@ impl Speculator {
                     .collect::<anyhow::Result<_>>()?;
                 {
                     let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+                    let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+                    let dist_n = src_cand.len();
                     let bs = self
                         .batch_spec
                         .as_mut()
@@ -1023,6 +1039,21 @@ impl Speculator {
                         &mut bs.cache[0].tokens.slice_mut(..seqs * w),
                         seqs,
                         w,
+                    )?;
+                    stream.memcpy_dtod(&src_cand, &mut bs.cache[0].cand.slice_mut(..dist_n))?;
+                    stream.memcpy_dtod(&src_q, &mut bs.cache[0].q_probs.slice_mut(..dist_n))?;
+                }
+                if model.spec_beta().is_some() {
+                    let dist_n = seqs * STEPS * crate::ops::sample::BETA_CAND_K;
+                    let bs = self
+                        .batch_spec
+                        .as_ref()
+                        .context("batch spec buffers missing")?;
+                    model.set_batch_verify_draft_dist(
+                        seqs,
+                        w,
+                        &bs.cache[0].cand.slice(..dist_n),
+                        &bs.cache[0].q_probs.slice(..dist_n),
                     )?;
                 }
                 let pending = {
@@ -1388,6 +1419,8 @@ impl Speculator {
             };
             let w = self.choose_batch_width(seqs, &init_conf, max_width);
             let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+            let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+            let dist_n = src_cand.len();
             let bs = self
                 .batch_spec
                 .as_mut()
@@ -1402,6 +1435,8 @@ impl Speculator {
                 seqs,
                 w,
             )?;
+            stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
+            stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
             entry.slots = verify_slots.to_vec();
             entry.width = w;
             entry.confidences.clone_from(&init_conf);
@@ -1420,6 +1455,19 @@ impl Speculator {
                     self.draft.reset_slot(s.slot);
                 }
             }
+        }
+        if model.spec_beta().is_some() {
+            let dist_n = seqs * STEPS * crate::ops::sample::BETA_CAND_K;
+            let bs = self
+                .batch_spec
+                .as_ref()
+                .context("batch spec buffers missing")?;
+            model.set_batch_verify_draft_dist(
+                seqs,
+                verify_w,
+                &bs.cache[slot_idx].cand.slice(..dist_n),
+                &bs.cache[slot_idx].q_probs.slice(..dist_n),
+            )?;
         }
         let pending = {
             let Self {
@@ -1612,6 +1660,8 @@ impl Speculator {
         };
         let next_w = self.choose_batch_width(seqs, &next_conf, eff_max);
         let next_tokens = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+        let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+        let dist_n = src_cand.len();
         let bs = self
             .batch_spec
             .as_mut()
@@ -1625,6 +1675,8 @@ impl Speculator {
             seqs,
             next_w,
         )?;
+        stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
+        stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
         entry.slots = pending.slots;
         entry.width = next_w;
         entry.confidences = next_conf;
@@ -1724,6 +1776,8 @@ impl Speculator {
             };
             let w = self.choose_batch_width(seqs, &init_conf, max_width);
             let src = self.draft.batch_verify_tokens(seqs, VERIFY_ROWS)?;
+            let (src_cand, src_q) = self.draft.batch_dflash2_distributions(seqs, STEPS)?;
+            let dist_n = src_cand.len();
             let bs = self
                 .batch_spec
                 .as_mut()
@@ -1738,6 +1792,8 @@ impl Speculator {
                 seqs,
                 w,
             )?;
+            stream.memcpy_dtod(&src_cand, &mut entry.cand.slice_mut(..dist_n))?;
+            stream.memcpy_dtod(&src_q, &mut entry.q_probs.slice_mut(..dist_n))?;
             entry.slots = slots.to_vec();
             entry.width = w;
             entry.confidences.clone_from(&init_conf);
@@ -1745,6 +1801,19 @@ impl Speculator {
             entry.tick = tick;
             (w, init_conf, idx)
         };
+        if model.spec_beta().is_some() {
+            let dist_n = seqs * STEPS * crate::ops::sample::BETA_CAND_K;
+            let bs = self
+                .batch_spec
+                .as_ref()
+                .context("batch spec buffers missing")?;
+            model.set_batch_verify_draft_dist(
+                seqs,
+                verify_w,
+                &bs.cache[slot_idx].cand.slice(..dist_n),
+                &bs.cache[slot_idx].q_probs.slice(..dist_n),
+            )?;
+        }
         let pending = {
             let bs = self
                 .batch_spec
@@ -2536,6 +2605,17 @@ impl Speculator {
         } else {
             None
         };
+        if model.spec_beta().is_some() {
+            ensure!(
+                self.draft.is_dflash2(),
+                "--spec-beta requires a DFlash 2 drafter"
+            );
+            if drafts == Drafts::Dspark
+                && let Some((cand, q_probs)) = self.draft.dflash2_distributions()
+            {
+                model.set_verify_draft_dist(&cand, &q_probs)?;
+            }
+        }
         let pending = model.start_verify(VerifyTokens::Drafts(tokens), Accept::Greedy)?;
         self.round_events[slot][1].record(&stream)?;
         // Enqueue the draft graph on the compute stream immediately after recording `verified`

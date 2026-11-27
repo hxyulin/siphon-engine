@@ -204,6 +204,8 @@ fn args() -> anyhow::Result<Args> {
     let mut max_image_pixels = siphon::vision::DEFAULT_MAX_PIXELS;
     let mut max_images = vision::DEFAULT_MAX_IMAGES;
     let mut accept_margin = 0.0f32;
+    let mut spec_beta = None;
+    let mut draft_temp_scale = 0.85f32;
     let mut group_by_confidence = false;
     let mut kv_args = Vec::new();
     let mut moe_top_k = None;
@@ -313,6 +315,25 @@ fn args() -> anyhow::Result<Args> {
                     "--accept-margin takes a finite non-negative logit margin"
                 );
             }
+            "--spec-beta" => {
+                let b: f32 = value()?
+                    .parse()
+                    .context("--spec-beta takes a float in (0, 1]")?;
+                ensure!(
+                    b.is_finite() && b > 0.0 && b <= 1.0,
+                    "--spec-beta takes a finite float in (0, 1]"
+                );
+                spec_beta = Some(b);
+            }
+            "--draft-temp-scale" => {
+                draft_temp_scale = value()?
+                    .parse()
+                    .context("--draft-temp-scale takes a positive float")?;
+                ensure!(
+                    draft_temp_scale.is_finite() && draft_temp_scale > 0.0,
+                    "--draft-temp-scale takes a finite positive float"
+                );
+            }
             "--group-by-confidence" => group_by_confidence = true,
             "--max-image-pixels" => {
                 max_image_pixels = value()?
@@ -399,6 +420,10 @@ fn args() -> anyhow::Result<Args> {
     let address = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("{host}:{port} is not an address"))?;
+    ensure!(
+        !(accept_margin > 0.0 && spec_beta.is_some()),
+        "--accept-margin and --spec-beta cannot both be enabled"
+    );
     Ok(Args {
         engine: engine::Options {
             model_dir: model_dir.clone(),
@@ -438,6 +463,8 @@ fn args() -> anyhow::Result<Args> {
                 max_pixels: max_image_pixels,
             }),
             accept_margin,
+            spec_beta,
+            draft_temp_scale,
             group_by_confidence,
             kv_args,
             moe_top_k,

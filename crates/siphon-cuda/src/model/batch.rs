@@ -137,6 +137,10 @@ pub(super) struct BatchVerifyState {
     pub(super) pending: bool,
     /// Scratch slots backing inactive padded sequences when `seqs < padded_seqs`.
     dummy_slots: Vec<DummyVerifySlot>,
+    /// Fixed-address 16-sparse DFlash 2 draft candidates and normalized probabilities
+    /// (`[max_seqs * 7 * 16]` each) for batched `--spec-beta` rejection sampling.
+    pub(super) draft_cand: CudaSlice<i32>,
+    pub(super) draft_q: CudaSlice<f32>,
 }
 
 impl BatchVerifyState {
@@ -205,6 +209,14 @@ impl BatchVerifyState {
             padded_seqs: 0,
             pending: false,
             dummy_slots: Vec::new(),
+            draft_cand: zeros(
+                stream,
+                max_seqs * crate::draft::STEPS * crate::ops::sample::BETA_CAND_K,
+            )?,
+            draft_q: zeros(
+                stream,
+                max_seqs * crate::draft::STEPS * crate::ops::sample::BETA_CAND_K,
+            )?,
         })
     }
 }
@@ -1334,6 +1346,36 @@ impl Model {
     pub fn reserve_batch_verify(&mut self, max_seqs: usize) -> anyhow::Result<()> {
         let max_seqs = max_seqs.clamp(1, BATCH_VERIFY_MAX_ROWS / VERIFY_ROWS);
         self.ensure_batch_verify(max_seqs, max_seqs * VERIFY_ROWS)
+    }
+
+    /// Copies batched DFlash 2 16-candidate ids and normalized filtered probabilities
+    /// (`[seqs * 7 * 16]` each) into fixed-address batch-verify scratch for `--spec-beta`.
+    pub fn set_batch_verify_draft_dist(
+        &mut self,
+        seqs: usize,
+        width: usize,
+        cand: &CudaView<'_, i32>,
+        q_probs: &CudaView<'_, f32>,
+    ) -> anyhow::Result<()> {
+        let stride_elems = crate::draft::STEPS * crate::ops::sample::BETA_CAND_K;
+        let expected = seqs * stride_elems;
+        ensure!(
+            cand.len() == expected && q_probs.len() == expected,
+            "batch draft dist len ({}, {}), expected {expected}",
+            cand.len(),
+            q_probs.len()
+        );
+        self.ensure_batch_verify(seqs, seqs * width)?;
+        let stream = Arc::clone(&self.ctx.stream);
+        let bv = self
+            .batch_verify
+            .as_mut()
+            .and_then(|p| p.batch.as_mut())
+            .and_then(|b| b.verify.as_mut())
+            .context("the batch verify state is missing")?;
+        stream.memcpy_dtod(cand, &mut bv.draft_cand.slice_mut(..expected))?;
+        stream.memcpy_dtod(q_probs, &mut bv.draft_q.slice_mut(..expected))?;
+        Ok(())
     }
 
     pub(super) fn ensure_batch_verify(

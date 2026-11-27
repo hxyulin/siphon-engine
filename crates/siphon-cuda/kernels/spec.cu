@@ -204,8 +204,10 @@ extern "C" __global__ void accept_greedy(const int* tokens, const int* argmax, c
 // Margin-tolerant speculative acceptance of a verify of m rows: tokens [m] holds the anchor
 // and m - 1 drafts, argmax [m] each row's target token (greedy argmax or sampled draw), and
 // logits [m, vocab] each row's F32 softcapped target logits. Accepts the longest prefix of
-// drafts where draft == target, or (margin > 0 and logits[accepted, draft] >=
-// logits[accepted, target] - margin), or exactly *keep - 1 drafts when *keep is nonzero.
+// drafts where draft == target, or (margin > 0 and |logits[accepted, draft] -
+// logits[accepted, target]| <= margin), or exactly *keep - 1 drafts when *keep is nonzero.
+// Two-sided |delta| is bit-exact with one-sided under greedy (where target is argmax) and
+// prevents silent argmax collapse under T > 0 sampling.
 // Writes result = [accepted, tokens[0..8], argmax[0..8]] (rows past m left alone) and the
 // next anchor, argmax[accepted], to anchor. One thread.
 extern "C" __global__ void accept_margin(const int* tokens, const int* argmax, const float* logits,
@@ -224,12 +226,42 @@ extern "C" __global__ void accept_margin(const int* tokens, const int* argmax, c
             }
             if (margin > 0.f && draft >= 0 && draft < vocab && target >= 0 && target < vocab) {
                 const float* row = logits + size_t(accepted) * size_t(vocab);
-                if (row[draft] >= row[target] - margin) {
+                if (fabsf(row[draft] - row[target]) <= margin) {
                     ++accepted;
                     continue;
                 }
             }
             break;
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = tokens[i];
+        result[1 + kVerifyRows + i] = argmax[i];
+    }
+    *anchor = argmax[accepted];
+}
+
+// Beta-relaxed / maximal-coupling speculative acceptance of a verify of m rows:
+// accept_flag[j] is 1 if sampling row j accepted tokens[j + 1] via u * beta * q <= p,
+// 0 if rejected, or -1 if row j was greedy (compare tokens[j + 1] == argmax[j]).
+// Writes result = [accepted, tokens[0..8], argmax[0..8]] and *anchor = argmax[accepted].
+// One thread, PDL-wired.
+extern "C" __global__ void accept_beta(const int* tokens, const int* argmax, const int* accept_flag,
+                                       const unsigned* keep, int m, int* result, int* anchor) {
+    pdl_trigger();
+    pdl_wait();
+    int accepted = 0;
+    if (*keep != 0) {
+        accepted = min(int(*keep), m) - 1;
+    } else {
+        while (accepted + 1 < m) {
+            const int flag = accept_flag[accepted];
+            if (flag == 1 || (flag < 0 && tokens[accepted + 1] == argmax[accepted])) {
+                ++accepted;
+            } else {
+                break;
+            }
         }
     }
     result[0] = accepted;
@@ -391,12 +423,47 @@ extern "C" __global__ void accept_margin_batch(const int* tokens, const int* arg
             }
             if (margin > 0.f && draft >= 0 && draft < vocab && target >= 0 && target < vocab) {
                 const float* row = seq_logits + size_t(accepted) * size_t(vocab);
-                if (row[draft] >= row[target] - margin) {
+                if (fabsf(row[draft] - row[target]) <= margin) {
                     ++accepted;
                     continue;
                 }
             }
             break;
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = seq_tokens[i];
+        result[1 + kVerifyRows + i] = seq_argmax[i];
+    }
+    anchors[seq] = seq_argmax[accepted];
+}
+
+// Batched beta-relaxed / maximal-coupling acceptance for `seqs` sequences, each of `m` rows.
+// tokens, argmax, accept_flags are [seqs, m]; keep is [seqs]; results is [seqs, kResultLen];
+// anchors is [seqs]. Grid: (seqs, 1, 1), 1 thread, PDL-wired.
+extern "C" __global__ void accept_beta_batch(const int* tokens, const int* argmax,
+                                             const int* accept_flags, const unsigned* keep, int m,
+                                             int* results, int* anchors) {
+    pdl_trigger();
+    pdl_wait();
+    const int seq = blockIdx.x;
+    const int* seq_tokens = tokens + size_t(seq) * size_t(m);
+    const int* seq_argmax = argmax + size_t(seq) * size_t(m);
+    const int* seq_flags = accept_flags + size_t(seq) * size_t(m);
+    int* result = results + size_t(seq) * kResultLen;
+    int accepted = 0;
+    const unsigned k = keep[seq];
+    if (k != 0) {
+        accepted = min(int(k), m) - 1;
+    } else {
+        while (accepted + 1 < m) {
+            const int flag = seq_flags[accepted];
+            if (flag == 1 || (flag < 0 && seq_tokens[accepted + 1] == seq_argmax[accepted])) {
+                ++accepted;
+            } else {
+                break;
+            }
         }
     }
     result[0] = accepted;

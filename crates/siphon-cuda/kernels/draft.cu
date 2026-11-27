@@ -2558,6 +2558,91 @@ constexpr int kSelectWarps = kTopK;  // one warp per candidate
 constexpr int kSelectSteps = kBlock - 1;
 }  // namespace
 
+// Filters DFlash 2's kTopK (=16) candidate logits in warp 0 registers using vLLM order
+// (temperature * temp_scale -> top_k -> top_p -> min_p), writing normalized filtered
+// probabilities `q_out[0..kTopK-1]` (0.f for filtered-out candidates) into shared memory
+// and returning `inv_t = 1 / (temperature * temp_scale)`.
+__device__ __forceinline__ float select_filter_16(const float* score, const race::DraftRace& d,
+                                                  float* q_out) {
+    const int lane = threadIdx.x & 31;
+    const float alpha = (d.temp_scale > 0.f) ? d.temp_scale : 1.f;
+    const float inv_t = 1.f / __fmul_rn(d.temperature, alpha);
+
+    float sv = lane < kTopK ? score[lane] : -INFINITY;
+    int32_t si = lane;
+
+#pragma unroll
+    for (int size = 2; size <= kTopK; size <<= 1) {
+        const bool dir = ((lane & size) == 0);
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, sv, stride);
+            const int32_t oi = __shfl_xor_sync(0xffffffffu, si, stride);
+            if (lane < kTopK) {
+                const bool is_upper = (lane & stride) != 0;
+                const bool want_better = dir ? !is_upper : is_upper;
+                if (want_better ? better(ov, oi, sv, si) : better(sv, si, ov, oi)) {
+                    sv = ov;
+                    si = oi;
+                }
+            }
+        }
+    }
+
+    const float top = __shfl_sync(0xffffffffu, sv, 0);
+    bool keep = (lane < kTopK) && isfinite(sv);
+
+    if (d.top_k > 0 && d.top_k < kTopK) {
+        const float kth = __shfl_sync(0xffffffffu, sv, d.top_k - 1);
+        keep = keep && (sv >= kth);
+    }
+
+    if (d.top_p < 1.f && isfinite(top)) {
+        const float w = keep ? expf((sv - top) * inv_t) : 0.f;
+        float tot = w;
+#pragma unroll
+        for (int offset = 8; offset >= 1; offset >>= 1) {
+            tot += __shfl_xor_sync(0xffffffffu, tot, offset);
+        }
+        float pref = w;
+#pragma unroll
+        for (int offset = 1; offset < kTopK; offset <<= 1) {
+            const float up = __shfl_up_sync(0xffffffffu, pref, offset);
+            if (lane < kTopK && lane >= offset) {
+                pref += up;
+            }
+        }
+        float strictly_above = pref - w;
+#pragma unroll
+        for (int offset = 1; offset < kTopK; offset <<= 1) {
+            const float prev_v = __shfl_up_sync(0xffffffffu, sv, offset);
+            const float prev_a = __shfl_up_sync(0xffffffffu, strictly_above, offset);
+            if (lane < kTopK && lane >= offset && prev_v == sv) {
+                strictly_above = prev_a;
+            }
+        }
+        const float cutoff = d.top_p * tot;
+        keep = (lane == 0 && isfinite(sv)) || (keep && strictly_above < cutoff);
+    }
+
+    if (d.min_p > 0.f && isfinite(top)) {
+        keep = (lane == 0 && isfinite(sv)) || (keep && expf((sv - top) * inv_t) >= d.min_p);
+    }
+
+    const float w_kept = (keep && isfinite(top)) ? expf((sv - top) * inv_t) : 0.f;
+    float q_tot = w_kept;
+#pragma unroll
+    for (int offset = 8; offset >= 1; offset >>= 1) {
+        q_tot += __shfl_xor_sync(0xffffffffu, q_tot, offset);
+    }
+    const float qp = (q_tot > 0.f) ? (w_kept / q_tot) : (lane == 0 ? 1.f : 0.f);
+    if (lane < kTopK) {
+        q_out[si] = qp;
+    }
+    __syncwarp();
+    return inv_t;
+}
+
 // The selector's greedy walk over `steps` draft rows (1 to 7). Row e has candidates
 // ids[e, 0..16] with logits unary[e, ..] (F32 [steps, 16], best first) and the hidden
 // projection hp[e] (BF16 [steps, 256]). Its predecessor t is the anchor (control[2]) for
@@ -2565,18 +2650,19 @@ constexpr int kSelectSteps = kBlock - 1;
 //   s = softcap tanh((unary[e, c] + bf16(sum_r bf16(pred[t, r] hp[e, r]) succ[c, r])) / softcap)
 // with F32 sums; the walk picks the largest, ties to the earlier candidate, and its
 // softmax probability over the 16 scores is the draft's confidence. Writes draft_ids and
-// confidence [steps]. When the request samples (`race`, see StepRace), the walk picks the
-// best noisy score s / T plus the target's noise for row e's position, and the confidence
-// is the largest probability under softmax(s) over the 16, as StepRace::weight explains. One block of 16 warps,
-// warp c for candidate c; lane l holds elements 8l to 8l + 7 of each row.
+// confidence [steps], and optionally normalized filtered probabilities q_probs [steps, 16].
+// When the request samples (`race`, see DraftRace), warp 0 filters the 16 candidates by
+// (top_k, top_p, min_p) at T_draft = temperature * temp_scale before the coupled Gumbel-Max
+// race, while confidence remains the largest probability under softmax(s) at T=1.
 extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
 draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
              const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
              const int32_t* control, int32_t steps, float softcap, int32_t* draft_ids,
-             float* confidence, const race::DraftRace* race) {
+             float* confidence, float* q_probs, const race::DraftRace* race) {
     __shared__ float product[kRank];
     __shared__ float score[kTopK];
-    __shared__ float noisy[kTopK];
+    __shared__ float boost[kTopK];
+    __shared__ float q_sh[kTopK];
     __shared__ int32_t chosen;
     pdl_wait();
     pdl_trigger();
@@ -2633,13 +2719,17 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
             const bool valid = id >= 0 && id < vocab;
             score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
             if (r.on) {
-                noisy[warp] = valid ? r.noisy(score[warp], id) : -INFINITY;
+                boost[warp] = valid ? race::race_boost(r.key, id) : -INFINITY;
             }
         }
         __syncthreads();
         if (warp == 0 && r.on) {
+            const float inv_t = select_filter_16(score, *race, q_sh);
             const float s = lane < kTopK ? score[lane] : -INFINITY;
-            float bv = lane < kTopK ? noisy[lane] : -INFINITY;
+            const float qp = lane < kTopK ? q_sh[lane] : 0.f;
+            float bv = (lane < kTopK && qp > 0.f)
+                           ? __fadd_rn(__fmul_rn(s, inv_t), boost[lane])
+                           : -INFINITY;
             int32_t bi = lane;
             float top = s;
 #pragma unroll
@@ -2654,6 +2744,9 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
             }
             const float sum = warp_sum(
                 lane < kTopK && s != -INFINITY ? expf(s - top) : 0.f);
+            if (q_probs != nullptr && lane < kTopK) {
+                q_probs[e * kTopK + lane] = qp;
+            }
             if (lane == 0) {
                 draft_ids[e] = cand[e * kTopK + bi];
                 confidence[e] = 1.f / sum;
@@ -2673,6 +2766,9 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
                 }
             }
             const float sum = warp_sum(lane < kTopK && s != -INFINITY ? expf(s - bv) : 0.f);
+            if (q_probs != nullptr && lane < kTopK) {
+                q_probs[e * kTopK + lane] = (lane == bi) ? 1.f : 0.f;
+            }
             if (lane == 0) {
                 draft_ids[e] = cand[e * kTopK + bi];
                 confidence[e] = 1.f / sum;
@@ -2694,7 +2790,8 @@ draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* 
                   const race::DraftRace* race) {
     __shared__ float product[kRank];
     __shared__ float score[kTopK];
-    __shared__ float noisy[kTopK];
+    __shared__ float boost[kTopK];
+    __shared__ float q_sh[kTopK];
     __shared__ int32_t chosen;
     pdl_wait();
     pdl_trigger();
@@ -2748,13 +2845,22 @@ draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* 
             const bool valid = id >= 0 && id < vocab;
             score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
             if (r.on) {
-                noisy[warp] = valid ? r.noisy(score[warp], id) : -INFINITY;
+                boost[warp] = valid ? race::race_boost(r.key, id) : -INFINITY;
             }
         }
         __syncthreads();
         if (warp == 0) {
             const float s = lane < kTopK ? score[lane] : -INFINITY;
-            const float key = lane < kTopK ? (r.on ? noisy[lane] : score[lane]) : -INFINITY;
+            float key = s;
+            float key_all = s;
+            if (r.on) {
+                const float inv_t = select_filter_16(score, *race, q_sh);
+                const float qp = lane < kTopK ? q_sh[lane] : 0.f;
+                key_all = (lane < kTopK && isfinite(s))
+                              ? __fadd_rn(__fmul_rn(s, inv_t), boost[lane])
+                              : -INFINITY;
+                key = (lane < kTopK && qp > 0.f) ? key_all : -INFINITY;
+            }
             float bv = key;
             int32_t bi = lane;
             float top = s;
@@ -2770,9 +2876,11 @@ draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* 
             }
             const float sum = warp_sum(
                 lane < kTopK && s != -INFINITY ? expf(s - top) : 0.f);
-            // Second-best candidate excluding `bi`.
+            // Second-best kept candidate excluding `bi`, falling back to unfiltered runner-up.
             float bv2 = (lane < kTopK && lane != bi) ? key : -INFINITY;
-            int32_t bi2 = (lane < kTopK && lane != bi) ? lane : kTopK;
+            int32_t bi2 = (lane < kTopK && lane != bi && isfinite(key)) ? lane : kTopK;
+            float fb2 = (lane < kTopK && lane != bi) ? key_all : -INFINITY;
+            int32_t fbi2 = (lane < kTopK && lane != bi && isfinite(key_all)) ? lane : kTopK;
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
                 const float ov = __shfl_xor_sync(0xffffffffu, bv2, offset);
@@ -2781,6 +2889,15 @@ draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* 
                     bv2 = ov;
                     bi2 = oi;
                 }
+                const float fov = __shfl_xor_sync(0xffffffffu, fb2, offset);
+                const int32_t foi = __shfl_xor_sync(0xffffffffu, fbi2, offset);
+                if (better(fov, foi, fb2, fbi2)) {
+                    fb2 = fov;
+                    fbi2 = foi;
+                }
+            }
+            if (bi2 >= kTopK) {
+                bi2 = fbi2;
             }
             if (lane == 0) {
                 const int32_t id1 = cand[e * kTopK + bi];
@@ -2809,7 +2926,8 @@ draft_select_branch(const int32_t* cand, const float* unary, const __nv_bfloat16
                     const race::DraftRace* race) {
     __shared__ float product[kRank];
     __shared__ float score[kTopK];
-    __shared__ float noisy[kTopK];
+    __shared__ float boost[kTopK];
+    __shared__ float q_sh[kTopK];
     __shared__ int32_t cur_token;
     pdl_wait();
     pdl_trigger();
@@ -2858,12 +2976,20 @@ draft_select_branch(const int32_t* cand, const float* unary, const __nv_bfloat16
             const bool valid = cid >= 0 && cid < vocab;
             score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
             if (r.on) {
-                noisy[warp] = valid ? r.noisy(score[warp], cid) : -INFINITY;
+                boost[warp] = valid ? race::race_boost(r.key, cid) : -INFINITY;
             }
         }
         __syncthreads();
         if (warp == 0) {
-            const float key = lane < kTopK ? (r.on ? noisy[lane] : score[lane]) : -INFINITY;
+            const float s = lane < kTopK ? score[lane] : -INFINITY;
+            float key = s;
+            if (r.on) {
+                const float inv_t = select_filter_16(score, *race, q_sh);
+                const float qp = lane < kTopK ? q_sh[lane] : 0.f;
+                key = (lane < kTopK && qp > 0.f)
+                          ? __fadd_rn(__fmul_rn(s, inv_t), boost[lane])
+                          : -INFINITY;
+            }
             float bv = key;
             int32_t bi = lane;
 #pragma unroll
@@ -3188,17 +3314,20 @@ draft_gather_mask_rows(const __nv_bfloat16* y, __nv_bfloat16* out, int32_t steps
 }
 
 // Batched DFlash 2 selector walk over seqs sequences, each with `steps` (1..7) draft rows.
-// Writes draft_ids [seqs, steps], confidence [seqs, steps], and (if non-null) verify_tokens
-// [seqs, steps + 1] with each sequence's anchor at column 0 and drafts at columns 1..=steps.
+// Writes draft_ids [seqs, steps], confidence [seqs, steps], optionally normalized filtered
+// probabilities q_probs [seqs, steps, 16], and (if non-null) verify_tokens [seqs, steps + 1]
+// with each sequence's anchor at column 0 and drafts at columns 1..=steps.
 // Grid: (seqs, 1, 1), 512 threads (16 warps).
 extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
 draft_select_batch(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
                    const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
                    const int32_t* controls, int32_t steps, float softcap, int32_t* draft_ids,
-                   float* confidence, int32_t* verify_tokens, const race::DraftRace* races) {
+                   float* confidence, float* q_probs, int32_t* verify_tokens,
+                   const race::DraftRace* races) {
     __shared__ float product[kRank];
     __shared__ float score[kTopK];
-    __shared__ float noisy[kTopK];
+    __shared__ float boost[kTopK];
+    __shared__ float q_sh[kTopK];
     __shared__ int32_t chosen;
     pdl_wait();
     pdl_trigger();
@@ -3211,6 +3340,7 @@ draft_select_batch(const int32_t* cand, const float* unary, const __nv_bfloat16*
     const race::DraftRace* seq_race = races != nullptr ? races + seq : nullptr;
     int32_t* seq_ids = draft_ids + size_t(seq) * steps;
     float* seq_conf = confidence + size_t(seq) * steps;
+    float* seq_q = q_probs != nullptr ? q_probs + size_t(seq) * steps * kTopK : nullptr;
     int32_t* seq_vtoks = verify_tokens != nullptr ? verify_tokens + size_t(seq) * (steps + 1) : nullptr;
     const uint4 zero = make_uint4(0, 0, 0, 0);
     auto row = [&](const __nv_bfloat16* table, int32_t id) {
@@ -3264,13 +3394,17 @@ draft_select_batch(const int32_t* cand, const float* unary, const __nv_bfloat16*
             const bool valid = id >= 0 && id < vocab;
             score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
             if (r.on) {
-                noisy[warp] = valid ? r.noisy(score[warp], id) : -INFINITY;
+                boost[warp] = valid ? race::race_boost(r.key, id) : -INFINITY;
             }
         }
         __syncthreads();
         if (warp == 0 && r.on) {
+            const float inv_t = select_filter_16(score, *seq_race, q_sh);
             const float s = lane < kTopK ? score[lane] : -INFINITY;
-            float bv = lane < kTopK ? noisy[lane] : -INFINITY;
+            const float qp = lane < kTopK ? q_sh[lane] : 0.f;
+            float bv = (lane < kTopK && qp > 0.f)
+                           ? __fadd_rn(__fmul_rn(s, inv_t), boost[lane])
+                           : -INFINITY;
             int32_t bi = lane;
             float top = s;
 #pragma unroll
@@ -3285,6 +3419,9 @@ draft_select_batch(const int32_t* cand, const float* unary, const __nv_bfloat16*
             }
             const float sum = warp_sum(
                 lane < kTopK && s != -INFINITY ? expf(s - top) : 0.f);
+            if (seq_q != nullptr && lane < kTopK) {
+                seq_q[e * kTopK + lane] = qp;
+            }
             if (lane == 0) {
                 const int32_t picked = seq_cand[e * kTopK + bi];
                 seq_ids[e] = picked;
@@ -3308,6 +3445,9 @@ draft_select_batch(const int32_t* cand, const float* unary, const __nv_bfloat16*
                 }
             }
             const float sum = warp_sum(lane < kTopK && s != -INFINITY ? expf(s - bv) : 0.f);
+            if (seq_q != nullptr && lane < kTopK) {
+                seq_q[e * kTopK + lane] = (lane == bi) ? 1.f : 0.f;
+            }
             if (lane == 0) {
                 const int32_t picked = seq_cand[e * kTopK + bi];
                 seq_ids[e] = picked;

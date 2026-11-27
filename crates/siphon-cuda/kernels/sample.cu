@@ -281,6 +281,25 @@ __device__ __forceinline__ float block_max(float v, float* scratch) {
     return v;
 }
 
+// The F32 sum of v over the block, in every thread.
+__device__ __forceinline__ float block_sum_f32(float v, float* scratch) {
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+        scratch[threadIdx.x / 32] = v;
+    }
+    __syncthreads();
+    v = threadIdx.x % 32 < kWarps ? scratch[threadIdx.x % 32] : 0.f;
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
 // The smallest (or, with `largest`, the largest) of v over the block, in every thread.
 __device__ __forceinline__ unsigned block_extreme(unsigned v, bool largest, unsigned* scratch) {
     const auto pick_one = [largest](unsigned a, unsigned b) { return largest ? max(a, b) : min(a, b); };
@@ -387,8 +406,10 @@ struct Search {
     unsigned uscratch[32];
     float fscratch[32];
     int iscratch[32];
-    // Values each block posts for the others: its maximum, its range of keys, its argmax.
+    // Values each block posts for the others: its maximum, its range of keys, its argmax,
+    // and its filtered partition sum for beta-relaxed rejection sampling.
     float max;
+    float z_sum;
     unsigned kmin;
     unsigned kmax;
     float best;
@@ -891,6 +912,344 @@ sample_race_bf16(const __nv_bfloat16* logits, int n, int stride, float cap, cons
                  int* out) {
     sample_race_impl<__nv_bfloat16>(logits, n, stride, cap, params, state, partial_scores,
                                     partial_idxs, counters, out);
+}
+
+// ---------------------------------------------------------------------------------------
+// Beta-relaxed / maximal-coupling rejection sampling for 16-sparse DFlash 2 drafts.
+//
+// For beta = 1.0, this implements exact lossless Leviathan/Chen maximal-coupling rejection
+// sampling with residual resampling r(y) \propto max(0, p(y) - q(y)). For 0 < beta < 1,
+// it relaxes acceptance to min(1, p(x) / (beta * q(x))) with residual max(0, p - beta * q),
+// guaranteeing 0% out-of-support mass (supp(p_tilde) <= supp(p_filt)).
+//
+// Grid matches sample_prepare_bf16 (rows * kCluster blocks, 512 threads) and
+// sample_race_bf16 ((kRaceBlocks, rows), 256 threads). Accepted sampling rows early-return
+// in sample_race_beta_bf16 without scanning the vocabulary.
+
+extern "C" __global__ void SIPHON_CLUSTER_DIMS(kCluster) __launch_bounds__(kPrepareThreads)
+sample_prepare_beta_bf16(const __nv_bfloat16* logits, int n, int stride, float cap,
+                         const Params* params, const int* tokens, int width, const int* cand,
+                         const float* q_probs, int cand_steps_stride, float beta, State* state,
+                         int* accept_flag, float* r_log, int* out) {
+    constexpr int kCandK = 16;
+    __shared__ Search sh;
+    pdl_wait();
+#if SIPHON_SM89
+    ClusterGroup cluster;
+#else
+    cg::cluster_group cluster = cg::this_cluster();
+#endif
+    const int rank = static_cast<int>(cluster.block_rank());
+    const int row = blockIdx.x / kCluster;
+    const __nv_bfloat16* x = logits + static_cast<size_t>(row) * stride;
+    constexpr int kAlign = 8;
+    const int share = ((n + kCluster - 1) / kCluster + (kAlign - 1)) & ~(kAlign - 1);
+    const int offset = min(n, rank * share);
+    const Part<__nv_bfloat16> part{x + offset, min(share, n - offset), offset, cap};
+    const Params p = params[row];
+
+    if (!(p.temperature > 0.f)) {
+        float best = -INFINITY;
+        int best_idx = INT_MAX;
+        for_each_part<kPrepareThreads, false>(part, threadIdx.x, [&](float v, int i) {
+            if (argmax_better(v, part.offset + i, best, best_idx)) {
+                best = v;
+                best_idx = part.offset + i;
+            }
+        });
+        const auto warp_reduce = [&] {
+#pragma unroll
+            for (int o = 16; o >= 1; o /= 2) {
+                const float v = __shfl_xor_sync(0xffffffffu, best, o);
+                const int idx = __shfl_xor_sync(0xffffffffu, best_idx, o);
+                if (argmax_better(v, idx, best, best_idx)) {
+                    best = v;
+                    best_idx = idx;
+                }
+            }
+        };
+        warp_reduce();
+        const int lane = threadIdx.x % 32;
+        const int warp = threadIdx.x / 32;
+        if (lane == 0) {
+            sh.fscratch[warp] = best;
+            sh.iscratch[warp] = best_idx;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            best = lane < kWarps ? sh.fscratch[lane] : -INFINITY;
+            best_idx = lane < kWarps ? sh.iscratch[lane] : INT_MAX;
+            warp_reduce();
+            if (lane == 0) {
+                sh.best = best;
+                sh.best_idx = best_idx;
+            }
+        }
+        cluster.sync();
+        if (rank == 0 && warp == 0) {
+            best = lane < kCluster ? cluster.map_shared_rank(&sh, lane)->best : -INFINITY;
+            best_idx = lane < kCluster ? cluster.map_shared_rank(&sh, lane)->best_idx : INT_MAX;
+            warp_reduce();
+            if (lane == 0) {
+                out[row] = best_idx;
+                state[row] = State{0u, 0u, 0.f, 0u};
+                accept_flag[row] = -1;
+            }
+        }
+        cluster.sync();
+        pdl_trigger();
+        return;
+    }
+
+    const bool top_k = p.top_k > 0 && p.top_k < n;
+    const bool top_p = p.top_p < 1.f;
+    const bool min_p = p.min_p > 0.f;
+    float m = -INFINITY;
+    for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) { m = fmaxf(m, v); });
+    m = block_max(m, sh.fscratch);
+    if (threadIdx.x == 0) {
+        sh.max = m;
+    }
+    cluster.sync();
+    for (int r = 0; r < kCluster; ++r) {
+        m = fmaxf(m, cluster.map_shared_rank(&sh, r)->max);
+    }
+    const float max = m;
+    const float inv_t = 1.f / p.temperature;
+    unsigned lowest = 0;
+    if (top_k) {
+        lowest = threshold(part, lowest, max, inv_t, false, static_cast<unsigned long long>(p.top_k),
+                           1.f, sh, cluster);
+    }
+    if (top_p) {
+        lowest = threshold(part, lowest, max, inv_t, true, 0, p.top_p, sh, cluster);
+    }
+
+    // Filtered partition function Z_kept = sum_{kept} exp((v - max) / T).
+    float own_z = 0.f;
+    for_each_part<kPrepareThreads, true>(part, threadIdx.x, [&](float v, int) {
+        if (isnan(v) || order_key(v) < lowest) {
+            return;
+        }
+        const float z = (v - max) * inv_t;
+        if (!(z >= kMassFloor)) {
+            return;
+        }
+        const float w = expf(z);
+        if (min_p && w < p.min_p) {
+            return;
+        }
+        own_z += w;
+    });
+    own_z = block_sum_f32(own_z, sh.fscratch);
+    if (threadIdx.x == 0) {
+        sh.z_sum = own_z;
+    }
+    cluster.sync();
+
+    if (rank == 0 && (threadIdx.x / 32) == 0) {
+        const int lane = threadIdx.x & 31;
+        float z_kept = 0.f;
+        for (int r = 0; r < kCluster; ++r) {
+            z_kept += cluster.map_shared_rank(&sh, r)->z_sum;
+        }
+        z_kept = fmaxf(z_kept, 1e-30f);
+
+        const int seq = row / width;
+        const int local_row = row % width;
+        const bool has_draft = (local_row < width - 1) && (cand != nullptr) && (q_probs != nullptr);
+        if (!has_draft) {
+            if (lane == 0) {
+                state[row] = State{1u, lowest, max, 0u};
+                accept_flag[row] = 0;
+            }
+        } else {
+            const int cand_row = seq * cand_steps_stride + local_row;
+            const int draft_tok = tokens[seq * width + local_row + 1];
+            int hit = 0;
+            if (lane < kCandK) {
+                const int cid = cand[static_cast<size_t>(cand_row) * kCandK + lane];
+                const float qp = q_probs[static_cast<size_t>(cand_row) * kCandK + lane];
+                float w_p = 0.f;
+                bool passes = false;
+                if (cid >= 0 && cid < n) {
+                    const float raw = __bfloat162float(x[cid]);
+                    const float v = cap > 0.f ? softcap_f32(raw, cap) : raw;
+                    if (!isnan(v) && order_key(v) >= lowest) {
+                        const float w = expf((v - max) * inv_t);
+                        if (!min_p || w >= p.min_p) {
+                            w_p = w;
+                            passes = true;
+                        }
+                    }
+                }
+                const float w_q = beta * qp * z_kept;
+                r_log[static_cast<size_t>(row) * kCandK + lane] =
+                    (w_p > w_q) ? logf(w_p - w_q) : -INFINITY;
+                if (cid == draft_tok && qp > 0.f && passes) {
+                    const float p_d = w_p / z_kept;
+                    const float u = race::unit(race::mix64(draw_key(p) ^ race::kAcceptSalt));
+                    if (u * beta * qp <= p_d) {
+                        hit = 1;
+                    }
+                }
+            }
+            const int acc = __any_sync(0xffffffffu, hit != 0) ? 1 : 0;
+            if (lane == 0) {
+                state[row] = State{1u, lowest, max, 0u};
+                accept_flag[row] = acc;
+                if (acc == 1) {
+                    out[row] = draft_tok;
+                }
+            }
+        }
+    }
+    cluster.sync();
+    pdl_trigger();
+}
+
+extern "C" __global__ void __launch_bounds__(kRaceThreads)
+sample_race_beta_bf16(const __nv_bfloat16* logits, int n, int stride, float cap,
+                      const Params* params, const State* state, int width, const int* cand,
+                      int cand_steps_stride, const int* accept_flag, const float* r_log,
+                      float* partial_scores, int* partial_idxs, float* fb_scores, int* fb_idxs,
+                      unsigned* counters, int* out) {
+    constexpr int kCandK = 16;
+    __shared__ float warp_scores[kRaceThreads / 32];
+    __shared__ int warp_idxs[kRaceThreads / 32];
+    __shared__ float fb_warp_scores[kRaceThreads / 32];
+    __shared__ int fb_warp_idxs[kRaceThreads / 32];
+    __shared__ int sh_cand[kCandK];
+    __shared__ float sh_rlog[kCandK];
+    __shared__ bool last;
+    pdl_trigger();
+    pdl_wait();
+    const int row = blockIdx.y;
+    const State s = state[row];
+    if (s.sample == 0 || accept_flag[row] != 0) {
+        return;
+    }
+    const int seq = row / width;
+    const int local_row = row % width;
+    const bool has_draft = (local_row < width - 1) && (cand != nullptr) && (r_log != nullptr);
+    if (has_draft && threadIdx.x < kCandK) {
+        const int cand_row = seq * cand_steps_stride + local_row;
+        sh_cand[threadIdx.x] = cand[static_cast<size_t>(cand_row) * kCandK + threadIdx.x];
+        sh_rlog[threadIdx.x] = r_log[static_cast<size_t>(row) * kCandK + threadIdx.x];
+    }
+    __syncthreads();
+
+    const Params p = params[row];
+    const __nv_bfloat16* x = logits + static_cast<size_t>(row) * stride;
+    const float inv_t = 1.f / p.temperature;
+    const bool min_p = p.min_p > 0.f;
+    const unsigned long long key = race::mix64(draw_key(p) ^ race::kResidSalt);
+    float best = -INFINITY;
+    int best_idx = INT_MAX;
+    float fb_best = -INFINITY;
+    int fb_idx = INT_MAX;
+    const auto take = [&](float score, int i) {
+        if (score > best || (score == best && i < best_idx)) {
+            best = score;
+            best_idx = i;
+        }
+    };
+    const auto fb_take = [&](float score, int i) {
+        if (score > fb_best || (score == fb_best && i < fb_idx)) {
+            fb_best = score;
+            fb_idx = i;
+        }
+    };
+    const auto consider = [&](float v, int i) {
+        if (order_key(v) < s.lowest || isnan(v)) {
+            return;
+        }
+        const float z = (v - s.max) * inv_t;
+        if (z + kMaxBoost + 0.01f < fminf(best, fb_best)) {
+            return;
+        }
+        if (min_p && expf(z) < p.min_p) {
+            return;
+        }
+        float z_res = z;
+        bool res_ok = true;
+        if (has_draft) {
+#pragma unroll
+            for (int k = 0; k < kCandK; ++k) {
+                if (i == sh_cand[k]) {
+                    z_res = sh_rlog[k];
+                    res_ok = isfinite(z_res);
+                    break;
+                }
+            }
+        }
+        const bool need_res = res_ok && (z_res + kMaxBoost >= best);
+        const bool need_fb = (z + kMaxBoost >= fb_best);
+        if (!need_res && !need_fb) {
+            return;
+        }
+        const float boost = race_boost(key, i);
+        if (need_res) {
+            take(z_res + boost, i);
+        }
+        if (need_fb) {
+            fb_take(z + boost, i);
+        }
+    };
+    const Part<__nv_bfloat16> part{x, n, 0, cap};
+    for_each_part<kRaceBlocks * kRaceThreads, true>(part, blockIdx.x * kRaceThreads + threadIdx.x,
+                                                    consider);
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const auto warp_reduce = [&] {
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            take(__shfl_xor_sync(0xffffffffu, best, offset),
+                 __shfl_xor_sync(0xffffffffu, best_idx, offset));
+            fb_take(__shfl_xor_sync(0xffffffffu, fb_best, offset),
+                    __shfl_xor_sync(0xffffffffu, fb_idx, offset));
+        }
+    };
+    warp_reduce();
+    if (lane == 0) {
+        warp_scores[warp] = best;
+        warp_idxs[warp] = best_idx;
+        fb_warp_scores[warp] = fb_best;
+        fb_warp_idxs[warp] = fb_idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < kRaceThreads / 32 ? warp_scores[lane] : -INFINITY;
+        best_idx = lane < kRaceThreads / 32 ? warp_idxs[lane] : INT_MAX;
+        fb_best = lane < kRaceThreads / 32 ? fb_warp_scores[lane] : -INFINITY;
+        fb_idx = lane < kRaceThreads / 32 ? fb_warp_idxs[lane] : INT_MAX;
+        warp_reduce();
+        if (lane == 0) {
+            partial_scores[row * kRaceBlocks + blockIdx.x] = best;
+            partial_idxs[row * kRaceBlocks + blockIdx.x] = best_idx;
+            fb_scores[row * kRaceBlocks + blockIdx.x] = fb_best;
+            fb_idxs[row * kRaceBlocks + blockIdx.x] = fb_idx;
+            __threadfence();
+            last = atomicAdd(&counters[row], 1u) == kRaceBlocks - 1;
+        }
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    if (warp == 0) {
+        __threadfence();
+        best = lane < kRaceBlocks ? __ldcg(&partial_scores[row * kRaceBlocks + lane]) : -INFINITY;
+        best_idx = lane < kRaceBlocks ? __ldcg(&partial_idxs[row * kRaceBlocks + lane]) : INT_MAX;
+        fb_best = lane < kRaceBlocks ? __ldcg(&fb_scores[row * kRaceBlocks + lane]) : -INFINITY;
+        fb_idx = lane < kRaceBlocks ? __ldcg(&fb_idxs[row * kRaceBlocks + lane]) : INT_MAX;
+        warp_reduce();
+        if (lane == 0) {
+            const int chosen = best_idx != INT_MAX ? best_idx : (fb_idx != INT_MAX ? fb_idx : 0);
+            out[row] = chosen;
+            counters[row] = 0;
+        }
+    }
 }
 
 // -ln E_i of tokens 0..n of the draw with this seed and position, for tests of the host

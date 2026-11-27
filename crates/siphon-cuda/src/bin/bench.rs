@@ -170,8 +170,8 @@ mod linux {
         verify_widths: bool,
         /// Whether `--spec auto` falls back to plain steps.
         fallback: bool,
-        /// `--spec`'s temperature and top-p, or greedy decoding.
-        sampling: Option<(f32, f32)>,
+        /// `--spec`'s `(temperature, top_p, min_p)`, or greedy decoding.
+        sampling: Option<(f32, f32, f32)>,
         /// Seeds `--spec` samples with, from 0.
         seeds: u64,
         /// Batch sizes to time batched decode at, instead of plain decode.
@@ -180,6 +180,10 @@ mod linux {
         follow: bool,
         /// Opt-in logit margin for speculative acceptance (`0.0` = exact lossless).
         accept_margin: f32,
+        /// Opt-in beta-relaxed / maximal-coupling rejection sampling parameter (`(0, 1]`).
+        spec_beta: Option<f32>,
+        /// Draft temperature scale `alpha = T_draft / T_target` (default `0.85`).
+        draft_temp_scale: f32,
         /// Enable 2-branch speculative tree verification (`--spec-tree`).
         spec_tree: bool,
         /// Secondary branch length for `--spec-tree` (`--spec-tree-k2`, default 2).
@@ -229,10 +233,13 @@ mod linux {
         let mut fallback = false;
         let mut temperature = None;
         let mut top_p = None;
+        let mut min_p = None;
         let mut seeds = 6;
         let mut batch = None;
         let mut follow = false;
         let mut accept_margin = 0.0f32;
+        let mut spec_beta: Option<f32> = None;
+        let mut draft_temp_scale = siphon_cuda::ops::draft::DEFAULT_DRAFT_TEMP_SCALE;
         let mut spec_tree = false;
         let mut spec_tree_k2 = 2usize;
         let mut spec_tree_branch = None;
@@ -289,6 +296,7 @@ mod linux {
                 "--fallback" => fallback = true,
                 "--temperature" => temperature = Some(value()?.parse()?),
                 "--top-p" => top_p = Some(value()?.parse()?),
+                "--min-p" => min_p = Some(value()?.parse()?),
                 "--seeds" => seeds = value()?.parse()?,
                 "--batch" => batch = Some(token_counts(&arg, &value()?)?),
                 "--follow" => follow = true,
@@ -296,6 +304,8 @@ mod linux {
                 "--moe-min-k" => moe_min_k = Some(value()?.parse()?),
                 "--moe-prune" => moe_prune = Some(value()?.parse()?),
                 "--accept-margin" => accept_margin = value()?.parse()?,
+                "--spec-beta" => spec_beta = Some(value()?.parse()?),
+                "--draft-temp-scale" => draft_temp_scale = value()?.parse()?,
                 "--spec-tree" => spec_tree = true,
                 "--spec-tree-k2" => spec_tree_k2 = value()?.parse()?,
                 "--spec-tree-branch" => {
@@ -315,9 +325,23 @@ mod linux {
             accept_margin.is_finite() && accept_margin >= 0.0,
             "--accept-margin must be finite and non-negative"
         );
+        if let Some(b) = spec_beta {
+            ensure!(
+                b.is_finite() && b > 0.0 && b <= 1.0,
+                "--spec-beta must be in (0, 1]"
+            );
+            ensure!(
+                accept_margin == 0.0,
+                "--spec-beta and --accept-margin cannot both be enabled"
+            );
+        }
         ensure!(
-            temperature.is_some() || top_p.is_none(),
-            "--top-p needs --temperature"
+            draft_temp_scale.is_finite() && draft_temp_scale > 0.0,
+            "--draft-temp-scale must be finite and positive"
+        );
+        ensure!(
+            temperature.is_some() || (top_p.is_none() && min_p.is_none()),
+            "--top-p and --min-p need --temperature"
         );
         ensure!(
             (1..=MAX_PREFILL_CHUNK).contains(&chunk),
@@ -363,11 +387,13 @@ mod linux {
             sweep,
             verify_widths,
             fallback,
-            sampling: temperature.map(|t| (t, top_p.unwrap_or(1.0))),
+            sampling: temperature.map(|t| (t, top_p.unwrap_or(1.0), min_p.unwrap_or(0.0))),
             seeds,
             batch,
             follow,
             accept_margin,
+            spec_beta,
+            draft_temp_scale,
             spec_tree,
             spec_tree_k2,
             spec_tree_branch,
@@ -1122,6 +1148,7 @@ mod linux {
             model.set_prefill_dense(args.prefill_dense)?;
             model.set_moe_pruning(args.moe_pruning)?;
             model.set_accept_margin(args.accept_margin)?;
+            model.set_spec_beta(args.spec_beta)?;
             println!(
                 "{} | {} | driver {} | max clocks SM {} MHz, memory {} MHz | compute processes \
                  before load: {}",
@@ -1138,6 +1165,8 @@ mod linux {
             );
             let margin_note = if args.accept_margin > 0.0 {
                 format!(", accept margin {:.3}", args.accept_margin)
+            } else if let Some(b) = args.spec_beta {
+                format!(", spec beta {b:.2}")
             } else {
                 String::new()
             };
@@ -1180,6 +1209,7 @@ mod linux {
                     model.enable_sampling()?;
                 }
                 let mut speculator = Speculator::with_draft(&model, draft, width)?;
+                speculator.set_draft_temp_scale(args.draft_temp_scale)?;
                 if args.spec_tree {
                     let branch_strategy = match args.spec_tree_branch {
                         Some(b) => BranchStrategy::Fixed(b),
@@ -1341,8 +1371,8 @@ mod linux {
         ) -> anyhow::Result<()> {
             let runs: Vec<Sampling> = match args.sampling {
                 None => vec![Sampling::GREEDY],
-                Some((t, p)) => (0..args.seeds)
-                    .map(|seed| Sampling::new(t, 0, p, 0.0, seed))
+                Some((t, p, m)) => (0..args.seeds)
+                    .map(|seed| Sampling::new(t, 0, p, m, seed))
                     .collect::<anyhow::Result<_>>()?,
             };
             for &context in contexts {
@@ -1461,9 +1491,9 @@ mod linux {
                         write_sweep(path, prompt.len(), first, &tokens, &rows)?;
                     }
                 }
-                if let Some((t, p)) = args.sampling {
+                if let Some((t, p, m)) = args.sampling {
                     println!(
-                        "context {} tokens, temperature {t}, top-p {p}, median of {} seeds: \
+                        "context {} tokens, temperature {t}, top-p {p}, min-p {m}, median of {} seeds: \
                          speculation {:.1} tok/s, plain decode {:.1} tok/s, {:.3} tokens per \
                          round\n",
                         prompt.len(),

@@ -110,6 +110,10 @@ impl Default for Sampling {
     }
 }
 
+/// Candidates per draft step in beta-relaxed / maximal-coupling rejection sampling
+/// (matches DFlash 2's `SELECTOR_TOP_K = 16`).
+pub const BETA_CAND_K: usize = 16;
+
 /// The settings and intermediates of up to `rows` rows.
 pub struct SampleBuffers {
     rows: usize,
@@ -121,6 +125,13 @@ pub struct SampleBuffers {
     idxs: CudaSlice<i32>,
     /// `sample_race`'s block counters, 0 between launches.
     counters: CudaSlice<u32>,
+    /// Per-row beta-rejection acceptance flag (`1` accepted, `0` rejected/bonus, `-1` greedy).
+    accept_flag: CudaSlice<i32>,
+    /// Shifted log residual weights `[rows, BETA_CAND_K]` for beta-rejection.
+    r_log: CudaSlice<f32>,
+    /// Fallback plain-distribution partials `[rows * RACE_BLOCKS]` for beta-rejection.
+    fb_scores: CudaSlice<f32>,
+    fb_idxs: CudaSlice<i32>,
 }
 
 impl Drop for SampleBuffers {
@@ -140,7 +151,17 @@ impl SampleBuffers {
             scores: stream.alloc_zeros(rows * RACE_BLOCKS)?,
             idxs: stream.alloc_zeros(rows * RACE_BLOCKS)?,
             counters: stream.alloc_zeros(rows)?,
+            accept_flag: stream.alloc_zeros(rows)?,
+            r_log: stream.alloc_zeros(rows * BETA_CAND_K)?,
+            fb_scores: stream.alloc_zeros(rows * RACE_BLOCKS)?,
+            fb_idxs: stream.alloc_zeros(rows * RACE_BLOCKS)?,
         })
+    }
+
+    /// Per-row beta-rejection acceptance flags (`[rows]`) written by [`Sample::run_beta_bf16`].
+    #[must_use]
+    pub fn accept_flags(&self, rows: usize) -> cudarc::driver::CudaView<'_, i32> {
+        self.accept_flag.slice(..rows)
     }
 
     /// Uploads the settings of the first rows: each row's sampling and the position its
@@ -181,6 +202,8 @@ pub struct Sample {
     prepare_bf16: CudaFunction,
     race: CudaFunction,
     race_bf16: CudaFunction,
+    prepare_beta_bf16: CudaFunction,
+    race_beta_bf16: CudaFunction,
     noise: CudaFunction,
 }
 
@@ -192,6 +215,8 @@ impl Sample {
             prepare_bf16: module.load_function("sample_prepare_bf16")?,
             race: module.load_function("sample_race")?,
             race_bf16: module.load_function("sample_race_bf16")?,
+            prepare_beta_bf16: module.load_function("sample_prepare_beta_bf16")?,
+            race_beta_bf16: module.load_function("sample_race_beta_bf16")?,
             noise: module.load_function("sample_noise")?,
         })
     }
@@ -378,5 +403,135 @@ impl Sample {
         // `RACE_BLOCKS` per row, counters are zero between launches, and the kernel reads
         // nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.race_bf16, config) }
+    }
+
+    /// Beta-relaxed / maximal-coupling rejection sampling over BF16 `logits`
+    /// (`[seqs * width, stride]`, inline `softcap`) using 16-sparse draft distributions
+    /// `(cand, q_probs)` laid out with stride `cand_steps_stride` steps per sequence.
+    /// Writes per-row acceptance flags into `buffers.accept_flags(rows)` and residual/bonus
+    /// (or greedy argmax) draws into `out` (`[rows]`).
+    #[expect(clippy::too_many_arguments, reason = "logits, draft dist, beta and buffers")]
+    pub fn run_beta_bf16(
+        &self,
+        stream: &CudaStream,
+        logits: &impl DeviceIn<bf16>,
+        n: usize,
+        stride: usize,
+        softcap: f32,
+        tokens: &impl DeviceIn<i32>,
+        width: usize,
+        cand: &impl DeviceIn<i32>,
+        q_probs: &impl DeviceIn<f32>,
+        cand_steps_stride: usize,
+        beta: f32,
+        buffers: &mut SampleBuffers,
+        out: &mut impl DeviceOut<i32>,
+    ) -> anyhow::Result<()> {
+        let (logits, tokens, cand, q_probs, mut out) = (
+            logits.view(),
+            tokens.view(),
+            cand.view(),
+            q_probs.view(),
+            out.view_mut(),
+        );
+        ensure!(n > 0 && stride >= n, "invalid logits shape n={n}, stride={stride}");
+        ensure!(
+            logits.len().is_multiple_of(stride),
+            "logits have {} elements, not a multiple of stride {stride}",
+            logits.len()
+        );
+        ensure!(
+            n <= MAX_TOKENS,
+            "rows of {n} tokens, the kernels take at most {MAX_TOKENS}"
+        );
+        ensure!(
+            softcap.is_finite() && softcap >= 0.0,
+            "softcap must be finite and non-negative, not {softcap}"
+        );
+        ensure!(
+            beta.is_finite() && beta > 0.0 && beta <= 1.0,
+            "spec_beta must be in (0, 1], got {beta}"
+        );
+        let rows = logits.len() / stride;
+        ensure!(
+            width > 0 && rows.is_multiple_of(width),
+            "rows {rows} must be a multiple of verify width {width}"
+        );
+        let seqs = rows / width;
+        ensure!(
+            cand_steps_stride + 1 >= width,
+            "cand_steps_stride {cand_steps_stride} too small for width {width}"
+        );
+        ensure!(
+            (1..=buffers.rows).contains(&rows),
+            "{rows} rows, the buffers hold {}",
+            buffers.rows
+        );
+        ensure!(tokens.len() == rows, "tokens has {} elements, not {rows}", tokens.len());
+        ensure!(out.len() == rows, "out has {} elements, not {rows}", out.len());
+        let min_cand = seqs * cand_steps_stride * BETA_CAND_K;
+        ensure!(
+            cand.len() >= min_cand && q_probs.len() >= min_cand,
+            "draft dist buffers too small ({}, {}), need {min_cand}",
+            cand.len(),
+            q_probs.len()
+        );
+        let n_arg = i32::try_from(n)?;
+        let stride_arg = i32::try_from(stride)?;
+        let width_arg = i32::try_from(width)?;
+        let cand_stride_arg = i32::try_from(cand_steps_stride)?;
+        let grid_rows = u32::try_from(rows)?;
+
+        let config = LaunchConfig {
+            grid_dim: (grid_rows * PREPARE_CLUSTER, 1, 1),
+            block_dim: (PREPARE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n_arg)
+            .i32(stride_arg)
+            .f32(softcap)
+            .ptr(&buffers.params, stream)
+            .ptr(&tokens, stream)
+            .i32(width_arg)
+            .ptr(&cand, stream)
+            .ptr(&q_probs, stream)
+            .i32(cand_stride_arg)
+            .f32(beta)
+            .ptr_mut(&mut buffers.state, stream)
+            .ptr_mut(&mut buffers.accept_flag, stream)
+            .ptr_mut(&mut buffers.r_log, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: matches `sample_prepare_beta_bf16`; all buffers are validated for `rows`
+        // and `seqs * cand_steps_stride * 16`, and the kernel waits at `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.prepare_beta_bf16, config) }?;
+
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(RACE_BLOCKS)?, grid_rows, 1),
+            block_dim: (RACE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n_arg)
+            .i32(stride_arg)
+            .f32(softcap)
+            .ptr(&buffers.params, stream)
+            .ptr(&buffers.state, stream)
+            .i32(width_arg)
+            .ptr(&cand, stream)
+            .i32(cand_stride_arg)
+            .ptr(&buffers.accept_flag, stream)
+            .ptr(&buffers.r_log, stream)
+            .ptr_mut(&mut buffers.scores, stream)
+            .ptr_mut(&mut buffers.idxs, stream)
+            .ptr_mut(&mut buffers.fb_scores, stream)
+            .ptr_mut(&mut buffers.fb_idxs, stream)
+            .ptr_mut(&mut buffers.counters, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: matches `sample_race_beta_bf16`; partials and fallback partials hold
+        // `RACE_BLOCKS` per row, counters are zero between launches, and reads wait on PDL.
+        unsafe { args.launch_pdl(stream, &self.race_beta_bf16, config) }
     }
 }

@@ -490,16 +490,51 @@ impl ArgmaxPartials {
     }
 }
 
-/// Words of a draft's race buffer, `race::DraftRace` in `kernels/race.cuh`: the
-/// temperature's bits, the seed's low and high words and a pad word. Temperature 0
-/// drafts greedily.
-pub const RACE_WORDS: usize = 4;
+/// Default draft temperature calibration `alpha = T_draft / T_target` for DFlash 2's
+/// 16-candidate selector when sampling is active (offline study optimum across T=0.6..1.0).
+pub const DEFAULT_DRAFT_TEMP_SCALE: f32 = 0.85;
+
+/// Words of a draft's race buffer, `race::DraftRace` in `kernels/race.cuh`:
+/// `[temperature, seed_lo, seed_hi, top_k, top_p, min_p, temp_scale, pad]`.
+/// Temperature 0 drafts greedily.
+pub const RACE_WORDS: usize = 8;
 
 /// The race buffer's words for a request sampling at `temperature` (0 for greedy) with
-/// `seed`.
+/// `seed`, without target filters (`top_k=0, top_p=1, min_p=0, temp_scale=1`).
 #[must_use]
 pub fn race_words(temperature: f32, seed: u64) -> [u32; RACE_WORDS] {
-    [temperature.to_bits(), seed as u32, (seed >> 32) as u32, 0]
+    [
+        temperature.to_bits(),
+        seed as u32,
+        (seed >> 32) as u32,
+        0,
+        1.0f32.to_bits(),
+        0.0f32.to_bits(),
+        1.0f32.to_bits(),
+        0,
+    ]
+}
+
+/// The race buffer's words for a full `Sampling` configuration plus draft temperature scale
+/// `temp_scale` (`alpha = T_draft / T_target`, default [`DEFAULT_DRAFT_TEMP_SCALE`]).
+#[must_use]
+pub fn race_words_sampling(
+    sampling: crate::ops::sample::Sampling,
+    temp_scale: f32,
+) -> [u32; RACE_WORDS] {
+    if sampling.is_greedy() {
+        return race_words(0.0, 0);
+    }
+    [
+        sampling.temperature.to_bits(),
+        sampling.seed as u32,
+        (sampling.seed >> 32) as u32,
+        sampling.top_k.min(i32::MAX as u32),
+        sampling.top_p.to_bits(),
+        sampling.min_p.to_bits(),
+        temp_scale.to_bits(),
+        0,
+    ]
 }
 
 /// What one Markov step's coupled pick reads (`StepRace` in `kernels/draft.cu`): the
@@ -2345,9 +2380,10 @@ impl DraftKernels {
         Ok(())
     }
 
-    /// DFlash 2's greedy walk over the candidates of [`Self::topk`] (see `draft_select`):
-    /// `hp` is BF16 `[steps.max(2), 256]`, the hidden projection of block rows 1 to
-    /// `steps`; the anchor is `control[2]`. Writes `steps` draft ids and confidences.
+    /// DFlash 2's greedy/coupled walk over the candidates of [`Self::topk`] (see
+    /// `draft_select`): `hp` is BF16 `[steps.max(2), 256]`, the hidden projection of block
+    /// rows 1 to `steps`; the anchor is `control[2]`. Writes `steps` draft ids and
+    /// confidences, plus optional normalized filtered probabilities `q_probs` (`[7, 16]`).
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn select(
         &self,
@@ -2362,6 +2398,7 @@ impl DraftKernels {
         softcap: f32,
         ids: &mut CudaSlice<i32>,
         confidence: &mut CudaSlice<f32>,
+        q_probs: Option<&mut CudaSlice<f32>>,
         race: &CudaSlice<u32>,
     ) -> anyhow::Result<()> {
         ensure!(
@@ -2372,6 +2409,9 @@ impl DraftKernels {
         );
         check_len("cand", cand.len(), (BLOCK - 1) * TOP_K)?;
         check_len("unary", unary.len(), (BLOCK - 1) * TOP_K)?;
+        if let Some(q) = &q_probs {
+            check_len("q_probs", q.len(), (BLOCK - 1) * TOP_K)?;
+        }
         ensure!(
             hp.len() >= steps * RANK,
             "hp has {} elements, too few for {steps} rows",
@@ -2393,13 +2433,14 @@ impl DraftKernels {
             .f32(softcap)
             .ptr_mut(ids, stream)
             .ptr_mut(confidence, stream)
+            .opt_mut(q_probs, stream)
             .ptr(race, stream);
         // SAFETY: the arguments match `draft_select(const int*, const float*, const bf16*,
-        // const bf16*, const bf16*, int, const int*, int, float, int*, float*, const
-        // DraftRace*)`. The kernel
-        // reads rows below `steps` of the checked inputs, bounds-checks every token against
-        // `vocab` before reading a codebook row, and writes `steps` ids and confidences. It
-        // reads everything after `pdl_wait`.
+        // const bf16*, const bf16*, int, const int*, int, float, int*, float*, float*, const
+        // DraftRace*)`. The kernel reads rows below `steps` of the checked inputs,
+        // bounds-checks every token against `vocab` before reading a codebook row, and
+        // writes `steps` ids, confidences and optional `q_probs`. It reads everything after
+        // `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.select, one_block(TOP_K * 32)) }?;
         Ok(())
     }
@@ -3235,6 +3276,7 @@ impl DraftKernels {
         softcap: f32,
         ids: &mut impl DeviceOut<i32>,
         confidence: &mut impl DeviceOut<f32>,
+        mut q_probs: Option<CudaViewMut<'_, f32>>,
         mut verify_tokens: Option<CudaViewMut<'_, i32>>,
         races: &impl DeviceIn<u32>,
     ) -> anyhow::Result<()> {
@@ -3256,6 +3298,9 @@ impl DraftKernels {
         check_len("ids", ids.len(), seqs * steps)?;
         check_len("confidence", confidence.len(), seqs * steps)?;
         check_len("races", races.len(), seqs * RACE_WORDS)?;
+        if let Some(q) = &q_probs {
+            check_len("q_probs", q.len(), seqs * steps * TOP_K)?;
+        }
         if let Some(vt) = &verify_tokens {
             check_len("verify_tokens", vt.len(), seqs * (steps + 1))?;
         }
@@ -3271,6 +3316,7 @@ impl DraftKernels {
             .f32(softcap)
             .ptr_mut(&mut ids, stream)
             .ptr_mut(&mut confidence, stream)
+            .opt_mut(q_probs.as_mut(), stream)
             .opt_mut(verify_tokens.as_mut(), stream)
             .ptr(&races, stream);
         let config = LaunchConfig {

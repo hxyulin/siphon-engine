@@ -49,12 +49,23 @@ __device__ __forceinline__ float race_boost(unsigned long long key, int i) {
     return -logf(e);
 }
 
-// A request's sampling as the draft reads it, struct Race in ops/draft.rs: temperature 0
-// drafts greedily.
+// Independent RNG domain-separation salts for beta-relaxed / maximal-coupling rejection
+// sampling (sample.cu): acceptance uniform draw vs residual resampling race.
+constexpr unsigned long long kAcceptSalt = 0x517cc1b727220a95ull;
+constexpr unsigned long long kResidSalt = 0x94d049bb133111ebull;
+
+// A request's sampling as the draft reads it, RACE_WORDS (= 8) in ops/draft.rs:
+// temperature 0 drafts greedily. DFlash 2's 16-candidate selector applies the target's
+// filters (top_k, top_p, min_p) and draft temperature scale `temp_scale` (default 0.85)
+// in registers before the coupled Gumbel-Max race, preserving exact target losslessness.
 struct DraftRace {
     float temperature;
     unsigned seed_lo;
     unsigned seed_hi;
+    int top_k;
+    float top_p;
+    float min_p;
+    float temp_scale;
     unsigned pad;
 };
 

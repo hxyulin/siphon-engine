@@ -42,9 +42,10 @@ use crate::{
     ops::spec::TapLayout,
     ops::{
         draft::{
-            ArgmaxPartials, AttentionKeys, AttentionScratch, BLOCK, CONTROL, DraftKernels,
-            F8_MAX_PRODUCTS, FoldRows, Fp8Product, Fp8Rows, KV_WIDTH, KvCache, LogitBounds,
-            RACE_WORDS, Rope, StepRace, TOP_K, TopkScratch, race_words,
+            ArgmaxPartials, AttentionKeys, AttentionScratch, BLOCK, CONTROL,
+            DEFAULT_DRAFT_TEMP_SCALE, DraftKernels, F8_MAX_PRODUCTS, FoldRows, Fp8Product, Fp8Rows,
+            KV_WIDTH, KvCache, LogitBounds, RACE_WORDS, Rope, StepRace, TOP_K, TopkScratch,
+            race_words_sampling,
         },
         linear::{Gemm, Linear, MAX_PRODUCTS, Start},
         linear_fp8::LinearFp8,
@@ -453,6 +454,9 @@ pub struct Draft {
     /// When set, DFlash 2's selector runs `draft_select_top2` so runner-up candidates and
     /// confidences are available for 2-branch speculative tree construction.
     tree_top2: bool,
+    /// Draft temperature calibration multiplier `alpha = T_draft / T_target` for DFlash 2's
+    /// 16-candidate selector when sampling is active (default `0.85`).
+    temp_scale: f32,
 }
 
 /// Copies of a draft's sliding rings at one committed position, from
@@ -1026,9 +1030,11 @@ struct Dflash2Scratch {
     /// The input convolution of a sublayer, BF16 `[8, 2304]`.
     conv: CudaSlice<bf16>,
     topk: TopkScratch,
-    /// The top 16 candidates of each draft row and their logits, `[7, 16]`.
+    /// The top 16 candidates of each draft row, their logits, and normalized filtered
+    /// sampling probabilities (`[7, 16]` each).
     cand: CudaSlice<i32>,
     unary: CudaSlice<f32>,
+    q_probs: CudaSlice<f32>,
     /// The hidden projection of block rows 1 to 7, BF16 `[7, 256]`.
     hp: CudaSlice<bf16>,
 }
@@ -1064,6 +1070,7 @@ impl Scratch {
                 topk: TopkScratch::new(stream)?,
                 cand: stream.alloc_zeros(STEPS * TOP_K)?,
                 unary: zf(STEPS * TOP_K)?,
+                q_probs: zf(STEPS * TOP_K)?,
                 hp: z(STEPS * RANK)?,
             }),
             _ => None,
@@ -1368,7 +1375,35 @@ impl Draft {
             head_copy,
             batch: None,
             tree_top2: false,
+            temp_scale: DEFAULT_DRAFT_TEMP_SCALE,
         })
+    }
+
+    /// Sets the draft temperature calibration multiplier `alpha = T_draft / T_target` for
+    /// DFlash 2's 16-candidate selector when sampling (`> 0.0`, default `0.85`).
+    pub fn set_temp_scale(&mut self, scale: f32) -> anyhow::Result<()> {
+        ensure!(
+            scale.is_finite() && scale > 0.0,
+            "draft temp_scale must be finite and positive, got {scale}"
+        );
+        self.temp_scale = scale;
+        Ok(())
+    }
+
+    /// Current draft temperature calibration multiplier (`alpha = T_draft / T_target`).
+    #[must_use]
+    pub fn temp_scale(&self) -> f32 {
+        self.temp_scale
+    }
+
+    /// DFlash 2's per-step candidate ids (`[7 * 16]`) and normalized filtered probabilities
+    /// (`[7 * 16]`) from the most recent single-sequence round, or `None` for non-DFlash 2.
+    #[must_use]
+    pub fn dflash2_distributions(&self) -> Option<(CudaView<'_, i32>, CudaView<'_, f32>)> {
+        self.s
+            .dflash2
+            .as_ref()
+            .map(|d2| (d2.cand.slice(..), d2.q_probs.slice(..)))
     }
 
     /// The target hidden states the draft reads per position, in order.
@@ -1734,11 +1769,7 @@ impl Draft {
         stream: &Arc<CudaStream>,
         sampling: Sampling,
     ) -> anyhow::Result<()> {
-        let words = if sampling.is_greedy() {
-            race_words(0.0, 0)
-        } else {
-            race_words(sampling.temperature, sampling.seed)
-        };
+        let words = race_words_sampling(sampling, self.temp_scale);
         stream.memcpy_htod(&words, &mut self.inputs.race)?;
         Ok(())
     }
@@ -2810,6 +2841,7 @@ impl Draft {
                 self.softcap,
                 &mut s.ids,
                 &mut s.confidence,
+                Some(&mut d2.q_probs),
                 &self.inputs.race,
             )
         }

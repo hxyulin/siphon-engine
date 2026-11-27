@@ -495,6 +495,10 @@ struct Ctx {
     moe_pruning: MoePruning,
     /// Opt-in logit margin for speculative acceptance (`0.0` for exact lossless acceptance).
     accept_margin: f32,
+    /// Opt-in beta-relaxed / maximal-coupling rejection sampling parameter (`(0, 1]`).
+    /// `None` uses default coupled Gumbel-Max race; `Some(1.0)` is exact lossless
+    /// Leviathan/Chen rejection; `Some(0.70..0.95)` is Pareto-optimal controlled-lossy.
+    spec_beta: Option<f32>,
 }
 
 impl std::fmt::Debug for Model {
@@ -726,6 +730,7 @@ impl Model {
                 },
                 moe_pruning: MoePruning::default(),
                 accept_margin: 0.0,
+                spec_beta: None,
             },
             passes,
             rounded_below: 0,
@@ -1521,6 +1526,10 @@ impl Model {
             margin.is_finite() && margin >= 0.0,
             "accept_margin must be finite and non-negative, got {margin}"
         );
+        ensure!(
+            !(margin > 0.0 && self.ctx.spec_beta.is_some()),
+            "accept_margin and spec_beta cannot both be enabled"
+        );
         if self.ctx.accept_margin.to_bits() != margin.to_bits() {
             self.ctx.accept_margin = margin;
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
@@ -1533,6 +1542,36 @@ impl Model {
     #[must_use]
     pub fn accept_margin(&self) -> f32 {
         self.ctx.accept_margin
+    }
+
+    /// Enables or disables beta-relaxed / maximal-coupling rejection sampling (`0 < beta <= 1`)
+    /// for DFlash 2 speculation. `Some(1.0)` is exact lossless Leviathan/Chen maximal-coupling
+    /// rejection; `Some(0.70..0.90)` relaxes acceptance with 0% out-of-support mass. Drops any
+    /// captured verify and batched-verify graphs when changed.
+    pub fn set_spec_beta(&mut self, beta: Option<f32>) -> anyhow::Result<()> {
+        if let Some(b) = beta {
+            ensure!(
+                b.is_finite() && b > 0.0 && b <= 1.0,
+                "spec_beta must be in (0, 1], got {b}"
+            );
+            ensure!(
+                self.ctx.accept_margin == 0.0,
+                "spec_beta and accept_margin cannot both be enabled"
+            );
+        }
+        let changed = self.ctx.spec_beta.map(f32::to_bits) != beta.map(f32::to_bits);
+        if changed {
+            self.ctx.spec_beta = beta;
+            self.verify_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch_verify_graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// Active beta-relaxed / maximal-coupling rejection parameter, or `None` for coupled race.
+    #[must_use]
+    pub fn spec_beta(&self) -> Option<f32> {
+        self.ctx.spec_beta
     }
 
     /// The token after a step or prefill, whose logits are in the decode buffers: the
