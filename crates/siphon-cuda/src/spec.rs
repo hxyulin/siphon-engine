@@ -2156,12 +2156,9 @@ impl Speculator {
         };
         let pending = model.start_verify(VerifyTokens::Drafts(tokens), Accept::Greedy)?;
         self.round_events[slot][1].record(&stream)?;
-        // Immediately copy verify result to pinned host memory on `copy_stream` while the
-        // main stream runs the draft graph.
-        self.copy_stream.wait(&self.round_events[slot][1])?;
-        self.pinned_verify_result
-            .copy_from_device(&self.copy_stream, &model.verify_result_device()?)?;
-        self.results_copied.record(&self.copy_stream)?;
+        // Enqueue the draft graph on the compute stream immediately after recording `verified`
+        // so it launches with zero host-side delay, then pull the verify result on `copy_stream`
+        // in parallel.
         if drafts == Drafts::Dspark {
             self.draft.set_round_inputs_kept(
                 &stream,
@@ -2176,6 +2173,10 @@ impl Speculator {
         self.round_events[slot][2].record(&stream)?;
         self.round_event_pending[slot] = true;
         self.round_event_slot ^= 1;
+        self.copy_stream.wait(&self.round_events[slot][1])?;
+        self.pinned_verify_result
+            .copy_from_device(&self.copy_stream, &model.verify_result_device()?)?;
+        self.results_copied.record(&self.copy_stream)?;
         if drafts == Drafts::Dspark && matches!(self.width, Width::Adaptive(_)) {
             self.copy_stream.wait(&self.round_events[slot][2])?;
             self.pinned_conf.copy_from_device(
