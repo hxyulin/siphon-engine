@@ -1,10 +1,13 @@
 [package]
 name = "siphon-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Serve, inspect, and plan inference for Inkling 2 Mini"
 
 [[bin]]
 name = "siphon"
@@ -15,23 +18,45 @@ name = "archive"
 required-features = ["archive"]
 
 [features]
-archive = ["dep:serde", "dep:serde_json", "dep:tempfile", "dep:zstd"]
-http-zstd = ["siphon-serve/http-zstd"]
+archive = ["serde_json/raw_value", "dep:tempfile", "dep:zstd"]
+http-zstd = ["tower-http/compression-zstd", "tower-http/decompression-zstd", "dep:zstd"]
 
 [dependencies]
+anstream = "1"
 anyhow.workspace = true
+axum = "0.8"
+base64 = "0.22"
 clap.workspace = true
 clap_complete = "4.6"
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, features = ["raw_value"], optional = true }
-siphon = { path = "../siphon" }
-siphon-plan = { path = "../siphon-plan" }
-siphon-serve = { path = "../siphon-serve" }
+futures-util = { version = "0.3.34", default-features = false }
+http-body = "1.0.1"
+image.workspace = true
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error = "0.1.20"
+shlex = "2"
+siphon.workspace = true
 tempfile = { version = "3", optional = true }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio-stream = "0.1.19"
+tower-http = { version = "0.6.11", default-features = false, features = ["compression-gzip", "decompression-gzip"] }
 zstd = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
-serde_json.workspace = true
+flate2 = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "test-util"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc.workspace = true
+half.workspace = true
+siphon-cuda.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+siphon-mlx.workspace = true
 
 [lints]
 workspace = true

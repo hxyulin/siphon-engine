@@ -1,12 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/siphon", "crates/siphon-cli", "crates/siphon-cuda", "crates/siphon-plan", "crates/siphon-serve"]
+members = ["crates/siphon", "crates/siphon-cli", "crates/siphon-cuda", "crates/siphon-mlx"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-publish = false
+publish = ["crates-io"]
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/hxyulin/siphon-engine"
+readme = "README.md"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -19,6 +22,9 @@ safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
+siphon = { package = "siphon-engine", version = "0.1.0", path = "crates/siphon" }
+siphon-cuda = { version = "0.1.0", path = "crates/siphon-cuda" }
+siphon-mlx = { version = "0.1.0", path = "crates/siphon-mlx" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

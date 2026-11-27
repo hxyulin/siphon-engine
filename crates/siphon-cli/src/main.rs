@@ -1,9 +1,11 @@
 #[cfg(feature = "archive")]
 mod archive;
+mod plan;
+mod serve;
 
 use std::{
     collections::BTreeMap,
-    env, io,
+    io,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -37,8 +39,8 @@ fn command() -> Command {
                         .action(ArgAction::SetTrue)
                         .help("List each tensor individually"),
                 ),
-            siphon_plan::command(),
-            siphon_serve::command(),
+            plan::command(),
+            serve::command(),
             #[cfg(feature = "archive")]
             archive::command(),
             Command::new("completions")
@@ -71,17 +73,12 @@ fn main() -> ExitCode {
             };
             inspect(&dir, listing)
         }
-        "plan" => siphon_plan::run(matches),
+        "plan" => plan::run(matches),
         "serve" => {
-            // Include the loaded kernel code in the startup memory check.
-            if env::var_os("CUDA_MODULE_LOADING").is_none() {
-                // SAFETY: main has not started any threads.
-                unsafe { env::set_var("CUDA_MODULE_LOADING", "EAGER") };
-            }
             let subcommand = command
                 .find_subcommand_mut("serve")
                 .expect("serve is defined");
-            return siphon_serve::run(subcommand, matches).unwrap_or_else(|error| error.exit());
+            return serve::run(subcommand, &matches).unwrap_or_else(|error| error.exit());
         }
         #[cfg(feature = "archive")]
         "archive" => archive::run(&matches),

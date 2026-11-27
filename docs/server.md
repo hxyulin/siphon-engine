@@ -8,6 +8,10 @@ SIPHON_API_KEY=<key> target/release/siphon serve <model-dir> --port 8000
 
 ## Startup
 
+The server selects CUDA on Linux and MLX on Apple Silicon. Use `--backend cuda` or `--backend mlx` to make the selection explicit.
+
+### CUDA
+
 Before loading anything, the server plans the GPU memory from the config and the checkpoint headers. The global KV caches of every stream share one pool of pages ([Concurrent requests](#concurrent-requests)). Without `--context`, the pool takes the free memory less `--margin` (0.25 GiB by default) and what the weights and buffers need, up to `--streams` times the model's 1,048,576 per-request limit (each individual request stays capped at 1,048,576). With `--context`, it stops and prints the plan if that context does not fit. It prints the plan in two lines.
 
 It then loads the model, prices each verify width on a short prompt, and serves. After warmup it compares the memory the process uses with the plan and prints both. It reads its own buffers from the CUDA memory pool that every allocation comes from, and the module images and CUDA graphs from the change in free memory. After each job it checks the pool's peak again and warns if the peak went past the plan.
@@ -16,7 +20,15 @@ It then loads the model, prices each verify width on a short prompt, and serves.
 
 Set `--weights` and `--kv` to plan for the formats you intend to serve. Both default to `fp8`. In `--interactive` mode, press `w` to toggle weight precision, `k` to cycle through the KV formats, and `d` to switch between the bundled draft and the directory supplied with `--drafter`. The arrow keys move the context in steps of 8K or 64K positions. Press `m` to return to the largest context that fits. Press `q` or Esc to print a `siphon serve` command and exit. Press Ctrl-C to cancel.
 
+### MLX
+
+Install the pinned MLX-LM environment as described in the [Apple Silicon quick start](../README.md#apple-silicon). `SIPHON_MLX_PYTHON` sets the Python executable and defaults to `python3`. The worker loads the checkpoint once and decodes one text sequence at a time, with no shared prefix cache or speculative decoding.
+
+MLX supports `--host`, `--port`, `--name`, `--queue`, `--drain-timeout`, `--keepalive-after`, `--context`, `--prefill-chunk` and `--greedy`. The MLX context limit defaults to 8192 positions per request, including prompt and output. Choose a larger limit with `--context` if the Mac has enough memory. `siphon plan` estimates CUDA memory.
+
 ## Options
+
+The table shows CUDA defaults and behavior. See [MLX startup](#mlx) for supported options and context limits on Apple Silicon.
 
 | Option | Default | Effect |
 | --- | --- | --- |

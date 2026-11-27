@@ -1788,31 +1788,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
-name = "siphon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "image",
- "memmap2",
- "safetensors",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "siphon-cli"
 version = "0.1.0"
 dependencies = [
+ "anstream",
  "anyhow",
+ "axum",
+ "base64 0.22.1",
  "clap",
  "clap_complete",
+ "cudarc",
+ "flate2",
+ "futures-util",
+ "half",
+ "http-body",
+ "image",
+ "ratatui",
  "serde",
  "serde_json",
- "siphon",
- "siphon-plan",
- "siphon-serve",
+ "serde_path_to_error",
+ "shlex",
+ "siphon-cuda",
+ "siphon-engine",
+ "siphon-mlx",
  "tempfile",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-http",
  "zstd",
 ]
 
@@ -1825,48 +1829,29 @@ dependencies = [
  "half",
  "safetensors",
  "serde_json",
- "siphon",
+ "siphon-engine",
 ]
 
 [[package]]
-name = "siphon-plan"
-version = "0.1.0"
-dependencies = [
- "anstream",
- "anyhow",
- "clap",
- "ratatui",
- "shlex",
- "siphon",
- "siphon-serve",
- "tempfile",
-]
-
-[[package]]
-name = "siphon-serve"
+name = "siphon-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64 0.22.1",
- "clap",
- "cudarc",
- "flate2",
- "futures-util",
- "half",
- "http-body",
  "image",
+ "memmap2",
+ "safetensors",
  "serde",
  "serde_json",
- "serde_path_to_error",
- "siphon",
- "siphon-cuda",
- "tokenizers",
- "tokio",
- "tokio-stream",
- "tower",
- "tower-http",
- "zstd",
+ "sha2",
+]
+
+[[package]]
+name = "siphon-mlx"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

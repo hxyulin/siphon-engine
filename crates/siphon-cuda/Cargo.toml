@@ -1,21 +1,29 @@
 [package]
 name = "siphon-cuda"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "CUDA inference backend for Inkling 2 Mini"
+# The CUDA integration tests use large fixtures from the repository checkout.
+exclude = ["/tests/"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow.workspace = true
 cudarc.workspace = true
 half.workspace = true
-siphon = { path = "../siphon" }
+siphon.workspace = true
 safetensors.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-siphon = { path = "../siphon" }
+siphon.workspace = true
 
 [lints]
 workspace = true

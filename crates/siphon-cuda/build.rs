@@ -4,12 +4,19 @@
 //! Only runs when targeting Linux. Finds `nvcc` through `NVCC`, then `CUDA_HOME`,
 //! then `PATH`. `SIPHON_CUDA_ARCH` overrides the default `sm_120a` target: `sm_89` builds
 //! for the RTX 4090 and sets the `sm89` cfg, which turns off what only `sm_120a` can run.
+//! On docs.rs, writes placeholder cubins so rustdoc can check the Linux API without CUDA.
 
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo::rerun-if-changed=kernels");
-    for var in ["NVCC", "CUDA_HOME", "SIPHON_CUDA_ARCH", "SIPHON_FAST_MATH"] {
+    for var in [
+        "NVCC",
+        "CUDA_HOME",
+        "SIPHON_CUDA_ARCH",
+        "SIPHON_FAST_MATH",
+        "DOCS_RS",
+    ] {
         println!("cargo::rerun-if-env-changed={var}");
     }
     let arch = env::var("SIPHON_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".to_owned());
@@ -41,6 +48,16 @@ fn main() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "cu"))
         .collect();
     sources.sort();
+
+    if env::var_os("DOCS_RS").is_some() {
+        for source in sources {
+            let name = source.file_stem().expect("kernel file has a name");
+            fs::write(out_dir.join(name).with_extension("cubin"), [])
+                .expect("write documentation cubin placeholder");
+        }
+        println!("cargo::rustc-env=SIPHON_KERNELS_HASH=docsrs");
+        return;
+    }
 
     // FNV-1a over every cubin's name and bytes.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

@@ -1,10 +1,13 @@
 [package]
-name = "siphon"
-version = "0.1.0"
+name = "siphon-engine"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Checkpoint loading, memory planning, and inference primitives for Inkling 2 Mini"
 
 [dependencies]
 anyhow.workspace = true

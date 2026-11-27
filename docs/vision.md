@@ -131,7 +131,7 @@ On every image, mlx-vlm's greedy reply starts by describing the picture correctl
 
 ### What the Rust tests check
 
-`cargo test -p siphon vision` runs against these fixtures:
+`cargo test -p siphon-engine vision` runs against these fixtures:
 
 - **Patch order and normalization, bit for bit.** Patching the reference's own RGB pixels gives the reference's patch hash for all four checked-in RGB images, the JPEG included.
 - **The whole of `prepare`, bit for bit,** for PNG, GIF and lossy WebP: the `image` crate's WebP decoder matches libwebp exactly on this image.
