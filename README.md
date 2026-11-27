@@ -2,14 +2,14 @@
 
 # Siphon
 
-**An inference engine for one model on one GPU: [Inkling 2 Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/) on an NVIDIA RTX 5090.**
+**An inference engine for one model, [Inkling 2 Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/), on one NVIDIA GPU: an RTX 5090, an RTX PRO 6000 Blackwell or an RTX 4090.**
 
-Rust host code, CUDA kernels written for this model and `sm_120a`, and an OpenAI-compatible server.
+Rust host code, CUDA kernels written for this model and `sm_120a` (`sm_89` for the RTX 4090), and an OpenAI-compatible server.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![CUDA 13.5](https://img.shields.io/badge/CUDA-13.5-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
-[![GPU: RTX 5090](https://img.shields.io/badge/GPU-RTX%205090%20%28sm__120a%29-76B900?logo=nvidia)](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/)
+[![GPU: RTX 5090 · RTX PRO 6000 · RTX 4090](https://img.shields.io/badge/GPU-RTX%205090%20%C2%B7%20RTX%20PRO%206000%20%C2%B7%20RTX%204090-76B900?logo=nvidia)](#gpus)
 [![Model: Inkling 2 Mini](https://img.shields.io/badge/model-Inkling%202%20Mini-FFD21E?logo=huggingface)](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 [![Image](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml/badge.svg)](https://github.com/hxyulin/siphon-engine/actions/workflows/image.yml)
 
@@ -28,7 +28,7 @@ Rust host code, CUDA kernels written for this model and `sm_120a`, and an OpenAI
 
 ## Quick start
 
-Siphon needs Linux, an RTX 5090 and a driver for CUDA 13.5 or later. Download the checkpoint from Hugging Face ([`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)), then build and run the server image. The NVIDIA container toolkit passes the host's driver in:
+Siphon needs Linux, an RTX 5090 or RTX PRO 6000 Blackwell and a driver for CUDA 13.5 or later. An RTX 4090 needs its own build ([Build from source](#build-from-source)). Download the checkpoint from Hugging Face ([`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)), then build and run the server image. The NVIDIA container toolkit passes the host's driver in:
 
 ```sh
 docker build -t siphon .
@@ -52,9 +52,21 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 
 Siphon also runs [`hxyulin/Inkling-2-Mini-Fast-NVFP4`](https://huggingface.co/hxyulin/Inkling-2-Mini-Fast-NVFP4), the official checkpoint with [Lucebox's tuned attention output projections](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF), with no options changed. On 100 GPQA questions at temperature 1 it answered 81 correctly against the official checkpoint's 77, with 3,055 output tokens per reply on average against 11,871. These numbers come from a build with Q8_0 copies of the tuned matrices, about 0.8% from the BF16 ones in that repo.
 
+## GPUs
+
+The same kernels serve the RTX 5090 and the RTX PRO 6000 Blackwell (`sm_120a`). The RTX 4090 runs an `sm_89` build. Decode reads the weights once per token, so it runs about as fast on the two Blackwell cards, which have the same memory bandwidth. The PRO 6000's 96 GB hold the model's full context and more streams, and it prefills about 37% faster. Plain decode and batched steps with FP8 weights and cache, from `bench`, tok/s:
+
+| GPU | Memory | Plain decode, context 0 · 32K | Prefill, 8,192 tokens | Batched steps, 16 · 32 · 64 streams | Longest context, 1 stream |
+| --- | --- | ---: | ---: | ---: | ---: |
+| RTX 5090 | 32 GB, 1.79 TB/s, 600 W | 356 · 303 | 16,203 | 1,452 · 2,145 · 3,237 | 661,504 |
+| RTX PRO 6000 Blackwell Workstation Edition | 96 GB, 1.79 TB/s, 600 W | 351 · 300 | 22,125 | 1,449 · 2,176 · 3,462 | 1,048,576 |
+| RTX 4090 | 24 GB, 1.01 TB/s, 450 W | 204 · 166 | 9,672 | not measured | 235,520 |
+
+The RTX 5090 and RTX PRO 6000 rows ran main at 93ad984, with the BF16 output projection that `--weights fp8` keeps by default; the PRO 6000 ran the [Fast NVFP4 checkpoint](https://huggingface.co/hxyulin/Inkling-2-Mini-Fast-NVFP4), whose weights have the same formats and sizes as the official one. The RTX 4090 row ran an earlier commit with `--output-projection fp8`. Its context is the planned one with the bundled draft; `--kv nvfp4` with DFlash 2 reaches 516,096 positions ([RTX 4090](#rtx-4090)). [RTX PRO 6000 Blackwell](#rtx-pro-6000-blackwell) and [RTX 4090](#rtx-4090) below have more of each card's numbers.
+
 ## Performance
 
-All numbers come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, unless a section names another commit, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default. These runs read an FP8 copy of the attention output projection, now `--output-projection fp8`. The default reads its BF16 weights, which takes 0.16 ms more per plain step at context 0 and 0.13 ms at 32K, and 1 to 2% more per verify pass ([engine.md](docs/engine.md#the-output-projection)).
+The numbers in this section come from one RTX 5090 (32 GB, 600 W) running main at d60a6c9, unless a section names another commit or GPU, with no other process on the GPU. Speculation and batching use FP8 dense weights and an FP8 KV cache, the server's default. These runs read an FP8 copy of the attention output projection, now `--output-projection fp8`. The default reads its BF16 weights, which takes 0.16 ms more per plain step at context 0 and 0.13 ms at 32K, and 1 to 2% more per verify pass ([engine.md](docs/engine.md#the-output-projection)).
 
 ### Decode
 
@@ -149,6 +161,43 @@ The server plans its GPU memory from the config and the checkpoint headers befor
 `--prefill-chunk 1024` halves the prefill buffers, which raises the FP8 contexts to 679,936 and 754,688 for 6 to 7% of prefill speed.
 
 `siphon-plan <model-dir>` shows the plan in a terminal before you start the server, and runs on macOS too.
+
+### RTX PRO 6000 Blackwell
+
+Main at 93ad984 on an RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver 595.84), with the Fast NVFP4 checkpoint and FP8 weights and cache. Plain decode, 100 steps:
+
+| Context | Step | tok/s |
+| ---: | ---: | ---: |
+| 0 | 2.851 ms | 350.7 |
+| 4,096 | 3.004 ms | 332.9 |
+| 32,768 | 3.328 ms | 300.4 |
+
+The RTX 5090 took 2.810, 2.945 and 3.303 ms at the same commit. Prefill in chunks of 2,048 ran 22,759 tok/s at 2,048 tokens, 23,082 at 4,096 and 22,125 at 8,192. `--expert-activations quantized --prefill-dense fp8` raises that to 35,176, 35,027 and 33,862 tok/s, but fails the quality gate on some texts ([Features](#features)).
+
+DFlash 2 after the `anyhow` source at 10,674 tokens, 256 tokens: greedy speculation ran 851 tok/s, 2.64 times plain decode's 322, at 6.50 tokens per round. At temperature 0.6, three seeds ran 668 to 787 tok/s.
+
+Batched steps, tok/s in all with tok/s per stream in brackets:
+
+| Context of each stream | 1 stream | 16 streams | 32 streams | 64 streams |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 306 | 1,449 (91) | 2,176 (68) | **3,462** (54) |
+| 4,096 | 285 | 1,230 (77) | 1,787 (56) | **2,622** (41) |
+
+With 95.1 GiB free, the planner gives one to four streams the model's full 1,048,576 positions with the FP8 cache. With `--host-cache`, a 330K-token conversation that left the GPU came back in 0.81 s instead of 38.9 s of prefill ([server.md](docs/server.md#prefix-cache)). [batching.md](docs/batching.md#against-vllm-and-sglang-on-an-rtx-pro-6000-workstation-edition) compares batched decode on this card with vLLM and SGLang.
+
+### RTX 4090
+
+The `sm_89` build ([Build from source](#build-from-source)) with FP8 weights and cache and `--output-projection fp8`, plain decode from `bench`:
+
+| Context | FP8 weights and cache | BF16 weights and cache |
+| ---: | ---: | ---: |
+| 0 | 204.4 tok/s | 148.9 tok/s |
+| 4,096 | 196.5 tok/s | |
+| 32,768 | 165.8 tok/s | 113.4 tok/s |
+
+Prefill ran 9,672 tok/s at 8,192 tokens and 8,950 at 32,768. Through `siphon-serve`, with the Fast NVFP4 checkpoint and greedy decoding, one stream decoded code at 349 tok/s with the bundled draft and 390 with DFlash 2, JSON at 411 and 442, and prose at 235 to 263. Two concurrent requests ran 262 tok/s in all, and four ran 341.
+
+Context is the limit on this card: the weights take 16.8 GiB of its 23.13 GiB free, so the planner gives one stream 235,520 positions with the FP8 cache, 331,776 with `--kv mixed` and 385,024 with `--kv nvfp4`. NVFP4 with DFlash 2, `--prefill-chunk 1024` and `--margin 0.1` plans 516,096. A 478,195-token prompt prefilled in 138.5 s there and decoded at 207 tok/s, on a plan 8,192 to 18,432 positions shorter than today's. [server.md](docs/server.md#serving-on-an-rtx-4090) has the recommended configurations and [engine.md](docs/engine.md#rtx-4090-sm_89) the build's differences.
 
 ## Features
 
