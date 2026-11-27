@@ -987,6 +987,8 @@ pub struct Attention {
     /// `attention_rows_bf16_<NT>`, `attention_rows_fp8_<NT>` and `attention_rows_fp4_<NT>`
     /// for NT = 1 to 3.
     rows: Vec<[CudaFunction; 3]>,
+    /// `attention_rows_tree_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
+    rows_tree: Vec<[CudaFunction; 3]>,
     /// `attention_batch_bf16`, `attention_batch_fp8` and `attention_batch_fp4`.
     batch: [CudaFunction; 3],
     /// `attention_batch_verify_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
@@ -1193,6 +1195,24 @@ impl Attention {
                         rows_function(&format!("attention_rows_bf16_{nt}"), ROWS_SHARED_BYTES[0])?,
                         rows_function(&format!("attention_rows_fp8_{nt}"), ROWS_SHARED_BYTES[1])?,
                         rows_function(&format!("attention_rows_fp4_{nt}"), ROWS_SHARED_BYTES[2])?,
+                    ])
+                })
+                .collect::<anyhow::Result<_>>()?,
+            rows_tree: (1..=ROWS_QUERY_TILES)
+                .map(|nt| {
+                    Ok([
+                        rows_function(
+                            &format!("attention_rows_tree_bf16_{nt}"),
+                            ROWS_SHARED_BYTES[0],
+                        )?,
+                        rows_function(
+                            &format!("attention_rows_tree_fp8_{nt}"),
+                            ROWS_SHARED_BYTES[1],
+                        )?,
+                        rows_function(
+                            &format!("attention_rows_tree_fp4_{nt}"),
+                            ROWS_SHARED_BYTES[2],
+                        )?,
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
@@ -1478,6 +1498,100 @@ impl Attention {
         // block of their KV head has finished reading the cache; no two blocks write the same
         // elements, since rows <= 8 < slots. Before `pdl_wait` it reads only `start` and the
         // caches, which no kernel of the pass writes before this one.
+        unsafe { args.launch_pdl(stream, function, config) }
+    }
+
+    /// Tree-verify variant of [`Self::attention_rows`]: row `r` sits at sequence position
+    /// `*start + tree_depth[r]`, attends over committed prefix slots below `*start` plus
+    /// its own tree ancestors `tree_attn_anc[r * 8 .. r * 8 + 8]`, and stages its native
+    /// K and V into `k_stage` and `v_stage` (`[8, cache.row_bytes()]`) instead of mutating
+    /// `cache`. `Spec::kv_commit_tree` commits the winning branch after acceptance.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors attention_rows plus tree topology and staging buffers"
+    )]
+    pub fn attention_rows_tree(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        cache: &KvCache,
+        start: &CudaSlice<u32>,
+        rows: usize,
+        bias: &impl DeviceIn<bf16>,
+        sinks: &impl DeviceIn<bf16>,
+        gate: Option<&CudaView<'_, bf16>>,
+        scratch: &mut RowsAttentionScratch,
+        out: &mut impl DeviceOut<bf16>,
+        tree_depth: &CudaSlice<u32>,
+        tree_attn_anc: &CudaSlice<i32>,
+        k_stage: &mut CudaSlice<u8>,
+        v_stage: &mut CudaSlice<u8>,
+    ) -> anyhow::Result<()> {
+        let (q, k, v, bias, sinks) = (q.view(), k.view(), v.view(), bias.view(), sinks.view());
+        let mut out = out.view_mut();
+        if let Some(gate) = gate {
+            check_len("gate", gate.len(), rows * HEADS * HEAD_DIM)?;
+        }
+        ensure!(
+            (1..=ROWS_MAX).contains(&rows),
+            "{rows} rows, expected 1 to {ROWS_MAX}"
+        );
+        check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        check_len("sinks", sinks.len(), rows * HEADS)?;
+        check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("start", start.len(), 1)?;
+        check_len("tree_depth", tree_depth.len(), ROWS_MAX)?;
+        check_len("tree_attn_anc", tree_attn_anc.len(), ROWS_MAX * ROWS_MAX)?;
+        check_len("k_stage", k_stage.len(), ROWS_MAX * cache.row_bytes())?;
+        check_len("v_stage", v_stage.len(), ROWS_MAX * cache.row_bytes())?;
+        let extent = extent("bias", bias.len(), rows * HEADS)?;
+        let slots = u32::try_from(cache.slots)?;
+        let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
+        let entry = &self.rows_tree[(3 * rows).div_ceil(8) - 1];
+        let (function, smem) = match *cache.data {
+            KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
+            KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
+            KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
+        match &*cache.data {
+            KvData::Bf16 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
+            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                args.ptr(keys, stream).ptr(values, stream)
+            }
+        };
+        args.ptr(&bias, stream)
+            .ptr(&sinks, stream)
+            .ptr_mut(&mut scratch.out, stream)
+            .ptr_mut(&mut scratch.max, stream)
+            .ptr_mut(&mut scratch.sum, stream)
+            .ptr_mut(&mut scratch.counters, stream)
+            .ptr_mut(&mut out, stream)
+            .opt(gate, stream)
+            .ptr(start, stream)
+            .i32(i32::try_from(rows)?)
+            .u32(slots)
+            .u32(window)
+            .u32(extent)
+            .f32(SCALE)
+            .ptr(tree_depth, stream)
+            .ptr(tree_attn_anc, stream)
+            .ptr_mut(k_stage, stream)
+            .ptr_mut(v_stage, stream);
+        let config = LaunchConfig {
+            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS, 1),
+            block_dim: (ROWS_THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        // SAFETY: matches `attention_rows_tree_{bf16,fp8,fp4}_<NT>`; `k_cache` and
+        // `v_cache` are read-only below `min(*start, slots)`, `k_stage` and `v_stage` hold
+        // 8 rows of `cache.row_bytes()` bytes in the cache's native format, and only
+        // `start`, `k_cache`, `v_cache` are read before `pdl_wait`.
         unsafe { args.launch_pdl(stream, function, config) }
     }
 

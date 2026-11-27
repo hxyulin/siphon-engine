@@ -275,6 +275,15 @@ pub enum PrefillLogits<'a> {
     ),
 }
 
+/// Per-visit tree topology and KV staging slices passed to [`Ctx::attention_block_rows`].
+struct TreeAttentionVisit<'a> {
+    conv_anc: &'a CudaSlice<i32>,
+    depth: &'a CudaSlice<u32>,
+    attn_anc: &'a CudaSlice<i32>,
+    k_stage: &'a mut CudaSlice<u8>,
+    v_stage: &'a mut CudaSlice<u8>,
+}
+
 /// Intermediates of the message gates for a chunk.
 struct GateRows {
     /// Whether the products run in a fixed order for any row count (see
@@ -2118,7 +2127,9 @@ impl Ctx {
             let visit = visits.next().context("fewer visit caches than visits")?;
             Ok::<_, anyhow::Error>((visit, plan.next().flatten()))
         };
-        if let Some(v) = p.verify.as_mut() {
+        if let Some(v) = p.verify.as_mut()
+            && !v.tree_active
+        {
             self.kernels.spec.ring_backup(
                 &self.stream,
                 &v.rings,
@@ -2550,7 +2561,7 @@ impl Ctx {
             .as_mut()
             .context("the verify buffers are missing")?;
         let spec = &self.kernels.spec;
-        if self.accept_margin > 0.0 {
+        if self.accept_margin > 0.0 && !v.tree_active {
             let head_logits = p
                 .head_logits
                 .as_mut()
@@ -2643,6 +2654,55 @@ impl Ctx {
                     p.head_fp8.as_mut(),
                     &mut v.argmax.slice_mut(..m),
                 )?;
+            }
+            if v.tree_active {
+                let tv = v
+                    .tree
+                    .as_mut()
+                    .context("the tree verify buffers are missing")?;
+                spec.accept_tree(
+                    &self.stream,
+                    &rows(&p.tokens, m, 1),
+                    &v.argmax.slice(..m),
+                    &tv.primary_child,
+                    &tv.secondary_child,
+                    &tv.forced_path,
+                    &tv.forced_len,
+                    m,
+                    &mut v.result,
+                    &mut tv.path,
+                    &mut v.anchor,
+                )?;
+                spec.kv_commit_tree(
+                    &self.stream,
+                    &tv.kv_caches,
+                    &tv.kv_stages,
+                    &tv.kv_slots,
+                    &tv.kv_row_bytes,
+                    &p.start,
+                    &v.result,
+                    &tv.path,
+                    m,
+                )?;
+                spec.conv_commit_tree(
+                    &self.stream,
+                    &v.states,
+                    &v.inputs,
+                    &v.result,
+                    &tv.path,
+                )?;
+                if let Some(taps) = p.taps.as_ref() {
+                    spec.taps_compact_tree(
+                        &self.stream,
+                        taps,
+                        &mut tv.taps_compact,
+                        &v.result,
+                        &tv.path,
+                        p.tap_layout.len(),
+                        m,
+                    )?;
+                }
+                return Ok(());
             }
             spec.accept_greedy(
                 &self.stream,
@@ -2933,6 +2993,18 @@ impl Ctx {
         } else {
             (k_in, v_in)
         };
+        let tree_attn = p
+            .verify
+            .as_mut()
+            .filter(|v| v.tree_active)
+            .and_then(|v| v.tree.as_mut())
+            .map(|tv| TreeAttentionVisit {
+                conv_anc: &tv.conv_anc,
+                depth: &tv.depth,
+                attn_anc: &tv.attn_anc,
+                k_stage: &mut tv.stage_k[index],
+                v_stage: &mut tv.stage_v[index],
+            });
         self.attention_block_rows(
             state,
             &mut p.attention,
@@ -2944,7 +3016,9 @@ impl Ctx {
             prequant_qkv.then_some(one_input),
             m,
             batch.as_ref(),
+            tree_attn,
         )?;
+        let tree_active = p.verify.as_ref().is_some_and(|v| v.tree_active);
         // Up to STEP_ROWS rows, and in a batched step, the kernel that ends the visit shifts
         // every conv state.
         let step = m <= STEP_ROWS || batch.is_some();
@@ -2958,6 +3032,24 @@ impl Ctx {
                 hidden: (!block_start).then(|| rows(&p.hidden, m, hidden)),
                 residual: rows_mut(&mut p.residual, m, hidden),
             }
+        } else if tree_active {
+            let conv_anc = &p
+                .verify
+                .as_ref()
+                .and_then(|v| v.tree.as_ref())
+                .context("the tree verify buffers are missing")?
+                .conv_anc;
+            self.kernels.conv.short_conv_residual_tree(
+                &self.stream,
+                &rows(&p.attention.proj, m, hidden),
+                &w.post_attention_conv,
+                &state.conv[2],
+                (!block_start).then(|| rows(&p.hidden, m, hidden)).as_ref(),
+                &mut rows_mut(&mut p.residual, m, hidden),
+                conv_anc,
+                m,
+            )?;
+            RowsPartial::F32(rows(&p.residual, m, hidden))
         } else {
             RowsPartial::ConvResidual {
                 x: rows(&p.attention.proj, m, hidden),
@@ -3151,6 +3243,38 @@ impl Ctx {
                     m,
                 )?;
             }
+            std::mem::swap(&mut p.hidden, &mut p.out);
+            return Ok(());
+        }
+        if tree_active {
+            let v = p
+                .verify
+                .as_mut()
+                .context("the verify buffers are missing")?;
+            let conv_anc = &v
+                .tree
+                .as_ref()
+                .context("the tree verify buffers are missing")?
+                .conv_anc;
+            let len = VERIFY_ROWS * VISIT_CHANNELS;
+            let mut visit_inputs = v.inputs.slice_mut(index * len..(index + 1) * len);
+            self.kernels.conv.moe_conv_residual_tree_rows(
+                &self.stream,
+                &rows(&p.moe.down, m, 8 * hidden),
+                &rows(&p.moe.weights, m, 8),
+                &w.post_mlp_conv,
+                &state.conv[3],
+                &rows(&p.residual, m, hidden),
+                &mut rows_mut(&mut p.out, m, hidden),
+                [
+                    rows(&p.attention.proj, m, hidden),
+                    rows(&p.attention.k_raw, m, kv_dims),
+                    rows(&p.attention.v_raw, m, kv_dims),
+                ],
+                &mut visit_inputs,
+                conv_anc,
+                m,
+            )?;
             std::mem::swap(&mut p.hidden, &mut p.out);
             return Ok(());
         }
@@ -3485,7 +3609,7 @@ impl Ctx {
     /// With `batch`, each row is the next token of its own sequence instead, with the
     /// caches, conv states and position `batch` gives; `state` then only gives the cache's
     /// size and format. When `prequant_qkv` is `Some(one_input)`, `dense` already holds the
-    /// MXFP8 inputs.
+    /// MXFP8 inputs. With `tree`, rows form a speculative tree whose K/V are staged.
     #[expect(
         clippy::too_many_arguments,
         reason = "the attention inputs and outputs"
@@ -3503,6 +3627,7 @@ impl Ctx {
         prequant_qkv: Option<bool>,
         m: usize,
         batch: Option<&BatchRows<'_>>,
+        tree: Option<TreeAttentionVisit<'_>>,
     ) -> anyhow::Result<()> {
         fn product<'a>(
             (weight, fp8): (&'a CudaSlice<bf16>, Option<&'a Fp8Matrix>),
@@ -3569,40 +3694,49 @@ impl Ctx {
                 v_static,
             },
         };
-        self.kernels.norm.attention_post_rows(
-            &self.stream,
-            AttentionPostRows {
-                k_raw: rows(&t.k_raw, m, kv_dims),
-                v_raw: rows(&t.v_raw, m, kv_dims),
-                conv,
-                k_state: &state.conv[0],
-                v_state: &state.conv[1],
-                q_raw: rows(&t.q_raw, m, q_dims),
-                q_scale: &a.q_clip_scale,
-                r_raw: rows(&t.r_raw, m, rel_dims),
-                r_scale: &a.rel_clip_scale,
-                k: rows_mut(&mut t.k, m, kv_dims),
-                v: rows_mut(&mut t.v, m, kv_dims),
-                q: rows_mut(&mut t.q, m, q_dims),
-                r: rows_mut(&mut t.r, m, rel_dims),
-                log_scale: (!sliding).then_some((
-                    start.as_view(),
-                    cfg.log_scaling_alpha,
-                    cfg.log_scaling_n_floor as f32,
-                )),
-                qk_threshold: cfg.qk_l2_clip_threshold,
-                rel_threshold: cfg.rel_l2_clip_threshold,
-                eps: self.eps(),
-                bias: step.then(|| {
-                    (
-                        &a.rel_table,
-                        rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
-                    )
-                }),
-                batch,
-            },
-            m,
-        )?;
+        let post_args = AttentionPostRows {
+            k_raw: rows(&t.k_raw, m, kv_dims),
+            v_raw: rows(&t.v_raw, m, kv_dims),
+            conv,
+            k_state: &state.conv[0],
+            v_state: &state.conv[1],
+            q_raw: rows(&t.q_raw, m, q_dims),
+            q_scale: &a.q_clip_scale,
+            r_raw: rows(&t.r_raw, m, rel_dims),
+            r_scale: &a.rel_clip_scale,
+            k: rows_mut(&mut t.k, m, kv_dims),
+            v: rows_mut(&mut t.v, m, kv_dims),
+            q: rows_mut(&mut t.q, m, q_dims),
+            r: rows_mut(&mut t.r, m, rel_dims),
+            log_scale: (!sliding).then_some((
+                start.as_view(),
+                cfg.log_scaling_alpha,
+                cfg.log_scaling_n_floor as f32,
+            )),
+            qk_threshold: cfg.qk_l2_clip_threshold,
+            rel_threshold: cfg.rel_l2_clip_threshold,
+            eps: self.eps(),
+            bias: step.then(|| {
+                (
+                    &a.rel_table,
+                    rows_mut(&mut t.bias, m, heads * cfg.rel_extent),
+                )
+            }),
+            batch,
+        };
+        if let Some(tv) = &tree {
+            self.kernels.norm.attention_post_rows_tree(
+                &self.stream,
+                post_args,
+                tv.conv_anc,
+                tv.depth,
+                m,
+            )?;
+        } else {
+            self.kernels
+                .norm
+                .attention_post_rows(&self.stream, post_args, m)?;
+        }
         if !step {
             let [k_state, v_state, ..] = &mut state.conv;
             self.kernels.conv.shift_state(
@@ -3653,6 +3787,26 @@ impl Ctx {
                 Some(&rows(&t.gate, m, q_dims)),
                 &mut t.rows,
                 &mut rows_mut(&mut t.gated, m, q_dims),
+            )?;
+        } else if let Some(tv) = tree {
+            ensure!(invariant, "a tree verify runs the invariant kernels");
+            self.kernels.attention.attention_rows_tree(
+                &self.stream,
+                &rows(&t.q, m, q_dims),
+                &rows(&t.k, m, kv_dims),
+                &rows(&t.v, m, kv_dims),
+                &state.kv,
+                start,
+                m,
+                &rows(&t.bias, m, heads * cfg.rel_extent),
+                &rows(&t.sinks, m, heads),
+                Some(&rows(&t.gate, m, q_dims)),
+                &mut t.rows,
+                &mut rows_mut(&mut t.gated, m, q_dims),
+                tv.depth,
+                tv.attn_anc,
+                tv.k_stage,
+                tv.v_stage,
             )?;
         } else if invariant {
             self.kernels.attention.attention_rows(

@@ -44,7 +44,7 @@ const USAGE: &str = "usage: siphon-serve <model-dir> [--host 127.0.0.1] [--port 
                      [--output-projection bf16|fp8] [--kv fp8|bf16|nvfp4|nvfp4-all|mixed] [--streams 1] \
                      [--queue 8] [--widths 1,2,...,8] [--name inkling-2-mini] [--drafter DIR] [--draft fast] \
                      [--draft-shortlist N] [--draft-context-rows N] \
-                     [--fallback] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
+                     [--fallback] [--spec-tree] [--no-prefix-cache] [--prefix-cache-entries N] [--prefix-cache-ttl 600] \
                      [--host-cache GiB] [--cache-dir DIR] [--drain-timeout 600] [--prefill-attention auto|bf16|fp8|fp4] \
                      [--prefill-dense bf16|fp8] [--expert-activations bf16|quantized|fp8] \
                      [--decode-floor 20] [--piggyback-prefill] [--piggyback-budget 256] [--greedy] [--vision] \
@@ -184,6 +184,7 @@ fn args() -> anyhow::Result<Args> {
     let mut draft_shortlist = None;
     let mut draft_context_rows = None;
     let mut fallback = false;
+    let mut spec_tree = false;
     let mut prefix_cache = true;
     let mut prefix_entries = None;
     let mut prefix_ttl = 600;
@@ -261,6 +262,7 @@ fn args() -> anyhow::Result<Args> {
                 draft_context_rows = Some(n);
             }
             "--fallback" => fallback = true,
+            "--spec-tree" => spec_tree = true,
             "--no-prefix-cache" => prefix_cache = false,
             "--prefix-cache-entries" => prefix_entries = Some(value()?.parse()?),
             "--prefix-cache-ttl" => prefix_ttl = value()?.parse()?,
@@ -397,6 +399,7 @@ fn args() -> anyhow::Result<Args> {
             draft_shortlist,
             draft_context_rows,
             fallback,
+            spec_tree,
             prefix_entries: if prefix_cache {
                 entries(prefix_entries, streams)?
             } else {

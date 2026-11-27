@@ -75,6 +75,8 @@ READ_ONLY_PER_KERNEL: dict[str, set[str]] = {
     # append to the cache, after the wait.
     **{f"attention_rows_{f}_{nt}": {"k_cache", "v_cache", "start"}
        for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
+    **{f"attention_rows_tree_{f}_{nt}": {"k_cache", "v_cache", "start"}
+       for f in ("bf16", "fp8", "fp4") for nt in (1, 2, 3)},
     # A batched step's state tables and positions: the host writes them before the step.
     **{f"attention_batch_{f}": {"states", "positions"} for f in ("bf16", "fp8", "fp4")},
     **{f"attention_batch_nosplit_{f}_{nt}": {"states", "positions"}

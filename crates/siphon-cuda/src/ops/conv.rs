@@ -87,6 +87,8 @@ pub struct Conv {
     short_conv_residual_rows_packed_2304: CudaFunction,
     moe_conv_residual_rows_packed_2304: CudaFunction,
     shift_visit_states_packed_2304: CudaFunction,
+    short_conv_residual_tree_2304: CudaFunction,
+    moe_conv_residual_tree_rows_2304: CudaFunction,
 }
 
 /// The other conv streams of a visit, which [`Conv::moe_conv_residual_step_rows`] shifts
@@ -146,6 +148,9 @@ impl Conv {
                 .load_function("moe_conv_residual_rows_packed_2304")?,
             shift_visit_states_packed_2304: module
                 .load_function("shift_visit_states_packed_2304")?,
+            short_conv_residual_tree_2304: module.load_function("short_conv_residual_tree_2304")?,
+            moe_conv_residual_tree_rows_2304: module
+                .load_function("moe_conv_residual_tree_rows_2304")?,
         })
     }
 
@@ -880,6 +885,125 @@ impl Conv {
         // `states` (words 2..5) are live and distinct across slices, and the kernel reads
         // nothing before `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.shift_visit_states_packed_2304, config) }
+    }
+
+    /// Tree-verify post-attention short conv and residual add: row `r` convolves its 4
+    /// tree ancestors `conv_anc[r * 4 .. r * 4 + 4]` (oldest first; negative values read
+    /// `state[3 + anc]`), adds `hidden[r]` if given, and writes the F32 sum to `residual`.
+    /// Does not mutate `state`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn short_conv_residual_tree(
+        &self,
+        stream: &CudaStream,
+        proj: &impl DeviceIn<bf16>,
+        weight: &CudaSlice<bf16>,
+        state: &CudaSlice<f32>,
+        hidden: Option<&CudaView<'_, bf16>>,
+        residual: &mut impl DeviceOut<f32>,
+        conv_anc: &CudaSlice<i32>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let proj = proj.view();
+        let mut residual = residual.view_mut();
+        check_hidden_conv(weight, state)?;
+        ensure!(
+            (1..=STEP_MAX_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {STEP_MAX_ROWS}"
+        );
+        check_len("proj", proj.len(), rows * HIDDEN)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        ensure!(
+            conv_anc.len() >= rows * KERNEL,
+            "conv_anc has {} elements, need at least {}",
+            conv_anc.len(),
+            rows * KERNEL
+        );
+        if let Some(h) = hidden {
+            check_len("hidden", h.len(), rows * HIDDEN)?;
+        }
+        let mut args = KernelArgs::default();
+        args.ptr(&proj, stream)
+            .ptr(weight, stream)
+            .ptr(state, stream)
+            .opt(hidden, stream)
+            .ptr_mut(&mut residual, stream)
+            .ptr(conv_anc, stream);
+        // SAFETY: matches `short_conv_residual_tree_2304(const bf16*, const bf16*,
+        // const float*, const bf16*, float*, const int*)`; every buffer holds `rows` rows,
+        // `conv_anc` holds 4 valid indices per row in `-3..rows`, and only `weight` is read
+        // before `pdl_wait`.
+        unsafe {
+            args.launch_pdl(
+                stream,
+                &self.short_conv_residual_tree_2304,
+                hidden_rows_config(rows)?,
+            )
+        }
+    }
+
+    /// Tree-verify post-MLP MoE combine, short conv and residual add for `rows` (`1..=8`)
+    /// tree nodes: each node convolves its 4 tree ancestors `conv_anc[r * 4 .. r * 4 + 4]`
+    /// and records all four conv streams (`k_raw`, `v_raw`, `proj`, combined) into `inputs`
+    /// (`[8, VISIT_CHANNELS]`). Leaves all conv states untouched; `Spec::conv_commit_tree`
+    /// commits the winning branch after acceptance.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn moe_conv_residual_tree_rows(
+        &self,
+        stream: &CudaStream,
+        experts: &impl DeviceIn<bf16>,
+        weights: &impl DeviceIn<f32>,
+        weight: &CudaSlice<bf16>,
+        state: &CudaSlice<f32>,
+        residual: &impl DeviceIn<f32>,
+        out: &mut impl DeviceOut<bf16>,
+        [proj, k_raw, v_raw]: [CudaView<'_, bf16>; 3],
+        inputs: &mut CudaViewMut<'_, bf16>,
+        conv_anc: &CudaSlice<i32>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let (experts, weights, residual) = (experts.view(), weights.view(), residual.view());
+        let mut out = out.view_mut();
+        check_hidden_conv(weight, state)?;
+        ensure!(
+            (1..=STEP_MAX_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {STEP_MAX_ROWS}"
+        );
+        check_len("experts", experts.len(), rows * TOP_K * HIDDEN)?;
+        check_len("weights", weights.len(), rows * TOP_K)?;
+        check_len("residual", residual.len(), rows * HIDDEN)?;
+        check_len("out", out.len(), rows * HIDDEN)?;
+        check_len("proj", proj.len(), rows * HIDDEN)?;
+        check_len("k_raw", k_raw.len(), rows * DYNAMIC_DIMS)?;
+        check_len("v_raw", v_raw.len(), rows * DYNAMIC_DIMS)?;
+        check_len("inputs", inputs.len(), STEP_MAX_ROWS * VISIT_CHANNELS)?;
+        ensure!(
+            conv_anc.len() >= rows * KERNEL,
+            "conv_anc has {} elements, need at least {}",
+            conv_anc.len(),
+            rows * KERNEL
+        );
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(HIDDEN / STEP_BLOCK_COLS)?, 1, 1),
+            block_dim: (u32::try_from(32 * rows)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&experts, stream)
+            .ptr(&weights, stream)
+            .ptr(weight, stream)
+            .ptr(state, stream)
+            .ptr(&residual, stream)
+            .ptr_mut(&mut out, stream)
+            .i32(i32::try_from(rows)?)
+            .ptr(&proj, stream)
+            .ptr(&k_raw, stream)
+            .ptr(&v_raw, stream)
+            .ptr_mut(inputs, stream)
+            .ptr(conv_anc, stream);
+        // SAFETY: matches `moe_conv_residual_tree_rows_2304`; every buffer has the length
+        // checked above for `rows` rows, `conv_anc` holds valid indices in `-3..rows`, and
+        // only `weight` is read before `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.moe_conv_residual_tree_rows_2304, config) }
     }
 }
 

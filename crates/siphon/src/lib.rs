@@ -6,6 +6,7 @@ mod format;
 pub mod memory;
 pub mod prefix_hash;
 pub mod race;
+pub mod tree;
 pub mod vision;
 
 pub use checkpoint::{Checkpoint, TensorEntry};

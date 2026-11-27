@@ -364,6 +364,8 @@ pub struct Options {
     pub draft_context_rows: Option<usize>,
     /// Whether the speculator falls back to plain steps (`WidthPolicy::with_plain`).
     pub fallback: bool,
+    /// Whether opt-in 2-branch speculative tree verification is enabled (`--spec-tree`).
+    pub spec_tree: bool,
     /// Entries of the prefix cache, 1 to `streams`, or 0 for none.
     pub prefix_entries: usize,
     /// How long an unused prefix cache entry lives.
@@ -968,6 +970,9 @@ mod cuda {
             .map_or(DraftSource::Bundled, DraftSource::Dflash);
         let draft = load_draft(&mut model, &checkpoint, source, capacity, &draft_options)?;
         let mut speculator = Speculator::with_draft(&model, draft, width)?;
+        if options.spec_tree {
+            speculator.set_spec_tree(siphon_cuda::spec::SpecTreeConfig::two_branch())?;
+        }
         speculator.set_prefill_chunk(chunk)?;
         let tower = load_tower(options, &gpu, &checkpoint)?;
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());

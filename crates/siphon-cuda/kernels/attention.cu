@@ -4262,7 +4262,7 @@ struct RowsRaw4<Fp4Format> {
 // 4 l .. 4 l + 3 over d = 0 .. 7 in order. Writes partial kRowsBlocks of each query row.
 // Every load goes out first, from both places a key or value may come from (row 0 or slot 0
 // where one does not apply), so that the block waits for memory once.
-template <class F, bool kDirectCombine = false>
+template <class F, bool kDirectCombine = false, bool kTree = false>
 __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_bfloat16* k_new,
                                             const __nv_bfloat16* v_new, const typename F::Elem* k_cache,
                                             const typename F::Elem* v_cache, const __nv_bfloat16* bias,
@@ -4270,7 +4270,9 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
                                             float* partial_sum, unsigned start, int rows, unsigned slots,
                                             unsigned window, unsigned extent, float scale, int recent_block,
                                             const RowsMerge* mg = nullptr, __nv_bfloat16* out = nullptr,
-                                            const __nv_bfloat16* gate = nullptr) {
+                                            const __nv_bfloat16* gate = nullptr,
+                                            const uint32_t* tree_depth = nullptr,
+                                            const int* tree_attn_anc = nullptr) {
     using Raw4 = typename RowsRaw4<F>::Type;
     constexpr int kElems = F::kChunkElems;
     const int kv_head = blockIdx.x;
@@ -4284,12 +4286,20 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
     if (j >= rows) {
         return;
     }
-    const unsigned position = start + unsigned(j);
+    const int row_depth = kTree ? int(tree_depth[j]) : j;
+    const unsigned position = start + unsigned(row_depth);
     const unsigned newest = position % slots;
     // Whether key `dist` exists, whether it is a row's new key, and its slot otherwise.
     const auto exists = [&](int dist) { return unsigned(dist) <= position && (window == 0 || unsigned(dist) < window); };
     const auto old_slot = [&](int dist) {
-        return exists(dist) && dist > j ? (newest >= unsigned(dist) ? newest - dist : newest + slots - dist) : 0u;
+        return exists(dist) && dist > row_depth ? (newest >= unsigned(dist) ? newest - dist : newest + slots - dist) : 0u;
+    };
+    const auto anc_row = [&](int dist) {
+        if constexpr (kTree) {
+            return tree_attn_anc[j * kRowsRecent + dist];
+        } else {
+            return dist <= j ? j - dist : -1;
+        }
     };
 
     uint4 key_new[4];
@@ -4301,7 +4311,8 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
     uint2 value_new[kRowsRecent];
     Raw4 value_old[kRowsRecent];
     {
-        const __nv_bfloat16* src = k_new + (size_t(d <= j ? j - d : 0) * kKvHeads + kv_head) * kHeadDim + 32 * part;
+        const int anc_d = anc_row(d);
+        const __nv_bfloat16* src = k_new + (size_t(anc_d >= 0 ? anc_d : 0) * kKvHeads + kv_head) * kHeadDim + 32 * part;
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             key_new[c] = *reinterpret_cast<const uint4*>(src + 8 * c);
@@ -4329,8 +4340,9 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
     }
 #pragma unroll
     for (int key_d = 0; key_d < kRowsRecent; ++key_d) {
+        const int anc_kd = anc_row(key_d);
         value_new[key_d] = *reinterpret_cast<const uint2*>(
-            v_new + (size_t(key_d <= j ? j - key_d : 0) * kKvHeads + kv_head) * kHeadDim + 4 * lane);
+            v_new + (size_t(anc_kd >= 0 ? anc_kd : 0) * kKvHeads + kv_head) * kHeadDim + 4 * lane);
         if constexpr (F::kFp4) {
             // Two data bytes in the low half, the group's scale above them.
             value_old[key_d] =
@@ -4353,7 +4365,7 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
             key[8 * c + e] = rows_cache_value<F>(v[e]);
         }
     }
-    if (d > j) {
+    if (d > row_depth) {
         if constexpr (F::kFp4) {
             unpack_fp4x32(key_old[0], uint8_t(key_old_scales & 0xffu), uint8_t(key_old_scales >> 8), key);
         } else {
@@ -4412,7 +4424,7 @@ __device__ __forceinline__ void rows_recent(const __nv_bfloat16* q, const __nv_b
 #pragma unroll
     for (int key_d = 0; key_d < kRowsRecent; ++key_d) {
         float v[4];
-        if (key_d <= j) {
+        if (key_d <= row_depth) {
             unpack_bf16x4(value_new[key_d], v);
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
@@ -4497,13 +4509,15 @@ __device__ __forceinline__ unsigned load_acquire(const unsigned* p) {
 //
 // Split blocks `used` and later hold no keys: their partials are max -FLT_MAX, sum 0 and
 // output 0, which add exactly nothing, so they are not read.
-template <class F, bool kSingleCombiner = false>
+template <class F, bool kSingleCombiner = false, bool kTree = false>
 __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* partial_out, const float* partial_max,
                                              const float* partial_sum, __nv_bfloat16* out,
                                              const __nv_bfloat16* gate, const __nv_bfloat16* k_new,
                                              const __nv_bfloat16* v_new, typename F::Elem* k_cache,
                                              typename F::Elem* v_cache, unsigned start, int rows,
-                                             unsigned slots, int used, int combiner, int combiners) {
+                                             unsigned slots, int used, int combiner, int combiners,
+                                             typename F::Elem* k_stage = nullptr,
+                                             typename F::Elem* v_stage = nullptr) {
     static_assert(kRowsBlocks == 32 && kRowsThreads == kHeadDim && kRowsWarps >= kRowsCombineQueries);
     const int kv_head = blockIdx.x;
     const int warp = threadIdx.x / 32;
@@ -4543,13 +4557,15 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
         out[at] = gate != nullptr
                       ? to_bf16_ftz(fmul(__bfloat162float(attn), mlx_sigmoid(__bfloat162float(gate[at]))))
                       : attn;
-        if (k_cache != nullptr && qi % kGroup == 0) {
+        typename F::Elem* dst_k = kTree ? k_stage : k_cache;
+        typename F::Elem* dst_v = kTree ? v_stage : v_cache;
+        if (dst_k != nullptr && qi % kGroup == 0) {
             const size_t row = qi / kGroup;
             const size_t channel = size_t(kv_head) * kHeadDim + d;
+            const unsigned slot_idx = kTree ? unsigned(row) : (start + unsigned(row)) % slots;
             if constexpr (F::kFp4) {
                 // Thread 16 i rounds group i of the head, as kv_append_rows_fp4 does.
                 if (d % 16 == 0) {
-                    const unsigned slot_idx = (start + unsigned(row)) % slots;
 #pragma unroll
                     for (int kv = 0; kv < 2; ++kv) {
                         const __nv_bfloat16* x = (kv == 0 ? k_new : v_new) + row * kKvRow + channel;
@@ -4560,15 +4576,15 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
                         }
                         uint8_t sc;
                         const uint2 data = fp4_group(vals, sc);
-                        typename F::Elem* cache = kv == 0 ? k_cache : v_cache;
+                        typename F::Elem* cache = kv == 0 ? dst_k : dst_v;
                         *reinterpret_cast<uint2*>(cache + fp4_data(slot_idx, kv_head) + d / 2) = data;
                         cache[fp4_scales(slot_idx, kv_head) + d / 16] = sc;
                     }
                 }
             } else {
-                const size_t dst = size_t((start + unsigned(row)) % slots) * kKvRow + channel;
-                F::store1(k_cache + dst, k_new[row * kKvRow + channel]);
-                F::store1(v_cache + dst, v_new[row * kKvRow + channel]);
+                const size_t dst = size_t(slot_idx) * kKvRow + channel;
+                F::store1(dst_k + dst, k_new[row * kKvRow + channel]);
+                F::store1(dst_v + dst, v_new[row * kKvRow + channel]);
             }
         }
     };
@@ -4619,13 +4635,13 @@ __device__ __forceinline__ void rows_combine(RowsCombine& sm, const float* parti
 // kWritePartials = true, writes the block's partials of every query row; with
 // kWritePartials = false (single-block no-split fast path), leaves the merged output, max
 // and sum in `RowsMerge::o[0]`, `m[0]` and `l[0]` in shared memory.
-template <class F, int NT, bool kWritePartials = true>
+template <class F, int NT, bool kWritePartials = true, bool kTree = false>
 __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typename F::Elem* k_cache,
                                            const typename F::Elem* v_cache, const __nv_bfloat16* bias,
                                            float* partial_out, float* partial_max, float* partial_sum,
                                            unsigned start, int rows, unsigned slots, unsigned window,
                                            unsigned extent, float scale, unsigned live, int block, int split_stride,
-                                           char* smem) {
+                                           char* smem, const uint32_t* tree_depth = nullptr) {
     constexpr bool kFp8 = sizeof(typename F::Elem) == 1;
     constexpr int kStages = RowsStages<F>::kValue;
     auto& sm = *reinterpret_cast<RowsShared<F>*>(smem);
@@ -4715,9 +4731,11 @@ __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typenam
         for (int e = 0; e < 2; ++e) {
             const int qi = 8 * j + 2 * t + e;
             const unsigned row = unsigned(qi / kGroup);
+            const unsigned row_depth = (kTree && qi < queries) ? tree_depth[row] : row;
             valid[j][e] = qi < queries;
-            newest[j][e] = first_newest + row < slots ? first_newest + row : first_newest + row - slots;
-            live_slots[j][e] = min(start + row + 1, slots);
+            newest[j][e] =
+                first_newest + row_depth < slots ? first_newest + row_depth : first_newest + row_depth - slots;
+            live_slots[j][e] = min(start + row_depth + 1, slots);
             bias_row[j][e] = unsigned((qi / kGroup) * kHeads + head0 + qi % kGroup) * extent;
         }
     }
@@ -5109,7 +5127,7 @@ __device__ __forceinline__ void rows_split(const __nv_bfloat16* q, const typenam
     }
 }
 
-template <class F, int NT, bool kSingleCombiner = false>
+template <class F, int NT, bool kSingleCombiner = false, bool kTree = false>
 __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __nv_bfloat16* k_new,
                                                const __nv_bfloat16* v_new, typename F::Elem* k_cache,
                                                typename F::Elem* v_cache, const __nv_bfloat16* bias,
@@ -5117,7 +5135,10 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
                                                float* partial_sum, unsigned* counters, __nv_bfloat16* out,
                                                const __nv_bfloat16* gate, const unsigned* start_ptr, int rows,
                                                unsigned slots, unsigned window, unsigned extent, float scale,
-                                               int split_blocks, char* smem) {
+                                               int split_blocks, char* smem, const uint32_t* tree_depth = nullptr,
+                                               const int* tree_attn_anc = nullptr,
+                                               typename F::Elem* k_stage = nullptr,
+                                               typename F::Elem* v_stage = nullptr) {
     const int kv_head = blockIdx.x;
     // The grid launches split blocks 0 .. split_blocks - 1, then recent blocks from 0: block
     // index kRowsBlocks + r is recent block r. Each split block strides cache splits by
@@ -5127,17 +5148,19 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
     const int queries = kGroup * rows;
     pdl_trigger();
     const unsigned start = *start_ptr;
-    // Live slots of the last row: no row reads past them.
-    const unsigned live = min(start + unsigned(rows), slots);
+    // Live slots of the cache: in tree mode only prefix slots below `start` hold keys
+    // (new tree keys are staged separately and never written to the cache during forward).
+    const unsigned live = kTree ? min(start, slots) : min(start + unsigned(rows), slots);
     // Split blocks with any key: those whose first split starts below the live slots.
     const int used = min(split_blocks, int((live + kRowsSplitSlots - 1) / kRowsSplitSlots));
     if (block >= kRowsBlocks) {
         pdl_wait();
-        rows_recent<F>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out, partial_max, partial_sum, start,
-                       rows, slots, window, extent, scale, block - kRowsBlocks);
+        rows_recent<F, false, kTree>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out, partial_max,
+                                     partial_sum, start, rows, slots, window, extent, scale, block - kRowsBlocks,
+                                     nullptr, nullptr, nullptr, tree_depth, tree_attn_anc);
     } else if (block < used) {
-        rows_split<F, NT, true>(q, k_cache, v_cache, bias, partial_out, partial_max, partial_sum, start, rows, slots,
-                                window, extent, scale, live, block, split_blocks, smem);
+        rows_split<F, NT, true, kTree>(q, k_cache, v_cache, bias, partial_out, partial_max, partial_sum, start, rows,
+                                       slots, window, extent, scale, live, block, split_blocks, smem, tree_depth);
     } else {
         pdl_wait();
     }
@@ -5153,8 +5176,8 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
         if (combine.arrival != blocks - 1) {
             return;
         }
-        rows_combine<F, true>(combine, partial_out, partial_max, partial_sum, out, gate, k_new, v_new, k_cache,
-                              v_cache, start, rows, slots, used, 0, 1);
+        rows_combine<F, true, kTree>(combine, partial_out, partial_max, partial_sum, out, gate, k_new, v_new, k_cache,
+                                     v_cache, start, rows, slots, used, 0, 1, k_stage, v_stage);
         __syncthreads();
         if (threadIdx.x == 0) {
             counters[kv_head] = 0;
@@ -5186,8 +5209,8 @@ __device__ __forceinline__ void attention_rows(const __nv_bfloat16* q, const __n
     if (combiner < 0) {
         return;
     }
-    rows_combine<F, false>(combine, partial_out, partial_max, partial_sum, out, gate, k_new, v_new, k_cache, v_cache,
-                           start, rows, slots, used, combiner, combiners);
+    rows_combine<F, false, kTree>(combine, partial_out, partial_max, partial_sum, out, gate, k_new, v_new, k_cache,
+                                  v_cache, start, rows, slots, used, combiner, combiners, k_stage, v_stage);
     __syncthreads();
     if (threadIdx.x == 0 && atomic_add_acq_rel(&counters[kKvHeads + kv_head], 1u) == unsigned(combiners - 1)) {
         counters[kv_head] = 0;
@@ -5314,6 +5337,52 @@ ATTENTION_ROWS(3)
 ATTENTION_ROWS_FP4(1)
 ATTENTION_ROWS_FP4(2)
 ATTENTION_ROWS_FP4(3)
+
+// Tree-verify attention (`attention_rows_tree_{bf16,fp8,fp4}_<NT>`): each row attends over
+// the committed prefix (`k_cache`, `v_cache`) plus its own tree ancestors (`tree_attn_anc`)
+// at true sequence position `*start + tree_depth[row]`, and stages its native-format K/V
+// into `k_stage`, `v_stage` (`[8, row_bytes]`) instead of mutating the caches.
+#define ATTENTION_ROWS_TREE(NT)                                                                                     \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_rows_tree_bf16_##NT(                    \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new, __nv_bfloat16* k_cache,     \
+        __nv_bfloat16* v_cache, const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out,          \
+        float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out, const __nv_bfloat16* gate,  \
+        const unsigned* start, int rows, unsigned slots, unsigned window, unsigned extent, float scale,             \
+        const uint32_t* tree_depth, const int* tree_attn_anc, __nv_bfloat16* k_stage, __nv_bfloat16* v_stage) {     \
+        extern __shared__ __align__(16) char rows_smem[];                                                           \
+        attention_rows<Bf16Format, NT, false, true>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out,    \
+                                                    partial_max, partial_sum, counters, out, gate, start, rows,     \
+                                                    slots, window, extent, scale, kRowsBlocks, rows_smem,           \
+                                                    tree_depth, tree_attn_anc, k_stage, v_stage);                   \
+    }                                                                                                               \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_rows_tree_fp8_##NT(                     \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new, uint8_t* k_cache,           \
+        uint8_t* v_cache, const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out,                \
+        float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out, const __nv_bfloat16* gate,  \
+        const unsigned* start, int rows, unsigned slots, unsigned window, unsigned extent, float scale,             \
+        const uint32_t* tree_depth, const int* tree_attn_anc, uint8_t* k_stage, uint8_t* v_stage) {                 \
+        extern __shared__ __align__(16) char rows_smem[];                                                           \
+        attention_rows<Fp8Format, NT, false, true>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out,     \
+                                                   partial_max, partial_sum, counters, out, gate, start, rows,      \
+                                                   slots, window, extent, scale, kRowsBlocks, rows_smem,            \
+                                                   tree_depth, tree_attn_anc, k_stage, v_stage);                    \
+    }                                                                                                               \
+    extern "C" __global__ void __launch_bounds__(kRowsThreads, 2) attention_rows_tree_fp4_##NT(                     \
+        const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new, uint8_t* k_cache,           \
+        uint8_t* v_cache, const __nv_bfloat16* bias, const __nv_bfloat16* sinks, float* partial_out,                \
+        float* partial_max, float* partial_sum, unsigned* counters, __nv_bfloat16* out, const __nv_bfloat16* gate,  \
+        const unsigned* start, int rows, unsigned slots, unsigned window, unsigned extent, float scale,             \
+        const uint32_t* tree_depth, const int* tree_attn_anc, uint8_t* k_stage, uint8_t* v_stage) {                 \
+        extern __shared__ __align__(16) char rows_smem[];                                                           \
+        attention_rows<Fp4Format, NT, false, true>(q, k_new, v_new, k_cache, v_cache, bias, sinks, partial_out,     \
+                                                   partial_max, partial_sum, counters, out, gate, start, rows,      \
+                                                   slots, window, extent, scale, kRowsBlocks, rows_smem,            \
+                                                   tree_depth, tree_attn_anc, k_stage, v_stage);                    \
+    }
+
+ATTENTION_ROWS_TREE(1)
+ATTENTION_ROWS_TREE(2)
+ATTENTION_ROWS_TREE(3)
 
 // Words per row of a batched step's state table (see `BATCH_STATE_WORDS` in ops/spec.rs):
 // the device addresses of the row's key cache, value cache, and key, value,

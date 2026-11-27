@@ -113,6 +113,8 @@ pub struct DraftKernels {
     topk_partial: CudaFunction,
     topk_merge: CudaFunction,
     select: CudaFunction,
+    select_top2: CudaFunction,
+    select_branch: CudaFunction,
     set_control_kept_batch: CudaFunction,
     dflash_commit_rope_store_batch: CudaFunction,
     block_input_batch: CudaFunction,
@@ -822,6 +824,8 @@ impl DraftKernels {
             topk_partial: f("draft_topk_partial")?,
             topk_merge: f("draft_topk_merge")?,
             select: f("draft_select")?,
+            select_top2: f("draft_select_top2")?,
+            select_branch: f("draft_select_branch")?,
             set_control_kept_batch: f("draft_set_control_kept_batch")?,
             dflash_commit_rope_store_batch: f("draft_dflash_commit_rope_store_batch")?,
             block_input_batch: f("draft_block_input_batch")?,
@@ -2397,6 +2401,127 @@ impl DraftKernels {
         // `vocab` before reading a codebook row, and writes `steps` ids and confidences. It
         // reads everything after `pdl_wait`.
         unsafe { args.launch_pdl(stream, &self.select, one_block(TOP_K * 32)) }?;
+        Ok(())
+    }
+
+    /// Tree-aware variant of [`Self::select`]: produces identical primary `ids` and
+    /// `confidence` plus runner-up `alt_ids` and `alt_conf` at every step `0..steps`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn select_top2(
+        &self,
+        stream: &CudaStream,
+        cand: &CudaSlice<i32>,
+        unary: &CudaSlice<f32>,
+        hp: &CudaSlice<bf16>,
+        predecessor: &CudaSlice<bf16>,
+        successor: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        steps: usize,
+        softcap: f32,
+        ids: &mut CudaSlice<i32>,
+        confidence: &mut CudaSlice<f32>,
+        alt_ids: &mut CudaSlice<i32>,
+        alt_conf: &mut CudaSlice<f32>,
+        race: &CudaSlice<u32>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            (1..BLOCK).contains(&steps)
+                && ids.len() >= steps
+                && confidence.len() >= steps
+                && alt_ids.len() >= steps
+                && alt_conf.len() >= steps,
+            "{steps} steps for {} ids, {} confidences, {} alt_ids, {} alt_conf",
+            ids.len(),
+            confidence.len(),
+            alt_ids.len(),
+            alt_conf.len()
+        );
+        check_len("cand", cand.len(), (BLOCK - 1) * TOP_K)?;
+        check_len("unary", unary.len(), (BLOCK - 1) * TOP_K)?;
+        ensure!(
+            hp.len() >= steps * RANK,
+            "hp has {} elements, too few for {steps} rows",
+            hp.len()
+        );
+        let vocab = rows_of("predecessor", predecessor.len(), RANK)?;
+        check_len("successor", successor.len(), vocab * RANK)?;
+        check_len("control", control.len(), CONTROL)?;
+        check_len("race", race.len(), RACE_WORDS)?;
+        let mut args = KernelArgs::default();
+        args.ptr(cand, stream)
+            .ptr(unary, stream)
+            .ptr(hp, stream)
+            .ptr(predecessor, stream)
+            .ptr(successor, stream)
+            .i32(i32_arg("vocab", vocab)?)
+            .ptr(control, stream)
+            .i32(i32_arg("steps", steps)?)
+            .f32(softcap)
+            .ptr_mut(ids, stream)
+            .ptr_mut(confidence, stream)
+            .ptr_mut(alt_ids, stream)
+            .ptr_mut(alt_conf, stream)
+            .ptr(race, stream);
+        // SAFETY: matches `draft_select_top2`; all inputs are checked for `steps` and
+        // read after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.select_top2, one_block(TOP_K * 32)) }?;
+        Ok(())
+    }
+
+    /// Rolls out `k2` conditioned tokens for a secondary tree branch starting at
+    /// `branch_step` with first token `alt_first`, using DFlash 2's bigram selector over
+    /// the round's already-computed `cand`, `unary` and `hp`.
+    #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
+    pub fn select_branch(
+        &self,
+        stream: &CudaStream,
+        cand: &CudaSlice<i32>,
+        unary: &CudaSlice<f32>,
+        hp: &CudaSlice<bf16>,
+        predecessor: &CudaSlice<bf16>,
+        successor: &CudaSlice<bf16>,
+        control: &CudaSlice<i32>,
+        branch_step: usize,
+        alt_first: i32,
+        k2: usize,
+        max_steps: usize,
+        softcap: f32,
+        branch_ids: &mut CudaSlice<i32>,
+        race: &CudaSlice<u32>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            k2 >= 1 && branch_step + k2 <= max_steps && max_steps < BLOCK && branch_ids.len() >= k2,
+            "invalid select_branch dims: branch_step={branch_step}, k2={k2}, max_steps={max_steps}"
+        );
+        check_len("cand", cand.len(), (BLOCK - 1) * TOP_K)?;
+        check_len("unary", unary.len(), (BLOCK - 1) * TOP_K)?;
+        ensure!(
+            hp.len() >= max_steps * RANK,
+            "hp has {} elements, too few for {max_steps} rows",
+            hp.len()
+        );
+        let vocab = rows_of("predecessor", predecessor.len(), RANK)?;
+        check_len("successor", successor.len(), vocab * RANK)?;
+        check_len("control", control.len(), CONTROL)?;
+        check_len("race", race.len(), RACE_WORDS)?;
+        let mut args = KernelArgs::default();
+        args.ptr(cand, stream)
+            .ptr(unary, stream)
+            .ptr(hp, stream)
+            .ptr(predecessor, stream)
+            .ptr(successor, stream)
+            .i32(i32_arg("vocab", vocab)?)
+            .ptr(control, stream)
+            .i32(i32_arg("branch_step", branch_step)?)
+            .i32(alt_first)
+            .i32(i32_arg("k2", k2)?)
+            .i32(i32_arg("max_steps", max_steps)?)
+            .f32(softcap)
+            .ptr_mut(branch_ids, stream)
+            .ptr(race, stream);
+        // SAFETY: matches `draft_select_branch`; all inputs are checked for `max_steps`
+        // and read after `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.select_branch, one_block(TOP_K * 32)) }?;
         Ok(())
     }
 

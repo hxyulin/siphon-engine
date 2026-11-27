@@ -177,6 +177,12 @@ mod linux {
         follow: bool,
         /// Opt-in logit margin for speculative acceptance (`0.0` = exact lossless).
         accept_margin: f32,
+        /// Enable 2-branch speculative tree verification (`--spec-tree`).
+        spec_tree: bool,
+        /// Secondary branch length for `--spec-tree` (`--spec-tree-k2`, default 2).
+        spec_tree_k2: usize,
+        /// Branching strategy for `--spec-tree` (`--spec-tree-branch auto|N`, default auto).
+        spec_tree_branch: Option<usize>,
         kv_options: KvOptions,
         moe_pruning: MoePruning,
     }
@@ -222,6 +228,9 @@ mod linux {
         let mut batch = None;
         let mut follow = false;
         let mut accept_margin = 0.0f32;
+        let mut spec_tree = false;
+        let mut spec_tree_k2 = 2usize;
+        let mut spec_tree_branch = None;
         let mut kv_options = KvOptions::default();
         let mut moe_top_k = None;
         let mut moe_min_k = None;
@@ -273,6 +282,12 @@ mod linux {
                 "--moe-min-k" => moe_min_k = Some(value()?.parse()?),
                 "--moe-prune" => moe_prune = Some(value()?.parse()?),
                 "--accept-margin" => accept_margin = value()?.parse()?,
+                "--spec-tree" => spec_tree = true,
+                "--spec-tree-k2" => spec_tree_k2 = value()?.parse()?,
+                "--spec-tree-branch" => {
+                    let v = value()?;
+                    spec_tree_branch = if v == "auto" { None } else { Some(v.parse()?) };
+                }
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -337,6 +352,9 @@ mod linux {
             batch,
             follow,
             accept_margin,
+            spec_tree,
+            spec_tree_k2,
+            spec_tree_branch,
             kv_options,
             moe_pruning,
         })
@@ -992,8 +1010,8 @@ mod linux {
             model::{DEFAULT_PREFILL_CHUNK, Model, Sampling, SavedState},
             ops::spec::VERIFY_ROWS,
             spec::{
-                DraftSource, Drafts, Speculator, SweepRow, Width, WidthPolicy, load_draft, price,
-                verify_times,
+                BranchStrategy, DraftSource, Drafts, SpecTreeConfig, Speculator, SweepRow, Width,
+                WidthPolicy, load_draft, price, verify_times,
             },
             weights::{WeightFormat, Weights},
         };
@@ -1135,6 +1153,18 @@ mod linux {
                     model.enable_sampling()?;
                 }
                 let mut speculator = Speculator::with_draft(&model, draft, width)?;
+                if args.spec_tree {
+                    let branch_strategy = match args.spec_tree_branch {
+                        Some(b) => BranchStrategy::Fixed(b),
+                        None => BranchStrategy::LowestConfidence { max_depth: 3 },
+                    };
+                    speculator.set_spec_tree(SpecTreeConfig {
+                        enabled: true,
+                        secondary_len: args.spec_tree_k2,
+                        branch_strategy,
+                        ..SpecTreeConfig::two_branch()
+                    })?;
+                }
                 spec(
                     &mut model,
                     &mut speculator,
@@ -1367,6 +1397,14 @@ mod linux {
                         spec_clocks.mem_mhz
                     );
                     println!("  rounds by width 1 to 8: {:?}", stats.widths);
+                    if stats.tree_rounds > 0 {
+                        println!(
+                            "  spec tree: {} tree rounds, {} secondary branch wins ({:.1}%)",
+                            stats.tree_rounds,
+                            stats.secondary_accepted,
+                            100.0 * stats.secondary_accepted as f64 / stats.tree_rounds as f64
+                        );
+                    }
                     println!(
                         "  plain steps: {} of {} tokens, {} probes, {:.3} ms per step",
                         stats.stepped.len(),

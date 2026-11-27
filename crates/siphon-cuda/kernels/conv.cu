@@ -950,3 +950,107 @@ shift_visit_states_packed_2304(const __nv_bfloat16* k_raw, const __nv_bfloat16* 
         shift_one(combined, batch_state(states, state_idx, 5), kHidden);
     }
 }
+
+// Tree-verify post-attention short conv and residual add: row r (blockIdx.y) convolves
+// its 4 tree ancestors `conv_anc[r * 4 + 0..4]` (oldest first; negative offsets index
+// `state[3 + anc]`), adds `hidden[r]` if not null, and writes the F32 sum to `residual[r]`.
+// Matches `depth_attention_rows`'s kPartialConvResidual rounding bit-for-bit.
+// Grid: (2304 / 256, rows), 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+short_conv_residual_tree_2304(const __nv_bfloat16* proj, const __nv_bfloat16* __restrict__ weight,
+                              const float* state, const __nv_bfloat16* hidden, float* residual,
+                              const int* conv_anc) {
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    float taps[kKernel];
+    load_bf16x4(weight + size_t(c) * kKernel, taps);
+    pdl_trigger();
+    pdl_wait();
+    float win[kKernel];
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        const int anc = conv_anc[r * kKernel + k];
+        win[k] = anc >= 0 ? __bfloat162float(proj[size_t(anc) * kHidden + c])
+                          : state[size_t(kKernel - 1 + anc) * kHidden + c];
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(win[k]), taps[k]));
+    }
+    const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), win[kKernel - 1]), kShortDivisor));
+    const size_t at = size_t(r) * kHidden + c;
+    residual[at] = hidden != nullptr ? __fadd_rn(__bfloat162float(hidden[at]), y) : y;
+}
+
+// Tree-verify variant of moe_conv_residual_step_rows_2304: combines each tree node's 8
+// experts, convolves along `conv_anc[r * 4 + 0..4]` in shared memory (where comb[0..3]
+// holds `state[0..3]` and comb[3..3+rows] holds the combines of rows 0..rows), adds
+// `residual`, writes `out`, and records all 4 streams' raw conv inputs into `inputs[8, 6656]`.
+// Leaves all 4 conv states untouched (`conv_commit_tree` updates them along the winning path).
+// Grid: (2304 / 32, 1, 1), 32 * rows threads.
+extern "C" __global__ void __launch_bounds__(kStepBlockCols * kStepMaxRows)
+moe_conv_residual_tree_rows_2304(const __nv_bfloat16* experts, const float* weights,
+                                 const __nv_bfloat16* __restrict__ weight, const float* state,
+                                 const float* residual, __nv_bfloat16* out, int rows,
+                                 const __nv_bfloat16* proj, const __nv_bfloat16* k_raw,
+                                 const __nv_bfloat16* v_raw, __nv_bfloat16* inputs,
+                                 const int* conv_anc) {
+    constexpr int kOld = kKernel - 1;
+    __shared__ float comb[kStepMaxRows + kOld][kStepBlockCols];
+    const int lane = threadIdx.x % 32;
+    const int r = threadIdx.x / 32;
+    const int c = blockIdx.x * kStepBlockCols + lane;
+    const bool kv = c < kKvDims;
+    float taps[kKernel];
+    load_bf16x4(weight + size_t(c) * kKernel, taps);
+    pdl_trigger();
+    pdl_wait();
+    float e[kTopK];
+    float w[kTopK];
+#pragma unroll
+    for (int x = 0; x < kTopK; ++x) {
+        e[x] = __bfloat162float(experts[(size_t(r) * kTopK + x) * kHidden + c]);
+        w[x] = weights[size_t(r) * kTopK + x];
+    }
+    const float res = residual[size_t(r) * kHidden + c];
+    if (r < kOld) {
+        comb[r][lane] = state[size_t(r) * kHidden + c];
+    }
+    float total = 0.f;
+#pragma unroll
+    for (int x = 0; x < kTopK; ++x) {
+        if (w[x] != 0.f) {
+            total = __fadd_rn(total, __fmul_rn(e[x], w[x]));
+        }
+    }
+    const float mine = round_bf16(total);
+    comb[r + kOld][lane] = mine;
+    if (rows < kOld && r == 0) {
+#pragma unroll
+        for (int k = 1; k < kOld; ++k) {
+            if (k >= rows) {
+                comb[k][lane] = state[size_t(k) * kHidden + c];
+            }
+        }
+    }
+    __syncthreads();
+
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kKernel; ++k) {
+        const int idx = conv_anc[r * kKernel + k] + kOld;
+        acc = __fadd_rn(acc, __fmul_rn(round_bf16(comb[idx][lane]), taps[k]));
+    }
+    const float y = round_bf16(__fdiv_rn(__fadd_rn(round_bf16(acc), mine), kShortDivisor));
+    out[size_t(r) * kHidden + c] = __float2bfloat16(__fadd_rn(res, y));
+    if (inputs != nullptr) {
+        __nv_bfloat16* row = inputs + size_t(r) * kVisitChannels;
+        row[2 * kKvDims + kHidden + c] = __float2bfloat16(mine);
+        row[2 * kKvDims + c] = proj[size_t(r) * kHidden + c];
+        if (kv) {
+            row[c] = k_raw[size_t(r) * kKvDims + c];
+            row[kKvDims + c] = v_raw[size_t(r) * kKvDims + c];
+        }
+    }
+}

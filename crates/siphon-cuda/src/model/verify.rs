@@ -25,6 +25,7 @@ use cudarc::driver::{
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
 };
 use half::bf16;
+use siphon::tree::SpecTree;
 
 use super::{
     Model, PrefillLogits, Sampling, StepGraph, VisitState, prefill::PrefillScratch, zeros,
@@ -46,6 +47,16 @@ pub enum VerifyTokens<'a> {
     Drafts(CudaView<'a, i32>),
 }
 
+/// Where the tokens of a tree verify ([`Model::verify_tree`]) come from.
+#[derive(Clone, Copy)]
+pub enum VerifyTreeTokens<'a> {
+    /// All `m` tree nodes on the host (index 0 is the anchor, `1..m` are draft nodes).
+    Host(&'a [u32]),
+    /// The current anchor ([`Model::verify_anchor`]) on the device at node 0, plus the
+    /// `m - 1` draft nodes (`1..m`) on the host.
+    WithDeviceAnchor(&'a [u32]),
+}
+
 /// Which rows a verify keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accept {
@@ -54,6 +65,17 @@ pub enum Accept {
     Greedy,
     /// The first `n` rows, whatever the tokens: teacher forcing, or a chosen rollback.
     Rows(usize),
+}
+
+/// Which branch a tree verify ([`Model::verify_tree`]) keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcceptTree {
+    /// Greedy or coupled-race tree walk: at each node checks `primary_child` first, then
+    /// `secondary_child`.
+    Auto,
+    /// Forces a specific valid root-to-node path `[0, ...]` (for parity testing and
+    /// teacher forcing).
+    Path(Vec<usize>),
 }
 
 /// The outcome of a verify.
@@ -84,6 +106,41 @@ impl Verdict {
     }
 }
 
+/// The outcome of a 2-branch speculative tree verify ([`Model::verify_tree`]).
+#[derive(Clone, Debug)]
+pub struct TreeVerdict {
+    /// Drafts kept along the winning branch (`path.len() - 1`).
+    pub accepted: usize,
+    /// Winning node indices from root `0` to the deepest accepted node (`len = accepted + 1`).
+    pub path: Vec<usize>,
+    /// Input token of every tree node (anchor at index 0).
+    pub tokens: Vec<u32>,
+    /// Target token of every tree node (greedy or sampled draw).
+    pub argmax: Vec<u32>,
+    /// Whether the winning path took the secondary branch.
+    pub took_secondary: bool,
+}
+
+impl TreeVerdict {
+    /// The target's next token after the winning branch (the next anchor).
+    #[must_use]
+    pub fn next(&self) -> u32 {
+        self.argmax[self.path[self.accepted]]
+    }
+
+    /// The tokens emitted by this tree verify round: accepted drafts along the winning
+    /// path followed by [`Self::next`].
+    #[must_use]
+    pub fn emitted(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.accepted + 1);
+        for &node in &self.path[1..=self.accepted] {
+            out.push(self.tokens[node]);
+        }
+        out.push(self.next());
+        out
+    }
+}
+
 /// A verify pass that [`Model::start_verify`] launched and whose verdict
 /// [`Model::finish_verify`] has not read yet.
 #[must_use = "the model's position advances only in finish_verify"]
@@ -91,6 +148,102 @@ impl Verdict {
 pub struct PendingVerify {
     rows: usize,
     start: usize,
+}
+
+/// A tree verify pass that [`Model::start_verify_tree`] launched and whose verdict
+/// [`Model::finish_verify_tree`] has not read yet.
+#[must_use = "the model's position advances only in finish_verify_tree"]
+#[derive(Debug)]
+pub struct PendingTreeVerify {
+    rows: usize,
+    start: usize,
+    secondary_first: Option<usize>,
+}
+
+/// Lazily allocated device buffers for 2-branch speculative tree verification. Allocated
+/// only on the first [`Model::verify_tree`] call so linear speculation pays zero memory.
+pub(super) struct TreeVerifyBuffers {
+    /// Short-conv ancestor indices `[8, 4]` (oldest first; negative indexes conv state).
+    pub conv_anc: CudaSlice<i32>,
+    /// Tree depth of each node (`[8]`; position = `*start + depth[r]`).
+    pub depth: CudaSlice<u32>,
+    /// Recent-attention ancestor indices `[8, 8]` for distances `0..8`.
+    pub attn_anc: CudaSlice<i32>,
+    /// Primary and secondary child node indices per node (`[8]`, `-1` if none).
+    pub primary_child: CudaSlice<i32>,
+    pub secondary_child: CudaSlice<i32>,
+    /// Forced winning path for [`AcceptTree::Path`] (`[8]`), and its length (`[1]`, 0 for Auto).
+    pub forced_path: CudaSlice<i32>,
+    pub forced_len: CudaSlice<u32>,
+    /// Winning node path written by `accept_tree` (`[8]`).
+    pub path: CudaSlice<i32>,
+    /// Every visit's `(k_cache, v_cache)` device addresses (`[2 * visits]`).
+    pub kv_caches: CudaSlice<u64>,
+    /// Every visit's `(stage_k, stage_v)` device addresses (`[2 * visits]`).
+    pub kv_stages: CudaSlice<u64>,
+    /// Every visit's KV slot count (`[visits]`).
+    pub kv_slots: CudaSlice<u32>,
+    /// Every visit's KV row byte width (`[visits]`: 2048, 1024, or 576).
+    pub kv_row_bytes: CudaSlice<u32>,
+    /// Per-visit staged native-format keys and values (`[8, row_bytes]` bytes each).
+    pub stage_k: Vec<CudaSlice<u8>>,
+    pub stage_v: Vec<CudaSlice<u8>>,
+    /// Winning-path compacted feature taps `[8, tap_count, hidden]`.
+    pub taps_compact: CudaSlice<bf16>,
+}
+
+impl TreeVerifyBuffers {
+    fn new(
+        stream: &Arc<CudaStream>,
+        visits: &[VisitState],
+        tap_count: usize,
+        hidden: usize,
+    ) -> anyhow::Result<Self> {
+        let mut kv_caches = Vec::with_capacity(2 * visits.len());
+        let mut kv_stages = Vec::with_capacity(2 * visits.len());
+        let mut kv_slots = Vec::with_capacity(visits.len());
+        let mut kv_row_bytes = Vec::with_capacity(visits.len());
+        let mut stage_k = Vec::with_capacity(visits.len());
+        let mut stage_v = Vec::with_capacity(visits.len());
+        for v in visits {
+            let (k_ptr, v_ptr) = match v.kv.data() {
+                KvData::Bf16 { keys, values } => {
+                    (keys.device_ptr(stream).0, values.device_ptr(stream).0)
+                }
+                KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                    (keys.device_ptr(stream).0, values.device_ptr(stream).0)
+                }
+            };
+            let rb = v.kv.row_bytes();
+            let sk: CudaSlice<u8> = zeros(stream, VERIFY_ROWS * rb)?;
+            let sv: CudaSlice<u8> = zeros(stream, VERIFY_ROWS * rb)?;
+            kv_caches.push(k_ptr);
+            kv_caches.push(v_ptr);
+            kv_stages.push(sk.device_ptr(stream).0);
+            kv_stages.push(sv.device_ptr(stream).0);
+            kv_slots.push(u32::try_from(v.kv.slots())?);
+            kv_row_bytes.push(u32::try_from(rb)?);
+            stage_k.push(sk);
+            stage_v.push(sv);
+        }
+        Ok(Self {
+            conv_anc: zeros(stream, VERIFY_ROWS * 4)?,
+            depth: zeros(stream, VERIFY_ROWS)?,
+            attn_anc: zeros(stream, VERIFY_ROWS * VERIFY_ROWS)?,
+            primary_child: zeros(stream, VERIFY_ROWS)?,
+            secondary_child: zeros(stream, VERIFY_ROWS)?,
+            forced_path: zeros(stream, VERIFY_ROWS)?,
+            forced_len: zeros(stream, 1)?,
+            path: zeros(stream, VERIFY_ROWS)?,
+            kv_caches: stream.clone_htod(&kv_caches)?,
+            kv_stages: stream.clone_htod(&kv_stages)?,
+            kv_slots: stream.clone_htod(&kv_slots)?,
+            kv_row_bytes: stream.clone_htod(&kv_row_bytes)?,
+            stage_k,
+            stage_v,
+            taps_compact: zeros(stream, VERIFY_ROWS * tap_count * hidden)?,
+        })
+    }
 }
 
 /// What a verify pass keeps besides a chunk's intermediates (see `kernels/spec.cu`).
@@ -126,6 +279,10 @@ pub(super) struct VerifyBuffers {
     pub h2d_done: CudaEvent,
     /// Whether a pass was launched and its verdict not read yet.
     pub pending: bool,
+    /// Lazily allocated buffers for [`Model::verify_tree`].
+    pub tree: Option<TreeVerifyBuffers>,
+    /// True while capturing or running a tree-verify pass through `prefill_enqueue`.
+    pub tree_active: bool,
 }
 
 impl Drop for VerifyBuffers {
@@ -198,6 +355,8 @@ impl VerifyBuffers {
             host_result: PinnedBuf::zeros(stream, RESULT_LEN)?,
             h2d_done: sync_event(stream)?,
             pending: false,
+            tree: None,
+            tree_active: false,
         })
     }
 }
@@ -261,6 +420,7 @@ impl Model {
             .context("the verify buffers are missing")?;
         ensure!(!v.pending, "the last verify's verdict was not read");
         v.h2d_done.synchronize()?;
+        v.tree_active = false;
         match tokens {
             VerifyTokens::Host(t) => {
                 {
@@ -504,5 +664,253 @@ impl Model {
             false,
             &[],
         )
+    }
+
+    /// Runs a 2-branch (or general) speculative tree verify of `tree.num_nodes` nodes
+    /// (`1..=VERIFY_ROWS`) in a single target forward pass, commits only the winning
+    /// branch's KV cache entries and conv states, compacts the winning branch's feature
+    /// taps for the drafter, and advances the model's position past the accepted nodes.
+    pub fn verify_tree(
+        &mut self,
+        tokens: VerifyTreeTokens<'_>,
+        tree: &SpecTree,
+        accept: AcceptTree,
+    ) -> anyhow::Result<TreeVerdict> {
+        let pending = self.start_verify_tree(tokens, tree, accept)?;
+        self.finish_verify_tree(pending)
+    }
+
+    /// Launches [`Self::verify_tree`] asynchronously on the model stream. Work enqueued
+    /// before [`Self::finish_verify_tree`] sees the winning path's compacted taps in
+    /// [`Self::verify_tree_taps`], accepted count in [`Self::verify_kept`], and next
+    /// anchor in [`Self::verify_anchor`].
+    #[expect(clippy::too_many_lines, reason = "validates tree, uploads metadata, launches graph")]
+    pub fn start_verify_tree(
+        &mut self,
+        tokens: VerifyTreeTokens<'_>,
+        tree: &SpecTree,
+        accept: AcceptTree,
+    ) -> anyhow::Result<PendingTreeVerify> {
+        let m = tree.num_nodes;
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&m),
+            "a tree verify takes 1 to {VERIFY_ROWS} nodes, not {m}"
+        );
+        match &tokens {
+            VerifyTreeTokens::Host(t) => ensure!(
+                t.len() == m,
+                "tree has {m} nodes, got {} host tokens",
+                t.len()
+            ),
+            VerifyTreeTokens::WithDeviceAnchor(d) => ensure!(
+                d.len() + 1 == m,
+                "tree has {m} nodes, got {} draft tokens with device anchor",
+                d.len()
+            ),
+        }
+        let start = self.position;
+        let last = start + tree.max_depth();
+        ensure!(
+            self.visits.iter().all(|v| v.kv.holds(last)),
+            "the global KV caches cannot hold position {last}"
+        );
+        super::map_visits(
+            &mut self.visits,
+            self.ring_slab.as_mut(),
+            last + 1,
+            &Arc::clone(&self.ctx.stream),
+        )?;
+
+        let (forced_path, forced_len) = match accept {
+            AcceptTree::Auto => ([0i32; VERIFY_ROWS], 0u32),
+            AcceptTree::Path(path) => {
+                ensure!(
+                    !path.is_empty() && path.len() <= m && path[0] == 0,
+                    "invalid forced tree path {path:?} for {m} nodes"
+                );
+                let mut fp = [0i32; VERIFY_ROWS];
+                for (d, &node) in path.iter().enumerate() {
+                    ensure!(node < m, "forced path node {node} >= {m}");
+                    if d > 0 {
+                        let parent = i32::try_from(path[d - 1])?;
+                        ensure!(
+                            tree.parent[node] == parent,
+                            "forced path node {node} has parent {}, expected {parent}",
+                            tree.parent[node]
+                        );
+                    }
+                    fp[d] = i32::try_from(node)?;
+                }
+                (fp, u32::try_from(path.len())?)
+            }
+        };
+
+        self.ensure_verify()?;
+        self.ensure_verify_tree()?;
+        let stream = Arc::clone(&self.ctx.stream);
+        let p = self
+            .verify
+            .as_mut()
+            .context("the verify buffers are missing")?;
+        let v = p
+            .verify
+            .as_mut()
+            .context("the verify buffers are missing")?;
+        ensure!(!v.pending, "the last verify's verdict was not read");
+        match tokens {
+            VerifyTreeTokens::Host(t) => {
+                let ids = t
+                    .iter()
+                    .map(|&tok| Ok(i32::try_from(tok)?))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                stream.memcpy_htod(&ids, &mut p.tokens.slice_mut(..m))?;
+            }
+            VerifyTreeTokens::WithDeviceAnchor(d) => {
+                stream.memcpy_dtod(&v.anchor, &mut p.tokens.slice_mut(..1))?;
+                if !d.is_empty() {
+                    let ids = d
+                        .iter()
+                        .map(|&tok| Ok(i32::try_from(tok)?))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    stream.memcpy_htod(&ids, &mut p.tokens.slice_mut(1..m))?;
+                }
+            }
+        }
+        stream.memcpy_htod(
+            &[u32::try_from(start).context("position does not fit the kernels")?],
+            &mut p.start,
+        )?;
+        let tv = v
+            .tree
+            .as_mut()
+            .context("the tree verify buffers are missing")?;
+        stream.memcpy_htod(&tree.conv_anc, &mut tv.conv_anc)?;
+        stream.memcpy_htod(&tree.depth, &mut tv.depth)?;
+        stream.memcpy_htod(&tree.attn_anc, &mut tv.attn_anc)?;
+        stream.memcpy_htod(&tree.primary_child, &mut tv.primary_child)?;
+        stream.memcpy_htod(&tree.secondary_child, &mut tv.secondary_child)?;
+        stream.memcpy_htod(&forced_path, &mut tv.forced_path)?;
+        stream.memcpy_htod(&[forced_len], &mut tv.forced_len)?;
+        if let Some(sample) = p.sample.as_mut() {
+            // Tree row j sits at sequence position start + depth[j] and predicts start + depth[j] + 1.
+            let settings: Vec<(Sampling, usize)> = (0..m)
+                .map(|j| (self.sampling, start + tree.depth[j] as usize + 1))
+                .collect();
+            sample.upload(&stream, &settings)?;
+        }
+        v.tree_active = true;
+        let launched = self.launch_verify_tree(m, start);
+        self.verify_buffers_mut()?.tree_active = false;
+        launched?;
+        self.verify_rows = m;
+        self.verify_buffers_mut()?.pending = true;
+        let secondary_first = tree
+            .branch_parent
+            .and_then(|b| usize::try_from(tree.secondary_child[b]).ok());
+        Ok(PendingTreeVerify {
+            rows: m,
+            start,
+            secondary_first,
+        })
+    }
+
+    /// Waits for `pending` to finish, reads the tree verdict and winning path, and
+    /// advances the model's position past the accepted nodes.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking the pass by value reads each verdict once"
+    )]
+    pub fn finish_verify_tree(&mut self, pending: PendingTreeVerify) -> anyhow::Result<TreeVerdict> {
+        let PendingTreeVerify {
+            rows: m,
+            start,
+            secondary_first,
+        } = pending;
+        ensure!(
+            self.position == start && self.verify_rows == m,
+            "the tree verdict belongs to another pass"
+        );
+        let stream = Arc::clone(&self.ctx.stream);
+        let v = self.verify_buffers_mut()?;
+        v.pending = false;
+        let result = stream.clone_dtoh(&v.result)?;
+        let raw_path = stream.clone_dtoh(
+            &v.tree
+                .as_ref()
+                .context("the tree verify buffers are missing")?
+                .path,
+        )?;
+        let accepted = usize::try_from(result[0])?;
+        ensure!(accepted < m, "accepted {accepted} of {} tree nodes", m - 1);
+        let path: Vec<usize> = raw_path[..=accepted]
+            .iter()
+            .map(|&n| usize::try_from(n).context("negative node index in tree path"))
+            .collect::<anyhow::Result<_>>()?;
+        let ids = |r: &[i32]| -> anyhow::Result<Vec<u32>> {
+            r.iter()
+                .map(|&t| u32::try_from(t).context("a negative token id"))
+                .collect()
+        };
+        let took_secondary = secondary_first.is_some_and(|s| path.contains(&s));
+        self.position = start + accepted + 1;
+        Ok(TreeVerdict {
+            accepted,
+            path,
+            tokens: ids(&result[1..=m])?,
+            argmax: ids(&result[1 + VERIFY_ROWS..1 + VERIFY_ROWS + m])?,
+            took_secondary,
+        })
+    }
+
+    /// The compacted winning-branch feature taps of the last [`Self::start_verify_tree`],
+    /// BF16 `[rows, taps, 2304]`, where rows `0..=accepted` hold the winning path in depth
+    /// order so [`crate::draft::Draft::set_round_inputs_kept`] commits them directly.
+    pub fn verify_tree_taps(&self) -> anyhow::Result<CudaView<'_, bf16>> {
+        let p = self.verify.as_ref().context("no verify has run")?;
+        let tv = p
+            .verify
+            .as_ref()
+            .and_then(|v| v.tree.as_ref())
+            .context("no tree verify has run")?;
+        let row_len = p.tap_layout.len() * self.ctx.hidden();
+        Ok(tv.taps_compact.slice(..self.verify_rows * row_len))
+    }
+
+    fn ensure_verify_tree(&mut self) -> anyhow::Result<()> {
+        let stream = Arc::clone(&self.ctx.stream);
+        let hidden = self.ctx.hidden();
+        let visits = &self.visits;
+        let p = self
+            .verify
+            .as_mut()
+            .context("the verify buffers are missing")?;
+        let tap_count = p.tap_layout.len();
+        let v = p
+            .verify
+            .as_mut()
+            .context("the verify buffers are missing")?;
+        if v.tree.is_none() {
+            v.tree = Some(TreeVerifyBuffers::new(&stream, visits, tap_count, hidden)?);
+        }
+        Ok(())
+    }
+
+    /// Replays the tree-verify CUDA graph for `m` nodes, capturing it first if needed.
+    fn launch_verify_tree(&mut self, m: usize, start: usize) -> anyhow::Result<()> {
+        if self.verify_tree_graphs[m - 1].is_none() {
+            let stream = Arc::clone(&self.ctx.stream);
+            stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let enqueued = self.enqueue_verify(m, start);
+            let graph = stream.end_capture(CUgraphInstantiate_flags(0));
+            enqueued.context("capturing the tree verify pass")?;
+            let graph = graph?.context("the tree verify capture recorded no work")?;
+            graph.upload()?;
+            self.verify_tree_graphs[m - 1] = Some(StepGraph(graph));
+        }
+        let graph = self.verify_tree_graphs[m - 1]
+            .as_ref()
+            .context("the tree verify graph is missing")?;
+        graph.0.launch()?;
+        Ok(())
     }
 }

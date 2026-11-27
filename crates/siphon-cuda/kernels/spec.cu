@@ -420,3 +420,145 @@ pack_verify_tokens_batch(const int* src, int* dst, int seqs, int width) {
         dst[idx] = src[size_t(seq) * kVerifyRows + col];
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// 2-branch speculative tree verify: acceptance along primary/secondary child pointers,
+// winning-path KV commit (sliding and global, all formats), conv state commit, and
+// feature tap compaction for the draft model.
+
+// Tree acceptance over m <= 8 nodes in topological order:
+// - If *forced_len != 0, copies forced_path[0..*forced_len] into path and accepts
+//   *forced_len - 1 draft tokens (teacher forcing / parity testing).
+// - Otherwise walks from root 0: checks primary_child[u] first, then secondary_child[u].
+// Writes result = [accepted, tokens[0..m], argmax[0..m]], path[0..=accepted], and
+// *anchor = argmax[path[accepted]]. One thread.
+extern "C" __global__ void accept_tree(const int* tokens, const int* argmax,
+                                       const int* primary_child, const int* secondary_child,
+                                       const int* forced_path, const unsigned* forced_len, int m,
+                                       int* result, int* path, int* anchor) {
+    int accepted = 0;
+    path[0] = 0;
+    const unsigned flen = *forced_len;
+    if (flen != 0) {
+        const int keep = min(int(flen), m);
+        accepted = keep - 1;
+        for (int d = 0; d < keep; ++d) {
+            path[d] = forced_path[d];
+        }
+    } else {
+        int u = 0;
+        while (accepted + 1 < m) {
+            const int target = argmax[u];
+            const int c1 = primary_child[u];
+            const int c2 = secondary_child[u];
+            if (c1 >= 0 && tokens[c1] == target) {
+                u = c1;
+                path[++accepted] = u;
+            } else if (c2 >= 0 && tokens[c2] == target) {
+                u = c2;
+                path[++accepted] = u;
+            } else {
+                break;
+            }
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = tokens[i];
+        result[1 + kVerifyRows + i] = argmax[i];
+    }
+    *anchor = argmax[path[accepted]];
+}
+
+// Commits the winning tree path's staged K and V rows into every visit's KV cache
+// (both sliding rings and global caches, BF16 / FP8 / NVFP4).
+// caches[2*v], caches[2*v+1]: device pointers to visit v's k_cache and v_cache.
+// stages[2*v], stages[2*v+1]: device pointers to visit v's [8, row_bytes] staged K and V.
+// slots[v]: cache slot count of visit v; row_bytes[v]: bytes per slot (2048, 1024, or 576).
+// Grid: (max_depth_plus_1, visits, 1), 128 threads (16 bytes per thread, covers 2048 B).
+extern "C" __global__ void __launch_bounds__(128)
+kv_commit_tree(const unsigned long long* caches, const unsigned long long* stages,
+               const unsigned* slots, const unsigned* row_bytes, const unsigned* start,
+               const int* result, const int* path) {
+    const int d = blockIdx.x;
+    if (d > result[0]) {
+        return;
+    }
+    const int v = blockIdx.y;
+    const unsigned rb = row_bytes[v];
+    const unsigned byte_off = threadIdx.x * 16u;
+    if (byte_off >= rb) {
+        return;
+    }
+    const int src_row = path[d];
+    const size_t dst_slot = (*start + unsigned(d)) % slots[v];
+    const auto* src_k = reinterpret_cast<const uint8_t*>(stages[2 * v]);
+    const auto* src_v = reinterpret_cast<const uint8_t*>(stages[2 * v + 1]);
+    auto* dst_k = reinterpret_cast<uint8_t*>(caches[2 * v]);
+    auto* dst_v = reinterpret_cast<uint8_t*>(caches[2 * v + 1]);
+    *reinterpret_cast<uint4*>(dst_k + dst_slot * size_t(rb) + byte_off) =
+        *reinterpret_cast<const uint4*>(src_k + size_t(src_row) * size_t(rb) + byte_off);
+    *reinterpret_cast<uint4*>(dst_v + dst_slot * size_t(rb) + byte_off) =
+        *reinterpret_cast<const uint4*>(src_v + size_t(src_row) * size_t(rb) + byte_off);
+}
+
+// Shifts every visit's four conv states in place from [state (3 rows); inputs[path[0..=accepted]]].
+// Tree verify leaves `state` untouched during the forward pass, so no separate backup is needed.
+// Grid: (3, 4, visits), 96 threads (vectorized 8 channels/thread matching `conv_rollback`).
+extern "C" __global__ void __launch_bounds__(kRollbackThreads)
+conv_commit_tree(const unsigned long long* states, const __nv_bfloat16* inputs,
+                 const int* result, const int* path) {
+    pdl_trigger();
+    pdl_wait();
+    const int s = blockIdx.y;
+    const int dims = stream_dims(s);
+    const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * kRollbackVec;
+    if (c0 >= dims) {
+        return;
+    }
+    const int v = blockIdx.z;
+    const int offset = stream_offset(s);
+    const int keep = result[0] + 1;
+    float* state = reinterpret_cast<float*>(states[v * kStreams + s]);
+    const __nv_bfloat16* rows = inputs + size_t(v) * kVerifyRows * kVisitChannels + offset;
+    const int stride = gridDim.x * blockDim.x * kRollbackVec;
+    for (int c = c0; c < dims; c += stride) {
+        float4 lo[kStateRows];
+        float4 hi[kStateRows];
+#pragma unroll
+        for (int r = 0; r < kStateRows; ++r) {
+            const int i = keep + r;
+            if (i < kStateRows) {
+                const float* src = state + size_t(i) * dims + c;
+                lo[r] = *reinterpret_cast<const float4*>(src);
+                hi[r] = *reinterpret_cast<const float4*>(src + 4);
+            } else {
+                const int src_row = path[i - kStateRows];
+                bf16x8_to_f32x8(rows + size_t(src_row) * kVisitChannels + c, lo[r], hi[r]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < kStateRows; ++r) {
+            float* dst = state + size_t(r) * dims + c;
+            *reinterpret_cast<float4*>(dst) = lo[r];
+            *reinterpret_cast<float4*>(dst + 4) = hi[r];
+        }
+    }
+}
+
+// Compacts feature taps along the winning path path[0..=accepted] into contiguous rows
+// 0..=accepted of dst_taps, so the draft model's `set_round_inputs_kept` commits them
+// unchanged. Grid: (max_depth_plus_1, tap_count, 1), 288 threads.
+extern "C" __global__ void __launch_bounds__(288)
+taps_compact_tree(const __nv_bfloat16* src_taps, __nv_bfloat16* dst_taps, const int* result,
+                  const int* path, int tap_count) {
+    const int d = blockIdx.x;
+    if (d > result[0]) {
+        return;
+    }
+    const int tap = blockIdx.y;
+    const int src_row = path[d];
+    const int c = threadIdx.x * 8;
+    *reinterpret_cast<uint4*>(dst_taps + (size_t(d) * tap_count + tap) * kHidden + c) =
+        *reinterpret_cast<const uint4*>(src_taps + (size_t(src_row) * tap_count + tap) * kHidden + c);
+}

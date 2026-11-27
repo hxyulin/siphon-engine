@@ -44,6 +44,8 @@ use anyhow::{Context as _, ensure};
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView, sys::CUevent_flags};
 use half::bf16;
 use siphon::Checkpoint;
+pub use siphon::tree::{BranchStrategy, SpecTree, SpecTreeConfig};
+use siphon::tree::choose_branch_parent;
 
 mod host;
 mod prefix;
@@ -56,9 +58,9 @@ use crate::{
     draft::{Draft, DraftOptions, STEPS, WINDOW},
     gpu::{PinnedBuf, sync_event},
     model::{
-        Accept, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, HybridStepResult, HybridVerifyResult,
-        ImageSource, Model, PackedPrefill, PrefillLogits, Sampling, SavedState, Verdict,
-        VerifyTokens,
+        Accept, AcceptTree, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, HybridStepResult,
+        HybridVerifyResult, ImageSource, Model, PackedPrefill, PrefillLogits, Sampling, SavedState,
+        Verdict, VerifyTokens, VerifyTreeTokens,
     },
     ops::{
         draft::MAX_BATCH_SEQS,
@@ -412,6 +414,10 @@ pub struct SpecStats {
     pub draft: Duration,
     /// Wall time of the plain steps.
     pub plain: Duration,
+    /// Rounds that verified a 2-branch speculative tree.
+    pub tree_rounds: usize,
+    /// Tree rounds in which the winning path entered the secondary branch.
+    pub secondary_accepted: usize,
 }
 
 impl SpecStats {
@@ -518,6 +524,8 @@ pub struct Speculator {
     batch_spec: Option<BatchSpecBuffers>,
     /// Running per-confidence-bin acceptance calibration for batched DFlash 2 width choice.
     batch_calibration: Calibration,
+    /// Configuration for opt-in 2-branch speculative tree verification (disabled by default).
+    tree_config: SpecTreeConfig,
 }
 
 impl Drop for Speculator {
@@ -830,7 +838,29 @@ impl Speculator {
             prefill_chunk: crate::model::DEFAULT_PREFILL_CHUNK,
             batch_spec: None,
             batch_calibration: Calibration::default(),
+            tree_config: SpecTreeConfig::default(),
         })
+    }
+
+    /// Enables or configures 2-branch speculative tree verification (disabled by default so
+    /// linear speculation stays bit-for-bit untouched).
+    pub fn set_spec_tree(&mut self, config: SpecTreeConfig) -> anyhow::Result<()> {
+        if config.enabled {
+            ensure!(
+                (1..=STEPS).contains(&config.secondary_len),
+                "spec tree secondary_len {} out of range 1..={STEPS}",
+                config.secondary_len
+            );
+        }
+        self.draft.set_tree_top2(config.enabled);
+        self.tree_config = config;
+        Ok(())
+    }
+
+    /// Current 2-branch speculative tree configuration.
+    #[must_use]
+    pub fn spec_tree(&self) -> &SpecTreeConfig {
+        &self.tree_config
     }
 
     /// Whether this speculator's drafter supports batched speculation (DFlash 2).
@@ -2449,6 +2479,13 @@ impl Speculator {
         drafts: Drafts,
         rng: &mut u64,
     ) -> anyhow::Result<Vec<u32>> {
+        if self.tree_config.enabled
+            && drafts == Drafts::Dspark
+            && width >= 3
+            && let Some(emitted) = self.try_verify_tree_round(model, width)?
+        {
+            return Ok(emitted);
+        }
         let stream = Arc::clone(model.stream());
         let vocab = model.config().unpadded_vocab_size as u64;
         let proposals = self.width.drafts();
@@ -2566,6 +2603,118 @@ impl Speculator {
                 .note_tokens(&stream, model.draft_shared(), &ids)?;
         }
         Ok(emitted)
+    }
+
+    /// Attempts a 2-branch speculative tree verify round within `width` (`3..=VERIFY_ROWS`)
+    /// total verify rows. Returns `Ok(None)` to fall back to the linear verify path if all
+    /// primary drafts exceed [`SpecTreeConfig::max_branch_confidence`] or if no distinct
+    /// secondary token is available.
+    fn try_verify_tree_round(
+        &mut self,
+        model: &mut Model,
+        width: usize,
+    ) -> anyhow::Result<Option<Vec<u32>>> {
+        let stream = Arc::clone(model.stream());
+        let proposals = self.width.drafts();
+        let k2 = self.tree_config.secondary_len.min(width - 2);
+        let k1 = width - 1 - k2;
+        if k1 == 0 || k2 == 0 || proposals < k1 + k2 {
+            return Ok(None);
+        }
+        if self.conf_in_flight {
+            self.conf_copied.synchronize()?;
+            self.conf_in_flight = false;
+        }
+        let confidences = stream.clone_dtoh(&self.draft.confidences().slice(..k1))?;
+        let Some(branch_parent) =
+            choose_branch_parent(&self.tree_config, k1, &confidences, None)
+        else {
+            return Ok(None);
+        };
+        let primary_i32 = stream.clone_dtoh(&self.draft.draft_ids().slice(..k1))?;
+        let Some(alt_tokens) = self.draft.rollout_secondary_branch(
+            &stream,
+            branch_parent,
+            primary_i32[branch_parent],
+            k2,
+            proposals,
+        )?
+        else {
+            return Ok(None);
+        };
+        let tree = SpecTree::two_branch(k1, branch_parent, k2)?;
+        let mut tree_drafts = Vec::with_capacity(k1 + k2);
+        for &tok in &primary_i32 {
+            tree_drafts.push(u32::try_from(tok).context("negative primary draft token")?);
+        }
+        tree_drafts.extend_from_slice(&alt_tokens);
+
+        let slot = self.round_event_slot;
+        self.flush_round_event(slot)?;
+        self.round_events[slot][0].record(&stream)?;
+        let start = model.position();
+        let pending = model.start_verify_tree(
+            VerifyTreeTokens::WithDeviceAnchor(&tree_drafts),
+            &tree,
+            AcceptTree::Auto,
+        )?;
+        self.round_events[slot][1].record(&stream)?;
+        self.draft.set_round_inputs_kept(
+            &stream,
+            &model.verify_tree_taps()?,
+            start,
+            &model.verify_kept()?,
+            model.verify_anchor()?,
+        )?;
+        self.draft
+            .replay_round(&stream, &self.linear, model.draft_shared(), proposals)?;
+        self.round_events[slot][2].record(&stream)?;
+        self.round_event_pending[slot] = true;
+        self.round_event_slot ^= 1;
+        if matches!(self.width, Width::Adaptive(_)) {
+            self.copy_stream.wait(&self.round_events[slot][2])?;
+            self.pinned_conf.copy_from_device(
+                &self.copy_stream,
+                &self.draft.confidences().slice(..proposals),
+            )?;
+            self.conf_copied.record(&self.copy_stream)?;
+            self.conf_in_flight = true;
+        }
+        let verdict = model.finish_verify_tree(pending)?;
+        let a = verdict.accepted;
+        if let Some(hook) = self.round_hook.as_mut() {
+            hook(&RoundRecord {
+                start,
+                drafts: &tree_drafts,
+                draft_logits: &[],
+                target_logits: &model.verify_logits()?,
+                drawn: &verdict.argmax,
+                accepted: a,
+            })?;
+        }
+        let emitted = verdict.emitted();
+        self.stats.rounds += 1;
+        self.stats.tree_rounds += 1;
+        if verdict.took_secondary {
+            self.stats.secondary_accepted += 1;
+        }
+        self.stats.widths[tree.num_nodes - 1] += 1;
+        for kept in &mut self.stats.accepted_at[..a] {
+            *kept += 1;
+        }
+        let primary_kept = if verdict.took_secondary {
+            branch_parent
+        } else {
+            a
+        };
+        self.calibration.record(k1 + 1, primary_kept);
+        let ids: Vec<i32> = emitted
+            .iter()
+            .map(|&t| i32::try_from(t))
+            .collect::<Result<_, _>>()?;
+        self.draft
+            .note_tokens(&stream, model.draft_shared(), &ids)?;
+        Ok(Some(emitted))
     }
 
     /// Runs `steps` plain steps from `token`, the anchor, appends their tokens to `out`

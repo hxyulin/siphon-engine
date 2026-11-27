@@ -2683,6 +2683,208 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
     }
 }
 
+// Tree-aware variant of draft_select: identical primary greedy/coupled walk over `steps`
+// rows, plus records the runner-up candidate `alt_ids[e]` (distinct from `draft_ids[e]`)
+// and its softmax probability `alt_conf[e]` over the 16 candidates at every step e.
+extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
+draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
+                  const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
+                  const int32_t* control, int32_t steps, float softcap, int32_t* draft_ids,
+                  float* confidence, int32_t* alt_ids, float* alt_conf,
+                  const race::DraftRace* race) {
+    __shared__ float product[kRank];
+    __shared__ float score[kTopK];
+    __shared__ float noisy[kTopK];
+    __shared__ int32_t chosen;
+    pdl_wait();
+    pdl_trigger();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const uint4 zero = make_uint4(0, 0, 0, 0);
+    auto row = [&](const __nv_bfloat16* table, int32_t id) {
+        return id >= 0 && id < vocab
+                   ? *reinterpret_cast<const uint4*>(table + size_t(id) * kRank + lane * 8)
+                   : zero;
+    };
+    uint4 succ[kSelectSteps], pred[kSelectSteps];
+#pragma unroll
+    for (int e = 0; e < kSelectSteps; ++e) {
+        succ[e] = e < steps ? row(successor, cand[e * kTopK + warp]) : zero;
+        pred[e] = e == 0     ? (warp == 0 ? row(predecessor, control[2]) : zero)
+                  : e < steps ? row(predecessor, cand[(e - 1) * kTopK + warp])
+                              : zero;
+    }
+    if (threadIdx.x == 0) {
+        chosen = 0;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int e = 0; e < kSelectSteps; ++e) {
+        if (e >= steps) {
+            break;
+        }
+        if (warp == chosen) {
+            const uint4 h = *reinterpret_cast<const uint4*>(hp + size_t(e) * kRank + lane * 8);
+            const uint32_t hw[4] = {h.x, h.y, h.z, h.w};
+            const uint32_t aw[4] = {pred[e].x, pred[e].y, pred[e].z, pred[e].w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                product[lane * 8 + 2 * k] = round_bf16(__fmul_rn(bf_lo(aw[k]), bf_lo(hw[k])));
+                product[lane * 8 + 2 * k + 1] = round_bf16(__fmul_rn(bf_hi(aw[k]), bf_hi(hw[k])));
+            }
+        }
+        __syncthreads();
+        const uint32_t sw[4] = {succ[e].x, succ[e].y, succ[e].z, succ[e].w};
+        float dot = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            dot = fmaf(product[lane * 8 + 2 * k], bf_lo(sw[k]), dot);
+            dot = fmaf(product[lane * 8 + 2 * k + 1], bf_hi(sw[k]), dot);
+        }
+        dot = warp_sum(dot);
+        const StepRace r = step_race(race, control, e);
+        if (lane == 0) {
+            const int32_t id = cand[e * kTopK + warp];
+            const float s = __fadd_rn(unary[e * kTopK + warp], round_bf16(dot));
+            const bool valid = id >= 0 && id < vocab;
+            score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
+            if (r.on) {
+                noisy[warp] = valid ? r.noisy(score[warp], id) : -INFINITY;
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float s = lane < kTopK ? score[lane] : -INFINITY;
+            const float key = lane < kTopK ? (r.on ? noisy[lane] : score[lane]) : -INFINITY;
+            float bv = key;
+            int32_t bi = lane;
+            float top = s;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+                const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
+                if (better(ov, oi, bv, bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+                top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, offset));
+            }
+            const float sum = warp_sum(
+                lane < kTopK && s != -INFINITY ? expf(s - top) : 0.f);
+            // Second-best candidate excluding `bi`.
+            float bv2 = (lane < kTopK && lane != bi) ? key : -INFINITY;
+            int32_t bi2 = (lane < kTopK && lane != bi) ? lane : kTopK;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv2, offset);
+                const int32_t oi = __shfl_xor_sync(0xffffffffu, bi2, offset);
+                if (better(ov, oi, bv2, bi2)) {
+                    bv2 = ov;
+                    bi2 = oi;
+                }
+            }
+            if (lane == 0) {
+                const int32_t id1 = cand[e * kTopK + bi];
+                const int32_t id2 = bi2 < kTopK ? cand[e * kTopK + bi2] : id1;
+                draft_ids[e] = id1;
+                confidence[e] = sum > 0.f ? 1.f / sum : 0.f;
+                alt_ids[e] = id2;
+                const float s2 = bi2 < kTopK ? score[bi2] : -INFINITY;
+                alt_conf[e] = (sum > 0.f && s2 != -INFINITY) ? expf(s2 - top) / sum : 0.f;
+                chosen = bi;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Rolls out the secondary branch of length `k2` starting at `branch_step` (0..steps-1)
+// with first secondary token `alt_first` (already chosen at `branch_step`), producing
+// conditioned continuation tokens `branch_ids[0..k2]` (where `branch_ids[0] = alt_first`)
+// using DFlash 2's bigram selector over the already-computed `cand`, `unary` and `hp`.
+extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
+draft_select_branch(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
+                    const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
+                    const int32_t* control, int32_t branch_step, int32_t alt_first, int32_t k2,
+                    int32_t max_steps, float softcap, int32_t* branch_ids,
+                    const race::DraftRace* race) {
+    __shared__ float product[kRank];
+    __shared__ float score[kTopK];
+    __shared__ float noisy[kTopK];
+    __shared__ int32_t cur_token;
+    pdl_wait();
+    pdl_trigger();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const uint4 zero = make_uint4(0, 0, 0, 0);
+    auto row = [&](const __nv_bfloat16* table, int32_t id) {
+        return id >= 0 && id < vocab
+                   ? *reinterpret_cast<const uint4*>(table + size_t(id) * kRank + lane * 8)
+                   : zero;
+    };
+    if (threadIdx.x == 0) {
+        branch_ids[0] = alt_first;
+        cur_token = alt_first;
+    }
+    __syncthreads();
+    for (int t = 1; t < k2; ++t) {
+        const int e = branch_step + t;
+        if (e >= max_steps) {
+            break;
+        }
+        if (warp == 0) {
+            const uint4 h = *reinterpret_cast<const uint4*>(hp + size_t(e) * kRank + lane * 8);
+            const uint4 a = row(predecessor, cur_token);
+            const uint32_t hw[4] = {h.x, h.y, h.z, h.w};
+            const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                product[lane * 8 + 2 * k] = round_bf16(__fmul_rn(bf_lo(aw[k]), bf_lo(hw[k])));
+                product[lane * 8 + 2 * k + 1] = round_bf16(__fmul_rn(bf_hi(aw[k]), bf_hi(hw[k])));
+            }
+        }
+        __syncthreads();
+        const int32_t cid = cand[e * kTopK + warp];
+        const uint4 srow = row(successor, cid);
+        const uint32_t sw[4] = {srow.x, srow.y, srow.z, srow.w};
+        float dot = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            dot = fmaf(product[lane * 8 + 2 * k], bf_lo(sw[k]), dot);
+            dot = fmaf(product[lane * 8 + 2 * k + 1], bf_hi(sw[k]), dot);
+        }
+        dot = warp_sum(dot);
+        const StepRace r = step_race(race, control, e);
+        if (lane == 0) {
+            const float s = __fadd_rn(unary[e * kTopK + warp], round_bf16(dot));
+            const bool valid = cid >= 0 && cid < vocab;
+            score[warp] = valid ? __fmul_rn(softcap, tanhf(__fdiv_rn(s, softcap))) : -INFINITY;
+            if (r.on) {
+                noisy[warp] = valid ? r.noisy(score[warp], cid) : -INFINITY;
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float key = lane < kTopK ? (r.on ? noisy[lane] : score[lane]) : -INFINITY;
+            float bv = key;
+            int32_t bi = lane;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, offset);
+                const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, offset);
+                if (better(ov, oi, bv, bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (lane == 0) {
+                const int32_t picked = cand[e * kTopK + bi];
+                branch_ids[t] = picked;
+                cur_token = picked;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Batched DFlash 2: B sequences (1..=32) drafted concurrently, each with an 8-row block
 // (8 * B <= 256 rows total) and its own per-layer sliding KV rings addressed through

@@ -340,6 +340,9 @@ pub struct Draft {
     head_copy: Option<CudaSlice<bf16>>,
     /// Per-slot sliding rings and batched buffers for DFlash 2.
     batch: Option<batch::BatchDflash2>,
+    /// When set, DFlash 2's selector runs `draft_select_top2` so runner-up candidates and
+    /// confidences are available for 2-branch speculative tree construction.
+    tree_top2: bool,
 }
 
 /// Copies of a draft's sliding rings at one committed position, from
@@ -798,6 +801,13 @@ struct Scratch {
     ids: CudaSlice<i32>,
     /// Each draft's softmax probability under the Markov logits, F32 `[7]`.
     confidence: CudaSlice<f32>,
+    /// Runner-up draft token ids and confidences for 2-branch tree drafting (`[7]`).
+    alt_ids: CudaSlice<i32>,
+    alt_conf: CudaSlice<f32>,
+    /// Secondary branch rollout tokens (`[7]`).
+    branch_ids: CudaSlice<i32>,
+    /// Lazily allocated top-k scratch for non-DFlash2 tree fallback.
+    fallback_topk: Option<(TopkScratch, CudaSlice<f32>, CudaSlice<i32>)>,
     /// Each step's Markov logits, BF16 `[7, vocab]`, when recorded.
     logits: Option<CudaSlice<bf16>>,
     /// The context rows of a DFlash or DFlash 2 draft.
@@ -889,6 +899,10 @@ impl Scratch {
             bounds: LogitBounds::new(stream, config.unpadded_vocab_size)?,
             ids: stream.alloc_zeros(STEPS)?,
             confidence: stream.alloc_zeros(STEPS)?,
+            alt_ids: stream.alloc_zeros(STEPS)?,
+            alt_conf: stream.alloc_zeros(STEPS)?,
+            branch_ids: stream.alloc_zeros(STEPS)?,
+            fallback_topk: None,
             logits: None,
             dflash,
             dflash2,
@@ -1103,6 +1117,7 @@ impl Draft {
             head,
             head_copy,
             batch: None,
+            tree_top2: false,
         })
     }
 
@@ -1587,6 +1602,153 @@ impl Draft {
     #[must_use]
     pub fn confidences(&self) -> &CudaSlice<f32> {
         &self.s.confidence
+    }
+
+    /// Enables or disables top-2 candidate recording for 2-branch speculative tree
+    /// drafting. Disabled by default so linear speculation graphs stay untouched.
+    pub fn set_tree_top2(&mut self, enable: bool) {
+        if self.tree_top2 != enable {
+            self.tree_top2 = enable;
+            self.graphs = Default::default();
+        }
+    }
+
+    /// Runner-up draft token ids (`I32 [7]`), populated when [`Self::set_tree_top2`] is
+    /// enabled on a DFlash 2 draft.
+    #[must_use]
+    pub fn alt_ids(&self) -> &CudaSlice<i32> {
+        &self.s.alt_ids
+    }
+
+    /// Runner-up confidences (`F32 [7]`), populated alongside [`Self::alt_ids`].
+    #[must_use]
+    pub fn alt_confidences(&self) -> &CudaSlice<f32> {
+        &self.s.alt_conf
+    }
+
+    /// Rolls out `k2` tokens for a secondary tree branch diverging at `branch_step`
+    /// (`0..steps`), starting with a token distinct from `primary_at_branch`.
+    ///
+    /// On DFlash 2, uses the runner-up token recorded by `draft_select_top2` and rolls
+    /// out `k2 - 1` conditioned continuation tokens via `draft_select_branch`. On DSpark
+    /// and DFlash 1, extracts the top-16 base logits for rows `branch_step..branch_step+k2`
+    /// and picks the runner-up at `branch_step` plus top-1 continuations. Returns `Ok(None)`
+    /// if no valid distinct alternate token exists.
+    #[expect(clippy::too_many_lines, reason = "DFlash 2 GPU branch rollout plus base-logit fallback")]
+    pub fn rollout_secondary_branch(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        branch_step: usize,
+        primary_at_branch: i32,
+        k2: usize,
+        steps: usize,
+    ) -> anyhow::Result<Option<Vec<u32>>> {
+        ensure!(
+            k2 >= 1 && branch_step + k2 <= steps && steps <= STEPS,
+            "invalid tree branch: branch_step={branch_step}, k2={k2}, steps={steps}"
+        );
+        if let Arch::Dflash2 { weights, .. } = &self.arch {
+            let mut alt_ids = [0i32; STEPS];
+            stream.memcpy_dtoh(&self.s.alt_ids.slice(..steps), &mut alt_ids[..steps])?;
+            stream.synchronize()?;
+            let alt_first = alt_ids[branch_step];
+            if alt_first < 0
+                || alt_first == primary_at_branch
+                || usize::try_from(alt_first).is_ok_and(|t| t >= self.vocab)
+            {
+                return Ok(None);
+            }
+            if k2 == 1 {
+                return Ok(Some(vec![u32::try_from(alt_first)?]));
+            }
+            let d2 = self
+                .s
+                .dflash2
+                .as_ref()
+                .context("the DFlash 2 buffers are missing")?;
+            self.kernels.select_branch(
+                stream,
+                &d2.cand,
+                &d2.unary,
+                &d2.hp,
+                &weights.selector.predecessor,
+                &weights.selector.successor,
+                &self.inputs.control,
+                branch_step,
+                alt_first,
+                k2,
+                steps,
+                self.softcap,
+                &mut self.s.branch_ids,
+                &self.inputs.race,
+            )?;
+            let mut out = vec![0i32; k2];
+            stream.memcpy_dtoh(&self.s.branch_ids.slice(..k2), &mut out)?;
+            stream.synchronize()?;
+            let tokens = out
+                .into_iter()
+                .map(|t| u32::try_from(t).context("negative secondary draft token"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            return Ok(Some(tokens));
+        }
+
+        // Fallback for DSpark / DFlash 1: top-16 from `self.s.base` rows `branch_step..branch_step+k2`.
+        let list = self.head.as_ref().and_then(|h| h.shortlist.as_ref());
+        let (rows, ld) = match list {
+            Some(l) => {
+                let b = l.capacity();
+                (b, b)
+            }
+            None => (self.vocab, self.padded_vocab),
+        };
+        if self.s.fallback_topk.is_none() {
+            self.s.fallback_topk = Some((
+                TopkScratch::new(stream)?,
+                stream.alloc_zeros(STEPS * TOP_K)?,
+                stream.alloc_zeros(STEPS * TOP_K)?,
+            ));
+        }
+        let (topk, vals, ids) = self
+            .s
+            .fallback_topk
+            .as_mut()
+            .context("fallback topk missing")?;
+        let base_slice = self.s.base.slice(branch_step * ld..(branch_step + k2) * ld);
+        let mut vals_slice = vals.slice_mut(..k2 * TOP_K);
+        let mut ids_slice = ids.slice_mut(..k2 * TOP_K);
+        self.kernels.topk(
+            stream,
+            &base_slice,
+            k2,
+            rows,
+            ld,
+            list.map(|l| &l.count),
+            list.map(|l| &l.map),
+            topk,
+            &mut vals_slice,
+            &mut ids_slice,
+        )?;
+        let mut host_ids = vec![0i32; k2 * TOP_K];
+        stream.memcpy_dtoh(&ids.slice(..k2 * TOP_K), &mut host_ids)?;
+        stream.synchronize()?;
+        let mut out = Vec::with_capacity(k2);
+        let alt_first = host_ids[..TOP_K]
+            .iter()
+            .copied()
+            .find(|&id| id != primary_at_branch && usize::try_from(id).is_ok_and(|t| t < self.vocab));
+        let Some(first) = alt_first else {
+            return Ok(None);
+        };
+        out.push(u32::try_from(first)?);
+        for t in 1..k2 {
+            let pick = host_ids[t * TOP_K..(t + 1) * TOP_K]
+                .iter()
+                .copied()
+                .find(|&id| usize::try_from(id).is_ok_and(|tok| tok < self.vocab))
+                .unwrap_or(first);
+            out.push(u32::try_from(pick)?);
+        }
+        Ok(Some(out))
     }
 
     /// The last round's decoder output for the 8 block rows, BF16 `[8, 2304]`.
@@ -2366,20 +2528,39 @@ impl Draft {
                 m_rows,
             )?;
         }
-        k.select(
-            stream,
-            &d2.cand,
-            &d2.unary,
-            &d2.hp,
-            &weights.selector.predecessor,
-            &weights.selector.successor,
-            control,
-            steps,
-            self.softcap,
-            &mut s.ids,
-            &mut s.confidence,
-            &self.inputs.race,
-        )
+        if self.tree_top2 {
+            k.select_top2(
+                stream,
+                &d2.cand,
+                &d2.unary,
+                &d2.hp,
+                &weights.selector.predecessor,
+                &weights.selector.successor,
+                control,
+                steps,
+                self.softcap,
+                &mut s.ids,
+                &mut s.confidence,
+                &mut s.alt_ids,
+                &mut s.alt_conf,
+                &self.inputs.race,
+            )
+        } else {
+            k.select(
+                stream,
+                &d2.cand,
+                &d2.unary,
+                &d2.hp,
+                &weights.selector.predecessor,
+                &weights.selector.successor,
+                control,
+                steps,
+                self.softcap,
+                &mut s.ids,
+                &mut s.confidence,
+                &self.inputs.race,
+            )
+        }
     }
 }
 

@@ -26,7 +26,10 @@ pub use prefill::{
     PendingHybridVerify, PrefillAttention, PrefillLogits,
 };
 pub use prefix::{DeviceSpan, GlobalKv, LocalState};
-pub use verify::{Accept, PendingVerify, Verdict, VerifyTokens};
+pub use verify::{
+    Accept, AcceptTree, PendingTreeVerify, PendingVerify, TreeVerdict, Verdict, VerifyTokens,
+    VerifyTreeTokens,
+};
 
 pub use crate::ops::{routing::MoePruning, sample::Sampling};
 
@@ -436,6 +439,8 @@ pub struct Model {
     verify: Option<prefill::PrefillScratch>,
     /// The captured verify pass of each width from 1 to [`VERIFY_ROWS`].
     verify_graphs: Vec<Option<StepGraph>>,
+    /// The captured tree-verify pass of each node count from 1 to [`VERIFY_ROWS`].
+    verify_tree_graphs: Vec<Option<StepGraph>>,
     /// Rows of the last verify.
     verify_rows: usize,
     /// The feature taps that prefill with taps and verify record for the draft.
@@ -721,6 +726,7 @@ impl Model {
             prefill: None,
             verify: None,
             verify_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
+            verify_tree_graphs: (0..VERIFY_ROWS).map(|_| None).collect(),
             verify_rows: 0,
             tap_layout: crate::ops::spec::TapLayout::stock(),
             slots: Vec::new(),
@@ -886,6 +892,7 @@ impl Model {
         self.tap_graph = None;
         self.verify = None;
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
         self.batch = None;
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_verify = None;
@@ -921,6 +928,7 @@ impl Model {
             self.step_taps = None;
             self.verify = None;
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
             self.batch = None;
             self.batch_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_verify = None;
@@ -1142,6 +1150,7 @@ impl Model {
         self.graph = None;
         self.tap_graph = None;
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_verify_graphs.clear();
         Ok(())
@@ -1443,6 +1452,7 @@ impl Model {
             p.head_fp8 = None;
         }
         self.verify_graphs.iter_mut().for_each(|g| *g = None);
+        self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_graphs.iter_mut().for_each(|g| *g = None);
         self.batch_verify_graphs.clear();
         Ok(())

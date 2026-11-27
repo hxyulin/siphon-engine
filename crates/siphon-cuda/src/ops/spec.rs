@@ -138,6 +138,10 @@ pub struct Spec {
     accept_greedy_batch: CudaFunction,
     accept_margin_batch: CudaFunction,
     pack_verify_tokens_batch: CudaFunction,
+    accept_tree: CudaFunction,
+    kv_commit_tree: CudaFunction,
+    conv_commit_tree: CudaFunction,
+    taps_compact_tree: CudaFunction,
 }
 
 impl Spec {
@@ -157,6 +161,10 @@ impl Spec {
             accept_greedy_batch: f("accept_greedy_batch")?,
             accept_margin_batch: f("accept_margin_batch")?,
             pack_verify_tokens_batch: f("pack_verify_tokens_batch")?,
+            accept_tree: f("accept_tree")?,
+            kv_commit_tree: f("kv_commit_tree")?,
+            conv_commit_tree: f("conv_commit_tree")?,
+            taps_compact_tree: f("taps_compact_tree")?,
         })
     }
 
@@ -659,6 +667,198 @@ impl Spec {
         // The kernel reads only indices below `seqs * VERIFY_ROWS` in `src` and writes only
         // indices below `seqs * width` in `dst`, after `pdl_wait()`.
         unsafe { args.launch_pdl(stream, &self.pack_verify_tokens_batch, one_block(256)) }?;
+        Ok(())
+    }
+
+    /// Tree acceptance over `rows` (`1..=VERIFY_ROWS`) nodes in topological order: walks
+    /// from root 0 checking `primary_child[u]` then `secondary_child[u]` against
+    /// `argmax[u]`, or forces `forced_path[0..*forced_len]` when `*forced_len != 0`.
+    /// Writes `[accepted, tokens[0..rows], argmax[0..rows]]` to `result`, the winning node
+    /// indices `path[0..=accepted]`, and the next anchor `argmax[path[accepted]]`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_tree(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        primary_child: &CudaSlice<i32>,
+        secondary_child: &CudaSlice<i32>,
+        forced_path: &CudaSlice<i32>,
+        forced_len: &CudaSlice<u32>,
+        rows: usize,
+        result: &mut CudaSlice<i32>,
+        path: &mut CudaSlice<i32>,
+        anchor: &mut CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax) = (tokens.view(), argmax.view());
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        check_len("tokens", tokens.len(), rows)?;
+        check_len("argmax", argmax.len(), rows)?;
+        check_len("primary_child", primary_child.len(), VERIFY_ROWS)?;
+        check_len("secondary_child", secondary_child.len(), VERIFY_ROWS)?;
+        check_len("forced_path", forced_path.len(), VERIFY_ROWS)?;
+        check_len("forced_len", forced_len.len(), 1)?;
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("path", path.len(), VERIFY_ROWS)?;
+        check_len("anchor", anchor.len(), 1)?;
+        let m = i32::try_from(rows)?;
+        let mut launch = stream.launch_builder(&self.accept_tree);
+        launch
+            .arg(&tokens)
+            .arg(&argmax)
+            .arg(primary_child)
+            .arg(secondary_child)
+            .arg(forced_path)
+            .arg(forced_len)
+            .arg(&m)
+            .arg(result)
+            .arg(path)
+            .arg(anchor);
+        // SAFETY: matches `accept_tree(const int*, const int*, const int*, const int*,
+        // const int*, const unsigned*, int, int*, int*, int*)`; all buffers have the sizes
+        // checked above.
+        unsafe { launch.launch(one_block(1)) }?;
+        Ok(())
+    }
+
+    /// Commits the winning tree path `path[0..=result[0]]` from each visit's staged K/V
+    /// buffers into its KV cache (sliding and global, BF16/FP8/NVFP4).
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn kv_commit_tree(
+        &self,
+        stream: &CudaStream,
+        caches: &CudaSlice<u64>,
+        stages: &CudaSlice<u64>,
+        slots: &CudaSlice<u32>,
+        row_bytes: &CudaSlice<u32>,
+        start: &CudaSlice<u32>,
+        result: &CudaSlice<i32>,
+        path: &CudaSlice<i32>,
+        max_depth_plus_1: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            caches.len().is_multiple_of(2) && !caches.is_empty(),
+            "{} cache addresses, not pairs",
+            caches.len()
+        );
+        let visits = caches.len() / 2;
+        check_len("stages", stages.len(), 2 * visits)?;
+        check_len("slots", slots.len(), visits)?;
+        check_len("row_bytes", row_bytes.len(), visits)?;
+        check_len("start", start.len(), 1)?;
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("path", path.len(), VERIFY_ROWS)?;
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&max_depth_plus_1),
+            "max_depth_plus_1 {max_depth_plus_1}, expected 1 to {VERIFY_ROWS}"
+        );
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(max_depth_plus_1)?,
+                u32::try_from(visits).context("too many visits")?,
+                1,
+            ),
+            block_dim: (u32::try_from(KV_DIMS / 8)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = stream.launch_builder(&self.kv_commit_tree);
+        launch
+            .arg(caches)
+            .arg(stages)
+            .arg(slots)
+            .arg(row_bytes)
+            .arg(start)
+            .arg(result)
+            .arg(path);
+        // SAFETY: matches `kv_commit_tree`; `caches` and `stages` point to live visit
+        // buffers of `slots[v]` and 8 rows of `row_bytes[v]` bytes (each a multiple of 16,
+        // at most 2048), and `path[0..=result[0]]` holds valid row indices below `VERIFY_ROWS`.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
+    /// Commits every visit's four conv states in place along the winning tree path
+    /// `path[0..=result[0]]` from `[state (3 rows); inputs[path[..]]]`.
+    pub fn conv_commit_tree(
+        &self,
+        stream: &CudaStream,
+        states: &CudaSlice<u64>,
+        inputs: &CudaSlice<bf16>,
+        result: &CudaSlice<i32>,
+        path: &CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        let visits = visits(states)?;
+        check_len(
+            "inputs",
+            inputs.len(),
+            visits * VERIFY_ROWS * VISIT_CHANNELS,
+        )?;
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("path", path.len(), VERIFY_ROWS)?;
+        let mut args = KernelArgs::default();
+        args.ptr(states, stream)
+            .ptr(inputs, stream)
+            .ptr(result, stream)
+            .ptr(path, stream);
+        // SAFETY: matches `conv_commit_tree(const unsigned long long*, const bf16*,
+        // const int*, const int*)`; bounds match `conv_rollback` and `path` holds valid
+        // indices below `VERIFY_ROWS` up to `result[0]`.
+        unsafe { args.launch_pdl(stream, &self.conv_commit_tree, state_config(visits)?) }?;
+        Ok(())
+    }
+
+    /// Compacts feature taps along the winning path `path[0..=result[0]]` into contiguous
+    /// rows `0..=result[0]` of `dst_taps`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn taps_compact_tree(
+        &self,
+        stream: &CudaStream,
+        src_taps: &impl DeviceIn<bf16>,
+        dst_taps: &mut impl DeviceOut<bf16>,
+        result: &CudaSlice<i32>,
+        path: &CudaSlice<i32>,
+        tap_count: usize,
+        max_depth_plus_1: usize,
+    ) -> anyhow::Result<()> {
+        let (src_taps, mut dst_taps) = (src_taps.view(), dst_taps.view_mut());
+        ensure!(
+            (1..=MAX_TAPS).contains(&tap_count) && (1..=VERIFY_ROWS).contains(&max_depth_plus_1),
+            "invalid taps_compact_tree dims: tap_count={tap_count}, max_depth_plus_1={max_depth_plus_1}"
+        );
+        ensure!(
+            src_taps.len() >= tap_count * HIDDEN
+                && src_taps.len().is_multiple_of(tap_count * HIDDEN),
+            "src_taps has {} elements, not rows of {} x {HIDDEN}",
+            src_taps.len(),
+            tap_count
+        );
+        ensure!(
+            dst_taps.len() >= max_depth_plus_1 * tap_count * HIDDEN,
+            "dst_taps has {} elements, need at least {}",
+            dst_taps.len(),
+            max_depth_plus_1 * tap_count * HIDDEN
+        );
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("path", path.len(), VERIFY_ROWS)?;
+        let tap_count_arg = i32::try_from(tap_count)?;
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(max_depth_plus_1)?, u32::try_from(tap_count)?, 1),
+            block_dim: (u32::try_from(HIDDEN / 8)?, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = stream.launch_builder(&self.taps_compact_tree);
+        launch
+            .arg(&src_taps)
+            .arg(&mut dst_taps)
+            .arg(result)
+            .arg(path)
+            .arg(&tap_count_arg);
+        // SAFETY: matches `taps_compact_tree(const bf16*, bf16*, const int*, const int*,
+        // int)`; each block copies one hidden vector of 2304 bf16 (288 x 8).
+        unsafe { launch.launch(config) }?;
         Ok(())
     }
 }

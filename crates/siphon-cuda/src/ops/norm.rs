@@ -153,6 +153,7 @@ pub struct Norm {
     attention_post_bf16: CudaFunction,
     attention_post_rows_bf16: CudaFunction,
     attention_post_rows_packed_bf16: CudaFunction,
+    attention_post_rows_tree_bf16: CudaFunction,
 }
 
 /// The extent of a relative bias table `[16, extent]`, after checking that the bias holds
@@ -227,6 +228,7 @@ impl Norm {
             attention_post_rows_bf16: module.load_function("attention_post_rows_bf16")?,
             attention_post_rows_packed_bf16: module
                 .load_function("attention_post_rows_packed_bf16")?,
+            attention_post_rows_tree_bf16: module.load_function("attention_post_rows_tree_bf16")?,
         })
     }
 
@@ -771,7 +773,12 @@ impl Norm {
             KvConvWeights::Static { k, v } => {
                 check("k conv weight", k.len(), kv * CONV_TAPS)?;
                 check("v conv weight", v.len(), kv * CONV_TAPS)?;
-                args.ptr(*k, stream).ptr(*v, stream).u64(0).u64(0).u64(0).u64(0);
+                args.ptr(*k, stream)
+                    .ptr(*v, stream)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0);
             }
             KvConvWeights::Dynamic {
                 k_dynamic,
@@ -820,5 +827,134 @@ impl Norm {
         // live `[3, 1024]` K/V conv state pair in `states` (words 2 and 3), the kernel writes
         // no conv state, and before `pdl_wait` it reads only read-only weights.
         unsafe { args.launch_pdl(stream, &self.attention_post_rows_packed_bf16, config) }
+    }
+
+    /// Tree-verify variant of [`Self::attention_post_rows`]: row `r` sits at sequence
+    /// position `*start + depth[r]` (for full-attention log scaling) and convolves its K/V
+    /// windows from its 4 tree ancestors `conv_anc[r * 4 .. r * 4 + 4]`. Leaves `k_state`
+    /// and `v_state` intact.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks and pushes every kernel argument"
+    )]
+    pub fn attention_post_rows_tree(
+        &self,
+        stream: &CudaStream,
+        a: AttentionPostRows<'_>,
+        conv_anc: &CudaSlice<i32>,
+        depth: &CudaSlice<u32>,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        let kv = KV_HEADS * HEAD_DIM;
+        let check = |name: &str, len: usize, want: usize| {
+            ensure!(len == want, "{name} has {len} elements, expected {want}");
+            Ok(())
+        };
+        ensure!(rows > 0, "no rows");
+        ensure!(a.batch.is_none(), "tree attention_post does not take a batch");
+        ensure!(
+            conv_anc.len() >= rows * CONV_TAPS,
+            "conv_anc has {} elements, need at least {}",
+            conv_anc.len(),
+            rows * CONV_TAPS
+        );
+        ensure!(
+            depth.len() >= rows,
+            "depth has {} elements, need at least {rows}",
+            depth.len()
+        );
+        for (name, len) in [
+            ("k_raw", a.k_raw.len()),
+            ("v_raw", a.v_raw.len()),
+            ("k", a.k.len()),
+            ("v", a.v.len()),
+        ] {
+            check(name, len, rows * kv)?;
+        }
+        check("k_state", a.k_state.len(), (CONV_TAPS - 1) * kv)?;
+        check("v_state", a.v_state.len(), (CONV_TAPS - 1) * kv)?;
+        check("q_raw", a.q_raw.len(), rows * Q_HEADS * HEAD_DIM)?;
+        check("q", a.q.len(), rows * Q_HEADS * HEAD_DIM)?;
+        check("q_scale", a.q_scale.len(), Q_HEADS * HEAD_DIM)?;
+        check("r_raw", a.r_raw.len(), rows * Q_HEADS * REL_DIM)?;
+        check("r", a.r.len(), rows * Q_HEADS * REL_DIM)?;
+        check("r_scale", a.r_scale.len(), Q_HEADS * REL_DIM)?;
+        let extent = bias_extent(a.bias.as_ref(), rows)?;
+        let config = LaunchConfig {
+            grid_dim: (
+                POST_BLOCKS + if a.bias.is_some() { BIAS_BLOCKS } else { 0 },
+                u32::try_from(rows).context("too many rows")?,
+                1,
+            ),
+            block_dim: (POST_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&a.k_raw, stream).ptr(&a.v_raw, stream);
+        match &a.conv {
+            KvConvWeights::Static { k, v } => {
+                check("k conv weight", k.len(), kv * CONV_TAPS)?;
+                check("v conv weight", v.len(), kv * CONV_TAPS)?;
+                args.ptr(*k, stream)
+                    .ptr(*v, stream)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0)
+                    .u64(0);
+            }
+            KvConvWeights::Dynamic {
+                k_dynamic,
+                v_dynamic,
+                k_static,
+                v_static,
+            } => {
+                check("k_dynamic", k_dynamic.len(), rows * KV_HEADS * CONV_TAPS)?;
+                check("v_dynamic", v_dynamic.len(), rows * KV_HEADS * CONV_TAPS)?;
+                check("k_static", k_static.len(), CONV_TAPS * kv)?;
+                check("v_static", v_static.len(), CONV_TAPS * kv)?;
+                args.u64(0)
+                    .u64(0)
+                    .ptr(k_dynamic, stream)
+                    .ptr(v_dynamic, stream)
+                    .ptr(*k_static, stream)
+                    .ptr(*v_static, stream);
+            }
+        }
+        let (start, log_scale, alpha, n_floor) = match a.log_scale {
+            Some((start, alpha, n_floor)) => {
+                check("start", start.len(), 1)?;
+                (Some(start), 1, alpha, n_floor)
+            }
+            None => (None, 0, 0.0, 1.0),
+        };
+        let (mut k_out, mut v_out, mut q_out, mut r_out) = (a.k, a.v, a.q, a.r);
+        let (table, mut bias) = a.bias.unzip();
+        args.ptr(a.k_state, stream)
+            .ptr(a.v_state, stream)
+            .ptr(&a.q_raw, stream)
+            .ptr(a.q_scale, stream)
+            .ptr(&a.r_raw, stream)
+            .ptr(a.r_scale, stream)
+            .ptr_mut(&mut k_out, stream)
+            .ptr_mut(&mut v_out, stream)
+            .ptr_mut(&mut q_out, stream)
+            .ptr_mut(&mut r_out, stream)
+            .opt(start.as_ref(), stream)
+            .i32(log_scale)
+            .f32(alpha)
+            .f32(n_floor)
+            .f32(a.qk_threshold)
+            .f32(a.rel_threshold)
+            .f32(a.eps)
+            .opt(table, stream)
+            .opt_mut(bias.as_mut(), stream)
+            .i32(i32::try_from(extent)?)
+            .ptr(conv_anc, stream)
+            .ptr(depth, stream);
+        // SAFETY: matches `attention_post_rows_tree_bf16`; every buffer is checked for
+        // `rows` rows, `conv_anc` holds 4 valid ancestor indices per row (in `-3..rows`),
+        // `depth` holds `rows` tree depths, and the kernel reads nothing non-weight before
+        // `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.attention_post_rows_tree_bf16, config) }
     }
 }
