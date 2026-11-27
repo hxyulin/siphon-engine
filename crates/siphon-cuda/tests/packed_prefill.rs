@@ -910,6 +910,34 @@ fn model_prefill_packed_uneven_with_prefixes_matches_separate() -> anyhow::Resul
     let rows: Vec<(usize, u32)> = toks.iter().copied().enumerate().collect();
     let _ = model.step_batch(&rows)?;
     let got_logits = model.batch_logits(n)?;
+    let kl_and_cosine = |want_row: &[f32], got_row: &[f32]| -> (f64, f64) {
+        let want_max = want_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let got_max = got_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let want_logz = want_row
+            .iter()
+            .map(|&v| f64::from(v - want_max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(want_max);
+        let got_logz = got_row
+            .iter()
+            .map(|&v| f64::from(v - got_max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(got_max);
+        let (mut kl, mut dot, mut want_sq, mut got_sq) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&want_elem, &got_elem) in want_row.iter().zip(got_row) {
+            let want_f64 = f64::from(want_elem);
+            let got_f64 = f64::from(got_elem);
+            let want_lp = want_f64 - want_logz;
+            let got_lp = got_f64 - got_logz;
+            kl += want_lp.exp() * (want_lp - got_lp);
+            dot += want_f64 * got_f64;
+            want_sq += want_f64 * want_f64;
+            got_sq += got_f64 * got_f64;
+        }
+        (kl, dot / (want_sq.sqrt() * got_sq.sqrt()))
+    };
     for i in 0..n {
         let got_row = &got_logits[i * vocab..(i + 1) * vocab];
         let want_row = &want_logits[i];
@@ -921,8 +949,9 @@ fn model_prefill_packed_uneven_with_prefixes_matches_separate() -> anyhow::Resul
             sum_diff += f64::from(d);
         }
         let mean_diff = sum_diff / vocab as f64;
+        let (kl, cosine) = kl_and_cosine(want_row, got_row);
         println!(
-            "slice {i} (prefix={:4}, len={:3}): want={} got={} max_diff={max_diff:.4} mean_diff={mean_diff:.5}",
+            "slice {i} (prefix={:4}, len={:3}): want={} got={} KL={kl:.5} cosine={cosine:.5} max_diff={max_diff:.4} mean_diff={mean_diff:.5}",
             specs[i].1, specs[i].2, want_first[i], toks[i]
         );
         ensure!(
@@ -931,9 +960,14 @@ fn model_prefill_packed_uneven_with_prefixes_matches_separate() -> anyhow::Resul
             toks[i],
             want_first[i]
         );
+        // Packed prefill runs BF16 GEMM / expert_matmul / TC router at the combined row count
+        // (`m = 467`) while separate prefill runs each slice at its own length (`m = 1..256`).
+        // Bound the output distribution by KL divergence and cosine similarity so constant
+        // low-probability tail shifts do not false-fail exact top-1 matches.
         ensure!(
-            max_diff < 3.0 && mean_diff < 0.6,
-            "packed slice {i} logits diverged: max_diff={max_diff} mean_diff={mean_diff}"
+            kl < 0.01 && cosine > 0.97,
+            "packed slice {i} distribution diverged: KL={kl:.5} cosine={cosine:.5} \
+             (max_diff={max_diff:.4} mean_diff={mean_diff:.5})"
         );
     }
     Ok(())
