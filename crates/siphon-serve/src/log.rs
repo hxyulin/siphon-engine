@@ -174,12 +174,12 @@ impl RequestLog {
         f.engine.push(summary);
     }
 
-    /// The `request` line, or `None` for a successful health check or metrics scrape,
-    /// which would fill the log.
+    /// The `request` line, or `None` for a successful health check, metrics scrape or
+    /// model-list poll, which would fill the log.
     fn line(&self) -> Option<String> {
         let f = self.fields();
-        let quiet =
-            self.method == Method::GET && matches!(self.path.as_str(), "/health" | "/metrics");
+        let quiet = self.method == Method::GET
+            && matches!(self.path.as_str(), "/health" | "/metrics" | "/v1/models");
         let status = match f.status {
             _ if f.disconnected && f.status.is_none() => "499".to_owned(),
             Some(s) => s.as_u16().to_string(),
@@ -314,6 +314,12 @@ mod tests {
         assert_eq!(health.line(), None);
         health.respond(StatusCode::SERVICE_UNAVAILABLE, None);
         assert!(health.line().unwrap().contains("status=503"));
+
+        let models = RequestLog::new("req-2b".into(), Method::GET, "/v1/models");
+        models.respond(StatusCode::OK, None);
+        assert_eq!(models.line(), None);
+        models.respond(StatusCode::UNAUTHORIZED, Some("unauthorized"));
+        assert!(models.line().unwrap().contains("status=401"));
 
         let gone = RequestLog::new("req-3".into(), Method::POST, "/v1/completions");
         gone.disconnected();

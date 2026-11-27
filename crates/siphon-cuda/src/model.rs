@@ -715,7 +715,6 @@ impl Model {
             Products::Fp8
         };
         let prefill_dense_o = if prefill_dense == Products::Fp8
-            && crate::BLOCK_SCALED_MMA
             && weights.layers.iter().all(|l| l.mxfp8_o.is_some())
         {
             Products::Fp8
@@ -1065,13 +1064,7 @@ impl Model {
             products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
             "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"
         );
-        // On sm_89 (Ada), per-row FP8 dense GEMMs run natively on Ada's FP8 tensor cores while
-        // W_o stays BF16 (its MXFP8 block-32 GEMM requires Blackwell's block-scaled MMA).
-        let dense_o = if crate::BLOCK_SCALED_MMA {
-            products
-        } else {
-            Products::Bf16
-        };
+        let dense_o = products;
         let changed = self.ctx.prefill_dense != products || self.ctx.prefill_dense_o != dense_o;
         if dense_o == Products::Fp8 {
             let hidden = self.ctx.hidden();
@@ -1118,8 +1111,8 @@ impl Model {
     /// and wide batched passes `m >= 48`). Has no effect when `prefill_dense` is `Bf16`.
     pub fn set_prefill_dense_output(&mut self, products: Products) -> anyhow::Result<()> {
         ensure!(
-            crate::BLOCK_SCALED_MMA || products == Products::Bf16,
-            "MXFP8 output projection needs the block-scaled MMA, which this sm_89 build lacks"
+            products != Products::Fp4,
+            "dense output projection products are bf16 or fp8, not fp4"
         );
         ensure!(
             products != Products::Bf16
@@ -2816,7 +2809,6 @@ impl Ctx {
             && use_fp8_gemm
         {
             if self.prefill_dense_o == Products::Fp8
-                && crate::BLOCK_SCALED_MMA
                 && products.iter().all(|p| p.mxfp8.is_some())
             {
                 let mut gemms: Vec<Mxfp8Gemm<'_>> = products

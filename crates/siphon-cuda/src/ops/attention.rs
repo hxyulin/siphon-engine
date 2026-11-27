@@ -2313,7 +2313,13 @@ impl Attention {
             (KvData::Bf16 { .. }, _) => &self.prefill,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
             (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4) => &self.prefill_fp8_mma,
-            (KvData::Nvfp4 { .. }, Products::Bf16 | Products::Fp8) => &self.prefill_fp4,
+            (KvData::Nvfp4 { .. }, Products::Bf16) => &self.prefill_fp4,
+            // On sm_89, `prefill_attention_fp4_mma` decodes staged NVFP4 keys and values to
+            // E4M3 and runs both Q K^T and P V on native Ada FP8 tensor cores (330 TF/s).
+            (KvData::Nvfp4 { .. }, Products::Fp8) if !crate::BLOCK_SCALED_MMA => {
+                &self.prefill_fp4_mma
+            }
+            (KvData::Nvfp4 { .. }, Products::Fp8) => &self.prefill_fp4,
             (KvData::Nvfp4 { .. }, Products::Fp4) => &self.prefill_fp4_mma,
         };
         let mut launch = stream.launch_builder(function);

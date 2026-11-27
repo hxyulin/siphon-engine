@@ -380,11 +380,9 @@ impl Weights {
             .transpose()?;
         let release_inputs = options.weights == WeightFormat::Fp8 && options.prefill_dense_fp8;
         let release_o = release_inputs
-            && (options.output == OutputProjection::Fp8
-                || (options.output == OutputProjection::Mxfp8 && crate::BLOCK_SCALED_MMA));
+            && matches!(options.output, OutputProjection::Fp8 | OutputProjection::Mxfp8);
         let need_mxfp8_o = options.weights == WeightFormat::Fp8
-            && (options.output == OutputProjection::Mxfp8
-                || (options.prefill_dense_fp8 && crate::BLOCK_SCALED_MMA));
+            && (options.output == OutputProjection::Mxfp8 || options.prefill_dense_fp8);
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {

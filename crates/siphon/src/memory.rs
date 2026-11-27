@@ -692,8 +692,7 @@ impl Planner {
         });
         let release_bf16 = inputs.weights == WeightFormat::Fp8 && inputs.prefill_dense_fp8;
         let release_bf16_o = release_bf16
-            && (inputs.output == OutputProjection::Fp8
-                || (inputs.output == OutputProjection::Mxfp8 && inputs.block_scaled_mma));
+            && matches!(inputs.output, OutputProjection::Fp8 | OutputProjection::Mxfp8);
         let fixed = Plan {
             capacity: 0,
             pooled: inputs.pooled,
@@ -938,10 +937,8 @@ fn quantized_copy_bytes(
                     OutputProjection::Mxfp8 => mxfp8_matrix(hidden, q_dims),
                     OutputProjection::Bf16 => 0,
                 };
-                let prefill_mxfp8 = if prefill_dense_fp8
-                    && block_scaled_mma
-                    && output != OutputProjection::Mxfp8
-                {
+                let prefill_mxfp8 = if prefill_dense_fp8 && output != OutputProjection::Mxfp8 {
+                    let _ = block_scaled_mma;
                     mxfp8_matrix(hidden, q_dims)
                 } else {
                     0

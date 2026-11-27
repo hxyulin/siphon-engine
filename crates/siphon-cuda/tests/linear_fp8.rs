@@ -693,7 +693,6 @@ fn gemm_raw_matches_gemm_and_captures_graph() -> anyhow::Result<()> {
 /// scales, used for `W_o` under `--prefill-dense fp8`) against an F64 reference across
 /// `32x64`, `64x64`, and `128x128` tiles, partial shapes, and CUDA graph capture/replay.
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn gemm_mxfp8_matches_reference() -> anyhow::Result<()> {
     use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 
@@ -719,7 +718,11 @@ fn gemm_mxfp8_matches_reference() -> anyhow::Result<()> {
         for r in (0..n).step_by(17) {
             w_host[r * k + 64] = bf16::from_f32(32.0);
         }
-        let x_ref = mxfp8_rows(&x_host);
+        let x_ref = if cfg!(sm89) {
+            per_row_fp8_rows(&x_host, k)
+        } else {
+            mxfp8_rows(&x_host)
+        };
         let w_ref = mxfp8_rows(&w_host);
         let x_dev = stream.clone_htod(&x_host)?;
         let w_dev = stream.clone_htod(&w_host)?;
@@ -745,7 +748,8 @@ fn gemm_mxfp8_matches_reference() -> anyhow::Result<()> {
         let got = stream.clone_dtoh(&out_dev)?;
         let mut worst = 0.0f64;
         let ku = k as f64 * u;
-        let gamma = ku / (1.0 - ku);
+        let ada_mma_err = if cfg!(sm89) { 2f64.powi(-10) } else { 0.0 };
+        let gamma = ku / (1.0 - ku) + ada_mma_err;
         let rows: Vec<usize> = (0..m)
             .filter(|&r| m <= 64 || r % 37 == 0 || r + 2 >= m || r < 2)
             .collect();
@@ -918,9 +922,6 @@ fn gemm_fp8_throughput() -> anyhow::Result<()> {
         "batch", "m", "fp8 (us)", "fp8 TF/s", "bf16 (us)", "bf16 TF/s", "speedup"
     );
     for &(label, k, ns, mxfp8) in batches {
-        if mxfp8 && !siphon_cuda::BLOCK_SCALED_MMA {
-            continue;
-        }
         let n_sum: usize = ns.iter().sum();
         let bf16_w: Vec<_> = ns
             .iter()

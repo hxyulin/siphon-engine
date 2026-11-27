@@ -598,7 +598,9 @@ impl LinearFp8 {
     }
 
     /// [`Self::gemm`] for MXFP8 block-scaled weights (`[n, k]` E4M3 + `[n, k / 32]` UE8M0
-    /// scales): both operands use hardware block-32 scales inside `mma.sync.aligned.kind::mxf8f6f4`.
+    /// scales): on `sm_120a`, both operands use hardware block-32 scales inside
+    /// `mma.sync.aligned.kind::mxf8f6f4`; on `sm_89`, Ada FP8 MMA runs per-32 k-slices scaled
+    /// by each column's UE8M0 weight scale with per-row F32 input scales applied in the epilogue.
     pub fn gemm_mxfp8(
         &self,
         stream: &CudaStream,
@@ -606,10 +608,6 @@ impl LinearFp8 {
         m: usize,
         scratch: &mut Fp8Rows,
     ) -> anyhow::Result<()> {
-        ensure!(
-            crate::BLOCK_SCALED_MMA,
-            "MXFP8 block-scaled GEMM needs block-scaled MMA, which sm_89 lacks"
-        );
         let mut raw: Vec<RawProduct<'_>> = products
             .iter_mut()
             .map(|p| {

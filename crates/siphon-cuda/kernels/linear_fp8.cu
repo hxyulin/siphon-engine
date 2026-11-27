@@ -627,6 +627,10 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         (void)step;
 #endif
         uint32_t sb[kNi] = {};
+#if SIPHON_SM89
+        uint32_t sb0[kNi] = {};
+        uint32_t sb1[kNi] = {};
+#endif
         if constexpr (kBlockScaleB) {
             const auto* b_scales = static_cast<const uint8_t*>(p.w_scale);
             const size_t scale_stride = size_t(k / 32);
@@ -639,6 +643,14 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
                                    b_scales + size_t(b_scale_row) * scale_stride + step * 4)
                              : 0x7f7f7f7fu;
             }
+#if SIPHON_SM89
+            const int t = lane % 4;
+#pragma unroll
+            for (int ni = 0; ni < kNi; ++ni) {
+                sb0[ni] = __shfl_sync(0xffffffffu, sb[ni], 8 * t);
+                sb1[ni] = __shfl_sync(0xffffffffu, sb[ni], 8 * t + 4);
+            }
+#endif
         }
         // Double-buffer A and B fragments across the four k32 slices so ldmatrix latency
         // hides behind the FP8 MMAs of the previous slice.
@@ -671,12 +683,33 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
                 load_bf(bf[nxt], kK + 1);
                 load_af(af[nxt], kK + 1);
             }
-#pragma unroll
-            for (int mi = 0; mi < kMi; ++mi) {
+#if SIPHON_SM89
+            if constexpr (kBlockScaleB) {
 #pragma unroll
                 for (int ni = 0; ni < kNi; ++ni) {
-                    mma<kK, kBlockScaleB>(acc[mi][ni], af[cur][mi], bf[cur][ni][0], bf[cur][ni][1],
-                                          sa[mi], kBlockScaleB ? sb[ni] : 0x7f7f7f7fu);
+                    const float s0 = e8m0((sb0[ni] >> (8 * kK)) & 0xffu);
+                    const float s1 = e8m0((sb1[ni] >> (8 * kK)) & 0xffu);
+#pragma unroll
+                    for (int mi = 0; mi < kMi; ++mi) {
+                        float tmp[4] = {};
+                        mma<kK, false>(tmp, af[cur][mi], bf[cur][ni][0], bf[cur][ni][1], 0u, 0u);
+                        acc[mi][ni][0] = fmaf(tmp[0], s0, acc[mi][ni][0]);
+                        acc[mi][ni][1] = fmaf(tmp[1], s1, acc[mi][ni][1]);
+                        acc[mi][ni][2] = fmaf(tmp[2], s0, acc[mi][ni][2]);
+                        acc[mi][ni][3] = fmaf(tmp[3], s1, acc[mi][ni][3]);
+                    }
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (int mi = 0; mi < kMi; ++mi) {
+#pragma unroll
+                    for (int ni = 0; ni < kNi; ++ni) {
+                        mma<kK, kBlockScaleB>(acc[mi][ni], af[cur][mi], bf[cur][ni][0],
+                                              bf[cur][ni][1], sa[mi],
+                                              kBlockScaleB ? sb[ni] : 0x7f7f7f7fu);
+                    }
                 }
             }
         };

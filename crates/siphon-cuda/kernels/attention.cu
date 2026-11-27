@@ -1878,7 +1878,13 @@ struct alignas(16) PrefillShared {
     // E4M3 value tile so warp skewing overlaps tensor-core MMA with SFU softmax.
     static constexpr int kStages = (kFp8 && !kMmaLow) ? 1 : 2;
     static constexpr int kKTile = kMmaLow ? kPrefillKeys * kHeadDim / 2 : kPrefillKeys * kHeadDim;
+#if SIPHON_SM89
+    // On sm_89, Fp4MmaFormat decodes staged NVFP4 keys into swizzled [64, 128] E4M3 in `v[0]`
+    // so both Q K^T and P V run on native Ada FP8 MMA (`m16n8k32`).
+    static constexpr int kVTile = kMma4 ? kPrefillKeys * kHeadDim / 2 : (kMmaLow ? 16 : kPrefillKeys * kHeadDim);
+#else
     static constexpr int kVTile = kMmaLow ? 16 : kPrefillKeys * kHeadDim;
+#endif
     __nv_bfloat16 k[kStages][kKTile];
     __nv_bfloat16 v[kStages][kVTile];
     // Raw cache staging tiles: [64, 128] for E4M3, [64, 64+8] for NVFP4 (stub
@@ -2231,11 +2237,17 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
     // qs4[ks] the 4 packed UE4M3 scales of row g (t = 0) or g + 8 (t = 1), and
     // q_outer[i] the per-row outer scale folded into `row_score_scale`.
     uint32_t qa[kMmaLow ? 1 : kHeadDim / 16][4];
+#if SIPHON_SM89
+    uint32_t qa8[kMmaLow ? kHeadDim / 32 : 1][4];
+    uint32_t qs[kMmaLow ? kHeadDim / 32 : 1];
+#else
     uint32_t qa8[kMma8 ? kHeadDim / 32 : 1][4];
     uint32_t qs[kMma8 ? kHeadDim / 32 : 1];
     uint32_t qa4[kMma4 ? kHeadDim / 64 : 1][4];
     uint32_t qs4[kMma4 ? kHeadDim / 64 : 1];
+#endif
     float q_outer[2] = {1.f, 1.f};
+#if !SIPHON_SM89
     auto load_q4 = [&](const PrefillSegment& g) {
         uint32_t scale_packed[2][kHeadDim / 64];
 #pragma unroll
@@ -2297,6 +2309,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
             qs4[ks] = (lane & 1) ? scale_packed[1][ks] : scale_packed[0][ks];
         }
     };
+#endif
     auto load_q8 = [&](const PrefillSegment& g) {
 #if SIPHON_SM89
 #pragma unroll
@@ -2377,11 +2390,17 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
 #endif
     };
     auto load_q = [&](const PrefillSegment& g) {
+#if SIPHON_SM89
+        if constexpr (kMmaLow) {
+            load_q8(g);
+        } else {
+#else
         if constexpr (kMma4) {
             load_q4(g);
         } else if constexpr (kMma8) {
             load_q8(g);
         } else {
+#endif
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 const unsigned mg = g.block_m * kRows + warp * 16 + lane / 4 + 8 * i;
@@ -2618,6 +2637,28 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                         *reinterpret_cast<uint32_t*>(vt_dst + vt_offset(dim, position / 16) + position % 16) = out4[d];
                     }
                 }
+#if SIPHON_SM89
+                // Decode staged NVFP4 keys (`sm.k8[stage]`) into swizzled [64, 128] E4M3 in `sm.v[0]`
+                // so S = Q K^T runs on Ada's 330 TF/s native FP8 MMA alongside P V.
+                const uint8_t* k4 = sm.k8[stage];
+                uint8_t* k8_dst = reinterpret_cast<uint8_t*>(sm.v[0]);
+                for (int i = threadIdx.x; i < kPrefillKeys * kFp4HeadScales; i += kThreads) {
+                    const int row = i / kFp4HeadScales;
+                    const int group = i % kFp4HeadScales;
+                    const uint2 raw = *reinterpret_cast<const uint2*>(&k4[k4_offset(row, group / 2) + (group % 2) * 8]);
+                    const __half2 sc = e4m3_half2(k4[kScalesAt + row * kFp4HeadScales + group]);
+                    uint32_t lo[4];
+                    uint32_t hi[4];
+                    e2m1x8_to_f16x8(raw.x, lo);
+                    e2m1x8_to_f16x8(raw.y, hi);
+                    const uint4 packed = make_uint4(
+                        f16x4_to_e4m3x4(hmul2_bits(lo[0], sc), hmul2_bits(lo[1], sc)),
+                        f16x4_to_e4m3x4(hmul2_bits(lo[2], sc), hmul2_bits(lo[3], sc)),
+                        f16x4_to_e4m3x4(hmul2_bits(hi[0], sc), hmul2_bits(hi[1], sc)),
+                        f16x4_to_e4m3x4(hmul2_bits(hi[2], sc), hmul2_bits(hi[3], sc)));
+                    *reinterpret_cast<uint4*>(k8_dst + k8_offset(row, group)) = packed;
+                }
+#endif
                 __syncthreads();
             } else if constexpr (F::kFp4) {
                 // Each group of 16 elements decodes directly to two F16 chunks for both K and V.
@@ -2677,6 +2718,22 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
 
             // S = Q K^T: n-tile n holds keys 8n..8n+7.
             float s[kPrefillKeys / 8][4] = {};
+#if SIPHON_SM89
+            if constexpr (kMmaLow) {
+                const uint8_t* keys8 = kMma4 ? reinterpret_cast<const uint8_t*>(sm.v[0]) : sm.k8[stage];
+#pragma unroll
+                for (int ks = 0; ks < kHeadDim / 32; ++ks) {
+#pragma unroll
+                    for (int np = 0; np < kPrefillKeys / 16; ++np) {
+                        uint32_t b[4];
+                        const int key = np * 16 + (lane & 7) + 8 * (lane >> 4);
+                        ldmatrix_x4(b, keys8 + k8_offset(key, 2 * ks + ((lane >> 3) & 1)));
+                        mma_fp8(s[2 * np], qa8[ks], b[0], b[1], qs[ks]);
+                        mma_fp8(s[2 * np + 1], qa8[ks], b[2], b[3], qs[ks]);
+                    }
+                }
+            } else {
+#else
             if constexpr (kMma4) {
                 const uint8_t* keys4 = sm.k8[stage];
                 constexpr int kScalesAt = kPrefillKeys * kFp4HeadBytes;
@@ -2720,6 +2777,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
                     }
                 }
             } else {
+#endif
 #pragma unroll
                 for (int ks = 0; ks < kHeadDim / 16; ++ks) {
 #pragma unroll
