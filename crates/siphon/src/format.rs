@@ -313,6 +313,9 @@ impl fmt::Display for Nvfp4ScaleFormat {
 /// `Mxfp6` re-quantizes each 32-element MXFP8 block to OCP MXFP6 E2M3 at load time using
 /// MSE-optimal UE8M0 block scales, saving 25% of weight bytes (`-0.95 GiB`, ~`+111K` NVFP4 KV
 /// positions) while mapping bit-exactly back into E4M3 for single-pass FP8 MMA.
+/// `Nvfp4` re-quantizes each 16-element half-block to Four Over Six NVFP4 at load time using
+/// the same kernels and optional `--nvfp4-scales 4bit` compression as layers 0–19, saving
+/// `1.78 GiB` (`1.90 GiB` with 4-bit scales) over MXFP8 and speeding up decode, verify, and prefill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mxfp8ExpertFormat {
     /// Raw checkpoint MXFP8 (E4M3 values + UE8M0 per-32 scales).
@@ -320,6 +323,8 @@ pub enum Mxfp8ExpertFormat {
     Mxfp8,
     /// Load-time MXFP6 E2M3 (6-bit values in 2 planes `lo4` + `hi2` + UE8M0 per-32 scales).
     Mxfp6,
+    /// Load-time Four Over Six NVFP4 (E2M1 values + E4M3 or 4-bit offset per-16 scales).
+    Nvfp4,
 }
 
 impl FromStr for Mxfp8ExpertFormat {
@@ -329,7 +334,8 @@ impl FromStr for Mxfp8ExpertFormat {
         match s {
             "mxfp8" => Ok(Self::Mxfp8),
             "mxfp6" => Ok(Self::Mxfp6),
-            _ => bail!("unknown MXFP8 expert format {s:?}; expected mxfp8 or mxfp6"),
+            "nvfp4" => Ok(Self::Nvfp4),
+            _ => bail!("unknown MXFP8 expert format {s:?}; expected mxfp8, mxfp6 or nvfp4"),
         }
     }
 }
@@ -339,6 +345,7 @@ impl fmt::Display for Mxfp8ExpertFormat {
         f.write_str(match self {
             Self::Mxfp8 => "mxfp8",
             Self::Mxfp6 => "mxfp6",
+            Self::Nvfp4 => "nvfp4",
         })
     }
 }

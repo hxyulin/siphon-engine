@@ -83,7 +83,7 @@ struct Args {
     /// Set NVFP4 expert block scale format (8bit or 4bit).
     #[arg(long, value_name = "FORMAT", default_value_t)]
     nvfp4_scales: siphon::Nvfp4ScaleFormat,
-    /// Set MXFP8 expert layer storage format (mxfp8 or mxfp6).
+    /// Set MXFP8 expert layer storage format (mxfp8, mxfp6, or nvfp4).
     #[arg(long, value_name = "FORMAT", default_value_t)]
     mxfp8_experts: siphon::Mxfp8ExpertFormat,
     /// Set the draft weight format.

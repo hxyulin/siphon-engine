@@ -169,7 +169,7 @@ mod linux {
             } else if arg == "--mxfp8-experts" {
                 mxfp8_experts = it
                     .next()
-                    .context("--mxfp8-experts needs mxfp8 or mxfp6")?
+                    .context("--mxfp8-experts needs mxfp8, mxfp6 or nvfp4")?
                     .parse()?;
             } else if arg == "--moe-top-k" {
                 moe_top_k = Some(it.next().context("--moe-top-k needs 1..=8")?.parse()?);

@@ -1021,3 +1021,170 @@ extern "C" __global__ void __launch_bounds__(256)
         make_uint4(lo_out[0], lo_out[1], lo_out[2], lo_out[3]);
     reinterpret_cast<uint2*>(w_hi2 + blk * 8)[0] = make_uint2(hi_out[0], hi_out[1]);
 }
+
+namespace {
+
+__device__ __forceinline__ float e4m3_round(float x) {
+    const __nv_fp8_e4m3 q(x);
+    return float(q);
+}
+
+__device__ __forceinline__ uint32_t cvt_e2m1x2_val(float lo_in, float hi_in, float& lo_val,
+                                                   float& hi_val) {
+#if SIPHON_SM89
+    auto code = [](float y) -> uint32_t {
+        const float a = fabsf(y);
+        const uint32_t c = uint32_t(a > 0.25f) + uint32_t(a >= 0.75f) + uint32_t(a > 1.25f) +
+                           uint32_t(a >= 1.75f) + uint32_t(a > 2.5f) + uint32_t(a >= 3.5f) +
+                           uint32_t(a > 5.f);
+        return isnan(y) ? 7u : c | (__float_as_uint(y) >> 31 << 3);
+    };
+    const uint32_t byte = code(lo_in) | (code(hi_in) << 4);
+    const float2 vals = e2m1x2(byte);
+    lo_val = vals.x;
+    hi_val = vals.y;
+    return byte;
+#else
+    uint32_t byte;
+    uint32_t halves;
+    asm("{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %3, %2; cvt.u32.u8 %0, b; "
+        "cvt.rn.f16x2.e2m1x2 %1, b; }"
+        : "=r"(byte), "=r"(halves)
+        : "f"(lo_in), "f"(hi_in));
+    const __half2 h = *reinterpret_cast<const __half2*>(&halves);
+    lo_val = __low2float(h);
+    hi_val = __high2float(h);
+    return byte;
+#endif
+}
+
+__device__ __forceinline__ float fp4_candidate(const float (&x)[16], float scale, float inverse,
+                                               float outer, uint2& packed) {
+    float err = 0.f;
+    uint32_t bytes[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float lv, hv;
+        bytes[i] = cvt_e2m1x2_val(x[2 * i] * inverse, x[2 * i + 1] * inverse, lv, hv);
+        const float d0 = lv * scale * outer - x[2 * i];
+        const float d1 = hv * scale * outer - x[2 * i + 1];
+        err = fmaf(d0, d0, err);
+        err = fmaf(d1, d1, err);
+    }
+    packed.x = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+    packed.y = bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
+    return err;
+}
+
+}  // namespace
+
+// Computes per-expert `global_scale = amax * (2688 / 1536)` for Four Over Six NVFP4 so
+// `outer_scale = global_scale / 2688 = amax / 1536` fits both 4- and 6-max block candidates
+// inside E4M3's finite range. Grid: (n_experts, 1, 1), block: (256, 1, 1).
+extern "C" __global__ void __launch_bounds__(256)
+    mxfp8_expert_amax(const uint8_t* __restrict__ w_in, const uint8_t* __restrict__ s_in,
+                      float* __restrict__ global_scale, size_t blocks_per_expert) {
+    const size_t expert = size_t(blockIdx.x);
+    const size_t base_blk = expert * blocks_per_expert;
+    float local_max = 0.f;
+    for (size_t blk = threadIdx.x; blk < blocks_per_expert; blk += 256) {
+        const size_t b = base_blk + blk;
+        const float sc = e8m0(s_in[b]);
+        const uint4* w_ptr = reinterpret_cast<const uint4*>(w_in + b * 32);
+        const uint4 v0 = w_ptr[0];
+        const uint4 v1 = w_ptr[1];
+        const uint32_t words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        float bmax = 0.f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const uint32_t wd = words[w];
+            const float2 p0 = e4m3x2(wd & 0xffffu);
+            const float2 p1 = e4m3x2(wd >> 16);
+            bmax = fmaxf(bmax, fmaxf(fmaxf(fabsf(p0.x), fabsf(p0.y)),
+                                     fmaxf(fabsf(p1.x), fabsf(p1.y))));
+        }
+        local_max = fmaxf(local_max, bmax * sc);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, off));
+    }
+    __shared__ float smem[8];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (lane == 0) {
+        smem[warp] = local_max;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v = lane < 8 ? smem[lane] : 0.f;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+        }
+        if (lane == 0) {
+            global_scale[expert] = v * (kNvfp4ScaleEnc / 1536.f);
+        }
+    }
+}
+
+// Re-quantizes MXFP8 blocks (32 E4M3 values + 1 UE8M0 scale each) into two 16-element
+// Four Over Six NVFP4 blocks matching layers 0–19 (`w_out`: 16 bytes/MXFP8 block,
+// `s_out`: 2 E4M3 scales/MXFP8 block).
+extern "C" __global__ void __launch_bounds__(256)
+    pack_mxfp8_to_nvfp4(const uint8_t* __restrict__ w_in, const uint8_t* __restrict__ s_in,
+                        const float* __restrict__ global_scale, uint8_t* __restrict__ w_out,
+                        uint8_t* __restrict__ s_out, size_t blocks_per_expert,
+                        size_t total_blocks) {
+    const size_t blk = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (blk >= total_blocks) {
+        return;
+    }
+    const size_t expert = blk / blocks_per_expert;
+    const float outer_scale = __fdiv_rn(global_scale[expert], kNvfp4ScaleEnc);
+    const float encoder = (outer_scale > 0.f) ? __fdiv_rn(1.f, outer_scale) : 0.f;
+    const float encoder6 = encoder * (1.f / 6.f);
+    const float encoder4 = encoder * 0.25f;
+
+    const float sc = e8m0(s_in[blk]);
+    const uint4* w_ptr = reinterpret_cast<const uint4*>(w_in + blk * 32);
+    const uint4 v0 = w_ptr[0];
+    const uint4 v1 = w_ptr[1];
+    const uint32_t words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    float x[32];
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const uint32_t wd = words[w];
+        const float2 p0 = e4m3x2(wd & 0xffffu);
+        const float2 p1 = e4m3x2(wd >> 16);
+        x[4 * w + 0] = p0.x * sc;
+        x[4 * w + 1] = p0.y * sc;
+        x[4 * w + 2] = p1.x * sc;
+        x[4 * w + 3] = p1.y * sc;
+    }
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        float h[16];
+        float bmax = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            h[i] = x[half * 16 + i];
+            bmax = fmaxf(bmax, fabsf(h[i]));
+        }
+        const float scale6 = e4m3_round(fminf(bmax * encoder6, 448.f));
+        const float scale4 = e4m3_round(fminf(bmax * encoder4, 448.f));
+        const float denom6 = scale6 * outer_scale;
+        const float denom4 = scale4 * outer_scale;
+        const float inv6 = (denom6 > 0.f) ? __fdiv_rn(1.f, denom6) : 0.f;
+        const float inv4 = (denom4 > 0.f) ? __fdiv_rn(1.f, denom4) : 0.f;
+        uint2 packed6, packed4;
+        const float err6 = fp4_candidate(h, scale6, inv6, outer_scale, packed6);
+        const float err4 = fp4_candidate(h, scale4, inv4, outer_scale, packed4);
+        const bool choose4 = err4 < err6;
+        const uint2 packed = choose4 ? packed4 : packed6;
+        const __nv_fp8_e4m3 sc_fp8(choose4 ? scale4 : scale6);
+        const size_t nv_blk = blk * 2 + half;
+        s_out[nv_blk] = sc_fp8.__x;
+        reinterpret_cast<uint2*>(w_out + nv_blk * 8)[0] = packed;
+    }
+}

@@ -101,7 +101,9 @@ impl Table {
     }
 }
 
-pub use siphon::{LmHeadFormat, Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection, WeightFormat};
+pub use siphon::{
+    LmHeadFormat, Mxfp8ExpertFormat, Nvfp4ScaleFormat, OutputProjection, WeightFormat,
+};
 
 /// Options for [`Weights::load_with_options`]: streaming layer-by-layer quantization that
 /// drops unused BF16 weights as each layer is quantized and loads quantized LM heads
@@ -442,20 +444,23 @@ impl Weights {
             WeightFormat::Bf16 => LmHeadFormat::Bf16,
             WeightFormat::Fp8 => LmHeadFormat::Fp8,
         });
-        let linear_fp8 =
-            (options.weights == WeightFormat::Fp8 || effective_lm_head == LmHeadFormat::Fp8)
-                .then(|| LinearFp8::load(gpu.context()))
-                .transpose()?;
+        let linear_fp8 = (options.weights == WeightFormat::Fp8
+            || effective_lm_head == LmHeadFormat::Fp8)
+            .then(|| LinearFp8::load(gpu.context()))
+            .transpose()?;
         let linear_nvfp4 = (effective_lm_head == LmHeadFormat::Nvfp4)
             .then(|| LinearNvfp4::load(gpu.context()))
             .transpose()?;
         let experts_ops = (options.nvfp4_scales == Nvfp4ScaleFormat::Offset4
-            || options.mxfp8_experts == Mxfp8ExpertFormat::Mxfp6)
+            || options.mxfp8_experts != Mxfp8ExpertFormat::Mxfp8)
             .then(|| Experts::load(gpu.context()))
             .transpose()?;
         let release_inputs = options.weights == WeightFormat::Fp8 && options.prefill_dense_fp8;
         let release_o = release_inputs
-            && matches!(options.output, OutputProjection::Fp8 | OutputProjection::Mxfp8);
+            && matches!(
+                options.output,
+                OutputProjection::Fp8 | OutputProjection::Mxfp8
+            );
         let need_mxfp8_o = options.weights == WeightFormat::Fp8
             && (options.output == OutputProjection::Mxfp8 || options.prefill_dense_fp8);
 
@@ -464,16 +469,25 @@ impl Weights {
             let mut layer = LayerWeights::load(&loader, config, layer_idx)
                 .with_context(|| format!("loading layer {layer_idx}"))?;
             if let Some(experts) = experts_ops.as_ref() {
+                match options.mxfp8_experts {
+                    Mxfp8ExpertFormat::Mxfp8 => {}
+                    Mxfp8ExpertFormat::Mxfp6 => {
+                        pack_layer_mxfp8_to_mxfp6(&mut layer, experts, stream).with_context(
+                            || format!("packing MXFP6 E2M3 experts for layer {layer_idx}"),
+                        )?;
+                    }
+                    Mxfp8ExpertFormat::Nvfp4 => {
+                        pack_layer_mxfp8_to_nvfp4(&mut layer, experts, config, stream)
+                            .with_context(|| {
+                                format!("packing Four Over Six NVFP4 experts for layer {layer_idx}")
+                            })?;
+                    }
+                }
                 if options.nvfp4_scales == Nvfp4ScaleFormat::Offset4 {
                     pack_layer_nvfp4_scales_4bit(&mut layer, experts, config, stream)
                         .with_context(|| {
                             format!("packing 4-bit NVFP4 scales for layer {layer_idx}")
                         })?;
-                }
-                if options.mxfp8_experts == Mxfp8ExpertFormat::Mxfp6 {
-                    pack_layer_mxfp8_to_mxfp6(&mut layer, experts, stream).with_context(|| {
-                        format!("packing MXFP6 E2M3 experts for layer {layer_idx}")
-                    })?;
                 }
             }
             if options.weights == WeightFormat::Fp8 {
@@ -537,7 +551,7 @@ impl Weights {
         if release_inputs
             || effective_lm_head != LmHeadFormat::Bf16
             || options.nvfp4_scales == Nvfp4ScaleFormat::Offset4
-            || options.mxfp8_experts == Mxfp8ExpertFormat::Mxfp6
+            || options.mxfp8_experts != Mxfp8ExpertFormat::Mxfp8
         {
             gpu.trim_mem_pool()?;
         }
@@ -550,10 +564,7 @@ impl Weights {
     pub fn has_bf16_inputs(&self) -> bool {
         self.layers.iter().all(|l| {
             l.attention.has_bf16_inputs()
-                && l.message_gates
-                    .iter()
-                    .flatten()
-                    .all(|g| g.down.is_some())
+                && l.message_gates.iter().flatten().all(|g| g.down.is_some())
         })
     }
 
@@ -698,10 +709,9 @@ fn quantize_layer_fp8(
         .into_iter()
         .map(|w| quantize(w, hidden))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let o_bf16 = a
-        .o
-        .as_ref()
-        .context("BF16 attention output projection was released")?;
+    let o_bf16 =
+        a.o.as_ref()
+            .context("BF16 attention output projection was released")?;
     let o = match output {
         OutputProjection::Fp8 => Some(quantize(o_bf16, q_dims)?),
         OutputProjection::Bf16 | OutputProjection::Mxfp8 => None,
@@ -712,8 +722,8 @@ fn quantize_layer_fp8(
         bytes += mxfp8.bytes();
         layer.mxfp8_o = Some(mxfp8);
     }
-    bytes += inputs.iter().map(Fp8Matrix::bytes).sum::<usize>()
-        + o.as_ref().map_or(0, Fp8Matrix::bytes);
+    bytes +=
+        inputs.iter().map(Fp8Matrix::bytes).sum::<usize>() + o.as_ref().map_or(0, Fp8Matrix::bytes);
     layer.fp8 = Some(Fp8Projections { inputs, o });
     for gate in layer.message_gates.iter_mut().flatten() {
         let quantize_gate =
@@ -1059,6 +1069,37 @@ fn pack_layer_mxfp8_to_mxfp6(
     e.w2 = w2_lo4;
     e.w2_scale = s2_out;
     e.format = ExpertFormat::Mxfp6 { w13_hi2, w2_hi2 };
+    Ok(())
+}
+
+/// Re-quantizes one MXFP8 expert layer (`w13`, `w2`) to Four Over Six NVFP4 on GPU and drops
+/// the original 8-bit buffers right away so peak VRAM stays low (and subsequent 4-bit scale
+/// packing can compress its scales alongside layers 0–19).
+fn pack_layer_mxfp8_to_nvfp4(
+    layer: &mut LayerWeights,
+    experts: &Experts,
+    config: &TextConfig,
+    stream: &Arc<CudaStream>,
+) -> anyhow::Result<()> {
+    let e = &mut layer.experts;
+    if !matches!(e.format, ExpertFormat::Mxfp8) {
+        return Ok(());
+    }
+    let n_experts = config.n_routed_experts;
+    let (w13_out, s13_out, g13) =
+        experts.pack_mxfp8_to_nvfp4(stream, &e.w13, &e.w13_scale, n_experts)?;
+    e.w13 = w13_out;
+    e.w13_scale = s13_out;
+    let (w2_out, s2_out, g2) =
+        experts.pack_mxfp8_to_nvfp4(stream, &e.w2, &e.w2_scale, n_experts)?;
+    e.w2 = w2_out;
+    e.w2_scale = s2_out;
+    e.format = ExpertFormat::Nvfp4 {
+        w13_global_scale: g13,
+        w2_global_scale: g2,
+        w13_scale_base: None,
+        w2_scale_base: None,
+    };
     Ok(())
 }
 

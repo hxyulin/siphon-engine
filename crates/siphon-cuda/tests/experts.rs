@@ -670,10 +670,7 @@ fn expert_mlp_pruned_slots_skip_nan_and_finish_cleanly() -> anyhow::Result<()> {
         let mut combined = stream.alloc_zeros::<bf16>(HIDDEN)?;
         elementwise.moe_combine(stream, &out_dev, &row.routing, &mut combined)?;
         assert!(
-            stream
-                .clone_dtoh(&combined)?
-                .iter()
-                .all(|v| v.is_finite()),
+            stream.clone_dtoh(&combined)?.iter().all(|v| v.is_finite()),
             "fp4 {fp4}: moe_combine contains NaN/Inf"
         );
     }
@@ -818,8 +815,7 @@ fn check_reference_with_mma_err(
                                     sum += product.abs();
                                 }
                                 let want = dot * scale;
-                                let bound =
-                                    2f64.powi(-8) * want.abs() + mma_err * sum * scale;
+                                let bound = 2f64.powi(-8) * want.abs() + mma_err * sum * scale;
                                 let value = f64::from(got[pair * n + col].to_f32());
                                 let err = (value - want).abs();
                                 assert!(
@@ -2046,11 +2042,7 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
             // Ada sm_89 FP8 tensor-core MMA accumulates with ~14-bit precision (f32) or
             // 11-bit precision per 32-element k-step (f16, NVFP4).
             let mma_err = if sm89_per_row {
-                if fp4 {
-                    2f64.powi(-9)
-                } else {
-                    2f64.powi(-10)
-                }
+                if fp4 { 2f64.powi(-9) } else { 2f64.powi(-10) }
             } else {
                 2f64.powi(-14)
             };
@@ -2066,7 +2058,15 @@ fn check_quantized(fp4: bool, fp8: bool) -> anyhow::Result<()> {
                     mma_err,
                 )
             } else {
-                check_reference_with_mma_err(&case, &host, &x64, &indices, inputs_per_row, got, mma_err)
+                check_reference_with_mma_err(
+                    &case,
+                    &host,
+                    &x64,
+                    &indices,
+                    inputs_per_row,
+                    got,
+                    mma_err,
+                )
             };
             eprintln!("{case}: worst error {worst:.3} of bound");
         }
@@ -2307,11 +2307,21 @@ fn fused_swiglu_quant_matches_separate_kernels() -> anyhow::Result<()> {
         )?;
         let mut act_q_sep = QuantizedRows::new(stream, pairs * INTERMEDIATE, pairs)?;
         if fp8 {
-            s.experts
-                .quantize_rows_fp8(stream, &act_bf16, INTERMEDIATE, w2_w.format, &mut act_q_sep)?;
+            s.experts.quantize_rows_fp8(
+                stream,
+                &act_bf16,
+                INTERMEDIATE,
+                w2_w.format,
+                &mut act_q_sep,
+            )?;
         } else {
-            s.experts
-                .quantize_rows(stream, &act_bf16, INTERMEDIATE, w2_w.format, &mut act_q_sep)?;
+            s.experts.quantize_rows(
+                stream,
+                &act_bf16,
+                INTERMEDIATE,
+                w2_w.format,
+                &mut act_q_sep,
+            )?;
         }
         let mut down_sep = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
         s.experts.expert_matmul_quantized_grouped(
@@ -2549,8 +2559,13 @@ fn bench_expert_activations() -> anyhow::Result<()> {
                         s.experts
                             .quantize_rows_fp8(stream, &x, k, weights.format, &mut xq)?;
                     } else {
-                        s.experts
-                            .quantize_rows_fp8_per_row(stream, &x, k, weights.format, &mut xq)?;
+                        s.experts.quantize_rows_fp8_per_row(
+                            stream,
+                            &x,
+                            k,
+                            weights.format,
+                            &mut xq,
+                        )?;
                     }
                     if swiglu {
                         s.experts.expert_matmul_quantized_swiglu_grouped(
@@ -2632,13 +2647,9 @@ fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
         let full_s_gpu = stream.clone_htod(&full_s)?;
         let rows = experts * target_n;
         let blocks = proj.k / 16;
-        let (packed_scales, scale_base) = s.experts.pack_nvfp4_scales_4bit(
-            stream,
-            &mut full_w_gpu,
-            &full_s_gpu,
-            rows,
-            blocks,
-        )?;
+        let (packed_scales, scale_base) =
+            s.experts
+                .pack_nvfp4_scales_4bit(stream, &mut full_w_gpu, &full_s_gpu, rows, blocks)?;
         let h_packed = stream.clone_dtoh(&packed_scales)?;
         let h_base = stream.clone_dtoh(&scale_base)?;
         let mut h_unpacked = vec![0u8; rows * blocks];
@@ -2662,7 +2673,13 @@ fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
             n: target_n,
             k: proj.k,
         };
-        Ok((full_proj, packed_scales, scale_base, unpacked_scales, experts))
+        Ok((
+            full_proj,
+            packed_scales,
+            scale_base,
+            unpacked_scales,
+            experts,
+        ))
     };
 
     let (w13_p, s13_4, b13, s13_8, n_exp) = pack_proj("gate_up", 2 * INTERMEDIATE)?;
@@ -2718,31 +2735,40 @@ fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
     let x13_gpu = stream.clone_htod(&x13_h)?;
     let x2_gpu = stream.clone_htod(&x2_h)?;
 
-    let assert_bf16_eq = |label: &str, a: &CudaSlice<bf16>, b: &CudaSlice<bf16>| -> anyhow::Result<()> {
-        let ha = stream.clone_dtoh(a)?;
-        let hb = stream.clone_dtoh(b)?;
-        assert_eq!(ha.len(), hb.len(), "{label}: length mismatch");
-        for (i, (&x, &y)) in ha.iter().zip(&hb).enumerate() {
-            assert_eq!(
-                x.to_bits(),
-                y.to_bits(),
-                "{label}: mismatch at {i}: 4bit={x} ({:#06x}) vs 8bit={y} ({:#06x})",
-                x.to_bits(),
-                y.to_bits()
-            );
-        }
-        Ok(())
-    };
+    let assert_bf16_eq =
+        |label: &str, a: &CudaSlice<bf16>, b: &CudaSlice<bf16>| -> anyhow::Result<()> {
+            let ha = stream.clone_dtoh(a)?;
+            let hb = stream.clone_dtoh(b)?;
+            assert_eq!(ha.len(), hb.len(), "{label}: length mismatch");
+            for (i, (&x, &y)) in ha.iter().zip(&hb).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{label}: mismatch at {i}: 4bit={x} ({:#06x}) vs 8bit={y} ({:#06x})",
+                    x.to_bits(),
+                    y.to_bits()
+                );
+            }
+            Ok(())
+        };
 
     // 1. expert_matvec (w13 and w2)
     for (label, x, w8, w4, out_len) in [
-        ("matvec w13", &x13_gpu, &w13_8, &w13_4, indices_h.len() * w13_p.n),
+        (
+            "matvec w13",
+            &x13_gpu,
+            &w13_8,
+            &w13_4,
+            indices_h.len() * w13_p.n,
+        ),
         ("matvec w2", &x2_gpu, &w2_8, &w2_4, indices_h.len() * w2_p.n),
     ] {
         let mut out8 = stream.alloc_zeros::<bf16>(out_len)?;
         let mut out4 = stream.alloc_zeros::<bf16>(out_len)?;
-        s.experts.expert_matvec(stream, x, &indices_gpu, w8, &mut out8)?;
-        s.experts.expert_matvec(stream, x, &indices_gpu, w4, &mut out4)?;
+        s.experts
+            .expert_matvec(stream, x, &indices_gpu, w8, &mut out8)?;
+        s.experts
+            .expert_matvec(stream, x, &indices_gpu, w4, &mut out4)?;
         assert_bf16_eq(label, &out4, &out8)?;
     }
 
@@ -2754,12 +2780,30 @@ fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
     let mut out4 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
     let mut sync = stream.alloc_zeros::<u32>(1 + pairs)?;
     s.experts.expert_mlp(
-        stream, &x13_gpu, &indices_gpu, &w13_8, &w2_8, &mut act8, &mut out8, &mut sync,
-        GATE_SOFTCAP, UP_SOFTCAP, None,
+        stream,
+        &x13_gpu,
+        &indices_gpu,
+        &w13_8,
+        &w2_8,
+        &mut act8,
+        &mut out8,
+        &mut sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        None,
     )?;
     s.experts.expert_mlp(
-        stream, &x13_gpu, &indices_gpu, &w13_4, &w2_4, &mut act4, &mut out4, &mut sync,
-        GATE_SOFTCAP, UP_SOFTCAP, None,
+        stream,
+        &x13_gpu,
+        &indices_gpu,
+        &w13_4,
+        &w2_4,
+        &mut act4,
+        &mut out4,
+        &mut sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        None,
     )?;
     assert_bf16_eq("mlp act", &act4, &act8)?;
     assert_bf16_eq("mlp out", &out4, &out8)?;
@@ -2783,11 +2827,27 @@ fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
         let mut o4 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
         let mut rsync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(m))?;
         rows_ops.expert_mlp_rows(
-            stream, &x_g, &id_g, &w13_8, &w2_8, &mut a8, &mut o8, &mut rsync, GATE_SOFTCAP,
+            stream,
+            &x_g,
+            &id_g,
+            &w13_8,
+            &w2_8,
+            &mut a8,
+            &mut o8,
+            &mut rsync,
+            GATE_SOFTCAP,
             UP_SOFTCAP,
         )?;
         rows_ops.expert_mlp_rows(
-            stream, &x_g, &id_g, &w13_4, &w2_4, &mut a4, &mut o4, &mut rsync, GATE_SOFTCAP,
+            stream,
+            &x_g,
+            &id_g,
+            &w13_4,
+            &w2_4,
+            &mut a4,
+            &mut o4,
+            &mut rsync,
+            GATE_SOFTCAP,
             UP_SOFTCAP,
         )?;
         assert_bf16_eq(&format!("mlp_rows m={m} act"), &a4, &a8)?;
@@ -2814,40 +2874,73 @@ fn nvfp4_4bit_scales_match_unpacked() -> anyhow::Result<()> {
     let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
     let mut a4 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
     s.experts.expert_matmul_swiglu_grouped(
-        stream, &x_g, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &x_g,
+        &w13_8,
+        &mut a8,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     s.experts.expert_matmul_swiglu_grouped(
-        stream, &x_g, &w13_4, &mut a4, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &x_g,
+        &w13_4,
+        &mut a4,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     assert_bf16_eq("gemm bf16 w13 swiglu", &a4, &a8)?;
     let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
     let mut o4 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
-    s.experts.expert_matmul_grouped(stream, &a8, &w2_8, &mut o8, &scratch)?;
-    s.experts.expert_matmul_grouped(stream, &a4, &w2_4, &mut o4, &scratch)?;
+    s.experts
+        .expert_matmul_grouped(stream, &a8, &w2_8, &mut o8, &scratch)?;
+    s.experts
+        .expert_matmul_grouped(stream, &a4, &w2_4, &mut o4, &scratch)?;
     assert_bf16_eq("gemm bf16 w2", &o4, &o8)?;
 
     // FP8-act SwiGLU + w2
-    s.experts.expert_group_quantized(stream, &id_g, n_exp, &mut scratch)?;
+    s.experts
+        .expert_group_quantized(stream, &id_g, n_exp, &mut scratch)?;
     let mut xq = QuantizedRows::new(stream, m * SLOTS * HIDDEN, m * SLOTS)?;
     if siphon_cuda::BLOCK_SCALED_MMA {
-        s.experts.quantize_rows_fp8(stream, &x_g, HIDDEN, w13_4.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8(stream, &x_g, HIDDEN, w13_4.format, &mut xq)?;
     } else {
-        s.experts.quantize_rows_fp8_per_row(stream, &x_g, HIDDEN, w13_4.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8_per_row(stream, &x_g, HIDDEN, w13_4.format, &mut xq)?;
     }
     s.experts.expert_matmul_quantized_swiglu_grouped(
-        stream, &xq, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &xq,
+        &w13_8,
+        &mut a8,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     s.experts.expert_matmul_quantized_swiglu_grouped(
-        stream, &xq, &w13_4, &mut a4, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &xq,
+        &w13_4,
+        &mut a4,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     assert_bf16_eq("gemm fp8 w13 swiglu", &a4, &a8)?;
     if siphon_cuda::BLOCK_SCALED_MMA {
-        s.experts.quantize_rows_fp8(stream, &a4, INTERMEDIATE, w2_4.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8(stream, &a4, INTERMEDIATE, w2_4.format, &mut xq)?;
     } else {
-        s.experts.quantize_rows_fp8_per_row(stream, &a4, INTERMEDIATE, w2_4.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8_per_row(stream, &a4, INTERMEDIATE, w2_4.format, &mut xq)?;
     }
-    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_8, &mut o8, &scratch)?;
-    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_4, &mut o4, &scratch)?;
+    s.experts
+        .expert_matmul_quantized_grouped(stream, &xq, &w2_8, &mut o8, &scratch)?;
+    s.experts
+        .expert_matmul_quantized_grouped(stream, &xq, &w2_4, &mut o4, &scratch)?;
     assert_bf16_eq("gemm fp8 w2", &o4, &o8)?;
     Ok(())
 }
@@ -2898,7 +2991,8 @@ fn mxfp6_matches_unpacked_mxfp8() -> anyhow::Result<()> {
         let full_w_gpu = stream.clone_htod(&full_w)?;
         let full_s_gpu = stream.clone_htod(&full_s)?;
         let (lo4, hi2, scales_out) =
-            s.experts.pack_mxfp8_to_mxfp6(stream, &full_w_gpu, &full_s_gpu)?;
+            s.experts
+                .pack_mxfp8_to_mxfp6(stream, &full_w_gpu, &full_s_gpu)?;
         let h_lo4 = stream.clone_dtoh(&lo4)?;
         let h_hi2 = stream.clone_dtoh(&hi2)?;
         let total = experts * target_n * proj.k;
@@ -2951,31 +3045,40 @@ fn mxfp6_matches_unpacked_mxfp8() -> anyhow::Result<()> {
     let x13_gpu = stream.clone_htod(&x13_h)?;
     let x2_gpu = stream.clone_htod(&x2_h)?;
 
-    let assert_bf16_eq = |label: &str, a: &CudaSlice<bf16>, b: &CudaSlice<bf16>| -> anyhow::Result<()> {
-        let ha = stream.clone_dtoh(a)?;
-        let hb = stream.clone_dtoh(b)?;
-        assert_eq!(ha.len(), hb.len(), "{label}: length mismatch");
-        for (i, (&x, &y)) in ha.iter().zip(&hb).enumerate() {
-            assert_eq!(
-                x.to_bits(),
-                y.to_bits(),
-                "{label}: mismatch at {i}: mxfp6={x} ({:#06x}) vs mxfp8={y} ({:#06x})",
-                x.to_bits(),
-                y.to_bits()
-            );
-        }
-        Ok(())
-    };
+    let assert_bf16_eq =
+        |label: &str, a: &CudaSlice<bf16>, b: &CudaSlice<bf16>| -> anyhow::Result<()> {
+            let ha = stream.clone_dtoh(a)?;
+            let hb = stream.clone_dtoh(b)?;
+            assert_eq!(ha.len(), hb.len(), "{label}: length mismatch");
+            for (i, (&x, &y)) in ha.iter().zip(&hb).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{label}: mismatch at {i}: mxfp6={x} ({:#06x}) vs mxfp8={y} ({:#06x})",
+                    x.to_bits(),
+                    y.to_bits()
+                );
+            }
+            Ok(())
+        };
 
     // 1. expert_matvec (w13 and w2)
     for (label, x, w8, w6, out_len) in [
-        ("matvec w13", &x13_gpu, &w13_8, &w13_6, indices_h.len() * n13),
+        (
+            "matvec w13",
+            &x13_gpu,
+            &w13_8,
+            &w13_6,
+            indices_h.len() * n13,
+        ),
         ("matvec w2", &x2_gpu, &w2_8, &w2_6, indices_h.len() * n2),
     ] {
         let mut out8 = stream.alloc_zeros::<bf16>(out_len)?;
         let mut out6 = stream.alloc_zeros::<bf16>(out_len)?;
-        s.experts.expert_matvec(stream, x, &indices_gpu, w8, &mut out8)?;
-        s.experts.expert_matvec(stream, x, &indices_gpu, w6, &mut out6)?;
+        s.experts
+            .expert_matvec(stream, x, &indices_gpu, w8, &mut out8)?;
+        s.experts
+            .expert_matvec(stream, x, &indices_gpu, w6, &mut out6)?;
         assert_bf16_eq(label, &out6, &out8)?;
     }
 
@@ -2987,12 +3090,30 @@ fn mxfp6_matches_unpacked_mxfp8() -> anyhow::Result<()> {
     let mut out6 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
     let mut sync = stream.alloc_zeros::<u32>(1 + pairs)?;
     s.experts.expert_mlp(
-        stream, &x13_gpu, &indices_gpu, &w13_8, &w2_8, &mut act8, &mut out8, &mut sync,
-        GATE_SOFTCAP, UP_SOFTCAP, None,
+        stream,
+        &x13_gpu,
+        &indices_gpu,
+        &w13_8,
+        &w2_8,
+        &mut act8,
+        &mut out8,
+        &mut sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        None,
     )?;
     s.experts.expert_mlp(
-        stream, &x13_gpu, &indices_gpu, &w13_6, &w2_6, &mut act6, &mut out6, &mut sync,
-        GATE_SOFTCAP, UP_SOFTCAP, None,
+        stream,
+        &x13_gpu,
+        &indices_gpu,
+        &w13_6,
+        &w2_6,
+        &mut act6,
+        &mut out6,
+        &mut sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        None,
     )?;
     assert_bf16_eq("mlp act", &act6, &act8)?;
     assert_bf16_eq("mlp out", &out6, &out8)?;
@@ -3016,11 +3137,27 @@ fn mxfp6_matches_unpacked_mxfp8() -> anyhow::Result<()> {
         let mut o6 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
         let mut rsync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(m))?;
         rows_ops.expert_mlp_rows(
-            stream, &x_g, &id_g, &w13_8, &w2_8, &mut a8, &mut o8, &mut rsync, GATE_SOFTCAP,
+            stream,
+            &x_g,
+            &id_g,
+            &w13_8,
+            &w2_8,
+            &mut a8,
+            &mut o8,
+            &mut rsync,
+            GATE_SOFTCAP,
             UP_SOFTCAP,
         )?;
         rows_ops.expert_mlp_rows(
-            stream, &x_g, &id_g, &w13_6, &w2_6, &mut a6, &mut o6, &mut rsync, GATE_SOFTCAP,
+            stream,
+            &x_g,
+            &id_g,
+            &w13_6,
+            &w2_6,
+            &mut a6,
+            &mut o6,
+            &mut rsync,
+            GATE_SOFTCAP,
             UP_SOFTCAP,
         )?;
         assert_bf16_eq(&format!("mlp_rows m={m} act"), &a6, &a8)?;
@@ -3047,40 +3184,358 @@ fn mxfp6_matches_unpacked_mxfp8() -> anyhow::Result<()> {
     let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
     let mut a6 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
     s.experts.expert_matmul_swiglu_grouped(
-        stream, &x_g, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &x_g,
+        &w13_8,
+        &mut a8,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     s.experts.expert_matmul_swiglu_grouped(
-        stream, &x_g, &w13_6, &mut a6, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &x_g,
+        &w13_6,
+        &mut a6,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     assert_bf16_eq("gemm bf16 w13 swiglu", &a6, &a8)?;
     let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
     let mut o6 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
-    s.experts.expert_matmul_grouped(stream, &a8, &w2_8, &mut o8, &scratch)?;
-    s.experts.expert_matmul_grouped(stream, &a6, &w2_6, &mut o6, &scratch)?;
+    s.experts
+        .expert_matmul_grouped(stream, &a8, &w2_8, &mut o8, &scratch)?;
+    s.experts
+        .expert_matmul_grouped(stream, &a6, &w2_6, &mut o6, &scratch)?;
     assert_bf16_eq("gemm bf16 w2", &o6, &o8)?;
 
     // FP8-act SwiGLU + w2
-    s.experts.expert_group_quantized(stream, &id_g, n_exp, &mut scratch)?;
+    s.experts
+        .expert_group_quantized(stream, &id_g, n_exp, &mut scratch)?;
     let mut xq = QuantizedRows::new(stream, m * SLOTS * HIDDEN, m * SLOTS)?;
     if siphon_cuda::BLOCK_SCALED_MMA {
-        s.experts.quantize_rows_fp8(stream, &x_g, HIDDEN, w13_6.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8(stream, &x_g, HIDDEN, w13_6.format, &mut xq)?;
     } else {
-        s.experts.quantize_rows_fp8_per_row(stream, &x_g, HIDDEN, w13_6.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8_per_row(stream, &x_g, HIDDEN, w13_6.format, &mut xq)?;
     }
     s.experts.expert_matmul_quantized_swiglu_grouped(
-        stream, &xq, &w13_8, &mut a8, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &xq,
+        &w13_8,
+        &mut a8,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     s.experts.expert_matmul_quantized_swiglu_grouped(
-        stream, &xq, &w13_6, &mut a6, &scratch, GATE_SOFTCAP, UP_SOFTCAP,
+        stream,
+        &xq,
+        &w13_6,
+        &mut a6,
+        &scratch,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
     )?;
     assert_bf16_eq("gemm fp8 w13 swiglu", &a6, &a8)?;
     if siphon_cuda::BLOCK_SCALED_MMA {
-        s.experts.quantize_rows_fp8(stream, &a6, INTERMEDIATE, w2_6.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8(stream, &a6, INTERMEDIATE, w2_6.format, &mut xq)?;
     } else {
-        s.experts.quantize_rows_fp8_per_row(stream, &a6, INTERMEDIATE, w2_6.format, &mut xq)?;
+        s.experts
+            .quantize_rows_fp8_per_row(stream, &a6, INTERMEDIATE, w2_6.format, &mut xq)?;
     }
-    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_8, &mut o8, &scratch)?;
-    s.experts.expert_matmul_quantized_grouped(stream, &xq, &w2_6, &mut o6, &scratch)?;
+    s.experts
+        .expert_matmul_quantized_grouped(stream, &xq, &w2_8, &mut o8, &scratch)?;
+    s.experts
+        .expert_matmul_quantized_grouped(stream, &xq, &w2_6, &mut o6, &scratch)?;
     assert_bf16_eq("gemm fp8 w2", &o6, &o8)?;
+    Ok(())
+}
+
+/// Verifies `pack_mxfp8_to_nvfp4` (Four Over Six) against the F64 reference on decoded
+/// MXFP8 weights (Frobenius error + matvec reference bound) and checks that subsequent
+/// `pack_nvfp4_scales_4bit` matches unpacked 8-bit scales bit for bit across `mlp` and
+/// `mlp_rows`.
+#[test]
+fn mxfp8_to_nvfp4_matches_reference_and_4bit_scales() -> anyhow::Result<()> {
+    use siphon_cuda::ops::experts_rows::ExpertsRows;
+
+    let s = Setup::new()?;
+    let rows_ops = ExpertsRows::load(s.gpu.context())?;
+    let stream = s.stream();
+    let file = "experts_mxfp8";
+    let fixture = Fixture::load(file)?;
+
+    let pack_proj = |name: &str, target_n: usize| -> anyhow::Result<_> {
+        let proj = Projection::load(&s, &fixture, file, name)?;
+        let experts = proj.weight.len() / (proj.n * proj.k);
+        assert_eq!(target_n % proj.n, 0);
+        let reps = target_n / proj.n;
+        let orig_w = stream.clone_dtoh(&proj.weight)?;
+        let orig_s = stream.clone_dtoh(&proj.scales)?;
+        let w_stride = proj.n * proj.k;
+        let s_stride = proj.n * (proj.k / 32);
+        let mut full_w = Vec::with_capacity(experts * reps * w_stride);
+        let mut full_s = Vec::with_capacity(experts * reps * s_stride);
+        for e in 0..experts {
+            for _ in 0..reps {
+                full_w.extend_from_slice(&orig_w[e * w_stride..(e + 1) * w_stride]);
+                full_s.extend_from_slice(&orig_s[e * s_stride..(e + 1) * s_stride]);
+            }
+        }
+        let full_w_gpu = stream.clone_htod(&full_w)?;
+        let full_s_gpu = stream.clone_htod(&full_s)?;
+        let (mut w_nv, s_nv, g_nv) =
+            s.experts
+                .pack_mxfp8_to_nvfp4(stream, &full_w_gpu, &full_s_gpu, experts)?;
+
+        // Check relative Frobenius error between original MXFP8 and packed NVFP4 weights.
+        let h_w = stream.clone_dtoh(&w_nv)?;
+        let h_s = stream.clone_dtoh(&s_nv)?;
+        let h_g = stream.clone_dtoh(&g_nv)?;
+        let host_mxfp8 = HostProjection {
+            weight: &full_w,
+            scales: &full_s,
+            global_scale: None,
+            n: target_n,
+            k: proj.k,
+        };
+        let host_nvfp4 = HostProjection {
+            weight: &h_w,
+            scales: &h_s,
+            global_scale: Some(h_g.clone()),
+            n: target_n,
+            k: proj.k,
+        };
+        let mut sq_err = 0.0f64;
+        let mut sq_norm = 0.0f64;
+        for e in 0..experts {
+            let ref_w = host_mxfp8.decode(e);
+            let q_w = host_nvfp4.decode(e);
+            let out_scale = host_nvfp4.output_scale(e);
+            for (&a, &b) in ref_w.iter().zip(&q_w) {
+                let d = b * out_scale - a;
+                sq_err += d * d;
+                sq_norm += a * a;
+            }
+        }
+        let rel_frob = (sq_err / sq_norm).sqrt();
+        assert!(
+            rel_frob < 0.12,
+            "{name}: NVFP4 relative Frobenius error {rel_frob:.4} too large"
+        );
+
+        // Also test 4-bit offset scale packing on the newly converted NVFP4 weights.
+        let rows = experts * target_n;
+        let blocks_per_row = proj.k / 16;
+        let (s_4bit, base) =
+            s.experts
+                .pack_nvfp4_scales_4bit(stream, &mut w_nv, &s_nv, rows, blocks_per_row)?;
+        let h_s4 = stream.clone_dtoh(&s_4bit)?;
+        let h_base = stream.clone_dtoh(&base)?;
+        let mut h_s_unpacked = vec![0u8; rows * blocks_per_row];
+        for r in 0..rows {
+            let b = h_base[r];
+            for blk in 0..blocks_per_row {
+                let packed = h_s4[r * (blocks_per_row / 2) + blk / 2];
+                let off = if blk % 2 == 0 {
+                    packed & 0x0f
+                } else {
+                    packed >> 4
+                };
+                h_s_unpacked[r * blocks_per_row + blk] = b.saturating_sub(off);
+            }
+        }
+        let s_unpacked_gpu = stream.clone_htod(&h_s_unpacked)?;
+        Ok((
+            w_nv,
+            s_unpacked_gpu,
+            s_4bit,
+            base,
+            g_nv,
+            target_n,
+            proj.k,
+            experts,
+        ))
+    };
+
+    let (w13, s13_8, s13_4, b13, g13, n13, k13, n_exp) = pack_proj("gate_up", 2 * INTERMEDIATE)?;
+    let (w2, s2_8, s2_4, b2, g2, n2, k2, _) = pack_proj("down", HIDDEN)?;
+
+    let w13_8 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: &g13,
+            scale_base: None,
+        },
+        weight: &w13,
+        scales: &s13_8,
+        n: n13,
+        k: k13,
+    };
+    let w13_4 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: &g13,
+            scale_base: Some(&b13),
+        },
+        weight: &w13,
+        scales: &s13_4,
+        n: n13,
+        k: k13,
+    };
+    let w2_8 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: &g2,
+            scale_base: None,
+        },
+        weight: &w2,
+        scales: &s2_8,
+        n: n2,
+        k: k2,
+    };
+    let w2_4 = ExpertWeights {
+        format: ExpertFormat::Nvfp4 {
+            global_scale: &g2,
+            scale_base: Some(&b2),
+        },
+        weight: &w2,
+        scales: &s2_4,
+        n: n2,
+        k: k2,
+    };
+
+    let (indices_h, _) = fixture.i32("indices")?;
+    let (x13_h, _) = fixture.bf16("gate_up.x")?;
+    let indices_gpu = stream.clone_htod(&indices_h)?;
+    let x13_gpu = stream.clone_htod(&x13_h)?;
+    let pairs = indices_h.len();
+
+    let mut act8 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+    let mut act4 = stream.alloc_zeros::<bf16>(pairs * INTERMEDIATE)?;
+    let mut out8 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    let mut out4 = stream.alloc_zeros::<bf16>(pairs * HIDDEN)?;
+    let mut sync = stream.alloc_zeros::<u32>(1 + pairs)?;
+    s.experts.expert_mlp(
+        stream,
+        &x13_gpu,
+        &indices_gpu,
+        &w13_8,
+        &w2_8,
+        &mut act8,
+        &mut out8,
+        &mut sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        None,
+    )?;
+    s.experts.expert_mlp(
+        stream,
+        &x13_gpu,
+        &indices_gpu,
+        &w13_4,
+        &w2_4,
+        &mut act4,
+        &mut out4,
+        &mut sync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+        None,
+    )?;
+    assert_eq!(
+        stream
+            .clone_dtoh(&act4)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        stream
+            .clone_dtoh(&act8)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "mlp act 4bit vs 8bit mismatch"
+    );
+    assert_eq!(
+        stream
+            .clone_dtoh(&out4)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        stream
+            .clone_dtoh(&out8)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "mlp out 4bit vs 8bit mismatch"
+    );
+
+    let m = 4usize;
+    let mut xm = Vec::with_capacity(m * HIDDEN);
+    let mut idm = Vec::with_capacity(m * SLOTS);
+    for r in 0..m {
+        let src = r % (x13_h.len() / HIDDEN);
+        xm.extend_from_slice(&x13_h[src * HIDDEN..(src + 1) * HIDDEN]);
+        for slot in 0..SLOTS {
+            idm.push(((r * 3 + slot) % n_exp) as i32);
+        }
+    }
+    let x_g = stream.clone_htod(&xm)?;
+    let id_g = stream.clone_htod(&idm)?;
+    let mut a8 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+    let mut a4 = stream.alloc_zeros::<bf16>(m * SLOTS * INTERMEDIATE)?;
+    let mut o8 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+    let mut o4 = stream.alloc_zeros::<bf16>(m * SLOTS * HIDDEN)?;
+    let mut rsync = stream.alloc_zeros::<u32>(ExpertsRows::sync_len(m))?;
+    rows_ops.expert_mlp_rows(
+        stream,
+        &x_g,
+        &id_g,
+        &w13_8,
+        &w2_8,
+        &mut a8,
+        &mut o8,
+        &mut rsync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+    )?;
+    rows_ops.expert_mlp_rows(
+        stream,
+        &x_g,
+        &id_g,
+        &w13_4,
+        &w2_4,
+        &mut a4,
+        &mut o4,
+        &mut rsync,
+        GATE_SOFTCAP,
+        UP_SOFTCAP,
+    )?;
+    assert_eq!(
+        stream
+            .clone_dtoh(&a4)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        stream
+            .clone_dtoh(&a8)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "mlp_rows act 4bit vs 8bit mismatch"
+    );
+    assert_eq!(
+        stream
+            .clone_dtoh(&o4)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        stream
+            .clone_dtoh(&o8)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "mlp_rows out 4bit vs 8bit mismatch"
+    );
     Ok(())
 }

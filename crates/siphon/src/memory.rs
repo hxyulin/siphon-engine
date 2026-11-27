@@ -357,7 +357,7 @@ pub struct PlanInputs<'a> {
     pub block_scaled_mma: bool,
     /// Storage format of NVFP4 expert block scales (`8bit` E4M3 or `4bit` per-row offsets).
     pub nvfp4_scales: Nvfp4ScaleFormat,
-    /// Storage format of MXFP8 expert layers (`mxfp8` or load-time `mxfp6` E2M3).
+    /// Storage format of MXFP8 expert layers (`mxfp8`, `mxfp6`, or load-time `nvfp4`).
     pub mxfp8_experts: Mxfp8ExpertFormat,
     /// Layout and element format of the target's key and value caches.
     pub kv: KvFormat,
@@ -723,7 +723,10 @@ impl Planner {
         });
         let release_bf16 = inputs.weights == WeightFormat::Fp8 && inputs.prefill_dense_fp8;
         let release_bf16_o = release_bf16
-            && matches!(inputs.output, OutputProjection::Fp8 | OutputProjection::Mxfp8);
+            && matches!(
+                inputs.output,
+                OutputProjection::Fp8 | OutputProjection::Mxfp8
+            );
         let fixed = Plan {
             capacity: 0,
             pooled: inputs.pooled,
@@ -829,8 +832,7 @@ impl Planner {
     #[must_use]
     pub fn max_pool_positions(&self) -> usize {
         if self.pool.is_some() {
-            self.max_positions
-                .saturating_mul(self.fixed.streams.max(1))
+            self.max_positions.saturating_mul(self.fixed.streams.max(1))
         } else {
             self.max_positions
         }
@@ -920,6 +922,29 @@ fn target_weight_bytes(
             {
                 // 6-bit E2M3 (lo4 = k/2, hi2 = k/4 -> 3/4 of MXFP8 weight bytes).
                 return entry.byte_len() * 3 / 4;
+            }
+            if mxfp8_experts == Mxfp8ExpertFormat::Nvfp4
+                && entry.dtype == Dtype::F8_E4M3
+                && (name.ends_with(".w13_weight") || name.ends_with(".w2_weight"))
+            {
+                // 4-bit E2M1 (half the bytes) plus one F32 global scale per expert.
+                let experts = entry.shape.first().copied().unwrap_or(0);
+                return entry.byte_len() / 2 + experts * 4;
+            }
+            if mxfp8_experts == Mxfp8ExpertFormat::Nvfp4
+                && entry.dtype == Dtype::U8
+                && (name.ends_with(".w13_weight_scale") || name.ends_with(".w2_weight_scale"))
+            {
+                // NVFP4 has one scale per 16 values (twice MXFP8's per-32 count): 2x bytes in
+                // 8-bit E4M3, or 1x bytes plus one E4M3 base byte per row in 4-bit offset form.
+                if nvfp4_scales == Nvfp4ScaleFormat::Offset4 {
+                    let rows: usize = entry
+                        .shape
+                        .split_last()
+                        .map_or(0, |(_, prefix)| prefix.iter().product());
+                    return entry.byte_len() + rows;
+                }
+                return entry.byte_len() * 2;
             }
             let widened = [
                 "attn_res.",
@@ -1023,14 +1048,7 @@ fn quantized_copy_bytes(
 
 #[cfg(test)]
 fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
-    quantized_copy_bytes(
-        c,
-        WeightFormat::Fp8,
-        output,
-        LmHeadFormat::Fp8,
-        false,
-        true,
-    )
+    quantized_copy_bytes(c, WeightFormat::Fp8, output, LmHeadFormat::Fp8, false, true)
 }
 
 /// Device bytes of the per-layer MXFP8 block-32 copies of the attention output projection
@@ -1590,15 +1608,47 @@ mod tests {
                 ("model.llm.layers.0.attn.wk_dv.weight", Dtype::BF16, &[200]),
                 ("model.llm.layers.0.attn.wv_dv.weight", Dtype::BF16, &[200]),
                 ("model.llm.layers.0.attn.wr_du.weight", Dtype::BF16, &[100]),
-                ("model.llm.layers.0.attn.gate_attn.weight", Dtype::BF16, &[500]),
-                ("model.llm.layers.0.attn.attn_sink_proj.weight", Dtype::BF16, &[20]),
-                ("model.llm.layers.5.attn.k_sconv.weight_proj", Dtype::BF16, &[30]),
-                ("model.llm.layers.5.attn.v_sconv.weight_proj", Dtype::BF16, &[30]),
+                (
+                    "model.llm.layers.0.attn.gate_attn.weight",
+                    Dtype::BF16,
+                    &[500],
+                ),
+                (
+                    "model.llm.layers.0.attn.attn_sink_proj.weight",
+                    Dtype::BF16,
+                    &[20],
+                ),
+                (
+                    "model.llm.layers.5.attn.k_sconv.weight_proj",
+                    Dtype::BF16,
+                    &[30],
+                ),
+                (
+                    "model.llm.layers.5.attn.v_sconv.weight_proj",
+                    Dtype::BF16,
+                    &[30],
+                ),
                 ("model.llm.layers.0.attn.wo_ud.weight", Dtype::BF16, &[400]),
-                ("model.llm.layers.6.controllers.attn.down_weight", Dtype::BF16, &[80]),
-                ("model.llm.layers.6.controllers.attn.forget_weight", Dtype::BF16, &[80]),
-                ("model.llm.layers.6.controllers.attn.gain_weight", Dtype::BF16, &[80]),
-                ("model.llm.layers.0.mlp.experts.w13_weight", Dtype::U8, &[1000]),
+                (
+                    "model.llm.layers.6.controllers.attn.down_weight",
+                    Dtype::BF16,
+                    &[80],
+                ),
+                (
+                    "model.llm.layers.6.controllers.attn.forget_weight",
+                    Dtype::BF16,
+                    &[80],
+                ),
+                (
+                    "model.llm.layers.6.controllers.attn.gain_weight",
+                    Dtype::BF16,
+                    &[80],
+                ),
+                (
+                    "model.llm.layers.0.mlp.experts.w13_weight",
+                    Dtype::U8,
+                    &[1000],
+                ),
             ],
         );
         let checkpoint = Checkpoint::open(&dir).expect("opening");
@@ -1689,9 +1739,30 @@ mod tests {
             Nvfp4ScaleFormat::Offset4,
             Mxfp8ExpertFormat::Mxfp6,
         );
+        let b8_fp4 = target_weight_bytes(
+            &s4_cp,
+            LmHeadFormat::Fp8,
+            false,
+            false,
+            Nvfp4ScaleFormat::E4m3,
+            Mxfp8ExpertFormat::Nvfp4,
+        );
+        let b4_fp4 = target_weight_bytes(
+            &s4_cp,
+            LmHeadFormat::Fp8,
+            false,
+            false,
+            Nvfp4ScaleFormat::Offset4,
+            Mxfp8ExpertFormat::Nvfp4,
+        );
         assert_eq!(b8, 2 * 4 * (1152 + 144 + 72 + 2304 + 72));
         assert_eq!(b4, 2 * 4 * (1152 + 72 + 1 + 36 + 1 + 2304 + 72));
         assert_eq!(b4_fp6, 2 * 4 * (1152 + 72 + 1 + 36 + 1 + 1728 + 72));
+        assert_eq!(b8_fp4, 2 * 4 * (1152 + 144 + 72 + 1152 + 144) + 2 * 4);
+        assert_eq!(
+            b4_fp4,
+            2 * 4 * (1152 + 72 + 1 + 36 + 1 + 1152 + 72 + 1) + 2 * 4
+        );
         std::fs::remove_dir_all(s4_dir).expect("cleaning up");
 
         // NVFP4 LM head replaces FP8 LM head copy (never keeps both).
@@ -1862,9 +1933,8 @@ mod tests {
         let c = config();
         // Verify (8 rows) + batch (32 rows) + batch_verify (256 rows) no longer allocate
         // F32 head_capped (which previously took (32 + 32 + 256) * unpadded_vocab * 4 ~ 256 MB).
-        let old_head = |rows: usize| {
-            rows.max(HEAD_ROWS) * (c.vocab_size * 2 + c.unpadded_vocab_size * 4)
-        };
+        let old_head =
+            |rows: usize| rows.max(HEAD_ROWS) * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
         let new_head = |rows: usize| rows * c.vocab_size * 2;
         let saved: usize = [8usize, 32, 256]
             .into_iter()
@@ -1986,7 +2056,10 @@ mod tests {
 
     #[test]
     fn pooled_multi_stream_capacity_scales_past_model_max_length() {
-        let dir = checkpoint("pool-multi", &[("model.llm.norm.weight", Dtype::BF16, &[25])]);
+        let dir = checkpoint(
+            "pool-multi",
+            &[("model.llm.norm.weight", Dtype::BF16, &[25])],
+        );
         let checkpoint = Checkpoint::open(&dir).expect("opening");
         let c = config();
         let make = |streams, pooled, kv, draft| {

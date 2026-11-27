@@ -210,7 +210,7 @@ struct FormatOptions {
     /// Set the NVFP4 expert block scale format (8bit or 4bit).
     #[arg(long, value_name = "FORMAT", default_value_t)]
     nvfp4_scales: Nvfp4ScaleFormat,
-    /// Set the MXFP8 expert layer storage format (mxfp8 or mxfp6).
+    /// Set the MXFP8 expert layer storage format (mxfp8, mxfp6, or nvfp4).
     #[arg(long, value_name = "FORMAT", default_value_t)]
     mxfp8_experts: Mxfp8ExpertFormat,
 }

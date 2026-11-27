@@ -429,7 +429,7 @@ pub struct Options {
     pub expert_activations: String,
     /// Storage format of NVFP4 expert block scales (`8bit` E4M3 or `4bit` per-row offsets).
     pub nvfp4_scales: siphon::Nvfp4ScaleFormat,
-    /// Storage format of MXFP8 expert layers (`mxfp8` or load-time `mxfp6` E2M3).
+    /// Storage format of MXFP8 expert layers (`mxfp8`, `mxfp6`, or load-time `nvfp4`).
     pub mxfp8_experts: siphon::Mxfp8ExpertFormat,
     /// Whether every request decodes greedily, whatever it asks.
     pub greedy: bool,

@@ -586,6 +586,10 @@ pub struct Experts {
     pack_scales_4bit: CudaFunction,
     /// `pack_mxfp8_to_mxfp6`: load-time MXFP8 -> 2-plane MXFP6 E2M3 packer.
     pack_mxfp6: CudaFunction,
+    /// `mxfp8_expert_amax`: per-expert amax -> global scale for Four Over Six NVFP4.
+    mxfp8_expert_amax: CudaFunction,
+    /// `pack_mxfp8_to_nvfp4`: load-time MXFP8 -> Four Over Six NVFP4 packer.
+    pack_mxfp8_nvfp4: CudaFunction,
     group: CudaFunction,
     /// `expert_gemm_*` for NVFP4, MXFP8, NVFP4-s4, and MXFP6, each plain and with SwiGLU.
     gemm: [[CudaFunction; 2]; 4],
@@ -746,6 +750,8 @@ impl Experts {
         ];
         let pack_scales_4bit = module.load_function("pack_nvfp4_scales_4bit")?;
         let pack_mxfp6 = module.load_function("pack_mxfp8_to_mxfp6")?;
+        let mxfp8_expert_amax = module.load_function("mxfp8_expert_amax")?;
+        let pack_mxfp8_nvfp4 = module.load_function("pack_mxfp8_to_nvfp4")?;
         Ok(Self {
             matvec: MATVEC_KERNELS
                 .iter()
@@ -760,6 +766,8 @@ impl Experts {
             mlp,
             pack_scales_4bit,
             pack_mxfp6,
+            mxfp8_expert_amax,
+            pack_mxfp8_nvfp4,
             group: matmul.load_function("expert_group")?,
             gemm,
             gemm_q,
@@ -873,6 +881,74 @@ impl Experts {
             unsafe { launch.launch(config) }?;
         }
         Ok((w_lo4, w_hi2, s_out))
+    }
+
+    /// Re-quantizes raw MXFP8 weights (`[n_experts * rows * k]` E4M3 bytes) and UE8M0 scales
+    /// (`[total_blocks]` bytes) into Four Over Six NVFP4 `(w_out, s_out, global_scale)` of sizes
+    /// `total_blocks * 16`, `total_blocks * 2`, and `n_experts` floats.
+    pub fn pack_mxfp8_to_nvfp4(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_in: &CudaSlice<u8>,
+        s_in: &CudaSlice<u8>,
+        n_experts: usize,
+    ) -> anyhow::Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<f32>)> {
+        ensure!(
+            w_in.len().is_multiple_of(32),
+            "w_in has {} bytes, not a multiple of 32",
+            w_in.len()
+        );
+        let total_blocks = w_in.len() / 32;
+        ensure!(
+            s_in.len() == total_blocks,
+            "s_in has {} bytes, expected {total_blocks}",
+            s_in.len()
+        );
+        ensure!(
+            n_experts > 0 && total_blocks.is_multiple_of(n_experts),
+            "total_blocks = {total_blocks} not divisible by n_experts = {n_experts}"
+        );
+        let blocks_per_expert = total_blocks / n_experts;
+        let mut global_scale = stream.alloc_zeros::<f32>(n_experts)?;
+        let mut w_out = stream.alloc_zeros::<u8>(total_blocks * 16)?;
+        let mut s_out = stream.alloc_zeros::<u8>(total_blocks * 2)?;
+        if total_blocks > 0 {
+            let bpe_arg = u64::try_from(blocks_per_expert)?;
+            let mut launch1 = stream.launch_builder(&self.mxfp8_expert_amax);
+            launch1
+                .arg(w_in)
+                .arg(s_in)
+                .arg(&mut global_scale)
+                .arg(&bpe_arg);
+            let cfg1 = LaunchConfig {
+                grid_dim: (u32::try_from(n_experts)?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: matches `mxfp8_expert_amax(const u8*, const u8*, float*, size_t)`;
+            // buffer sizes match `n_experts * blocks_per_expert` as checked above.
+            unsafe { launch1.launch(cfg1) }?;
+
+            let tot_arg = u64::try_from(total_blocks)?;
+            let mut launch2 = stream.launch_builder(&self.pack_mxfp8_nvfp4);
+            launch2
+                .arg(w_in)
+                .arg(s_in)
+                .arg(&global_scale)
+                .arg(&mut w_out)
+                .arg(&mut s_out)
+                .arg(&bpe_arg)
+                .arg(&tot_arg);
+            let cfg2 = LaunchConfig {
+                grid_dim: (u32::try_from(total_blocks.div_ceil(256))?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: matches `pack_mxfp8_to_nvfp4(const u8*, const u8*, const float*, u8*, u8*, size_t, size_t)`;
+            // buffer sizes match `total_blocks` and `n_experts` as checked above.
+            unsafe { launch2.launch(cfg2) }?;
+        }
+        Ok((w_out, s_out, global_scale))
     }
 
     /// Multiplies each row's input by the weights of its 8 selected experts, writing BF16
@@ -1830,7 +1906,9 @@ fn push_weight_args(
             args.ptr(weight, stream).ptr(scales, stream).u64(0);
         }
         ExpertFormat::Mxfp6 { hi2 } => {
-            args.ptr(weight, stream).ptr(hi2, stream).ptr(scales, stream);
+            args.ptr(weight, stream)
+                .ptr(hi2, stream)
+                .ptr(scales, stream);
         }
     }
 }
@@ -1855,8 +1933,8 @@ fn mlp_grid_blocks(pairs: usize, tiles13: usize, tiles2: usize, max_blocks: usiz
         if blocks < max_blocks / 2 {
             break;
         }
-        let no_intra_wave_wait = (0..pairs)
-            .all(|p| ((p + 1) * tiles13 - 1) / blocks < (tasks13 + p * tiles2) / blocks);
+        let no_intra_wave_wait =
+            (0..pairs).all(|p| ((p + 1) * tiles13 - 1) / blocks < (tasks13 + p * tiles2) / blocks);
         if no_intra_wave_wait {
             return blocks;
         }
