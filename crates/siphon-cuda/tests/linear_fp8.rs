@@ -232,11 +232,24 @@ fn mxfp8_rows(x: &[bf16]) -> Vec<f64> {
         .collect()
 }
 
+/// `x` rows of k values as the sm_89 FP8 GEMM quantizes them, dequantized: per-row E4M3
+/// with one F32 scale (`amax / 448`) per row.
+fn per_row_fp8_rows(x: &[bf16], k: usize) -> Vec<f64> {
+    x.chunks_exact(k)
+        .flat_map(|row| {
+            let amax = row.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+            let scale = f64::from(amax / 448.0);
+            let inv = if amax > 0.0 { 448.0 / amax } else { 0.0 };
+            row.iter()
+                .map(move |v| f64::from(e4m3_value(e4m3_from_f32(v.to_f32() * inv))) * scale)
+        })
+        .collect()
+}
+
 /// The FP8 GEMM against the F64 reference over the quantized weights and inputs: batches of
 /// products that share an input and that do not, partial row and column tiles, and k of
 /// the attention inputs, the output projection and the message gates.
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn gemm_matches_reference() -> anyhow::Result<()> {
     // (m, k, [(n, input)]): products with the same input index share x.
     type Case = (usize, usize, &'static [(usize, usize)]);
@@ -273,7 +286,16 @@ fn gemm_matches_reference() -> anyhow::Result<()> {
         let inputs: Vec<Vec<bf16>> = (0..3)
             .map(|i| hash_values(100 + 10 * case as u32 + i, m * k))
             .collect();
-        let quantized: Vec<Vec<f64>> = inputs.iter().map(|x| mxfp8_rows(x)).collect();
+        let quantized: Vec<Vec<f64>> = inputs
+            .iter()
+            .map(|x| {
+                if cfg!(sm89) {
+                    per_row_fp8_rows(x, k)
+                } else {
+                    mxfp8_rows(x)
+                }
+            })
+            .collect();
         let x_dev = inputs
             .iter()
             .map(|x| stream.clone_htod(x))
@@ -324,9 +346,12 @@ fn gemm_matches_reference() -> anyhow::Result<()> {
                     let s = f64::from(scales[c]);
                     let want = s * sum;
                     // F32 sums in any order (Higham's gamma for k terms), the scale's
-                    // rounding and the output's half BF16 ulp.
+                    // rounding and the output's half BF16 ulp. On sm_89, Ada's native FP8
+                    // MMA accumulates each 32-element dot internally with ~14-bit significand
+                    // before adding to the F32 accumulator.
                     let ku = k as f64 * u;
-                    let bound = s * ku / (1.0 - ku) * abs + want.abs() * u;
+                    let ada_mma_err = if cfg!(sm89) { 2f64.powi(-10) } else { 0.0 };
+                    let bound = s * (ku / (1.0 - ku) + ada_mma_err) * abs + want.abs() * 2.0 * u;
                     let allowed = bound + bf16_half_ulp(want + bound.copysign(want));
                     let err = (got[r * n + c].to_f64() - want).abs();
                     assert!(
@@ -573,7 +598,6 @@ fn time_case(
 /// batched DFlash 2) matches `LinearFp8::gemm` bit for bit across 32x64, 64x64, and
 /// 128x128 tiles and survives CUDA graph capture/replay.
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn gemm_raw_matches_gemm_and_captures_graph() -> anyhow::Result<()> {
     use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 
@@ -867,10 +891,6 @@ fn gemm_fp8_throughput() -> anyhow::Result<()> {
     use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};
     use siphon_cuda::ops::linear::Gemm;
 
-    if !siphon_cuda::BLOCK_SCALED_MMA {
-        eprintln!("skipped: FP8 GEMM needs the block-scaled MMA, which sm_89 lacks");
-        return Ok(());
-    }
     let gpu = Gpu::new(0)?;
     let stream = gpu.stream();
     let fp8 = LinearFp8::load(gpu.context())?;
@@ -894,6 +914,9 @@ fn gemm_fp8_throughput() -> anyhow::Result<()> {
         "batch", "m", "fp8 (us)", "fp8 TF/s", "bf16 (us)", "bf16 TF/s", "speedup"
     );
     for &(label, k, ns, mxfp8) in batches {
+        if mxfp8 && !siphon_cuda::BLOCK_SCALED_MMA {
+            continue;
+        }
         let n_sum: usize = ns.iter().sum();
         let bf16_w: Vec<_> = ns
             .iter()

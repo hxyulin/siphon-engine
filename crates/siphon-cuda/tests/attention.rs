@@ -305,21 +305,34 @@ fn stored(format: KvFormat, x: bf16) -> f32 {
     }
 }
 
-/// The queries `[heads, 128]` as the FP8 product prefill attention quantizes them: MXFP8
-/// per head and 32 dims, a UE8M0 scale of the block's amax / 448 rounded up (at least
-/// 2^-126) and E4M3 values rounded to nearest even. Exact in BF16.
+/// The queries `[heads, 128]` as the FP8 product prefill attention quantizes them:
+/// - on `sm_120a`: MXFP8 per head and 32 dims, a UE8M0 scale of the block's amax / 448 rounded up
+///   (at least 2^-126) and E4M3 values rounded to nearest even;
+/// - on `sm_89`: per-head-row E4M3 with F32 scale `amax / 448` folded into the score scale.
 fn mxfp8_queries(q: &[bf16]) -> Vec<bf16> {
-    q.chunks(32)
-        .flat_map(|block| {
-            let amax = block.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
-            let raw = amax / 448.0;
-            let exponent = ((raw.to_bits() + 0x007f_ffff) & 0x7f80_0000) >> 23;
-            let scale = f32::from_bits(exponent.max(1) << 23);
-            block
-                .iter()
-                .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() / scale)) * scale))
-        })
-        .collect()
+    if cfg!(sm89) {
+        q.chunks(HEAD_DIM)
+            .flat_map(|head| {
+                let amax = head.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
+                let scale = amax * (1.0 / 448.0);
+                let inv = if amax > 0.0 { 448.0 / amax } else { 0.0 };
+                head.iter()
+                    .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() * inv)) * scale))
+            })
+            .collect()
+    } else {
+        q.chunks(32)
+            .flat_map(|block| {
+                let amax = block.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
+                let raw = amax / 448.0;
+                let exponent = ((raw.to_bits() + 0x007f_ffff) & 0x7f80_0000) >> 23;
+                let scale = f32::from_bits(exponent.max(1) << 23);
+                block
+                    .iter()
+                    .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() / scale)) * scale))
+            })
+            .collect()
+    }
 }
 
 /// Rounds `y` to the nearest E2M1 value, ties to even, saturated to `+-6.0`, matching
@@ -1493,7 +1506,6 @@ fn fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
 }
 
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
     let chunks = [
         Chunk::full(77),
@@ -1537,7 +1549,6 @@ fn long_fp8_global_prefill_attention_matches_decode() -> anyhow::Result<()> {
 }
 
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn long_fp8_product_prefill_attention_matches_decode() -> anyhow::Result<()> {
     check_prefill_with(
         |stream| KvCache::global_with_format(stream, 40_960, KvFormat::Fp8),
@@ -1798,7 +1809,7 @@ fn prefill_attention_fp4_timing() -> anyhow::Result<()> {
         let start = seq_len - CHUNK;
         stream.memcpy_htod(&[u32::try_from(start)?], &mut start_dev)?;
         for &(name, format, products) in variants {
-            if !siphon_cuda::BLOCK_SCALED_MMA && products != Products::Bf16 {
+            if !siphon_cuda::BLOCK_SCALED_MMA && products == Products::Fp4 {
                 continue;
             }
             let mut cache = match (format, products) {

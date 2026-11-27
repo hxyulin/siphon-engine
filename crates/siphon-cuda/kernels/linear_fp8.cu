@@ -449,20 +449,29 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
                  : "r"(addr));
 }
 
-// c += a b: the A scales of rows g and g + 8 from byte kByte of lanes 4g and 4g + 1's
-// `scale_a`. With `kBlockScaleB`, B scales of columns 0..7 come from byte kByte of lane
-// 4g's `scale_b`; otherwise B scales are 1 (0x7f = 2^0).
+// c += a b: on sm_120a, block-scaled MMA with A scales of rows g and g + 8 from byte kByte
+// of lanes 4g and 4g + 1's `scale_a` (and B scales from `scale_b` if `kBlockScaleB`, else 1).
+// On sm_89, native Ada FP8 MMA when `!kBlockScaleB` (per-row F32 input and weight scales
+// multiply in the epilogue); `kBlockScaleB` traps on sm_89.
 template <int kByte, bool kBlockScaleB>
 __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
                                     uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
 #if SIPHON_SM89
-    (void)c;
-    (void)a;
-    (void)b0;
-    (void)b1;
     (void)scale_a;
     (void)scale_b;
-    __trap();
+    if constexpr (kBlockScaleB) {
+        (void)c;
+        (void)a;
+        (void)b0;
+        (void)b1;
+        __trap();
+    } else {
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    }
 #else
     if constexpr (kBlockScaleB) {
         asm volatile(
@@ -561,8 +570,10 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         b_live |= uint32_t(b_ok) << i;
         b_src[i] = p.w + size_t(b_ok ? n0 + row : 0) * k + chunk * 16;
     }
+#if !SIPHON_SM89
     const bool scale_ok = tid < kBm && m0 + tid < m;
     const uint8_t* scale_src = p.x_scale + size_t(scale_ok ? m0 + tid : 0) * (k / 32);
+#endif
 
     const uint32_t smem0 = smem_addr(smem);
     auto load = [&](int stage, int step) {
@@ -576,9 +587,11 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         for (int i = 0; i < kLoadsB; ++i) {
             cp_async16(base + kStageA + b_dst[i], b_src[i] + k0, b_live >> i & 1);
         }
+#if !SIPHON_SM89
         if (tid < kBm) {
             cp_async4(base + kStageA + kStageB + 4 * tid, scale_src + step * 4, scale_ok);
         }
+#endif
     };
 
     // ldmatrix rows of this lane: x rows lane % 16, chunk lane / 16 of each 16-row
@@ -602,13 +615,17 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
 
     auto compute_stage = [&](int stage, int step) {
         const uint32_t base = smem0 + stage * kStage;
+        uint32_t sa[kMi] = {};
+#if !SIPHON_SM89
         const uint32_t* scales =
             reinterpret_cast<const uint32_t*>(smem + stage * kStage + kStageA + kStageB);
-        uint32_t sa[kMi];
 #pragma unroll
         for (int mi = 0; mi < kMi; ++mi) {
             sa[mi] = scales[scale_row + 16 * mi];
         }
+#else
+        (void)step;
+#endif
         uint32_t sb[kNi] = {};
         if constexpr (kBlockScaleB) {
             const auto* b_scales = static_cast<const uint8_t*>(p.w_scale);
@@ -692,6 +709,18 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         return;
     }
     const int g = lane / 4, t = lane % 4;
+#if SIPHON_SM89
+    const auto* x_scale_f32 = reinterpret_cast<const float*>(p.x_scale);
+    float xs[kMi][2];
+#pragma unroll
+    for (int mi = 0; mi < kMi; ++mi) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = m0 + wm * kWarpRows + mi * 16 + g + 8 * h;
+            xs[mi][h] = row < m ? x_scale_f32[row] : 0.f;
+        }
+    }
+#endif
 #pragma unroll
     for (int ni = 0; ni < kNi; ++ni) {
         const int col = n0 + wn * kWarpCols + ni * 8 + 2 * t;
@@ -715,8 +744,14 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
                     continue;
                 }
                 __nv_bfloat16* dst_row = p.out + size_t(row) * n + col;
+#if SIPHON_SM89
+                const float rscale = xs[mi][h];
+                const float v0 = (acc[mi][ni][2 * h] * rscale) * s0;
+                const float v1 = (acc[mi][ni][2 * h + 1] * rscale) * s1;
+#else
                 const float v0 = acc[mi][ni][2 * h] * s0;
                 const float v1 = acc[mi][ni][2 * h + 1] * s1;
+#endif
                 if (second && n % 2 == 0) {
                     *reinterpret_cast<__nv_bfloat162*>(dst_row) = __floats2bfloat162_rn(v0, v1);
                 } else {
@@ -793,8 +828,10 @@ __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const ui
         a_src[i] = x + size_t(a_ok ? m0 + row : 0) * k + chunk * 16;
         b_src[i] = weight + size_t(b_ok ? n0 + row : 0) * k + chunk * 16;
     }
+#if !SIPHON_SM89
     const bool scale_ok = tid < kBm && m0 + tid < m;
     const uint8_t* scale_src = x_scale + size_t(scale_ok ? m0 + tid : 0) * (k / 32);
+#endif
 
     const uint32_t smem0 = smem_addr(smem);
     auto load = [&](int stage, int step) {
@@ -805,9 +842,11 @@ __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const ui
             cp_async16(base + dst[i], a_src[i] + k0, a_live >> i & 1);
             cp_async16(base + kStageA + dst[i], b_src[i] + k0, b_live >> i & 1);
         }
+#if !SIPHON_SM89
         if (tid < kBm) {
             cp_async4(base + kStageA + kStageB + 4 * tid, scale_src + step * 4, scale_ok);
         }
+#endif
     };
 
     const int a_row = wm * kWarpRows + lane % 16;
@@ -835,13 +874,15 @@ __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const ui
         cp_async_commit();
 
         const uint32_t base = smem0 + stage * kStage;
+        uint32_t sa[kMi] = {};
+#if !SIPHON_SM89
         const uint32_t* x_scales =
             reinterpret_cast<const uint32_t*>(smem + stage * kStage + kStageA + kStageB);
-        uint32_t sa[kMi];
 #pragma unroll
         for (int mi = 0; mi < kMi; ++mi) {
             sa[mi] = x_scales[scale_row + 16 * mi];
         }
+#endif
         auto k_step = [&]<int kK>() {
             uint32_t bf[kNi][2];
 #pragma unroll
@@ -895,19 +936,32 @@ __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const ui
             float best_v = -INFINITY;
             int best_i = INT_MAX;
             if (row < m) {
+#if SIPHON_SM89
+                const float rscale = reinterpret_cast<const float*>(x_scale)[row];
+#endif
 #pragma unroll
                 for (int ni = 0; ni < kNi; ++ni) {
                     const int col = n0 + wn * kWarpCols + ni * 8 + 2 * t;
                     if (col < vocab) {
+#if SIPHON_SM89
+                        const float v0 = __bfloat162float(
+                            __float2bfloat16_rn((acc[mi][ni][2 * h] * rscale) * s0[ni]));
+#else
                         const float v0 =
                             __bfloat162float(__float2bfloat16_rn(acc[mi][ni][2 * h] * s0[ni]));
+#endif
                         if (argmax_better(v0, col, best_v, best_i)) {
                             best_v = v0;
                             best_i = col;
                         }
                         if (col + 1 < vocab) {
+#if SIPHON_SM89
+                            const float v1 = __bfloat162float(
+                                __float2bfloat16_rn((acc[mi][ni][2 * h + 1] * rscale) * s1[ni]));
+#else
                             const float v1 = __bfloat162float(
                                 __float2bfloat16_rn(acc[mi][ni][2 * h + 1] * s1[ni]));
+#endif
                             if (argmax_better(v1, col + 1, best_v, best_i)) {
                                 best_v = v1;
                                 best_i = col + 1;
@@ -1009,9 +1063,9 @@ extern "C" __global__ void __launch_bounds__(128, 2)
     gemm8::gemm<32, 64, 1, 4, 3, true>(batch, gemm8_smem);
 }
 
-// Quantizes `rows` BF16 rows of k values (`x`) to MXFP8 for gemm_fp8: E4M3 `values`
-// [rows, k] and UE8M0 `scales` [rows, k / 32]. One warp per row, 8 rows per block of 256
-// threads; k must be a multiple of 32.
+// Quantizes `rows` BF16 rows of k values (`x`) to MXFP8: E4M3 `values` [rows, k] and UE8M0
+// `scales` [rows, k / 32]. One warp per row, 8 rows per block of 256 threads; k must be a
+// multiple of 32. Used for MXFP8 weights (W_o) on all targets and dense inputs on sm_120a.
 extern "C" __global__ void __launch_bounds__(256)
     quantize_rows_mxfp8_dense(const __nv_bfloat16* __restrict__ x, int rows, int k,
                               uint8_t* __restrict__ values, uint8_t* __restrict__ scales) {
@@ -1019,5 +1073,51 @@ extern "C" __global__ void __launch_bounds__(256)
     if (row < rows) {
         quantize_row_mxfp8<false>(x + size_t(row) * k, k, values + size_t(row) * k,
                                   scales + size_t(row) * (k / 32));
+    }
+}
+
+// Quantizes `rows` BF16 rows of k values (`x`) to per-row E4M3 `values` [rows, k] and one
+// F32 scale per row in `scales` [rows] (fits in `k / 32 >= 4` bytes per row for k >= 128).
+// Used by sm_89's native Ada FP8 dense GEMM (`gemm_fp8_*`).
+extern "C" __global__ void __launch_bounds__(256)
+    quantize_rows_fp8_dense(const __nv_bfloat16* __restrict__ x, int rows, int k,
+                            uint8_t* __restrict__ values, uint8_t* __restrict__ scales) {
+    const int row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= rows) {
+        return;
+    }
+    const int lane = threadIdx.x % 32;
+    const auto* src = reinterpret_cast<const uint4*>(x + size_t(row) * k);
+    auto* dst = reinterpret_cast<uint2*>(values + size_t(row) * k);
+    const int vecs = k / 8;
+    float amax = 0.f;
+    for (int i = lane; i < vecs; i += 32) {
+        const uint4 v = src[i];
+        const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            amax = fmaxf(amax, fabsf(lo(words[w])));
+            amax = fmaxf(amax, fabsf(hi(words[w])));
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+    }
+    const float s = amax / kE4m3Max;
+    const float inv = amax > 0.f ? __fdiv_rn(kE4m3Max, amax) : 0.f;
+    if (lane == 0) {
+        reinterpret_cast<float*>(scales)[row] = s;
+    }
+    for (int i = lane; i < vecs; i += 32) {
+        const uint4 v = src[i];
+        const auto pack4 = [&](uint32_t p0, uint32_t p1) -> uint32_t {
+            const uint32_t b0 = __nv_cvt_float_to_fp8(lo(p0) * inv, __NV_SATFINITE, __NV_E4M3);
+            const uint32_t b1 = __nv_cvt_float_to_fp8(hi(p0) * inv, __NV_SATFINITE, __NV_E4M3);
+            const uint32_t b2 = __nv_cvt_float_to_fp8(lo(p1) * inv, __NV_SATFINITE, __NV_E4M3);
+            const uint32_t b3 = __nv_cvt_float_to_fp8(hi(p1) * inv, __NV_SATFINITE, __NV_E4M3);
+            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        };
+        dst[i] = make_uint2(pack4(v.x, v.y), pack4(v.z, v.w));
     }
 }

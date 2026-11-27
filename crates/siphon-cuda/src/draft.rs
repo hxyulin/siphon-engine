@@ -1419,10 +1419,6 @@ impl Draft {
     /// (`LinearFp8::gemm_raw`) for batched DFlash 2 projections with `m >= 32` rows.
     /// Drops captured batched DFlash 2 graphs when changed.
     pub fn set_fp8_dense(&mut self, on: bool) -> anyhow::Result<()> {
-        ensure!(
-            crate::BLOCK_SCALED_MMA || !on,
-            "FP8 dense products need the block-scaled MMA, which this sm_89 build lacks"
-        );
         if self.fp8_dense != on {
             self.fp8_dense = on;
             if let Some(b) = self.batch.as_mut() {

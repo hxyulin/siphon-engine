@@ -317,7 +317,6 @@ fn run_rows_products(
             .all(|p| matches!(p.1, Some(QuantizedWeight::Fp8(_))));
     let use_fp8_tc = use_fp8
         && fp8_dense
-        && crate::BLOCK_SCALED_MMA
         && m >= BATCH_FP8_DENSE_MIN_ROWS
         && matches!(
             products.first().and_then(|p| p.1),
@@ -1317,7 +1316,7 @@ impl Draft {
                     )?;
                 }
                 Some(Matrix::Fp8(w)) => {
-                    if fp8_dense && crate::BLOCK_SCALED_MMA && sm >= BATCH_FP8_DENSE_MIN_ROWS {
+                    if fp8_dense && sm >= BATCH_FP8_DENSE_MIN_ROWS {
                         lfp8.gemm_raw(
                             stream,
                             &mut [Fp8RawGemm {

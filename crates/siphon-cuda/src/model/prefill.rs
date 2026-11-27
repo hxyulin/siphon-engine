@@ -111,7 +111,7 @@ impl PrefillAttention {
     /// The products for a chunk whose last row sits at position `end - 1`.
     fn products(self, end: usize) -> Products {
         match self {
-            Self::Auto if end > FP8_ATTENTION_KEYS && crate::BLOCK_SCALED_MMA => Products::Fp8,
+            Self::Auto if end > FP8_ATTENTION_KEYS => Products::Fp8,
             Self::Auto | Self::Bf16 => Products::Bf16,
             Self::Fp8 => Products::Fp8,
             Self::Fp4 => Products::Fp4,
@@ -2483,9 +2483,7 @@ impl Ctx {
 
     /// Whether wide (`m > 32`) greedy LM heads can use the native FP8 tensor-core GEMM.
     pub(super) fn fp8_wide_head(&self) -> bool {
-        self.weights.lm_head_nvfp4.is_none()
-            && self.weights.lm_head_fp8.is_some()
-            && crate::BLOCK_SCALED_MMA
+        self.weights.lm_head_nvfp4.is_none() && self.weights.lm_head_fp8.is_some()
     }
 
     /// Fused greedy LM head: computes each row's argmax over `0..unpadded_vocab_size`
@@ -2519,7 +2517,6 @@ impl Ctx {
                 Start::Early,
             )?
         } else if m > 32
-            && crate::BLOCK_SCALED_MMA
             && let (Some(fp8), Some(scratch)) = (self.weights.lm_head_fp8.as_ref(), head_fp8)
         {
             self.kernels.linear_fp8.gemm_argmax(
@@ -3781,8 +3778,11 @@ impl Ctx {
             InputNorms::Separate { q, k, v } => [q, k, v],
         };
         let shared = matches!(w.input_norms, InputNorms::Shared(_));
-        let prequant_qkv =
-            !a.gate.invariant && self.prefill_dense == Products::Fp8 && m > 1 && w.fp8.is_some();
+        let prequant_qkv = !a.gate.invariant
+            && self.prefill_dense == Products::Fp8
+            && crate::BLOCK_SCALED_MMA
+            && m > 1
+            && w.fp8.is_some();
         let Some(query) = &w.attention_query else {
             ensure!(
                 a.messages.is_none(),

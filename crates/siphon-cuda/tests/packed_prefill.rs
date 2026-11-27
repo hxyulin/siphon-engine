@@ -745,7 +745,6 @@ fn prefill_attention_packed_uneven_matches_separate_global_fp8() -> anyhow::Resu
 }
 
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn prefill_attention_packed_uneven_matches_separate_global_fp8_mma() -> anyhow::Result<()> {
     // Exclude len=1 when comparing FP8 MMA against single-row decode_attention (which keeps Q
     // unquantized); test len=1..256 with the non-MMA path above and len=2..256 here.

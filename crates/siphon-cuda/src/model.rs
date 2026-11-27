@@ -1018,8 +1018,7 @@ impl Model {
     /// [`crate::BLOCK_SCALED_MMA`].
     pub fn set_prefill_attention(&mut self, attention: PrefillAttention) -> anyhow::Result<()> {
         ensure!(
-            crate::BLOCK_SCALED_MMA
-                || !matches!(attention, PrefillAttention::Fp8 | PrefillAttention::Fp4),
+            crate::BLOCK_SCALED_MMA || attention != PrefillAttention::Fp4,
             "{attention} prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
         );
         self.ctx.prefill_attention = attention;
@@ -1046,15 +1045,18 @@ impl Model {
             "dense prefill products are bf16 or fp8, not fp4"
         );
         ensure!(
-            crate::BLOCK_SCALED_MMA || products == Products::Bf16,
-            "FP8 dense products need the block-scaled MMA, which this sm_89 build lacks"
-        );
-        ensure!(
             products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
             "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"
         );
-        let changed = self.ctx.prefill_dense != products || self.ctx.prefill_dense_o != products;
-        if products == Products::Fp8 {
+        // On sm_89 (Ada), per-row FP8 dense GEMMs run natively on Ada's FP8 tensor cores while
+        // W_o stays BF16 (its MXFP8 block-32 GEMM requires Blackwell's block-scaled MMA).
+        let dense_o = if crate::BLOCK_SCALED_MMA {
+            products
+        } else {
+            Products::Bf16
+        };
+        let changed = self.ctx.prefill_dense != products || self.ctx.prefill_dense_o != dense_o;
+        if dense_o == Products::Fp8 {
             let hidden = self.ctx.hidden();
             let q_dims = self.ctx.config.num_attention_heads * self.ctx.config.head_dim;
             let mut quantized = false;
@@ -1078,7 +1080,7 @@ impl Model {
             }
         }
         self.ctx.prefill_dense = products;
-        self.ctx.prefill_dense_o = products;
+        self.ctx.prefill_dense_o = dense_o;
         if changed {
             self.batch_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_verify_graphs.clear();
@@ -2760,7 +2762,6 @@ impl Ctx {
             );
         }
         let use_fp8_gemm = self.prefill_dense == Products::Fp8
-            && crate::BLOCK_SCALED_MMA
             && if invariant {
                 m >= prefill::BATCH_FP8_DENSE_MIN_ROWS
             } else {
@@ -2769,7 +2770,10 @@ impl Ctx {
         if let Some(scratch) = dense
             && use_fp8_gemm
         {
-            if self.prefill_dense_o == Products::Fp8 && products.iter().all(|p| p.mxfp8.is_some()) {
+            if self.prefill_dense_o == Products::Fp8
+                && crate::BLOCK_SCALED_MMA
+                && products.iter().all(|p| p.mxfp8.is_some())
+            {
                 let mut gemms: Vec<Mxfp8Gemm<'_>> = products
                     .iter_mut()
                     .filter_map(|p| {

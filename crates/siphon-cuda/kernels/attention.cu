@@ -1706,12 +1706,17 @@ __device__ __forceinline__ void mma_fp4(float (&c)[4], const uint32_t (&a)[4], u
 #endif
 }
 
-// c += a b, block-scaled FP8 with F32 accumulators: the A scales of rows g and
-// g + 8 from byte 0 of lanes 4g and 4g + 1's `scale_a`, B scales 1.
+// c += a b, FP8 E4M3 with F32 accumulators: on sm_120a, block-scaled MMA with A scales of
+// rows g and g + 8 from byte 0 of lanes 4g and 4g + 1's `scale_a`, B scales 1; on sm_89,
+// native Ada FP8 MMA (per-head-row Q scale folded into `row_score_scale`, unscaled K/V/P).
 __device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
                                         uint32_t scale_a) {
 #if SIPHON_SM89
-    __trap();
+    (void)scale_a;
+    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #else
     asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %11}, {%12}, {%11, %11};"
@@ -2241,6 +2246,44 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         }
     };
     auto load_q8 = [&](const PrefillSegment& g) {
+#if SIPHON_SM89
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const unsigned mg = g.block_m * kRows + warp * 16 + lane / 4 + 8 * i;
+            const bool valid = mg < total_m;
+            const size_t head = size_t(valid ? mg / kGroup : 0) * kHeads + g.kv_head * kGroup + mg % kGroup;
+            const __nv_bfloat16* row = q + head * kHeadDim + (lane % 4) * 4;
+            float x[kHeadDim / 32][8];
+            float amax = 0.f;
+#pragma unroll
+            for (int s = 0; s < kHeadDim / 32; ++s) {
+                float lo4[4];
+                float hi4[4];
+                unpack_bf16x4(valid ? *reinterpret_cast<const uint2*>(row + 32 * s) : make_uint2(0, 0), lo4);
+                unpack_bf16x4(valid ? *reinterpret_cast<const uint2*>(row + 32 * s + 16) : make_uint2(0, 0), hi4);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    x[s][j] = lo4[j];
+                    x[s][4 + j] = hi4[j];
+                    amax = fmaxf(amax, fmaxf(fabsf(lo4[j]), fabsf(hi4[j])));
+                }
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            const float sc = __fmul_rn(amax, 1.f / 448.f);
+            const float inv = amax > 0.f ? __fdiv_rn(448.f, amax) : 0.f;
+            q_outer[i] = sc;
+#pragma unroll
+            for (int s = 0; s < kHeadDim / 32; ++s) {
+                qa8[s][i] = pack_e4m3x4(x[s][0] * inv, x[s][1] * inv, x[s][2] * inv, x[s][3] * inv);
+                qa8[s][2 + i] = pack_e4m3x4(x[s][4] * inv, x[s][5] * inv, x[s][6] * inv, x[s][7] * inv);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kHeadDim / 32; ++s) {
+            qs[s] = 0x7f7f7f7fu;
+        }
+#else
         uint32_t scale[2][kHeadDim / 32];
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -2279,6 +2322,7 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         for (int s = 0; s < kHeadDim / 32; ++s) {
             qs[s] = lane & 1 ? scale[1][s] : scale[0][s];
         }
+#endif
     };
     auto load_q = [&](const PrefillSegment& g) {
         if constexpr (kMma4) {
@@ -2409,9 +2453,10 @@ __device__ __forceinline__ void prefill_attention(const __nv_bfloat16* q, const 
         float o[kHeadDim / 8][4] = {};
         // Capture this segment's score scale before `load_q(next_seg)` updates `q_outer`
         // on the segment's last tile.
+        constexpr bool kHasQOuter = kMma4 || (SIPHON_SM89 && kMma8);
         const float row_score_scale[2] = {
-            kMma4 ? score_scale * q_outer[0] : score_scale,
-            kMma4 ? score_scale * q_outer[1] : score_scale,
+            kHasQOuter ? score_scale * q_outer[0] : score_scale,
+            kHasQOuter ? score_scale * q_outer[1] : score_scale,
         };
 
         for (unsigned t = seg.t_begin; t < seg.t_end; ++t) {
@@ -3354,8 +3399,48 @@ __device__ __forceinline__ void prefill_attention_packed(
     uint32_t qa[kMma8 ? 1 : kHeadDim / 16][4];
     uint32_t qa8[kMma8 ? kHeadDim / 32 : 1][4];
     uint32_t qs[kMma8 ? kHeadDim / 32 : 1];
+    float q_outer[2] = {1.f, 1.f};
     auto load_q8 = [&](const PrefillPackedSegment& g) {
         const unsigned total_m = g.rows * kGroup;
+#if SIPHON_SM89
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const unsigned mg = g.block_m * kRows + warp * 16 + lane / 4 + 8 * i;
+            const bool valid = mg < total_m;
+            const size_t head =
+                size_t(g.row_start + (valid ? mg / kGroup : 0)) * kHeads + g.kv_head * kGroup + mg % kGroup;
+            const __nv_bfloat16* row = q + head * kHeadDim + (lane % 4) * 4;
+            float x[kHeadDim / 32][8];
+            float amax = 0.f;
+#pragma unroll
+            for (int s = 0; s < kHeadDim / 32; ++s) {
+                float lo4[4];
+                float hi4[4];
+                unpack_bf16x4(valid ? *reinterpret_cast<const uint2*>(row + 32 * s) : make_uint2(0, 0), lo4);
+                unpack_bf16x4(valid ? *reinterpret_cast<const uint2*>(row + 32 * s + 16) : make_uint2(0, 0), hi4);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    x[s][j] = lo4[j];
+                    x[s][4 + j] = hi4[j];
+                    amax = fmaxf(amax, fmaxf(fabsf(lo4[j]), fabsf(hi4[j])));
+                }
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            const float sc = __fmul_rn(amax, 1.f / 448.f);
+            const float inv = amax > 0.f ? __fdiv_rn(448.f, amax) : 0.f;
+            q_outer[i] = sc;
+#pragma unroll
+            for (int s = 0; s < kHeadDim / 32; ++s) {
+                qa8[s][i] = pack_e4m3x4(x[s][0] * inv, x[s][1] * inv, x[s][2] * inv, x[s][3] * inv);
+                qa8[s][2 + i] = pack_e4m3x4(x[s][4] * inv, x[s][5] * inv, x[s][6] * inv, x[s][7] * inv);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kHeadDim / 32; ++s) {
+            qs[s] = 0x7f7f7f7fu;
+        }
+#else
         uint32_t scale[2][kHeadDim / 32];
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -3392,6 +3477,7 @@ __device__ __forceinline__ void prefill_attention_packed(
         for (int s = 0; s < kHeadDim / 32; ++s) {
             qs[s] = lane & 1 ? scale[1][s] : scale[0][s];
         }
+#endif
     };
     auto load_q = [&](const PrefillPackedSegment& g) {
         if constexpr (kMma8) {
@@ -3503,6 +3589,11 @@ __device__ __forceinline__ void prefill_attention_packed(
             }
         }
         float o[kHeadDim / 8][4] = {};
+        constexpr bool kHasQOuter = SIPHON_SM89 && kMma8;
+        const float row_score_scale[2] = {
+            kHasQOuter ? score_scale * q_outer[0] : score_scale,
+            kHasQOuter ? score_scale * q_outer[1] : score_scale,
+        };
 
         for (unsigned t = seg.t_begin; t < seg.t_end; ++t) {
             const PrefillTile tile = tile_at(seg, t);
@@ -3656,7 +3747,7 @@ __device__ __forceinline__ void prefill_attention_packed(
                 for (int n = 0; n < kPrefillKeys / 8; ++n) {
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        s[n][e] *= score_scale;
+                        s[n][e] *= row_score_scale[e / 2];
                     }
                 }
             } else if (tile.full && tile.near) {
@@ -3665,7 +3756,7 @@ __device__ __forceinline__ void prefill_attention_packed(
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
                         const float b = __bfloat162float(bias_base[e / 2][-(n * 8 + e % 2)]);
-                        s[n][e] = fmaf(b, kLog2e, s[n][e] * score_scale);
+                        s[n][e] = fmaf(b, kLog2e, s[n][e] * row_score_scale[e / 2]);
                     }
                 }
             } else {
@@ -3678,7 +3769,7 @@ __device__ __forceinline__ void prefill_attention_packed(
                         const unsigned p = tile.p0 + j;
                         const unsigned distance = position[i] - p;
                         const bool visible = p < tile.end && p <= position[i] && (window == 0 || distance < window);
-                        float x = s[n][e] * score_scale;
+                        float x = s[n][e] * row_score_scale[i];
                         if (tile.biased && distance < extent) {
                             x = fmaf(__bfloat162float(bias_base[i][-(n * 8 + e % 2)]), kLog2e, x);
                         }

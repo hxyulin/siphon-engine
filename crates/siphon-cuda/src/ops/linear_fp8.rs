@@ -228,7 +228,10 @@ pub struct LinearFp8 {
     gemm_mxfp8: GemmFamily,
     /// `gemm_fp8_128x128_argmax` (fused LM head + tile argmax).
     gemm_argmax: CudaFunction,
+    /// `quantize_rows_mxfp8_dense`: per-32 MXFP8 quantization (weights on all arches, inputs on sm_120a).
     quantize_rows: CudaFunction,
+    /// `quantize_rows_fp8_dense`: per-row E4M3 + F32 scale quantization for sm_89 Ada FP8 GEMMs.
+    quantize_rows_fp8: CudaFunction,
     /// Multiprocessor count, for picking between the `128x128` and `64x64` tiles.
     sms: usize,
 }
@@ -478,6 +481,7 @@ impl LinearFp8 {
             },
             gemm_argmax: load_gemm("gemm_fp8_128x128_argmax", GEMM_SHARED)?,
             quantize_rows: module.load_function("quantize_rows_mxfp8_dense")?,
+            quantize_rows_fp8: module.load_function("quantize_rows_fp8_dense")?,
             sms,
         })
     }
@@ -602,6 +606,10 @@ impl LinearFp8 {
         m: usize,
         scratch: &mut Fp8Rows,
     ) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA,
+            "MXFP8 block-scaled GEMM needs block-scaled MMA, which sm_89 lacks"
+        );
         let mut raw: Vec<RawProduct<'_>> = products
             .iter_mut()
             .map(|p| {
@@ -746,10 +754,6 @@ impl LinearFp8 {
         partial_idxs: &mut impl DeviceOut<i32>,
         m: usize,
     ) -> anyhow::Result<usize> {
-        ensure!(
-            crate::BLOCK_SCALED_MMA,
-            "FP8 tensor-core LM head needs block-scaled MMA, which sm_89 lacks"
-        );
         let (x, mut partial_vals, mut partial_idxs) =
             (x.view(), partial_vals.view_mut(), partial_idxs.view_mut());
         ensure!(m > 0, "no rows");
@@ -974,7 +978,12 @@ impl LinearFp8 {
             .slice_mut(offset / 32..(offset + rows * k) / 32);
         let rows_arg = i32::try_from(rows)?;
         let k_arg = i32::try_from(k)?;
-        let mut launch = stream.launch_builder(&self.quantize_rows);
+        let func = if cfg!(sm89) {
+            &self.quantize_rows_fp8
+        } else {
+            &self.quantize_rows
+        };
+        let mut launch = stream.launch_builder(func);
         launch
             .arg(x)
             .arg(&rows_arg)

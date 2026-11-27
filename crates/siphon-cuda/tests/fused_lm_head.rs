@@ -274,7 +274,6 @@ fn fused_linear_rows_argmax_tie_breaking_nan_and_masking() -> anyhow::Result<()>
 }
 
 #[test]
-#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
 fn fused_linear_fp8_gemm_argmax_matches_unfused() -> anyhow::Result<()> {
     let s = Setup::new()?;
     let stream = s.gpu.stream();
