@@ -1463,6 +1463,34 @@ fn hybrid_step_matches_separate_fp8() -> anyhow::Result<()> {
     let mut got_long_first = None;
     let mut got_short_step0_logits = None;
     let mut near_tie_flips = 0usize;
+    let kl_and_cosine = |want_row: &[f32], got_row: &[f32]| -> (f64, f64) {
+        let want_max = want_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let got_max = got_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let want_logz = want_row
+            .iter()
+            .map(|&v| f64::from(v - want_max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(want_max);
+        let got_logz = got_row
+            .iter()
+            .map(|&v| f64::from(v - got_max).exp())
+            .sum::<f64>()
+            .ln()
+            + f64::from(got_max);
+        let (mut kl, mut dot, mut want_sq, mut got_sq) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&want_elem, &got_elem) in want_row.iter().zip(got_row) {
+            let want_f64 = f64::from(want_elem);
+            let got_f64 = f64::from(got_elem);
+            let want_lp = want_f64 - want_logz;
+            let got_lp = got_f64 - got_logz;
+            kl += want_lp.exp() * (want_lp - got_lp);
+            dot += want_f64 * got_f64;
+            want_sq += want_f64 * want_f64;
+            got_sq += got_f64 * got_f64;
+        }
+        (kl, dot / (want_sq.sqrt() * got_sq.sqrt()))
+    };
 
     for step in 0..6 {
         let mut decode_rows: Vec<(usize, u32)> = (0..decode_n)
@@ -1507,25 +1535,31 @@ fn hybrid_step_matches_separate_fp8() -> anyhow::Result<()> {
                 sum_diff += f64::from(d);
             }
             let mean_diff = sum_diff / vocab as f64;
+            let (kl, cosine) = kl_and_cosine(want_row, got_row);
+            // `step_hybrid` runs BF16 dense GEMM (`m > 64`) + prefill `expert_matmul` while
+            // `step_batch_sampled` runs FP8 `linear_rows` + `expert_mlp_rows`. On peaked
+            // distributions, constant low-probability tail shifts can exceed raw logit
+            // `max_diff` ~3.0 even at `KL = 0.00000` (including in pure BF16/BF16), so bound
+            // the actual probability distribution via KL divergence and cosine similarity.
             ensure!(
-                max_diff < 3.0 && mean_diff < 0.6,
-                "step {step} decode slot {slot} logits drifted: max_diff={max_diff:.4}, mean_diff={mean_diff:.5}"
+                kl < 0.01 && cosine > 0.98,
+                "step {step} decode slot {slot} distribution drifted: KL={kl:.5}, \
+                 cosine={cosine:.5} (max_diff={max_diff:.4}, mean_diff={mean_diff:.5})"
             );
             if got_tok != want_tok {
-                // `step_hybrid` runs BF16 dense GEMM (`m > 64`) while `step_batch_sampled`
-                // uses FP8 decode weights; allow rare top-1 flips only on genuine near-ties
-                // (small reference margin + small logit diff) and teacher-force the next input.
+                // Allow rare top-1 flips only on genuine near-ties (small reference margin +
+                // low KL) and teacher-force the next input.
                 let ref_margin =
                     (want_row[want_tok as usize] - want_row[got_tok as usize]).abs();
                 println!(
                     "step {step} decode slot {slot} BF16-hybrid vs FP8-decode near-tie: \
                      got {got_tok}, want {want_tok}, ref_margin={ref_margin:.4}, \
-                     max_diff={max_diff:.4}, mean_diff={mean_diff:.5}"
+                     KL={kl:.5}, cosine={cosine:.5}, max_diff={max_diff:.4}, mean_diff={mean_diff:.5}"
                 );
                 ensure!(
-                    ref_margin < 1.0 && max_diff < 1.5,
+                    ref_margin < 1.0 && kl < 0.01,
                     "step {step} decode slot {slot} diverged beyond near-tie: \
-                     got {got_tok}, want {want_tok} (ref_margin={ref_margin:.4}, max_diff={max_diff:.4})"
+                     got {got_tok}, want {want_tok} (ref_margin={ref_margin:.4}, KL={kl:.5})"
                 );
                 near_tie_flips += 1;
             }
@@ -1586,34 +1620,6 @@ fn hybrid_step_matches_separate_fp8() -> anyhow::Result<()> {
             .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, x)| {
                 if x > bv { (i, x) } else { (bi, bv) }
             })
-    };
-    let kl_and_cosine = |want_row: &[f32], got_row: &[f32]| -> (f64, f64) {
-        let want_max = want_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let got_max = got_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let want_logz = want_row
-            .iter()
-            .map(|&v| f64::from(v - want_max).exp())
-            .sum::<f64>()
-            .ln()
-            + f64::from(want_max);
-        let got_logz = got_row
-            .iter()
-            .map(|&v| f64::from(v - got_max).exp())
-            .sum::<f64>()
-            .ln()
-            + f64::from(got_max);
-        let (mut kl, mut dot, mut want_sq, mut got_sq) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for (&want_elem, &got_elem) in want_row.iter().zip(got_row) {
-            let want_f64 = f64::from(want_elem);
-            let got_f64 = f64::from(got_elem);
-            let want_lp = want_f64 - want_logz;
-            let got_lp = got_f64 - got_logz;
-            kl += want_lp.exp() * (want_lp - got_lp);
-            dot += want_f64 * got_f64;
-            want_sq += want_f64 * want_f64;
-            got_sq += got_f64 * got_f64;
-        }
-        (kl, dot / (want_sq.sqrt() * got_sq.sqrt()))
     };
     for (name, got_row, want_row) in [
         ("long(1500)", &long_step0_logits, &ref_prefill_step0_logits[0]),
