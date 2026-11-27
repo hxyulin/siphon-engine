@@ -1290,6 +1290,8 @@ impl Speculator {
         let stream = Arc::clone(model.stream());
         self.ensure_batch_spec(&stream)?;
         self.resolve_pending_batch_draft(&stream, slots, max_width)?;
+        self.draft
+            .set_fp8_dense(model.prefill_dense() == crate::ops::Products::Fp8)?;
         let starts: Vec<usize> = slots
             .iter()
             .map(|&s| model.slot_position(s))

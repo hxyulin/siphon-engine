@@ -53,7 +53,7 @@ use crate::{
         experts::{self, ExpertActivations, Experts, MoeEnd},
         experts_rows::ExpertsRows,
         linear::{Gemm, Gemv, Linear, Pace, Prefetch, Start},
-        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8},
+        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8, Mxfp8Gemm, Mxfp8Matrix},
         linear_rows::{self, LinearRows, RowsProduct},
         misc::{ArgmaxScratch, GATE_SLOTS, GateStep, Misc},
         norm::{KvConvWeights, Norm},
@@ -454,6 +454,9 @@ struct Ctx {
     chunk_attention: Products,
     /// How prefill's (and large batched passes') dense products multiply.
     prefill_dense: Products,
+    /// How `W_o` (the attention output projection) multiplies when `prefill_dense == Fp8`:
+    /// `Fp8` uses MXFP8 block-32 tensor cores (`mxfp8_o`), `Bf16` keeps BF16 (`Linear::gemm_bf16`).
+    prefill_dense_o: Products,
     /// The 4-bit rounding of the global caches' writes, for the visits with `round` set.
     kv_rounding: KvRounding,
     /// Opt-in MoE dynamic top-k and probability-threshold expert pruning.
@@ -659,6 +662,7 @@ impl Model {
                 prefill_attention: DEFAULT_PREFILL_ATTENTION,
                 chunk_attention: Products::Bf16,
                 prefill_dense: Products::Bf16,
+                prefill_dense_o: Products::Bf16,
                 kv_rounding: if has_nvfp4 {
                     KvRounding {
                         quant: KvQuant::Nvfp4,
@@ -949,14 +953,20 @@ impl Model {
         Ok(())
     }
 
+    /// Current dense product setting for prefill and wide batched passes (`m >= 48`).
+    #[must_use]
+    pub fn prefill_dense(&self) -> Products {
+        self.ctx.prefill_dense
+    }
+
     /// Makes [`Model::prefill`] — and batched passes ([`Model::step_batch`],
     /// [`Model::verify_batch`]) of at least 48 rows — run their dense products with
-    /// `products`: with [`Products::Fp8`], the attention input projections, the message
-    /// gates' down projections (in prefill), and in batched passes the FP8 output
-    /// projection and LM head run on FP8 tensor cores with MXFP8 inputs. It reads the FP8
-    /// weight copies, so it needs a model loaded with [`WeightFormat::Fp8`]; decode and
-    /// single-sequence verify are unaffected. Drops the captured batched graphs when
-    /// changed.
+    /// `products`: with [`Products::Fp8`], the attention input projections, the attention
+    /// output projection (`W_o`, quantized to MXFP8 with block-32 scales), the message
+    /// gates' down projections (in prefill), and in batched passes the LM head run on FP8
+    /// tensor cores with MXFP8 inputs. It reads the FP8 weight copies, so it needs a model
+    /// loaded with [`WeightFormat::Fp8`]; decode and single-sequence verify are unaffected.
+    /// Drops the captured batched graphs when changed.
     pub fn set_prefill_dense(&mut self, products: Products) -> anyhow::Result<()> {
         ensure!(
             products != Products::Fp4,
@@ -970,8 +980,69 @@ impl Model {
             products == Products::Bf16 || self.ctx.weights.layers.iter().all(|l| l.fp8.is_some()),
             "FP8 dense products need the FP8 weight copies (WeightFormat::Fp8)"
         );
-        if self.ctx.prefill_dense != products {
-            self.ctx.prefill_dense = products;
+        let changed = self.ctx.prefill_dense != products || self.ctx.prefill_dense_o != products;
+        if products == Products::Fp8 {
+            let hidden = self.ctx.hidden();
+            let q_dims = self.ctx.config.num_attention_heads * self.ctx.config.head_dim;
+            let mut quantized = false;
+            for layer in &mut self.ctx.weights.layers {
+                if layer.mxfp8_o.is_none() {
+                    layer.mxfp8_o = Some(self.ctx.kernels.linear_fp8.quantize_mxfp8(
+                        &self.ctx.stream,
+                        &layer.attention.o,
+                        hidden,
+                        q_dims,
+                    )?);
+                    quantized = true;
+                }
+            }
+            if quantized {
+                self.ctx.stream.synchronize()?;
+            }
+        } else {
+            for layer in &mut self.ctx.weights.layers {
+                layer.mxfp8_o = None;
+            }
+        }
+        self.ctx.prefill_dense = products;
+        self.ctx.prefill_dense_o = products;
+        if changed {
+            self.batch_graphs.iter_mut().for_each(|g| *g = None);
+            self.batch_verify_graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// Overrides the attention output projection (`W_o`) product format under
+    /// [`Products::Fp8`] dense dispatch: `Products::Fp8` uses MXFP8 block-32 tensor cores,
+    /// while `Products::Bf16` keeps `W_o` in BF16 (using `Linear::gemm_bf16` for prefill
+    /// and wide batched passes `m >= 48`). Has no effect when `prefill_dense` is `Bf16`.
+    pub fn set_prefill_dense_output(&mut self, products: Products) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA || products == Products::Bf16,
+            "MXFP8 output projection needs the block-scaled MMA, which this sm_89 build lacks"
+        );
+        if self.ctx.prefill_dense_o != products {
+            if products == Products::Fp8 && self.ctx.prefill_dense == Products::Fp8 {
+                let hidden = self.ctx.hidden();
+                let q_dims = self.ctx.config.num_attention_heads * self.ctx.config.head_dim;
+                for layer in &mut self.ctx.weights.layers {
+                    if layer.mxfp8_o.is_none() {
+                        layer.mxfp8_o = Some(self.ctx.kernels.linear_fp8.quantize_mxfp8(
+                            &self.ctx.stream,
+                            &layer.attention.o,
+                            hidden,
+                            q_dims,
+                        )?);
+                    }
+                }
+                self.ctx.stream.synchronize()?;
+            } else if products == Products::Bf16 {
+                for layer in &mut self.ctx.weights.layers {
+                    layer.mxfp8_o = None;
+                }
+            }
+            self.ctx.prefill_dense_o = products;
             self.batch_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_verify_graphs.clear();
         }
@@ -1792,9 +1863,12 @@ impl Blocks {
 /// One product of [`Ctx::gemm_rows`]: `out [m, n] = x [m, k] @ weight [n, k]^T`.
 struct RowProduct<'a> {
     weight: &'a CudaSlice<bf16>,
-    /// The weight's FP8 copy, which the multi-row kernel reads instead when every product
-    /// of a batch has one.
+    /// The weight's per-row FP8 copy, which the multi-row kernel (or FP8 GEMM) reads
+    /// instead when every product of a batch has one.
     fp8: Option<&'a Fp8Matrix>,
+    /// Optional MXFP8 block-32 copy (for `W_o`), preferred by the FP8 tensor-core GEMM
+    /// when `prefill_dense_o == Products::Fp8`.
+    mxfp8: Option<&'a Mxfp8Matrix>,
     x: CudaView<'a, bf16>,
     out: CudaViewMut<'a, bf16>,
 }
@@ -2485,24 +2559,47 @@ impl Ctx {
             };
         if let Some(scratch) = dense
             && use_fp8_gemm
-            && products.iter().all(|p| p.fp8.is_some())
         {
-            let mut gemms: Vec<Fp8Gemm<'_>> = products
-                .iter_mut()
-                .filter_map(|p| {
-                    Some(Fp8Gemm {
-                        weight: p.fp8?,
-                        x: p.x.slice(..),
-                        out: p.out.slice_mut(..),
+            if self.prefill_dense_o == Products::Fp8 && products.iter().all(|p| p.mxfp8.is_some()) {
+                let mut gemms: Vec<Mxfp8Gemm<'_>> = products
+                    .iter_mut()
+                    .filter_map(|p| {
+                        Some(Mxfp8Gemm {
+                            weight: p.mxfp8?,
+                            x: p.x.slice(..),
+                            out: p.out.slice_mut(..),
+                        })
                     })
-                })
-                .collect();
-            return self
-                .kernels
-                .linear_fp8
-                .gemm(&self.stream, &mut gemms, m, scratch);
+                    .collect();
+                return self
+                    .kernels
+                    .linear_fp8
+                    .gemm_mxfp8(&self.stream, &mut gemms, m, scratch);
+            }
+            if products.iter().all(|p| p.fp8.is_some()) {
+                let mut gemms: Vec<Fp8Gemm<'_>> = products
+                    .iter_mut()
+                    .filter_map(|p| {
+                        Some(Fp8Gemm {
+                            weight: p.fp8?,
+                            x: p.x.slice(..),
+                            out: p.out.slice_mut(..),
+                        })
+                    })
+                    .collect();
+                return self
+                    .kernels
+                    .linear_fp8
+                    .gemm(&self.stream, &mut gemms, m, scratch);
+            }
         }
-        if invariant {
+        // Under opt-in `--prefill-dense fp8`, BF16 projections without an FP8/MXFP8 copy
+        // (such as BF16 `W_o` when `prefill_dense_o == Bf16`) at `m >= 48` dispatch to
+        // BF16 tensor-core GEMM (`Linear::gemm_bf16`) instead of `LinearRows`.
+        let use_wide_bf16_gemm = invariant
+            && self.prefill_dense == Products::Fp8
+            && m >= prefill::BATCH_BF16_GEMM_MIN_ROWS;
+        if invariant && !use_wide_bf16_gemm {
             ensure!(
                 m <= linear_rows::MAX_ROWS,
                 "{m} rows; the invariant products take at most {}",

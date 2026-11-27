@@ -22,6 +22,7 @@ use crate::{
             MAX_BATCH_SEQS, RACE_WORDS, TOP_K, TopkScratch, race_words,
         },
         linear::Start,
+        linear_fp8::{Fp8RawGemm, Fp8Rows as Fp8GemmScratch, LinearFp8},
         linear_rows::{LinearRows, MAX_PRODUCTS as ROWS_MAX_PRODUCTS, RowsProduct},
         spec::RESULT_LEN,
     },
@@ -33,6 +34,10 @@ use crate::{
 
 /// Maximum sequences one batched DFlash 2 round drafts.
 pub const MAX_BATCH_DRAFT_SEQS: usize = MAX_BATCH_SEQS;
+/// Smallest batched DFlash 2 row count that uses native FP8 tensor-core GEMMs
+/// (`LinearFp8::gemm_raw`) when `Draft::fp8_dense` is enabled.
+const BATCH_FP8_DENSE_MIN_ROWS: usize = 48;
+const _: () = assert!(BATCH_FP8_DENSE_MIN_ROWS == siphon::memory::BATCH_FP8_DENSE_MIN_ROWS);
 
 /// Captured batched DFlash 2 round and the external device addresses baked into it.
 /// Per-round varying metadata (`controls`, `starts`, `races`, `cache_table`) lives inside
@@ -136,6 +141,8 @@ pub(super) struct BatchDflash2 {
     hp: CudaSlice<bf16>,
     ids: CudaSlice<i32>,
     confidence: CudaSlice<f32>,
+    /// Pre-allocated MXFP8 input scratch for native FP8 tensor-core GEMMs (`m >= 32`).
+    dense: Fp8GemmScratch,
     /// Ready-to-verify tokens `[max_seqs * BLOCK]` (`[anchor, d0..d_{steps-1}]` per seq).
     verify_tokens: CudaSlice<i32>,
     /// Captured graphs keyed by `(seqs, commit_width, draft_steps)`.
@@ -150,6 +157,7 @@ impl BatchDflash2 {
     fn new(
         stream: &Arc<CudaStream>,
         layers: usize,
+        tap_count: usize,
         q_width: usize,
         mlp_width: usize,
         base_ld: usize,
@@ -159,6 +167,12 @@ impl BatchDflash2 {
     ) -> anyhow::Result<Self> {
         let max_rows = max_seqs * BLOCK;
         let max_steps = max_seqs * STEPS;
+        let max_k = (tap_count * HIDDEN).max(q_width).max(mlp_width);
+        let dense_len = if max_rows >= BATCH_FP8_DENSE_MIN_ROWS {
+            max_rows * max_k
+        } else {
+            0
+        };
         let z = |n: usize| stream.alloc_zeros::<bf16>(n);
         let zf = |n: usize| stream.alloc_zeros::<f32>(n);
         let zi = |n: usize| stream.alloc_zeros::<i32>(n);
@@ -213,9 +227,14 @@ impl BatchDflash2 {
             hp: z(max_steps * RANK)?,
             ids: zi(max_steps)?,
             confidence: zf(max_steps)?,
+            dense: Fp8GemmScratch::new(stream, dense_len)?,
             verify_tokens: zi(max_rows)?,
             graphs: HashMap::new(),
         })
+    }
+
+    pub(super) fn clear_graphs(&mut self) {
+        self.graphs.clear();
     }
 
     pub(super) fn graph_count(&self) -> usize {
@@ -248,18 +267,47 @@ type BatchProduct<'a> = (
     CudaViewMut<'a, bf16>,
 );
 
-/// Runs one or more `out = x @ W^T` products through `LinearRows`, using FP8 raw weights
-/// when every product supplies one and BF16 otherwise.
+/// Runs one or more `out = x @ W^T` products through `LinearFp8::gemm_raw` (when
+/// `fp8_dense` is set, `m >= 32`, and every product supplies an FP8 weight with `k % 128 == 0`)
+/// or `LinearRows` otherwise.
+#[expect(clippy::too_many_arguments, reason = "kernel handles, scratch, and product slice")]
 fn run_rows_products(
     linear_rows: &LinearRows,
+    linear_fp8: &LinearFp8,
+    dense: &mut Fp8GemmScratch,
+    fp8_dense: bool,
     stream: &CudaStream,
     x: &CudaView<'_, bf16>,
     m: usize,
     products: &mut [BatchProduct<'_>],
 ) -> anyhow::Result<()> {
     let use_fp8 = products.iter().all(|p| p.1.is_some());
+    let use_fp8_tc = use_fp8
+        && fp8_dense
+        && crate::BLOCK_SCALED_MMA
+        && m >= BATCH_FP8_DENSE_MIN_ROWS
+        && products
+            .first()
+            .and_then(|p| p.1)
+            .is_some_and(|w| w.k.is_multiple_of(128));
     for chunk in products.chunks_mut(ROWS_MAX_PRODUCTS) {
-        if use_fp8 {
+        if use_fp8_tc {
+            let mut batch: Vec<Fp8RawGemm<'_>> = chunk
+                .iter_mut()
+                .map(|(_, fp8, out)| {
+                    let w = fp8.context("FP8 weight missing")?;
+                    Ok(Fp8RawGemm {
+                        values: w.values.slice(..),
+                        scales: w.scales.slice(..),
+                        rows: w.rows(),
+                        k: w.k,
+                        x: x.slice(..),
+                        out: out.slice_mut(..),
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            linear_fp8.gemm_raw(stream, &mut batch, m, dense)?;
+        } else if use_fp8 {
             let mut batch: Vec<RowsProduct<'_>> = chunk
                 .iter_mut()
                 .map(|(_, fp8, out)| {
@@ -322,6 +370,7 @@ impl Draft {
             let mut b = BatchDflash2::new(
                 stream,
                 layers,
+                self.arch.tap_count(),
                 self.arch.q_width(),
                 self.arch.mlp_width(),
                 base_ld,
@@ -832,6 +881,8 @@ impl Draft {
         let b = self.batch.as_mut().context("batch DFlash 2 missing")?;
         let fp8_kv = b.fp8_kv;
         let lr = &self.linear_rows;
+        let lfp8 = &self.linear_fp8;
+        let fp8_dense = self.fp8_dense;
         let cache_table = b.cache_table.slice(..seqs * layers * 2);
 
         // 1. Optional context commit (`seqs * commit.width` rows).
@@ -849,6 +900,9 @@ impl Draft {
             let cm = seqs * c.width;
             run_rows_products(
                 lr,
+                lfp8,
+                &mut b.dense,
+                fp8_dense,
                 stream,
                 &c.taps,
                 cm,
@@ -885,7 +939,7 @@ impl Draft {
                 prods.push((Some(&lw.k), fp8.map(|f| &f.k), ck));
                 prods.push((Some(&lw.v), fp8.map(|f| &f.v), cv));
             }
-            run_rows_products(lr, stream, &normed, cm, &mut prods)?;
+            run_rows_products(lr, lfp8, &mut b.dense, fp8_dense, stream, &normed, cm, &mut prods)?;
             let k_norms: Vec<&CudaSlice<bf16>> =
                 weights.layers.iter().map(|l| &l.k_norm).collect();
             let controls = b.controls.slice(..seqs * CONTROL);
@@ -979,6 +1033,9 @@ impl Draft {
                 let v_out = b.v.slice_mut(..bm * KV_WIDTH);
                 run_rows_products(
                     lr,
+                    lfp8,
+                    &mut b.dense,
+                    fp8_dense,
                     stream,
                     &conv_in,
                     bm,
@@ -1031,6 +1088,9 @@ impl Draft {
                 let o_out = b.o.slice_mut(..bm * HIDDEN);
                 run_rows_products(
                     lr,
+                    lfp8,
+                    &mut b.dense,
+                    fp8_dense,
                     stream,
                     &attn_in,
                     bm,
@@ -1080,6 +1140,9 @@ impl Draft {
                 let up_out = b.up.slice_mut(..bm * mlp_width);
                 run_rows_products(
                     lr,
+                    lfp8,
+                    &mut b.dense,
+                    fp8_dense,
                     stream,
                     &conv_in,
                     bm,
@@ -1100,6 +1163,9 @@ impl Draft {
                 let mlp_out = b.mlp.slice_mut(..bm * HIDDEN);
                 run_rows_products(
                     lr,
+                    lfp8,
+                    &mut b.dense,
+                    fp8_dense,
                     stream,
                     &act_in,
                     bm,
@@ -1162,19 +1228,35 @@ impl Draft {
                     )?;
                 }
                 Some(Matrix::Fp8(w)) => {
-                    lr.run(
-                        stream,
-                        &mut [RowsProduct::fp8_raw(
-                            w.values.slice(..rows * HIDDEN),
-                            w.scales.slice(..rows),
-                            rows,
-                            HIDDEN,
-                            &y_in,
-                            &mut base_out,
-                        )],
-                        sm,
-                        Start::Early,
-                    )?;
+                    if fp8_dense && crate::BLOCK_SCALED_MMA && sm >= BATCH_FP8_DENSE_MIN_ROWS {
+                        lfp8.gemm_raw(
+                            stream,
+                            &mut [Fp8RawGemm {
+                                values: w.values.slice(..rows * HIDDEN),
+                                scales: w.scales.slice(..rows),
+                                rows,
+                                k: HIDDEN,
+                                x: y_in.slice(..),
+                                out: base_out.slice_mut(..),
+                            }],
+                            sm,
+                            &mut b.dense,
+                        )?;
+                    } else {
+                        lr.run(
+                            stream,
+                            &mut [RowsProduct::fp8_raw(
+                                w.values.slice(..rows * HIDDEN),
+                                w.scales.slice(..rows),
+                                rows,
+                                HIDDEN,
+                                &y_in,
+                                &mut base_out,
+                            )],
+                            sm,
+                            Start::Early,
+                        )?;
+                    }
                 }
             }
         }

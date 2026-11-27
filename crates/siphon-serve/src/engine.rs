@@ -375,7 +375,8 @@ pub struct Options {
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
-    /// Prefill's dense product precision (`bf16` or `fp8`), as `Products` parses it.
+    /// Dense product precision in prefill and wide batched passes (`m >= 48`): `bf16` or
+    /// `fp8`, as `Products` parses it.
     pub prefill_dense: String,
     /// Expert activation precision (`bf16`, `quantized`, or `fp8`), as `ExpertActivations`
     /// parses it.
@@ -880,6 +881,7 @@ mod cuda {
             checkpoint: &checkpoint,
             weights: weight_format,
             output: output_projection(options),
+            prefill_dense_fp8: options.prefill_dense == "fp8",
             kv,
             draft: options
                 .drafter

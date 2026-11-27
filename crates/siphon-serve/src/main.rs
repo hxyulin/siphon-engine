@@ -102,9 +102,9 @@ seconds it ends what is left with an error. Then it saves --cache-dir and exits.
 default) runs BF16 up to 16,384 keys and FP8 tensor cores past them, where they cut time to
 first token by up to a fifth; bf16 keeps every prompt as before, fp8 runs FP8 throughout, and
 fp4 runs native Blackwell NVFP4 Q K^T + FP8 P V over NVFP4 caches (and FP8 over FP8 caches).
---prefill-dense picks dense products in prefill and large batched passes (>= 48 rows): bf16
-(the default) keeps BF16/row-invariant products, and fp8 runs MXFP8 tensor-core GEMMs with
---weights fp8.
+--prefill-dense picks dense products in prefill and wide batched passes (>= 48 rows, including
+batched verify and batched DFlash 2): bf16 (the default) keeps BF16/row-invariant products,
+and fp8 runs FP8/MXFP8 tensor-core GEMMs (including MXFP8 W_o) with --weights fp8.
 --expert-activations picks prefill's (and wide batched) expert activations: bf16 (the
 default), quantized (NVFP4/MXFP8 tensor cores), or fp8 (MXFP8 activations on FP8 tensor
 cores). Together with --prefill-dense fp8 and --prefill-attention fp8, quantized expert

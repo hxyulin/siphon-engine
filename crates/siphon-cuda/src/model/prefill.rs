@@ -124,9 +124,13 @@ const STEP_ROWS: usize = VERIFY_ROWS;
 /// logits take 13 MB in BF16 and 26 MB after the F32 softcap.
 const HEAD_ROWS: usize = 32;
 const _: () = assert!(HEAD_ROWS == siphon::memory::HEAD_ROWS);
-/// Smallest batched/invariant row count that uses native FP8 tensor-core dense GEMMs
-/// (`LinearFp8::gemm`) when `prefill_dense == Products::Fp8`.
+/// Smallest batched/invariant row count that uses native FP8/MXFP8 tensor-core dense GEMMs
+/// (`LinearFp8::gemm` / `gemm_mxfp8`) when `prefill_dense == Products::Fp8`.
 pub(super) const BATCH_FP8_DENSE_MIN_ROWS: usize = 48;
+const _: () = assert!(BATCH_FP8_DENSE_MIN_ROWS == siphon::memory::BATCH_FP8_DENSE_MIN_ROWS);
+/// Smallest batched/invariant row count that dispatches BF16 dense projections (without an
+/// FP8/MXFP8 copy) to BF16 tensor-core GEMMs (`Linear::gemm_bf16`) under `--prefill-dense fp8`.
+pub(super) const BATCH_BF16_GEMM_MIN_ROWS: usize = 48;
 /// Receives each chunk's feature taps and the position of its first row.
 pub(super) type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
@@ -255,7 +259,7 @@ struct GateRows {
     /// The MXFP8 inputs of `Products::Fp8` dense products: up to three inputs of
     /// `2 * hidden` values per row in prefill, or `max(3 * hidden, q_dims)` per row in
     /// invariant chunks with at least [`BATCH_FP8_DENSE_MIN_ROWS`] rows. The attention
-    /// projections and batched LM head borrow it too.
+    /// projections (`qkv`, `W_o`) and batched LM head borrow it too.
     dense: Fp8Rows,
 }
 
@@ -1541,6 +1545,7 @@ impl Ctx {
             &mut [RowProduct {
                 weight: self.weights.lm_head.slice(),
                 fp8,
+                mxfp8: None,
                 x: p.final_hidden.slice((m - 1) * hidden..mh),
                 out: s.logits.as_view_mut(),
             }],
@@ -1591,6 +1596,7 @@ impl Ctx {
                 &mut [RowProduct {
                     weight: self.weights.lm_head.slice(),
                     fp8,
+                    mxfp8: None,
                     x: p.final_hidden.slice(first * hidden..(first + n) * hidden),
                     out: rows_mut(head_logits, n, padded),
                 }],
@@ -1710,6 +1716,7 @@ impl Ctx {
                 &mut [RowProduct {
                     weight: self.weights.lm_head.slice(),
                     fp8: self.weights.lm_head_fp8.as_ref(),
+                    mxfp8: None,
                     x: final_hidden.slice(first * hidden..(first + n) * hidden),
                     out: rows_mut(&mut tmp_logits, n, padded),
                 }],
@@ -1759,6 +1766,7 @@ impl Ctx {
                 &mut [RowProduct {
                     weight: self.weights.lm_head.slice(),
                     fp8: self.weights.lm_head_fp8.as_ref(),
+                    mxfp8: None,
                     x: rows(&p.final_hidden, m, self.hidden()),
                     out: rows_mut(head_logits, m, padded),
                 }],
@@ -1809,6 +1817,7 @@ impl Ctx {
                     &mut [RowProduct {
                         weight: self.weights.lm_head.slice(),
                         fp8: self.weights.lm_head_fp8.as_ref(),
+                        mxfp8: None,
                         x: rows(&p.final_hidden, m, self.hidden()),
                         out: rows_mut(head_logits, m, padded),
                     }],
@@ -1891,6 +1900,7 @@ impl Ctx {
                 &mut [RowProduct {
                     weight: self.weights.lm_head.slice(),
                     fp8: self.weights.lm_head_fp8.as_ref(),
+                    mxfp8: None,
                     x: rows(&p.final_hidden, m, self.hidden()),
                     out: rows_mut(head_logits, m, padded),
                 }],
@@ -1928,6 +1938,7 @@ impl Ctx {
                 &mut [RowProduct {
                     weight: self.weights.lm_head.slice(),
                     fp8: self.weights.lm_head_fp8.as_ref(),
+                    mxfp8: None,
                     x: rows(&p.final_hidden, m, self.hidden()),
                     out: rows_mut(head_logits, m, padded),
                 }],
@@ -2704,6 +2715,7 @@ impl Ctx {
             RowProduct {
                 weight,
                 fp8,
+                mxfp8: None,
                 x: x.slice(..),
                 out,
             }
@@ -2884,16 +2896,13 @@ impl Ctx {
             &mut [RowProduct {
                 weight: &a.o,
                 fp8: w.fp8.as_ref().and_then(|f| f.o.as_ref()),
+                mxfp8: w.mxfp8_o.as_ref(),
                 x: rows(&t.gated, m, q_dims),
                 out: rows_mut(&mut t.proj, m, hidden),
             }],
             m,
             invariant,
-            // In prefill (`!invariant`) the output projection stays BF16 under
-            // `Products::Fp8` for the prefill quality gate; in batched/invariant passes
-            // with `OutputProjection::Fp8` (`w.fp8.o.is_some()`) and `m >= 48`, it uses
-            // native FP8 tensor cores when `prefill_dense == Products::Fp8`.
-            invariant.then_some(&mut *dense),
+            Some(&mut *dense),
         )
     }
 
@@ -2944,6 +2953,7 @@ impl Ctx {
                 &mut [RowProduct {
                     weight: &weights[0].down,
                     fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
+                    mxfp8: None,
                     x: rows(&t.inputs[first], m, 2 * hidden),
                     out: down.slice_mut(..),
                 }],
@@ -2960,18 +2970,21 @@ impl Ctx {
                         RowProduct {
                             weight: &weights[0].down,
                             fp8: weights[0].fp8.as_ref().map(|f| &f[0]),
+                            mxfp8: None,
                             x: x0,
                             out: d0,
                         },
                         RowProduct {
                             weight: &weights[1].down,
                             fp8: weights[1].fp8.as_ref().map(|f| &f[0]),
+                            mxfp8: None,
                             x: x1,
                             out: d1,
                         },
                         RowProduct {
                             weight: &weights[2].down,
                             fp8: weights[2].fp8.as_ref().map(|f| &f[0]),
+                            mxfp8: None,
                             x: x2,
                             out: d2,
                         },
@@ -3468,6 +3481,7 @@ impl Ctx {
                     &mut [RowProduct {
                         weight: self.weights.lm_head.slice(),
                         fp8,
+                        mxfp8: None,
                         x: p.out.slice(first * hidden..(first + n) * hidden),
                         out: rows_mut(head_logits, n, padded),
                     }],
@@ -3603,36 +3617,42 @@ impl Ctx {
                 RowProduct {
                     weight: &attn_w.q,
                     fp8: fp8(0),
+                    mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.q_raw, m, q_dims),
                 },
                 RowProduct {
                     weight: &attn_w.r,
                     fp8: fp8(1),
+                    mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.r_raw, m, rel_dims),
                 },
                 RowProduct {
                     weight: &attn_w.gate,
                     fp8: fp8(2),
+                    mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.gate, m, q_dims),
                 },
                 RowProduct {
                     weight: &attn_w.sink,
                     fp8: fp8(3),
+                    mxfp8: None,
                     x: q_in.slice(..),
                     out: rows_mut(&mut attn.sinks, m, heads),
                 },
                 RowProduct {
                     weight: &attn_w.k,
                     fp8: fp8(4),
+                    mxfp8: None,
                     x: k_in.slice(..),
                     out: rows_mut(&mut attn.k_raw, m, kv_dims),
                 },
                 RowProduct {
                     weight: &attn_w.v,
                     fp8: fp8(5),
+                    mxfp8: None,
                     x: v_in.slice(..),
                     out: rows_mut(&mut attn.v_raw, m, kv_dims),
                 },
@@ -3641,12 +3661,14 @@ impl Ctx {
                 products.push(RowProduct {
                     weight: k_proj,
                     fp8: fp8(6),
+                    mxfp8: None,
                     x: k_in.slice(..),
                     out: rows_mut(&mut attn.k_dynamic, m, taps_w),
                 });
                 products.push(RowProduct {
                     weight: v_proj,
                     fp8: fp8(7),
+                    mxfp8: None,
                     x: v_in.slice(..),
                     out: rows_mut(&mut attn.v_dynamic, m, taps_w),
                 });
@@ -3846,12 +3868,13 @@ impl Ctx {
             &mut [RowProduct {
                 weight: &attn_w.o,
                 fp8: layer_w.fp8.as_ref().and_then(|f| f.o.as_ref()),
+                mxfp8: layer_w.mxfp8_o.as_ref(),
                 x: rows(&attn.gated, m, q_dims),
                 out: rows_mut(&mut attn.proj, m, hidden),
             }],
             m,
             false,
-            None,
+            Some(&mut p.gate.dense),
         )?;
 
         // 6. Ragged packed post-attention conv + residual add across all `m` rows in 1 launch,

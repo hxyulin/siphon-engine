@@ -630,6 +630,7 @@ mod linux {
             checkpoint: &checkpoint,
             weights: args.weights,
             output: args.output,
+            prefill_dense_fp8: args.prefill_dense == Products::Fp8,
             kv: args.kv,
             draft: DraftChoice::None,
             prefill_chunk: 0,

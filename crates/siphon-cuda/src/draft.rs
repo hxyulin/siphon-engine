@@ -47,6 +47,7 @@ use crate::{
             RACE_WORDS, Rope, StepRace, TOP_K, TopkScratch, race_words,
         },
         linear::{Gemm, Linear, MAX_PRODUCTS, Start},
+        linear_fp8::LinearFp8,
         linear_rows::{LinearRows, MAX_PRODUCTS as ROWS_MAX_PRODUCTS, RowsProduct},
         sample::Sampling,
     },
@@ -311,6 +312,10 @@ pub fn rope_inv_freq_theta(theta: f64) -> Vec<f32> {
 pub struct Draft {
     kernels: DraftKernels,
     linear_rows: LinearRows,
+    linear_fp8: LinearFp8,
+    /// Whether batched DFlash 2 projections with `m >= 32` dispatch to native FP8 tensor
+    /// cores (`LinearFp8::gemm_raw`), synced from `Model::prefill_dense() == Products::Fp8`.
+    fp8_dense: bool,
     arch: Arch,
     /// RoPE frequencies `theta^(-2i/128)`, F32 `[64]`.
     inv_freq: CudaSlice<f32>,
@@ -1073,9 +1078,12 @@ impl Draft {
             None
         };
         let linear_rows = LinearRows::load(stream.context())?;
+        let linear_fp8 = LinearFp8::load(stream.context())?;
         Ok(Self {
             kernels,
             linear_rows,
+            linear_fp8,
+            fp8_dense: false,
             arch,
             inv_freq: stream.clone_htod(&inv_freq)?,
             caches,
@@ -1102,6 +1110,23 @@ impl Draft {
     #[must_use]
     pub fn tap_layout(&self) -> TapLayout {
         self.arch.taps()
+    }
+
+    /// Enables (`on = true`) or disables native FP8 tensor-core GEMM dispatch
+    /// (`LinearFp8::gemm_raw`) for batched DFlash 2 projections with `m >= 32` rows.
+    /// Drops captured batched DFlash 2 graphs when changed.
+    pub fn set_fp8_dense(&mut self, on: bool) -> anyhow::Result<()> {
+        ensure!(
+            crate::BLOCK_SCALED_MMA || !on,
+            "FP8 dense products need the block-scaled MMA, which this sm_89 build lacks"
+        );
+        if self.fp8_dense != on {
+            self.fp8_dense = on;
+            if let Some(b) = self.batch.as_mut() {
+                b.clear_graphs();
+            }
+        }
+        Ok(())
     }
 
     /// Elements of one position's taps: taps times the hidden width.

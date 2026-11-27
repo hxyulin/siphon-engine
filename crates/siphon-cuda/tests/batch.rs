@@ -832,6 +832,10 @@ fn batch_dflash2_profile() -> anyhow::Result<()> {
         return Ok(());
     };
     let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    let fp8_dense = env::var("SIPHON_PREFILL_DENSE").is_ok_and(|v| v == "fp8");
+    if fp8_dense {
+        model.set_prefill_dense(siphon_cuda::ops::Products::Fp8)?;
+    }
     let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
     let checkpoint = Checkpoint::open(&model_dir)?;
     let mut draft = load_draft(
@@ -841,6 +845,9 @@ fn batch_dflash2_profile() -> anyhow::Result<()> {
         2048,
         &DraftOptions::fast(),
     )?;
+    if fp8_dense {
+        draft.set_fp8_dense(true)?;
+    }
     let stream = std::sync::Arc::clone(model.stream());
     let linear = siphon_cuda::ops::linear::Linear::load(stream.context())?;
     let max_b = 32usize;
@@ -1200,5 +1207,174 @@ fn shortlist_note_tokens_preserves_graphs() -> anyhow::Result<()> {
         after_reset == before,
         "reset invalidated draft CUDA graphs: before={before:?}, after={after_reset:?}"
     );
+    Ok(())
+}
+
+/// Parity check for wide FP8 dense tensor-core dispatch (`m >= 48`) + MXFP8/BF16-TC `W_o`
+/// across `step_batch` (`B=32`) and `verify_batch` (`B=32 W=8` `M=256`):
+/// verifies CUDA graph capture/replay and tight KL / top-1 agreement against default
+/// `--prefill-dense bf16` (`LinearRows`).
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL) and a GPU"]
+#[expect(clippy::too_many_lines, reason = "end-to-end B=32 decode and B=32 W=8 verify parity")]
+fn batch_wide_fp8_dense_and_wo_parity() -> anyhow::Result<()> {
+    use siphon_cuda::ops::Products;
+
+    fn kl_div(want: &[f32], got: &[f32]) -> f64 {
+        let log_softmax = |x: &[f32]| {
+            let max = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let sum: f64 = x.iter().map(|&v| f64::from(v - max).exp()).sum();
+            let log_sum = sum.ln();
+            x.iter()
+                .map(|&v| f64::from(v - max) - log_sum)
+                .collect::<Vec<_>>()
+        };
+        let (p, q) = (log_softmax(want), log_softmax(got));
+        p.iter().zip(&q).map(|(lp, lq)| lp.exp() * (lp - lq)).sum()
+    }
+
+    if !siphon_cuda::BLOCK_SCALED_MMA {
+        println!("skipped: FP8 dense GEMM needs block-scaled MMA, which sm_89 lacks");
+        return Ok(());
+    }
+
+    let (_gpu, mut model) = load(KvFormat::Fp8, WeightFormat::Fp8)?;
+    let vocab = model.config().unpadded_vocab_size;
+    let capture = capture_tokens()?;
+    let b = 32usize;
+    let w = 8usize;
+    model.add_slots(b - 1)?;
+    let slots: Vec<usize> = (0..b).collect();
+    let samplings = vec![Sampling::GREEDY; b];
+    let accepts = vec![Accept::Rows(1); b];
+
+    // Prefill 32 short prompts (64 tokens each) and record baseline step_batch + verify_batch.
+    let reset_and_prefill = |model: &mut Model| -> anyhow::Result<Vec<u32>> {
+        let mut firsts = Vec::with_capacity(b);
+        for slot in 0..b {
+            model.reset_slot(slot)?;
+            let start = (slot * 29) % (capture.len() - 96);
+            let tok = model.prefill_slot(slot, &capture[start..start + 64], 64)?;
+            firsts.push(tok);
+        }
+        Ok(firsts)
+    };
+
+    // Baseline (`--prefill-dense bf16`).
+    model.set_prefill_dense(Products::Bf16)?;
+    let firsts = reset_and_prefill(&mut model)?;
+    let step_rows: Vec<(usize, u32)> = firsts.iter().copied().enumerate().collect();
+    let want_step = model.step_batch(&step_rows)?;
+    let want_step_logits = model.batch_logits(b)?;
+
+    let verify_toks: Vec<Vec<u32>> = (0..b)
+        .map(|s| {
+            let base = (s * 29) % (capture.len() - 96) + 65;
+            let mut row = vec![want_step[s]];
+            row.extend_from_slice(&capture[base..base + w - 1]);
+            row
+        })
+        .collect();
+    let verify_slices: Vec<&[u32]> = verify_toks.iter().map(Vec::as_slice).collect();
+    let _ = model.verify_batch(
+        &slots,
+        BatchVerifyTokens::Host(&verify_slices),
+        &accepts,
+        &samplings,
+    )?;
+    let want_verify_logits = model.batch_verify_logits()?;
+
+    // Compare both MXFP8 W_o and BF16-TC W_o under `--prefill-dense fp8`.
+    let argmax = |row: &[f32]| -> usize {
+        row.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map_or(0, |(i, _)| i)
+    };
+    let want_verify_top1: Vec<usize> = (0..b * w)
+        .map(|r| argmax(&want_verify_logits[r * vocab..(r + 1) * vocab]))
+        .collect();
+    for (label, wo_mode) in [("mxfp8-wo", Products::Fp8), ("bf16-tc-wo", Products::Bf16)] {
+        model.set_prefill_dense(Products::Fp8)?;
+        model.set_prefill_dense_output(wo_mode)?;
+        let _ = reset_and_prefill(&mut model)?;
+        // First pass captures the CUDA graphs; second pass replays them and must match bit-for-bit.
+        let got_step = model.step_batch(&step_rows)?;
+        let got_step_logits = model.batch_logits(b)?;
+        let _ = model.verify_batch(
+            &slots,
+            BatchVerifyTokens::Host(&verify_slices),
+            &accepts,
+            &samplings,
+        )?;
+        let got_verify_logits = model.batch_verify_logits()?;
+
+        let _ = reset_and_prefill(&mut model)?;
+        let replay_step = model.step_batch(&step_rows)?;
+        let replay_step_logits = model.batch_logits(b)?;
+        let _ = model.verify_batch(
+            &slots,
+            BatchVerifyTokens::Host(&verify_slices),
+            &accepts,
+            &samplings,
+        )?;
+        let replay_verify_logits = model.batch_verify_logits()?;
+        ensure!(
+            replay_step == got_step && replay_step_logits == got_step_logits,
+            "{label}: B=32 step graph replay differed from capture"
+        );
+        ensure!(
+            replay_verify_logits == got_verify_logits,
+            "{label}: B=32 W=8 verify graph replay differed from capture"
+        );
+
+        let step_agree = got_step
+            .iter()
+            .zip(&want_step)
+            .filter(|(a, b)| a == b)
+            .count();
+        let step_kls: Vec<f64> = (0..b)
+            .map(|r| {
+                kl_div(
+                    &want_step_logits[r * vocab..(r + 1) * vocab],
+                    &got_step_logits[r * vocab..(r + 1) * vocab],
+                )
+            })
+            .collect();
+        let step_mean_kl = step_kls.iter().sum::<f64>() / b as f64;
+        let step_max_kl = step_kls.iter().copied().fold(0.0, f64::max);
+
+        let verify_agree = (0..b * w)
+            .filter(|&r| {
+                argmax(&got_verify_logits[r * vocab..(r + 1) * vocab]) == want_verify_top1[r]
+            })
+            .count();
+        let verify_kls: Vec<f64> = (0..b * w)
+            .map(|r| {
+                kl_div(
+                    &want_verify_logits[r * vocab..(r + 1) * vocab],
+                    &got_verify_logits[r * vocab..(r + 1) * vocab],
+                )
+            })
+            .collect();
+        let verify_mean_kl = verify_kls.iter().sum::<f64>() / (b * w) as f64;
+        let verify_max_kl = verify_kls.iter().copied().fold(0.0, f64::max);
+        println!(
+            "{label}: B=32 step top1={step_agree}/{b} mean_kl={step_mean_kl:.3e} max_kl={step_max_kl:.3e} | \
+             B=32 W=8 verify top1={verify_agree}/{} mean_kl={verify_mean_kl:.3e} max_kl={verify_max_kl:.3e} (graph replay bit-exact)",
+            b * w
+        );
+        // Full 64-token FP8-dense prefill + FP8-dense step/verify vs BF16-dense baseline:
+        // matches eval --prefill-dense fp8 parity (top-1 >= 90%, mean KL <= 2e-2).
+        ensure!(
+            step_agree >= 28 && step_mean_kl <= 1.5e-2 && step_max_kl <= 0.15,
+            "{label}: B=32 step parity exceeded limit: top1={step_agree}/{b} mean={step_mean_kl:.3e} max={step_max_kl:.3e}"
+        );
+        ensure!(
+            verify_agree >= 235 && verify_mean_kl <= 2.0e-2,
+            "{label}: B=32 W=8 verify parity exceeded limit: top1={verify_agree}/{} mean={verify_mean_kl:.3e} max={verify_max_kl:.3e}",
+            b * w
+        );
+    }
     Ok(())
 }

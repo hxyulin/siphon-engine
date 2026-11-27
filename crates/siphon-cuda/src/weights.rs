@@ -30,7 +30,7 @@ use crate::{
     gpu::HostMapped,
     ops::{
         linear::Prefetch,
-        linear_fp8::{Fp8Matrix, LinearFp8},
+        linear_fp8::{Fp8Matrix, LinearFp8, Mxfp8Matrix},
     },
 };
 
@@ -113,6 +113,9 @@ pub struct LayerWeights {
     /// FP8 copies of the attention projections for decode, after
     /// [`Weights::quantize_fp8`].
     pub fp8: Option<Fp8Projections>,
+    /// MXFP8 block-32 copy of `attention.o` (`W_o`), allocated lazily when opt-in
+    /// `--prefill-dense fp8` is enabled.
+    pub mxfp8_o: Option<Mxfp8Matrix>,
 }
 
 /// FP8 copies of one layer's attention projections.
@@ -460,6 +463,7 @@ impl LayerWeights {
             experts: ExpertWeights::load(loader, config, &format!("{p}.mlp.experts"))?,
             message_gates,
             fp8: None,
+            mxfp8_o: None,
         })
     }
 }

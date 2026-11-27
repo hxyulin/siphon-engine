@@ -280,7 +280,9 @@ constexpr int kBk = 128;
 
 struct Product {
     const uint8_t* w;
-    const float* w_scale;
+    // Per-row F32 scales (`const float*`) when `!kBlockScaleB`, or per-32 UE8M0 scales
+    // (`const uint8_t*`, `[n, k / 32]`) when `kBlockScaleB`.
+    const void* w_scale;
     const uint8_t* x;
     const uint8_t* x_scale;
     __nv_bfloat16* out;
@@ -324,20 +326,37 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
 }
 
 // c += a b: the A scales of rows g and g + 8 from byte kByte of lanes 4g and 4g + 1's
-// `scale_a`, B scales 1.
-template <int kByte>
+// `scale_a`. With `kBlockScaleB`, B scales of columns 0..7 come from byte kByte of lane
+// 4g's `scale_b`; otherwise B scales are 1 (0x7f = 2^0).
+template <int kByte, bool kBlockScaleB>
 __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
-                                    uint32_t b1, uint32_t scale_a) {
+                                    uint32_t b1, uint32_t scale_a, uint32_t scale_b) {
 #if SIPHON_SM89
+    (void)c;
+    (void)a;
+    (void)b0;
+    (void)b1;
+    (void)scale_a;
+    (void)scale_b;
     __trap();
 #else
-    asm volatile(
-        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
-        "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
-        "{%13}, {%12,%12};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
-          "h"(uint16_t(kByte)), "h"(uint16_t(0)), "r"(0x7f7f7f7fu));
+    if constexpr (kBlockScaleB) {
+        asm volatile(
+            "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
+            "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
+            "{%13}, {%11,%12};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
+              "h"(uint16_t(kByte)), "h"(uint16_t(0)), "r"(scale_b));
+    } else {
+        asm volatile(
+            "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3."
+            "e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
+            "{%13}, {%12,%12};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a),
+              "h"(uint16_t(kByte)), "h"(uint16_t(0)), "r"(0x7f7f7f7fu));
+    }
 #endif
 }
 
@@ -346,7 +365,12 @@ __device__ __forceinline__ int offset(int row, int chunk) {
     return row * kBk + ((chunk ^ (row & 7)) << 4);
 }
 
-template <int kBm, int kBn, int kWarpsM, int kWarpsN, int kStages>
+template <int kV>
+struct KTag {
+    static constexpr int value = kV;
+};
+
+template <int kBm, int kBn, int kWarpsM, int kWarpsN, int kStages, bool kBlockScaleB>
 __device__ void gemm(const Batch& b, uint8_t* smem) {
     constexpr int kThreads = 32 * kWarpsM * kWarpsN;
     constexpr int kWarpRows = kBm / kWarpsM;
@@ -452,7 +476,7 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         cp_async_commit();
     }
 
-    auto compute_stage = [&](int stage) {
+    auto compute_stage = [&](int stage, int step) {
         const uint32_t base = smem0 + stage * kStage;
         const uint32_t* scales =
             reinterpret_cast<const uint32_t*>(smem + stage * kStage + kStageA + kStageB);
@@ -461,8 +485,22 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         for (int mi = 0; mi < kMi; ++mi) {
             sa[mi] = scales[scale_row + 16 * mi];
         }
+        uint32_t sb[kNi] = {};
+        if constexpr (kBlockScaleB) {
+            const auto* b_scales = static_cast<const uint8_t*>(p.w_scale);
+            const size_t scale_stride = size_t(k / 32);
+            const int g = lane / 4;
+#pragma unroll
+            for (int ni = 0; ni < kNi; ++ni) {
+                const int b_scale_row = n0 + wn * kWarpCols + ni * 8 + g;
+                sb[ni] = b_scale_row < n
+                             ? *reinterpret_cast<const uint32_t*>(
+                                   b_scales + size_t(b_scale_row) * scale_stride + step * 4)
+                             : 0x7f7f7f7fu;
+            }
+        }
         // Double-buffer A and B fragments across the four k32 slices so ldmatrix latency
-        // hides behind the 16 FP8 MMAs of the previous slice.
+        // hides behind the FP8 MMAs of the previous slice.
         auto load_bf = [&](uint32_t (&bf)[kNi][2], int kk_idx) {
 #pragma unroll
             for (int nj = 0; nj < kNi; nj += 2) {
@@ -484,7 +522,8 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         uint32_t af[2][kMi][4];
         load_bf(bf[0], 0);
         load_af(af[0], 0);
-        auto run_k = [&]<int kK>() {
+        auto run_k = [&](auto tag) {
+            constexpr int kK = decltype(tag)::value;
             constexpr int cur = kK & 1;
             constexpr int nxt = cur ^ 1;
             if constexpr (kK + 1 < 4) {
@@ -495,14 +534,15 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
             for (int mi = 0; mi < kMi; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < kNi; ++ni) {
-                    mma<kK>(acc[mi][ni], af[cur][mi], bf[cur][ni][0], bf[cur][ni][1], sa[mi]);
+                    mma<kK, kBlockScaleB>(acc[mi][ni], af[cur][mi], bf[cur][ni][0], bf[cur][ni][1],
+                                          sa[mi], kBlockScaleB ? sb[ni] : 0x7f7f7f7fu);
                 }
             }
         };
-        run_k.template operator()<0>();
-        run_k.template operator()<1>();
-        run_k.template operator()<2>();
-        run_k.template operator()<3>();
+        run_k(KTag<0>{});
+        run_k(KTag<1>{});
+        run_k(KTag<2>{});
+        run_k(KTag<3>{});
     };
 
     for (int step0 = 0; step0 < steps; step0 += kStages) {
@@ -518,7 +558,7 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
                 }
                 cp_async_commit();
                 if (warp_active) {
-                    compute_stage(st);
+                    compute_stage(st, step);
                 }
             }
         }
@@ -535,8 +575,13 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
             continue;
         }
         const bool second = col + 1 < n;
-        const float s0 = p.w_scale[col];
-        const float s1 = second ? p.w_scale[col + 1] : 0.f;
+        float s0 = 1.f;
+        float s1 = 1.f;
+        if constexpr (!kBlockScaleB) {
+            const auto* w_scale_f32 = static_cast<const float*>(p.w_scale);
+            s0 = w_scale_f32[col];
+            s1 = second ? w_scale_f32[col + 1] : 0.f;
+        }
 #pragma unroll
         for (int mi = 0; mi < kMi; ++mi)
 #pragma unroll
@@ -690,7 +735,7 @@ __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const ui
                 ldmatrix_x4(af, base + offset(a_row + mi * 16, 2 * kK + lane / 16));
 #pragma unroll
                 for (int ni = 0; ni < kNi; ++ni) {
-                    mma<kK>(acc[mi][ni], af, bf[ni][0], bf[ni][1], sa[mi]);
+                    mma<kK, false>(acc[mi][ni], af, bf[ni][0], bf[ni][1], sa[mi], 0x7f7f7f7fu);
                 }
             }
         };
@@ -786,21 +831,27 @@ __device__ void gemm_argmax(const uint8_t* weight, const float* scales, const ui
 
 }  // namespace gemm8
 
-// The FP8 GEMM entry points. Grid: one block per tile of every product; k must be a
-// multiple of 128.
+// The FP8 GEMM entry points (per-row F32 weight scales). Grid: one block per tile of every
+// product; k must be a multiple of 128.
 // - gemm_fp8_128x128: 99,840 bytes dynamic shared memory, 1 CTA/SM, for large prefill batches.
-// - gemm_fp8_64x64:   49,920 bytes dynamic shared memory, 2 CTAs/SM, for narrow/small batches
-//   (such as message gate down projections with n = 64).
+// - gemm_fp8_64x64:   49,920 bytes dynamic shared memory, 2 CTAs/SM, for medium/narrow batches.
+// - gemm_fp8_32x64:   37,248 bytes dynamic shared memory, 2 CTAs/SM, for m <= 32 (4 active warps).
 extern "C" __global__ void __launch_bounds__(256, 1)
     gemm_fp8_128x128(const __grid_constant__ gemm8::Batch batch) {
     extern __shared__ __align__(16) uint8_t gemm8_smem[];
-    gemm8::gemm<128, 128, 2, 4, 3>(batch, gemm8_smem);
+    gemm8::gemm<128, 128, 2, 4, 3, false>(batch, gemm8_smem);
 }
 
 extern "C" __global__ void __launch_bounds__(128, 2)
     gemm_fp8_64x64(const __grid_constant__ gemm8::Batch batch) {
     extern __shared__ __align__(16) uint8_t gemm8_smem[];
-    gemm8::gemm<64, 64, 2, 2, 3>(batch, gemm8_smem);
+    gemm8::gemm<64, 64, 2, 2, 3, false>(batch, gemm8_smem);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    gemm_fp8_32x64(const __grid_constant__ gemm8::Batch batch) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm<32, 64, 1, 4, 3, false>(batch, gemm8_smem);
 }
 
 // Fused FP8 GEMM + tile-argmax entry point for the LM head (m > 32). Grid: ceil(m / 128) *
@@ -812,6 +863,26 @@ extern "C" __global__ void __launch_bounds__(256, 1)
     extern __shared__ __align__(16) uint8_t gemm8_smem[];
     gemm8::gemm_argmax(weight, scales, x, x_scale, partial_vals, partial_idxs, m, vocab, k,
                        gemm8_smem);
+}
+
+// MXFP8 block-scaled GEMM entry points (per-32 UE8M0 weight scales, e.g. W_o). Same tile
+// shapes and shared memory budgets as the per-row entry points (weight scales load via L1).
+extern "C" __global__ void __launch_bounds__(256, 1)
+    gemm_mxfp8_128x128(const __grid_constant__ gemm8::Batch batch) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm<128, 128, 2, 4, 3, true>(batch, gemm8_smem);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    gemm_mxfp8_64x64(const __grid_constant__ gemm8::Batch batch) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm<64, 64, 2, 2, 3, true>(batch, gemm8_smem);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    gemm_mxfp8_32x64(const __grid_constant__ gemm8::Batch batch) {
+    extern __shared__ __align__(16) uint8_t gemm8_smem[];
+    gemm8::gemm<32, 64, 1, 4, 3, true>(batch, gemm8_smem);
 }
 
 // Quantizes `rows` BF16 rows of k values (`x`) to MXFP8 for gemm_fp8: E4M3 `values`

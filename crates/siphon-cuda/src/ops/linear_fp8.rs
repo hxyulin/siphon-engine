@@ -135,28 +135,81 @@ struct Entry {
     function: CudaFunction,
 }
 
+/// A weight `[rows, k]` in MXFP8 format: E4M3 bytes `[rows, k]` and one UE8M0 scale byte
+/// per 32 values `[rows, k / 32]`. Used for `W_o` under opt-in `--prefill-dense fp8`, where
+/// per-32 block scales preserve outlier head precision that per-row F32 scales lose.
+#[derive(Debug)]
+pub struct Mxfp8Matrix {
+    values: CudaSlice<u8>,
+    scales: CudaSlice<u8>,
+    rows: usize,
+    k: usize,
+}
+
+impl Mxfp8Matrix {
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    #[must_use]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Device bytes the matrix takes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.values.len() + self.scales.len()
+    }
+
+    /// The E4M3 values `[rows, k]`, as bytes.
+    #[must_use]
+    pub fn values(&self) -> CudaView<'_, u8> {
+        self.values.slice(..)
+    }
+
+    /// The UE8M0 scales `[rows, k / 32]`, as bytes.
+    #[must_use]
+    pub fn scales(&self) -> CudaView<'_, u8> {
+        self.scales.slice(..)
+    }
+}
+
+/// Three tile variants of one FP8 GEMM family (`128x128`, `64x64`, `32x64`).
+#[derive(Debug)]
+struct GemmFamily {
+    large: CudaFunction,
+    small: CudaFunction,
+    thin: CudaFunction,
+}
+
 #[derive(Debug)]
 pub struct LinearFp8 {
     entries: Vec<Entry>,
     quantize: CudaFunction,
-    /// `gemm_fp8_128x128`, `gemm_fp8_64x64`, `gemm_fp8_128x128_argmax`, and
-    /// `quantize_rows_mxfp8_dense`.
-    gemm: CudaFunction,
-    gemm_small: CudaFunction,
+    /// `gemm_fp8_{128x128,64x64,32x64}` (per-row F32 weight scales).
+    gemm: GemmFamily,
+    /// `gemm_mxfp8_{128x128,64x64,32x64}` (per-32 UE8M0 weight scales).
+    gemm_mxfp8: GemmFamily,
+    /// `gemm_fp8_128x128_argmax` (fused LM head + tile argmax).
     gemm_argmax: CudaFunction,
     quantize_rows: CudaFunction,
-    /// Multiprocessor count, for picking between the 128x128 and 64x64 tiles.
+    /// Multiprocessor count, for picking between the `128x128` and `64x64` tiles.
     sms: usize,
 }
 
-/// Rows and columns of `gemm_fp8_128x128` and `gemm_fp8_64x64`, their threads and dynamic
-/// shared memory (3 stages of x and W rows of 128 bytes and x row scales).
+/// Tile shapes, threads, and dynamic shared memory of the FP8/MXFP8 GEMM kernels
+/// (3 stages of `bm` x rows and `bn` W rows of 128 bytes plus `bm` x row scales).
 pub const GEMM_TILE: usize = 128;
 const GEMM_THREADS: u32 = 256;
 const GEMM_SHARED: u32 = 3 * (2 * 128 * 128 + 128 * 4);
 const GEMM_SMALL_TILE: usize = 64;
 const GEMM_SMALL_THREADS: u32 = 128;
 const GEMM_SMALL_SHARED: u32 = 3 * (2 * 64 * 128 + 64 * 4);
+const GEMM_THIN_M: usize = 32;
+const GEMM_THIN_N: usize = 64;
+const GEMM_THIN_SHARED: u32 = 3 * ((32 + 64) * 128 + 32 * 4);
 /// k of [`LinearFp8::gemm`] must be a multiple of this: one pipeline stage.
 const GEMM_K: usize = 128;
 
@@ -244,6 +297,34 @@ pub struct Fp8GemmQuantized<'a> {
     pub out: CudaViewMut<'a, bf16>,
 }
 
+/// One product `out [m, n] = x [m, k] @ weight [n, k]^T` with separate E4M3 values and
+/// per-row F32 scales (e.g. draft weights in `ops::draft::Fp8Rows`).
+pub struct Fp8RawGemm<'a> {
+    pub values: CudaView<'a, u8>,
+    pub scales: CudaView<'a, f32>,
+    pub rows: usize,
+    pub k: usize,
+    pub x: CudaView<'a, bf16>,
+    pub out: CudaViewMut<'a, bf16>,
+}
+
+/// One product `out [m, n] = x [m, k] @ weight [n, k]^T` with MXFP8 block-32 weights.
+pub struct Mxfp8Gemm<'a> {
+    pub weight: &'a Mxfp8Matrix,
+    pub x: CudaView<'a, bf16>,
+    pub out: CudaViewMut<'a, bf16>,
+}
+
+/// Internal descriptor shared by [`LinearFp8::gemm`], [`LinearFp8::gemm_raw`], and
+/// [`LinearFp8::gemm_mxfp8`].
+struct RawProduct<'a> {
+    w_ptr: u64,
+    w_scale_ptr: u64,
+    rows: usize,
+    k: usize,
+    x: CudaView<'a, bf16>,
+    out: CudaViewMut<'a, bf16>,
+}
 /// Kernel parameter: one product, as `gemm8::Product` in the kernel.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -270,9 +351,9 @@ struct GemmBatch {
 impl LinearFp8 {
     pub fn load(ctx: &Arc<CudaContext>) -> anyhow::Result<Self> {
         let module = load_module(ctx, "linear_fp8", cubin!("linear_fp8"))?;
-        let sms = usize::try_from(
-            ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-        )?;
+        let sms = usize::try_from(ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )?)?;
         let entry = |k, name: &str| -> anyhow::Result<Entry> {
             Ok(Entry {
                 k,
@@ -293,11 +374,67 @@ impl LinearFp8 {
                 entry(3072, "gemv_fp8_k3072")?,
             ],
             quantize: module.load_function("quantize_e4m3_rows")?,
-            gemm: load_gemm("gemm_fp8_128x128", GEMM_SHARED)?,
-            gemm_small: load_gemm("gemm_fp8_64x64", GEMM_SMALL_SHARED)?,
+            gemm: GemmFamily {
+                large: load_gemm("gemm_fp8_128x128", GEMM_SHARED)?,
+                small: load_gemm("gemm_fp8_64x64", GEMM_SMALL_SHARED)?,
+                thin: load_gemm("gemm_fp8_32x64", GEMM_THIN_SHARED)?,
+            },
+            gemm_mxfp8: GemmFamily {
+                large: load_gemm("gemm_mxfp8_128x128", GEMM_SHARED)?,
+                small: load_gemm("gemm_mxfp8_64x64", GEMM_SMALL_SHARED)?,
+                thin: load_gemm("gemm_mxfp8_32x64", GEMM_THIN_SHARED)?,
+            },
             gemm_argmax: load_gemm("gemm_fp8_128x128_argmax", GEMM_SHARED)?,
             quantize_rows: module.load_function("quantize_rows_mxfp8_dense")?,
             sms,
+        })
+    }
+
+    /// Quantizes `weight` (`[rows, k]` row-major) to MXFP8: E4M3 values `[rows, k]` and
+    /// one UE8M0 scale per 32 values `[rows, k / 32]`. `k` must be a multiple of 128.
+    pub fn quantize_mxfp8(
+        &self,
+        stream: &Arc<CudaStream>,
+        weight: &CudaSlice<bf16>,
+        rows: usize,
+        k: usize,
+    ) -> anyhow::Result<Mxfp8Matrix> {
+        ensure!(rows > 0, "no rows to quantize");
+        ensure!(
+            k > 0 && k.is_multiple_of(GEMM_K),
+            "MXFP8 weight needs k a positive multiple of {GEMM_K}, not {k}"
+        );
+        ensure!(
+            weight.len() == rows * k,
+            "weight has {} elements, expected {rows} x {k}",
+            weight.len()
+        );
+        let mut values = stream.alloc_zeros::<u8>(rows * k)?;
+        let mut scales = stream.alloc_zeros::<u8>(rows * (k / 32))?;
+        let rows_arg = i32::try_from(rows)?;
+        let k_arg = i32::try_from(k)?;
+        let x = weight.slice(..);
+        let mut launch = stream.launch_builder(&self.quantize_rows);
+        launch
+            .arg(&x)
+            .arg(&rows_arg)
+            .arg(&k_arg)
+            .arg(&mut values)
+            .arg(&mut scales);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(rows.div_ceil(8))?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `quantize_rows_mxfp8_dense(const bf16*, int, int, u8*,
+        // u8*)`; `weight` holds `rows * k` elements, `values` holds `rows * k` bytes,
+        // `scales` holds `rows * (k / 32)` bytes, and `k` is a multiple of 128 (hence 32).
+        unsafe { launch.launch(config) }?;
+        Ok(Mxfp8Matrix {
+            values,
+            scales,
+            rows,
+            k,
         })
     }
 
@@ -314,28 +451,123 @@ impl LinearFp8 {
         m: usize,
         scratch: &mut Fp8Rows,
     ) -> anyhow::Result<()> {
+        let mut raw: Vec<RawProduct<'_>> = products
+            .iter_mut()
+            .map(|p| {
+                let (w_ptr, _) = p.weight.data.device_ptr(stream);
+                let scale_off = u64::try_from(p.weight.padded_rows() * p.weight.k)?;
+                Ok(RawProduct {
+                    w_ptr,
+                    w_scale_ptr: w_ptr + scale_off,
+                    rows: p.weight.rows,
+                    k: p.weight.k,
+                    x: p.x.slice(..),
+                    out: p.out.slice_mut(..),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        self.launch_gemm(&self.gemm, stream, &mut raw, m, scratch)
+    }
+
+    /// [`Self::gemm`] for FP8 weights stored as separate E4M3 values `[rows, k]` and
+    /// per-row F32 scales `[rows]` (such as draft backbone/head weights).
+    pub fn gemm_raw(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Fp8RawGemm<'_>],
+        m: usize,
+        scratch: &mut Fp8Rows,
+    ) -> anyhow::Result<()> {
+        let mut raw: Vec<RawProduct<'_>> = products
+            .iter_mut()
+            .enumerate()
+            .map(|(i, p)| {
+                ensure!(
+                    p.values.len() >= p.rows * p.k && p.scales.len() >= p.rows,
+                    "product {i}: FP8 raw buffers too short for {} x {}",
+                    p.rows,
+                    p.k
+                );
+                let (w_ptr, _) = p.values.device_ptr(stream);
+                let (w_scale_ptr, _) = p.scales.device_ptr(stream);
+                Ok(RawProduct {
+                    w_ptr,
+                    w_scale_ptr,
+                    rows: p.rows,
+                    k: p.k,
+                    x: p.x.slice(..),
+                    out: p.out.slice_mut(..),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        self.launch_gemm(&self.gemm, stream, &mut raw, m, scratch)
+    }
+
+    /// [`Self::gemm`] for MXFP8 block-scaled weights (`[n, k]` E4M3 + `[n, k / 32]` UE8M0
+    /// scales): both operands use hardware block-32 scales inside `mma.sync.aligned.kind::mxf8f6f4`.
+    pub fn gemm_mxfp8(
+        &self,
+        stream: &CudaStream,
+        products: &mut [Mxfp8Gemm<'_>],
+        m: usize,
+        scratch: &mut Fp8Rows,
+    ) -> anyhow::Result<()> {
+        let mut raw: Vec<RawProduct<'_>> = products
+            .iter_mut()
+            .map(|p| {
+                let (w_ptr, _) = p.weight.values.device_ptr(stream);
+                let (w_scale_ptr, _) = p.weight.scales.device_ptr(stream);
+                RawProduct {
+                    w_ptr,
+                    w_scale_ptr,
+                    rows: p.weight.rows,
+                    k: p.weight.k,
+                    x: p.x.slice(..),
+                    out: p.out.slice_mut(..),
+                }
+            })
+            .collect();
+        self.launch_gemm(&self.gemm_mxfp8, stream, &mut raw, m, scratch)
+    }
+
+    fn launch_gemm(
+        &self,
+        family: &GemmFamily,
+        stream: &CudaStream,
+        products: &mut [RawProduct<'_>],
+        m: usize,
+        scratch: &mut Fp8Rows,
+    ) -> anyhow::Result<()> {
         ensure!(
             (1..=MAX_PRODUCTS).contains(&products.len()),
             "{} products, expected 1 to {MAX_PRODUCTS}",
             products.len()
         );
         ensure!(m > 0, "no rows");
-        let k = products[0].weight.k;
+        let k = products[0].k;
         ensure!(
-            k.is_multiple_of(GEMM_K),
-            "the FP8 GEMM needs k a multiple of {GEMM_K}, not {k}"
+            k > 0 && k.is_multiple_of(GEMM_K),
+            "the FP8 GEMM needs k a positive multiple of {GEMM_K}, not {k}"
         );
         let tiles_128: usize = m.div_ceil(GEMM_TILE)
             * products
                 .iter()
-                .map(|p| p.weight.rows.div_ceil(GEMM_TILE))
+                .map(|p| p.rows.div_ceil(GEMM_TILE))
                 .sum::<usize>();
-        let (function, tile_size, threads, shared) = if m > GEMM_SMALL_TILE && tiles_128 >= self.sms
-        {
-            (&self.gemm, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
+        let (function, tile_m, tile_n, threads, shared) = if m <= GEMM_THIN_M {
+            (
+                &family.thin,
+                GEMM_THIN_M,
+                GEMM_THIN_N,
+                GEMM_SMALL_THREADS,
+                GEMM_THIN_SHARED,
+            )
+        } else if m > GEMM_SMALL_TILE && tiles_128 >= self.sms {
+            (&family.large, GEMM_TILE, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
         } else {
             (
-                &self.gemm_small,
+                &family.small,
+                GEMM_SMALL_TILE,
                 GEMM_SMALL_TILE,
                 GEMM_SMALL_THREADS,
                 GEMM_SMALL_SHARED,
@@ -353,17 +585,17 @@ impl LinearFp8 {
         let (scales_base, _) = scratch.scales.device_ptr(stream);
         let mut tiles = 0usize;
         for (i, p) in products.iter_mut().enumerate() {
-            let n = p.weight.rows;
-            ensure!(
-                p.weight.k == k,
-                "product {i} has k = {}, expected {k}",
-                p.weight.k
-            );
+            let n = p.rows;
+            ensure!(p.k == k, "product {i} has k = {}, expected {k}", p.k);
             ensure!(
                 p.x.len() == m * k && p.out.len() == m * n,
                 "product {i}: x has {} and out {} elements, expected {m} x {k} and {m} x {n}",
                 p.x.len(),
                 p.out.len()
+            );
+            ensure!(
+                p.w_ptr.is_multiple_of(16),
+                "product {i}: weight must be 16-byte aligned"
             );
             let (x_ptr, _) = p.x.device_ptr(stream);
             let offset = if let Some(&(_, offset)) = inputs.iter().find(|&&(a, _)| a == x_ptr) {
@@ -380,12 +612,11 @@ impl LinearFp8 {
                 inputs.push((x_ptr, offset));
                 offset
             };
-            tiles += m.div_ceil(tile_size) * n.div_ceil(tile_size);
-            let (w_ptr, _) = p.weight.data.device_ptr(stream);
+            tiles += m.div_ceil(tile_m) * n.div_ceil(tile_n);
             let (out_ptr, _) = p.out.device_ptr_mut(stream);
             batch.p[i] = GemmProduct {
-                w: w_ptr,
-                w_scale: w_ptr + u64::try_from(p.weight.padded_rows() * k)?,
+                w: p.w_ptr,
+                w_scale: p.w_scale_ptr,
                 x: values_base + u64::try_from(offset)?,
                 x_scale: scales_base + u64::try_from(offset / 32)?,
                 out: out_ptr,
@@ -400,10 +631,11 @@ impl LinearFp8 {
         };
         // SAFETY: `batch` has the kernel's `gemm8::Batch` layout. Each product's x region
         // holds m rows of k quantized values and m * k / 32 scales, written above on this
-        // stream; each weight holds `padded_rows` rows of k bytes and their scales, and the
-        // kernel reads only rows below n of it (zero-filling the rest) and x rows below m.
-        // It stores only rows below m and columns below n of `out`, sized m x n above. k is a
-        // multiple of 128, the stage width, so every 16-byte copy is aligned and in bounds.
+        // stream; each weight holds at least n rows of k bytes and its per-row or per-32
+        // scales, and the kernel reads only rows below n of it (zero-filling the rest) and
+        // x rows below m. It stores only rows below m and columns below n of `out`, sized
+        // m x n above. k is a multiple of 128, the stage width, so every 16-byte copy is
+        // aligned and in bounds.
         unsafe { launch_by_value(stream, function, config, &batch, false) }
     }
 
@@ -514,12 +746,26 @@ impl LinearFp8 {
                 .iter()
                 .map(|p| p.weight.rows.div_ceil(GEMM_TILE))
                 .sum::<usize>();
-        let (function, tile_size, threads, shared) = if m > GEMM_SMALL_TILE && tiles_128 >= self.sms
-        {
-            (&self.gemm, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
+        let (function, tile_m, tile_n, threads, shared) = if m <= GEMM_THIN_M {
+            (
+                &self.gemm.thin,
+                GEMM_THIN_M,
+                GEMM_THIN_N,
+                GEMM_SMALL_THREADS,
+                GEMM_THIN_SHARED,
+            )
+        } else if m > GEMM_SMALL_TILE && tiles_128 >= self.sms {
+            (
+                &self.gemm.large,
+                GEMM_TILE,
+                GEMM_TILE,
+                GEMM_THREADS,
+                GEMM_SHARED,
+            )
         } else {
             (
-                &self.gemm_small,
+                &self.gemm.small,
+                GEMM_SMALL_TILE,
                 GEMM_SMALL_TILE,
                 GEMM_SMALL_THREADS,
                 GEMM_SMALL_SHARED,
@@ -553,7 +799,7 @@ impl LinearFp8 {
                 m * k,
                 scratch.values.len()
             );
-            tiles += m.div_ceil(tile_size) * n.div_ceil(tile_size);
+            tiles += m.div_ceil(tile_m) * n.div_ceil(tile_n);
             let (w_ptr, _) = p.weight.data.device_ptr(stream);
             let (out_ptr, _) = p.out.device_ptr_mut(stream);
             batch.p[i] = GemmProduct {

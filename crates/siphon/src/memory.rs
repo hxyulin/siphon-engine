@@ -141,6 +141,8 @@ pub const MARKOV_RANK: usize = 256;
 pub const COMMIT_ROWS: usize = 512;
 /// Rows the LM head of a prefill or verify runs at once.
 pub const HEAD_ROWS: usize = 32;
+/// Smallest batched/invariant row count that allocates MXFP8 dense GEMM scratch.
+pub const BATCH_FP8_DENSE_MIN_ROWS: usize = 48;
 /// The FP8 copies of the target pad their rows to a multiple of this.
 pub const FP8_ROW_PAD: usize = 32;
 /// Floats of one prefill attention partial slot: 128 rows of 128 values, a maximum and a sum.
@@ -211,6 +213,8 @@ pub struct PlanInputs<'a> {
     pub weights: WeightFormat,
     /// The output projection's format under [`WeightFormat::Fp8`].
     pub output: OutputProjection,
+    /// Whether opt-in `--prefill-dense fp8` is enabled (adds per-layer MXFP8 copies of `W_o`).
+    pub prefill_dense_fp8: bool,
     pub kv: KvFormat,
     pub draft: DraftChoice<'a>,
     /// Rows of the largest prefill chunk, or 0 if nothing prefills.
@@ -510,8 +514,9 @@ impl Planner {
                 + spec_rows * taps * hidden * 2
                 + visits.len() * spec_seqs * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
                 + sliding_visits * spec_seqs * VERIFY_ROWS * 2 * ring_row_bytes;
-            // Batched DFlash 2 activations, split-KV partials, and shortlist/vocab logits.
-            let draft_scratch = 220 << 20;
+            // Batched DFlash 2 activations, split-KV partials, shortlist/vocab logits, and
+            // pre-allocated MXFP8 dense GEMM scratch (`BatchDflash2::dense`, ~2.3 MiB).
+            let draft_scratch = 224 << 20;
             extra_draft_rings + verify_bufs + draft_scratch
         } else {
             0
@@ -544,7 +549,14 @@ impl Planner {
             weights: target_weight_bytes(inputs.checkpoint, inputs.weights),
             fp8_copies: match inputs.weights {
                 WeightFormat::Bf16 => 0,
-                WeightFormat::Fp8 => fp8_copy_bytes(c, inputs.output),
+                WeightFormat::Fp8 => {
+                    fp8_copy_bytes(c, inputs.output)
+                        + if inputs.prefill_dense_fp8 {
+                            mxfp8_output_bytes(c)
+                        } else {
+                            0
+                        }
+                }
             },
             kv: 0,
             rings,
@@ -727,6 +739,15 @@ fn fp8_copy_bytes(c: &TextConfig, output: OutputProjection) -> usize {
     layers + fp8_matrix(c.vocab_size, hidden)
 }
 
+/// Device bytes of the per-layer MXFP8 block-32 copies of the attention output projection
+/// (`W_o`), allocated lazily when opt-in `--prefill-dense fp8` is enabled.
+#[must_use]
+pub fn mxfp8_output_bytes(c: &TextConfig) -> usize {
+    let hidden = c.hidden_size;
+    let q_dims = c.num_attention_heads * c.head_dim;
+    c.num_hidden_layers * (hidden * q_dims + hidden * (q_dims / 32))
+}
+
 /// Rows of block states a step keeps: the block starts of the prelude, of one pass of the
 /// core and of the coda.
 fn max_blocks(c: &TextConfig) -> usize {
@@ -831,7 +852,7 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
         0
     };
     // At 48+ rows, invariant chunks also allocate MXFP8 scratch for opt-in FP8 dense GEMMs.
-    let dense = if rows >= 48 {
+    let dense = if rows >= BATCH_FP8_DENSE_MIN_ROWS {
         let values = rows * (3 * hidden).max(c.num_attention_heads * c.head_dim);
         values + values / 32
     } else {
@@ -1221,6 +1242,7 @@ mod tests {
                 checkpoint: &checkpoint,
                 weights: WeightFormat::Fp8,
                 output: OutputProjection::default(),
+                prefill_dense_fp8: false,
                 kv: KvFormat::Fp8,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
@@ -1259,6 +1281,7 @@ mod tests {
                 checkpoint: &checkpoint,
                 weights: WeightFormat::Fp8,
                 output: OutputProjection::default(),
+                prefill_dense_fp8: false,
                 kv,
                 draft: DraftChoice::None,
                 prefill_chunk: 2048,
@@ -1363,5 +1386,17 @@ mod tests {
         // Small vocabularies clamp cleanly to `vocab`.
         assert_eq!(shortlist_capacity(100, 128), 128);
         assert_eq!(shortlist_capacity(128, 128), 128);
+    }
+
+    #[test]
+    fn mxfp8_output_and_batch_dense_scratch_match_shapes() {
+        let c = config();
+        // 24 layers x 2304 x (3072 + 96) = 175,177,728 bytes (~167 MiB).
+        assert_eq!(mxfp8_output_bytes(&c), 24 * 2304 * (3072 + 96));
+        // Below BATCH_FP8_DENSE_MIN_ROWS (48), no MXFP8 dense scratch is added.
+        let inv47 = invariant_scratch(&c, 47);
+        let inv48 = invariant_scratch(&c, 48);
+        let dense48 = 48 * (3 * c.hidden_size) + (48 * 3 * c.hidden_size) / 32;
+        assert!(inv48 - inv47 > dense48);
     }
 }

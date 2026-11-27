@@ -16,7 +16,7 @@ use siphon_cuda::{
     Gpu,
     ops::{
         linear::{Gemv, Linear, Start},
-        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8Rows, LinearFp8},
+        linear_fp8::{Fp8Gemm, Fp8Gemv, Fp8Matrix, Fp8RawGemm, Fp8Rows, LinearFp8, Mxfp8Gemm},
     },
 };
 
@@ -251,6 +251,19 @@ fn gemm_matches_reference() -> anyhow::Result<()> {
         ),
         (2048, 3072, &[(2304, 0)]),
         (1921, 2304, &[(2305, 0)]),
+        // m = 32 exercises gemm_fp8_32x64 (B=32 decode / B=4 W=8 verify).
+        (
+            32,
+            2304,
+            &[(3072, 0), (384, 0), (3072, 0), (24, 0), (1024, 1), (1024, 2)],
+        ),
+        // m = 64 exercises gemm_fp8_64x64.
+        (64, 3072, &[(2304, 0)]),
+        // m = 256 exercises DFlash 2 shapes (o: k=4096, down: k=6912, gate+up: k=2304, fc: k=9216).
+        (256, 4096, &[(2304, 0)]),
+        (256, 6912, &[(2304, 0)]),
+        (256, 2304, &[(6912, 0), (6912, 0)]),
+        (256, 9216, &[(2304, 0)]),
         (77, 4608, &[(64, 0), (64, 1), (64, 2)]),
         (2, 2304, &[(130, 0)]),
     ];
@@ -554,11 +567,190 @@ fn time_case(
     Ok((fp8_us, bf16_us))
 }
 
-/// Times `LinearFp8::gemm` (including MXFP8 input quantization) next to `Linear::gemm_bf16`
-/// on the model's prefill dense shapes at M = 512, 1024, 2048. Run with
+/// Checks `LinearFp8::gemm_raw` (separate unpadded E4M3 values + F32 scales, as used by
+/// batched DFlash 2) matches `LinearFp8::gemm` bit for bit across 32x64, 64x64, and
+/// 128x128 tiles and survives CUDA graph capture/replay.
+#[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
+fn gemm_raw_matches_gemm_and_captures_graph() -> anyhow::Result<()> {
+    use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let fp8 = LinearFp8::load(gpu.context())?;
+    let mut scratch = Fp8Rows::new(stream, 256 * 9216)?;
+
+    let cases: &[(usize, usize, &[usize])] = &[
+        (32, 2304, &[4096, 1024, 1024]),
+        (64, 4096, &[2304]),
+        (256, 6912, &[2304]),
+        (256, 2304, &[6912, 6912]),
+        (256, 9216, &[2304]),
+    ];
+    for (ci, &(m, k, ns)) in cases.iter().enumerate() {
+        let x = stream.clone_htod(&hash_values(500 + ci as u32, m * k))?;
+        let mats = ns
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let w = stream.clone_htod(&hash_values(600 + 13 * ci as u32 + i as u32, n * k))?;
+                fp8.quantize_any(stream, &w, n, k)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // Build separate unpadded values + F32 scales buffers matching `ops::draft::Fp8Rows`.
+        let raw_bufs = mats
+            .iter()
+            .map(|mat| -> anyhow::Result<_> {
+                let (bytes, scales) = read_back(&gpu, mat)?;
+                Ok((stream.clone_htod(&bytes)?, stream.clone_htod(&scales)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut want_outs = ns
+            .iter()
+            .map(|&n| stream.alloc_zeros::<bf16>(m * n))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut got_outs = ns
+            .iter()
+            .map(|&n| stream.alloc_zeros::<bf16>(m * n))
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let mut prods: Vec<_> = mats
+                .iter()
+                .zip(&mut want_outs)
+                .map(|(weight, out)| Fp8Gemm {
+                    weight,
+                    x: x.slice(..),
+                    out: out.slice_mut(..),
+                })
+                .collect();
+            fp8.gemm(stream, &mut prods, m, &mut scratch)?;
+        }
+        // Capture and replay `gemm_raw` in a CUDA graph.
+        stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        {
+            let mut prods: Vec<_> = raw_bufs
+                .iter()
+                .zip(ns)
+                .zip(&mut got_outs)
+                .map(|(((vals, sc), &n), out)| Fp8RawGemm {
+                    values: vals.slice(..),
+                    scales: sc.slice(..),
+                    rows: n,
+                    k,
+                    x: x.slice(..),
+                    out: out.slice_mut(..),
+                })
+                .collect();
+            fp8.gemm_raw(stream, &mut prods, m, &mut scratch)?;
+        }
+        let graph = stream
+            .end_capture(CUgraphInstantiate_flags(0))?
+            .ok_or_else(|| anyhow::anyhow!("empty capture"))?;
+        graph.launch()?;
+        for (i, (want, got)) in want_outs.iter().zip(&got_outs).enumerate() {
+            let w = stream.clone_dtoh(want)?;
+            let g = stream.clone_dtoh(got)?;
+            assert_eq!(
+                w, g,
+                "case {ci} ({m} x {k}) product {i}: gemm_raw differed from gemm"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Checks `LinearFp8::quantize_mxfp8` + `LinearFp8::gemm_mxfp8` (block-32 UE8M0 weight
+/// scales, used for `W_o` under `--prefill-dense fp8`) against an F64 reference across
+/// `32x64`, `64x64`, and `128x128` tiles, partial shapes, and CUDA graph capture/replay.
+#[test]
+#[cfg_attr(sm89, ignore = "needs the block-scaled MMA, which sm_89 lacks")]
+fn gemm_mxfp8_matches_reference() -> anyhow::Result<()> {
+    use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+
+    let gpu = Gpu::new(0)?;
+    let stream = gpu.stream();
+    let fp8 = LinearFp8::load(gpu.context())?;
+    let mut scratch = Fp8Rows::new(stream, 2048 * 3072)?;
+    let u = f64::from(f32::EPSILON) / 2.0;
+
+    // Cover 32x64 (m=2, m=32), 64x64 (m=64, m=256), 128x128 (m=2048), and odd n.
+    let cases: &[(usize, usize, usize)] = &[
+        (2, 130, 3072),
+        (32, 2304, 3072),
+        (64, 2304, 3072),
+        (256, 2304, 3072),
+        (2048, 2304, 3072),
+        (37, 2305, 2304),
+    ];
+    for (ci, &(m, n, k)) in cases.iter().enumerate() {
+        let x_host = hash_values(800 + ci as u32, m * k);
+        let mut w_host = hash_values(900 + ci as u32, n * k);
+        // Inject large head outliers into W_o rows to exercise per-32 block scales.
+        for r in (0..n).step_by(17) {
+            w_host[r * k + 64] = bf16::from_f32(32.0);
+        }
+        let x_ref = mxfp8_rows(&x_host);
+        let w_ref = mxfp8_rows(&w_host);
+        let x_dev = stream.clone_htod(&x_host)?;
+        let w_dev = stream.clone_htod(&w_host)?;
+        let mat = fp8.quantize_mxfp8(stream, &w_dev, n, k)?;
+        let mut out_dev = stream.alloc_zeros::<bf16>(m * n)?;
+
+        stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        fp8.gemm_mxfp8(
+            stream,
+            &mut [Mxfp8Gemm {
+                weight: &mat,
+                x: x_dev.slice(..),
+                out: out_dev.slice_mut(..),
+            }],
+            m,
+            &mut scratch,
+        )?;
+        let graph = stream
+            .end_capture(CUgraphInstantiate_flags(0))?
+            .ok_or_else(|| anyhow::anyhow!("empty capture"))?;
+        graph.launch()?;
+
+        let got = stream.clone_dtoh(&out_dev)?;
+        let mut worst = 0.0f64;
+        let ku = k as f64 * u;
+        let gamma = ku / (1.0 - ku);
+        let rows: Vec<usize> = (0..m)
+            .filter(|&r| m <= 64 || r % 37 == 0 || r + 2 >= m || r < 2)
+            .collect();
+        for r in rows {
+            for c in (0..n).filter(|&c| n <= 200 || c % 19 == 0 || c + 2 >= n || c < 2) {
+                let (sum, abs) = w_ref[c * k..(c + 1) * k]
+                    .iter()
+                    .zip(&x_ref[r * k..(r + 1) * k])
+                    .fold((0.0, 0.0), |(sum, abs), (&wv, &xv)| {
+                        let p = wv * xv;
+                        (sum + p, abs + p.abs())
+                    });
+                let bound = gamma * abs;
+                let allowed = bound + bf16_half_ulp(sum + bound.copysign(sum));
+                let err = (got[r * n + c].to_f64() - sum).abs();
+                assert!(
+                    err <= allowed,
+                    "mxfp8 case {ci} ({m} x {n} x {k}) row {r} col {c}: got {}, want {sum}, \
+                     err {err:e} > {allowed:e}",
+                    got[r * n + c]
+                );
+                worst = worst.max(err / allowed);
+            }
+        }
+        eprintln!("gemm_mxfp8 case {ci} ({m} x {n} x {k}): worst error {worst:.3} of bound");
+    }
+    Ok(())
+}
+
+/// Times `LinearFp8::gemm` / `gemm_mxfp8` next to `Linear::gemm_bf16` on batched decode,
+/// batched verify, DFlash 2, and prefill dense shapes. Run with
 /// `cargo test --release --test linear_fp8 -- --ignored --nocapture gemm_fp8_throughput`.
 #[test]
 #[ignore = "timing, not a check"]
+#[expect(clippy::too_many_lines, reason = "benchmarks multiple shapes and formats")]
 fn gemm_fp8_throughput() -> anyhow::Result<()> {
     use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};
     use siphon_cuda::ops::linear::Gemm;
@@ -573,20 +765,23 @@ fn gemm_fp8_throughput() -> anyhow::Result<()> {
     let linear = Linear::load(gpu.context())?;
     let mut scratch = Fp8Rows::new(stream, 3 * 2048 * 4608)?;
 
-    let batches: &[(&str, usize, &[usize])] = &[
+    let batches: &[(&str, usize, &[usize], bool)] = &[
         (
-            "attention inputs",
+            "attn inputs",
             2304,
             &[3072, 384, 3072, 24, 1024, 1024, 32, 32],
+            false,
         ),
-        ("o", 3072, &[2304]),
-        ("gate down (3x)", 4608, &[64, 64, 64]),
+        ("W_o (mxfp8)", 3072, &[2304], true),
+        ("dflash2 o", 4096, &[2304], false),
+        ("dflash2 down", 6912, &[2304], false),
+        ("dflash2 gate+up", 2304, &[6912, 6912], false),
     ];
     eprintln!(
         "{:18} {:>5} {:>10} {:>10} {:>10} {:>10} {:>8}",
         "batch", "m", "fp8 (us)", "fp8 TF/s", "bf16 (us)", "bf16 TF/s", "speedup"
     );
-    for &(label, k, ns) in batches {
+    for &(label, k, ns, mxfp8) in batches {
         let n_sum: usize = ns.iter().sum();
         let bf16_w: Vec<_> = ns
             .iter()
@@ -598,7 +793,19 @@ fn gemm_fp8_throughput() -> anyhow::Result<()> {
             .zip(ns)
             .map(|(w, &n)| fp8.quantize_any(stream, w, n, k))
             .collect::<anyhow::Result<_>>()?;
-        for m in [512, 1024, 2048] {
+        let mxfp8_w: Vec<_> = if mxfp8 {
+            bf16_w
+                .iter()
+                .zip(ns)
+                .map(|(w, &n)| fp8.quantize_mxfp8(stream, w, n, k))
+                .collect::<anyhow::Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        for m in [32, 64, 256, 2048] {
+            if label.starts_with("dflash2") && m > 256 {
+                continue;
+            }
             let x = stream.clone_htod(&hash_values(99, m * k))?;
             let mut outs: Vec<_> = ns
                 .iter()
@@ -609,7 +816,18 @@ fn gemm_fp8_throughput() -> anyhow::Result<()> {
                 const REPLAYS: usize = 5;
                 stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
                 for _ in 0..LAUNCHES {
-                    if use_fp8 {
+                    if use_fp8 && mxfp8 {
+                        let mut products: Vec<_> = mxfp8_w
+                            .iter()
+                            .zip(&mut outs)
+                            .map(|(w, out)| Mxfp8Gemm {
+                                weight: w,
+                                x: x.slice(..),
+                                out: out.slice_mut(..),
+                            })
+                            .collect();
+                        fp8.gemm_mxfp8(stream, &mut products, m, &mut scratch)?;
+                    } else if use_fp8 {
                         let mut products: Vec<_> = fp8_w
                             .iter()
                             .zip(&mut outs)

@@ -135,6 +135,7 @@ impl App {
                             checkpoint: &checkpoint,
                             weights,
                             output,
+                            prefill_dense_fp8: false,
                             kv,
                             draft: match draft {
                                 Draft::Bundled => DraftChoice::Bundled(approx),
