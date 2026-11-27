@@ -44,8 +44,11 @@ use anyhow::{Context as _, ensure};
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView, sys::CUevent_flags};
 use half::bf16;
 use siphon::Checkpoint;
-pub use siphon::tree::{BranchStrategy, SpecTree, SpecTreeConfig};
-use siphon::tree::choose_branch_parent;
+pub use siphon::tree::{BranchStrategy, DEFAULT_MIN_BRANCH_ENTROPY, SpecTree, SpecTreeConfig};
+use siphon::tree::{
+    choose_branch_parent, choose_branch_parent_by_entropy, entropy_nats,
+    sample_without_replacement, secondary_draw_uniform,
+};
 
 mod host;
 mod prefix;
@@ -465,6 +468,7 @@ pub struct SweepRow {
 }
 
 /// The draft and the round loop for one sequence of a [`Model`].
+#[expect(clippy::struct_excessive_bools, reason = "in-flight event flags and coupled mode")]
 pub struct Speculator {
     draft: Draft,
     linear: Linear,
@@ -487,6 +491,14 @@ pub struct Speculator {
     conf_copied: CudaEvent,
     /// Whether `copy_stream` has an in-flight async D2H of single-stream draft confidences.
     conf_in_flight: bool,
+    /// Dedicated event and pinned host buffers for zero-sync single-stream tree draft reads
+    /// (`cand`, `q_probs`, `draft_ids`, and winning tree `path`).
+    tree_dist_copied: CudaEvent,
+    tree_dist_in_flight: bool,
+    pinned_tree_path: PinnedBuf<i32>,
+    pinned_tree_cand: PinnedBuf<i32>,
+    pinned_tree_q: PinnedBuf<f32>,
+    pinned_tree_ids: PinnedBuf<i32>,
     /// Persistent page-locked host buffers for single-stream verify results, draft
     /// confidences, and random drafts.
     pinned_verify_result: PinnedBuf<i32>,
@@ -833,6 +845,18 @@ impl Speculator {
             results_copied: sync_event(stream)?,
             conf_copied: sync_event(stream)?,
             conf_in_flight: false,
+            tree_dist_copied: sync_event(stream)?,
+            tree_dist_in_flight: false,
+            pinned_tree_path: PinnedBuf::zeros(stream, VERIFY_ROWS)?,
+            pinned_tree_cand: PinnedBuf::zeros(
+                stream,
+                STEPS * crate::ops::sample::BETA_CAND_K,
+            )?,
+            pinned_tree_q: PinnedBuf::zeros(
+                stream,
+                STEPS * crate::ops::sample::BETA_CAND_K,
+            )?,
+            pinned_tree_ids: PinnedBuf::zeros(stream, STEPS)?,
             pinned_verify_result: PinnedBuf::zeros(stream, RESULT_LEN)?,
             pinned_conf: PinnedBuf::zeros(stream, STEPS)?,
             pinned_random: PinnedBuf::zeros(stream, STEPS)?,
@@ -862,11 +886,7 @@ impl Speculator {
     /// linear speculation stays bit-for-bit untouched).
     pub fn set_spec_tree(&mut self, config: SpecTreeConfig) -> anyhow::Result<()> {
         if config.enabled {
-            ensure!(
-                (1..=STEPS).contains(&config.secondary_len),
-                "spec tree secondary_len {} out of range 1..={STEPS}",
-                config.secondary_len
-            );
+            config.check()?;
         }
         self.draft.set_tree_top2(config.enabled);
         self.tree_config = config;
@@ -2428,7 +2448,7 @@ impl Speculator {
     /// for them. Generation stops before the work when `room` returns false.
     #[expect(
         clippy::too_many_lines,
-        reason = "main speculative generation loop with plain-step fallback"
+        reason = "main speculative generation loop with plain-step fallback and tree verify"
     )]
     pub fn generate_with_room(
         &mut self,
@@ -2454,6 +2474,10 @@ impl Speculator {
         if self.conf_in_flight {
             self.conf_copied.synchronize()?;
             self.conf_in_flight = false;
+        }
+        if self.tree_dist_in_flight {
+            self.tree_dist_copied.synchronize()?;
+            self.tree_dist_in_flight = false;
         }
         self.round_event_pending = [false; 2];
         self.round_event_slot = 0;
@@ -2490,6 +2514,10 @@ impl Speculator {
             let width = match next {
                 Next::Verify(width) => width,
                 Next::Plain(steps) => {
+                    if self.tree_dist_in_flight {
+                        self.tree_dist_copied.synchronize()?;
+                        self.tree_dist_in_flight = false;
+                    }
                     let start = model.position();
                     let token = match anchor {
                         Some(t) => t,
@@ -2534,6 +2562,10 @@ impl Speculator {
         if self.conf_in_flight {
             self.conf_copied.synchronize()?;
             self.conf_in_flight = false;
+        }
+        if self.tree_dist_in_flight {
+            self.tree_dist_copied.synchronize()?;
+            self.tree_dist_in_flight = false;
         }
         stream.synchronize()?;
         self.stats.wall = started.elapsed();
@@ -2583,6 +2615,10 @@ impl Speculator {
             && let Some(emitted) = self.try_verify_tree_round(model, width)?
         {
             return Ok(emitted);
+        }
+        if self.tree_dist_in_flight {
+            self.tree_dist_copied.synchronize()?;
+            self.tree_dist_in_flight = false;
         }
         let stream = Arc::clone(model.stream());
         let vocab = model.config().unpadded_vocab_size as u64;
@@ -2677,6 +2713,23 @@ impl Speculator {
             self.conf_copied.record(&self.copy_stream)?;
             self.conf_in_flight = true;
         }
+        if drafts == Drafts::Dspark
+            && self.tree_config.enabled
+            && let Some((cand, q_probs)) = self.draft.dflash2_distributions()
+        {
+            self.copy_stream.wait(&self.round_events[slot][2])?;
+            let dist_n = proposals * crate::ops::sample::BETA_CAND_K;
+            self.pinned_tree_cand
+                .copy_from_device(&self.copy_stream, &cand.slice(..dist_n))?;
+            self.pinned_tree_q
+                .copy_from_device(&self.copy_stream, &q_probs.slice(..dist_n))?;
+            self.pinned_tree_ids.copy_from_device(
+                &self.copy_stream,
+                &self.draft.draft_ids().slice(..proposals),
+            )?;
+            self.tree_dist_copied.record(&self.copy_stream)?;
+            self.tree_dist_in_flight = true;
+        }
         // Wait only for verify results (not draft!), overlapping verdict processing,
         // `note_tokens`, and the caller's `on_round` callback with the GPU draft graph.
         self.results_copied.synchronize()?;
@@ -2715,9 +2768,14 @@ impl Speculator {
     }
 
     /// Attempts a 2-branch speculative tree verify round within `width` (`3..=VERIFY_ROWS`)
-    /// total verify rows. Returns `Ok(None)` to fall back to the linear verify path if all
-    /// primary drafts exceed [`SpecTreeConfig::max_branch_confidence`] or if no distinct
-    /// secondary token is available.
+    /// total verify rows. Returns `Ok(None)` to fall back to the linear verify path if the
+    /// gating threshold is not crossed (confidence threshold for greedy/coupled-race, or
+    /// entropy threshold `H(q) > min_branch_entropy` for `--spec-beta` sampling) or if no
+    /// distinct secondary token is available.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "handles both greedy/coupled-race and entropy-gated WOR beta-residual trees"
+    )]
     fn try_verify_tree_round(
         &mut self,
         model: &mut Model,
@@ -2725,32 +2783,157 @@ impl Speculator {
     ) -> anyhow::Result<Option<Vec<u32>>> {
         let stream = Arc::clone(model.stream());
         let proposals = self.width.drafts();
-        let k2 = self.tree_config.secondary_len.min(width - 2);
-        let k1 = width - 1 - k2;
-        if k1 == 0 || k2 == 0 || proposals < k1 + k2 {
+        let max_k2 = self.tree_config.secondary_len.min(width - 2);
+        if max_k2 == 0 || proposals < width - 1 {
             return Ok(None);
         }
         if self.conf_in_flight {
             self.conf_copied.synchronize()?;
             self.conf_in_flight = false;
         }
-        let confidences = stream.clone_dtoh(&self.draft.confidences().slice(..k1))?;
-        let Some(branch_parent) =
-            choose_branch_parent(&self.tree_config, k1, &confidences, None)
-        else {
-            return Ok(None);
+        let had_tree_dist = if self.tree_dist_in_flight {
+            self.tree_dist_copied.synchronize()?;
+            self.tree_dist_in_flight = false;
+            true
+        } else {
+            false
         };
-        let primary_i32 = stream.clone_dtoh(&self.draft.draft_ids().slice(..k1))?;
-        let Some(alt_tokens) = self.draft.rollout_secondary_branch(
-            &stream,
-            branch_parent,
-            primary_i32[branch_parent],
-            k2,
-            proposals,
-        )?
-        else {
-            return Ok(None);
+
+        let start = model.position();
+        let beta_sampling = model.spec_beta().is_some() && !model.sampling().is_greedy();
+        let (k1, k2, branch_parent, primary_i32, alt_tokens) = if beta_sampling {
+            ensure!(
+                self.draft.is_dflash2(),
+                "--spec-beta requires a DFlash 2 drafter"
+            );
+            let k_cand = crate::ops::sample::BETA_CAND_K;
+            let dist_n = proposals * k_cand;
+            let (cand_host, q_host, ids_host) = if had_tree_dist {
+                (
+                    self.pinned_tree_cand.as_slice()[..dist_n].to_vec(),
+                    self.pinned_tree_q.as_slice()[..dist_n].to_vec(),
+                    self.pinned_tree_ids.as_slice()[..proposals].to_vec(),
+                )
+            } else {
+                let (cand_d, q_d) = self
+                    .draft
+                    .dflash2_distributions()
+                    .context("DFlash 2 distributions missing")?;
+                let c = stream.clone_dtoh(&cand_d.slice(..dist_n))?;
+                let q = stream.clone_dtoh(&q_d.slice(..dist_n))?;
+                let ids = stream.clone_dtoh(&self.draft.draft_ids().slice(..proposals))?;
+                (c, q, ids)
+            };
+
+            let k1_max = width - 2;
+            let mut entropies = [0.0f32; STEPS];
+            let mut top1_q = [0.0f32; STEPS];
+            for j in 0..proposals {
+                let row = &q_host[j * k_cand..(j + 1) * k_cand];
+                entropies[j] = entropy_nats(row);
+                top1_q[j] = row.iter().copied().fold(0.0f32, f32::max);
+            }
+
+            let (k1, k2, b) = match self.tree_config.branch_strategy {
+                BranchStrategy::Fixed(_) => {
+                    let k2 = max_k2;
+                    let k1 = width - 1 - k2;
+                    let Some(b) = choose_branch_parent_by_entropy(
+                        &self.tree_config,
+                        k1,
+                        &entropies[..k1],
+                        None,
+                    ) else {
+                        return Ok(None);
+                    };
+                    if b + k2 > proposals {
+                        return Ok(None);
+                    }
+                    (k1, k2, b)
+                }
+                BranchStrategy::LowestConfidence { .. } => {
+                    let Some(b) = choose_branch_parent_by_entropy(
+                        &self.tree_config,
+                        k1_max,
+                        &entropies[..k1_max],
+                        Some(&top1_q[..k1_max]),
+                    ) else {
+                        return Ok(None);
+                    };
+                    // Match offline study (553fd32): choose 5+2 over 6+1 only when the
+                    // next step is confident enough to sustain a 2-node secondary branch.
+                    let next_top1 = top1_q.get(b + 1).copied().unwrap_or(0.0);
+                    let k2 = if max_k2 >= 2
+                        && b < width - 1 - max_k2
+                        && b + max_k2 <= proposals
+                        && next_top1 > 0.65
+                    {
+                        max_k2
+                    } else {
+                        1
+                    };
+                    let k1 = width - 1 - k2;
+                    (k1, k2, b)
+                }
+            };
+
+            let pos = u32::try_from(start + b + 1).context("position does not fit kernels")?;
+            let u_sec = secondary_draw_uniform(model.sampling().seed, pos);
+            let cand_b = &cand_host[b * k_cand..(b + 1) * k_cand];
+            let q_b = &q_host[b * k_cand..(b + 1) * k_cand];
+            let Some(x2) = sample_without_replacement(cand_b, q_b, ids_host[b], u_sec) else {
+                return Ok(None);
+            };
+            let (alt_tokens, branch_q) =
+                self.draft
+                    .rollout_secondary_branch_from(&stream, b, x2, k2, proposals)?;
+
+            // Assemble per-tree-node 16-sparse draft distributions `[m, 16]`.
+            let m = 1 + k1 + k2;
+            let mut tree_cand = vec![-1i32; m * k_cand];
+            let mut tree_q = vec![0.0f32; m * k_cand];
+            for r in 0..k1 {
+                tree_cand[r * k_cand..(r + 1) * k_cand]
+                    .copy_from_slice(&cand_host[r * k_cand..(r + 1) * k_cand]);
+                tree_q[r * k_cand..(r + 1) * k_cand]
+                    .copy_from_slice(&q_host[r * k_cand..(r + 1) * k_cand]);
+            }
+            for t in 0..k2.saturating_sub(1) {
+                let node = 1 + k1 + t;
+                let step = b + 1 + t;
+                tree_cand[node * k_cand..(node + 1) * k_cand]
+                    .copy_from_slice(&cand_host[step * k_cand..(step + 1) * k_cand]);
+                tree_q[node * k_cand..(node + 1) * k_cand]
+                    .copy_from_slice(&branch_q[(t + 1) * k_cand..(t + 2) * k_cand]);
+            }
+            model.set_verify_tree_draft_dist(&tree_cand, &tree_q)?;
+            (k1, k2, b, ids_host[..k1].to_vec(), alt_tokens)
+        } else {
+            let k2 = max_k2;
+            let k1 = width - 1 - k2;
+            if k1 == 0 {
+                return Ok(None);
+            }
+            let confidences = stream.clone_dtoh(&self.draft.confidences().slice(..k1))?;
+            let Some(branch_parent) =
+                choose_branch_parent(&self.tree_config, k1, &confidences, None)
+            else {
+                return Ok(None);
+            };
+            let primary_i32 = stream.clone_dtoh(&self.draft.draft_ids().slice(..k1))?;
+            let Some(alt_tokens) = self.draft.rollout_secondary_branch(
+                &stream,
+                branch_parent,
+                primary_i32[branch_parent],
+                k2,
+                proposals,
+            )?
+            else {
+                return Ok(None);
+            };
+            (k1, k2, branch_parent, primary_i32, alt_tokens)
         };
+
         let tree = SpecTree::two_branch(k1, branch_parent, k2)?;
         let mut tree_drafts = Vec::with_capacity(k1 + k2);
         for &tok in &primary_i32 {
@@ -2761,7 +2944,6 @@ impl Speculator {
         let slot = self.round_event_slot;
         self.flush_round_event(slot)?;
         self.round_events[slot][0].record(&stream)?;
-        let start = model.position();
         let pending = model.start_verify_tree(
             VerifyTreeTokens::WithDeviceAnchor(&tree_drafts),
             &tree,
@@ -2780,6 +2962,12 @@ impl Speculator {
         self.round_events[slot][2].record(&stream)?;
         self.round_event_pending[slot] = true;
         self.round_event_slot ^= 1;
+        self.copy_stream.wait(&self.round_events[slot][1])?;
+        self.pinned_verify_result
+            .copy_from_device(&self.copy_stream, &model.verify_result_device()?)?;
+        self.pinned_tree_path
+            .copy_from_device(&self.copy_stream, &model.verify_tree_path_device()?)?;
+        self.results_copied.record(&self.copy_stream)?;
         if matches!(self.width, Width::Adaptive(_)) {
             self.copy_stream.wait(&self.round_events[slot][2])?;
             self.pinned_conf.copy_from_device(
@@ -2789,7 +2977,26 @@ impl Speculator {
             self.conf_copied.record(&self.copy_stream)?;
             self.conf_in_flight = true;
         }
-        let verdict = model.finish_verify_tree(pending)?;
+        if let Some((cand, q_probs)) = self.draft.dflash2_distributions() {
+            self.copy_stream.wait(&self.round_events[slot][2])?;
+            let dist_n = proposals * crate::ops::sample::BETA_CAND_K;
+            self.pinned_tree_cand
+                .copy_from_device(&self.copy_stream, &cand.slice(..dist_n))?;
+            self.pinned_tree_q
+                .copy_from_device(&self.copy_stream, &q_probs.slice(..dist_n))?;
+            self.pinned_tree_ids.copy_from_device(
+                &self.copy_stream,
+                &self.draft.draft_ids().slice(..proposals),
+            )?;
+            self.tree_dist_copied.record(&self.copy_stream)?;
+            self.tree_dist_in_flight = true;
+        }
+        self.results_copied.synchronize()?;
+        let verdict = model.complete_verify_tree(
+            pending,
+            self.pinned_verify_result.as_slice(),
+            self.pinned_tree_path.as_slice(),
+        )?;
         let a = verdict.accepted;
         if let Some(hook) = self.round_hook.as_mut() {
             hook(&RoundRecord {

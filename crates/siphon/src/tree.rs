@@ -23,6 +23,11 @@ pub const MAX_TREE_NODES: usize = VERIFY_ROWS;
 pub const CONV_KERNEL: usize = 4;
 /// Number of carried history rows in each conv state (`CONV_KERNEL - 1`).
 pub const CONV_STATE_ROWS: usize = CONV_KERNEL - 1;
+/// Default minimum draft Shannon entropy (in nats) required to branch when stochastic
+/// `--spec-beta` residual tree verification is active.
+pub const DEFAULT_MIN_BRANCH_ENTROPY: f32 = 0.80;
+/// Domain-separated RNG salt for without-replacement secondary root draw `x2 ~ q2(. | x1)`.
+pub const SECONDARY_DRAW_SALT: u64 = 0xd1b5_4a32_d192_ed03;
 
 /// How a 2-branch speculative tree chooses the node where the secondary branch diverges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +59,13 @@ pub struct SpecTreeConfig {
     pub branch_strategy: BranchStrategy,
     /// Skip branching and verify a full linear chain when the best branch point's primary
     /// confidence is at least this threshold (e.g. `0.98`). Set to `1.0` to always branch.
+    /// Used for greedy and coupled-race tree verification.
     pub max_branch_confidence: f32,
+    /// Minimum draft Shannon entropy `H(q)` (in nats) required to branch when stochastic
+    /// `--spec-beta` residual tree verification is active (default `0.80`). Below this
+    /// threshold, speculation stays linear (`1 + 7`) so it never sacrifices trailing draft
+    /// slots on low-entropy positions.
+    pub min_branch_entropy: f32,
 }
 
 impl Default for SpecTreeConfig {
@@ -64,6 +75,7 @@ impl Default for SpecTreeConfig {
             secondary_len: 2,
             branch_strategy: BranchStrategy::default(),
             max_branch_confidence: 0.98,
+            min_branch_entropy: DEFAULT_MIN_BRANCH_ENTROPY,
         }
     }
 }
@@ -93,6 +105,11 @@ impl SpecTreeConfig {
                 && (0.0..=1.0).contains(&self.max_branch_confidence),
             "max_branch_confidence is {}, expected in [0, 1]",
             self.max_branch_confidence
+        );
+        ensure!(
+            self.min_branch_entropy.is_finite() && self.min_branch_entropy >= 0.0,
+            "min_branch_entropy is {}, expected >= 0",
+            self.min_branch_entropy
         );
         if let BranchStrategy::Fixed(b) = self.branch_strategy {
             ensure!(
@@ -389,6 +406,114 @@ pub fn choose_branch_parent(
             best.map(|(b, _)| b)
         }
     }
+}
+
+/// Shannon entropy `H(q) = -sum_{k: q_k > 0} q_k ln(q_k)` in nats for a sparse probability
+/// vector `probs`.
+#[must_use]
+pub fn entropy_nats(probs: &[f32]) -> f32 {
+    let mut h = 0.0f64;
+    for &p in probs {
+        if p > 0.0 && p.is_finite() {
+            let pf = f64::from(p);
+            h -= pf * pf.ln();
+        }
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "entropy in nats fits f32")]
+    let h = h.max(0.0) as f32;
+    h
+}
+
+/// Entropy-gated branch parent selection for stochastic `--spec-beta` 2-branch residual
+/// tree verification.
+///
+/// Only steps `b` with `entropies[b] > config.min_branch_entropy` are eligible; if none
+/// qualify, returns `None` so the round stays linear (`1 + 7`). Among eligible steps in
+/// `0..limit`, maximizes survival-weighted entropy `survival(b) * entropies[b]` when
+/// `confidences` is provided (or raw `entropies[b]` otherwise).
+#[must_use]
+pub fn choose_branch_parent_by_entropy(
+    config: &SpecTreeConfig,
+    primary_len: usize,
+    entropies: &[f32],
+    confidences: Option<&[f32]>,
+) -> Option<usize> {
+    if !config.enabled || primary_len == 0 || entropies.is_empty() {
+        return None;
+    }
+    match config.branch_strategy {
+        BranchStrategy::Fixed(b) => {
+            let b = b.min(primary_len - 1);
+            let h = entropies.get(b).copied().unwrap_or(0.0);
+            (h > config.min_branch_entropy).then_some(b)
+        }
+        BranchStrategy::LowestConfidence { max_depth } => {
+            let limit = primary_len.min(max_depth + 1).min(entropies.len());
+            let mut survival = 1.0f64;
+            let mut best: Option<(usize, f64)> = None;
+            for (b, &h) in entropies[..limit].iter().enumerate() {
+                if h.is_finite() && h > config.min_branch_entropy {
+                    let score = survival * f64::from(h);
+                    if best.is_none_or(|(_, best_score)| score > best_score) {
+                        best = Some((b, score));
+                    }
+                }
+                if let Some(conf) = confidences {
+                    let c = f64::from(conf.get(b).copied().unwrap_or(0.0).clamp(0.0, 1.0));
+                    survival *= c;
+                }
+            }
+            best.map(|(b, _)| b)
+        }
+    }
+}
+
+/// Deterministic 53-bit uniform in `[0, 1)` for drawing the without-replacement secondary
+/// root token at `(seed, position)`, independent of `kAcceptSalt`, `kAccept2Salt`, and
+/// `kResidSalt`.
+#[must_use]
+pub fn secondary_draw_uniform(seed: u64, position: u32) -> f64 {
+    let z = crate::race::mix64(crate::race::draw_key(seed, position) ^ SECONDARY_DRAW_SALT);
+    ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+/// Draws a secondary root token `x2 != exclude` **without replacement** from the sparse
+/// distribution `(cand, q_probs)` using `u` in `[0, 1)`, i.e. from
+/// `q2(y) = q(y) / (1 - q(exclude))` for `y != exclude`.
+///
+/// Returns `None` if no valid candidate outside `exclude` has positive probability.
+#[must_use]
+pub fn sample_without_replacement(
+    cand: &[i32],
+    q_probs: &[f32],
+    exclude: i32,
+    u: f64,
+) -> Option<i32> {
+    if cand.len() != q_probs.len() {
+        return None;
+    }
+    let mut rem = 0.0f64;
+    for (&id, &p) in cand.iter().zip(q_probs) {
+        if id >= 0 && id != exclude && p > 0.0 && p.is_finite() {
+            rem += f64::from(p);
+        }
+    }
+    if rem <= 1e-7 {
+        return None;
+    }
+    let target = u.clamp(0.0, 1.0 - f64::EPSILON) * rem;
+    let mut acc = 0.0f64;
+    let mut last_valid = None;
+    for (&id, &p) in cand.iter().zip(q_probs) {
+        if id >= 0 && id != exclude && p > 0.0 && p.is_finite() {
+            last_valid = Some(id);
+            acc += f64::from(p);
+            if target < acc {
+                return Some(id);
+            }
+        }
+    }
+    last_valid
 }
 
 /// Result of greedy or coupled-race acceptance on a [`SpecTree`].
@@ -1105,6 +1230,68 @@ mod tests {
         assert_eq!(
             choose_branch_parent(&fixed, 5, &[0.90, 0.30, 0.20, 0.90, 0.90], None),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn entropy_gating_and_without_replacement_draw() {
+        assert!((entropy_nats(&[1.0, 0.0, 0.0]) - 0.0).abs() < 1e-6);
+        let unif4 = [0.25f32; 4];
+        assert!((entropy_nats(&unif4) - 4.0f32.ln()).abs() < 1e-5);
+
+        let cfg = SpecTreeConfig::two_branch();
+        // All below 0.80 -> stay linear (None).
+        assert_eq!(
+            choose_branch_parent_by_entropy(&cfg, 5, &[0.2, 0.5, 0.79, 0.1, 0.4], None),
+            None
+        );
+        // Step 0 confident (H=0.1, c=0.95), step 1 high entropy (H=1.4) -> picks 1.
+        assert_eq!(
+            choose_branch_parent_by_entropy(
+                &cfg,
+                5,
+                &[0.10, 1.40, 0.90, 0.20, 0.10],
+                Some(&[0.95, 0.40, 0.60, 0.90, 0.95])
+            ),
+            Some(1)
+        );
+        // Step 0 already above 0.80 (H=0.95, c=0.60) vs step 2 (H=1.05): survival-weighted
+        // prefers earlier step 0 (0.95 > 0.60 * 0.80 * 1.05 = 0.504).
+        assert_eq!(
+            choose_branch_parent_by_entropy(
+                &cfg,
+                5,
+                &[0.95, 0.30, 1.05, 0.10, 0.10],
+                Some(&[0.60, 0.80, 0.50, 0.90, 0.95])
+            ),
+            Some(0)
+        );
+
+        // Without-replacement draw matches exact renormalized distribution q(. | != x1).
+        let cand = [10i32, 20, 30, 40];
+        let q = [0.40f32, 0.30, 0.20, 0.10];
+        let exclude = 10i32; // rem = 0.60 -> [0.5, 1/3, 1/6]
+        let trials = 120_000u32;
+        let mut counts = [0usize; 4];
+        for pos in 0..trials {
+            let u = secondary_draw_uniform(42, pos);
+            let x2 = sample_without_replacement(&cand, &q, exclude, u).expect("valid draw");
+            assert_ne!(x2, exclude);
+            let idx = cand.iter().position(|&c| c == x2).expect("in cand");
+            counts[idx] += 1;
+        }
+        assert_eq!(counts[0], 0);
+        for (i, want) in [(1, 0.5f64), (2, 1.0 / 3.0), (3, 1.0 / 6.0)] {
+            let emp = counts[i] as f64 / f64::from(trials);
+            assert!(
+                (emp - want).abs() < 0.005,
+                "idx {i}: emp={emp:.4} vs want={want:.4}"
+            );
+        }
+        // Point-mass q -> returns None.
+        assert_eq!(
+            sample_without_replacement(&cand, &[1.0, 0.0, 0.0, 0.0], 10, 0.5),
+            None
         );
     }
 }

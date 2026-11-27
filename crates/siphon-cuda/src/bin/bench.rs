@@ -192,6 +192,8 @@ mod linux {
         spec_tree_k2: usize,
         /// Branching strategy for `--spec-tree` (`--spec-tree-branch auto|N`, default auto).
         spec_tree_branch: Option<usize>,
+        /// Minimum draft entropy (nats) to branch under `--spec-tree --spec-beta` (default 0.80).
+        spec_tree_entropy: f32,
         kv_options: KvOptions,
         moe_pruning: MoePruning,
     }
@@ -245,6 +247,7 @@ mod linux {
         let mut spec_tree = false;
         let mut spec_tree_k2 = 2usize;
         let mut spec_tree_branch = None;
+        let mut spec_tree_entropy = siphon_cuda::spec::DEFAULT_MIN_BRANCH_ENTROPY;
         let mut kv_options = KvOptions::default();
         let mut moe_top_k = None;
         let mut moe_min_k = None;
@@ -314,6 +317,7 @@ mod linux {
                     let v = value()?;
                     spec_tree_branch = if v == "auto" { None } else { Some(v.parse()?) };
                 }
+                "--spec-tree-entropy" => spec_tree_entropy = value()?.parse()?,
                 _ if arg.starts_with("--") => anyhow::bail!("unknown flag {arg}\n{USAGE}"),
                 _ => {
                     ensure!(model.is_none(), "{USAGE}");
@@ -399,6 +403,7 @@ mod linux {
             spec_tree,
             spec_tree_k2,
             spec_tree_branch,
+            spec_tree_entropy,
             kv_options,
             moe_pruning,
         })
@@ -1232,6 +1237,7 @@ mod linux {
                         enabled: true,
                         secondary_len: args.spec_tree_k2,
                         branch_strategy,
+                        min_branch_entropy: args.spec_tree_entropy,
                         ..SpecTreeConfig::two_branch()
                     })?;
                 }
@@ -1391,6 +1397,9 @@ mod linux {
             for &context in contexts {
                 let prompt = prompt(text, context, vocab);
                 let mut rates = Vec::with_capacity(runs.len());
+                let mut total_tree_rounds = 0usize;
+                let mut total_secondary_accepted = 0usize;
+                let mut total_rounds = 0usize;
                 for &sampling in &runs {
                     model.set_sampling(sampling);
                     model.reset()?;
@@ -1444,6 +1453,9 @@ mod linux {
                         .map(|a| format!("{:.1}%", a * 100.0))
                         .collect();
                     rates.push((spec_rate, plain_rate, stats.tokens_per_round()));
+                    total_rounds += stats.rounds;
+                    total_tree_rounds += stats.tree_rounds;
+                    total_secondary_accepted += stats.secondary_accepted;
                     if args.sampling.is_some() {
                         println!("seed {}:", sampling.seed);
                     }
@@ -1505,10 +1517,17 @@ mod linux {
                     }
                 }
                 if let Some((t, p, m)) = args.sampling {
+                    let tree_note = if args.spec_tree {
+                        format!(
+                            ", tree_rounds {total_tree_rounds}/{total_rounds}, secondary_accepted {total_secondary_accepted}"
+                        )
+                    } else {
+                        String::new()
+                    };
                     println!(
                         "context {} tokens, temperature {t}, top-p {p}, min-p {m}, median of {} seeds: \
                          speculation {:.1} tok/s, plain decode {:.1} tok/s, {:.3} tokens per \
-                         round\n",
+                         round{tree_note}\n",
                         prompt.len(),
                         rates.len(),
                         median(rates.iter().map(|r| r.0)),

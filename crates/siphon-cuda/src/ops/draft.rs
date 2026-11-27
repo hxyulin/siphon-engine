@@ -2446,7 +2446,8 @@ impl DraftKernels {
     }
 
     /// Tree-aware variant of [`Self::select`]: produces identical primary `ids` and
-    /// `confidence` plus runner-up `alt_ids` and `alt_conf` at every step `0..steps`.
+    /// `confidence` plus runner-up `alt_ids` and `alt_conf`, and optional normalized
+    /// filtered probabilities `q_probs` (`[7, 16]`), at every step `0..steps`.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn select_top2(
         &self,
@@ -2463,6 +2464,7 @@ impl DraftKernels {
         confidence: &mut CudaSlice<f32>,
         alt_ids: &mut CudaSlice<i32>,
         alt_conf: &mut CudaSlice<f32>,
+        q_probs: Option<&mut CudaSlice<f32>>,
         race: &CudaSlice<u32>,
     ) -> anyhow::Result<()> {
         ensure!(
@@ -2479,6 +2481,9 @@ impl DraftKernels {
         );
         check_len("cand", cand.len(), (BLOCK - 1) * TOP_K)?;
         check_len("unary", unary.len(), (BLOCK - 1) * TOP_K)?;
+        if let Some(q) = &q_probs {
+            check_len("q_probs", q.len(), (BLOCK - 1) * TOP_K)?;
+        }
         ensure!(
             hp.len() >= steps * RANK,
             "hp has {} elements, too few for {steps} rows",
@@ -2502,6 +2507,7 @@ impl DraftKernels {
             .ptr_mut(confidence, stream)
             .ptr_mut(alt_ids, stream)
             .ptr_mut(alt_conf, stream)
+            .opt_mut(q_probs, stream)
             .ptr(race, stream);
         // SAFETY: matches `draft_select_top2`; all inputs are checked for `steps` and
         // read after `pdl_wait`.
@@ -2511,7 +2517,9 @@ impl DraftKernels {
 
     /// Rolls out `k2` conditioned tokens for a secondary tree branch starting at
     /// `branch_step` with first token `alt_first`, using DFlash 2's bigram selector over
-    /// the round's already-computed `cand`, `unary` and `hp`.
+    /// the round's already-computed `cand`, `unary` and `hp`, optionally recording the
+    /// conditioned normalized filtered probabilities `branch_q_probs[t, 0..16]` for
+    /// `t = 1..k2`.
     #[expect(clippy::too_many_arguments, reason = "one argument per kernel input")]
     pub fn select_branch(
         &self,
@@ -2528,6 +2536,7 @@ impl DraftKernels {
         max_steps: usize,
         softcap: f32,
         branch_ids: &mut CudaSlice<i32>,
+        branch_q_probs: Option<&mut CudaSlice<f32>>,
         race: &CudaSlice<u32>,
     ) -> anyhow::Result<()> {
         ensure!(
@@ -2536,6 +2545,14 @@ impl DraftKernels {
         );
         check_len("cand", cand.len(), (BLOCK - 1) * TOP_K)?;
         check_len("unary", unary.len(), (BLOCK - 1) * TOP_K)?;
+        if let Some(q) = &branch_q_probs {
+            ensure!(
+                q.len() >= k2 * TOP_K,
+                "branch_q_probs has {} elements, need at least {}",
+                q.len(),
+                k2 * TOP_K
+            );
+        }
         ensure!(
             hp.len() >= max_steps * RANK,
             "hp has {} elements, too few for {max_steps} rows",
@@ -2559,6 +2576,7 @@ impl DraftKernels {
             .i32(i32_arg("max_steps", max_steps)?)
             .f32(softcap)
             .ptr_mut(branch_ids, stream)
+            .opt_mut(branch_q_probs, stream)
             .ptr(race, stream);
         // SAFETY: matches `draft_select_branch`; all inputs are checked for `max_steps`
         // and read after `pdl_wait`.

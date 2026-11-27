@@ -141,6 +141,7 @@ pub struct Spec {
     accept_beta_batch: CudaFunction,
     pack_verify_tokens_batch: CudaFunction,
     accept_tree: CudaFunction,
+    accept_tree_beta: CudaFunction,
     kv_commit_tree: CudaFunction,
     conv_commit_tree: CudaFunction,
     taps_compact_tree: CudaFunction,
@@ -166,6 +167,7 @@ impl Spec {
             accept_beta_batch: f("accept_beta_batch")?,
             pack_verify_tokens_batch: f("pack_verify_tokens_batch")?,
             accept_tree: f("accept_tree")?,
+            accept_tree_beta: f("accept_tree_beta")?,
             kv_commit_tree: f("kv_commit_tree")?,
             conv_commit_tree: f("conv_commit_tree")?,
             taps_compact_tree: f("taps_compact_tree")?,
@@ -808,6 +810,60 @@ impl Spec {
         // const int*, const unsigned*, int, int*, int*, int*)`; all buffers have the sizes
         // checked above.
         unsafe { launch.launch(one_block(1)) }?;
+        Ok(())
+    }
+
+    /// Beta-relaxed / maximal-coupling tree acceptance over `rows` (`1..=VERIFY_ROWS`)
+    /// nodes in topological order: follows `accept_flag[u]` (`1` primary, `2` secondary,
+    /// `0` stop, `-1` greedy comparison), or forces `forced_path[0..*forced_len]` when
+    /// `*forced_len != 0`. Writes `result`, `path[0..=accepted]`, and `anchor`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel signature")]
+    pub fn accept_tree_beta(
+        &self,
+        stream: &CudaStream,
+        tokens: &impl DeviceIn<i32>,
+        argmax: &impl DeviceIn<i32>,
+        accept_flag: &impl DeviceIn<i32>,
+        primary_child: &CudaSlice<i32>,
+        secondary_child: &CudaSlice<i32>,
+        forced_path: &CudaSlice<i32>,
+        forced_len: &CudaSlice<u32>,
+        rows: usize,
+        result: &mut CudaSlice<i32>,
+        path: &mut CudaSlice<i32>,
+        anchor: &mut CudaSlice<i32>,
+    ) -> anyhow::Result<()> {
+        let (tokens, argmax, accept_flag) = (tokens.view(), argmax.view(), accept_flag.view());
+        ensure!(
+            (1..=VERIFY_ROWS).contains(&rows),
+            "{rows} rows, expected 1 to {VERIFY_ROWS}"
+        );
+        check_len("tokens", tokens.len(), rows)?;
+        check_len("argmax", argmax.len(), rows)?;
+        check_len("accept_flag", accept_flag.len(), rows)?;
+        check_len("primary_child", primary_child.len(), VERIFY_ROWS)?;
+        check_len("secondary_child", secondary_child.len(), VERIFY_ROWS)?;
+        check_len("forced_path", forced_path.len(), VERIFY_ROWS)?;
+        check_len("forced_len", forced_len.len(), 1)?;
+        check_len("result", result.len(), RESULT_LEN)?;
+        check_len("path", path.len(), VERIFY_ROWS)?;
+        check_len("anchor", anchor.len(), 1)?;
+        let m = i32::try_from(rows)?;
+        let mut args = KernelArgs::default();
+        args.ptr(&tokens, stream)
+            .ptr(&argmax, stream)
+            .ptr(&accept_flag, stream)
+            .ptr(primary_child, stream)
+            .ptr(secondary_child, stream)
+            .ptr(forced_path, stream)
+            .ptr(forced_len, stream)
+            .i32(m)
+            .ptr_mut(result, stream)
+            .ptr_mut(path, stream)
+            .ptr_mut(anchor, stream);
+        // SAFETY: matches `accept_tree_beta`; all buffers have the checked sizes and reads
+        // wait at `pdl_wait()`.
+        unsafe { args.launch_pdl(stream, &self.accept_tree_beta, one_block(1)) }?;
         Ok(())
     }
 

@@ -411,3 +411,214 @@ fn tree_speculation_greedy_and_sampled() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Full-model statistical proof that entropy-gated without-replacement 2-branch residual
+/// tree verification (`--spec-tree --spec-beta 1.0`) preserves the exact target
+/// distribution on `regex-readme` (1,000 seeds per setting, two-sample chi-square against
+/// plain `Model::step`, z < 4.5, with active tree rounds and secondary branch wins).
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL), DFlash 2 (SIPHON_DFLASH), and ~21 GB GPU memory"]
+#[expect(clippy::too_many_lines, reason = "1,000-seed chi-square verification across two sampling settings")]
+fn tree_speculation_beta_lossless_distribution() -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use siphon_cuda::{ops::attention::KvFormat, weights::WeightFormat};
+    const DRAWN: usize = 4;
+
+    let dflash_dir = env::var_os("SIPHON_DFLASH")
+        .or_else(|| env::var_os("SIPHON_DFLASH2"))
+        .map(PathBuf::from)
+        .context("set SIPHON_DFLASH (or SIPHON_DFLASH2) to the DFlash 2 drafter directory")?;
+    let cap_dir = env::var_os("SIPHON_CAPTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference/out"),
+        PathBuf::from,
+    );
+    let readme_path = cap_dir.join("regex-readme-chunked.safetensors");
+    let bytes = fs::read(&readme_path)
+        .with_context(|| format!("reading {}", readme_path.display()))?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    let view = tensors.tensor("tokens")?;
+    ensure!(view.dtype() == Dtype::I32, "tokens are {:?}", view.dtype());
+    let readme: Vec<u32> = view
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| Ok(u32::try_from(i32::from_le_bytes(*b))?))
+        .collect::<anyhow::Result<_>>()?;
+
+    let capacity = 4096usize;
+    let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
+    let gpu = Gpu::new(0)?;
+    let config = TextConfig::load(&model_dir)?;
+    let passes = config.loop_config.num_passes;
+    let checkpoint = Checkpoint::open(&model_dir)?;
+    let weights = Weights::load(&checkpoint, &config, gpu.stream())?;
+    let mut model = Model::with_formats(
+        &gpu,
+        config,
+        weights,
+        passes,
+        capacity,
+        KvFormat::Fp8,
+        WeightFormat::Fp8,
+    )?;
+    model.enable_sampling()?;
+
+    let draft = load_draft(
+        &mut model,
+        &checkpoint,
+        DraftSource::Dflash(&dflash_dir),
+        capacity,
+        &DraftOptions::fast(),
+    )?;
+    let mut speculator = Speculator::with_draft(&model, draft, Width::Fixed(7))?;
+
+    // Find highest-entropy prefix in regex-readme (same procedure as tests/sampling.rs).
+    model.set_sampling(Sampling::GREEDY);
+    let mut best = (120usize, f64::MIN);
+    for cut in (120..=readme.len().min(1500)).step_by(20) {
+        model.reset()?;
+        model.prefill(&readme[..cut], DEFAULT_PREFILL_CHUNK, PrefillLogits::Last)?;
+        let logits = model.logits()?;
+        let max = logits.iter().copied().fold(f32::MIN, f32::max);
+        let w: Vec<f64> = logits.iter().map(|&l| f64::from(l - max).exp()).collect();
+        let total: f64 = w.iter().sum();
+        let h: f64 = w
+            .iter()
+            .filter(|&&v| v > 0.0)
+            .map(|&v| -(v / total) * (v / total).ln())
+            .sum();
+        if h > best.1 {
+            best = (cut, h);
+        }
+    }
+    let prompt = &readme[..best.0];
+    println!(
+        "regex-readme open_cut: {} tokens, next-token entropy {:.2} nats",
+        best.0, best.1
+    );
+
+    let seeds: u64 = env::var("SIPHON_SAMPLING_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+
+    let compare = |a: &[Vec<u32>], b: &[Vec<u32>]| -> (f64, f64) {
+        let mut counts: HashMap<&[u32], (f64, f64)> = HashMap::new();
+        for k in a {
+            counts.entry(k.as_slice()).or_default().0 += 1.0;
+        }
+        for k in b {
+            counts.entry(k.as_slice()).or_default().1 += 1.0;
+        }
+        let (mut stat, mut dof) = (0.0f64, -1.0f64);
+        let mut pooled = (0.0, 0.0);
+        for &(x, y) in counts.values() {
+            if x + y < 10.0 {
+                pooled.0 += x;
+                pooled.1 += y;
+            } else {
+                stat += (x - y).powi(2) / (x + y);
+                dof += 1.0;
+            }
+        }
+        if pooled.0 + pooled.1 > 0.0 {
+            stat += (pooled.0 - pooled.1).powi(2) / (pooled.0 + pooled.1);
+            dof += 1.0;
+        }
+        let dof = dof.max(1.0);
+        let a_wh = 2.0 / (9.0 * dof);
+        let z = ((stat / dof).cbrt() - (1.0 - a_wh)) / a_wh.sqrt();
+        (z, dof)
+    };
+
+    model.set_sampling(Sampling::GREEDY);
+    model.reset()?;
+    let first_greedy = speculator.prefill(&mut model, prompt, DEFAULT_PREFILL_CHUNK)?;
+    let saved = model.save_state()?;
+
+    let settings = [
+        ("T=0.8, p=0.95, m=0.05", 0.8f32, 0.95f32, 0.05f32),
+        ("T=1.0, p=0.95, m=0.00", 1.0f32, 0.95f32, 0.0f32),
+    ];
+    let mut worst = f64::MIN;
+
+    for (setting_idx, (name, temperature, top_p, min_p)) in (0u64..).zip(settings) {
+        let make_s = |tag: u64, seed: u64| {
+            Sampling::new(
+                temperature,
+                0,
+                top_p,
+                min_p,
+                (setting_idx << 40) | (tag << 32) | seed,
+            )
+        };
+
+        // 1. Plain `Model::step` reference.
+        model.set_spec_beta(None)?;
+        let mut plain = Vec::with_capacity(usize::try_from(seeds)?);
+        for seed in 0..seeds {
+            let sampling = make_s(1, seed)?;
+            model.set_sampling(sampling);
+            model.restore_state(&saved)?;
+            let mut tok = first_greedy;
+            let mut seq = Vec::with_capacity(DRAWN);
+            for _ in 0..DRAWN {
+                tok = model.step(tok, None)?;
+                seq.push(tok);
+            }
+            plain.push(seq);
+        }
+
+        // 2. Entropy-gated without-replacement 2-branch residual tree (`--spec-tree --spec-beta 1.0`).
+        model.set_spec_beta(Some(1.0))?;
+        speculator.set_spec_tree(SpecTreeConfig::two_branch())?;
+        let mut tree_seqs = Vec::with_capacity(usize::try_from(seeds)?);
+        let (mut rounds, mut emitted, mut tree_rounds, mut secondary_wins) = (0usize, 0usize, 0usize, 0usize);
+        for seed in 0..seeds {
+            let sampling = make_s(4, seed)?;
+            model.set_sampling(sampling);
+            model.restore_state(&saved)?;
+            speculator.restart(&mut model, first_greedy)?;
+            let mut seq = speculator.generate(&mut model, DRAWN, Drafts::Dspark)?;
+            let st = speculator.stats();
+            rounds += st.rounds;
+            emitted += st.emitted;
+            tree_rounds += st.tree_rounds;
+            secondary_wins += st.secondary_accepted;
+            seq.truncate(DRAWN);
+            tree_seqs.push(seq);
+        }
+
+        println!(
+            "P2 beta=1.0 tree ({name}): {seeds} seeds, {:.3} tok/rd, tree_rounds={tree_rounds}/{rounds}, \
+             secondary_accepted={secondary_wins}",
+            emitted as f64 / rounds.max(1) as f64
+        );
+        ensure!(
+            tree_rounds > 0 && secondary_wins > 0,
+            "P2 ({name}): expected active tree rounds ({tree_rounds}) and secondary wins ({secondary_wins})"
+        );
+        for j in 0..DRAWN {
+            let a: Vec<Vec<u32>> = tree_seqs.iter().map(|t| vec![t[j]]).collect();
+            let b: Vec<Vec<u32>> = plain.iter().map(|t| vec![t[j]]).collect();
+            let (z, dof) = compare(&a, &b);
+            println!("  token {}: chi-square z {z:.2} over {dof:.0} dof", j + 1);
+            worst = worst.max(z);
+        }
+        let pairs_a: Vec<Vec<u32>> = tree_seqs.iter().map(|t| t[..2].to_vec()).collect();
+        let pairs_b: Vec<Vec<u32>> = plain.iter().map(|t| t[..2].to_vec()).collect();
+        let (z12, dof12) = compare(&pairs_a, &pairs_b);
+        println!("  tokens 1-2: chi-square z {z12:.2} over {dof12:.0} dof");
+        worst = worst.max(z12);
+        let (z14, dof14) = compare(&tree_seqs, &plain);
+        println!("  tokens 1-4: chi-square z {z14:.2} over {dof14:.0} dof");
+        worst = worst.max(z14);
+    }
+
+    ensure!(
+        worst < 4.5,
+        "P2 beta=1.0 tree distribution differs from plain step (worst z {worst:.2})"
+    );
+    Ok(())
+}

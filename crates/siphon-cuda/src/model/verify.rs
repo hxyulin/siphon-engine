@@ -190,6 +190,20 @@ pub(super) struct TreeVerifyBuffers {
     pub stage_v: Vec<CudaSlice<u8>>,
     /// Winning-path compacted feature taps `[8, tap_count, hidden]`.
     pub taps_compact: CudaSlice<bf16>,
+    /// Fixed-address per-node 16-sparse draft candidates and normalized filtered
+    /// probabilities (`[8 * 16]` each) for `--spec-beta` tree verification inside captured
+    /// tree verify graphs.
+    pub draft_cand: CudaSlice<i32>,
+    pub draft_q: CudaSlice<f32>,
+    pub host_draft_cand: PinnedBuf<i32>,
+    pub host_draft_q: PinnedBuf<f32>,
+    pub dist_h2d_done: CudaEvent,
+}
+
+impl Drop for TreeVerifyBuffers {
+    fn drop(&mut self) {
+        let _ = self.dist_h2d_done.synchronize();
+    }
 }
 
 impl TreeVerifyBuffers {
@@ -242,6 +256,11 @@ impl TreeVerifyBuffers {
             stage_k,
             stage_v,
             taps_compact: zeros(stream, VERIFY_ROWS * tap_count * hidden)?,
+            draft_cand: zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
+            draft_q: zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
+            host_draft_cand: PinnedBuf::zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
+            host_draft_q: PinnedBuf::zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
+            dist_h2d_done: sync_event(stream)?,
         })
     }
 }
@@ -394,6 +413,45 @@ impl Model {
         let v = self.verify_buffers_mut()?;
         stream.memcpy_dtod(cand, &mut v.draft_cand)?;
         stream.memcpy_dtod(q_probs, &mut v.draft_q)?;
+        Ok(())
+    }
+
+    /// Uploads per-tree-node 16-sparse draft candidates and normalized filtered probabilities
+    /// (`[rows * 16]`, `rows <= VERIFY_ROWS`) into fixed-address tree verify scratch for
+    /// `--spec-beta` 2-branch residual tree verification inside captured tree verify graphs.
+    pub fn set_verify_tree_draft_dist(
+        &mut self,
+        cand: &[i32],
+        q_probs: &[f32],
+    ) -> anyhow::Result<()> {
+        let max_elems = VERIFY_ROWS * crate::ops::sample::BETA_CAND_K;
+        ensure!(
+            cand.len() == q_probs.len()
+                && !cand.is_empty()
+                && cand.len() <= max_elems
+                && cand.len().is_multiple_of(crate::ops::sample::BETA_CAND_K),
+            "tree draft dist len ({}, {}), expected non-empty multiple of {} up to {max_elems}",
+            cand.len(),
+            q_probs.len(),
+            crate::ops::sample::BETA_CAND_K
+        );
+        self.ensure_verify()?;
+        self.ensure_verify_tree()?;
+        let stream = Arc::clone(&self.ctx.stream);
+        let v = self.verify_buffers_mut()?;
+        let tv = v
+            .tree
+            .as_mut()
+            .context("the tree verify buffers are missing")?;
+        tv.dist_h2d_done.synchronize()?;
+        let n = cand.len();
+        tv.host_draft_cand.as_mut_slice()[..n].copy_from_slice(cand);
+        tv.host_draft_q.as_mut_slice()[..n].copy_from_slice(q_probs);
+        tv.host_draft_cand
+            .copy_to_device(&stream, n, &mut tv.draft_cand.slice_mut(..n))?;
+        tv.host_draft_q
+            .copy_to_device(&stream, n, &mut tv.draft_q.slice_mut(..n))?;
+        tv.dist_h2d_done.record(&stream)?;
         Ok(())
     }
     /// Runs the anchor and drafts in `tokens` at the current position as one verify pass of
@@ -850,11 +908,34 @@ impl Model {
 
     /// Waits for `pending` to finish, reads the tree verdict and winning path, and
     /// advances the model's position past the accepted nodes.
+    pub fn finish_verify_tree(&mut self, pending: PendingTreeVerify) -> anyhow::Result<TreeVerdict> {
+        let stream = Arc::clone(&self.ctx.stream);
+        let (result, raw_path) = {
+            let v = self.verify_buffers_mut()?;
+            let result = stream.clone_dtoh(&v.result)?;
+            let raw_path = stream.clone_dtoh(
+                &v.tree
+                    .as_ref()
+                    .context("the tree verify buffers are missing")?
+                    .path,
+            )?;
+            (result, raw_path)
+        };
+        self.complete_verify_tree(pending, &result, &raw_path)
+    }
+
+    /// Completes a tree verify pass from host-copied `result` (`[RESULT_LEN]`) and `raw_path`
+    /// (`[VERIFY_ROWS]`) buffers, advancing the model's position past the accepted nodes.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "taking the pass by value reads each verdict once"
     )]
-    pub fn finish_verify_tree(&mut self, pending: PendingTreeVerify) -> anyhow::Result<TreeVerdict> {
+    pub fn complete_verify_tree(
+        &mut self,
+        pending: PendingTreeVerify,
+        result: &[i32],
+        raw_path: &[i32],
+    ) -> anyhow::Result<TreeVerdict> {
         let PendingTreeVerify {
             rows: m,
             start,
@@ -864,16 +945,13 @@ impl Model {
             self.position == start && self.verify_rows == m,
             "the tree verdict belongs to another pass"
         );
-        let stream = Arc::clone(&self.ctx.stream);
-        let v = self.verify_buffers_mut()?;
-        v.pending = false;
-        let result = stream.clone_dtoh(&v.result)?;
-        let raw_path = stream.clone_dtoh(
-            &v.tree
-                .as_ref()
-                .context("the tree verify buffers are missing")?
-                .path,
-        )?;
+        ensure!(
+            result.len() >= RESULT_LEN && raw_path.len() >= VERIFY_ROWS,
+            "tree verdict buffers too small ({}, {})",
+            result.len(),
+            raw_path.len()
+        );
+        self.verify_buffers_mut()?.pending = false;
         let accepted = usize::try_from(result[0])?;
         ensure!(accepted < m, "accepted {accepted} of {} tree nodes", m - 1);
         let path: Vec<usize> = raw_path[..=accepted]
@@ -894,6 +972,18 @@ impl Model {
             argmax: ids(&result[1 + VERIFY_ROWS..1 + VERIFY_ROWS + m])?,
             took_secondary,
         })
+    }
+
+    /// Device buffer holding the winning tree node path (`I32 [VERIFY_ROWS]`) written by the
+    /// last [`Self::start_verify_tree`], for async copy on a dedicated copy stream.
+    pub fn verify_tree_path_device(&self) -> anyhow::Result<CudaView<'_, i32>> {
+        let p = self.verify.as_ref().context("no verify has run")?;
+        let tv = p
+            .verify
+            .as_ref()
+            .and_then(|v| v.tree.as_ref())
+            .context("no tree verify has run")?;
+        Ok(tv.path.slice(..))
     }
 
     /// The compacted winning-branch feature taps of the last [`Self::start_verify_tree`],

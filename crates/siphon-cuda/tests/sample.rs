@@ -1172,3 +1172,464 @@ fn beta_fast_paths_z_kept_and_first_reject() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Statistical proof that 2-branch without-replacement beta-residual tree verification
+/// (`Sample::run_beta_tree_bf16` + `Spec::accept_tree_beta`) preserves the exact filtered
+/// target distribution at `beta = 1.0` (0 out-of-support tokens, primary & secondary
+/// acceptance matching analytical theory, chi-square z-score well within `±3`) and matches
+/// analytical theory at `beta = 0.80` with 0 out-of-support tokens. Also checks
+/// `draft_select_top2` / `draft_select_branch` `q_probs` output and greedy fallback.
+#[test]
+#[expect(clippy::too_many_lines, reason = "8,000-seed 2-branch tree chi-square + selector check")]
+fn beta_tree_two_branch_without_replacement_exact_and_relaxed() -> anyhow::Result<()> {
+    use half::bf16;
+    use siphon::tree::{SpecTree, sample_without_replacement, secondary_draw_uniform};
+    use siphon_cuda::{
+        ops::{
+            draft::{BLOCK, DraftKernels, TOP_K, race_words_sampling},
+            sample::BETA_CAND_K,
+            spec::{RESULT_LEN, Spec, VERIFY_ROWS},
+        },
+        weights::draft::RANK,
+    };
+
+    let setup = Setup::new()?;
+    let stream = setup.stream();
+    let spec = Spec::load(setup.gpu.context())?;
+    let draft_k = DraftKernels::load(setup.gpu.context())?;
+
+    // 1. Verify `draft_select_top2` writes identical `q_probs` to `draft_select` and
+    //    `draft_select_branch` writes normalized `branch_q_probs` for continuation steps.
+    {
+        let svocab = 64usize;
+        let steps = 4usize;
+        let softcap = 30.0f32;
+        let pred = stream.alloc_zeros::<bf16>(svocab * RANK)?;
+        let succ = stream.alloc_zeros::<bf16>(svocab * RANK)?;
+        let hp = stream.alloc_zeros::<bf16>((BLOCK - 1) * RANK)?;
+        let mut cand_h = vec![0i32; (BLOCK - 1) * TOP_K];
+        let mut unary_h = vec![0.0f32; (BLOCK - 1) * TOP_K];
+        for e in 0..steps {
+            for c in 0..TOP_K {
+                cand_h[e * TOP_K + c] = i32::try_from((e * 13 + c) % svocab)?;
+                unary_h[e * TOP_K + c] = 4.0 - c as f32 * 0.35 + (e as f32) * 0.05;
+            }
+        }
+        let cand_d = stream.clone_htod(&cand_h)?;
+        let unary_d = stream.clone_htod(&unary_h)?;
+        let control = stream.clone_htod(&[10i32, 1, 0])?;
+        let sampling = Sampling::new(0.8, 0, 0.95, 0.05, 42)?;
+        let race_dev = stream.clone_htod(&race_words_sampling(sampling, 0.85))?;
+
+        let mut ids1 = stream.alloc_zeros::<i32>(steps)?;
+        let mut conf1 = stream.alloc_zeros::<f32>(steps)?;
+        let mut q1 = stream.alloc_zeros::<f32>((BLOCK - 1) * TOP_K)?;
+        draft_k.select(
+            stream,
+            &cand_d,
+            &unary_d,
+            &hp,
+            &pred,
+            &succ,
+            &control,
+            steps,
+            softcap,
+            &mut ids1,
+            &mut conf1,
+            Some(&mut q1),
+            &race_dev,
+        )?;
+
+        let mut ids2 = stream.alloc_zeros::<i32>(steps)?;
+        let mut conf2 = stream.alloc_zeros::<f32>(steps)?;
+        let mut alt_ids = stream.alloc_zeros::<i32>(steps)?;
+        let mut alt_conf = stream.alloc_zeros::<f32>(steps)?;
+        let mut q2 = stream.alloc_zeros::<f32>((BLOCK - 1) * TOP_K)?;
+        draft_k.select_top2(
+            stream,
+            &cand_d,
+            &unary_d,
+            &hp,
+            &pred,
+            &succ,
+            &control,
+            steps,
+            softcap,
+            &mut ids2,
+            &mut conf2,
+            &mut alt_ids,
+            &mut alt_conf,
+            Some(&mut q2),
+            &race_dev,
+        )?;
+        assert_eq!(stream.clone_dtoh(&ids1)?, stream.clone_dtoh(&ids2)?);
+        let q1_h = stream.clone_dtoh(&q1)?;
+        let q2_h = stream.clone_dtoh(&q2)?;
+        for i in 0..steps * TOP_K {
+            assert!(
+                (q1_h[i] - q2_h[i]).abs() <= 1e-6,
+                "select_top2 q_probs[{i}] {} != select {}",
+                q2_h[i],
+                q1_h[i]
+            );
+        }
+
+        // Check `select_branch` writes normalized `branch_q_probs` for t = 1..k2.
+        let mut br_ids = stream.alloc_zeros::<i32>(steps)?;
+        let mut br_q = stream.alloc_zeros::<f32>(steps * TOP_K)?;
+        draft_k.select_branch(
+            stream,
+            &cand_d,
+            &unary_d,
+            &hp,
+            &pred,
+            &succ,
+            &control,
+            0,
+            cand_h[1],
+            3,
+            steps,
+            softcap,
+            &mut br_ids,
+            Some(&mut br_q),
+            &race_dev,
+        )?;
+        let br_ids_h = stream.clone_dtoh(&br_ids)?;
+        let br_q_h = stream.clone_dtoh(&br_q)?;
+        assert_eq!(br_ids_h[0], cand_h[1]);
+        for t in 1..3 {
+            let slice = &br_q_h[t * TOP_K..(t + 1) * TOP_K];
+            let sum: f32 = slice.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5, "branch step {t}: sum={sum}");
+            // With zero pred/succ/hp, branch scores equal primary scores at step `t`.
+            for c in 0..TOP_K {
+                assert!(
+                    (slice[c] - q1_h[t * TOP_K + c]).abs() <= 1e-6,
+                    "branch step {t} c={c}: {} != {}",
+                    slice[c],
+                    q1_h[t * TOP_K + c]
+                );
+            }
+        }
+    }
+
+    // 2. 8,000-seed statistical proof for the 2-branch without-replacement branch node.
+    let vocab = 1024usize;
+    let synth_logits = logits(vocab, 1.4, 16, 54321);
+    let row_bf16: Vec<bf16> = synth_logits.iter().map(|&v| bf16::from_f32(v)).collect();
+    let quantized_f32: Vec<f32> = row_bf16.iter().map(|&b| b.to_f32()).collect();
+
+    let sampling = Sampling::new(0.9, 0, 0.95, 0.05, 1)?;
+    let target_p = filtered(&quantized_f32, sampling);
+
+    let mut order: Vec<usize> = (0..vocab).collect();
+    order.sort_by(|&a, &b| target_p[b].total_cmp(&target_p[a]));
+    let mut cand16 = [0i32; BETA_CAND_K];
+    let mut q16 = [0.0f32; BETA_CAND_K];
+    for k in 0..14 {
+        cand16[k] = i32::try_from(order[k])?;
+        // Deliberately skew q vs p so both primary rejection and secondary acceptance happen often.
+        let factor = if k % 2 == 0 { 1.8 } else { 0.45 };
+        q16[k] = ((target_p[order[k]] * factor) as f32).max(0.015);
+    }
+    let oos: Vec<usize> = order
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&i| target_p[i] == 0.0)
+        .take(2)
+        .collect();
+    assert_eq!(oos.len(), 2);
+    cand16[14] = i32::try_from(oos[0])?;
+    cand16[15] = i32::try_from(oos[1])?;
+    q16[14] = 0.08;
+    q16[15] = 0.07;
+    let q_sum: f32 = q16.iter().sum();
+    for v in &mut q16 {
+        *v /= q_sum;
+    }
+
+    // 3-node 2-branch tree: root 0 -> primary 1, secondary 2 (both leaves).
+    let tree = SpecTree::two_branch(1, 0, 1)?;
+    let m = tree.num_nodes; // 3
+    let trials = 8_000usize;
+
+    let mut logits_3 = Vec::with_capacity(m * vocab);
+    for _ in 0..m {
+        logits_3.extend_from_slice(&row_bf16);
+    }
+    let logits_d = stream.clone_htod(&logits_3)?;
+
+    let mut tree_cand_h = vec![-1i32; m * BETA_CAND_K];
+    let mut tree_q_h = vec![0.0f32; m * BETA_CAND_K];
+    tree_cand_h[..BETA_CAND_K].copy_from_slice(&cand16);
+    tree_q_h[..BETA_CAND_K].copy_from_slice(&q16);
+    let tree_cand_d = stream.clone_htod(&tree_cand_h)?;
+    let tree_q_d = stream.clone_htod(&tree_q_h)?;
+    let primary_d = stream.clone_htod(&tree.primary_child)?;
+    let secondary_d = stream.clone_htod(&tree.secondary_child)?;
+    let forced_path_d = stream.alloc_zeros::<i32>(VERIFY_ROWS)?;
+    let forced_len_d = stream.alloc_zeros::<u32>(1)?;
+
+    // Batch 64 independent root-node trials into one `run_beta_tree_bf16` launch by giving
+    // each trial 3 rows? No: `run_beta_tree_bf16` indexes `tokens[c1]` and `tokens[c2]`
+    // directly! We can pack 64 independent 3-node mini-trees into 192 rows with shifted
+    // `primary_child` / `secondary_child` indices (`3*s + 1`, `3*s + 2`) for fast 8,000-seed
+    // execution!
+    let batch_trees = 64usize;
+    let total_rows = batch_trees * m;
+    let batches = trials / batch_trees;
+    assert_eq!(batches * batch_trees, trials);
+
+    let mut b_logits = Vec::with_capacity(total_rows * vocab);
+    let mut b_primary = vec![-1i32; total_rows];
+    let mut b_secondary = vec![-1i32; total_rows];
+    let mut b_cand = vec![-1i32; total_rows * BETA_CAND_K];
+    let mut b_q = vec![0.0f32; total_rows * BETA_CAND_K];
+    for s in 0..batch_trees {
+        let base = s * m;
+        for _ in 0..m {
+            b_logits.extend_from_slice(&row_bf16);
+        }
+        b_primary[base] = i32::try_from(base + 1)?;
+        b_secondary[base] = i32::try_from(base + 2)?;
+        b_cand[base * BETA_CAND_K..(base + 1) * BETA_CAND_K].copy_from_slice(&cand16);
+        b_q[base * BETA_CAND_K..(base + 1) * BETA_CAND_K].copy_from_slice(&q16);
+    }
+    let b_logits_d = stream.clone_htod(&b_logits)?;
+    let b_primary_d = stream.clone_htod(&b_primary)?;
+    let b_secondary_d = stream.clone_htod(&b_secondary)?;
+    let b_cand_d = stream.clone_htod(&b_cand)?;
+    let b_q_d = stream.clone_htod(&b_q)?;
+    let mut buffers = SampleBuffers::new(stream, total_rows)?;
+    let mut out_d = stream.alloc_zeros::<i32>(total_rows)?;
+
+    for beta in [1.0f32, 0.80f32] {
+        let mut counts = vec![0usize; vocab];
+        let mut acc1_total = 0usize;
+        let mut acc2_total = 0usize;
+        let mut oos_emitted = 0usize;
+        let mut rng_state = 0xfeed_face_cafe_beefu64 ^ u64::from(beta.to_bits());
+
+        for b in 0..batches {
+            let mut tokens_h = vec![0i32; total_rows];
+            let mut settings = Vec::with_capacity(total_rows);
+            for s in 0..batch_trees {
+                let trial_seed = (b * batch_trees + s + 1) as u64;
+                // Draw x1 ~ q16.
+                let u1_draw = (splitmix64(&mut rng_state) >> 11) as f64 / ((1u64 << 53) as f64);
+                let mut cdf = 0.0f64;
+                let mut x1 = cand16[0];
+                for k in 0..BETA_CAND_K {
+                    cdf += f64::from(q16[k]);
+                    if u1_draw < cdf {
+                        x1 = cand16[k];
+                        break;
+                    }
+                }
+                // Draw x2 ~ q2(. | x1) without replacement.
+                let u_sec = secondary_draw_uniform(trial_seed, 100);
+                let x2 = sample_without_replacement(&cand16, &q16, x1, u_sec)
+                    .expect("non-degenerate q16 has secondary support");
+                assert_ne!(x1, x2);
+
+                let base = s * m;
+                tokens_h[base] = 0;
+                tokens_h[base + 1] = x1;
+                tokens_h[base + 2] = x2;
+                let row_s = Sampling {
+                    seed: trial_seed,
+                    ..sampling
+                };
+                settings.push((row_s, 100));
+                settings.push((row_s, 101));
+                settings.push((row_s, 101));
+            }
+            let tokens_d = stream.clone_htod(&tokens_h)?;
+            buffers.upload(stream, &settings)?;
+            setup.sample.run_beta_tree_bf16(
+                stream,
+                &b_logits_d,
+                vocab,
+                vocab,
+                0.0,
+                &tokens_d,
+                &b_primary_d,
+                &b_secondary_d,
+                &b_cand_d,
+                &b_q_d,
+                beta,
+                &mut buffers,
+                &mut out_d,
+            )?;
+            let flags_h = stream.clone_dtoh(&buffers.accept_flags(total_rows))?;
+            let out_h = stream.clone_dtoh(&out_d)?;
+            for s in 0..batch_trees {
+                let base = s * m;
+                let flag = flags_h[base];
+                let emitted = match flag {
+                    1 => {
+                        acc1_total += 1;
+                        assert_eq!(out_h[base], tokens_h[base + 1]);
+                        usize::try_from(tokens_h[base + 1])?
+                    }
+                    2 => {
+                        acc2_total += 1;
+                        assert_eq!(out_h[base], tokens_h[base + 2]);
+                        usize::try_from(tokens_h[base + 2])?
+                    }
+                    0 => usize::try_from(out_h[base])?,
+                    other => anyhow::bail!("unexpected accept_flag {other}"),
+                };
+                if target_p[emitted] == 0.0 {
+                    oos_emitted += 1;
+                }
+                counts[emitted] += 1;
+            }
+        }
+
+        assert_eq!(oos_emitted, 0, "beta={beta}: emitted out-of-support tokens");
+
+        // Analytical theory for primary acceptance and without-replacement secondary acceptance.
+        let mut r1 = vec![0.0f64; vocab];
+        let mut z1 = 0.0f64;
+        for y in 0..vocab {
+            let mut qy = 0.0f64;
+            for k in 0..BETA_CAND_K {
+                if usize::try_from(cand16[k]).ok() == Some(y) {
+                    qy = f64::from(q16[k]);
+                    break;
+                }
+            }
+            r1[y] = (target_p[y] - f64::from(beta) * qy).max(0.0);
+            z1 += r1[y];
+        }
+        for v in &mut r1 {
+            *v /= z1;
+        }
+        let mut theory_acc1 = 0.0f64;
+        let mut theory_acc2 = 0.0f64;
+        for k1 in 0..BETA_CAND_K {
+            let x1 = usize::try_from(cand16[k1])?;
+            let qx1 = f64::from(q16[k1]);
+            let a1 = (target_p[x1] / (f64::from(beta) * qx1)).min(1.0);
+            theory_acc1 += qx1 * a1;
+            let p_rej1 = qx1 * (1.0 - a1);
+            let rem = 1.0 - qx1;
+            if p_rej1 > 0.0 && rem > 0.0 {
+                let mut acc2_given_x1 = 0.0f64;
+                for k2 in 0..BETA_CAND_K {
+                    if k2 == k1 {
+                        continue;
+                    }
+                    let x2 = usize::try_from(cand16[k2])?;
+                    let q2_x2 = f64::from(q16[k2]) / rem;
+                    let a2 = (r1[x2] / (f64::from(beta) * q2_x2)).min(1.0);
+                    acc2_given_x1 += q2_x2 * a2;
+                }
+                theory_acc2 += p_rej1 * acc2_given_x1;
+            }
+        }
+        let emp_acc1 = acc1_total as f64 / trials as f64;
+        let emp_acc2 = acc2_total as f64 / trials as f64;
+        let se1 = (theory_acc1 * (1.0 - theory_acc1) / trials as f64).sqrt();
+        let se2 = (theory_acc2 * (1.0 - theory_acc2) / trials as f64).sqrt();
+        assert!(
+            (emp_acc1 - theory_acc1).abs() <= 4.0 * se1,
+            "beta={beta}: emp_acc1={emp_acc1:.4} vs theory={theory_acc1:.4} (se={se1:.4})"
+        );
+        assert!(
+            acc2_total > 0 && (emp_acc2 - theory_acc2).abs() <= 4.0 * se2,
+            "beta={beta}: emp_acc2={emp_acc2:.4} vs theory={theory_acc2:.4} (se={se2:.4})"
+        );
+
+        if (beta - 1.0).abs() < 1e-6 {
+            let mut chi2 = 0.0f64;
+            let mut df = 0usize;
+            let (mut tail_obs, mut tail_exp) = (0.0f64, 0.0f64);
+            for i in 0..vocab {
+                let exp = target_p[i] * trials as f64;
+                if exp >= 5.0 {
+                    let d = counts[i] as f64 - exp;
+                    chi2 += d * d / exp;
+                    df += 1;
+                } else if exp > 0.0 {
+                    tail_obs += counts[i] as f64;
+                    tail_exp += exp;
+                }
+            }
+            if tail_exp >= 1.0 {
+                let d = tail_obs - tail_exp;
+                chi2 += d * d / tail_exp;
+                df += 1;
+            }
+            let df = (df.saturating_sub(1)).max(1) as f64;
+            let z = ((chi2 / df).cbrt() - (1.0 - 2.0 / (9.0 * df))) / (2.0 / (9.0 * df)).sqrt();
+            eprintln!(
+                "beta_tree beta=1.0: acc1={emp_acc1:.4} (theory {theory_acc1:.4}), \
+                 acc2={emp_acc2:.4} (theory {theory_acc2:.4}), chi2={chi2:.2}, df={df:.0}, z={z:.2}, oos=0"
+            );
+            assert!(
+                z.abs() < 3.5,
+                "beta_tree beta=1.0 distribution mismatch: chi2={chi2:.2}, df={df:.0}, z={z:.2}"
+            );
+        } else {
+            eprintln!(
+                "beta_tree beta={beta:.2}: acc1={emp_acc1:.4} (theory {theory_acc1:.4}), \
+                 acc2={emp_acc2:.4} (theory {theory_acc2:.4}), oos=0"
+            );
+        }
+    }
+
+    // 3. Verify `accept_tree_beta` walks primary, secondary, rejection, and greedy correctly.
+    let mut single_buf = SampleBuffers::new(stream, m)?;
+    let mut single_out = stream.alloc_zeros::<i32>(m)?;
+    let mut res_d = stream.alloc_zeros::<i32>(RESULT_LEN)?;
+    let mut path_d = stream.alloc_zeros::<i32>(VERIFY_ROWS)?;
+    let mut anc_d = stream.alloc_zeros::<i32>(1)?;
+
+    // Greedy secondary match: primary != argmax, secondary == argmax -> path [0, 2]!
+    let greedy_top = i32::try_from(order[0])?;
+    let greedy_alt = i32::try_from(order[1])?;
+    let g_tokens_d = stream.clone_htod(&[0i32, greedy_alt, greedy_top])?;
+    single_buf.upload(
+        stream,
+        &[
+            (Sampling::GREEDY, 0),
+            (Sampling::GREEDY, 1),
+            (Sampling::GREEDY, 1),
+        ],
+    )?;
+    setup.sample.run_beta_tree_bf16(
+        stream,
+        &logits_d,
+        vocab,
+        vocab,
+        0.0,
+        &g_tokens_d,
+        &primary_d,
+        &secondary_d,
+        &tree_cand_d,
+        &tree_q_d,
+        1.0,
+        &mut single_buf,
+        &mut single_out,
+    )?;
+    spec.accept_tree_beta(
+        stream,
+        &g_tokens_d,
+        &single_out,
+        &single_buf.accept_flags(m),
+        &primary_d,
+        &secondary_d,
+        &forced_path_d,
+        &forced_len_d,
+        m,
+        &mut res_d,
+        &mut path_d,
+        &mut anc_d,
+    )?;
+    assert_eq!(stream.clone_dtoh(&res_d)?[0], 1, "greedy secondary should accept");
+    assert_eq!(&stream.clone_dtoh(&path_d)?[..2], &[0, 2]);
+    Ok(())
+}

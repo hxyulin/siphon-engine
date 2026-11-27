@@ -50,8 +50,10 @@ __device__ __forceinline__ float race_boost(unsigned long long key, int i) {
 }
 
 // Independent RNG domain-separation salts for beta-relaxed / maximal-coupling rejection
-// sampling (sample.cu): acceptance uniform draw vs residual resampling race.
+// sampling (sample.cu): primary acceptance uniform, secondary tree-branch acceptance
+// uniform, and residual resampling race.
 constexpr unsigned long long kAcceptSalt = 0x517cc1b727220a95ull;
+constexpr unsigned long long kAccept2Salt = 0x2545f4914f6cdd1dull;
 constexpr unsigned long long kResidSalt = 0x94d049bb133111ebull;
 
 // A request's sampling as the draft reads it, RACE_WORDS (= 8) in ops/draft.rs:

@@ -2780,13 +2780,14 @@ draft_select(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
 }
 
 // Tree-aware variant of draft_select: identical primary greedy/coupled walk over `steps`
-// rows, plus records the runner-up candidate `alt_ids[e]` (distinct from `draft_ids[e]`)
-// and its softmax probability `alt_conf[e]` over the 16 candidates at every step e.
+// rows, plus records the runner-up candidate `alt_ids[e]` (distinct from `draft_ids[e]`),
+// its softmax probability `alt_conf[e]` over the 16 candidates, and optional normalized
+// filtered probabilities `q_probs[e, 0..16]` at every step e.
 extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
 draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
                   const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
                   const int32_t* control, int32_t steps, float softcap, int32_t* draft_ids,
-                  float* confidence, int32_t* alt_ids, float* alt_conf,
+                  float* confidence, int32_t* alt_ids, float* alt_conf, float* q_probs,
                   const race::DraftRace* race) {
     __shared__ float product[kRank];
     __shared__ float score[kTopK];
@@ -2899,6 +2900,9 @@ draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* 
             if (bi2 >= kTopK) {
                 bi2 = fbi2;
             }
+            if (q_probs != nullptr && lane < kTopK) {
+                q_probs[e * kTopK + lane] = r.on ? q_sh[lane] : ((lane == bi) ? 1.f : 0.f);
+            }
             if (lane == 0) {
                 const int32_t id1 = cand[e * kTopK + bi];
                 const int32_t id2 = bi2 < kTopK ? cand[e * kTopK + bi2] : id1;
@@ -2917,12 +2921,13 @@ draft_select_top2(const int32_t* cand, const float* unary, const __nv_bfloat16* 
 // Rolls out the secondary branch of length `k2` starting at `branch_step` (0..steps-1)
 // with first secondary token `alt_first` (already chosen at `branch_step`), producing
 // conditioned continuation tokens `branch_ids[0..k2]` (where `branch_ids[0] = alt_first`)
+// and optional normalized filtered probabilities `branch_q_probs[t, 0..16]` for `t = 1..k2`
 // using DFlash 2's bigram selector over the already-computed `cand`, `unary` and `hp`.
 extern "C" __global__ void __launch_bounds__(kSelectWarps * 32)
 draft_select_branch(const int32_t* cand, const float* unary, const __nv_bfloat16* hp,
                     const __nv_bfloat16* predecessor, const __nv_bfloat16* successor, int32_t vocab,
                     const int32_t* control, int32_t branch_step, int32_t alt_first, int32_t k2,
-                    int32_t max_steps, float softcap, int32_t* branch_ids,
+                    int32_t max_steps, float softcap, int32_t* branch_ids, float* branch_q_probs,
                     const race::DraftRace* race) {
     __shared__ float product[kRank];
     __shared__ float score[kTopK];
@@ -3000,6 +3005,9 @@ draft_select_branch(const int32_t* cand, const float* unary, const __nv_bfloat16
                     bv = ov;
                     bi = oi;
                 }
+            }
+            if (branch_q_probs != nullptr && lane < kTopK) {
+                branch_q_probs[t * kTopK + lane] = r.on ? q_sh[lane] : ((lane == bi) ? 1.f : 0.f);
             }
             if (lane == 0) {
                 const int32_t picked = cand[e * kTopK + bi];

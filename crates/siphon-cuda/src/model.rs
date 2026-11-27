@@ -1563,6 +1563,7 @@ impl Model {
         if changed {
             self.ctx.spec_beta = beta;
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
+            self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_verify_graphs.clear();
         }
         Ok(())

@@ -2614,7 +2614,84 @@ impl Ctx {
             .as_mut()
             .context("the verify buffers are missing")?;
         let spec = &self.kernels.spec;
-        if let (Some(beta), false, Some(sample)) =
+        if let (Some(beta), true, Some(sample)) =
+            (self.spec_beta, v.tree_active, p.sample.as_mut())
+        {
+            let head_logits = p
+                .head_logits
+                .as_mut()
+                .context("the head_logits buffer is missing")?;
+            self.lm_head_rows(
+                rows(&p.final_hidden, m, self.hidden()),
+                rows_mut(head_logits, m, padded),
+                m,
+                true,
+                None,
+            )?;
+            let tv = v
+                .tree
+                .as_mut()
+                .context("the tree verify buffers are missing")?;
+            self.kernels.sample.run_beta_tree_bf16(
+                &self.stream,
+                &rows(head_logits, m, padded),
+                vocab,
+                padded,
+                cfg.final_logit_softcapping,
+                &rows(&p.tokens, m, 1),
+                &tv.primary_child,
+                &tv.secondary_child,
+                &tv.draft_cand,
+                &tv.draft_q,
+                beta,
+                sample,
+                &mut v.argmax.slice_mut(..m),
+            )?;
+            spec.accept_tree_beta(
+                &self.stream,
+                &rows(&p.tokens, m, 1),
+                &v.argmax.slice(..m),
+                &sample.accept_flags(m),
+                &tv.primary_child,
+                &tv.secondary_child,
+                &tv.forced_path,
+                &tv.forced_len,
+                m,
+                &mut v.result,
+                &mut tv.path,
+                &mut v.anchor,
+            )?;
+            spec.kv_commit_tree(
+                &self.stream,
+                &tv.kv_caches,
+                &tv.kv_stages,
+                &tv.kv_slots,
+                &tv.kv_row_bytes,
+                &p.start,
+                &v.result,
+                &tv.path,
+                m,
+            )?;
+            spec.conv_commit_tree(
+                &self.stream,
+                &v.states,
+                &v.inputs,
+                &v.result,
+                &tv.path,
+            )?;
+            if let Some(taps) = p.taps.as_ref() {
+                spec.taps_compact_tree(
+                    &self.stream,
+                    taps,
+                    &mut tv.taps_compact,
+                    &v.result,
+                    &tv.path,
+                    p.tap_layout.len(),
+                    m,
+                )?;
+            }
+            return Ok(());
+        } else if let (Some(beta), false, Some(sample)) =
             (self.spec_beta, v.tree_active, p.sample.as_mut())
         {
             let head_logits = p

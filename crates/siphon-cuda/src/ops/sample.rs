@@ -208,6 +208,8 @@ pub struct Sample {
     prepare_beta_bf16: CudaFunction,
     first_reject_beta: CudaFunction,
     race_beta_bf16: CudaFunction,
+    prepare_beta_tree_bf16: CudaFunction,
+    race_beta_tree_bf16: CudaFunction,
     noise: CudaFunction,
 }
 
@@ -222,6 +224,8 @@ impl Sample {
             prepare_beta_bf16: module.load_function("sample_prepare_beta_bf16")?,
             first_reject_beta: module.load_function("sample_first_reject_beta")?,
             race_beta_bf16: module.load_function("sample_race_beta_bf16")?,
+            prepare_beta_tree_bf16: module.load_function("sample_prepare_beta_tree_bf16")?,
+            race_beta_tree_bf16: module.load_function("sample_race_beta_tree_bf16")?,
             noise: module.load_function("sample_noise")?,
         })
     }
@@ -571,5 +575,132 @@ impl Sample {
         // `RACE_BLOCKS` per row, `first_reject` holds at least `seqs`, counters are zero
         // between launches, and reads wait on PDL.
         unsafe { args.launch_pdl(stream, &self.race_beta_bf16, config) }
+    }
+
+    /// 2-branch without-replacement beta-residual tree rejection sampling over BF16
+    /// `logits` (`[rows, stride]`, inline `softcap`) using per-node `primary_child`,
+    /// `secondary_child`, and 16-sparse draft distributions `(cand, q_probs)` (`[rows, 16]`).
+    /// Writes per-row acceptance flags (`1` primary, `2` secondary, `0` rejected/leaf,
+    /// `-1` greedy) into `buffers.accept_flags(rows)` and accepted/residual/bonus draws
+    /// into `out` (`[rows]`).
+    #[expect(clippy::too_many_arguments, reason = "logits, tree topology, draft dist, beta and buffers")]
+    pub fn run_beta_tree_bf16(
+        &self,
+        stream: &CudaStream,
+        logits: &impl DeviceIn<bf16>,
+        n: usize,
+        stride: usize,
+        softcap: f32,
+        tokens: &impl DeviceIn<i32>,
+        primary_child: &impl DeviceIn<i32>,
+        secondary_child: &impl DeviceIn<i32>,
+        cand: &impl DeviceIn<i32>,
+        q_probs: &impl DeviceIn<f32>,
+        beta: f32,
+        buffers: &mut SampleBuffers,
+        out: &mut impl DeviceOut<i32>,
+    ) -> anyhow::Result<()> {
+        let (logits, tokens, primary_child, secondary_child, cand, q_probs, mut out) = (
+            logits.view(),
+            tokens.view(),
+            primary_child.view(),
+            secondary_child.view(),
+            cand.view(),
+            q_probs.view(),
+            out.view_mut(),
+        );
+        ensure!(n > 0 && stride >= n, "invalid logits shape n={n}, stride={stride}");
+        ensure!(
+            logits.len().is_multiple_of(stride),
+            "logits have {} elements, not a multiple of stride {stride}",
+            logits.len()
+        );
+        ensure!(
+            n <= MAX_TOKENS,
+            "rows of {n} tokens, the kernels take at most {MAX_TOKENS}"
+        );
+        ensure!(
+            softcap.is_finite() && softcap >= 0.0,
+            "softcap must be finite and non-negative, not {softcap}"
+        );
+        ensure!(
+            beta.is_finite() && beta > 0.0 && beta <= 1.0,
+            "spec_beta must be in (0, 1], got {beta}"
+        );
+        let rows = logits.len() / stride;
+        ensure!(
+            (1..=buffers.rows).contains(&rows),
+            "{rows} rows, the buffers hold {}",
+            buffers.rows
+        );
+        ensure!(tokens.len() == rows, "tokens has {} elements, not {rows}", tokens.len());
+        ensure!(
+            primary_child.len() >= rows && secondary_child.len() >= rows,
+            "tree child arrays too small ({}, {}) for {rows} rows",
+            primary_child.len(),
+            secondary_child.len()
+        );
+        ensure!(out.len() == rows, "out has {} elements, not {rows}", out.len());
+        let min_cand = rows * BETA_CAND_K;
+        ensure!(
+            cand.len() >= min_cand && q_probs.len() >= min_cand,
+            "tree draft dist buffers too small ({}, {}), need {min_cand}",
+            cand.len(),
+            q_probs.len()
+        );
+        let n_arg = i32::try_from(n)?;
+        let stride_arg = i32::try_from(stride)?;
+        let grid_rows = u32::try_from(rows)?;
+
+        let config = LaunchConfig {
+            grid_dim: (grid_rows * PREPARE_CLUSTER, 1, 1),
+            block_dim: (PREPARE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n_arg)
+            .i32(stride_arg)
+            .f32(softcap)
+            .ptr(&buffers.params, stream)
+            .ptr(&tokens, stream)
+            .ptr(&primary_child, stream)
+            .ptr(&secondary_child, stream)
+            .ptr(&cand, stream)
+            .ptr(&q_probs, stream)
+            .f32(beta)
+            .ptr_mut(&mut buffers.state, stream)
+            .ptr_mut(&mut buffers.accept_flag, stream)
+            .ptr_mut(&mut buffers.r_log, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: matches `sample_prepare_beta_tree_bf16`; all buffers are validated for
+        // `rows` and `rows * BETA_CAND_K`, and the kernel waits at `pdl_wait`.
+        unsafe { args.launch_pdl(stream, &self.prepare_beta_tree_bf16, config) }?;
+
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(RACE_BLOCKS)?, grid_rows, 1),
+            block_dim: (RACE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = KernelArgs::default();
+        args.ptr(&logits, stream)
+            .i32(n_arg)
+            .i32(stride_arg)
+            .f32(softcap)
+            .ptr(&buffers.params, stream)
+            .ptr(&buffers.state, stream)
+            .ptr(&primary_child, stream)
+            .ptr(&cand, stream)
+            .ptr(&buffers.accept_flag, stream)
+            .ptr(&buffers.r_log, stream)
+            .ptr_mut(&mut buffers.scores, stream)
+            .ptr_mut(&mut buffers.idxs, stream)
+            .ptr_mut(&mut buffers.fb_scores, stream)
+            .ptr_mut(&mut buffers.fb_idxs, stream)
+            .ptr_mut(&mut buffers.counters, stream)
+            .ptr_mut(&mut out, stream);
+        // SAFETY: matches `sample_race_beta_tree_bf16`; partials and fallback partials hold
+        // `RACE_BLOCKS` per row, counters are zero between launches, and reads wait on PDL.
+        unsafe { args.launch_pdl(stream, &self.race_beta_tree_bf16, config) }
     }
 }

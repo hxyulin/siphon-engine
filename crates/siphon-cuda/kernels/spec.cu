@@ -537,6 +537,63 @@ extern "C" __global__ void accept_tree(const int* tokens, const int* argmax,
     *anchor = argmax[path[accepted]];
 }
 
+// Beta-relaxed / maximal-coupling tree acceptance over m <= 8 nodes in topological order:
+// accept_flag[u] is 1 if primary_child[u] was accepted, 2 if secondary_child[u] was accepted,
+// 0 if rejected/leaf, or -1 if row u was greedy (compare tokens[c1]/tokens[c2] == argmax[u]).
+// Writes result = [accepted, tokens[0..m], argmax[0..m]], path[0..=accepted], and
+// *anchor = argmax[path[accepted]]. One thread, PDL-wired.
+extern "C" __global__ void accept_tree_beta(const int* tokens, const int* argmax,
+                                            const int* accept_flag, const int* primary_child,
+                                            const int* secondary_child, const int* forced_path,
+                                            const unsigned* forced_len, int m, int* result,
+                                            int* path, int* anchor) {
+    pdl_trigger();
+    pdl_wait();
+    int accepted = 0;
+    path[0] = 0;
+    const unsigned flen = *forced_len;
+    if (flen != 0) {
+        const int keep = min(int(flen), m);
+        accepted = keep - 1;
+        for (int d = 0; d < keep; ++d) {
+            path[d] = forced_path[d];
+        }
+    } else {
+        int u = 0;
+        while (accepted + 1 < m) {
+            const int flag = accept_flag[u];
+            const int c1 = primary_child[u];
+            const int c2 = secondary_child[u];
+            if (flag == 1 && c1 >= 0) {
+                u = c1;
+                path[++accepted] = u;
+            } else if (flag == 2 && c2 >= 0) {
+                u = c2;
+                path[++accepted] = u;
+            } else if (flag < 0) {
+                const int target = argmax[u];
+                if (c1 >= 0 && tokens[c1] == target) {
+                    u = c1;
+                    path[++accepted] = u;
+                } else if (c2 >= 0 && tokens[c2] == target) {
+                    u = c2;
+                    path[++accepted] = u;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    result[0] = accepted;
+    for (int i = 0; i < m; ++i) {
+        result[1 + i] = tokens[i];
+        result[1 + kVerifyRows + i] = argmax[i];
+    }
+    *anchor = argmax[path[accepted]];
+}
+
 // Commits the winning tree path's staged K and V rows into every visit's KV cache
 // (both sliding rings and global caches, BF16 / FP8 / NVFP4).
 // caches[2*v], caches[2*v+1]: device pointers to visit v's k_cache and v_cache.

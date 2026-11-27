@@ -1030,11 +1030,13 @@ struct Dflash2Scratch {
     /// The input convolution of a sublayer, BF16 `[8, 2304]`.
     conv: CudaSlice<bf16>,
     topk: TopkScratch,
-    /// The top 16 candidates of each draft row, their logits, and normalized filtered
-    /// sampling probabilities (`[7, 16]` each).
+    /// The top 16 candidates of each draft row, their logits, normalized filtered
+    /// sampling probabilities (`[7, 16]` each), and secondary branch rollout probabilities
+    /// (`[7, 16]`).
     cand: CudaSlice<i32>,
     unary: CudaSlice<f32>,
     q_probs: CudaSlice<f32>,
+    branch_q_probs: CudaSlice<f32>,
     /// The hidden projection of block rows 1 to 7, BF16 `[7, 256]`.
     hp: CudaSlice<bf16>,
 }
@@ -1071,6 +1073,7 @@ impl Scratch {
                 cand: stream.alloc_zeros(STEPS * TOP_K)?,
                 unary: zf(STEPS * TOP_K)?,
                 q_probs: zf(STEPS * TOP_K)?,
+                branch_q_probs: zf(STEPS * TOP_K)?,
                 hp: z(STEPS * RANK)?,
             }),
             _ => None,
@@ -1962,6 +1965,7 @@ impl Draft {
                 steps,
                 self.softcap,
                 &mut self.s.branch_ids,
+                None,
                 &self.inputs.race,
             )?;
             let mut out = vec![0i32; k2];
@@ -2031,6 +2035,73 @@ impl Draft {
             out.push(u32::try_from(pick)?);
         }
         Ok(Some(out))
+    }
+
+    /// Rolls out `k2` tokens on DFlash 2 for a secondary tree branch diverging at
+    /// `branch_step` (`0..steps`) starting from an explicit secondary root token `alt_first`
+    /// (e.g. drawn without replacement from `q2(. | x1)`).
+    ///
+    /// Returns `(branch_tokens, branch_q_probs)`:
+    /// - When `k2 == 1`, launches no GPU kernel and returns `(vec![alt_first], Vec::new())`.
+    /// - When `k2 > 1`, rolls out `k2 - 1` conditioned continuations via `draft_select_branch`
+    ///   and returns `branch_q_probs` of length `k2 * TOP_K`, where slice `t * TOP_K..(t+1) * TOP_K`
+    ///   (`t = 1..k2`) holds the normalized filtered probabilities over `cand[branch_step + t]`.
+    pub fn rollout_secondary_branch_from(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        branch_step: usize,
+        alt_first: i32,
+        k2: usize,
+        steps: usize,
+    ) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+        ensure!(
+            k2 >= 1 && branch_step + k2 <= steps && steps <= STEPS,
+            "invalid tree branch: branch_step={branch_step}, k2={k2}, steps={steps}"
+        );
+        let first_u32 = u32::try_from(alt_first).context("negative secondary root token")?;
+        ensure!(
+            (first_u32 as usize) < self.vocab,
+            "secondary root token {first_u32} out of vocab {}",
+            self.vocab
+        );
+        if k2 == 1 {
+            return Ok((vec![first_u32], Vec::new()));
+        }
+        let Arch::Dflash2 { weights, .. } = &self.arch else {
+            anyhow::bail!("rollout_secondary_branch_from requires a DFlash 2 drafter");
+        };
+        let d2 = self
+            .s
+            .dflash2
+            .as_mut()
+            .context("the DFlash 2 buffers are missing")?;
+        self.kernels.select_branch(
+            stream,
+            &d2.cand,
+            &d2.unary,
+            &d2.hp,
+            &weights.selector.predecessor,
+            &weights.selector.successor,
+            &self.inputs.control,
+            branch_step,
+            alt_first,
+            k2,
+            steps,
+            self.softcap,
+            &mut self.s.branch_ids,
+            Some(&mut d2.branch_q_probs),
+            &self.inputs.race,
+        )?;
+        let mut out_ids = vec![0i32; k2];
+        let mut out_q = vec![0.0f32; k2 * TOP_K];
+        stream.memcpy_dtoh(&self.s.branch_ids.slice(..k2), &mut out_ids)?;
+        stream.memcpy_dtoh(&d2.branch_q_probs.slice(..k2 * TOP_K), &mut out_q)?;
+        stream.synchronize()?;
+        let tokens = out_ids
+            .into_iter()
+            .map(|t| u32::try_from(t).context("negative secondary draft token"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok((tokens, out_q))
     }
 
     /// The last round's decoder output for the 8 block rows, BF16 `[8, 2304]`.
@@ -2826,6 +2897,7 @@ impl Draft {
                 &mut s.confidence,
                 &mut s.alt_ids,
                 &mut s.alt_conf,
+                Some(&mut d2.q_probs),
                 &self.inputs.race,
             )
         } else {
