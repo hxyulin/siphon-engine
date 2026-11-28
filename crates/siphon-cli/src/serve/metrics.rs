@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::serve::vision::ImageStats;
+use crate::serve::{engine::Refused, vision::ImageStats};
 
 /// vLLM's bucket edges for time to first token, in seconds.
 const TTFT_BUCKETS: &[f64] = &[
@@ -126,9 +126,69 @@ pub struct SchedulerMetrics(Mutex<SchedulerState>);
 
 #[derive(Clone, Debug, Default)]
 struct SchedulerState {
-    active: [usize; 2],
+    active: [usize; 3],
+    prefix_hits: [(u64, f64); 3],
+    proposed: u64,
+    accepted: u64,
+    fallback_steps: u64,
+    admission_rejections: [u64; 3],
     prefill_tokens: u64,
     decode: BTreeMap<usize, (u64, Duration)>,
+}
+
+impl SchedulerState {
+    fn write_prefix_cache(&self, out: &mut String) {
+        let name = "siphon:prefix_cache_hit_tokens_total";
+        header(
+            out,
+            name,
+            "Prompt tokens reused from a prefix cache entry, by tier.",
+            "counter",
+        );
+        let tiers = ["gpu", "ram", "ssd"];
+        for (tier, (tokens, _)) in tiers.into_iter().zip(self.prefix_hits) {
+            let _ = writeln!(out, r#"{name}{{tier="{tier}"}} {tokens}"#);
+        }
+        let name = "siphon:prefix_cache_restore_seconds_total";
+        header(
+            out,
+            name,
+            "Seconds spent restoring hits, including disk reads and GPU restore submission.",
+            "counter",
+        );
+        for (tier, (_, seconds)) in tiers.into_iter().zip(self.prefix_hits) {
+            let _ = writeln!(out, r#"{name}{{tier="{tier}"}} {seconds}"#);
+        }
+    }
+
+    fn write_decode(&self, out: &mut String, capacity: usize) {
+        let name = "siphon:decode_tokens_total";
+        header(
+            out,
+            name,
+            "Output tokens from decode steps by stream count.",
+            "counter",
+        );
+        for streams in 1..=capacity {
+            let (tokens, _) = self.decode.get(&streams).copied().unwrap_or_default();
+            let _ = writeln!(out, r#"{name}{{streams="{streams}"}} {tokens}"#);
+        }
+        let name = "siphon:decode_seconds_total";
+        header(
+            out,
+            name,
+            "Wall-clock seconds spent in decode steps by stream count, including shared hybrid steps.",
+            "counter",
+        );
+        for streams in 1..=capacity {
+            let (_, elapsed) = self.decode.get(&streams).copied().unwrap_or_default();
+            let _ = writeln!(
+                out,
+                r#"{name}{{streams="{streams}"}} {}"#,
+                elapsed.as_secs_f64()
+            );
+        }
+    }
 }
 
 impl SchedulerMetrics {
@@ -171,7 +231,31 @@ impl SchedulerMetrics {
         *total_time += elapsed;
     }
 
-    pub fn write(&self, out: &mut String, capacity: usize) {
+    #[cfg(target_os = "linux")]
+    pub fn prefix_hit(&self, tier: siphon_cuda::spec::PrefixTier, tokens: usize, seconds: f64) {
+        let index = match tier {
+            siphon_cuda::spec::PrefixTier::Slot => 0,
+            siphon_cuda::spec::PrefixTier::Host => 1,
+            siphon_cuda::spec::PrefixTier::Disk => 2,
+        };
+        let (total_tokens, total_seconds) = &mut self.state().prefix_hits[index];
+        *total_tokens += tokens as u64;
+        *total_seconds += seconds;
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn speculation(&self, proposed: usize, accepted: usize, fallback_steps: usize) {
+        let mut state = self.state();
+        state.proposed += proposed as u64;
+        state.accepted += accepted as u64;
+        state.fallback_steps += fallback_steps as u64;
+    }
+
+    pub fn reject(&self, reason: Refused) {
+        self.state().admission_rejections[reason as usize] += 1;
+    }
+
+    pub fn write(&self, out: &mut String, capacity: usize, kv_pages: Option<(usize, usize)>) {
         let s = self.state().clone();
         for (name, help, value) in [
             (
@@ -189,44 +273,75 @@ impl SchedulerMetrics {
                 "Active requests in decode.",
                 s.active[1],
             ),
+            (
+                "siphon:num_requests_parked",
+                "Requests parked outside the active scheduler slots.",
+                s.active[2],
+            ),
         ] {
             header(out, name, help, "gauge");
             let _ = writeln!(out, "{name} {value}");
+        }
+        if let Some((free, total)) = kv_pages {
+            for (name, help, value) in [
+                (
+                    "siphon:kv_pool_free_pages",
+                    "Free pages in the KV pool.",
+                    free,
+                ),
+                (
+                    "siphon:kv_pool_total_pages",
+                    "Total pages in the KV pool.",
+                    total,
+                ),
+            ] {
+                header(out, name, help, "gauge");
+                let _ = writeln!(out, "{name} {value}");
+            }
+        }
+        for (name, help, value) in [
+            (
+                "siphon:speculative_proposed_tokens_total",
+                "Draft tokens evaluated by the target.",
+                s.proposed,
+            ),
+            (
+                "siphon:speculative_accepted_tokens_total",
+                "Draft tokens accepted by the target.",
+                s.accepted,
+            ),
+            (
+                "siphon:speculative_fallback_steps_total",
+                "Plain CUDA decode steps, counted per stream.",
+                s.fallback_steps,
+            ),
+        ] {
+            header(out, name, help, "counter");
+            let _ = writeln!(out, "{name} {value}");
+        }
+
+        s.write_prefix_cache(out);
+
+        let name = "siphon:admission_rejections_total";
+        header(
+            out,
+            name,
+            "Submissions rejected by engine admission, by reason.",
+            "counter",
+        );
+        for (reason, count) in Refused::ALL.into_iter().zip(s.admission_rejections) {
+            let reason = reason.label();
+            let _ = writeln!(out, r#"{name}{{reason="{reason}"}} {count}"#);
         }
         let name = "siphon:prefill_tokens_total";
         header(out, name, "Prompt tokens computed by prefill.", "counter");
         let _ = writeln!(out, "{name} {}", s.prefill_tokens);
 
-        let name = "siphon:decode_tokens_total";
-        header(
-            out,
-            name,
-            "Output tokens from decode steps by stream count.",
-            "counter",
-        );
-        for streams in 1..=capacity {
-            let (tokens, _) = s.decode.get(&streams).copied().unwrap_or_default();
-            let _ = writeln!(out, r#"{name}{{streams="{streams}"}} {tokens}"#);
-        }
-        let name = "siphon:decode_seconds_total";
-        header(
-            out,
-            name,
-            "Wall-clock seconds spent in decode steps by stream count, including shared hybrid steps.",
-            "counter",
-        );
-        for streams in 1..=capacity {
-            let (_, elapsed) = s.decode.get(&streams).copied().unwrap_or_default();
-            let _ = writeln!(
-                out,
-                r#"{name}{{streams="{streams}"}} {}"#,
-                elapsed.as_secs_f64()
-            );
-        }
+        s.write_decode(out, capacity);
     }
 }
 
-/// The phase of a request that holds a scheduler slot.
+/// Where an admitted request is in the scheduler.
 #[cfg(any(
     target_os = "linux",
     all(target_os = "macos", target_arch = "aarch64"),
@@ -236,6 +351,8 @@ impl SchedulerMetrics {
 pub enum StreamPhase {
     Prefill,
     Decode,
+    #[cfg(any(target_os = "linux", test))]
+    Parked,
 }
 
 /// Removes a request from the phase gauges when it leaves the scheduler.
@@ -646,7 +763,7 @@ mod tests {
         let metrics = Arc::new(SchedulerMetrics::default());
         let capture = || {
             let mut text = String::new();
-            metrics.write(&mut text, 4);
+            metrics.write(&mut text, 4, Some((12, 20)));
             text
         };
         let mut first = metrics.start();
@@ -660,8 +777,10 @@ mod tests {
         assert_eq!(value(&capture(), "siphon:num_requests_decoding"), 2.0);
         metrics.decode(2, 5, Duration::from_millis(250));
 
-        second.set(None);
+        second.set(Some(StreamPhase::Parked));
+        assert_eq!(value(&capture(), "siphon:num_requests_parked"), 1.0);
         assert_eq!(value(&capture(), "siphon:num_requests_decoding"), 1.0);
+        metrics.speculation(7, 3, 2);
         metrics.decode(1, 0, Duration::from_millis(125));
         second.set(Some(StreamPhase::Decode));
         drop((first, second));
@@ -672,6 +791,12 @@ mod tests {
             ("siphon:num_requests_prefilling", 0.0),
             ("siphon:num_requests_decoding", 0.0),
             ("siphon:prefill_tokens_total", 8.0),
+            ("siphon:num_requests_parked", 0.0),
+            ("siphon:kv_pool_free_pages", 12.0),
+            ("siphon:kv_pool_total_pages", 20.0),
+            ("siphon:speculative_proposed_tokens_total", 7.0),
+            ("siphon:speculative_accepted_tokens_total", 3.0),
+            ("siphon:speculative_fallback_steps_total", 2.0),
             (r#"siphon:decode_tokens_total{streams="1"}"#, 3.0),
             (r#"siphon:decode_tokens_total{streams="2"}"#, 5.0),
             (r#"siphon:decode_seconds_total{streams="1"}"#, 0.25),

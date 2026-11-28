@@ -77,6 +77,20 @@ impl Drop for PoolShared {
 #[derive(Clone)]
 pub struct PagePool(Arc<PoolShared>);
 
+/// Reads pool occupancy without keeping its device allocations alive.
+#[derive(Debug)]
+pub struct PagePoolUsage(std::sync::Weak<PoolShared>);
+
+impl PagePoolUsage {
+    /// Returns the pool's free and total page counts while it is live.
+    #[must_use]
+    pub fn pages(&self) -> Option<(usize, usize)> {
+        let pool = self.0.upgrade()?;
+        let free = pool.free().len();
+        Some((free, pool.total))
+    }
+}
+
 impl std::fmt::Debug for PagePool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PagePool")
@@ -157,6 +171,12 @@ impl PagePool {
     #[must_use]
     pub fn free_pages(&self) -> usize {
         self.0.free().len()
+    }
+
+    /// Creates a non-owning reader of the pool's occupancy.
+    #[must_use]
+    pub fn usage(&self) -> PagePoolUsage {
+        PagePoolUsage(Arc::downgrade(&self.0))
     }
 
     fn take(&self) -> Option<Arc<Page>> {

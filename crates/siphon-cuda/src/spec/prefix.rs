@@ -33,7 +33,7 @@ use super::{
     host::{DiskLoaded, DiskSaved, DiskTierConfig, DiskTierStats, HOST_CHUNK_POSITIONS, HostCache},
 };
 use crate::{
-    draft::DraftRings,
+    draft::{Draft, DraftRings},
     model::{LocalState, Model},
 };
 
@@ -49,6 +49,7 @@ pub(super) struct PrefixCache {
     /// Where the last [`Speculator::prefill_cached`] or [`Speculator::claim_slot`] found
     /// its prefix, `None` for a miss.
     last_tier: Option<PrefixTier>,
+    last_restore_seconds: f64,
     /// Lines for the server's log about dropped entries, drained by
     /// [`Speculator::cache_notes`].
     notes: Vec<String>,
@@ -378,6 +379,7 @@ impl Speculator {
             draft_global: self.draft.has_global_layers(),
             host: None,
             last_tier: None,
+            last_restore_seconds: 0.0,
             notes: Vec::new(),
         });
         Ok(bytes)
@@ -499,6 +501,13 @@ impl Speculator {
         self.prefix.as_ref().and_then(|c| c.last_tier)
     }
 
+    /// The last prefix hit's restore time in seconds. Includes disk reads and host
+    /// transfers when applicable. Device copies are timed through submission.
+    #[must_use]
+    pub fn last_prefix_restore_seconds(&self) -> f64 {
+        self.prefix.as_ref().map_or(0.0, |c| c.last_restore_seconds)
+    }
+
     /// Drops entries after `ttl` unused from now on.
     pub fn set_prefix_ttl(&mut self, ttl: Duration) {
         if let Some(cache) = self.prefix.as_mut() {
@@ -590,11 +599,14 @@ impl Speculator {
             Source::Host(..) => PrefixTier::Host,
             Source::Disk(..) => PrefixTier::Disk,
         });
+        let mut move_seconds = 0.0;
         let (mut hit, mut start) = match source {
             Some(Source::Device(i)) => {
                 let e = &cache.entries[i];
                 let (slot, len) = (e.slot.context("a live entry has a slot")?, e.tokens.len());
+                let started = Instant::now();
                 self.move_to_slot0(model, slot)?;
+                move_seconds = started.elapsed().as_secs_f64();
                 (Some(i), len)
             }
             Some(Source::Host(_, len) | Source::Disk(_, len)) => {
@@ -610,24 +622,23 @@ impl Speculator {
         let stream = std::sync::Arc::clone(model.stream());
         let cache = self.prefix.as_mut().context("the cache is on")?;
         cache.last_tier = tier;
+        cache.last_restore_seconds = 0.0;
         let mut from_host = false;
         match source {
             Some(Source::Device(i)) => {
+                let started = Instant::now();
                 let e = &mut cache.entries[i];
                 model.restore_local_state(0, &e.model)?;
                 self.draft.restore_rings(&stream, &e.draft)?;
                 e.used = now;
+                cache.last_restore_seconds = move_seconds + started.elapsed().as_secs_f64();
             }
             Some(Source::Host(j, len)) => {
                 model.reset()?;
                 // The draft's global caches now take another sequence.
                 self.draft_sequence += 1;
                 let host = cache.host.as_mut().context("a host hit has a host cache")?;
-                let started = host.start_restore()?;
-                let bytes =
-                    host.restore_slot(model, j, 0)? + host.restore_draft(&mut self.draft, j)?;
-                let seconds = host.finish_restore(started)?;
-                host.note(restored(len, 0, bytes, seconds, "with the draft's state"));
+                cache.last_restore_seconds = restore_solo(host, model, &mut self.draft, j, len)?;
                 from_host = true;
             }
             Some(Source::Disk(disk_id, len)) => {
@@ -636,11 +647,8 @@ impl Speculator {
                 let host = cache.host.as_mut().context("a disk hit has a host cache")?;
                 if let Some((j, read_bytes, read_secs)) = host.promote_disk(disk_id)? {
                     host.note(promoted(len, read_bytes, read_secs));
-                    let started = host.start_restore()?;
-                    let bytes =
-                        host.restore_slot(model, j, 0)? + host.restore_draft(&mut self.draft, j)?;
-                    let seconds = host.finish_restore(started)?;
-                    host.note(restored(len, 0, bytes, seconds, "with the draft's state"));
+                    cache.last_restore_seconds =
+                        read_secs + restore_solo(host, model, &mut self.draft, j, len)?;
                     from_host = true;
                 } else {
                     cache.last_tier = None;
@@ -716,7 +724,9 @@ impl Speculator {
             Source::Host(..) => PrefixTier::Host,
             Source::Disk(..) => PrefixTier::Disk,
         });
+        cache.last_restore_seconds = 0.0;
         if let Some(Source::Device(i)) = source {
+            let started = Instant::now();
             let e = &mut cache.entries[i];
             let slot = e.slot.context("a live entry has a slot")?;
             model.restore_local_state(slot, &e.model)?;
@@ -730,6 +740,7 @@ impl Speculator {
                     self.draft.reset_slot(slot);
                 }
             }
+            cache.last_restore_seconds = started.elapsed().as_secs_f64();
             return Ok((slot, len));
         }
         let slot = cache
@@ -740,8 +751,8 @@ impl Speculator {
         if self.draft.is_dflash2() {
             self.draft.reset_slot(slot);
         }
-        let (j, len) = match source {
-            Some(Source::Host(j, len)) => (j, len),
+        let (j, len, disk_seconds) = match source {
+            Some(Source::Host(j, len)) => (j, len, 0.0),
             Some(Source::Disk(disk_id, len)) => {
                 let host = cache.host.as_mut().context("a disk hit has a host cache")?;
                 let Some((j, read_bytes, read_secs)) = host.promote_disk(disk_id)? else {
@@ -749,7 +760,7 @@ impl Speculator {
                     return Ok((slot, 0));
                 };
                 host.note(promoted(len, read_bytes, read_secs));
-                (j, len)
+                (j, len, read_secs)
             }
             Some(Source::Device(_)) | None => return Ok((slot, 0)),
         };
@@ -757,6 +768,7 @@ impl Speculator {
         let started = host.start_restore()?;
         let bytes = host.restore_slot(model, j, slot)?;
         let seconds = host.finish_restore(started)?;
+        cache.last_restore_seconds = disk_seconds + seconds;
         let rings = !cache.draft_global && host.has_rings(j);
         host.note(restored(
             len,
@@ -1374,6 +1386,27 @@ impl Speculator {
                     .is_none_or(|c| c.of_slot(model, *s, now).is_none())
         })
     }
+}
+
+/// Restores both caches for a request prefilling and decoding alone in slot 0.
+fn restore_solo(
+    host: &mut HostCache,
+    model: &mut Model,
+    draft: &mut Draft,
+    entry: usize,
+    tokens: usize,
+) -> anyhow::Result<f64> {
+    let started = host.start_restore()?;
+    let bytes = host.restore_slot(model, entry, 0)? + host.restore_draft(draft, entry)?;
+    let seconds = host.finish_restore(started)?;
+    host.note(restored(
+        tokens,
+        0,
+        bytes,
+        seconds,
+        "with the draft's state",
+    ));
+    Ok(seconds)
 }
 
 /// A log line for a restore from the host tier.

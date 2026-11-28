@@ -199,6 +199,8 @@ impl Load {
 #[derive(Debug, Default)]
 struct Control {
     metrics: Arc<SchedulerMetrics>,
+    #[cfg(target_os = "linux")]
+    kv_pool: std::sync::OnceLock<siphon_cuda::vmm::PagePoolUsage>,
     /// New jobs are refused ([`Engine::drain`]).
     draining: AtomicBool,
     /// The jobs left end now, with an error ([`Engine::cancel`]).
@@ -489,11 +491,24 @@ pub struct Engine {
 }
 
 /// Why the engine did not take a job.
+#[derive(Clone, Copy)]
 pub enum Refused {
     Busy,
     /// The server drains before it stops ([`Engine::drain`]).
     Draining,
     Stopped,
+}
+
+impl Refused {
+    pub const ALL: [Self; 3] = [Self::Busy, Self::Draining, Self::Stopped];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Busy => "queue_full",
+            Self::Draining => "draining",
+            Self::Stopped => "engine_unavailable",
+        }
+    }
 }
 
 impl Engine {
@@ -504,7 +519,15 @@ impl Engine {
 
     /// Writes server-wide metrics from the scheduler.
     pub fn write_metrics(&self, out: &mut String) {
-        self.control.metrics.write(out, self.streams);
+        #[cfg(target_os = "linux")]
+        let pages = self
+            .control
+            .kv_pool
+            .get()
+            .and_then(siphon_cuda::vmm::PagePoolUsage::pages);
+        #[cfg(not(target_os = "linux"))]
+        let pages = None;
+        self.control.metrics.write(out, self.streams, pages);
     }
 
     /// Jobs that one submission may hold: as many as run and wait at once.
@@ -515,7 +538,12 @@ impl Engine {
     /// Queues `jobs`, which share their prompt, as one submission, or refuses them all
     /// when they do not fit the queue beside the jobs already there or the engine has
     /// stopped.
-    pub fn submit(&self, mut jobs: Vec<Job>) -> Result<(), Refused> {
+    pub fn submit(&self, jobs: Vec<Job>) -> Result<(), Refused> {
+        self.submit_jobs(jobs)
+            .inspect_err(|&reason| self.control.metrics.reject(reason))
+    }
+
+    fn submit_jobs(&self, mut jobs: Vec<Job>) -> Result<(), Refused> {
         static GROUPS: AtomicU64 = AtomicU64::new(0);
         if self.draining() {
             return Err(Refused::Draining);
@@ -779,6 +807,9 @@ mod cuda {
             .name("engine".to_owned())
             .spawn(move || match load(&options, &warmup) {
                 Ok((model, speculator, tower, capacity, check)) => {
+                    if let Some(pool) = model.kv_pool() {
+                        let _ = engine_control.kv_pool.set(pool.usage());
+                    }
                     let _ = ready.send(Ok(capacity));
                     run(
                         model,
@@ -1663,6 +1694,13 @@ mod cuda {
             self.cached = cached;
             let tier = speculator.last_prefix_tier().filter(|_| cached > 0);
             self.tier = tier.map(PrefixTier::name);
+            if let Some(tier) = tier {
+                self.stream.metrics().prefix_hit(
+                    tier,
+                    cached,
+                    speculator.last_prefix_restore_seconds(),
+                );
+            }
             let _ = self.job.events.send(Event::Cached(cached));
             let len = self.job.prompt.len();
             if len < LONG_PROMPT {
@@ -2054,7 +2092,7 @@ mod cuda {
                     r.since.elapsed().as_secs_f64()
                 );
                 r.parked = Some(id);
-                r.stream.set(None);
+                r.stream.set(Some(StreamPhase::Parked));
                 // An image that a prefill chunk kept for the next one is encoded again
                 // when the request returns, rather than held in GPU memory meanwhile.
                 r.kept = None;
@@ -2421,26 +2459,34 @@ mod cuda {
                 false
             };
             let mut last_step = Instant::now();
-            speculator.generate_with_room(model, remaining, Drafts::Dspark, room, |ids| {
-                request.speculated += ids.len();
-                let _ = request.job.events.send(Event::Round);
-                last = ids.last().copied().unwrap_or(last);
-                let now = Instant::now();
-                let tokens = request.decode_tokens(ids, stop);
-                request.stream.metrics().decode(1, tokens, now - last_step);
-                if request.done {
-                    return ControlFlow::Break(());
-                }
-                if let Some((queue, waiting)) = interrupt.as_mut()
-                    && let Ok(jobs) = queue.try_recv()
-                {
-                    waiting.extend(jobs);
-                    interrupted = true;
-                    return ControlFlow::Break(());
-                }
-                last_step = Instant::now();
-                ControlFlow::Continue(())
-            })?;
+            let generated =
+                speculator.generate_with_room(model, remaining, Drafts::Dspark, room, |ids| {
+                    request.speculated += ids.len();
+                    let _ = request.job.events.send(Event::Round);
+                    last = ids.last().copied().unwrap_or(last);
+                    let now = Instant::now();
+                    let tokens = request.decode_tokens(ids, stop);
+                    request.stream.metrics().decode(1, tokens, now - last_step);
+                    if request.done {
+                        return ControlFlow::Break(());
+                    }
+                    if let Some((queue, waiting)) = interrupt.as_mut()
+                        && let Ok(jobs) = queue.try_recv()
+                    {
+                        waiting.extend(jobs);
+                        interrupted = true;
+                        return ControlFlow::Break(());
+                    }
+                    last_step = Instant::now();
+                    ControlFlow::Continue(())
+                });
+            let stats = speculator.stats();
+            request.stream.metrics().speculation(
+                stats.proposed_tokens(),
+                stats.accepted_tokens(),
+                stats.stepped.len(),
+            );
+            generated?;
         }
         let stats = speculator.stats();
         let speculated = request.output.len() - before;
@@ -3557,6 +3603,9 @@ mod cuda {
     struct DecodeStep {
         streams: usize,
         tokens: usize,
+        proposed: usize,
+        accepted: usize,
+        fallback_steps: usize,
         started: Instant,
     }
 
@@ -3565,6 +3614,9 @@ mod cuda {
             Self {
                 streams,
                 tokens: 0,
+                proposed: 0,
+                accepted: 0,
+                fallback_steps: 0,
                 started: Instant::now(),
             }
         }
@@ -3575,6 +3627,7 @@ mod cuda {
 
         fn record(self, metrics: &SchedulerMetrics) {
             metrics.decode(self.streams, self.tokens, self.started.elapsed());
+            metrics.speculation(self.proposed, self.accepted, self.fallback_steps);
         }
     }
 
@@ -3664,6 +3717,8 @@ mod cuda {
                     Ok(verdicts) => {
                         for (&idx, verdict) in chunk.iter().zip(verdicts) {
                             let r = &mut active[idx];
+                            dispatch.proposed += verdict.tokens.len() - 1;
+                            dispatch.accepted += verdict.accepted;
                             let emitted = verdict.emitted();
                             min_emitted = min_emitted.min(emitted.len());
                             r.speculated += emitted.len();
@@ -3705,6 +3760,7 @@ mod cuda {
                             speculator.forget();
                             r.followed = false;
                         }
+                        dispatch.fallback_steps += 1;
                         r.batched += 1;
                         if alone_plain {
                             r.rent += 1;
@@ -3881,6 +3937,7 @@ mod cuda {
                             speculator.forget();
                             r.followed = false;
                         }
+                        dispatch.fallback_steps += 1;
                         r.batched += 1;
                         r.next = Some(token);
                         dispatch.emit(r, &[token], stop);
@@ -3934,6 +3991,8 @@ mod cuda {
                 Ok(res) => {
                     for (&idx, verdict) in first_chunk.iter().zip(res.verdicts) {
                         let r = &mut active[idx];
+                        dispatch.proposed += verdict.tokens.len() - 1;
+                        dispatch.accepted += verdict.accepted;
                         let emitted = verdict.emitted();
                         r.speculated += emitted.len();
                         let _ = r.job.events.send(Event::Round);
@@ -3982,6 +4041,8 @@ mod cuda {
                     Ok(verdicts) => {
                         for (&idx, verdict) in extra.iter().zip(verdicts) {
                             let r = &mut active[idx];
+                            dispatch.proposed += verdict.tokens.len() - 1;
+                            dispatch.accepted += verdict.accepted;
                             let emitted = verdict.emitted();
                             r.speculated += emitted.len();
                             let _ = r.job.events.send(Event::Round);
@@ -4017,6 +4078,7 @@ mod cuda {
                                 speculator.forget();
                                 r.followed = false;
                             }
+                            dispatch.fallback_steps += 1;
                             r.batched += 1;
                             r.next = Some(token);
                             dispatch.emit(r, &[token], stop);
@@ -4206,6 +4268,44 @@ mod tests {
         assert!(load.reserve(2, 3, 2));
         let counts = load.counts();
         assert_eq!((counts.waiting, counts.running), (4, 1));
+    }
+
+    #[test]
+    fn admission_rejections_count_each_refused_submission_once() {
+        let (engine, queue) = Engine::fake(1024);
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let job = || {
+            Job::new(
+                vec![1],
+                1,
+                false,
+                Sampling {
+                    temperature: 0.0,
+                    top_k: 0,
+                    top_p: 1.0,
+                    min_p: 0.0,
+                    seed: 0,
+                },
+                events.clone(),
+                Arc::from("admission-test"),
+            )
+        };
+        assert!(engine.submit(vec![job()]).is_ok());
+        let over_capacity = (0..engine.max_jobs()).map(|_| job()).collect();
+        assert!(matches!(engine.submit(over_capacity), Err(Refused::Busy)));
+
+        drop(queue);
+        assert!(matches!(engine.submit(vec![job()]), Err(Refused::Stopped)));
+        engine.drain();
+        assert!(matches!(engine.submit(vec![job()]), Err(Refused::Draining)));
+
+        let mut text = String::new();
+        engine.write_metrics(&mut text);
+        for reason in Refused::ALL {
+            let label = reason.label();
+            let expected = format!(r#"siphon:admission_rejections_total{{reason="{label}"}} 1"#);
+            assert!(text.lines().any(|line| line == expected), "{text}");
+        }
     }
 
     #[test]

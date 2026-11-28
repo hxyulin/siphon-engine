@@ -105,6 +105,12 @@ fn run(
                 .map(<[u32]>::len)
                 .collect::<Vec<_>>()
         );
+        let restore_seconds = spec.last_prefix_restore_seconds();
+        if from_cache == 0 {
+            assert_eq!(restore_seconds.to_bits(), 0.0f64.to_bits());
+        } else {
+            assert!(restore_seconds.is_finite() && restore_seconds >= 0.0);
+        }
         (first, from_cache)
     } else {
         model.reset()?;

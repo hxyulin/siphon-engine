@@ -422,6 +422,23 @@ pub struct SpecStats {
 }
 
 impl SpecStats {
+    /// The number of proposed draft tokens that the target verified. Each verify
+    /// also evaluates an anchor row, which is excluded from this count.
+    #[must_use]
+    pub fn proposed_tokens(&self) -> usize {
+        self.widths
+            .iter()
+            .enumerate()
+            .map(|(drafts, rounds)| drafts * rounds)
+            .sum()
+    }
+
+    /// The number of verified draft tokens kept by the target.
+    #[must_use]
+    pub fn accepted_tokens(&self) -> usize {
+        self.accepted_at.iter().sum()
+    }
+
     /// Mean tokens per verify round, the plain steps' tokens excluded.
     #[must_use]
     pub fn tokens_per_round(&self) -> f64 {
