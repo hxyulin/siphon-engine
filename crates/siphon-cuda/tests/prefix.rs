@@ -1315,6 +1315,24 @@ fn disk_cache_spills_promotes_and_dedups(
     let (got_b2, cached_b2, _) = serve_alone(&mut model, &mut spec, b1)?;
     same("B1 after L3 restart", &got_b2, &want_b, cached_b2, 4096)?;
 
+    // Stale-entry spill TTL: an entry idle in RAM longer than `max_spill_age` is dropped
+    // on eviction with zero NVMe writes (`skips_stale >= 1`).
+    let mut ttl_cfg = cfg.clone();
+    ttl_cfg.max_spill_age = Duration::from_secs(1);
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    spec.enable_host_cache(&model, tight_host_bytes)?;
+    let _ = fs::remove_dir_all(&dir);
+    spec.enable_disk_cache(ttl_cfg, &identity)?;
+    serve_alone(&mut model, &mut spec, a)?;
+    thread::sleep(Duration::from_millis(1200));
+    serve_alone(&mut model, &mut spec, b)?;
+    let stale_stats = spec.disk_cache_stats().context("stale stats")?;
+    println!("after stale A evicted by B (ttl=1s): {stale_stats:?}");
+    ensure!(
+        stale_stats.skips_stale >= 1 && stale_stats.spills == 0 && stale_stats.bytes_written == 0,
+        "stale evicted entry should skip SSD write: {stale_stats:?}"
+    );
+
     // Different identity discards all L3 files cleanly.
     spec.save_host_cache(&model, &dir, &identity)?;
     spec.enable_prefix_cache(&model, 1, TTL)?;

@@ -420,6 +420,8 @@ pub struct Options {
     pub cache_dir: Option<PathBuf>,
     /// Maximum bytes for an active L3 NVMe spillover tier in `cache_dir`, 0 for restart-only.
     pub disk_cache: u64,
+    /// Maximum idle age in RAM before an evicted entry is dropped instead of spilled to disk.
+    pub disk_cache_ttl: std::time::Duration,
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
@@ -1276,13 +1278,15 @@ mod cuda {
         };
         let identity = cache_identity(options)?;
         let loaded = if options.disk_cache > 0 {
-            let config = DiskTierConfig::new(dir.clone(), options.disk_cache);
+            let mut config = DiskTierConfig::new(dir.clone(), options.disk_cache);
+            config.max_spill_age = options.disk_cache_ttl;
             log!(
                 "disk cache: enabling active L3 tier in {} (cap {:.2} GiB, min spill {} tokens, \
-                 sustained write cap {} MiB/s)",
+                 ttl {} s, sustained write cap {} MiB/s)",
                 dir.display(),
                 options.disk_cache as f64 / f64::from(1u32 << 30),
                 config.min_spill_tokens,
+                config.max_spill_age.as_secs(),
                 config.max_write_bytes_per_sec >> 20,
             );
             speculator.enable_disk_cache(config, &identity)?

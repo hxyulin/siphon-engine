@@ -61,6 +61,9 @@ const LOG_THROTTLE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default minimum prompt length (in tokens) eligible to spill to NVMe (2 chunks = 4,096).
 pub const DEFAULT_MIN_SPILL_TOKENS: usize = 2 * HOST_CHUNK_POSITIONS;
+/// Default maximum idle age in RAM before an evicted entry is dropped instead of spilled
+/// to NVMe (`3,600 s` = 1 hour). `Duration::ZERO` disables age filtering.
+pub const DEFAULT_MAX_SPILL_AGE: Duration = Duration::from_secs(3600);
 /// Default sustained NVMe spill rate cap: 32 MiB/s (~2.7 TB/day worst-case ceiling).
 pub const DEFAULT_MAX_WRITE_BYTES_PER_SEC: u64 = 32 << 20;
 /// Default burst allowance for the spill write-rate token bucket: 2 GiB.
@@ -77,6 +80,9 @@ pub struct DiskTierConfig {
     pub max_bytes: u64,
     /// Entries shorter than this many tokens stay in RAM and do not spill on eviction.
     pub min_spill_tokens: usize,
+    /// Evicted RAM entries idle longer than this are dropped instead of written to NVMe.
+    /// [`Duration::ZERO`] disables the TTL check.
+    pub max_spill_age: Duration,
     /// Sustained write-rate cap in bytes/sec (`0` disables rate limiting).
     pub max_write_bytes_per_sec: u64,
     /// Burst capacity in bytes for the write-rate token bucket.
@@ -93,6 +99,7 @@ impl DiskTierConfig {
             dir,
             max_bytes,
             min_spill_tokens: DEFAULT_MIN_SPILL_TOKENS,
+            max_spill_age: DEFAULT_MAX_SPILL_AGE,
             max_write_bytes_per_sec: DEFAULT_MAX_WRITE_BYTES_PER_SEC,
             write_burst_bytes: DEFAULT_WRITE_BURST_BYTES,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
@@ -117,6 +124,8 @@ pub struct DiskTierStats {
     pub skips_clean: u64,
     /// Evicted entries skipped because they were shorter than `min_spill_tokens`.
     pub skips_small: u64,
+    /// Evicted entries skipped because they were idle in RAM longer than `max_spill_age`.
+    pub skips_stale: u64,
     /// Evicted entries skipped because a longer entry already covers them on disk.
     pub skips_superseded: u64,
     /// Evicted entries shed by the write-rate budget or writer backpressure.
@@ -940,6 +949,14 @@ impl HostCache {
             disk.stats.skips_clean += 1;
             disk.manifest_dirty = true;
             disk.maybe_checkpoint_manifest();
+            return;
+        }
+
+        // 2b. Stale-entry TTL guard: do not write entries that sat idle in RAM past
+        //     `max_spill_age` (applies on shutdown flush too so idle abandoned entries are
+        //     not dumped to SSD on restart).
+        if !disk.config.max_spill_age.is_zero() && e.used_at.elapsed() > disk.config.max_spill_age {
+            disk.stats.skips_stale += 1;
             return;
         }
 
