@@ -108,27 +108,38 @@ __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t
 }
 
 // Converts two E4M3 block scales (low byte s0, high byte s1) into broadcast BF16x2 factors
-// equal to `(s0 * 2^112, s0 * 2^112)` and `(s1 * 2^112, s1 * 2^112)`, exact for all finite
-// E4M3 scales.
+// equal to `(s0 * 2^112, s0 * 2^112)` and `(s1 * 2^112, s1 * 2^112)`, bit-exact for all
+// finite E4M3 scales with zero F16->F32 conversions (`0x7780` is BF16 2^112).
 __device__ __forceinline__ void e4m3x2_to_bf16x2_p112(uint32_t pair, __nv_bfloat162& s0_p112,
                                                       __nv_bfloat162& s1_p112) {
     const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3);
-    const float2 f = __half22float2(__half2(h));
-    s0_p112 = __floats2bfloat162_rn(f.x * 0x1p112f, f.x * 0x1p112f);
-    s1_p112 = __floats2bfloat162_rn(f.y * 0x1p112f, f.y * 0x1p112f);
+    const uint32_t u = uint32_t(h.x) | (uint32_t(h.y) << 16);
+    const uint32_t scaled = ((u & 0x7fff7fffu) >> 3) | (u & 0x80008000u);
+    const uint32_t k_lift = 0x77807780u;
+    const __nv_bfloat162 lift = *reinterpret_cast<const __nv_bfloat162*>(&k_lift);
+    const __nv_bfloat162 lifted =
+        __hmul2(__hmul2(*reinterpret_cast<const __nv_bfloat162*>(&scaled), lift), lift);
+    const uint32_t bits = *reinterpret_cast<const uint32_t*>(&lifted);
+    const uint32_t lo = (bits & 0xffffu) | ((bits & 0xffffu) << 16);
+    const uint32_t hi = (bits >> 16) | (bits & 0xffff0000u);
+    s0_p112 = *reinterpret_cast<const __nv_bfloat162*>(&lo);
+    s1_p112 = *reinterpret_cast<const __nv_bfloat162*>(&hi);
 }
 
 // Two E2M1 values (low nibble first) widened to BF16x2 and multiplied by `scale_p112`
-// (`e4m3 * 2^112`), exact with zero rounding error.
+// (`e4m3 * 2^112`), exact with zero rounding error. On sm_89 fuses `prmt >> 3` + sign OR.
 __device__ __forceinline__ uint32_t e2m1x2_to_bf16x2_scaled(uint32_t byte,
                                                             __nv_bfloat162 scale_p112) {
 #if SIPHON_SM89
-    const uint32_t u = e2m1x2_to_f16x2_sm89(byte);
+    const uint32_t select = ((byte & 0x7u) << 4) | ((byte & 0x70u) << 8);
+    uint32_t h;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(h) : "r"(0x3e3c3800u), "r"(0x46444240u), "r"(select));
+    uint32_t r = (h >> 3) | ((byte & 0x8u) << 12) | ((byte & 0x80u) << 24);
 #else
     const __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(uint8_t(byte), __NV_E2M1);
     const uint32_t u = uint32_t(h.x) | (uint32_t(h.y) << 16);
-#endif
     uint32_t r = ((u & 0x7fff7fffu) >> 3) | (u & 0x80008000u);
+#endif
     __nv_bfloat162 v = *reinterpret_cast<__nv_bfloat162*>(&r);
     v = __hmul2(v, scale_p112);
     return *reinterpret_cast<uint32_t*>(&v);

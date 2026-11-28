@@ -222,11 +222,16 @@ impl ExpertFormat<'_> {
     }
 
     /// Dynamic shared memory of an `expert_gemm_q8_*` block, `kQ8Shared` in
-    /// `kernels/expert_matmul.cu`: 3 stages of 32 bytes per weight row and 64 per pair, the
-    /// same scale slots, then the decode table of 176 entries of 16 bytes.
+    /// `kernels/expert_matmul.cu`: 3 stages of 32 bytes per weight row and 64 per pair,
+    /// scale slots (`128` rows on `sm_89`, `256` on `sm_120a`), and the 176-entry decode
+    /// table (`8` B/entry on `sm_89`, `16` B/entry on `sm_120a`).
     fn fp8_shared_bytes() -> usize {
-        let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
-        3 * (GEMM_COLUMNS * 32 + QUANTIZED_PAIRS * 64) + 2 * rows * 16 + 176 * 16
+        if cfg!(sm89) {
+            3 * (GEMM_COLUMNS * 32 + QUANTIZED_PAIRS * 64) + 2 * GEMM_COLUMNS * 16 + 176 * 8
+        } else {
+            let rows = GEMM_COLUMNS + QUANTIZED_PAIRS;
+            3 * (GEMM_COLUMNS * 32 + QUANTIZED_PAIRS * 64) + 2 * rows * 16 + 176 * 16
+        }
     }
 
     /// Dynamic shared memory of an `expert_gemm_*` block: per pipeline stage, the weight bytes
@@ -1587,8 +1592,12 @@ impl Experts {
             "fused SwiGLU-quant does not support MXFP6 weights"
         );
         ensure!(
-            crate::BLOCK_SCALED_MMA,
-            "fused SwiGLU-quant needs the block-scaled MMA, which this sm_89 build lacks"
+            crate::BLOCK_SCALED_MMA
+                || matches!(
+                    out_format,
+                    RowFormat::Fp8PerRowPaired | RowFormat::Fp8PerRowNatural
+                ),
+            "fused SwiGLU-quant for {out_format:?} needs block-scaled MMA, which this sm_89 build lacks"
         );
         ensure!(
             n.is_multiple_of(n_mult) && k.is_multiple_of(GEMM_K_MULTIPLE),
@@ -1923,6 +1932,16 @@ fn mlp_grid_blocks(pairs: usize, tiles13: usize, tiles2: usize, max_blocks: usiz
     let tasks = tasks13 + pairs * tiles2;
     if tasks <= max_blocks {
         return tasks;
+    }
+    if cfg!(sm89) {
+        // On 128-SM Ada (`max_blocks = 640`), launching full resident blocks (5.00 blocks/SM)
+        // avoids the 4.5-blocks/SM load imbalance of 576 blocks (14 max tasks/SM vs 15) as
+        // long as every pair's `w13` still finishes in an earlier wave than its `w2`.
+        let no_intra_wave_wait = (0..pairs)
+            .all(|p| ((p + 1) * tiles13 - 1) / max_blocks < (tasks13 + p * tiles2) / max_blocks);
+        if no_intra_wave_wait {
+            return max_blocks;
+        }
     }
     let min_waves = tasks.div_ceil(max_blocks);
     for waves in min_waves..=tasks {

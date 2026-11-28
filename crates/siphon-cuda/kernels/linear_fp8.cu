@@ -548,28 +548,26 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
     // Copies: each thread kLoadsA chunks of x rows and kLoadsB of W rows per stage (rows
     // tid / 8 + kCopyRows * i, chunk tid % 8), and threads below kBm the 4 scales of x row tid.
     const int chunk = tid % 8;
-    const uint8_t* a_src[kLoadsA];
-    const uint8_t* b_src[kLoadsB];
+    const int base_row = tid / 8;
     uint32_t a_dst[kLoadsA];
     uint32_t b_dst[kLoadsB];
     uint32_t a_live = 0;
     uint32_t b_live = 0;
 #pragma unroll
     for (int i = 0; i < kLoadsA; ++i) {
-        const int row = tid / 8 + kCopyRows * i;
+        const int row = base_row + kCopyRows * i;
         a_dst[i] = offset(row, chunk);
-        const bool a_ok = m0 + row < m;
-        a_live |= uint32_t(a_ok) << i;
-        a_src[i] = p.x + size_t(a_ok ? m0 + row : 0) * k + chunk * 16;
+        a_live |= uint32_t(m0 + row < m) << i;
     }
 #pragma unroll
     for (int i = 0; i < kLoadsB; ++i) {
-        const int row = tid / 8 + kCopyRows * i;
+        const int row = base_row + kCopyRows * i;
         b_dst[i] = offset(row, chunk);
-        const bool b_ok = n0 + row < n;
-        b_live |= uint32_t(b_ok) << i;
-        b_src[i] = p.w + size_t(b_ok ? n0 + row : 0) * k + chunk * 16;
+        b_live |= uint32_t(n0 + row < n) << i;
     }
+    const uint8_t* const a_base = p.x + size_t(m0 + base_row) * k + chunk * 16;
+    const uint8_t* const b_base = p.w + size_t(n0 + base_row) * k + chunk * 16;
+    const size_t copy_stride = size_t(kCopyRows) * k;
 #if !SIPHON_SM89
     const bool scale_ok = tid < kBm && m0 + tid < m;
     const uint8_t* scale_src = p.x_scale + size_t(scale_ok ? m0 + tid : 0) * (k / 32);
@@ -581,11 +579,14 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         const int k0 = step * kBk;
 #pragma unroll
         for (int i = 0; i < kLoadsA; ++i) {
-            cp_async16(base + a_dst[i], a_src[i] + k0, a_live >> i & 1);
+            const bool live = (a_live >> i) & 1;
+            cp_async16(base + a_dst[i], (live ? a_base + i * copy_stride : p.x) + k0, live);
         }
 #pragma unroll
         for (int i = 0; i < kLoadsB; ++i) {
-            cp_async16(base + kStageA + b_dst[i], b_src[i] + k0, b_live >> i & 1);
+            const bool live = (b_live >> i) & 1;
+            cp_async16(base + kStageA + b_dst[i], (live ? b_base + i * copy_stride : p.w) + k0,
+                       live);
         }
 #if !SIPHON_SM89
         if (tid < kBm) {
@@ -627,10 +628,6 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
         (void)step;
 #endif
         uint32_t sb[kNi] = {};
-#if SIPHON_SM89
-        uint32_t sb0[kNi] = {};
-        uint32_t sb1[kNi] = {};
-#endif
         if constexpr (kBlockScaleB) {
             const auto* b_scales = static_cast<const uint8_t*>(p.w_scale);
             const size_t scale_stride = size_t(k / 32);
@@ -643,14 +640,6 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
                                    b_scales + size_t(b_scale_row) * scale_stride + step * 4)
                              : 0x7f7f7f7fu;
             }
-#if SIPHON_SM89
-            const int t = lane % 4;
-#pragma unroll
-            for (int ni = 0; ni < kNi; ++ni) {
-                sb0[ni] = __shfl_sync(0xffffffffu, sb[ni], 8 * t);
-                sb1[ni] = __shfl_sync(0xffffffffu, sb[ni], 8 * t + 4);
-            }
-#endif
         }
         // Double-buffer A and B fragments across the four k32 slices so ldmatrix latency
         // hides behind the FP8 MMAs of the previous slice.
@@ -685,10 +674,12 @@ __device__ void gemm(const Batch& b, uint8_t* smem) {
             }
 #if SIPHON_SM89
             if constexpr (kBlockScaleB) {
+                const int t = lane % 4;
 #pragma unroll
                 for (int ni = 0; ni < kNi; ++ni) {
-                    const float s0 = e8m0((sb0[ni] >> (8 * kK)) & 0xffu);
-                    const float s1 = e8m0((sb1[ni] >> (8 * kK)) & 0xffu);
+                    const uint32_t byte_k = (sb[ni] >> (8 * kK)) & 0xffu;
+                    const float s0 = e8m0(__shfl_sync(0xffffffffu, byte_k, 8 * t));
+                    const float s1 = e8m0(__shfl_sync(0xffffffffu, byte_k, 8 * t + 4));
 #pragma unroll
                     for (int mi = 0; mi < kMi; ++mi) {
                         float tmp[4] = {};
@@ -1123,6 +1114,50 @@ extern "C" __global__ void __launch_bounds__(256)
     const auto* src = reinterpret_cast<const uint4*>(x + size_t(row) * k);
     auto* dst = reinterpret_cast<uint2*>(values + size_t(row) * k);
     const int vecs = k / 8;
+    const auto pack4 = [](uint32_t p0, uint32_t p1, float inv) -> uint32_t {
+        const float2 f0 = make_float2(lo(p0) * inv, hi(p0) * inv);
+        const float2 f1 = make_float2(lo(p1) * inv, hi(p1) * inv);
+        const uint32_t lo2 = uint32_t(__nv_cvt_float2_to_fp8x2(f0, __NV_SATFINITE, __NV_E4M3));
+        const uint32_t hi2 = uint32_t(__nv_cvt_float2_to_fp8x2(f1, __NV_SATFINITE, __NV_E4M3));
+        return lo2 | (hi2 << 16);
+    };
+    // Single-pass register-cached path for k <= 3072 (<= 12 uint4s per lane).
+    if (vecs <= 384) {
+        uint4 buf[12];
+        float amax = 0.f;
+#pragma unroll
+        for (int it = 0; it < 12; ++it) {
+            const int i = lane + 32 * it;
+            if (i < vecs) {
+                const uint4 v = src[i];
+                buf[it] = v;
+                const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    amax = fmaxf(amax, fabsf(lo(words[w])));
+                    amax = fmaxf(amax, fabsf(hi(words[w])));
+                }
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset >= 1; offset /= 2) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+        }
+        const float s = amax / kE4m3Max;
+        const float inv = amax > 0.f ? __fdiv_rn(kE4m3Max, amax) : 0.f;
+        if (lane == 0) {
+            reinterpret_cast<float*>(scales)[row] = s;
+        }
+#pragma unroll
+        for (int it = 0; it < 12; ++it) {
+            const int i = lane + 32 * it;
+            if (i < vecs) {
+                const uint4 v = buf[it];
+                dst[i] = make_uint2(pack4(v.x, v.y, inv), pack4(v.z, v.w, inv));
+            }
+        }
+        return;
+    }
     float amax = 0.f;
     for (int i = lane; i < vecs; i += 32) {
         const uint4 v = src[i];
@@ -1144,13 +1179,6 @@ extern "C" __global__ void __launch_bounds__(256)
     }
     for (int i = lane; i < vecs; i += 32) {
         const uint4 v = src[i];
-        const auto pack4 = [&](uint32_t p0, uint32_t p1) -> uint32_t {
-            const uint32_t b0 = __nv_cvt_float_to_fp8(lo(p0) * inv, __NV_SATFINITE, __NV_E4M3);
-            const uint32_t b1 = __nv_cvt_float_to_fp8(hi(p0) * inv, __NV_SATFINITE, __NV_E4M3);
-            const uint32_t b2 = __nv_cvt_float_to_fp8(lo(p1) * inv, __NV_SATFINITE, __NV_E4M3);
-            const uint32_t b3 = __nv_cvt_float_to_fp8(hi(p1) * inv, __NV_SATFINITE, __NV_E4M3);
-            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-        };
-        dst[i] = make_uint2(pack4(v.x, v.y), pack4(v.z, v.w));
+        dst[i] = make_uint2(pack4(v.x, v.y, inv), pack4(v.z, v.w, inv));
     }
 }

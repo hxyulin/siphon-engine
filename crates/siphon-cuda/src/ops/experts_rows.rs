@@ -149,8 +149,11 @@ impl ExpertsRows {
         let group = module.load_function("expert_group_rows")?;
         let (wide_nvfp4, wide_nvfp4_blocks) = load("expert_mlp_rows_wide_nvfp4_3", smem(RINGS[0]))?;
         let (wide_mxfp8, wide_mxfp8_blocks) = load("expert_mlp_rows_wide_mxfp8_3", smem(RINGS[0]))?;
-        let (wide_nvfp4_s4, wide_nvfp4_s4_blocks) =
-            load("expert_mlp_rows_wide_nvfp4_s4_3", smem(RINGS[0]))?;
+        let wide_s4_ring = if cfg!(sm89) { RINGS[1] } else { RINGS[0] };
+        let (wide_nvfp4_s4, wide_nvfp4_s4_blocks) = load(
+            &format!("expert_mlp_rows_wide_nvfp4_s4_{wide_s4_ring}"),
+            smem(wide_s4_ring),
+        )?;
         let (mxfp6_kernel, mxfp6_blocks) = load("expert_mlp_rows_mxfp6_3", smem_mxfp6(RINGS[0]))?;
         let (mxfp6_multi, mxfp6_multi_blocks) =
             load("expert_mlp_rows_multi_mxfp6_3", smem_mxfp6(RINGS[0]))?;
@@ -364,10 +367,15 @@ impl ExpertsRows {
                     smem_mxfp6(RINGS[0]),
                 )
             } else {
+                let ring = if cfg!(sm89) && format == 2 {
+                    RINGS[1]
+                } else {
+                    RINGS[0]
+                };
                 (
                     &self.wide_kernels[format],
                     self.wide_blocks[format],
-                    smem(RINGS[0]),
+                    smem(ring),
                 )
             };
             let config = LaunchConfig {

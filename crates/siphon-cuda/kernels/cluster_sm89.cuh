@@ -44,6 +44,10 @@ __device__ __forceinline__ unsigned load_acquire(const unsigned* p) {
     return v;
 }
 
+__device__ __forceinline__ void red_release_add(unsigned* p, unsigned val) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(val) : "memory");
+}
+
 // Per-block mailboxes of kBytes, for up to kBlocks blocks.
 template <int kBlocks, int kBytes>
 struct Mailboxes {
@@ -72,8 +76,7 @@ struct Mailboxes {
         } else {
             *reinterpret_cast<uint2*>(dst) = make_uint2(words[0], words[1]);
         }
-        __threadfence();
-        atomicAdd(reinterpret_cast<unsigned*>(at(block, barrier, 4)), unsigned(4 * kWords));
+        red_release_add(reinterpret_cast<unsigned*>(at(block, barrier, 4)), unsigned(4 * kWords));
     }
 
     // Waits on this block's barrier at shared address `barrier` until `bytes` have
@@ -87,6 +90,7 @@ struct Mailboxes {
         const int threads = kBlock ? int(blockDim.x) : 32;
         if (t == 0) {
             while (load_acquire(count) < bytes) {
+                __nanosleep(32);
             }
         }
         if constexpr (kBlock) {
@@ -94,10 +98,19 @@ struct Mailboxes {
         } else {
             __syncwarp();
         }
-        const auto* src = reinterpret_cast<const uint32_t*>(at(block, smem_address(target), bytes));
-        auto* dst = static_cast<uint32_t*>(target);
-        for (uint32_t i = t; i < bytes / 4; i += threads) {
-            dst[i] = __ldcg(src + i);
+        if ((bytes & 15u) == 0 && (reinterpret_cast<uintptr_t>(target) & 15u) == 0) {
+            const auto* src = reinterpret_cast<const uint4*>(at(block, smem_address(target), bytes));
+            auto* dst = static_cast<uint4*>(target);
+            for (uint32_t i = t; i < bytes / 16; i += threads) {
+                dst[i] = __ldcg(src + i);
+            }
+        } else {
+            const auto* src =
+                reinterpret_cast<const uint32_t*>(at(block, smem_address(target), bytes));
+            auto* dst = static_cast<uint32_t*>(target);
+            for (uint32_t i = t; i < bytes / 4; i += threads) {
+                dst[i] = __ldcg(src + i);
+            }
         }
         if constexpr (kBlock) {
             __syncthreads();
@@ -131,10 +144,10 @@ __device__ __forceinline__ void barrier(BarrierState* states, int max_clusters, 
         __threadfence();
         if (atomicAdd(&s.count, 1u) == unsigned(size) - 1) {
             atomicExch(&s.count, 0u);
-            __threadfence();
-            atomicAdd(&s.generation, 1u);
+            red_release_add(&s.generation, 1u);
         } else {
             while (load_acquire(&s.generation) == generation) {
+                __nanosleep(32);
             }
         }
     }

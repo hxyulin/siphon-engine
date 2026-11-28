@@ -473,6 +473,53 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
             const uint4 bv = slot[slot_index<G::kChunks>(g + 8, c)];
             const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
             const uint32_t bw[4] = {bv.x, bv.y, bv.z, bv.w};
+            if (ng == 1) {
+                // Fast stream-unpack path for chunks with <= 8 pairs (>90% of B=16/32 chunks):
+                // decodes weights on the fly per MMA without materializing 32-reg a[16], b[16].
+                if constexpr (kFp4) {
+                    uint32_t scale_a[2];
+                    uint32_t scale_b[2];
+                    e4m3x2_scale_pairs(sa, scale_a[0], scale_a[1]);
+                    e4m3x2_scale_pairs(sb, scale_b[0], scale_b[1]);
+#pragma unroll
+                    for (int h = 0; h < 4; ++h) {
+                        const uint32_t xw[4] = {xv0[j][h].x, xv0[j][h].y, xv0[j][h].z, xv0[j][h].w};
+                        const uint32_t s_a = scale_a[h / 2];
+                        const uint32_t s_b = scale_b[h / 2];
+                        const uint32_t a0 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[h]), s_a);
+                        const uint32_t b0 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[h]), s_b);
+                        const uint32_t a1 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[h] >> 8), s_a);
+                        const uint32_t b1 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[h] >> 8), s_b);
+                        mma(acc[0], a0, b0, a1, b1, xw[0], xw[1]);
+                        const uint32_t a2 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[h] >> 16), s_a);
+                        const uint32_t b2 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[h] >> 16), s_b);
+                        const uint32_t a3 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(aw[h] >> 24), s_a);
+                        const uint32_t b3 = bf16x2_mul(e2m1x2_to_scaled_bf16x2(bw[h] >> 24), s_b);
+                        mma(acc[0], a2, b2, a3, b3, xw[2], xw[3]);
+                    }
+                } else {
+                    const uint32_t scale_a = e8m0_scale_pair(sa);
+                    const uint32_t scale_b = e8m0_scale_pair(sb);
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const uint32_t xw[4] = {xv0[j][h].x, xv0[j][h].y, xv0[j][h].z, xv0[j][h].w};
+#pragma unroll
+                        for (int q = 0; q < 2; ++q) {
+                            const int wi = 2 * h + q;
+                            const uint32_t a0 = bf16x2_mul(
+                                f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(aw[wi] & 0xffffu)), scale_a);
+                            const uint32_t b0 = bf16x2_mul(
+                                f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(bw[wi] & 0xffffu)), scale_b);
+                            const uint32_t a1 = bf16x2_mul(
+                                f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(aw[wi] >> 16)), scale_a);
+                            const uint32_t b1 = bf16x2_mul(
+                                f16x2_to_scaled_bf16x2(e4m3x2_to_f16x2(bw[wi] >> 16)), scale_b);
+                            mma(acc[0], a0, b0, a1, b1, xw[2 * q], xw[2 * q + 1]);
+                        }
+                    }
+                }
+                continue;
+            }
             uint32_t a[G::kValues / 2];
             uint32_t b[G::kValues / 2];
             if constexpr (kFp4) {
@@ -1423,8 +1470,8 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32)
                                                ring);                                              \
     }
 
-#define EXPERT_MLP_ROWS_WIDE_S4(name, RING)                                                        \
-    extern "C" __global__ void __launch_bounds__(kWarps * 32)                                       \
+#define EXPERT_MLP_ROWS_WIDE_S4(name, RING, MIN_BLOCKS)                                            \
+    extern "C" __global__ void __launch_bounds__(kWarps * 32, MIN_BLOCKS)                          \
         name(const __nv_bfloat16* x, int m, const uint8_t* w13, const uint8_t* s13,                \
              const uint8_t* s13_base, const float* g13, const uint8_t* w2, const uint8_t* s2,      \
              const uint8_t* s2_base, const float* g2, __nv_bfloat16* act, __nv_bfloat16* out,      \
@@ -1446,7 +1493,8 @@ EXPERT_MLP_ROWS_MULTI(expert_mlp_rows_multi_mxfp8_3, false, 3, 3)
 EXPERT_MLP_ROWS_MULTI_S4(expert_mlp_rows_multi_nvfp4_s4_3, 3, 3)
 EXPERT_MLP_ROWS_WIDE(expert_mlp_rows_wide_nvfp4_3, true, 3)
 EXPERT_MLP_ROWS_WIDE(expert_mlp_rows_wide_mxfp8_3, false, 3)
-EXPERT_MLP_ROWS_WIDE_S4(expert_mlp_rows_wide_nvfp4_s4_3, 3)
+EXPERT_MLP_ROWS_WIDE_S4(expert_mlp_rows_wide_nvfp4_s4_3, 3, 2)
+EXPERT_MLP_ROWS_WIDE_S4(expert_mlp_rows_wide_nvfp4_s4_4, 4, 2)
 
 namespace {
 
