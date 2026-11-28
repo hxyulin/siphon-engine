@@ -34,13 +34,13 @@ use std::{
 
 use anyhow::{Context as _, bail, ensure};
 use serde_json::{Value, json};
-use siphon::prefix_hash::chunk_hashes;
+use siphon::prefix_hash::{chunk_hashes, prefix_hash};
 
 use super::{HOST_CHUNK_POSITIONS, HostCache, HostEntry};
 
 /// Changes whenever the files' layout changes, or the engine computes the saved state
 /// differently in a way the identity does not show.
-pub const DISK_FORMAT: u32 = 1;
+pub const DISK_FORMAT: u32 = 2;
 
 const MAGIC: &[u8; 8] = b"SIPHONHC";
 pub(super) const MANIFEST: &str = "manifest.json";
@@ -214,17 +214,34 @@ impl HostCache {
         }
         head.resize(head.len() + pad8(e.tokens.len() * 4), 0);
         w.write_all(&head)?;
+        let p = HOST_CHUNK_POSITIONS;
         let (target, draft) = self.parts();
         let mut bytes = head.len() as u64;
-        for &c in &e.kv {
-            let len = if self.drafted[c as usize] {
-                target + draft
+        for (j, &c) in e.kv.iter().enumerate() {
+            let pos_len = (e.tokens.len() - j * p).min(p);
+            let has_draft = self.drafted[c as usize];
+            let at = self.pool.address(c);
+            if pos_len == p {
+                let len = if has_draft { target + draft } else { target };
+                // SAFETY: a chunk holds `target + draft` bytes, and the copies are done.
+                w.write_all(unsafe { Self::host_bytes(at, len) })?;
+                bytes += len as u64;
             } else {
-                target
-            };
-            // SAFETY: a chunk holds `target + draft` bytes, and the copies are done.
-            w.write_all(unsafe { Self::host_bytes(self.pool.address(c), len) })?;
-            bytes += len as u64;
+                for (_, pb, before) in self.target.layout() {
+                    let n = pos_len * pb;
+                    // SAFETY: `p * before + pos_len * pb <= target`, and copies are done.
+                    w.write_all(unsafe { Self::host_bytes(at + p * before, n) })?;
+                    bytes += n as u64;
+                }
+                if has_draft && draft > 0 {
+                    for (_, dpb, before) in self.draft.layout() {
+                        let n = pos_len * dpb;
+                        // SAFETY: `target + p * before + pos_len * dpb <= target + draft`.
+                        w.write_all(unsafe { Self::host_bytes(at + target + p * before, n) })?;
+                        bytes += n as u64;
+                    }
+                }
+            }
         }
         let mut left = self.local_bytes + if e.rings { self.rings_bytes } else { 0 };
         for &c in &e.local {
@@ -305,7 +322,7 @@ impl HostCache {
             word(4) != 0,
         );
         ensure!(
-            tokens == chunks * HOST_CHUNK_POSITIONS && chunks > 0,
+            tokens > 0 && chunks == tokens.div_ceil(HOST_CHUNK_POSITIONS),
             "{tokens} tokens in {chunks} chunks"
         );
         let mut drafted = vec![0u8; chunks + pad8(chunks)];
@@ -338,11 +355,14 @@ impl HostCache {
         );
         let mut r = BufReader::with_capacity(1 << 20, file);
         let (used, rings, drafted, ids) = Self::read_entry_header(&mut r, key)?;
-        let entry_hashes = chunk_hashes(&ids, HOST_CHUNK_POSITIONS);
-        let full_hash = entry_hashes.last().copied();
-        if self.entries.iter().any(|e| {
-            e.tokens.len() == ids.len() && e.hashes.last().copied() == full_hash && e.tokens == ids
-        }) {
+        let p = HOST_CHUNK_POSITIONS;
+        let entry_hashes = chunk_hashes(&ids, p);
+        let full_hash = prefix_hash(&ids);
+        if self
+            .entries
+            .iter()
+            .any(|e| e.tokens.len() == ids.len() && e.full_hash == full_hash && e.tokens == ids)
+        {
             return Ok(Some(0));
         }
         let Some((kv, local, shared)) = self.allocate(&ids)? else {
@@ -352,10 +372,11 @@ impl HostCache {
         let mut read = 0u64;
         let result = (|| -> anyhow::Result<()> {
             for (j, &c) in kv.iter().enumerate() {
+                let pos_len = (ids.len() - j * p).min(p);
                 let has_draft = drafted[j] != 0;
                 let at = self.pool.address(c);
                 if j < shared {
-                    // Another entry's chunk: only a draft part it lacks is new.
+                    // Another entry's full chunk: only a draft part it lacks is new.
                     r.seek_relative(i64::try_from(target)?)?;
                     if has_draft && !self.drafted[c as usize] && draft > 0 {
                         // SAFETY: the draft part of a chunk no copy touches, which no
@@ -368,13 +389,32 @@ impl HostCache {
                     }
                     continue;
                 }
-                // SAFETY: a new chunk of this entry, which nothing else reads yet.
-                r.read_exact(unsafe { Self::host_bytes_mut(at, target) })?;
-                read += target as u64;
-                if has_draft {
-                    // SAFETY: as above.
-                    r.read_exact(unsafe { Self::host_bytes_mut(at + target, draft) })?;
-                    read += draft as u64;
+                if pos_len == p {
+                    // SAFETY: a new chunk of this entry, which nothing else reads yet.
+                    r.read_exact(unsafe { Self::host_bytes_mut(at, target) })?;
+                    read += target as u64;
+                    if has_draft && draft > 0 {
+                        // SAFETY: as above.
+                        r.read_exact(unsafe { Self::host_bytes_mut(at + target, draft) })?;
+                        read += draft as u64;
+                    }
+                } else {
+                    for (_, pb, before) in self.target.layout() {
+                        let n = pos_len * pb;
+                        // SAFETY: a new partial tail chunk not read by any other entry.
+                        r.read_exact(unsafe { Self::host_bytes_mut(at + p * before, n) })?;
+                        read += n as u64;
+                    }
+                    if has_draft && draft > 0 {
+                        for (_, dpb, before) in self.draft.layout() {
+                            let n = pos_len * dpb;
+                            // SAFETY: as above.
+                            r.read_exact(unsafe {
+                                Self::host_bytes_mut(at + target + p * before, n)
+                            })?;
+                            read += n as u64;
+                        }
+                    }
                 }
                 self.drafted[c as usize] = has_draft;
             }
@@ -402,6 +442,7 @@ impl HostCache {
         self.entries.push(HostEntry {
             tokens: ids,
             hashes: entry_hashes,
+            full_hash,
             kv,
             local,
             rings,

@@ -1,15 +1,36 @@
-//! Cumulative chunk hashing for O(prefix) prefix-cache lookup and chunk sharing.
+//! Cumulative chunk and exact-length hashing for fast prefix-cache lookup and chunk sharing.
 //!
-//! Prefix cache entries store prompt token keys aligned to multiples of the prefill chunk
-//! size (`chunk`). Computing a single pass of cumulative 64-bit hashes over an incoming
-//! prompt lets device and host caches reject mismatched entries in O(1) without scanning
-//! their token slices, while still verifying exact slice equality on hash hits.
+//! Prefix cache entries store prompt token keys at exact prompt boundaries (`prompt_len - 1`
+//! once above [`MIN_PREFIX_TOKENS`]). Computing a single pass of cumulative 64-bit hashes and
+//! streaming hasher states at each full `chunk` boundary lets device, host, and disk caches
+//! reject mismatched entries in O(1) on full chunks and hash only the short trailing tail
+//! (`< chunk` tokens) for arbitrary-length entries, while still verifying exact slice
+//! equality on hash hits.
 
 const MUL: u64 = 0x9e37_79b1_85eb_ca87;
+
+/// Minimum prefix length (in tokens) worth caching. Below this threshold, copying the fixed
+/// local sliding-ring and conv state (~80–105 MiB) costs more than prefilling from scratch.
+pub const MIN_PREFIX_TOKENS: usize = 256;
+
+/// Returns the exact prefix-cache save boundary for a prompt of `prompt_len` tokens:
+/// `prompt_len - 1` when at least [`MIN_PREFIX_TOKENS`] tokens would be saved (leaving 1
+/// token to compute the first token's logits, and allowing exact duplicate prompts to hit
+/// `prompt_len - 1` tokens), or `0` for tiny prompts below the threshold.
+#[must_use]
+pub const fn prefix_boundary(prompt_len: usize) -> usize {
+    let boundary = prompt_len.saturating_sub(1);
+    if boundary >= MIN_PREFIX_TOKENS {
+        boundary
+    } else {
+        0
+    }
+}
 
 /// Four-lane streaming 64-bit hasher over `u32` tokens: packs pairs into `u64` across
 /// four independent lanes for high instruction-level parallelism while guaranteeing
 /// split-invariant hashes (`prefix_hash(&t[..k * chunk]) == chunk_hashes(t, chunk)[k - 1]`).
+#[derive(Clone, Copy, Debug)]
 struct PrefixHasher {
     lanes: [u64; 4],
     pos: usize,
@@ -104,31 +125,41 @@ pub fn chunk_hashes(tokens: &[u32], chunk: usize) -> Vec<u64> {
     out
 }
 
-/// Precomputed cumulative chunk hashes for an incoming prompt, bounded to `max_chunks`.
+/// Precomputed cumulative chunk hashes and streaming states for an incoming prompt,
+/// bounded to `max_chunks`.
 #[derive(Clone, Debug)]
 pub struct PrefixHashes {
     chunk: usize,
     hashes: Vec<u64>,
+    states: Vec<PrefixHasher>,
 }
 
 impl PrefixHashes {
-    /// Computes cumulative chunk hashes for the first `max_chunks` full chunks of `tokens`.
+    /// Computes cumulative chunk hashes and streaming states for the first `max_chunks` full
+    /// chunks of `tokens`.
     #[must_use]
     pub fn new(tokens: &[u32], chunk: usize, max_chunks: usize) -> Self {
         if chunk == 0 || max_chunks == 0 {
             return Self {
                 chunk,
                 hashes: Vec::new(),
+                states: Vec::new(),
             };
         }
         let count = (tokens.len() / chunk).min(max_chunks);
         let mut out = Vec::with_capacity(count);
+        let mut states = Vec::with_capacity(count);
         let mut state = PrefixHasher::new();
         for block in tokens.chunks_exact(chunk).take(count) {
             state.update(block);
             out.push(state.finish());
+            states.push(state);
         }
-        Self { chunk, hashes: out }
+        Self {
+            chunk,
+            hashes: out,
+            states,
+        }
     }
 
     /// Cumulative hash of the first `chunks` full chunks (`chunks >= 1`).
@@ -151,6 +182,37 @@ impl PrefixHashes {
         self.hash_at_chunks(len / self.chunk)
     }
 
+    /// Cumulative hash of `&tokens[..len]` for any positive `len <= tokens.len()`.
+    ///
+    /// Chunk-aligned lengths within the precomputed table return in O(1); arbitrary lengths
+    /// resume from the nearest cached chunk boundary state and hash only the remaining tail
+    /// (`< chunk` tokens when covered by `max_chunks`).
+    #[inline]
+    #[must_use]
+    pub fn hash_at_len_in(&self, tokens: &[u32], len: usize) -> Option<u64> {
+        if len == 0 || len > tokens.len() {
+            return None;
+        }
+        if self.chunk > 0 {
+            let full = len / self.chunk;
+            let rem = len % self.chunk;
+            if rem == 0
+                && let Some(h) = self.hash_at_chunks(full)
+            {
+                return Some(h);
+            }
+            if full > 0 && full <= self.states.len() {
+                let mut state = self.states[full - 1];
+                state.update(&tokens[full * self.chunk..len]);
+                return Some(state.finish());
+            }
+            if full == 0 {
+                return Some(prefix_hash(&tokens[..len]));
+            }
+        }
+        Some(prefix_hash(&tokens[..len]))
+    }
+
     /// Number of leading chunks whose cumulative hashes match `entry_hashes`.
     #[inline]
     #[must_use]
@@ -164,7 +226,7 @@ impl PrefixHashes {
 }
 
 /// Longest entry in `entries` strictly shorter than `prompt` that `prompt` starts with,
-/// using `hashes` for O(1) mismatch rejection and exact slice verification on hash hits.
+/// using `hashes` for fast mismatch rejection and exact slice verification on hash hits.
 #[must_use]
 pub fn longest_prefix_match<T>(
     prompt: &[u32],
@@ -180,7 +242,11 @@ pub fn longest_prefix_match<T>(
         if len == 0 || best.is_some_and(|(_, best_len)| len <= best_len) || prompt.len() <= len {
             continue;
         }
-        if hashes.hash_at_len(len) == Some(hash_of(entry)) && prompt.starts_with(tokens) {
+        if prompt[len - 1] != tokens[len - 1] || prompt[0] != tokens[0] {
+            continue;
+        }
+        if hashes.hash_at_len_in(prompt, len) == Some(hash_of(entry)) && prompt.starts_with(tokens)
+        {
             best = Some((i, len));
         }
     }
@@ -211,6 +277,29 @@ mod tests {
         assert_eq!(ph.hash_at_len(8192), None);
         assert_eq!(ph.hash_at_len(1000), None);
         assert_eq!(ph.hash_at_len(0), None);
+        // Arbitrary lengths (below chunk, mid-chunk, exact chunk, beyond max_chunks).
+        for len in [
+            1, 7, 8, 9, 255, 256, 1000, 2047, 2048, 2049, 3499, 6144, 7000, 9999,
+        ] {
+            assert_eq!(
+                ph.hash_at_len_in(&tokens, len),
+                Some(prefix_hash(&tokens[..len])),
+                "mismatch at len={len}"
+            );
+        }
+        assert_eq!(ph.hash_at_len_in(&tokens, 0), None);
+        assert_eq!(ph.hash_at_len_in(&tokens, tokens.len() + 1), None);
+    }
+
+    #[test]
+    fn prefix_boundary_respects_min_threshold() {
+        assert_eq!(prefix_boundary(0), 0);
+        assert_eq!(prefix_boundary(1), 0);
+        assert_eq!(prefix_boundary(MIN_PREFIX_TOKENS), 0);
+        assert_eq!(prefix_boundary(MIN_PREFIX_TOKENS + 1), MIN_PREFIX_TOKENS);
+        assert_eq!(prefix_boundary(1500), 1499);
+        assert_eq!(prefix_boundary(2048), 2047);
+        assert_eq!(prefix_boundary(4097), 4096);
     }
 
     #[test]
@@ -244,12 +333,7 @@ mod tests {
         assert_eq!(got, Some(6));
 
         for (e, ch, _) in &entries {
-            let exact = e
-                .iter()
-                .zip(&prompt)
-                .take_while(|(a, b)| a == b)
-                .count()
-                / chunk;
+            let exact = e.iter().zip(&prompt).take_while(|(a, b)| a == b).count() / chunk;
             assert_eq!(hashes.shared_chunks(ch), exact);
         }
     }

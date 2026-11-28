@@ -37,7 +37,7 @@ use std::{ffi::c_void, sync::Arc, time::Instant};
 
 use anyhow::{Context as _, ensure};
 use cudarc::driver::{CudaEvent, CudaStream, PinnedHostSlice, sys};
-use siphon::prefix_hash::{PrefixHashes, chunk_hashes};
+use siphon::prefix_hash::{PrefixHashes, chunk_hashes, prefix_hash};
 
 use crate::{
     draft::{Draft, DraftRings},
@@ -227,13 +227,16 @@ fn copy(
 
 /// One prompt's state in host memory.
 struct HostEntry {
-    /// The prompt's key ([`super::Prompt::key`]) below its boundary, a multiple of
-    /// [`HOST_CHUNK_POSITIONS`]: its tokens, with image placeholders replaced by ids of the
-    /// images' hashes.
+    /// The prompt's key ([`super::Prompt::key`]) below its boundary (may be any positive
+    /// length, not necessarily a multiple of [`HOST_CHUNK_POSITIONS`]): its tokens, with
+    /// image placeholders replaced by ids of the images' hashes.
     tokens: Vec<u32>,
-    /// Cumulative hash after each [`HOST_CHUNK_POSITIONS`] chunk of `tokens`.
+    /// Cumulative hash after each full [`HOST_CHUNK_POSITIONS`] chunk of `tokens`.
     hashes: Vec<u64>,
-    /// The chunks of the global caches, by position.
+    /// Cumulative hash of all `tokens` ([`prefix_hash`]).
+    full_hash: u64,
+    /// The chunks of the global caches, by position (`tokens.len().div_ceil(HOST_CHUNK_POSITIONS)`).
+    /// Full leading chunks may be shared across entries; a trailing partial chunk is private.
     kv: Vec<u32>,
     /// The chunks of the rings and conv states, then the draft's rings.
     local: Vec<u32>,
@@ -249,6 +252,14 @@ struct HostEntry {
     disk_dirty: bool,
 }
 
+impl HostEntry {
+    /// Number of full [`HOST_CHUNK_POSITIONS`] KV chunks in this entry (eligible for sharing).
+    #[inline]
+    fn full_chunks(&self) -> usize {
+        self.tokens.len() / HOST_CHUNK_POSITIONS
+    }
+}
+
 /// A sequence parked in host memory mid-generation ([`HostCache::park`]): its global caches
 /// below its position, its rings and conv states at that position, and optionally its DFlash 2
 /// draft sliding rings.
@@ -262,21 +273,25 @@ struct Parked {
     draft_committed: Option<usize>,
 }
 
-/// What [`HostCache::park`] copied: global cache chunks copied and shared with an entry,
-/// and the bytes copied.
+/// Transfer statistics from parking a sequence in the host cache.
 #[derive(Debug)]
 pub struct ParkSaved {
+    /// Global cache chunks newly copied from the GPU.
     pub copied: usize,
+    /// Global cache chunks already available in a host entry and reused.
     pub shared: usize,
+    /// Bytes copied from the GPU, including local rings and convolution state.
     pub bytes: usize,
 }
 
 /// What [`HostCache::save`] copied.
 #[derive(Debug)]
 pub(super) struct Saved {
-    /// Global cache chunks copied, and shared with an earlier entry.
+    /// Global cache chunks newly copied from the GPU.
     pub copied: usize,
+    /// Global cache chunks reused from an earlier entry.
     pub shared: usize,
+    /// Total bytes copied from the GPU.
     pub bytes: usize,
 }
 
@@ -361,6 +376,7 @@ impl HostCache {
         Ok(())
     }
 
+    /// Drains the host cache's accumulated diagnostic messages.
     pub fn notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
     }
@@ -398,7 +414,16 @@ impl HostCache {
             {
                 continue;
             }
-            if e.hashes.last().copied() == hashes.hash_at_len(len) && prompt.starts_with(&e.tokens)
+            if let Some(&last_chunk_hash) = e.hashes.last()
+                && hashes.hash_at_chunks(e.hashes.len()) != Some(last_chunk_hash)
+            {
+                continue;
+            }
+            if prompt[len - 1] != e.tokens[len - 1] || prompt[0] != e.tokens[0] {
+                continue;
+            }
+            if hashes.hash_at_len_in(prompt, len) == Some(e.full_hash)
+                && prompt.starts_with(&e.tokens)
             {
                 best = Some((i, len));
             }
@@ -472,18 +497,14 @@ impl HostCache {
         rings: Option<&DraftRings>,
     ) -> anyhow::Result<Option<Saved>> {
         let p = HOST_CHUNK_POSITIONS;
-        ensure!(
-            !tokens.is_empty() && tokens.len().is_multiple_of(p),
-            "{} tokens are not a positive multiple of {p}",
-            tokens.len()
-        );
+        ensure!(!tokens.is_empty(), "cannot save an empty prompt");
         ensure!(
             model.slot_position(slot)? >= tokens.len() && local.position() == tokens.len(),
             "slot {slot} and its copies do not hold the {} tokens",
             tokens.len()
         );
         self.tick += 1;
-        let n = tokens.len() / p;
+        let n = tokens.len().div_ceil(p);
         let target = model.global_kv(slot)?;
         let draft_kv = draft.global_kv(&self.main);
         // The copies read what the model's stream has written by now.
@@ -493,11 +514,9 @@ impl HostCache {
         self.copy.wait(&ready)?;
 
         let entry_hashes = chunk_hashes(tokens, p);
-        let full_hash = entry_hashes.last().copied();
+        let full_hash = prefix_hash(tokens);
         let existing = self.entries.iter().position(|e| {
-            e.tokens.len() == tokens.len()
-                && e.hashes.last().copied() == full_hash
-                && e.tokens == tokens
+            e.tokens.len() == tokens.len() && e.full_hash == full_hash && e.tokens == tokens
         });
         let (kv, local_chunks, shared) = if let Some(h) = existing {
             // The same prompt again: only the draft's state may be new.
@@ -521,11 +540,12 @@ impl HostCache {
         let copied = n - shared;
         let mut bytes = 0;
         for (j, &c) in kv.iter().enumerate().skip(n - copied) {
+            let len = (tokens.len() - j * p).min(p);
             for (cache, pb, before) in target.layout() {
                 let at = (j * p) as u64 * pb as u64;
                 let host = self.pool.address(c) + p * before;
-                copy(&self.copy, Direction::ToHost, host, cache + at, p * pb)?;
-                bytes += p * pb;
+                copy(&self.copy, Direction::ToHost, host, cache + at, len * pb)?;
+                bytes += len * pb;
             }
             self.drafted[c as usize] = false;
         }
@@ -535,7 +555,7 @@ impl HostCache {
             bytes += self.local_bytes;
         }
         if let Some(rings) = rings {
-            bytes += self.save_draft(&kv, &local_chunks, &draft_kv, rings)?;
+            bytes += self.save_draft(&kv, &local_chunks, tokens.len(), &draft_kv, rings)?;
         }
         if let Some(h) = existing {
             self.entries[h].rings = true;
@@ -544,6 +564,7 @@ impl HostCache {
             self.entries.push(HostEntry {
                 tokens: tokens.to_vec(),
                 hashes: entry_hashes,
+                full_hash,
                 kv,
                 local: local_chunks,
                 rings: rings.is_some(),
@@ -570,6 +591,7 @@ impl HostCache {
         &mut self,
         kv: &[u32],
         local: &[u32],
+        tokens_len: usize,
         draft_kv: &GlobalKv,
         rings: &DraftRings,
     ) -> anyhow::Result<usize> {
@@ -580,11 +602,12 @@ impl HostCache {
             if self.drafted[c as usize] {
                 continue;
             }
+            let len = (tokens_len - j * p).min(p);
             for (cache, dpb, before) in draft_kv.layout() {
                 let at = (j * p) as u64 * dpb as u64;
                 let host = self.pool.address(c) + base + p * before;
-                copy(&self.copy, Direction::ToHost, host, cache + at, p * dpb)?;
-                bytes += p * dpb;
+                copy(&self.copy, Direction::ToHost, host, cache + at, len * dpb)?;
+                bytes += len * dpb;
             }
             self.drafted[c as usize] = true;
         }
@@ -598,11 +621,12 @@ impl HostCache {
         Ok(bytes + self.rings_bytes)
     }
 
-    /// Chunks for a new entry of `tokens`: the global cache chunks it shares with the entry
-    /// that agrees with it longest, new ones for the rest, and new ones for its rings and
-    /// conv states, and how many chunks it shares. Drops the entries that `tokens` extends,
-    /// then the least recently used, until the new chunks fit. Returns `None`, and keeps
-    /// every entry it has not dropped, when they do not fit at all.
+    /// Chunks for a new entry of `tokens`: the full global cache chunks it shares with the
+    /// entry that agrees with it longest, new ones for the rest (including any partial tail
+    /// chunk), and new ones for its rings and conv states, and how many chunks it shares.
+    /// Drops the entries that `tokens` extends, then the least recently used, until the new
+    /// chunks fit. Returns `None`, and keeps every entry it has not dropped, when they do
+    /// not fit at all.
     #[expect(clippy::type_complexity, reason = "the chunks and their count")]
     fn allocate(&mut self, tokens: &[u32]) -> anyhow::Result<Option<(Vec<u32>, Vec<u32>, usize)>> {
         self.allocate_with_protect(tokens, None)
@@ -615,13 +639,20 @@ impl HostCache {
         protect_disk_id: Option<u64>,
     ) -> anyhow::Result<Option<(Vec<u32>, Vec<u32>, usize)>> {
         let p = HOST_CHUNK_POSITIONS;
-        let n = tokens.len() / p;
-        let prompt_hashes = PrefixHashes::new(tokens, p, n);
+        let total_chunks = tokens.len().div_ceil(p);
+        let full_chunks = tokens.len() / p;
+        let prompt_hashes = PrefixHashes::new(tokens, p, full_chunks);
         let longest = self
             .entries
             .iter()
             .enumerate()
-            .map(|(i, e)| (i, prompt_hashes.shared_chunks(&e.hashes).min(e.kv.len())))
+            .map(|(i, e)| {
+                let k = prompt_hashes
+                    .shared_chunks(&e.hashes)
+                    .min(e.full_chunks())
+                    .min(full_chunks);
+                (i, k)
+            })
             .max_by_key(|&(_, k)| k)
             .map(|(i, k)| {
                 let exact = if k > 0 && self.entries[i].tokens[..k * p] == tokens[..k * p] {
@@ -635,7 +666,7 @@ impl HostCache {
                         .count()
                         / p
                 };
-                (i, exact.min(self.entries[i].kv.len()))
+                (i, exact.min(self.entries[i].full_chunks()).min(full_chunks))
             });
         let mut kv = match longest {
             Some((i, k)) if k > 0 => self.entries[i].kv[..k].to_vec(),
@@ -650,8 +681,12 @@ impl HostCache {
         let mut i = 0;
         while i < self.entries.len() {
             let e = &self.entries[i];
-            let is_prefix = e.tokens.len() <= tokens.len()
-                && e.hashes.last().copied() == prompt_hashes.hash_at_len(e.tokens.len())
+            let is_prefix = !e.tokens.is_empty()
+                && e.tokens.len() <= tokens.len()
+                && e.hashes
+                    .last()
+                    .is_none_or(|&h| prompt_hashes.hash_at_chunks(e.hashes.len()) == Some(h))
+                && tokens[e.tokens.len() - 1] == e.tokens[e.tokens.len() - 1]
                 && tokens.starts_with(&e.tokens);
             if is_prefix {
                 let e = self.entries.swap_remove(i);
@@ -660,7 +695,7 @@ impl HostCache {
                 i += 1;
             }
         }
-        let need = n - kv.len() + self.local_chunks();
+        let need = total_chunks - kv.len() + self.local_chunks();
         while self.pool.free.len() < need {
             if !self.evict_lru(need, "to save a new entry", protect_disk_id) {
                 for &c in &kv {
@@ -669,7 +704,7 @@ impl HostCache {
                 return Ok(None);
             }
         }
-        while kv.len() < n {
+        while kv.len() < total_chunks {
             kv.push(self.pool.take().context("a free chunk was counted")?);
         }
         let local = (0..self.local_chunks())
@@ -695,25 +730,26 @@ impl HostCache {
                 && target.position_bytes == self.target.position_bytes,
             "the slot's global caches differ from the host cache's"
         );
+        let total_len = self.entries[h].tokens.len();
         let chunks = self.entries[h].kv.clone();
         for (j, &c) in chunks.iter().enumerate() {
+            let len = (total_len - j * p).min(p);
             // Mapping the next chunk overlaps the copies queued before it.
-            model.map_slot(slot, (j + 1) * p)?;
+            model.map_slot(slot, j * p + len)?;
             for (cache, pb, before) in target.layout() {
                 let at = (j * p) as u64 * pb as u64;
                 let host = self.pool.address(c) + p * before;
-                copy(&self.main, Direction::ToDevice, host, cache + at, p * pb)?;
+                copy(&self.main, Direction::ToDevice, host, cache + at, len * pb)?;
             }
         }
         let e = &self.entries[h];
         let spans = model.local_spans(slot)?;
         self.pool
             .copy_run(&self.main, &e.local, 0, &spans, Direction::ToDevice)?;
-        let len = e.tokens.len();
         self.entries[h].used = self.tick;
         self.entries[h].used_at = Instant::now();
-        model.set_loaded_position(slot, len)?;
-        Ok(len * target.bytes_per_position() + self.local_bytes)
+        model.set_loaded_position(slot, total_len)?;
+        Ok(total_len * target.bytes_per_position() + self.local_bytes)
     }
 
     /// Copies entry `h`'s draft state into the draft: its rings, and its global caches if
@@ -723,15 +759,17 @@ impl HostCache {
         ensure!(self.has_draft(h), "host entry {h} lacks the draft's state");
         self.fence()?;
         let p = HOST_CHUNK_POSITIONS;
-        draft.map(self.entries[h].tokens.len(), &self.main)?;
+        let total_len = self.entries[h].tokens.len();
+        draft.map(total_len, &self.main)?;
         let e = &self.entries[h];
         let draft_kv = draft.global_kv(&self.main);
         let base = p * self.target.bytes_per_position();
         for (j, &c) in e.kv.iter().enumerate() {
+            let len = (total_len - j * p).min(p);
             for (cache, dpb, before) in draft_kv.layout() {
                 let at = (j * p) as u64 * dpb as u64;
                 let host = self.pool.address(c) + base + p * before;
-                copy(&self.main, Direction::ToDevice, host, cache + at, p * dpb)?;
+                copy(&self.main, Direction::ToDevice, host, cache + at, len * dpb)?;
             }
         }
         let spans = draft.ring_spans(&self.main);
@@ -742,9 +780,8 @@ impl HostCache {
             &spans,
             Direction::ToDevice,
         )?;
-        let len = e.tokens.len();
-        draft.set_loaded(len)?;
-        Ok(len * draft_kv.bytes_per_position() + self.rings_bytes)
+        draft.set_loaded(total_len)?;
+        Ok(total_len * draft_kv.bytes_per_position() + self.rings_bytes)
     }
 
     /// Copies entry `h`'s draft rings into `rings`, a device entry's copies.
@@ -798,7 +835,7 @@ impl HostCache {
             .map(|(i, e)| {
                 let k = prompt_hashes
                     .shared_chunks(&e.hashes)
-                    .min(e.kv.len())
+                    .min(e.full_chunks())
                     .min(prefilled);
                 (i, k)
             })
@@ -815,7 +852,7 @@ impl HostCache {
                         .count()
                         / p
                 };
-                (i, exact.min(self.entries[i].kv.len()).min(prefilled))
+                (i, exact.min(self.entries[i].full_chunks()).min(prefilled))
             });
         let mut kv = match longest {
             Some((i, k)) if k > 0 => self.entries[i].kv[..k].to_vec(),

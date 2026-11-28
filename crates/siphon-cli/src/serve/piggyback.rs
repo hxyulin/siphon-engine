@@ -9,6 +9,8 @@
 //! validation so both the Linux CUDA engine and macOS host unit tests share one source
 //! of truth.
 
+use siphon::prefix_hash::prefix_boundary;
+
 /// Snapshot of one active request's scheduling metadata for piggyback planning.
 #[cfg_attr(
     all(not(target_os = "linux"), not(test)),
@@ -66,7 +68,7 @@ pub struct PiggybackSlice {
     /// Whether `end == prompt_len` (slice finishes prompt and needs its first token).
     pub finishes_prompt: bool,
     /// Whether `end` lands on the prefix-cache save boundary
-    /// (`(prompt_len - 1) / prefill_chunk * prefill_chunk`, non-zero).
+    /// (`prefix_boundary(prompt_len)`, non-zero).
     pub hits_prefix_boundary: bool,
 }
 
@@ -260,7 +262,7 @@ pub fn plan_piggyback(
             continue;
         }
         let left = c.remaining();
-        let boundary = c.prompt_len.saturating_sub(1) / prefill_chunk * prefill_chunk;
+        let boundary = prefix_boundary(c.prompt_len);
         let mut take = left.min(remaining);
         // Never step across the prefix-cache save boundary without stopping on it.
         if boundary > 0 && c.prefilled < boundary && c.prefilled + take > boundary {
@@ -400,11 +402,12 @@ mod tests {
 
     #[test]
     fn aligns_chunk_end_to_prefix_cache_boundary_when_budget_misaligned() {
-        // prompt_len = 5000, chunk = 2048 -> boundary = 4096.
-        // prefilled = 4000, budget = 300 -> must cap at 4096 (96 tokens) and flag boundary.
-        let cands = [cand(0, 1, 1, 4000, 5000), cand(1, 2, 2, 0, 500)];
+        // prompt_len = 5000 -> exact boundary = 4999.
+        // prefilled = 4900, budget = 300 -> must cap at 4999 (99 tokens) and flag boundary.
+        let cands = [cand(0, 1, 1, 4900, 5000), cand(1, 2, 2, 0, 500)];
         let plan = plan_piggyback(&cands, 4, 2048, Some(300), 64, |_, _| true);
-        // SRPT picks idx 1 (500 remaining) first for 300 tokens; test idx 0 alone first:
+        // idx 0 has 100 remaining (< idx 1's 500), so SRPT picks idx 0 first (99 tokens to
+        // boundary 4999) and fills remaining 201 tokens into idx 1.
         let plan_single = plan_piggyback(&cands[..1], 4, 2048, Some(300), 64, |_, _| true);
         assert_eq!(
             plan_single,
@@ -412,15 +415,15 @@ mod tests {
                 slices: vec![PiggybackSlice {
                     index: 0,
                     slot: 1,
-                    start: 4000,
-                    end: 4096,
+                    start: 4900,
+                    end: 4999,
                     finishes_prompt: false,
                     hits_prefix_boundary: true,
                 }],
-                total_prefill_tokens: 96,
+                total_prefill_tokens: 99,
             }
         );
-        // When idx 0 is aged, it goes first (96 tokens to boundary), and idx 1 fills remaining 204.
+        // When idx 0 is aged, it goes first (99 tokens to boundary), and idx 1 fills remaining 201.
         let mut aged_cands = cands;
         aged_cands[0].aged = true;
         let plan_aged = plan_piggyback(&aged_cands, 4, 2048, Some(300), 64, |_, _| true);
@@ -431,8 +434,8 @@ mod tests {
                     PiggybackSlice {
                         index: 0,
                         slot: 1,
-                        start: 4000,
-                        end: 4096,
+                        start: 4900,
+                        end: 4999,
                         finishes_prompt: false,
                         hits_prefix_boundary: true,
                     },
@@ -440,7 +443,7 @@ mod tests {
                         index: 1,
                         slot: 2,
                         start: 0,
-                        end: 204,
+                        end: 201,
                         finishes_prompt: false,
                         hits_prefix_boundary: false,
                     },
@@ -448,7 +451,6 @@ mod tests {
                 total_prefill_tokens: 300,
             }
         );
-        // Sanity check non-aged plan used SRPT (idx 1 took 300).
         assert!(matches!(
             plan,
             TurnPlan::Piggyback {
@@ -714,13 +716,14 @@ mod tests {
                 }
             }
         }
-        // Turn 0: slot 3 finishes (100) + slot 2 gets 156 (156/600).
+        // Turn 0: slot 3 finishes (100, below MIN_PREFIX_TOKENS) + slot 2 gets 156 (156/600).
         // Turn 1: slot 3 now decodes alongside slots 0, 1! slot 2 gets 256 (412/600).
-        // Turn 2: slot 2 gets 188 (600/600) and finishes!
-        // Turn 3: DecodeOnly!
+        // Turn 2: slot 2 stops on exact prefix boundary 599 (187 tokens, hits_prefix_boundary).
+        // Turn 3: slot 2 finishes its final 1 token (600/600)!
+        // Turn 4: DecodeOnly!
         assert_eq!(handoff_turn_slot3, Some(0));
-        assert_eq!(handoff_turn_slot2, Some(2));
-        assert_eq!(decode_steps_without_stall, 3);
+        assert_eq!(handoff_turn_slot2, Some(3));
+        assert_eq!(decode_steps_without_stall, 4);
         assert_eq!(active[2].prefilled, 600);
         assert!(!active[2].is_prefilling);
         assert_eq!(active[3].prefilled, 100);

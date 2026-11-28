@@ -653,6 +653,7 @@ mod cuda {
             self, CONTEXT_BYTES, DEFAULT_MARGIN, DraftChoice, PlanInputs, Planner, VisionInputs,
             gib,
         },
+        prefix_hash::prefix_boundary,
         vision::VisionConfig,
     };
     use siphon_cuda::{
@@ -3313,11 +3314,17 @@ mod cuda {
                 .filter_map(|&slot| active.iter().position(|r| r.slot == slot))
                 .collect();
             // Encode any overlapping images before borrowing `active` immutably for slices.
+            let mut planned: Vec<(usize, usize, usize, usize, bool)> =
+                Vec::with_capacity(indices.len());
             let mut encoded_images: Vec<Vec<ImageRows>> = Vec::with_capacity(indices.len());
             for &idx in &indices {
                 let r = &mut active[idx];
                 let start = r.prefilled;
-                let end = r.job.prompt.len();
+                let len = r.job.prompt.len();
+                let boundary = prefix_boundary(len);
+                let raw_end = (start + chunk).min(len);
+                let split_for_save = boundary > r.cached && start < boundary && raw_end == len;
+                let end = if split_for_save { boundary } else { raw_end };
                 let imgs = if r.job.images.is_empty() {
                     Vec::new()
                 } else {
@@ -3336,19 +3343,17 @@ mod cuda {
                         }
                     }
                 };
+                planned.push((idx, end, len, boundary, split_for_save));
                 encoded_images.push(imgs);
             }
             let capacity = model.slot_capacity();
             let mut commit_draft = Vec::with_capacity(indices.len());
             let mut reset_draft = Vec::with_capacity(indices.len());
             let mut slices = Vec::with_capacity(indices.len());
-            let mut ends = Vec::with_capacity(indices.len());
             let mut total_processed = 0usize;
-            for (&idx, imgs) in indices.iter().zip(encoded_images) {
+            for (&(idx, end, len, _, split_for_save), imgs) in planned.iter().zip(encoded_images) {
                 let r = &active[idx];
-                let len = r.job.prompt.len();
-                let end = (r.prefilled + chunk).min(len);
-                if end == len {
+                if end == len || split_for_save {
                     // Pre-map prompt + decode headroom in one coalesced pass before prefill
                     // so the subsequent decode rounds hit zero VMM mapping stalls, while
                     // reserving pages for all other requests still prefilling.
@@ -3364,13 +3369,12 @@ mod cuda {
                     premap_slot_headroom(
                         model,
                         r.slot,
-                        end,
+                        len,
                         r.final_position(capacity),
                         other_reserve,
                     );
                 }
                 total_processed += end - r.prefilled;
-                ends.push((idx, end, len));
                 commit_draft.push(batch_spec && r.draft_ready);
                 reset_draft.push(r.prefilled == 0);
                 slices.push(PackedPrefill {
@@ -3386,8 +3390,10 @@ mod cuda {
             drop(slices);
             match results {
                 Ok(tokens) => {
-                    for ((idx, end, len), first) in ends.into_iter().zip(tokens) {
-                        let boundary = len.saturating_sub(1) / chunk * chunk;
+                    let mut split_indices = Vec::new();
+                    for ((idx, end, len, boundary, split_for_save), first) in
+                        planned.into_iter().zip(tokens)
+                    {
                         let slot = active[idx].slot;
                         active[idx].advance_prefill(end);
                         if end == boundary && end > active[idx].cached {
@@ -3408,7 +3414,9 @@ mod cuda {
                                 log!("no room in the KV pool to keep a prompt in the prefix cache");
                             }
                         }
-                        if end == len
+                        if split_for_save {
+                            split_indices.push(idx);
+                        } else if end == len
                             && let Some(first) = first
                         {
                             let r = &mut active[idx];
@@ -3416,6 +3424,85 @@ mod cuda {
                             r.prefill_s = r.started.elapsed().as_secs_f64();
                             r.send_images();
                             r.first_token(first, stop);
+                        }
+                    }
+                    // Immediately run the 1-token final pass for requests that stopped at
+                    // `len - 1` to snapshot their exact-length prefix cache entry.
+                    if !split_indices.is_empty() {
+                        let mut tail_images: Vec<Vec<ImageRows>> =
+                            Vec::with_capacity(split_indices.len());
+                        let mut failed_any = false;
+                        for &idx in &split_indices {
+                            let r = &mut active[idx];
+                            let start = r.prefilled;
+                            let len = r.job.prompt.len();
+                            let imgs = if r.job.images.is_empty() {
+                                Vec::new()
+                            } else {
+                                match image_rows(
+                                    tower,
+                                    hidden,
+                                    &r.job.images,
+                                    &mut r.kept,
+                                    &mut r.encodes,
+                                    (start, len),
+                                ) {
+                                    Ok(imgs) => imgs,
+                                    Err(e) => {
+                                        r.fail(&e);
+                                        failed_any = true;
+                                        Vec::new()
+                                    }
+                                }
+                            };
+                            tail_images.push(imgs);
+                        }
+                        if !failed_any {
+                            let mut tail_commit = Vec::with_capacity(split_indices.len());
+                            let mut tail_reset = Vec::with_capacity(split_indices.len());
+                            let mut tail_slices = Vec::with_capacity(split_indices.len());
+                            for (&idx, imgs) in split_indices.iter().zip(tail_images) {
+                                let r = &active[idx];
+                                let len = r.job.prompt.len();
+                                total_processed += len - r.prefilled;
+                                tail_commit.push(batch_spec && r.draft_ready);
+                                tail_reset.push(false);
+                                tail_slices.push(PackedPrefill {
+                                    slot: r.slot,
+                                    tokens: &r.job.prompt[r.prefilled..len],
+                                    images: imgs,
+                                    need_first_token: true,
+                                    sampling: r.sampling,
+                                });
+                            }
+                            let tail_res = speculator.prefill_packed_batch(
+                                model,
+                                &tail_slices,
+                                &tail_commit,
+                                &tail_reset,
+                                chunk,
+                            );
+                            drop(tail_slices);
+                            match tail_res {
+                                Ok(tail_tokens) => {
+                                    for (idx, first) in split_indices.into_iter().zip(tail_tokens) {
+                                        let len = active[idx].job.prompt.len();
+                                        active[idx].advance_prefill(len);
+                                        if let Some(first) = first {
+                                            let r = &mut active[idx];
+                                            r.kept = None;
+                                            r.prefill_s = r.started.elapsed().as_secs_f64();
+                                            r.send_images();
+                                            r.first_token(first, stop);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    for idx in split_indices {
+                                        active[idx].fail(&e);
+                                    }
+                                }
+                            }
                         }
                     }
                     log_cache(speculator);
@@ -3445,18 +3532,20 @@ mod cuda {
             .sum();
         let r = &mut active[i];
         let len = r.job.prompt.len();
-        let end = (r.prefilled + chunk).min(len);
-        if end == len {
+        let boundary = prefix_boundary(len);
+        let raw_end = (r.prefilled + chunk).min(len);
+        let split_for_save = boundary > r.cached && r.prefilled < boundary && raw_end == len;
+        let end = if split_for_save { boundary } else { raw_end };
+        if raw_end == len {
             premap_slot_headroom(
                 model,
                 r.slot,
-                end,
+                len,
                 r.final_position(capacity),
                 other_reserve,
             );
         }
-        let processed = end - r.prefilled;
-        let boundary = len.saturating_sub(1) / chunk * chunk;
+        let mut processed = end - r.prefilled;
         model.set_sampling(r.sampling);
         let tokens = &r.job.prompt[r.prefilled..end];
         let use_draft = r.draft_ready && speculator.supports_batch_spec();
@@ -3491,7 +3580,7 @@ mod cuda {
             };
             model.prefill_slot_with_images(r.slot, tokens, chunk, &mut source)
         };
-        let first = match prefilled {
+        let mut first = match prefilled {
             Ok(first) => first,
             Err(e) => {
                 r.fail(&e);
@@ -3511,9 +3600,57 @@ mod cuda {
                 log!("no room in the KV pool to keep a prompt in the prefix cache");
             }
         }
+        // Finish the final token immediately in the same turn after snapshotting at `len - 1`.
+        let final_end = if split_for_save {
+            let r = &mut active[i];
+            let tail_tokens = &r.job.prompt[boundary..len];
+            let tail_prefilled = if use_draft {
+                if r.job.images.is_empty() {
+                    speculator.prefill_slot_batch(model, r.slot, tail_tokens, None, chunk, false)
+                } else {
+                    let hidden = model.config().hidden_size;
+                    let (images, kept, encodes) = (&r.job.images, &mut r.kept, &mut r.encodes);
+                    let mut source = |start: usize, end: usize| {
+                        image_rows(tower, hidden, images, kept, encodes, (start, end))
+                    };
+                    speculator.prefill_slot_batch(
+                        model,
+                        r.slot,
+                        tail_tokens,
+                        Some(&mut source),
+                        chunk,
+                        false,
+                    )
+                }
+            } else if r.job.images.is_empty() {
+                model.prefill_slot(r.slot, tail_tokens, chunk)
+            } else {
+                let hidden = model.config().hidden_size;
+                let (images, kept, encodes) = (&r.job.images, &mut r.kept, &mut r.encodes);
+                let mut source = |start: usize, end: usize| {
+                    image_rows(tower, hidden, images, kept, encodes, (start, end))
+                };
+                model.prefill_slot_with_images(r.slot, tail_tokens, chunk, &mut source)
+            };
+            match tail_prefilled {
+                Ok(tok) => {
+                    first = tok;
+                    processed += len - boundary;
+                    r.advance_prefill(len);
+                    len
+                }
+                Err(e) => {
+                    r.fail(&e);
+                    log_cache(speculator);
+                    return processed.max(1);
+                }
+            }
+        } else {
+            end
+        };
         let r = &mut active[i];
         log_cache(speculator);
-        if end == len {
+        if final_end == len {
             r.kept = None;
             r.prefill_s = r.started.elapsed().as_secs_f64();
             r.send_images();

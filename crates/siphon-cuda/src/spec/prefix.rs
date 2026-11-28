@@ -26,7 +26,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
-use siphon::prefix_hash::{PrefixHashes, prefix_hash};
+use siphon::prefix_hash::{PrefixHashes, prefix_boundary, prefix_hash};
 
 use super::{
     Prompt, Speculator,
@@ -89,7 +89,7 @@ enum Source {
     Disk(u64, usize),
 }
 
-/// One prompt's state at its last chunk boundary.
+/// One prompt's state at its exact prefix boundary.
 struct Entry {
     /// The slot whose global caches hold the prompt's positions, `None` when unused.
     slot: Option<usize>,
@@ -97,8 +97,13 @@ struct Entry {
     sequence: u64,
     /// The prompt's key ([`Prompt::key`]) below the boundary.
     tokens: Vec<u32>,
-    /// Cumulative hash of `tokens` ([`prefix_hash`]), for O(1) mismatch rejection.
+    /// Cumulative hash of `tokens` ([`prefix_hash`]), for fast mismatch rejection.
     hash: u64,
+    /// Number of full `chunk`-sized leading chunks in `tokens` (`tokens.len() / chunk`).
+    prefix_chunks: usize,
+    /// Cumulative hash of `tokens[..prefix_chunks * chunk]` when `prefix_chunks > 0`, for
+    /// O(1) prefix mismatch rejection before hashing any trailing partial tail.
+    prefix_chunk_hash: u64,
     /// The prefill chunk the state was prefilled with.
     chunk: usize,
     used: Instant,
@@ -163,7 +168,15 @@ impl PrefixCache {
             {
                 continue;
             }
-            if hashes.hash_at_len(len) == Some(e.hash) && prompt.starts_with(&e.tokens) {
+            if e.prefix_chunks > 0
+                && hashes.hash_at_chunks(e.prefix_chunks) != Some(e.prefix_chunk_hash)
+            {
+                continue;
+            }
+            if prompt[len - 1] != e.tokens[len - 1] || prompt[0] != e.tokens[0] {
+                continue;
+            }
+            if hashes.hash_at_len_in(prompt, len) == Some(e.hash) && prompt.starts_with(&e.tokens) {
                 best = Some((i, len));
             }
         }
@@ -361,6 +374,8 @@ impl Speculator {
                     sequence: 0,
                     tokens: Vec::new(),
                     hash: 0,
+                    prefix_chunks: 0,
+                    prefix_chunk_hash: 0,
                     chunk: 0,
                     used: now,
                     model: model.local_state()?,
@@ -405,7 +420,11 @@ impl Speculator {
 
     /// Copies every live device entry to the host tier, so that the conversations the
     /// slots hold are there too, then writes every host entry to files in `dir` with a
-    /// manifest that records `identity` ([`HostCache::save_dir`]).
+    /// manifest that records `identity`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host tier is disabled or writing the cache fails.
     pub fn save_host_cache(
         &mut self,
         model: &Model,
@@ -661,12 +680,12 @@ impl Speculator {
                 self.draft_sequence += 1;
             }
         }
-        // The last chunk boundary below the end, so at least one row remains for the
-        // logits. `start` is such a boundary of a shorter prompt, so it is at most this.
-        let boundary = (tokens.len() - 1) / chunk * chunk;
-        if boundary > start || from_host {
-            // Prefill splits a chunk only at the end of its tokens, so the chunks match a
-            // prefill of the whole prompt.
+        // Save at the exact prompt-end boundary (`tokens.len() - 1` once above
+        // `MIN_PREFIX_TOKENS`), leaving one token for the first-token logits and allowing
+        // exact duplicate prompts to hit `tokens.len() - 1`.
+        let boundary = prefix_boundary(tokens.len());
+        let save_len = boundary.max(start);
+        if boundary > start || (from_host && start > 0) {
             if boundary > start {
                 let images = Prompt::images(&mut images);
                 self.prefill_rows(
@@ -682,11 +701,11 @@ impl Speculator {
             let cache = self.prefix.as_ref().context("the cache is on")?;
             hit = hit.or_else(|| cache.free_entry(model, &[], now));
             if let Some(i) = hit {
-                self.save_entry(model, i, 0, &key[..boundary], chunk)?;
+                self.save_entry(model, i, 0, &key[..save_len], chunk)?;
                 self.save_entry_rings(model, i)?;
             }
         }
-        let first = self.prefill_rows(model, &tokens[boundary..], images, chunk, &mut progress)?;
+        let first = self.prefill_rows(model, &tokens[save_len..], images, chunk, &mut progress)?;
         Ok((self.end_prompt(model, tokens.len(), first)?, start))
     }
 
@@ -818,7 +837,7 @@ impl Speculator {
             return Ok(());
         };
         cache.fence()?;
-        let boundary = prompt.len().saturating_sub(1) / chunk * chunk;
+        let boundary = prefix_boundary(prompt.len());
         if boundary == 0 {
             return Ok(());
         }
@@ -967,6 +986,12 @@ impl Speculator {
         e.tokens.clear();
         e.tokens.extend_from_slice(tokens);
         e.hash = prefix_hash(tokens);
+        e.prefix_chunks = if chunk > 0 { tokens.len() / chunk } else { 0 };
+        e.prefix_chunk_hash = if e.prefix_chunks > 0 {
+            prefix_hash(&tokens[..e.prefix_chunks * chunk])
+        } else {
+            0
+        };
         e.chunk = chunk;
         e.used = Instant::now();
         e.draft_sequence = None;
@@ -1062,7 +1087,7 @@ impl Speculator {
         self.prefix.as_ref().is_some_and(|c| c.host.is_some())
     }
 
-    /// Copies the sequence in slot `slot` to the host tier ([`HostCache::park`]) and frees
+    /// Copies the sequence in slot `slot` to the host tier and frees
     /// the slot: drops its entry and resets it. `key` is the prompt's key
     /// ([`Prompt::key`]) and the tokens fed after it, of which the first `prompt_len` came
     /// from the prompt. The slot keeps its pages, which a returning sequence of about its
@@ -1324,7 +1349,15 @@ impl Speculator {
             {
                 continue;
             }
-            if hashes.hash_at_len(len) == Some(e.hash) && key.starts_with(&e.tokens) {
+            if e.prefix_chunks > 0
+                && hashes.hash_at_chunks(e.prefix_chunks) != Some(e.prefix_chunk_hash)
+            {
+                continue;
+            }
+            if key[len - 1] != e.tokens[len - 1] || key[0] != e.tokens[0] {
+                continue;
+            }
+            if hashes.hash_at_len_in(key, len) == Some(e.hash) && key.starts_with(&e.tokens) {
                 best = Some(len);
             }
         }

@@ -40,15 +40,16 @@ use std::{
 
 use anyhow::{Context as _, bail, ensure};
 use serde_json::{Value, json};
-use siphon::prefix_hash::{PrefixHashes, chunk_hashes};
+use siphon::prefix_hash::{PrefixHashes, chunk_hashes, prefix_hash};
 
 use super::{
     HOST_CHUNK_POSITIONS, HostCache, HostEntry,
     disk::{Loaded, MANIFEST, Saved, discard, pad8, write_atomic},
 };
+use crate::model::GlobalKv;
 
 /// Disk format version for the active L3 deduplicated tier.
-pub const DISK_FORMAT_L3: u32 = 2;
+pub const DISK_FORMAT_L3: u32 = 3;
 
 const CHUNK_MAGIC: &[u8; 8] = b"SIPHONCK";
 const LOCAL_MAGIC: &[u8; 8] = b"SIPHONLC";
@@ -273,8 +274,10 @@ struct DiskEntry {
     id: u64,
     tokens: Vec<u32>,
     hashes: Vec<u64>,
+    full_hash: u64,
     chunk_keys: Vec<u128>,
     rings: bool,
+    tail_drafted: bool,
     local_file_bytes: u64,
     used: u64,
     in_flight: bool,
@@ -504,7 +507,7 @@ impl DiskTier {
                     continue;
                 };
                 let mut keys = Vec::with_capacity(keys_arr.len());
-                let mut ok = !keys_arr.is_empty();
+                let mut ok = true;
                 for k in keys_arr {
                     let Some(ks) = k.as_str() else {
                         ok = false;
@@ -525,7 +528,7 @@ impl DiskTier {
                     continue;
                 }
                 let lpath = local_path(&tier.config.dir, id);
-                let Ok((file_rings, tokens, actual_size)) =
+                let Ok((file_rings, tail_drafted, tokens, actual_size)) =
                     read_local_header(&lpath, tier.manifest_key, id)
                 else {
                     skipped += 1;
@@ -533,12 +536,14 @@ impl DiskTier {
                 };
                 if actual_size != local_file_bytes
                     || file_rings != rings
-                    || tokens.len() != keys.len() * HOST_CHUNK_POSITIONS
+                    || tokens.is_empty()
+                    || keys.len() != tokens.len() / HOST_CHUNK_POSITIONS
                 {
                     skipped += 1;
                     continue;
                 }
                 let hashes = chunk_hashes(&tokens, HOST_CHUNK_POSITIONS);
+                let full_hash = prefix_hash(&tokens);
                 // Register chunk refcounts.
                 for &key in &keys {
                     let (bytes, draft) = chunk_meta[&key];
@@ -559,8 +564,10 @@ impl DiskTier {
                     id,
                     tokens,
                     hashes,
+                    full_hash,
                     chunk_keys: keys,
                     rings,
+                    tail_drafted: tail_drafted && has_draft_kv,
                     local_file_bytes,
                     used,
                     in_flight: false,
@@ -620,11 +627,14 @@ impl DiskTier {
     }
 
     fn complete(&self, e: &DiskEntry, has_draft_kv: bool) -> bool {
+        let has_tail = !e.tokens.len().is_multiple_of(HOST_CHUNK_POSITIONS);
         e.rings
             && (!has_draft_kv
-                || e.chunk_keys
+                || (e
+                    .chunk_keys
                     .iter()
-                    .all(|k| self.chunks.get(k).is_some_and(|c| c.has_draft)))
+                    .all(|k| self.chunks.get(k).is_some_and(|c| c.has_draft))
+                    && (!has_tail || e.tail_drafted)))
     }
 
     pub(super) fn has_draft(&self, id: u64, has_draft_kv: bool) -> bool {
@@ -651,7 +661,16 @@ impl DiskTier {
             {
                 continue;
             }
-            if e.hashes.last().copied() == hashes.hash_at_len(len) && prompt.starts_with(&e.tokens)
+            if let Some(&last_chunk_hash) = e.hashes.last()
+                && hashes.hash_at_chunks(e.hashes.len()) != Some(last_chunk_hash)
+            {
+                continue;
+            }
+            if prompt[len - 1] != e.tokens[len - 1] || prompt[0] != e.tokens[0] {
+                continue;
+            }
+            if hashes.hash_at_len_in(prompt, len) == Some(e.full_hash)
+                && prompt.starts_with(&e.tokens)
             {
                 best = Some((e.id, len));
             }
@@ -752,7 +771,7 @@ fn read_local_header(
     path: &Path,
     manifest_key: u64,
     expected_id: u64,
-) -> anyhow::Result<(bool, Vec<u32>, u64)> {
+) -> anyhow::Result<(bool, bool, Vec<u32>, u64)> {
     let file = File::open(path)?;
     let size = file.metadata()?.len();
     let mut r = BufReader::new(file);
@@ -778,7 +797,7 @@ fn read_local_header(
         .iter()
         .map(|b| u32::from_le_bytes(*b))
         .collect();
-    Ok((flags & 1 != 0, tokens, size))
+    Ok((flags & 1 != 0, flags & 2 != 0, tokens, size))
 }
 
 fn remove_orphan_files(dir: &Path, live: &HashSet<String>) -> anyhow::Result<()> {
@@ -861,7 +880,9 @@ impl HostCache {
                     .disk
                     .as_ref()
                     .and_then(|d| d.entries.iter().find(|e| e.id == id))
-                    .map_or(usize::MAX, |e| e.chunk_keys.len() + self.local_chunks());
+                    .map_or(usize::MAX, |e| {
+                        e.tokens.len().div_ceil(HOST_CHUNK_POSITIONS) + self.local_chunks()
+                    });
                 if self.pool.free.len() < needed_upper {
                     break;
                 }
@@ -943,7 +964,7 @@ impl HostCache {
             && !e.disk_dirty
             && let Some(de) = disk.entries.iter_mut().find(|de| de.id == id)
             && de.tokens.len() == e.tokens.len()
-            && de.hashes.last() == e.hashes.last()
+            && de.full_hash == e.full_hash
         {
             de.used = de.used.max(e.used);
             disk.stats.skips_clean += 1;
@@ -964,11 +985,9 @@ impl HostCache {
         //    if so, just touch its LRU tick (zero bytes written). Strictly longer entries do
         //    not replace shorter prefixes on disk, because a shorter prompt cannot hit a
         //    longer entry and KV chunks are already 100% deduplicated.
-        let full_hash = e.hashes.last().copied();
+        let full_hash = e.full_hash;
         let exact_idx = disk.entries.iter().position(|de| {
-            de.tokens.len() == e.tokens.len()
-                && de.hashes.last().copied() == full_hash
-                && de.tokens == e.tokens
+            de.tokens.len() == e.tokens.len() && de.full_hash == full_hash && de.tokens == e.tokens
         });
         if let Some(idx) = exact_idx {
             let disk_complete = disk.complete(&disk.entries[idx], has_draft_kv);
@@ -981,8 +1000,11 @@ impl HostCache {
             }
         }
 
-        let keys = chunk_keys_128(&e.tokens, HOST_CHUNK_POSITIONS);
-        if keys.len() != e.kv.len() {
+        let p = HOST_CHUNK_POSITIONS;
+        let full_chunks = e.full_chunks();
+        let tail_positions = e.tokens.len() % p;
+        let keys = chunk_keys_128(&e.tokens, p);
+        if keys.len() != full_chunks || e.kv.len() != e.tokens.len().div_ceil(p) {
             return;
         }
 
@@ -990,7 +1012,7 @@ impl HostCache {
         let mut chunks_to_write: Vec<(usize, u128, bool, u64)> = Vec::new();
         let mut incremental_bytes = 0u64;
         let mut net_new_disk_bytes = 0u64;
-        for (j, (&c, &key)) in e.kv.iter().zip(&keys).enumerate() {
+        for (j, (&c, &key)) in e.kv[..full_chunks].iter().zip(&keys).enumerate() {
             let c_drafted = self.drafted[c as usize] && draft_bytes > 0;
             let payload_len = (target_bytes + if c_drafted { draft_bytes } else { 0 }) as u64;
             let file_bytes = FILE_HEADER_BYTES as u64 + payload_len;
@@ -1009,7 +1031,16 @@ impl HostCache {
                 }
             }
         }
-        let local_payload = (self.local_bytes + if e.rings { self.rings_bytes } else { 0 }) as u64;
+        let tail_drafted =
+            tail_positions > 0 && has_draft_kv && self.drafted[e.kv[full_chunks] as usize];
+        let tail_kv_bytes = (tail_positions * self.target.bytes_per_position()
+            + if tail_drafted {
+                tail_positions * self.draft.bytes_per_position()
+            } else {
+                0
+            }) as u64;
+        let local_payload =
+            (self.local_bytes + if e.rings { self.rings_bytes } else { 0 }) as u64 + tail_kv_bytes;
         let tokens_padded = (e.tokens.len() * 4 + pad8(e.tokens.len() * 4)) as u64;
         let local_file_bytes = FILE_HEADER_BYTES as u64 + tokens_padded + local_payload;
         incremental_bytes += local_file_bytes;
@@ -1047,7 +1078,7 @@ impl HostCache {
         while idx < disk.entries.len() {
             let de = &disk.entries[idx];
             let is_same = de.tokens.len() == e.tokens.len()
-                && de.hashes.last().copied() == full_hash
+                && de.full_hash == full_hash
                 && de.tokens == e.tokens;
             if is_same && Some(de.id) != protect_disk_id {
                 disk.evict_entry_index(idx);
@@ -1091,11 +1122,13 @@ impl HostCache {
             written_chunks += 1;
         }
 
-        // Materialize local state buffer (header + tokens + rings/conv + optional draft rings).
+        // Materialize local state buffer (header + tokens + rings/conv + optional draft rings
+        // + optional partial tail KV).
+        let local_flags = u32::from(e.rings) | (u32::from(tail_drafted) << 1);
         let mut lbuf = Vec::with_capacity(usize::try_from(local_file_bytes).unwrap_or(0));
         lbuf.extend_from_slice(LOCAL_MAGIC);
         lbuf.extend_from_slice(&DISK_FORMAT_L3.to_le_bytes());
-        lbuf.extend_from_slice(&u32::from(e.rings).to_le_bytes());
+        lbuf.extend_from_slice(&local_flags.to_le_bytes());
         lbuf.extend_from_slice(&manifest_key.to_le_bytes());
         lbuf.extend_from_slice(&entry_id.to_le_bytes());
         lbuf.extend_from_slice(&(e.tokens.len() as u64).to_le_bytes());
@@ -1110,12 +1143,29 @@ impl HostCache {
             lbuf.extend_from_slice(unsafe { Self::host_bytes(self.pool.address(c), len) });
             left -= len;
         }
+        if tail_positions > 0 {
+            let at = self.pool.address(e.kv[full_chunks]);
+            for (_, pb, before) in self.target.layout() {
+                let n = tail_positions * pb;
+                // SAFETY: `self.pending` was synchronized above, and tail chunk is live in `e`.
+                lbuf.extend_from_slice(unsafe { Self::host_bytes(at + p * before, n) });
+            }
+            if tail_drafted {
+                for (_, dpb, before) in self.draft.layout() {
+                    let n = tail_positions * dpb;
+                    // SAFETY: as above.
+                    lbuf.extend_from_slice(unsafe {
+                        Self::host_bytes(at + target_bytes + p * before, n)
+                    });
+                }
+            }
+        }
         debug_assert_eq!(lbuf.len() as u64, local_file_bytes);
         disk.writer
             .write_file(local_path(&dir, entry_id), lbuf, false);
 
         // Update chunk refcounts and byte accounting.
-        for (&c, &key) in e.kv.iter().zip(&keys) {
+        for (&c, &key) in e.kv[..full_chunks].iter().zip(&keys) {
             let c_drafted = self.drafted[c as usize] && draft_bytes > 0;
             let file_bytes = FILE_HEADER_BYTES as u64
                 + (target_bytes + if c_drafted { draft_bytes } else { 0 }) as u64;
@@ -1143,8 +1193,10 @@ impl HostCache {
             id: entry_id,
             tokens: e.tokens.clone(),
             hashes: e.hashes.clone(),
+            full_hash,
             chunk_keys: keys,
             rings: e.rings,
+            tail_drafted,
             local_file_bytes,
             used: e.used,
             in_flight: true,
@@ -1156,7 +1208,7 @@ impl HostCache {
         disk.maybe_checkpoint_manifest();
 
         if !force_shutdown {
-            let dedup_chunks = e.kv.len().saturating_sub(written_chunks);
+            let dedup_chunks = full_chunks.saturating_sub(written_chunks);
             self.notes.push(format!(
                 "disk cache: spilled {} tokens ({} MiB written, {written_chunks} new + \
                  {dedup_chunks} dedup chunks); {:.2}/{:.2} GiB used by {} entries ({} unique chunks)",
@@ -1219,11 +1271,9 @@ impl HostCache {
         let manifest_key = disk.manifest_key;
 
         // If an exact match already lives in RAM (e.g., from concurrent promotion), return it.
-        let full_hash = de.hashes.last().copied();
+        let full_hash = de.full_hash;
         if let Some(h) = self.entries.iter().position(|e| {
-            e.tokens.len() == de.tokens.len()
-                && e.hashes.last().copied() == full_hash
-                && e.tokens == de.tokens
+            e.tokens.len() == de.tokens.len() && e.full_hash == full_hash && e.tokens == de.tokens
         }) {
             return Ok(Some((h, 0, started.elapsed().as_secs_f64())));
         }
@@ -1234,10 +1284,13 @@ impl HostCache {
             return Ok(None);
         };
 
+        let p = HOST_CHUNK_POSITIONS;
+        let full_chunks = de.tokens.len() / p;
+        let tail_positions = de.tokens.len() % p;
         let (target_bytes, draft_bytes) = self.parts();
         let mut bytes_read = 0u64;
         let read_result = (|| -> anyhow::Result<()> {
-            for (j, (&c, &key)) in kv.iter().zip(&de.chunk_keys).enumerate() {
+            for (j, (&c, &key)) in kv[..full_chunks].iter().zip(&de.chunk_keys).enumerate() {
                 let path = chunk_path(&dir, key);
                 let at = self.pool.address(c);
                 if j < shared {
@@ -1268,6 +1321,7 @@ impl HostCache {
                 bytes_read += n;
             }
             let lpath = local_path(&dir, de.id);
+            let tail_chunk = (tail_positions > 0).then(|| kv[full_chunks]);
             let n = read_local_into(
                 &lpath,
                 manifest_key,
@@ -1277,7 +1331,14 @@ impl HostCache {
                 if de.rings { self.rings_bytes } else { 0 },
                 &self.pool,
                 &local,
+                tail_chunk,
+                de.tail_drafted,
+                &self.target,
+                &self.draft,
             )?;
+            if let Some(tc) = tail_chunk {
+                self.drafted[tc as usize] = de.tail_drafted;
+            }
             bytes_read += n;
             Ok(())
         })();
@@ -1305,6 +1366,7 @@ impl HostCache {
         self.entries.push(HostEntry {
             tokens: de.tokens,
             hashes: de.hashes,
+            full_hash,
             kv,
             local,
             rings: de.rings,
@@ -1363,6 +1425,7 @@ impl HostCache {
             let snapshot = HostEntry {
                 tokens: self.entries[idx].tokens.clone(),
                 hashes: self.entries[idx].hashes.clone(),
+                full_hash: self.entries[idx].full_hash,
                 kv: self.entries[idx].kv.clone(),
                 local: self.entries[idx].local.clone(),
                 rings: self.entries[idx].rings,
@@ -1475,7 +1538,7 @@ fn read_chunk_into(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "local file validation + pool scatter read"
+    reason = "local file validation + pool scatter read including optional partial tail KV"
 )]
 fn read_local_into(
     path: &Path,
@@ -1486,6 +1549,10 @@ fn read_local_into(
     rings_bytes: usize,
     pool: &super::ChunkPool,
     local_chunks: &[u32],
+    tail_chunk: Option<u32>,
+    tail_drafted: bool,
+    target: &GlobalKv,
+    draft: &GlobalKv,
 ) -> anyhow::Result<u64> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let size = file.metadata()?.len();
@@ -1500,27 +1567,59 @@ fn read_local_into(
     let tokens_len = usize::try_from(u64::from_le_bytes(
         fixed[32..40].try_into().expect("8 bytes"),
     ))?;
+    let file_tail_drafted = flags & 2 != 0;
     ensure!(
         ver == DISK_FORMAT_L3
             && key == manifest_key
             && id == expected_id
             && tokens_len == expected_tokens
-            && (flags & 1 != 0) == (rings_bytes > 0),
+            && (flags & 1 != 0) == (rings_bytes > 0)
+            && file_tail_drafted == tail_drafted,
         "local file header mismatch"
     );
+    let p = HOST_CHUNK_POSITIONS;
+    let tail_positions = tokens_len % p;
+    ensure!(
+        (tail_positions > 0) == tail_chunk.is_some(),
+        "tail chunk presence mismatch"
+    );
+    let tail_kv_bytes = tail_positions * target.bytes_per_position()
+        + if tail_drafted {
+            tail_positions * draft.bytes_per_position()
+        } else {
+            0
+        };
     let skip_tokens = tokens_len * 4 + pad8(tokens_len * 4);
-    let total_payload = local_bytes + rings_bytes;
+    let total_payload = local_bytes + rings_bytes + tail_kv_bytes;
     ensure!(
         size == (FILE_HEADER_BYTES + skip_tokens + total_payload) as u64,
         "local file size mismatch"
     );
     r.seek_relative(i64::try_from(skip_tokens)?)?;
-    let mut left = total_payload;
+    let mut left = local_bytes + rings_bytes;
     for &c in local_chunks {
         let len = left.min(pool.chunk_bytes);
         // SAFETY: freshly allocated local chunks of this entry.
         r.read_exact(unsafe { HostCache::host_bytes_mut(pool.address(c), len) })?;
         left -= len;
+    }
+    if let Some(tc) = tail_chunk {
+        let at = pool.address(tc);
+        for (_, pb, before) in target.layout() {
+            let n = tail_positions * pb;
+            // SAFETY: freshly allocated private partial tail chunk.
+            r.read_exact(unsafe { HostCache::host_bytes_mut(at + p * before, n) })?;
+        }
+        if tail_drafted {
+            let target_base = p * target.bytes_per_position();
+            for (_, dpb, before) in draft.layout() {
+                let n = tail_positions * dpb;
+                // SAFETY: as above.
+                r.read_exact(unsafe {
+                    HostCache::host_bytes_mut(at + target_base + p * before, n)
+                })?;
+            }
+        }
     }
     Ok(total_payload as u64)
 }
