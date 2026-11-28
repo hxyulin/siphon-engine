@@ -192,9 +192,9 @@ struct FormatOptions {
     /// Set the LM head format. Defaults to the weight format.
     #[arg(long, value_name = "FORMAT", value_parser = ["bf16", "fp8", "nvfp4"])]
     lm_head: Option<String>,
-    /// Set the KV cache format. nvfp4-all compresses both global and sliding caches.
+    /// Set the KV cache format. nvfp4-all compresses both global and sliding caches; nvfp4-g32 uses group-32 scales (544 B/slot).
     #[arg(long, value_name = "FORMAT", default_value = "fp8",
-          value_parser = ["fp8", "bf16", "nvfp4", "nvfp4-all", "mixed"])]
+          value_parser = ["fp8", "bf16", "nvfp4", "nvfp4-all", "nvfp4-g32", "nvfp4-g32-all", "mixed"])]
     kv: String,
     /// Set global prefill attention precision. auto uses FP8 past 2048 keys.
     #[arg(long, value_name = "FORMAT", default_value = "auto",

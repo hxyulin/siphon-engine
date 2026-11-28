@@ -1086,6 +1086,7 @@ mod cuda {
         let first = speculator.prefill(&mut model, warmup, chunk)?;
         let saved = model.save_state()?;
         let policy = price(&mut model, &mut speculator, &saved, warmup, first)?;
+        speculator.set_keep_tail(false);
         let priced: Vec<String> = options
             .widths
             .iter()

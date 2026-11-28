@@ -129,6 +129,12 @@ pub enum KvFormat {
     Nvfp4,
     /// NVFP4 for both global visits and sliding-window visits.
     Nvfp4All,
+    /// Group-32 NVFP4: E2M1 values with one E4M3 scale per 32 elements (4.25 bits/element,
+    /// 544 B/slot, 8.50 KiB/position = exact 8.50 GiB at 1M context). Global visits use
+    /// NVFP4-G32 and sliding-window visits stay E4M3.
+    Nvfp4G32,
+    /// Group-32 NVFP4 for both global visits and sliding-window visits.
+    Nvfp4G32All,
     /// FP8 for the first [`MIXED_FP8_VISITS`] global visits and NVFP4 for the rest. Layer 5
     /// and the first pass of layer 11 are the visits whose rounding to 4 bits costs the
     /// most (see engine.md, "KV cache reduction").
@@ -141,25 +147,28 @@ pub const MIXED_FP8_VISITS: usize = 2;
 impl KvFormat {
     /// The format of the cache of global visit `global` (its index among the global
     /// visits, in visit order): this format, [`KvFormat::Nvfp4`] for [`KvFormat::Nvfp4All`],
-    /// or for [`KvFormat::Mixed`] FP8 or NVFP4.
+    /// [`KvFormat::Nvfp4G32`] for [`KvFormat::Nvfp4G32All`], or for [`KvFormat::Mixed`] FP8
+    /// or NVFP4.
     #[must_use]
     pub fn cache_format(self, global: usize) -> Self {
         match self {
             Self::Mixed if global < MIXED_FP8_VISITS => Self::Fp8,
             Self::Mixed | Self::Nvfp4All => Self::Nvfp4,
+            Self::Nvfp4G32All => Self::Nvfp4G32,
             f => f,
         }
     }
 
     /// The format of the sliding-window caches under this setting: BF16 under
-    /// [`KvFormat::Bf16`], NVFP4 under [`KvFormat::Nvfp4All`], and E4M3 under the other
-    /// quantized KV settings (`Fp8`, `Nvfp4`, `Mixed`).
+    /// [`KvFormat::Bf16`], NVFP4 under [`KvFormat::Nvfp4All`], NVFP4-G32 under
+    /// [`KvFormat::Nvfp4G32All`], and E4M3 under the other quantized KV settings.
     #[must_use]
     pub const fn sliding_format(self) -> Self {
         match self {
             Self::Bf16 => Self::Bf16,
-            Self::Fp8 | Self::Nvfp4 | Self::Mixed => Self::Fp8,
+            Self::Fp8 | Self::Nvfp4 | Self::Nvfp4G32 | Self::Mixed => Self::Fp8,
             Self::Nvfp4All => Self::Nvfp4,
+            Self::Nvfp4G32All => Self::Nvfp4G32,
         }
     }
 
@@ -171,6 +180,7 @@ impl KvFormat {
             Self::Bf16 => 2 * dims,
             Self::Fp8 => dims,
             Self::Nvfp4 | Self::Nvfp4All | Self::Mixed => dims / 2 + dims / 16,
+            Self::Nvfp4G32 | Self::Nvfp4G32All => dims / 2 + dims / 32,
         }
     }
 }
@@ -184,9 +194,11 @@ impl FromStr for KvFormat {
             "fp8" => Ok(Self::Fp8),
             "nvfp4" => Ok(Self::Nvfp4),
             "nvfp4-all" => Ok(Self::Nvfp4All),
+            "nvfp4-g32" => Ok(Self::Nvfp4G32),
+            "nvfp4-g32-all" => Ok(Self::Nvfp4G32All),
             "mixed" => Ok(Self::Mixed),
             _ => bail!(
-                "unknown KV cache format {s:?}; expected bf16, fp8, nvfp4, nvfp4-all or mixed"
+                "unknown KV cache format {s:?}; expected bf16, fp8, nvfp4, nvfp4-all, nvfp4-g32, nvfp4-g32-all or mixed"
             ),
         }
     }
@@ -199,6 +211,8 @@ impl fmt::Display for KvFormat {
             Self::Fp8 => "fp8",
             Self::Nvfp4 => "nvfp4",
             Self::Nvfp4All => "nvfp4-all",
+            Self::Nvfp4G32 => "nvfp4-g32",
+            Self::Nvfp4G32All => "nvfp4-g32-all",
             Self::Mixed => "mixed",
         })
     }
@@ -218,6 +232,8 @@ pub enum KvQuant {
     /// llama.cpp's `q4_0`: 4-bit integers with one F16 scale per 32 elements, the scale the
     /// signed element of largest magnitude over -8.
     Q4_0,
+    /// NVFP4 with group-32 E4M3 scales (544 B/slot, 4.25 bits/element).
+    Nvfp4G32,
 }
 
 impl FromStr for KvQuant {
@@ -228,7 +244,8 @@ impl FromStr for KvQuant {
             "none" => Ok(Self::None),
             "nvfp4" => Ok(Self::Nvfp4),
             "q4_0" => Ok(Self::Q4_0),
-            _ => bail!("unknown KV rounding {s:?}; expected none, nvfp4 or q4_0"),
+            "nvfp4-g32" => Ok(Self::Nvfp4G32),
+            _ => bail!("unknown KV rounding {s:?}; expected none, nvfp4, q4_0 or nvfp4-g32"),
         }
     }
 }
@@ -239,6 +256,7 @@ impl fmt::Display for KvQuant {
             Self::None => "none",
             Self::Nvfp4 => "nvfp4",
             Self::Q4_0 => "q4_0",
+            Self::Nvfp4G32 => "nvfp4-g32",
         })
     }
 }

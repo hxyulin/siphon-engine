@@ -455,7 +455,11 @@ impl Spec {
             visits > 0 && seqs > 0 && seqs <= max_seqs,
             "invalid batch verify dims"
         );
-        check_len("tables", tables.len(), visits * max_seqs * BATCH_STATE_WORDS)?;
+        check_len(
+            "tables",
+            tables.len(),
+            visits * max_seqs * BATCH_STATE_WORDS,
+        )?;
         check_len(
             "inputs",
             inputs.len(),
@@ -988,7 +992,11 @@ impl Spec {
         check_len("path", path.len(), VERIFY_ROWS)?;
         let tap_count_arg = i32::try_from(tap_count)?;
         let config = LaunchConfig {
-            grid_dim: (u32::try_from(max_depth_plus_1)?, u32::try_from(tap_count)?, 1),
+            grid_dim: (
+                u32::try_from(max_depth_plus_1)?,
+                u32::try_from(tap_count)?,
+                1,
+            ),
             block_dim: (u32::try_from(HIDDEN / 8)?, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1056,10 +1064,12 @@ fn ring_config(
         "{rows} rows, expected 1 to {VERIFY_ROWS}"
     );
     ensure!(
-        row_bytes == crate::ops::attention::FP4_ROW
+        row_bytes == crate::ops::attention::FP4_G32_ROW
+            || row_bytes == crate::ops::attention::FP4_ROW
             || row_bytes == KV_DIMS
             || row_bytes == 2 * KV_DIMS,
-        "ring row_bytes {row_bytes}, expected {}, {KV_DIMS} or {}",
+        "ring row_bytes {row_bytes}, expected {}, {}, {KV_DIMS} or {}",
+        crate::ops::attention::FP4_G32_ROW,
         crate::ops::attention::FP4_ROW,
         2 * KV_DIMS
     );
@@ -1077,7 +1087,10 @@ fn ring_config(
     ))
 }
 
-#[expect(clippy::too_many_arguments, reason = "validates ring_backup_batch args")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validates ring_backup_batch args"
+)]
 fn ring_batch_config(
     tables_len: usize,
     num_sliding: usize,
@@ -1101,10 +1114,12 @@ fn ring_batch_config(
         "{rows} rows, expected 1 to {VERIFY_ROWS}"
     );
     ensure!(
-        row_bytes == crate::ops::attention::FP4_ROW
+        row_bytes == crate::ops::attention::FP4_G32_ROW
+            || row_bytes == crate::ops::attention::FP4_ROW
             || row_bytes == KV_DIMS
             || row_bytes == 2 * KV_DIMS,
-        "ring row_bytes {row_bytes}, expected {}, {KV_DIMS} or {}",
+        "ring row_bytes {row_bytes}, expected {}, {}, {KV_DIMS} or {}",
+        crate::ops::attention::FP4_G32_ROW,
         crate::ops::attention::FP4_ROW,
         2 * KV_DIMS
     );

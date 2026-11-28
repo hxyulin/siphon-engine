@@ -27,6 +27,7 @@ use super::{
 };
 use crate::{
     DeviceIn,
+    gpu::{ArenaBuf, ArenaCursor, ArenaSlice, DeviceArena},
     ops::{
         Products, QuantDest, QuantFormat,
         attention::{self, KV_HEADS, PREFILL_PACKED_MAX_BLOCKS, prefill_blocks},
@@ -157,8 +158,11 @@ const _: () = assert!(BATCH_FP8_DENSE_MIN_ROWS == siphon::memory::BATCH_FP8_DENS
 /// Smallest batched/invariant row count that dispatches BF16 dense projections (without an
 /// FP8/MXFP8 copy) to BF16 tensor-core GEMMs (`Linear::gemm_bf16`) under `--prefill-dense fp8`.
 pub(super) const BATCH_BF16_GEMM_MIN_ROWS: usize = 48;
-/// Receives each chunk's feature taps and the position of its first row.
-pub(super) type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
+/// Receives the first position and the device feature taps of each prefill chunk.
+///
+/// The BF16 view has shape `[rows, taps, hidden]` in [`Model::tap_layout`] order. Work
+/// enqueued on the model stream can consume the view before the next chunk reuses it.
+pub type TapsCallback<'a> = &'a mut dyn FnMut(usize, CudaView<'_, bf16>) -> anyhow::Result<()>;
 
 /// The embedding rows of one image in a prompt. Prefill writes them over the rows of the
 /// image's placeholder tokens after `embed_norm`, as Transformers' Inkling 2 scatters the
@@ -186,6 +190,7 @@ impl ImageRows {
 pub type ImageSource<'a> = &'a mut dyn FnMut(usize, usize) -> anyhow::Result<Vec<ImageRows>>;
 
 /// One sequence slice packed into [`Model::prefill_packed`].
+#[derive(Debug)]
 pub struct PackedPrefill<'a> {
     /// Target sequence slot (must be distinct across slices in one call).
     pub slot: usize,
@@ -314,11 +319,14 @@ struct GateRows {
     /// [`PrefillScratch::new`]).
     invariant: bool,
     /// Per slot, the normalized state and message side by side, BF16 `[rows, 2 * hidden]`.
-    inputs: [CudaSlice<bf16>; MESSAGE_SLOTS],
+    /// Slots 0..3 live only through Phase A (attention gates) and are arena-backed; slot 3
+    /// (MLP gate) is filled by `message_bank_inputs_rows` before attention and read after
+    /// attention, so it stays persistent across the visit.
+    inputs: [ArenaBuf<bf16>; MESSAGE_SLOTS],
     /// The down projections, BF16 `[slots, rows, rank]`.
-    down: CudaSlice<bf16>,
+    down: ArenaSlice<bf16>,
     /// A gate's output, F32 `[rows, hidden]`, and in invariant chunks one per slot of a launch.
-    out: CudaSlice<f32>,
+    out: ArenaSlice<f32>,
     /// The MXFP8 inputs of `Products::Fp8` dense products: up to three inputs of
     /// `2 * hidden` values per row in prefill, or `max(3 * hidden, q_dims)` per row in
     /// invariant chunks with at least [`BATCH_FP8_DENSE_MIN_ROWS`] rows. The attention
@@ -326,64 +334,31 @@ struct GateRows {
     dense: Fp8Rows,
 }
 
-impl GateRows {
-    fn new(
-        stream: &Arc<CudaStream>,
-        rows: usize,
-        hidden: usize,
-        q_dims: usize,
-        rank: usize,
-        invariant: bool,
-    ) -> anyhow::Result<Self> {
-        let dense_len = if !invariant {
-            dense_values(rows, hidden)
-        } else if rows >= BATCH_FP8_DENSE_MIN_ROWS {
-            rows * (3 * hidden).max(q_dims)
-        } else {
-            0
-        };
-        Ok(Self {
-            invariant,
-            inputs: [
-                zeros(stream, rows * 2 * hidden)?,
-                zeros(stream, rows * 2 * hidden)?,
-                zeros(stream, rows * 2 * hidden)?,
-                zeros(stream, rows * 2 * hidden)?,
-            ],
-            down: zeros(stream, MESSAGE_SLOTS * rows * rank)?,
-            // Invariant chunks run up to three gates at once, each with its own output.
-            out: zeros(
-                stream,
-                if invariant { GATE_SLOTS } else { 1 } * rows * hidden,
-            )?,
-            dense: Fp8Rows::new(stream, dense_len)?,
-        })
-    }
-}
-
 /// Intermediates of attention for a chunk, `[rows, ...]` versions of `AttentionTemps`.
 struct AttentionRows {
     /// Whether the products and attention run in a fixed order for any row count (see
     /// [`PrefillScratch::new`]).
     invariant: bool,
-    /// The partials of the multi-row attention, which invariant chunks run.
-    rows: attention::RowsAttentionScratch,
+    /// The partials of the multi-row attention, which only invariant chunks run.
+    rows: Option<attention::RowsAttentionScratch>,
     k_raw: CudaSlice<bf16>,
     v_raw: CudaSlice<bf16>,
-    k_dynamic: CudaSlice<bf16>,
-    v_dynamic: CudaSlice<bf16>,
-    q_raw: CudaSlice<bf16>,
-    r_raw: CudaSlice<bf16>,
-    gate: CudaSlice<bf16>,
-    sinks: CudaSlice<bf16>,
-    q: CudaSlice<bf16>,
-    k: CudaSlice<bf16>,
-    v: CudaSlice<bf16>,
-    r: CudaSlice<bf16>,
-    bias: CudaSlice<bf16>,
-    partials: attention::PrefillScratch,
-    out: CudaSlice<bf16>,
-    gated: CudaSlice<bf16>,
+    k_dynamic: ArenaSlice<bf16>,
+    v_dynamic: ArenaSlice<bf16>,
+    q_raw: ArenaSlice<bf16>,
+    r_raw: ArenaSlice<bf16>,
+    gate: ArenaSlice<bf16>,
+    sinks: ArenaSlice<bf16>,
+    q: ArenaSlice<bf16>,
+    k: ArenaSlice<bf16>,
+    v: ArenaSlice<bf16>,
+    r: ArenaSlice<bf16>,
+    bias: ArenaSlice<bf16>,
+    /// Flash prefill attention partials, only allocated for non-invariant prefill chunks.
+    partials: Option<attention::PrefillScratch>,
+    /// Un-gated attention output, only used by non-invariant prefill chunks.
+    out: Option<ArenaSlice<bf16>>,
+    gated: ArenaSlice<bf16>,
     proj: CudaSlice<bf16>,
 }
 
@@ -394,23 +369,21 @@ struct MoeRows {
     invariant: bool,
     /// The counters of the multi-row expert kernel, left zero by each call.
     expert_sync: CudaSlice<u32>,
-    logits: CudaSlice<f32>,
-    router: RouterRowsScratch,
-    indices: CudaSlice<i32>,
-    weights: CudaSlice<f32>,
-    act: CudaSlice<bf16>,
-    down: CudaSlice<bf16>,
+    logits: ArenaSlice<f32>,
+    /// Prefill router scratch, only allocated for non-invariant chunks.
+    router: Option<RouterRowsScratch>,
+    indices: ArenaSlice<i32>,
+    weights: ArenaSlice<f32>,
+    act: ArenaSlice<bf16>,
+    down: ArenaSlice<bf16>,
     /// The combined expert outputs, the post-MLP conv's input.
-    combined: CudaSlice<bf16>,
-    /// Grouping of the (row, slot) pairs by expert, shared by w13 and w2.
-    experts: ExpertScratch,
-    /// The quantized `w13` inputs of `ExpertActivations::Quantized` / `Fp8`: up to `rows`
-    /// rows of `hidden` values (kept distinct from `quantized` so `w13` can write fused
-    /// quantized SwiGLU activations directly into `quantized` for `w2`).
-    quantized_in: QuantizedRows,
-    /// The quantized `w2` inputs of `ExpertActivations::Quantized` / `Fp8`: up to `rows * 8`
-    /// rows of `intermediate` values.
-    quantized: QuantizedRows,
+    combined: ArenaSlice<bf16>,
+    /// Grouping of the (row, slot) pairs by expert, shared by w13 and w2 (prefill only).
+    experts: Option<ExpertScratch>,
+    /// The quantized `w13` inputs of `ExpertActivations::Quantized` / `Fp8` (prefill only).
+    quantized_in: Option<QuantizedRows>,
+    /// The quantized `w2` inputs of `ExpertActivations::Quantized` / `Fp8` (prefill only).
+    quantized: Option<QuantizedRows>,
 }
 
 /// Partial `(max_val, max_idx)` scratch for the fused greedy LM head (`verify_head`,
@@ -474,7 +447,7 @@ pub(super) struct PrefillScratch {
     packed_starts: CudaSlice<u32>,
     /// First-token argmax/sample outputs of [`Model::prefill_packed`], `[BATCH_ROWS]`.
     packed_argmax: CudaSlice<i32>,
-    embedded: CudaSlice<bf16>,
+    embedded: ArenaSlice<bf16>,
     hidden: CudaSlice<bf16>,
     out: CudaSlice<bf16>,
     prelude_hidden: CudaSlice<bf16>,
@@ -492,72 +465,31 @@ pub(super) struct PrefillScratch {
     /// instead of one per visit. Other chunks put them into the gate inputs' second halves.
     message_x: Option<CudaSlice<bf16>>,
     /// F32 `[rows, 1 or 3, hidden]`.
-    attention_inputs: CudaSlice<f32>,
+    attention_inputs: ArenaSlice<f32>,
     gate: GateRows,
-    qkv_in: [CudaSlice<bf16>; 3],
+    qkv_in: [ArenaSlice<bf16>; 3],
     attention: AttentionRows,
     residual: CudaSlice<f32>,
-    mlp_input: CudaSlice<f32>,
-    mlp_x: CudaSlice<bf16>,
+    mlp_input: ArenaSlice<f32>,
+    mlp_x: ArenaSlice<bf16>,
     moe: MoeRows,
-    pub(super) final_hidden: CudaSlice<bf16>,
+    pub(super) final_hidden: ArenaSlice<bf16>,
     /// BF16 LM-head logits (`[rows, vocab_size]`): allocated for prefill chunks and for
     /// sampled invariant chunks; omitted on greedy invariant chunks (which use
     /// `head_partials` directly).
-    pub(super) head_logits: Option<CudaSlice<bf16>>,
+    pub(super) head_logits: Option<ArenaBuf<bf16>>,
     /// F32 softcapped logits (`[HEAD_ROWS, unpadded_vocab]`): allocated for prefill
     /// `PrefillLogits::All`/`Every` only; never allocated on invariant verify/batch chunks.
-    head_capped: Option<CudaSlice<f32>>,
+    head_capped: Option<ArenaBuf<f32>>,
     /// Tile-argmax partial buffers for the fused greedy LM head.
     pub(super) head_partials: Option<HeadArgmaxScratch>,
     /// MXFP8 quantized `final_hidden` scratch for native FP8 LM head (`m > 32`).
     pub(super) head_fp8: Option<Fp8Rows>,
     /// Host copy of `head_capped` (non-invariant prefill only).
     head_host: Vec<f32>,
-}
-
-/// LM-head output and argmax scratch buffers for [`PrefillScratch::new`].
-type HeadBuffers = (
-    Option<CudaSlice<bf16>>,
-    Option<CudaSlice<f32>>,
-    Option<HeadArgmaxScratch>,
-    Option<Fp8Rows>,
-    Vec<f32>,
-);
-
-fn alloc_head_buffers(
-    stream: &Arc<CudaStream>,
-    cfg: &TextConfig,
-    rows: usize,
-    invariant: bool,
-    sampler: bool,
-    fp8_wide: bool,
-) -> anyhow::Result<HeadBuffers> {
-    if invariant {
-        let head_logits = sampler
-            .then(|| zeros(stream, rows * cfg.vocab_size))
-            .transpose()?;
-        let head_partials = (!sampler)
-            .then(|| HeadArgmaxScratch::new(stream, rows, cfg.unpadded_vocab_size, fp8_wide))
-            .transpose()?;
-        let head_fp8 = (!sampler && rows > 32 && fp8_wide)
-            .then(|| Fp8Rows::new(stream, rows * cfg.hidden_size))
-            .transpose()?;
-        Ok((head_logits, None, head_partials, head_fp8, Vec::new()))
-    } else {
-        Ok((
-            Some(zeros(stream, HEAD_ROWS * cfg.vocab_size)?),
-            Some(zeros(stream, HEAD_ROWS * cfg.unpadded_vocab_size)?),
-            Some(HeadArgmaxScratch::new(
-                stream,
-                HEAD_ROWS,
-                cfg.unpadded_vocab_size,
-                false,
-            )?),
-            None,
-            vec![0.0; HEAD_ROWS * cfg.unpadded_vocab_size],
-        ))
-    }
+    /// Backing allocation for all phase-aliased `ArenaSlice` fields above. MUST remain the
+    /// last field so Rust drops/leaks all derived views before freeing the backing memory.
+    _arena: DeviceArena,
 }
 
 impl PrefillScratch {
@@ -571,7 +503,7 @@ impl PrefillScratch {
     /// pass sets it, so that each of its rows equals a verify of that row alone.
     #[expect(
         clippy::too_many_lines,
-        reason = "allocates prefill scratch buffers together"
+        reason = "plans phase-aliased arena layout and allocates prefill scratch buffers together"
     )]
     pub(super) fn new(
         stream: &Arc<CudaStream>,
@@ -586,12 +518,145 @@ impl PrefillScratch {
         let heads = cfg.num_attention_heads;
         let q_dims = heads * cfg.head_dim;
         let kv_dims = cfg.num_key_value_heads * cfg.head_dim;
+        let rel_dims = heads * cfg.d_rel;
+        let bias_dims = heads * cfg.rel_extent;
         let dynamic = cfg.num_key_value_heads * cfg.sconv_kernel_size;
         let top_k = cfg.num_experts_per_tok;
         let width = cfg.intermediate_size;
+        let rank = cfg.loop_config.gate_rank;
         let looped = cfg.loop_config.core_end - cfg.loop_config.core_start;
-        let (head_logits, head_capped, head_partials, head_fp8, head_host) =
-            alloc_head_buffers(stream, cfg, rows, invariant, sampler, fp8_wide)?;
+        let gate_out_slots = if invariant { GATE_SLOTS } else { 1 };
+
+        // Plan the two-region phase-aliased transient arena.
+        // Region A holds buffers live across a sub-phase boundary:
+        //   - Phase A -> B1: qkv_in[0..3]
+        //   - Phase B2:      q, k, v
+        //   - Phase C:       mlp_input, mlp_x
+        //   - Phase D:       final_hidden, head_logits
+        let mut a_qkv_in = ArenaCursor::at(0);
+        let off_qkv_in = [
+            a_qkv_in.alloc::<bf16>(rows * hidden),
+            a_qkv_in.alloc::<bf16>(rows * hidden),
+            a_qkv_in.alloc::<bf16>(rows * hidden),
+        ];
+        let mut a_qkv = ArenaCursor::at(0);
+        let off_q = a_qkv.alloc::<bf16>(rows * q_dims);
+        let off_k = a_qkv.alloc::<bf16>(rows * kv_dims);
+        let off_v = a_qkv.alloc::<bf16>(rows * kv_dims);
+        let mut a_mlp = ArenaCursor::at(0);
+        let off_mlp_input = a_mlp.alloc::<f32>(rows * hidden);
+        let off_mlp_x = a_mlp.alloc::<bf16>(rows * hidden);
+        let mut a_head = ArenaCursor::at(0);
+        let off_final_hidden = a_head.alloc::<bf16>(rows * hidden);
+        let head_logits_len = if invariant {
+            if sampler { rows * cfg.vocab_size } else { 0 }
+        } else {
+            HEAD_ROWS * cfg.vocab_size
+        };
+        let off_head_logits = (head_logits_len > 0).then(|| a_head.alloc::<bf16>(head_logits_len));
+        let region_b_base = a_qkv_in
+            .end()
+            .max(a_qkv.end())
+            .max(a_mlp.end())
+            .max(a_head.end());
+
+        // Region B holds strictly disjoint per-phase buffers:
+        //   - Phase 0 (pre-visit): embedded
+        //   - Phase A (attn prep): gate.out, gate.down, attention_inputs, gate.inputs[0..3]
+        //   - Phase C1 (MLP gate): gate.out, gate.down, gate.inputs[3] (aliases attention_inputs)
+        //   - Phase B (attention): gate, sinks, r, bias, then post-bias (q_raw, r_raw, k_dyn,
+        //                          v_dyn) aliased with `out` (!invariant) or `gated` (invariant);
+        //                          for !invariant, `gated` aliases dead `bias`.
+        //   - Phase C2 (MoE):      logits, indices, weights, act, down, combined
+        //   - Phase D (LM head):   head_capped (!invariant)
+        let mut b_embed = ArenaCursor::at(region_b_base);
+        let off_embedded = b_embed.alloc::<bf16>(rows * hidden);
+
+        let mut b_gate_a = ArenaCursor::at(region_b_base);
+        let off_gate_out = b_gate_a.alloc::<f32>(gate_out_slots * rows * hidden);
+        let off_gate_down = b_gate_a.alloc::<bf16>(MESSAGE_SLOTS * rows * rank);
+        let off_attention_inputs = b_gate_a.alloc::<f32>(rows * 3 * hidden);
+        let off_gate_in0 = b_gate_a.alloc::<bf16>(rows * 2 * hidden);
+        let off_gate_in1 = b_gate_a.alloc::<bf16>(rows * 2 * hidden);
+        let off_gate_in2 = b_gate_a.alloc::<bf16>(rows * 2 * hidden);
+
+        let mut b_attn = ArenaCursor::at(region_b_base);
+        let off_gate = b_attn.alloc::<bf16>(rows * q_dims);
+        let off_sinks = b_attn.alloc::<bf16>(rows * heads);
+        let off_r = b_attn.alloc::<bf16>(rows * rel_dims);
+        let off_bias = b_attn.alloc::<bf16>(rows * bias_dims);
+        let b_attn_post_bias = b_attn.end();
+        let mut b_attn_raw = ArenaCursor::at(b_attn_post_bias);
+        let off_q_raw = b_attn_raw.alloc::<bf16>(rows * q_dims);
+        let off_r_raw = b_attn_raw.alloc::<bf16>(rows * rel_dims);
+        let off_k_dynamic = b_attn_raw.alloc::<bf16>(rows * dynamic);
+        let off_v_dynamic = b_attn_raw.alloc::<bf16>(rows * dynamic);
+        let mut b_attn_out = ArenaCursor::at(b_attn_post_bias);
+        let (off_attn_out, off_attn_gated) = if invariant {
+            (None, b_attn_out.alloc::<bf16>(rows * q_dims))
+        } else {
+            let out_off = b_attn_out.alloc::<bf16>(rows * q_dims);
+            // `bias` is dead before `attention_gate_and_output_rows` runs; verify `gated` fits.
+            let mut b_gated = ArenaCursor::at(off_bias);
+            let gated_off = b_gated.alloc::<bf16>(rows * q_dims);
+            debug_assert!(b_gated.end() <= b_attn_post_bias);
+            (Some(out_off), gated_off)
+        };
+        let b_attn_end = b_attn_raw.end().max(b_attn_out.end());
+
+        let mut b_moe = ArenaCursor::at(region_b_base);
+        let off_logits = b_moe.alloc::<f32>(rows * cfg.n_routed_experts);
+        let off_indices = b_moe.alloc::<i32>(rows * top_k);
+        let off_weights = b_moe.alloc::<f32>(rows * top_k);
+        let off_act = b_moe.alloc::<bf16>(rows * top_k * width);
+        let off_down = b_moe.alloc::<bf16>(rows * top_k * hidden);
+        let off_combined = b_moe.alloc::<bf16>(rows * hidden);
+
+        let mut b_head = ArenaCursor::at(region_b_base);
+        let off_head_capped =
+            (!invariant).then(|| b_head.alloc::<f32>(HEAD_ROWS * cfg.unpadded_vocab_size));
+
+        let arena_bytes = b_embed
+            .end()
+            .max(b_gate_a.end())
+            .max(b_attn_end)
+            .max(b_moe.end())
+            .max(b_head.end());
+        let arena = DeviceArena::new(stream, arena_bytes)?;
+
+        let dense_len = if !invariant {
+            dense_values(rows, hidden)
+        } else if rows >= BATCH_FP8_DENSE_MIN_ROWS {
+            rows * (3 * hidden).max(q_dims)
+        } else {
+            0
+        };
+        let head_logits =
+            off_head_logits.map(|off| ArenaBuf::Arena(arena.slice(stream, off, head_logits_len)));
+        let head_capped = off_head_capped.map(|off| {
+            ArenaBuf::Arena(arena.slice(stream, off, HEAD_ROWS * cfg.unpadded_vocab_size))
+        });
+        let head_partials = if invariant {
+            (!sampler)
+                .then(|| HeadArgmaxScratch::new(stream, rows, cfg.unpadded_vocab_size, fp8_wide))
+                .transpose()?
+        } else {
+            Some(HeadArgmaxScratch::new(
+                stream,
+                HEAD_ROWS,
+                cfg.unpadded_vocab_size,
+                false,
+            )?)
+        };
+        let head_fp8 = (invariant && !sampler && rows > 32 && fp8_wide)
+            .then(|| Fp8Rows::new(stream, rows * hidden))
+            .transpose()?;
+        let head_host = if invariant {
+            Vec::new()
+        } else {
+            vec![0.0; HEAD_ROWS * cfg.unpadded_vocab_size]
+        };
+
         Ok(Self {
             rows,
             record_taps: false,
@@ -605,7 +670,7 @@ impl PrefillScratch {
             packed: None,
             packed_starts: zeros(stream, BATCH_ROWS)?,
             packed_argmax: zeros(stream, BATCH_ROWS)?,
-            embedded: zeros(stream, rows * hidden)?,
+            embedded: arena.slice(stream, off_embedded, rows * hidden),
             hidden: zeros(stream, rows * hidden)?,
             out: zeros(stream, rows * hidden)?,
             prelude_hidden: zeros(stream, rows * hidden)?,
@@ -620,74 +685,95 @@ impl PrefillScratch {
             message_x: invariant
                 .then(|| zeros(stream, MESSAGE_SLOTS * looped * rows * hidden))
                 .transpose()?,
-            attention_inputs: zeros(stream, rows * 3 * hidden)?,
-            gate: GateRows::new(
-                stream,
-                rows,
-                hidden,
-                q_dims,
-                cfg.loop_config.gate_rank,
+            attention_inputs: arena.slice(stream, off_attention_inputs, rows * 3 * hidden),
+            gate: GateRows {
                 invariant,
-            )?,
+                inputs: [
+                    ArenaBuf::Arena(arena.slice(stream, off_gate_in0, rows * 2 * hidden)),
+                    ArenaBuf::Arena(arena.slice(stream, off_gate_in1, rows * 2 * hidden)),
+                    ArenaBuf::Arena(arena.slice(stream, off_gate_in2, rows * 2 * hidden)),
+                    ArenaBuf::Owned(zeros(stream, rows * 2 * hidden)?),
+                ],
+                down: arena.slice(stream, off_gate_down, MESSAGE_SLOTS * rows * rank),
+                out: arena.slice(stream, off_gate_out, gate_out_slots * rows * hidden),
+                dense: Fp8Rows::new(stream, dense_len)?,
+            },
             qkv_in: [
-                zeros(stream, rows * hidden)?,
-                zeros(stream, rows * hidden)?,
-                zeros(stream, rows * hidden)?,
+                arena.slice(stream, off_qkv_in[0], rows * hidden),
+                arena.slice(stream, off_qkv_in[1], rows * hidden),
+                arena.slice(stream, off_qkv_in[2], rows * hidden),
             ],
             attention: AttentionRows {
                 invariant,
-                rows: attention::RowsAttentionScratch::new(
-                    stream,
-                    if invariant { rows.min(BATCH_VERIFY_MAX_ROWS) } else { 1 },
-                )?,
+                rows: invariant
+                    .then(|| {
+                        attention::RowsAttentionScratch::new(
+                            stream,
+                            rows.min(BATCH_VERIFY_MAX_ROWS),
+                        )
+                    })
+                    .transpose()?,
                 k_raw: zeros(stream, rows * kv_dims)?,
                 v_raw: zeros(stream, rows * kv_dims)?,
-                k_dynamic: zeros(stream, rows * dynamic)?,
-                v_dynamic: zeros(stream, rows * dynamic)?,
-                q_raw: zeros(stream, rows * q_dims)?,
-                r_raw: zeros(stream, rows * heads * cfg.d_rel)?,
-                gate: zeros(stream, rows * q_dims)?,
-                sinks: zeros(stream, rows * heads)?,
-                q: zeros(stream, rows * q_dims)?,
-                k: zeros(stream, rows * kv_dims)?,
-                v: zeros(stream, rows * kv_dims)?,
-                r: zeros(stream, rows * heads * cfg.d_rel)?,
-                bias: zeros(stream, rows * heads * cfg.rel_extent)?,
-                partials: attention::PrefillScratch::new(stream, rows)?,
-                out: zeros(stream, rows * q_dims)?,
-                gated: zeros(stream, rows * q_dims)?,
+                k_dynamic: arena.slice(stream, off_k_dynamic, rows * dynamic),
+                v_dynamic: arena.slice(stream, off_v_dynamic, rows * dynamic),
+                q_raw: arena.slice(stream, off_q_raw, rows * q_dims),
+                r_raw: arena.slice(stream, off_r_raw, rows * rel_dims),
+                gate: arena.slice(stream, off_gate, rows * q_dims),
+                sinks: arena.slice(stream, off_sinks, rows * heads),
+                q: arena.slice(stream, off_q, rows * q_dims),
+                k: arena.slice(stream, off_k, rows * kv_dims),
+                v: arena.slice(stream, off_v, rows * kv_dims),
+                r: arena.slice(stream, off_r, rows * rel_dims),
+                bias: arena.slice(stream, off_bias, rows * bias_dims),
+                partials: (!invariant)
+                    .then(|| attention::PrefillScratch::new(stream, rows))
+                    .transpose()?,
+                out: off_attn_out.map(|off| arena.slice(stream, off, rows * q_dims)),
+                gated: arena.slice(stream, off_attn_gated, rows * q_dims),
                 proj: zeros(stream, rows * hidden)?,
             },
             residual: zeros(stream, rows * hidden)?,
-            mlp_input: zeros(stream, rows * hidden)?,
-            mlp_x: zeros(stream, rows * hidden)?,
+            mlp_input: arena.slice(stream, off_mlp_input, rows * hidden),
+            mlp_x: arena.slice(stream, off_mlp_x, rows * hidden),
             moe: MoeRows {
                 invariant,
                 expert_sync: zeros(
                     stream,
                     crate::ops::experts_rows::ExpertsRows::sync_len(rows),
                 )?,
-                logits: zeros(stream, rows * cfg.n_routed_experts)?,
-                router: RouterRowsScratch::new(stream, rows)?,
-                indices: zeros(stream, rows * top_k)?,
-                weights: zeros(stream, rows * top_k)?,
-                act: zeros(stream, rows * top_k * width)?,
-                down: zeros(stream, rows * top_k * hidden)?,
-                combined: zeros(stream, rows * hidden)?,
-                experts: ExpertScratch::new(stream, rows, cfg.n_routed_experts)?,
-                quantized_in: QuantizedRows::new(stream, rows * hidden, rows)?,
-                quantized: QuantizedRows::new(
-                    stream,
-                    rows * top_k * width.max(hidden / top_k),
-                    rows * top_k,
-                )?,
+                logits: arena.slice(stream, off_logits, rows * cfg.n_routed_experts),
+                router: (!invariant)
+                    .then(|| RouterRowsScratch::new(stream, rows))
+                    .transpose()?,
+                indices: arena.slice(stream, off_indices, rows * top_k),
+                weights: arena.slice(stream, off_weights, rows * top_k),
+                act: arena.slice(stream, off_act, rows * top_k * width),
+                down: arena.slice(stream, off_down, rows * top_k * hidden),
+                combined: arena.slice(stream, off_combined, rows * hidden),
+                experts: (!invariant)
+                    .then(|| ExpertScratch::new(stream, rows, cfg.n_routed_experts))
+                    .transpose()?,
+                quantized_in: (!invariant)
+                    .then(|| QuantizedRows::new(stream, rows * hidden, rows))
+                    .transpose()?,
+                quantized: (!invariant)
+                    .then(|| {
+                        QuantizedRows::new(
+                            stream,
+                            rows * top_k * width.max(hidden / top_k),
+                            rows * top_k,
+                        )
+                    })
+                    .transpose()?,
             },
-            final_hidden: zeros(stream, rows * hidden)?,
+            final_hidden: arena.slice(stream, off_final_hidden, rows * hidden),
             head_logits,
             head_capped,
             head_partials,
             head_fp8,
             head_host,
+            _arena: arena,
         })
     }
 
@@ -699,10 +785,13 @@ impl PrefillScratch {
         cfg: &TextConfig,
     ) -> anyhow::Result<()> {
         if self.head_logits.is_none() {
-            self.head_logits = Some(zeros(stream, self.rows * cfg.vocab_size)?);
+            self.head_logits = Some(ArenaBuf::Owned(zeros(stream, self.rows * cfg.vocab_size)?));
         }
         if self.head_capped.is_none() {
-            self.head_capped = Some(zeros(stream, self.rows * cfg.unpadded_vocab_size)?);
+            self.head_capped = Some(ArenaBuf::Owned(zeros(
+                stream,
+                self.rows * cfg.unpadded_vocab_size,
+            )?));
         }
         Ok(())
     }
@@ -989,7 +1078,10 @@ impl Model {
 
     /// [`Self::prefill_packed`] that also records feature taps for every packed row and
     /// passes each slice's `(slot, start_position, taps)` to `taps` on the model stream.
-    #[expect(clippy::too_many_lines, reason = "validates slices, enqueues packed pass, reads tokens")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates slices, enqueues packed pass, reads tokens"
+    )]
     pub(crate) fn prefill_packed_with_taps(
         &mut self,
         slices: &[PackedPrefill<'_>],
@@ -1170,7 +1262,10 @@ impl Model {
             "packed prefill has {} MoE tiles, exceeding {MOE_PACKED_MAX_TILES}",
             host_moe_tiles.len()
         );
-        let packed_buf = p.packed.as_mut().context("the packed buffers are missing")?;
+        let packed_buf = p
+            .packed
+            .as_mut()
+            .context("the packed buffers are missing")?;
         ctx.stream.memcpy_htod(
             &host_tables,
             &mut packed_buf.tables.slice_mut(..host_tables.len()),
@@ -1515,9 +1610,7 @@ impl Model {
             *sampler,
         )?;
         let row_len = p.tap_layout.len() * hidden;
-        if *batch_taps
-            && let (Some(src), Some(dst)) = (p.taps.as_ref(), batch_p.taps.as_mut())
-        {
+        if *batch_taps && let (Some(src), Some(dst)) = (p.taps.as_ref(), batch_p.taps.as_mut()) {
             stream.memcpy_dtod(
                 &src.slice(..decode_len * row_len),
                 &mut dst.slice_mut(..decode_len * row_len),
@@ -1773,7 +1866,10 @@ impl Model {
                 .and_then(|p| p.batch.as_ref())
                 .and_then(|b| b.verify.as_ref())
                 .context("the batch verify state is missing")?;
-            ensure!(!bv.pending, "the last batched verify's verdicts were not read");
+            ensure!(
+                !bv.pending,
+                "the last batched verify's verdicts were not read"
+            );
         }
         self.update_batch_tables(verify_slots, true)?;
         let stream = Arc::clone(&self.ctx.stream);
@@ -2054,7 +2150,7 @@ struct AttentionInputsRows<'a> {
     /// Receives the normalized visit input at a block start.
     normed: Option<CudaViewMut<'a, f32>>,
     inputs: &'a mut CudaSlice<f32>,
-    qkv_in: &'a mut [CudaSlice<bf16>; 3],
+    qkv_in: &'a mut [ArenaSlice<bf16>; 3],
     gate: &'a mut GateRows,
     messages: Option<(&'a [MessageGateWeights; MESSAGE_SLOTS], Messages<'a>)>,
 }
@@ -2611,8 +2707,7 @@ impl Ctx {
             .as_mut()
             .context("the verify buffers are missing")?;
         let spec = &self.kernels.spec;
-        if let (Some(beta), true, Some(sample)) =
-            (self.spec_beta, v.tree_active, p.sample.as_mut())
+        if let (Some(beta), true, Some(sample)) = (self.spec_beta, v.tree_active, p.sample.as_mut())
         {
             let head_logits = p
                 .head_logits
@@ -2669,13 +2764,7 @@ impl Ctx {
                 &tv.path,
                 m,
             )?;
-            spec.conv_commit_tree(
-                &self.stream,
-                &v.states,
-                &v.inputs,
-                &v.result,
-                &tv.path,
-            )?;
+            spec.conv_commit_tree(&self.stream, &v.states, &v.inputs, &v.result, &tv.path)?;
             if let Some(taps) = p.taps.as_ref() {
                 spec.taps_compact_tree(
                     &self.stream,
@@ -2841,13 +2930,7 @@ impl Ctx {
                     &tv.path,
                     m,
                 )?;
-                spec.conv_commit_tree(
-                    &self.stream,
-                    &v.states,
-                    &v.inputs,
-                    &v.result,
-                    &tv.path,
-                )?;
+                spec.conv_commit_tree(&self.stream, &v.states, &v.inputs, &v.result, &tv.path)?;
                 if let Some(taps) = p.taps.as_ref() {
                     spec.taps_compact_tree(
                         &self.stream,
@@ -3277,7 +3360,12 @@ impl Ctx {
         if gates.is_none()
             && let Some(qfmt) = w13_quant
         {
-            let quant = p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?;
+            let q_in = p
+                .moe
+                .quantized_in
+                .as_mut()
+                .context("prefill quantized_in scratch missing")?;
+            let quant = q_in.as_quant_dest(m, hidden, qfmt)?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
                 DepthRowsQuant {
@@ -3303,14 +3391,9 @@ impl Ctx {
                 },
                 self.eps(),
             )?;
-            p.moe
-                .quantized_in
-                .mark_quantized(&self.stream, m, hidden, qfmt);
+            q_in.mark_quantized(&self.stream, m, hidden, qfmt);
         } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
-            let mut slots = p
-                .gate
-                .dense
-                .split_slots_range_mut(m, 2 * hidden, 3, 1)?;
+            let mut slots = p.gate.dense.split_slots_range_mut(m, 2 * hidden, 3, 1)?;
             let (values, scales) = slots.pop().context("missing mlp gate dense slot")?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
@@ -3399,7 +3482,12 @@ impl Ctx {
                 Some(qfmt) => GateNorms::Quant {
                     weight: &w.mlp_norm,
                     normed: rows_mut(&mut p.mlp_x, m, hidden),
-                    quant: p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?,
+                    quant: p
+                        .moe
+                        .quantized_in
+                        .as_mut()
+                        .context("prefill quantized_in scratch missing")?
+                        .as_quant_dest(m, hidden, qfmt)?,
                 },
                 None => GateNorms::Bf16(vec![(&w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))]),
             };
@@ -3424,6 +3512,8 @@ impl Ctx {
             if let Some(qfmt) = w13_quant {
                 p.moe
                     .quantized_in
+                    .as_mut()
+                    .context("prefill quantized_in scratch missing")?
                     .mark_quantized(&self.stream, m, hidden, qfmt);
             }
         }
@@ -3461,7 +3551,10 @@ impl Ctx {
                         rows(&p.attention.v_raw, m, kv_dims),
                     ],
                     &b.tables.slice(at..at + seqs * BATCH_STATE_WORDS),
-                    Some(bv.inputs.slice_mut(index * visit_len..(index + 1) * visit_len)),
+                    Some(
+                        bv.inputs
+                            .slice_mut(index * visit_len..(index + 1) * visit_len),
+                    ),
                     seqs,
                     width,
                 )?;
@@ -3692,8 +3785,8 @@ impl Ctx {
     ) -> anyhow::Result<()> {
         let q_dims = self.config.num_attention_heads * self.config.head_dim;
         let hidden = self.hidden();
-        let use_fp8_o =
-            self.prefill_dense == Products::Fp8 && crate::BLOCK_SCALED_MMA && m > 1;
+        let attn_out = t.out.as_ref().context("prefill attention out missing")?;
+        let use_fp8_o = self.prefill_dense == Products::Fp8 && crate::BLOCK_SCALED_MMA && m > 1;
         if use_fp8_o
             && self.prefill_dense_o == Products::Fp8
             && let Some(mxfp8_o) = w.mxfp8_o.as_ref()
@@ -3702,7 +3795,7 @@ impl Ctx {
             let (mut values, mut scales) = slots.pop().context("missing dense slot")?;
             self.kernels.elementwise.attention_gate_quant_mxfp8(
                 &self.stream,
-                &rows(&t.out, m, q_dims),
+                &rows(attn_out, m, q_dims),
                 &rows(&t.gate, m, q_dims),
                 &mut values,
                 &mut scales,
@@ -3718,14 +3811,12 @@ impl Ctx {
                 dense,
             );
         }
-        if use_fp8_o
-            && let Some(fp8_o) = w.fp8.as_ref().and_then(|f| f.o.as_ref())
-        {
+        if use_fp8_o && let Some(fp8_o) = w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
             let mut slots = dense.split_slots_mut(m, q_dims, 1)?;
             let (mut values, mut scales) = slots.pop().context("missing dense slot")?;
             self.kernels.elementwise.attention_gate_quant_mxfp8(
                 &self.stream,
-                &rows(&t.out, m, q_dims),
+                &rows(attn_out, m, q_dims),
                 &rows(&t.gate, m, q_dims),
                 &mut values,
                 &mut scales,
@@ -3743,7 +3834,7 @@ impl Ctx {
         }
         self.kernels.elementwise.attention_gate(
             &self.stream,
-            &rows(&t.out, m, q_dims),
+            &rows(attn_out, m, q_dims),
             &rows(&t.gate, m, q_dims),
             &mut rows_mut(&mut t.gated, m, q_dims),
         )?;
@@ -3858,8 +3949,8 @@ impl Ctx {
                     .try_into()
                     .ok()
                     .context("expected 3 dense slots")?;
-                let [d0, d1, d2] =
-                    [(s0, norms[0]), (s1, norms[1]), (s2, norms[2])].map(|((values, scales), norm)| {
+                let [d0, d1, d2] = [(s0, norms[0]), (s1, norms[1]), (s2, norms[2])].map(
+                    |((values, scales), norm)| {
                         Some(QuantNormDest {
                             out: None,
                             weight: Some(norm),
@@ -3870,7 +3961,8 @@ impl Ctx {
                                 outer: None,
                             },
                         })
-                    });
+                    },
+                );
                 [d0, d1, d2, None]
             };
             self.kernels.routing.depth_attention_rows_quant(
@@ -4263,7 +4355,8 @@ impl Ctx {
                 m,
             )?;
         }
-        if !step {
+        let fuse_bias = !step && !invariant && batch.is_none() && tree.is_none() && m > 1;
+        if !step && !fuse_bias {
             self.kernels.attention.relative_bias_rows(
                 &self.stream,
                 &rows(&t.r, m, rel_dims),
@@ -4283,6 +4376,10 @@ impl Ctx {
         }
         if let Some(batch) = batch {
             ensure!(invariant, "a batched step runs the invariant kernels");
+            let attn_rows = t
+                .rows
+                .as_mut()
+                .context("invariant attention rows scratch missing")?;
             self.kernels.attention.attention_batch(
                 &self.stream,
                 &rows(&t.q, m, q_dims),
@@ -4294,11 +4391,15 @@ impl Ctx {
                 &rows(&t.bias, m, heads * cfg.rel_extent),
                 &rows(&t.sinks, m, heads),
                 Some(&rows(&t.gate, m, q_dims)),
-                &mut t.rows,
+                attn_rows,
                 &mut rows_mut(&mut t.gated, m, q_dims),
             )?;
         } else if let Some(tv) = tree {
             ensure!(invariant, "a tree verify runs the invariant kernels");
+            let attn_rows = t
+                .rows
+                .as_mut()
+                .context("invariant attention rows scratch missing")?;
             self.kernels.attention.attention_rows_tree(
                 &self.stream,
                 &rows(&t.q, m, q_dims),
@@ -4310,7 +4411,7 @@ impl Ctx {
                 &rows(&t.bias, m, heads * cfg.rel_extent),
                 &rows(&t.sinks, m, heads),
                 Some(&rows(&t.gate, m, q_dims)),
-                &mut t.rows,
+                attn_rows,
                 &mut rows_mut(&mut t.gated, m, q_dims),
                 tv.depth,
                 tv.attn_anc,
@@ -4318,6 +4419,10 @@ impl Ctx {
                 tv.v_stage,
             )?;
         } else if invariant {
+            let attn_rows = t
+                .rows
+                .as_mut()
+                .context("invariant attention rows scratch missing")?;
             self.kernels.attention.attention_rows(
                 &self.stream,
                 &rows(&t.q, m, q_dims),
@@ -4329,22 +4434,46 @@ impl Ctx {
                 &rows(&t.bias, m, heads * cfg.rel_extent),
                 &rows(&t.sinks, m, heads),
                 Some(&rows(&t.gate, m, q_dims)),
-                &mut t.rows,
+                attn_rows,
                 &mut rows_mut(&mut t.gated, m, q_dims),
             )?;
         } else {
-            self.attention_rows(
-                &rows(&t.q, m, q_dims),
-                &rows(&t.k, m, kv_dims),
-                &rows(&t.v, m, kv_dims),
-                &mut state.kv,
-                start,
-                m,
-                &rows(&t.bias, m, heads * cfg.rel_extent),
-                &rows(&t.sinks, m, heads),
-                &mut t.partials,
-                &mut rows_mut(&mut t.out, m, q_dims),
-            )?;
+            let partials = t
+                .partials
+                .as_mut()
+                .context("prefill attention partials missing")?;
+            let attn_out = t.out.as_mut().context("prefill attention out missing")?;
+            if fuse_bias {
+                self.kernels.attention.prefill_attention_fused_bias(
+                    &self.stream,
+                    &rows(&t.q, m, q_dims),
+                    &rows(&t.k, m, kv_dims),
+                    &rows(&t.v, m, kv_dims),
+                    &mut state.kv,
+                    start,
+                    m,
+                    &rows(&t.r, m, rel_dims),
+                    &a.rel_table_t,
+                    cfg.rel_extent,
+                    &rows(&t.sinks, m, heads),
+                    partials,
+                    &mut rows_mut(attn_out, m, q_dims),
+                    self.chunk_attention,
+                )?;
+            } else {
+                self.attention_rows(
+                    &rows(&t.q, m, q_dims),
+                    &rows(&t.k, m, kv_dims),
+                    &rows(&t.v, m, kv_dims),
+                    &mut state.kv,
+                    start,
+                    m,
+                    &rows(&t.bias, m, heads * cfg.rel_extent),
+                    &rows(&t.sinks, m, heads),
+                    partials,
+                    &mut rows_mut(attn_out, m, q_dims),
+                )?;
+            }
             return self.attention_gate_and_output_rows(w, t, dense, m);
         }
         self.gemm_rows(
@@ -4365,7 +4494,10 @@ impl Ctx {
     /// `first .. first + g.len()`, one, or three at once. Each gate normalizes its output
     /// according to `norms`.
     #[expect(clippy::too_many_arguments, reason = "the gates' inputs and outputs")]
-    #[expect(clippy::too_many_lines, reason = "handles 1-slot, 3-slot batched, and fused quant epilogues")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "handles 1-slot, 3-slot batched, and fused quant epilogues"
+    )]
     fn message_gate_rows(
         &self,
         weights: &[MessageGateWeights],
@@ -4537,24 +4669,20 @@ impl Ctx {
                         .try_into()
                         .ok()
                         .context("expected 3 BF16 gate norms")?;
-                    let mut slots = [
-                        (0, n0, o0),
-                        (1, n1, o1),
-                        (2, n2, o2),
-                    ]
-                    .map(|(i, norm, normed)| {
-                        let slot = first + i;
-                        GateOut3Slot {
-                            down: t.down.slice(slot * mr..(slot + 1) * mr),
-                            forget: &weights[i].forget,
-                            gain: &weights[i].gain,
-                            probs: Some(messages.probs.slice(slot * candidates..)),
-                            norm_weight: norm,
-                            normed: Some(normed),
-                            q_values: None,
-                            q_scales: None,
-                        }
-                    });
+                    let mut slots =
+                        [(0, n0, o0), (1, n1, o1), (2, n2, o2)].map(|(i, norm, normed)| {
+                            let slot = first + i;
+                            GateOut3Slot {
+                                down: t.down.slice(slot * mr..(slot + 1) * mr),
+                                forget: &weights[i].forget,
+                                gain: &weights[i].gain,
+                                probs: Some(messages.probs.slice(slot * candidates..)),
+                                norm_weight: norm,
+                                normed: Some(normed),
+                                q_values: None,
+                                q_scales: None,
+                            }
+                        });
                     self.kernels.misc.message_gate_out_rows_3(
                         &self.stream,
                         &mut slots,
@@ -4574,8 +4702,8 @@ impl Ctx {
                         .try_into()
                         .ok()
                         .context("expected 3 dense slots")?;
-                    let mut slots = [(0, v0, s0), (1, v1, s1), (2, v2, s2)].map(
-                        |(i, values, scales)| {
+                    let mut slots =
+                        [(0, v0, s0), (1, v1, s1), (2, v2, s2)].map(|(i, values, scales)| {
                             let slot = first + i;
                             GateOut3Slot {
                                 down: t.down.slice(slot * mr..(slot + 1) * mr),
@@ -4587,8 +4715,7 @@ impl Ctx {
                                 q_values: Some(values),
                                 q_scales: Some(scales),
                             }
-                        },
-                    );
+                        });
                     self.kernels.misc.message_gate_out_rows_3(
                         &self.stream,
                         &mut slots,
@@ -4655,11 +4782,8 @@ impl Ctx {
                 // `t.dense` is free now that the down projections finished above; each gate's
                 // norm epilogue writes MXFP8 directly into its slot for `LinearFp8::gemm_quantized`.
                 let slots = t.dense.split_slots_mut(m, hidden, n)?;
-                for (i, ((w, norm), (values, scales))) in weights
-                    .iter()
-                    .zip(norm_weights)
-                    .zip(slots)
-                    .enumerate()
+                for (i, ((w, norm), (values, scales))) in
+                    weights.iter().zip(norm_weights).zip(slots).enumerate()
                 {
                     let slot = first + i;
                     self.kernels.misc.message_gate_out_rows_quant(
@@ -4836,6 +4960,10 @@ impl Ctx {
                 cfg.mlp_up_softcap,
             );
         }
+        let router = t
+            .router
+            .as_mut()
+            .context("prefill router scratch missing")?;
         self.kernels.routing.moe_router_rows_pruned(
             &self.stream,
             &rows(x, m, hidden),
@@ -4844,13 +4972,25 @@ impl Ctx {
             &mut rows_mut(&mut t.logits, m, cfg.n_routed_experts),
             &mut rows_mut(&mut t.indices, m, top_k),
             &mut rows_mut(&mut t.weights, m, top_k),
-            &mut t.router,
+            router,
             cfg.route_scale,
             m,
             self.moe_pruning,
         )?;
         let (w13, w2) = self.expert_weights(w);
-        self.group_rows(&rows(&t.indices, m, top_k), &mut t.experts, m)?;
+        let experts_scratch = t
+            .experts
+            .as_mut()
+            .context("prefill expert scratch missing")?;
+        let quantized_in = t
+            .quantized_in
+            .as_mut()
+            .context("prefill quantized_in scratch missing")?;
+        let quantized = t
+            .quantized
+            .as_mut()
+            .context("prefill quantized scratch missing")?;
+        self.group_rows(&rows(&t.indices, m, top_k), experts_scratch, m)?;
         if crate::BLOCK_SCALED_MMA
             && self.expert_activations != ExpertActivations::Bf16
             && !matches!(w13.format, experts::ExpertFormat::Mxfp6 { .. })
@@ -4859,57 +4999,67 @@ impl Ctx {
             let stream = &self.stream;
             if !w13_prequantized {
                 if self.expert_activations == ExpertActivations::Fp8 {
-                    experts.quantize_rows_fp8(
-                        stream,
-                        &rows(x, m, hidden),
-                        w13.k,
-                        w13.format,
-                        &mut t.quantized_in,
-                    )?;
+                    if crate::BLOCK_SCALED_MMA {
+                        experts.quantize_rows_fp8(
+                            stream,
+                            &rows(x, m, hidden),
+                            w13.k,
+                            w13.format,
+                            quantized_in,
+                        )?;
+                    } else {
+                        experts.quantize_rows_fp8_per_row(
+                            stream,
+                            &rows(x, m, hidden),
+                            w13.k,
+                            w13.format,
+                            quantized_in,
+                        )?;
+                    }
                 } else {
                     experts.quantize_rows(
                         stream,
                         &rows(x, m, hidden),
                         w13.k,
                         w13.format,
-                        &mut t.quantized_in,
+                        quantized_in,
                     )?;
                 }
             }
             experts.expert_matmul_quantized_swiglu_quant_grouped(
                 stream,
-                &t.quantized_in,
+                quantized_in,
                 &w13,
-                &mut t.quantized,
-                &t.experts,
+                quantized,
+                experts_scratch,
                 cfg.mlp_gate_softcap,
                 cfg.mlp_up_softcap,
             )?;
             return experts.expert_matmul_quantized_grouped(
                 stream,
-                &t.quantized,
+                quantized,
                 &w2,
                 &mut rows_mut(&mut t.down, m, top_k * hidden),
-                &t.experts,
+                experts_scratch,
             );
         }
         self.moe_rows(
             &rows(x, m, hidden),
             &w13,
             &mut rows_mut(&mut t.act, m, top_k * width),
-            &t.experts,
+            experts_scratch,
             true,
             w13_prequantized,
-            &mut t.quantized_in,
+            quantized_in,
         )?;
         self.moe_rows(
             &rows(&t.act, m, top_k * width),
             &w2,
             &mut rows_mut(&mut t.down, m, top_k * hidden),
-            &t.experts,
+            experts_scratch,
             false,
             false,
-            &mut t.quantized,
+            quantized,
         )
     }
 
@@ -4917,7 +5067,10 @@ impl Ctx {
     /// all `m` packed rows and per-slice attention and short convolutions against each slot's
     /// own KV cache and conv states.
     #[expect(clippy::too_many_arguments, reason = "packed prefill state and slices")]
-    #[expect(clippy::too_many_lines, reason = "mirrors prefill_enqueue top to bottom")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors prefill_enqueue top to bottom"
+    )]
     fn prefill_packed_enqueue(
         &self,
         p: &mut PrefillScratch,
@@ -5094,7 +5247,8 @@ impl Ctx {
         for (k, &si) in finishing.iter().enumerate() {
             let last_row = meta[si].offset + meta[si].len - 1;
             self.stream.memcpy_dtod(
-                &p.final_hidden.slice(last_row * hidden..(last_row + 1) * hidden),
+                &p.final_hidden
+                    .slice(last_row * hidden..(last_row + 1) * hidden),
                 &mut p.out.slice_mut(k * hidden..(k + 1) * hidden),
             )?;
         }
@@ -5158,7 +5312,10 @@ impl Ctx {
 
     /// One decoder-layer visit for a packed multi-prompt prefill pass.
     #[expect(clippy::too_many_arguments, reason = "packed visit state")]
-    #[expect(clippy::too_many_lines, reason = "mirrors visit_rows with ragged packed kernels")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors visit_rows with ragged packed kernels"
+    )]
     fn visit_packed_rows(
         &self,
         p: &mut PrefillScratch,
@@ -5329,7 +5486,10 @@ impl Ctx {
         let state_end = state_off + plan.num_slices * BATCH_STATE_WORDS;
         let slice_words = plan.num_slices * PACKED_SLICE_WORDS;
         {
-            let packed_buf = p.packed.as_ref().context("the packed buffers are missing")?;
+            let packed_buf = p
+                .packed
+                .as_ref()
+                .context("the packed buffers are missing")?;
             let packed_rows = PackedRows {
                 states: packed_buf.tables.slice(state_off..state_end),
                 slices: packed_buf.slices.slice(..slice_words),
@@ -5373,12 +5533,17 @@ impl Ctx {
         }
 
         // 3. Relative bias and optional KV rounding once across all `m` rows.
-        self.kernels.attention.relative_bias_rows(
-            &self.stream,
-            &rows(&attn.r, m, rel_dims),
-            &attn_w.rel_table,
-            &mut rows_mut(&mut attn.bias, m, bias_w),
-        )?;
+        // Single-slice multi-row packed prefill uses the same fused relative-bias attention
+        // path as `prefill_slot`, keeping it bit-for-bit identical and skipping the bias buffer.
+        let single_fused_bias = plan.num_slices == 1 && m > 1;
+        if !single_fused_bias {
+            self.kernels.attention.relative_bias_rows(
+                &self.stream,
+                &rows(&attn.r, m, rel_dims),
+                &attn_w.rel_table,
+                &mut rows_mut(&mut attn.bias, m, bias_w),
+            )?;
+        }
         if slice_visits[0][index].round {
             self.kernels.attention.round_rows(
                 &self.stream,
@@ -5391,11 +5556,39 @@ impl Ctx {
 
         // 4. Ragged packed flash prefill attention + KV append across all S slices.
         {
-            let packed_buf = p.packed.as_mut().context("the packed buffers are missing")?;
+            let packed_buf = p
+                .packed
+                .as_mut()
+                .context("the packed buffers are missing")?;
+            let partials = attn
+                .partials
+                .as_mut()
+                .context("prefill attention partials missing")?;
+            let attn_out = attn.out.as_mut().context("prefill attention out missing")?;
             let total_blocks = plan.bf16_blocks + plan.fp8_blocks;
-            if plan.num_slices == 1
+            if single_fused_bias {
+                self.kernels.attention.prefill_attention_fused_bias(
+                    &self.stream,
+                    &rows(&attn.q, m, q_dims),
+                    &rows(&attn.k, m, kv_dims),
+                    &rows(&attn.v, m, kv_dims),
+                    &mut slice_visits[0][index].kv,
+                    &packed_buf.slices.slice(2..=2),
+                    m,
+                    &rows(&attn.r, m, rel_dims),
+                    &attn_w.rel_table_t,
+                    cfg.rel_extent,
+                    &rows(&attn.sinks, m, heads),
+                    partials,
+                    &mut rows_mut(attn_out, m, q_dims),
+                    self.prefill_attention.products(meta[0].start + m),
+                )?;
+            } else if plan.num_slices == 1
                 && meta[0].len == 1
-                && slice_visits[0][index].kv.format() != attention::KvFormat::Nvfp4
+                && !matches!(
+                    slice_visits[0][index].kv.format(),
+                    attention::KvFormat::Nvfp4 | attention::KvFormat::Nvfp4G32
+                )
             {
                 // Single 1-token slice: match `prefill_slot` bit-for-bit via decode attention.
                 self.kernels.attention.prefill_attention(
@@ -5408,8 +5601,8 @@ impl Ctx {
                     1,
                     &rows(&attn.bias, m, bias_w),
                     &rows(&attn.sinks, m, heads),
-                    &mut attn.partials,
-                    &mut rows_mut(&mut attn.out, m, q_dims),
+                    partials,
+                    &mut rows_mut(attn_out, m, q_dims),
                     self.prefill_attention.products(meta[0].start + 1),
                 )?;
             } else {
@@ -5447,9 +5640,9 @@ impl Ctx {
                         m,
                         &rows(&attn.bias, m, bias_w),
                         &rows(&attn.sinks, m, heads),
-                        &mut attn.partials,
+                        partials,
                         &mut packed_buf.attn_counters,
-                        &mut rows_mut(&mut attn.out, m, q_dims),
+                        &mut rows_mut(attn_out, m, q_dims),
                         Products::Bf16,
                     )?;
                     self.kernels.attention.prefill_attention_packed_kernel(
@@ -5463,9 +5656,9 @@ impl Ctx {
                         m,
                         &rows(&attn.bias, m, bias_w),
                         &rows(&attn.sinks, m, heads),
-                        &mut attn.partials,
+                        partials,
                         &mut packed_buf.attn_counters,
-                        &mut rows_mut(&mut attn.out, m, q_dims),
+                        &mut rows_mut(attn_out, m, q_dims),
                         Products::Fp8,
                     )?;
                     if sliding_kv {
@@ -5495,9 +5688,9 @@ impl Ctx {
                         m,
                         &rows(&attn.bias, m, bias_w),
                         &rows(&attn.sinks, m, heads),
-                        &mut attn.partials,
+                        partials,
                         &mut packed_buf.attn_counters,
-                        &mut rows_mut(&mut attn.out, m, q_dims),
+                        &mut rows_mut(attn_out, m, q_dims),
                         products,
                     )?;
                 }
@@ -5510,7 +5703,10 @@ impl Ctx {
         // 6. Ragged packed post-attention conv + residual add across all `m` rows in 1 launch,
         //    then one depth_attention_rows over all `m` rows.
         {
-            let packed_buf = p.packed.as_ref().context("the packed buffers are missing")?;
+            let packed_buf = p
+                .packed
+                .as_ref()
+                .context("the packed buffers are missing")?;
             let packed_rows = PackedRows {
                 states: packed_buf.tables.slice(state_off..state_end),
                 slices: packed_buf.slices.slice(..slice_words),
@@ -5540,7 +5736,12 @@ impl Ctx {
         if gates.is_none()
             && let Some(qfmt) = w13_quant
         {
-            let quant = p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?;
+            let q_in = p
+                .moe
+                .quantized_in
+                .as_mut()
+                .context("prefill quantized_in scratch missing")?;
+            let quant = q_in.as_quant_dest(m, hidden, qfmt)?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
                 DepthRowsQuant {
@@ -5566,14 +5767,9 @@ impl Ctx {
                 },
                 self.eps(),
             )?;
-            p.moe
-                .quantized_in
-                .mark_quantized(&self.stream, m, hidden, qfmt);
+            q_in.mark_quantized(&self.stream, m, hidden, qfmt);
         } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
-            let mut slots = p
-                .gate
-                .dense
-                .split_slots_range_mut(m, 2 * hidden, 3, 1)?;
+            let mut slots = p.gate.dense.split_slots_range_mut(m, 2 * hidden, 3, 1)?;
             let (values, scales) = slots.pop().context("missing mlp gate dense slot")?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
@@ -5653,12 +5849,16 @@ impl Ctx {
                 Some(qfmt) => GateNorms::Quant {
                     weight: &layer_w.mlp_norm,
                     normed: rows_mut(&mut p.mlp_x, m, hidden),
-                    quant: p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?,
+                    quant: p
+                        .moe
+                        .quantized_in
+                        .as_mut()
+                        .context("prefill quantized_in scratch missing")?
+                        .as_quant_dest(m, hidden, qfmt)?,
                 },
-                None => GateNorms::Bf16(vec![(
-                    &layer_w.mlp_norm,
-                    rows_mut(&mut p.mlp_x, m, hidden),
-                )]),
+                None => {
+                    GateNorms::Bf16(vec![(&layer_w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))])
+                }
             };
             self.message_gate_rows(
                 &gates[3..],
@@ -5681,6 +5881,8 @@ impl Ctx {
             if let Some(qfmt) = w13_quant {
                 p.moe
                     .quantized_in
+                    .as_mut()
+                    .context("prefill quantized_in scratch missing")?
                     .mark_quantized(&self.stream, m, hidden, qfmt);
             }
         }
@@ -5691,7 +5893,10 @@ impl Ctx {
         // 8. Ragged packed post-MLP conv + residual add across all S slices in 1 launch,
         //    then shift all 4 conv states (k, v, post-attn, post-MLP) for all S slices in 1 launch.
         {
-            let packed_buf = p.packed.as_ref().context("the packed buffers are missing")?;
+            let packed_buf = p
+                .packed
+                .as_ref()
+                .context("the packed buffers are missing")?;
             let packed_rows = PackedRows {
                 states: packed_buf.tables.slice(state_off..state_end),
                 slices: packed_buf.slices.slice(..slice_words),
@@ -5728,7 +5933,10 @@ impl Ctx {
     /// Hybrid forward pass combining `batch_rows` contiguous decode or batched-verify rows
     /// (`0..batch_rows`, backed by `batch_p.batch`) with one or more piggybacked prefill
     /// slices (`batch_rows..m`, backed by `slice_visits`).
-    #[expect(clippy::too_many_arguments, reason = "hybrid forward pass state and slices")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hybrid forward pass state and slices"
+    )]
     #[expect(
         clippy::too_many_lines,
         reason = "mirrors prefill_packed_enqueue + batch_head top to bottom"
@@ -6051,7 +6259,8 @@ impl Ctx {
                 let width = bv.width;
                 let seqs = batch_rows / width;
                 let spec = &self.kernels.spec;
-                let (tokens, argmax) = (rows(&p.tokens, batch_rows, 1), b.argmax.slice(..batch_rows));
+                let (tokens, argmax) =
+                    (rows(&p.tokens, batch_rows, 1), b.argmax.slice(..batch_rows));
                 let keep = bv.keep.slice(..seqs);
                 let mut results = bv.results.slice_mut(..seqs * RESULT_LEN);
                 let mut anchors = bv.anchors.slice_mut(..seqs);
@@ -6507,6 +6716,12 @@ impl Ctx {
                 .context("the batch buffers are missing")?
                 .rows(index, batch_rows);
             let like_kv = &slice_visits[0][index].kv;
+            let batch_attn_rows = batch_p
+                .attention
+                .rows
+                .as_mut()
+                .context("invariant attention rows scratch missing")?;
+            let attn_out = attn.out.as_mut().context("prefill attention out missing")?;
             self.kernels.attention.attention_batch(
                 &self.stream,
                 &attn.q.slice(..batch_rows * q_dims),
@@ -6518,29 +6733,36 @@ impl Ctx {
                 &attn.bias.slice(..batch_rows * bias_w),
                 &attn.sinks.slice(..batch_rows * heads),
                 None,
-                &mut batch_p.attention.rows,
-                &mut attn.out.slice_mut(..batch_rows * q_dims),
+                batch_attn_rows,
+                &mut attn_out.slice_mut(..batch_rows * q_dims),
             )?;
         }
 
         // 4b. Per-slice flash prefill attention for piggybacked prefills.
-        for (si, slice) in meta.iter().enumerate() {
-            let (off, len) = (slice.offset, slice.len);
-            let state = &mut slice_visits[si][index];
-            self.kernels.attention.prefill_attention(
-                &self.stream,
-                &attn.q.slice(off * q_dims..(off + len) * q_dims),
-                &attn.k.slice(off * kv_dims..(off + len) * kv_dims),
-                &attn.v.slice(off * kv_dims..(off + len) * kv_dims),
-                &mut state.kv,
-                &p.packed_starts.slice(si..=si),
-                len,
-                &attn.bias.slice(off * bias_w..(off + len) * bias_w),
-                &attn.sinks.slice(off * heads..(off + len) * heads),
-                &mut attn.partials,
-                &mut attn.out.slice_mut(off * q_dims..(off + len) * q_dims),
-                self.prefill_attention.products(slice.start + len),
-            )?;
+        {
+            let partials = attn
+                .partials
+                .as_mut()
+                .context("prefill attention partials missing")?;
+            let attn_out = attn.out.as_mut().context("prefill attention out missing")?;
+            for (si, slice) in meta.iter().enumerate() {
+                let (off, len) = (slice.offset, slice.len);
+                let state = &mut slice_visits[si][index];
+                self.kernels.attention.prefill_attention(
+                    &self.stream,
+                    &attn.q.slice(off * q_dims..(off + len) * q_dims),
+                    &attn.k.slice(off * kv_dims..(off + len) * kv_dims),
+                    &attn.v.slice(off * kv_dims..(off + len) * kv_dims),
+                    &mut state.kv,
+                    &p.packed_starts.slice(si..=si),
+                    len,
+                    &attn.bias.slice(off * bias_w..(off + len) * bias_w),
+                    &attn.sinks.slice(off * heads..(off + len) * heads),
+                    partials,
+                    &mut attn_out.slice_mut(off * q_dims..(off + len) * q_dims),
+                    self.prefill_attention.products(slice.start + len),
+                )?;
+            }
         }
 
         // 5. Attention gate + output projection once across all `m` rows.
@@ -6597,7 +6819,12 @@ impl Ctx {
         if gates.is_none()
             && let Some(qfmt) = w13_quant
         {
-            let quant = p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?;
+            let q_in = p
+                .moe
+                .quantized_in
+                .as_mut()
+                .context("prefill quantized_in scratch missing")?;
+            let quant = q_in.as_quant_dest(m, hidden, qfmt)?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
                 DepthRowsQuant {
@@ -6623,14 +6850,9 @@ impl Ctx {
                 },
                 self.eps(),
             )?;
-            p.moe
-                .quantized_in
-                .mark_quantized(&self.stream, m, hidden, qfmt);
+            q_in.mark_quantized(&self.stream, m, hidden, qfmt);
         } else if gates.is_some() && self.prequant_message_gates(p.gate.invariant, m) {
-            let mut slots = p
-                .gate
-                .dense
-                .split_slots_range_mut(m, 2 * hidden, 3, 1)?;
+            let mut slots = p.gate.dense.split_slots_range_mut(m, 2 * hidden, 3, 1)?;
             let (values, scales) = slots.pop().context("missing mlp gate dense slot")?;
             self.kernels.routing.depth_attention_rows_quant(
                 &self.stream,
@@ -6710,12 +6932,16 @@ impl Ctx {
                 Some(qfmt) => GateNorms::Quant {
                     weight: &layer_w.mlp_norm,
                     normed: rows_mut(&mut p.mlp_x, m, hidden),
-                    quant: p.moe.quantized_in.as_quant_dest(m, hidden, qfmt)?,
+                    quant: p
+                        .moe
+                        .quantized_in
+                        .as_mut()
+                        .context("prefill quantized_in scratch missing")?
+                        .as_quant_dest(m, hidden, qfmt)?,
                 },
-                None => GateNorms::Bf16(vec![(
-                    &layer_w.mlp_norm,
-                    rows_mut(&mut p.mlp_x, m, hidden),
-                )]),
+                None => {
+                    GateNorms::Bf16(vec![(&layer_w.mlp_norm, rows_mut(&mut p.mlp_x, m, hidden))])
+                }
             };
             self.message_gate_rows(
                 &gates[3..],
@@ -6738,6 +6964,8 @@ impl Ctx {
             if let Some(qfmt) = w13_quant {
                 p.moe
                     .quantized_in
+                    .as_mut()
+                    .context("prefill quantized_in scratch missing")?
                     .mark_quantized(&self.stream, m, hidden, qfmt);
             }
         }
@@ -6770,7 +6998,10 @@ impl Ctx {
                         p.attention.v_raw.slice(..batch_rows * kv_dims),
                     ],
                     &b.tables.slice(at..at + seqs * BATCH_STATE_WORDS),
-                    Some(bv.inputs.slice_mut(index * visit_len..(index + 1) * visit_len)),
+                    Some(
+                        bv.inputs
+                            .slice_mut(index * visit_len..(index + 1) * visit_len),
+                    ),
                     seqs,
                     width,
                 )?;

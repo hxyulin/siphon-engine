@@ -74,7 +74,9 @@ fn assert_f32_exact(label: &str, got: &[f32], want: &[f32]) {
 fn kv_ptrs(stream: &CudaStream, kv: &KvCache) -> (u64, u64) {
     match kv.data() {
         KvData::Bf16 { keys, values } => (keys.device_ptr(stream).0, values.device_ptr(stream).0),
-        KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+        KvData::Fp8 { keys, values }
+        | KvData::Nvfp4 { keys, values }
+        | KvData::Nvfp4G32 { keys, values } => {
             (keys.device_ptr(stream).0, values.device_ptr(stream).0)
         }
     }
@@ -114,7 +116,10 @@ fn build_packed_meta(
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "tests static/dynamic x sliding/global parity")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "tests static/dynamic x sliding/global parity"
+)]
 fn attention_post_packed_matches_separate() -> anyhow::Result<()> {
     let gpu = Gpu::new(0)?;
     let stream = gpu.stream();
@@ -205,8 +210,7 @@ fn attention_post_packed_matches_separate() -> anyhow::Result<()> {
                         v: ref_v.slice_mut(off * KV_DIMS..(off + len) * KV_DIMS),
                         q: ref_q.slice_mut(off * Q_DIMS..(off + len) * Q_DIMS),
                         r: ref_r.slice_mut(off * REL_DIMS..(off + len) * REL_DIMS),
-                        log_scale: log_scale
-                            .then_some((start_dev.as_view(), LOG_ALPHA, LOG_FLOOR)),
+                        log_scale: log_scale.then_some((start_dev.as_view(), LOG_ALPHA, LOG_FLOOR)),
                         qk_threshold: QK_THRESHOLD,
                         rel_threshold: REL_THRESHOLD,
                         eps: EPS,
@@ -279,16 +283,41 @@ fn attention_post_packed_matches_separate() -> anyhow::Result<()> {
             )?;
             conv.shift_visit_states_packed(
                 stream,
-                [Some(k_raw_dev.as_view()), Some(v_raw_dev.as_view()), None, None],
+                [
+                    Some(k_raw_dev.as_view()),
+                    Some(v_raw_dev.as_view()),
+                    None,
+                    None,
+                ],
                 &packed,
                 m,
             )?;
 
             let tag = format!("dyn={dynamic}_log={log_scale}");
-            assert_bf16_close(&format!("{tag}.k"), &stream.clone_dtoh(&got_k)?, &stream.clone_dtoh(&ref_k)?, 0);
-            assert_bf16_close(&format!("{tag}.v"), &stream.clone_dtoh(&got_v)?, &stream.clone_dtoh(&ref_v)?, 0);
-            assert_bf16_close(&format!("{tag}.q"), &stream.clone_dtoh(&got_q)?, &stream.clone_dtoh(&ref_q)?, 0);
-            assert_bf16_close(&format!("{tag}.r"), &stream.clone_dtoh(&got_r)?, &stream.clone_dtoh(&ref_r)?, 0);
+            assert_bf16_close(
+                &format!("{tag}.k"),
+                &stream.clone_dtoh(&got_k)?,
+                &stream.clone_dtoh(&ref_k)?,
+                0,
+            );
+            assert_bf16_close(
+                &format!("{tag}.v"),
+                &stream.clone_dtoh(&got_v)?,
+                &stream.clone_dtoh(&ref_v)?,
+                0,
+            );
+            assert_bf16_close(
+                &format!("{tag}.q"),
+                &stream.clone_dtoh(&got_q)?,
+                &stream.clone_dtoh(&ref_q)?,
+                0,
+            );
+            assert_bf16_close(
+                &format!("{tag}.r"),
+                &stream.clone_dtoh(&got_r)?,
+                &stream.clone_dtoh(&ref_r)?,
+                0,
+            );
             for si in 0..specs.len() {
                 assert_f32_exact(
                     &format!("{tag}.k_state[{si}]"),
@@ -307,7 +336,10 @@ fn attention_post_packed_matches_separate() -> anyhow::Result<()> {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "tests post-attn, post-MLP, and 4-stream shift parity")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "tests post-attn, post-MLP, and 4-stream shift parity"
+)]
 fn conv_residual_packed_matches_separate() -> anyhow::Result<()> {
     let gpu = Gpu::new(0)?;
     let stream = gpu.stream();
@@ -389,14 +421,15 @@ fn conv_residual_packed_matches_separate() -> anyhow::Result<()> {
                 KV_DIMS,
                 len,
             )?;
-            let h_slice =
-                with_hidden.then(|| hidden_dev.slice(off * HIDDEN..(off + len) * HIDDEN));
+            let h_slice = with_hidden.then(|| hidden_dev.slice(off * HIDDEN..(off + len) * HIDDEN));
             conv.short_conv_residual_rows(
                 stream,
                 &proj_dev.slice(off * HIDDEN..(off + len) * HIDDEN),
                 &post_attn_w,
                 &mut ref_states[si][2],
-                h_slice.as_ref().map(|v| v as &dyn siphon_cuda::DeviceIn<bf16>),
+                h_slice
+                    .as_ref()
+                    .map(|v| v as &dyn siphon_cuda::DeviceIn<bf16>),
                 &mut ref_res.slice_mut(off * HIDDEN..(off + len) * HIDDEN),
                 len,
             )?;
@@ -488,29 +521,78 @@ fn check_kv_equal(
 ) -> anyhow::Result<()> {
     match (got.data(), want.data()) {
         (
-            KvData::Bf16 { keys: gk, values: gv },
-            KvData::Bf16 { keys: wk, values: wv },
+            KvData::Bf16 {
+                keys: gk,
+                values: gv,
+            },
+            KvData::Bf16 {
+                keys: wk,
+                values: wv,
+            },
         ) => {
-            assert_bf16_close(&format!("{label}.k_cache"), &stream.clone_dtoh(gk)?, &stream.clone_dtoh(wk)?, 0);
-            assert_bf16_close(&format!("{label}.v_cache"), &stream.clone_dtoh(gv)?, &stream.clone_dtoh(wv)?, 0);
+            assert_bf16_close(
+                &format!("{label}.k_cache"),
+                &stream.clone_dtoh(gk)?,
+                &stream.clone_dtoh(wk)?,
+                0,
+            );
+            assert_bf16_close(
+                &format!("{label}.v_cache"),
+                &stream.clone_dtoh(gv)?,
+                &stream.clone_dtoh(wv)?,
+                0,
+            );
         }
         (
-            KvData::Fp8 { keys: gk, values: gv },
-            KvData::Fp8 { keys: wk, values: wv },
+            KvData::Fp8 {
+                keys: gk,
+                values: gv,
+            },
+            KvData::Fp8 {
+                keys: wk,
+                values: wv,
+            },
         )
         | (
-            KvData::Nvfp4 { keys: gk, values: gv },
-            KvData::Nvfp4 { keys: wk, values: wv },
+            KvData::Nvfp4 {
+                keys: gk,
+                values: gv,
+            },
+            KvData::Nvfp4 {
+                keys: wk,
+                values: wv,
+            },
+        )
+        | (
+            KvData::Nvfp4G32 {
+                keys: gk,
+                values: gv,
+            },
+            KvData::Nvfp4G32 {
+                keys: wk,
+                values: wv,
+            },
         ) => {
-            assert_eq!(stream.clone_dtoh(gk)?, stream.clone_dtoh(wk)?, "{label}.k_cache");
-            assert_eq!(stream.clone_dtoh(gv)?, stream.clone_dtoh(wv)?, "{label}.v_cache");
+            assert_eq!(
+                stream.clone_dtoh(gk)?,
+                stream.clone_dtoh(wk)?,
+                "{label}.k_cache"
+            );
+            assert_eq!(
+                stream.clone_dtoh(gv)?,
+                stream.clone_dtoh(wv)?,
+                "{label}.v_cache"
+            );
         }
         _ => anyhow::bail!("{label}: mismatched KvCache formats"),
     }
     Ok(())
 }
 
-#[expect(clippy::too_many_lines, reason = "sets up prefixes and compares packed vs separate attention")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sets up prefixes and compares packed vs separate attention"
+)]
 fn check_attention_packed(
     label: &str,
     make_cache: impl Fn(&Arc<CudaStream>) -> anyhow::Result<KvCache>,
@@ -537,11 +619,36 @@ fn check_attention_packed(
         let mut rc = make_cache(stream)?;
         let mut gc = make_cache(stream)?;
         if kv_start > 0 {
-            let pk = stream.clone_htod(&pseudo_random_bf16(kv_start * KV_DIMS, 700 + si as u32, 0.5, 0.0))?;
-            let pv = stream.clone_htod(&pseudo_random_bf16(kv_start * KV_DIMS, 800 + si as u32, 0.5, 0.0))?;
-            let pq = stream.clone_htod(&pseudo_random_bf16(kv_start * Q_DIMS, 850 + si as u32, 0.5, 0.0))?;
-            let pb = stream.clone_htod(&pseudo_random_bf16(kv_start * HEADS * EXTENT, 860 + si as u32, 0.5, 0.0))?;
-            let ps = stream.clone_htod(&pseudo_random_bf16(kv_start * HEADS, 870 + si as u32, 0.5, 0.0))?;
+            let pk = stream.clone_htod(&pseudo_random_bf16(
+                kv_start * KV_DIMS,
+                700 + si as u32,
+                0.5,
+                0.0,
+            ))?;
+            let pv = stream.clone_htod(&pseudo_random_bf16(
+                kv_start * KV_DIMS,
+                800 + si as u32,
+                0.5,
+                0.0,
+            ))?;
+            let pq = stream.clone_htod(&pseudo_random_bf16(
+                kv_start * Q_DIMS,
+                850 + si as u32,
+                0.5,
+                0.0,
+            ))?;
+            let pb = stream.clone_htod(&pseudo_random_bf16(
+                kv_start * HEADS * EXTENT,
+                860 + si as u32,
+                0.5,
+                0.0,
+            ))?;
+            let ps = stream.clone_htod(&pseudo_random_bf16(
+                kv_start * HEADS,
+                870 + si as u32,
+                0.5,
+                0.0,
+            ))?;
             let mut po = stream.alloc_zeros::<bf16>(kv_start * Q_DIMS)?;
             stream.memcpy_htod(&[0u32], &mut pos_dev)?;
             attention.prefill_attention(
@@ -639,7 +746,12 @@ fn check_attention_packed(
 
     // KV caches must match bit-for-bit on every slice.
     for si in 0..specs.len() {
-        check_kv_equal(stream, &format!("{label}[{si}]"), &got_caches[si], &ref_caches[si])?;
+        check_kv_equal(
+            stream,
+            &format!("{label}[{si}]"),
+            &got_caches[si],
+            &ref_caches[si],
+        )?;
     }
 
     let got = stream.clone_dtoh(&got_out)?;
@@ -770,6 +882,30 @@ fn prefill_attention_packed_uneven_matches_separate_global_fp4() -> anyhow::Resu
     )
 }
 
+#[test]
+fn prefill_attention_packed_uneven_matches_separate_global_fp4_g32() -> anyhow::Result<()> {
+    let specs = [(1, 0), (17, 37), (64, 512), (129, 1020), (256, 1500)];
+    check_attention_packed(
+        "uneven_global_fp4_g32",
+        |s| KvCache::global_with_format(s, 2048, KvFormat::Nvfp4G32),
+        &specs,
+        Products::Bf16,
+        1,
+    )
+}
+
+#[test]
+fn prefill_attention_packed_uneven_matches_separate_sliding_fp4_g32() -> anyhow::Result<()> {
+    let specs = [(1, 0), (17, 37), (64, 512), (129, 1020), (256, 1500)];
+    check_attention_packed(
+        "uneven_sliding_fp4_g32",
+        |s| KvCache::sliding_ring_with_format(s, WINDOW, WINDOW, KvFormat::Nvfp4G32),
+        &specs,
+        Products::Bf16,
+        1,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end Model::prefill_packed parity and S=16 / S=32 latency benchmarks.
 // ---------------------------------------------------------------------------
@@ -794,7 +930,11 @@ fn capture_tokens() -> anyhow::Result<Vec<u32>> {
         .collect()
 }
 
-fn load_model(capacity: usize, kv: KvFormat, weights: WeightFormat) -> anyhow::Result<(Gpu, Model)> {
+fn load_model(
+    capacity: usize,
+    kv: KvFormat,
+    weights: WeightFormat,
+) -> anyhow::Result<(Gpu, Model)> {
     let model_dir = PathBuf::from(env::var_os("SIPHON_MODEL").context("set SIPHON_MODEL")?);
     let gpu = Gpu::new(0)?;
     let config = TextConfig::load(&model_dir)?;
@@ -812,7 +952,10 @@ fn load_model(capacity: usize, kv: KvFormat, weights: WeightFormat) -> anyhow::R
 /// `prefill_slot` bit-for-bit (`max_diff == 0.0`).
 #[test]
 #[ignore = "needs the checkpoint and a GPU"]
-#[expect(clippy::too_many_lines, reason = "end-to-end ragged packed prefill parity test")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "end-to-end ragged packed prefill parity test"
+)]
 fn model_prefill_packed_uneven_with_prefixes_matches_separate() -> anyhow::Result<()> {
     let (_gpu, mut model) = load_model(4096, KvFormat::Fp8, WeightFormat::Fp8)?;
     let capture = capture_tokens()?;
@@ -993,11 +1136,13 @@ fn model_prefill_packed_timing_s16_s32() -> anyhow::Result<()> {
         ),
         (
             "S=16 ragged (1024 tok)",
-            [16, 32, 48, 64, 80, 96, 112, 128, 17, 31, 47, 57, 65, 73, 79, 79]
-                .into_iter()
-                .enumerate()
-                .map(|(i, len)| (i * 120, len))
-                .collect(),
+            [
+                16, 32, 48, 64, 80, 96, 112, 128, 17, 31, 47, 57, 65, 73, 79, 79,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| (i * 120, len))
+            .collect(),
         ),
         (
             "S=32 ragged (2048 tok)",
@@ -1052,11 +1197,8 @@ fn model_prefill_packed_timing_s16_s32() -> anyhow::Result<()> {
             gpu.stream().synchronize()?;
             let t0 = Instant::now();
             for (slot, &(base, len)) in specs.iter().enumerate() {
-                let _ = model.prefill_slot(
-                    slot,
-                    &capture[base..base + len],
-                    DEFAULT_PREFILL_CHUNK,
-                )?;
+                let _ =
+                    model.prefill_slot(slot, &capture[base..base + len], DEFAULT_PREFILL_CHUNK)?;
             }
             gpu.stream().synchronize()?;
             seq_ms.push(t0.elapsed().as_secs_f64() * 1e3);

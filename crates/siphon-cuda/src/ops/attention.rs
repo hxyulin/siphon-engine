@@ -115,9 +115,9 @@ const ROWS_SPLIT_SLOTS: u32 = 64;
 const ROWS_QUERY_TILES: usize = 3;
 /// Threads per block of `attention_rows_*`.
 const ROWS_THREADS: u32 = 128;
-/// Dynamic shared memory of `attention_rows_bf16`, `attention_rows_fp8` and
-/// `attention_rows_fp4`, the sizes of `RowsShared` in the kernel.
-const ROWS_SHARED_BYTES: [u32; 3] = [32_768, 49_152, 27_648];
+/// Dynamic shared memory of `attention_rows_bf16`, `attention_rows_fp8`,
+/// `attention_rows_fp4` and `attention_rows_fp4_g32`, the sizes of `RowsShared` in the kernel.
+const ROWS_SHARED_BYTES: [u32; 4] = [32_768, 49_152, 27_648, 26_112];
 /// Minimum batch sequence count at which [`BatchSplitMode::Auto`] switches from exact
 /// full split-K (bit-identical to single-sequence [`Attention::attention_rows`]) to
 /// adaptive SM-aware split-K. Keeps small batches (`seqs < 8`, including `B = 1..5`
@@ -126,6 +126,9 @@ pub const BATCH_ADAPTIVE_MIN_SEQS: usize = 8;
 /// Bytes of one slot of an NVFP4 key or value buffer: 8 heads of 64 bytes of E2M1 values,
 /// then 8 heads of 8 E4M3 scales (`kFp4Row` in the kernel).
 pub const FP4_ROW: usize = 576;
+/// Bytes of one slot of a group-32 NVFP4 key or value buffer: 8 heads of 64 bytes of E2M1
+/// values, then 8 heads of 4 E4M3 scales (`kFp4G32Row` in the kernel).
+pub const FP4_G32_ROW: usize = 544;
 
 /// Split-K policy for [`Attention::attention_batch`] and
 /// [`Attention::attention_batch_with_mode`].
@@ -198,6 +201,14 @@ pub enum KvData {
     /// NVFP4, [`FP4_ROW`] bytes per slot (see `KvFormat::Nvfp4`).
     Nvfp4 {
         keys: CudaSlice<u8>,
+        /// Value rows with their scales packed into each row.
+        values: CudaSlice<u8>,
+    },
+    /// Group-32 NVFP4, [`FP4_G32_ROW`] bytes per slot (see `KvFormat::Nvfp4G32`).
+    Nvfp4G32 {
+        /// Key rows with their group-32 scales packed into each row.
+        keys: CudaSlice<u8>,
+        /// Value rows with their group-32 scales packed into each row.
         values: CudaSlice<u8>,
     },
 }
@@ -236,8 +247,11 @@ impl RingSlab {
             KvFormat::Bf16 => slots * KV_ROW * size_of::<bf16>(),
             KvFormat::Fp8 => slots * KV_ROW,
             KvFormat::Nvfp4 => slots * FP4_ROW,
-            KvFormat::Mixed | KvFormat::Nvfp4All => {
-                anyhow::bail!("sliding caches take a concrete format (BF16, FP8 or NVFP4)")
+            KvFormat::Nvfp4G32 => slots * FP4_G32_ROW,
+            KvFormat::Mixed | KvFormat::Nvfp4All | KvFormat::Nvfp4G32All => {
+                anyhow::bail!(
+                    "sliding caches take a concrete format (BF16, FP8, NVFP4 or NVFP4-G32)"
+                )
             }
         };
         let layout =
@@ -403,7 +417,9 @@ impl Drop for KvCache {
             KvData::Bf16 { keys, values } => {
                 let _ = (keys.leak(), values.leak());
             }
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => {
                 let _ = (keys.leak(), values.leak());
             }
         }
@@ -482,8 +498,9 @@ impl KvCache {
             KvFormat::Bf16 => (capacity * KV_ROW, capacity * KV_ROW * size_of::<bf16>()),
             KvFormat::Fp8 => (capacity * KV_ROW, capacity * KV_ROW),
             KvFormat::Nvfp4 => (capacity * FP4_ROW, capacity * FP4_ROW),
-            KvFormat::Mixed | KvFormat::Nvfp4All => {
-                anyhow::bail!("each cache takes a concrete format (BF16, FP8 or NVFP4)")
+            KvFormat::Nvfp4G32 => (capacity * FP4_G32_ROW, capacity * FP4_G32_ROW),
+            KvFormat::Mixed | KvFormat::Nvfp4All | KvFormat::Nvfp4G32All => {
+                anyhow::bail!("each cache takes a concrete format (BF16, FP8, NVFP4 or NVFP4-G32)")
             }
         };
         let packed = window.is_some() && !bytes.is_multiple_of(pool.page_bytes());
@@ -514,7 +531,13 @@ impl KvCache {
                     keys: stream.upgrade_device_ptr(keys, len),
                     values: stream.upgrade_device_ptr(values, len),
                 },
-                KvFormat::Mixed | KvFormat::Nvfp4All => unreachable!("refused above"),
+                KvFormat::Nvfp4G32 => KvData::Nvfp4G32 {
+                    keys: stream.upgrade_device_ptr(keys, len),
+                    values: stream.upgrade_device_ptr(values, len),
+                },
+                KvFormat::Mixed | KvFormat::Nvfp4All | KvFormat::Nvfp4G32All => {
+                    unreachable!("refused above")
+                }
             }
         };
         Ok(Self {
@@ -540,8 +563,11 @@ impl KvCache {
             "a ring of {slots} slots cannot hold a window of {window}"
         );
         ensure!(
-            matches!(format, KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4),
-            "sliding caches take a concrete format (BF16, FP8 or NVFP4)"
+            matches!(
+                format,
+                KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4 | KvFormat::Nvfp4G32
+            ),
+            "sliding caches take a concrete format (BF16, FP8, NVFP4 or NVFP4-G32)"
         );
         u32::try_from(slots).context("too many KV cache slots")?;
         let (keys, values) = slab.ring_ptrs(index);
@@ -561,7 +587,13 @@ impl KvCache {
                     keys: stream.upgrade_device_ptr(keys, slots * FP4_ROW),
                     values: stream.upgrade_device_ptr(values, slots * FP4_ROW),
                 },
-                KvFormat::Mixed | KvFormat::Nvfp4All => unreachable!("refused above"),
+                KvFormat::Nvfp4G32 => KvData::Nvfp4G32 {
+                    keys: stream.upgrade_device_ptr(keys, slots * FP4_G32_ROW),
+                    values: stream.upgrade_device_ptr(values, slots * FP4_G32_ROW),
+                },
+                KvFormat::Mixed | KvFormat::Nvfp4All | KvFormat::Nvfp4G32All => {
+                    unreachable!("refused above")
+                }
             }
         };
         Ok(Self {
@@ -599,8 +631,11 @@ impl KvCache {
             "a ring of {slots} slots cannot hold a window of {window}"
         );
         ensure!(
-            matches!(format, KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4),
-            "sliding caches are BF16, FP8 or NVFP4"
+            matches!(
+                format,
+                KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4 | KvFormat::Nvfp4G32
+            ),
+            "sliding caches are BF16, FP8, NVFP4 or NVFP4-G32"
         );
         Self::new_pooled(stream, slots, Some(window), format, pool)
     }
@@ -723,8 +758,12 @@ impl KvCache {
         ensure!(slots > 0, "a KV cache needs at least one slot");
         u32::try_from(slots).context("too many KV cache slots")?;
         ensure!(
-            window.is_none() || matches!(format, KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4),
-            "sliding caches are BF16, FP8 or NVFP4"
+            window.is_none()
+                || matches!(
+                    format,
+                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4 | KvFormat::Nvfp4G32
+                ),
+            "sliding caches are BF16, FP8, NVFP4 or NVFP4-G32"
         );
         let len = slots * KV_ROW;
         let data = match format {
@@ -740,8 +779,12 @@ impl KvCache {
                 keys: stream.alloc_zeros(slots * FP4_ROW)?,
                 values: stream.alloc_zeros(slots * FP4_ROW)?,
             },
-            KvFormat::Mixed | KvFormat::Nvfp4All => {
-                anyhow::bail!("each cache takes a concrete format (BF16, FP8 or NVFP4)")
+            KvFormat::Nvfp4G32 => KvData::Nvfp4G32 {
+                keys: stream.alloc_zeros(slots * FP4_G32_ROW)?,
+                values: stream.alloc_zeros(slots * FP4_G32_ROW)?,
+            },
+            KvFormat::Mixed | KvFormat::Nvfp4All | KvFormat::Nvfp4G32All => {
+                anyhow::bail!("each cache takes a concrete format (BF16, FP8, NVFP4 or NVFP4-G32)")
             }
         };
         Ok(Self {
@@ -774,7 +817,9 @@ impl KvCache {
             KvData::Bf16 { keys, values } => {
                 (keys.device_ptr(stream).0, values.device_ptr(stream).0)
             }
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => {
                 (keys.device_ptr(stream).0, values.device_ptr(stream).0)
             }
         };
@@ -795,6 +840,7 @@ impl KvCache {
             KvData::Bf16 { .. } => KvFormat::Bf16,
             KvData::Fp8 { .. } => KvFormat::Fp8,
             KvData::Nvfp4 { .. } => KvFormat::Nvfp4,
+            KvData::Nvfp4G32 { .. } => KvFormat::Nvfp4G32,
         }
     }
 
@@ -805,15 +851,17 @@ impl KvCache {
             KvData::Bf16 { .. } => KV_ROW * size_of::<bf16>(),
             KvData::Fp8 { .. } => KV_ROW,
             KvData::Nvfp4 { .. } => FP4_ROW,
+            KvData::Nvfp4G32 { .. } => FP4_G32_ROW,
         }
     }
 
     /// Elements of one slot in each of the key and value buffers: 1,024 values, or for
-    /// NVFP4 [`FP4_ROW`] bytes.
+    /// NVFP4 [`FP4_ROW`] / [`FP4_G32_ROW`] bytes.
     #[must_use]
     pub fn row_len(&self) -> usize {
         match *self.data {
             KvData::Nvfp4 { .. } => FP4_ROW,
+            KvData::Nvfp4G32 { .. } => FP4_G32_ROW,
             _ => KV_ROW,
         }
     }
@@ -837,7 +885,9 @@ impl KvCache {
                 stream.memset_zeros(&mut keys.slice_mut(..len))?;
                 stream.memset_zeros(&mut values.slice_mut(..len))?;
             }
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => {
                 stream.memset_zeros(&mut keys.slice_mut(..len))?;
                 stream.memset_zeros(&mut values.slice_mut(..len))?;
             }
@@ -974,32 +1024,37 @@ pub struct Attention {
     decode_step: CudaFunction,
     decode_step_fp8: CudaFunction,
     decode_step_fp4: CudaFunction,
+    decode_step_fp4_g32: CudaFunction,
     kv_append_rows_fp4: CudaFunction,
+    kv_append_rows_fp4_g32: CudaFunction,
     kv_append_rows_packed: CudaFunction,
     kv_append_rows_packed_fp8: CudaFunction,
     kv_append_rows_packed_fp4: CudaFunction,
+    kv_append_rows_packed_fp4_g32: CudaFunction,
     prefill_fp4: CudaFunction,
+    prefill_fp4_g32: CudaFunction,
     /// `prefill_attention_fp4_mma`, for [`Products::Fp4`] on an NVFP4 cache.
     prefill_fp4_mma: CudaFunction,
+    prefill_fp4_g32_mma: CudaFunction,
     prefill: CudaFunction,
     prefill_fp8: CudaFunction,
     /// `prefill_attention_fp8_mma`, for [`Products::Fp8`].
     prefill_fp8_mma: CudaFunction,
     prefill_packed_fp4: CudaFunction,
+    prefill_packed_fp4_g32: CudaFunction,
     prefill_packed: CudaFunction,
     prefill_packed_fp8: CudaFunction,
     prefill_packed_fp8_mma: CudaFunction,
-    /// `attention_rows_bf16_<NT>`, `attention_rows_fp8_<NT>` and `attention_rows_fp4_<NT>`
-    /// for NT = 1 to 3.
-    rows: Vec<[CudaFunction; 3]>,
-    /// `attention_rows_tree_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
-    rows_tree: Vec<[CudaFunction; 3]>,
-    /// `attention_batch_bf16`, `attention_batch_fp8` and `attention_batch_fp4`.
-    batch: [CudaFunction; 3],
-    /// `attention_batch_verify_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
-    batch_verify: Vec<[CudaFunction; 3]>,
-    /// `attention_batch_nosplit_{bf16,fp8,fp4}_<NT>` for NT = 1 to 3.
-    batch_nosplit: Vec<[CudaFunction; 3]>,
+    /// `attention_rows_{bf16,fp8,fp4,fp4_g32}_<NT>` for NT = 1 to 3.
+    rows: Vec<[CudaFunction; 4]>,
+    /// `attention_rows_tree_{bf16,fp8,fp4,fp4_g32}_<NT>` for NT = 1 to 3.
+    rows_tree: Vec<[CudaFunction; 4]>,
+    /// `attention_batch_{bf16,fp8,fp4,fp4_g32}`.
+    batch: [CudaFunction; 4],
+    /// `attention_batch_verify_{bf16,fp8,fp4,fp4_g32}_<NT>` for NT = 1 to 3.
+    batch_verify: Vec<[CudaFunction; 4]>,
+    /// `attention_batch_nosplit_{bf16,fp8,fp4,fp4_g32}_<NT>` for NT = 1 to 3.
+    batch_nosplit: Vec<[CudaFunction; 4]>,
     /// Device streaming multiprocessor count, used to size adaptive split-K grids.
     sms: u32,
     /// Default split-K policy used by [`Attention::attention_batch`].
@@ -1050,6 +1105,7 @@ impl KvRounding {
             KvQuant::None => 0,
             KvQuant::Nvfp4 => 1,
             KvQuant::Q4_0 => 2,
+            KvQuant::Nvfp4G32 => 4,
         }
     }
 
@@ -1134,13 +1190,17 @@ impl Attention {
         let prefill_fp8 = module.load_function("prefill_attention_fp8")?;
         let prefill_fp8_mma = module.load_function("prefill_attention_fp8_mma")?;
         let prefill_fp4 = module.load_function("prefill_attention_fp4")?;
+        let prefill_fp4_g32 = module.load_function("prefill_attention_fp4_g32")?;
         let prefill_fp4_mma = module.load_function("prefill_attention_fp4_mma")?;
+        let prefill_fp4_g32_mma = module.load_function("prefill_attention_fp4_g32_mma")?;
         for function in [
             &prefill,
             &prefill_fp8,
             &prefill_fp8_mma,
             &prefill_fp4,
+            &prefill_fp4_g32,
             &prefill_fp4_mma,
+            &prefill_fp4_g32_mma,
         ] {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -1158,11 +1218,13 @@ impl Attention {
         let prefill_packed_fp8 = module.load_function("prefill_attention_packed_fp8")?;
         let prefill_packed_fp8_mma = module.load_function("prefill_attention_packed_fp8_mma")?;
         let prefill_packed_fp4 = module.load_function("prefill_attention_packed_fp4")?;
+        let prefill_packed_fp4_g32 = module.load_function("prefill_attention_packed_fp4_g32")?;
         for function in [
             &prefill_packed,
             &prefill_packed_fp8,
             &prefill_packed_fp8_mma,
             &prefill_packed_fp4,
+            &prefill_packed_fp4_g32,
         ] {
             function.set_attribute(
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -1181,16 +1243,22 @@ impl Attention {
             decode_step: module.load_function("decode_step_bf16")?,
             decode_step_fp8: module.load_function("decode_step_fp8")?,
             decode_step_fp4: module.load_function("decode_step_fp4")?,
+            decode_step_fp4_g32: module.load_function("decode_step_fp4_g32")?,
             kv_append_rows_fp4: module.load_function("kv_append_rows_fp4")?,
+            kv_append_rows_fp4_g32: module.load_function("kv_append_rows_fp4_g32")?,
             kv_append_rows_packed: module.load_function("kv_append_rows_packed_bf16")?,
             kv_append_rows_packed_fp8: module.load_function("kv_append_rows_packed_fp8")?,
             kv_append_rows_packed_fp4: module.load_function("kv_append_rows_packed_fp4")?,
+            kv_append_rows_packed_fp4_g32: module.load_function("kv_append_rows_packed_fp4_g32")?,
             prefill_fp4,
+            prefill_fp4_g32,
             prefill_fp4_mma,
+            prefill_fp4_g32_mma,
             prefill,
             prefill_fp8,
             prefill_fp8_mma,
             prefill_packed_fp4,
+            prefill_packed_fp4_g32,
             prefill_packed,
             prefill_packed_fp8,
             prefill_packed_fp8_mma,
@@ -1200,6 +1268,10 @@ impl Attention {
                         rows_function(&format!("attention_rows_bf16_{nt}"), ROWS_SHARED_BYTES[0])?,
                         rows_function(&format!("attention_rows_fp8_{nt}"), ROWS_SHARED_BYTES[1])?,
                         rows_function(&format!("attention_rows_fp4_{nt}"), ROWS_SHARED_BYTES[2])?,
+                        rows_function(
+                            &format!("attention_rows_fp4_g32_{nt}"),
+                            ROWS_SHARED_BYTES[3],
+                        )?,
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
@@ -1218,6 +1290,10 @@ impl Attention {
                             &format!("attention_rows_tree_fp4_{nt}"),
                             ROWS_SHARED_BYTES[2],
                         )?,
+                        rows_function(
+                            &format!("attention_rows_tree_fp4_g32_{nt}"),
+                            ROWS_SHARED_BYTES[3],
+                        )?,
                     ])
                 })
                 .collect::<anyhow::Result<_>>()?,
@@ -1225,6 +1301,7 @@ impl Attention {
                 rows_function("attention_batch_bf16", ROWS_SHARED_BYTES[0])?,
                 rows_function("attention_batch_fp8", ROWS_SHARED_BYTES[1])?,
                 rows_function("attention_batch_fp4", ROWS_SHARED_BYTES[2])?,
+                rows_function("attention_batch_fp4_g32", ROWS_SHARED_BYTES[3])?,
             ],
             batch_verify: (1..=ROWS_QUERY_TILES)
                 .map(|nt| {
@@ -1240,6 +1317,10 @@ impl Attention {
                         rows_function(
                             &format!("attention_batch_verify_fp4_{nt}"),
                             ROWS_SHARED_BYTES[2],
+                        )?,
+                        rows_function(
+                            &format!("attention_batch_verify_fp4_g32_{nt}"),
+                            ROWS_SHARED_BYTES[3],
                         )?,
                     ])
                 })
@@ -1258,6 +1339,10 @@ impl Attention {
                         rows_function(
                             &format!("attention_batch_nosplit_fp4_{nt}"),
                             ROWS_SHARED_BYTES[2],
+                        )?,
+                        rows_function(
+                            &format!("attention_batch_nosplit_fp4_g32_{nt}"),
+                            ROWS_SHARED_BYTES[3],
                         )?,
                     ])
                 })
@@ -1461,12 +1546,15 @@ impl Attention {
             KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
             KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
             KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
+            KvData::Nvfp4G32 { .. } => (&entry[3], ROWS_SHARED_BYTES[3]),
         };
         let mut args = KernelArgs::default();
         args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
         match &mut *cache.data {
             KvData::Bf16 { keys, values } => args.ptr_mut(keys, stream).ptr_mut(values, stream),
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => {
                 args.ptr_mut(keys, stream).ptr_mut(values, stream)
             }
         };
@@ -1484,8 +1572,16 @@ impl Attention {
             .u32(window)
             .u32(extent)
             .f32(SCALE);
+        let rows_blocks = if cfg!(sm89) {
+            slots
+                .div_ceil(ROWS_SPLIT_SLOTS)
+                .clamp(12, ROWS_SPLIT_BLOCKS)
+                + 2
+        } else {
+            ROWS_BLOCKS
+        };
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS, 1),
+            grid_dim: (KV_HEADS as u32, rows_blocks, 1),
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
@@ -1561,14 +1657,15 @@ impl Attention {
             KvData::Bf16 { .. } => (&entry[0], ROWS_SHARED_BYTES[0]),
             KvData::Fp8 { .. } => (&entry[1], ROWS_SHARED_BYTES[1]),
             KvData::Nvfp4 { .. } => (&entry[2], ROWS_SHARED_BYTES[2]),
+            KvData::Nvfp4G32 { .. } => (&entry[3], ROWS_SHARED_BYTES[3]),
         };
         let mut args = KernelArgs::default();
         args.ptr(&q, stream).ptr(&k, stream).ptr(&v, stream);
         match &*cache.data {
             KvData::Bf16 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                args.ptr(keys, stream).ptr(values, stream)
-            }
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => args.ptr(keys, stream).ptr(values, stream),
         };
         args.ptr(&bias, stream)
             .ptr(&sinks, stream)
@@ -1588,8 +1685,16 @@ impl Attention {
             .ptr(tree_attn_anc, stream)
             .ptr_mut(k_stage, stream)
             .ptr_mut(v_stage, stream);
+        let rows_blocks = if cfg!(sm89) {
+            slots
+                .div_ceil(ROWS_SPLIT_SLOTS)
+                .clamp(12, ROWS_SPLIT_BLOCKS)
+                + 2
+        } else {
+            ROWS_BLOCKS
+        };
         let config = LaunchConfig {
-            grid_dim: (KV_HEADS as u32, ROWS_BLOCKS, 1),
+            grid_dim: (KV_HEADS as u32, rows_blocks, 1),
             block_dim: (ROWS_THREADS, 1, 1),
             shared_mem_bytes: smem,
         };
@@ -1696,6 +1801,7 @@ impl Attention {
             KvData::Bf16 { .. } => 0,
             KvData::Fp8 { .. } => 1,
             KvData::Nvfp4 { .. } => 2,
+            KvData::Nvfp4G32 { .. } => 3,
         };
         let smem = ROWS_SHARED_BYTES[format_idx];
         let nt_idx = (3 * rows_per_seq).div_ceil(8) - 1;
@@ -1925,7 +2031,7 @@ impl Attention {
         let function = match *cache.data {
             KvData::Bf16 { .. } => &self.kv_append,
             KvData::Fp8 { .. } => &self.kv_append_fp8,
-            KvData::Nvfp4 { .. } => {
+            KvData::Nvfp4 { .. } | KvData::Nvfp4G32 { .. } => {
                 anyhow::bail!("NVFP4 caches append through the fused decode step")
             }
         };
@@ -1933,9 +2039,9 @@ impl Attention {
         launch.arg(&k).arg(&v);
         match &mut *cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                launch.arg(keys).arg(values)
-            }
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => launch.arg(keys).arg(values),
         };
         launch.arg(&position).arg(&slots);
         // SAFETY: the arguments match `kv_append_bf16(const bf16*, const bf16*, bf16*, bf16*,
@@ -1987,7 +2093,7 @@ impl Attention {
         let function = match *cache.data {
             KvData::Bf16 { .. } => &self.decode,
             KvData::Fp8 { .. } => &self.decode_fp8,
-            KvData::Nvfp4 { .. } => {
+            KvData::Nvfp4 { .. } | KvData::Nvfp4G32 { .. } => {
                 anyhow::bail!("NVFP4 caches attend through the fused decode step")
             }
         };
@@ -1995,9 +2101,9 @@ impl Attention {
         launch.arg(&q);
         match &*cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                launch.arg(keys).arg(values)
-            }
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => launch.arg(keys).arg(values),
         };
         launch
             .arg(&bias)
@@ -2132,6 +2238,10 @@ impl Attention {
                 args.ptr_mut(keys, stream).ptr_mut(values, stream);
                 &self.decode_step_fp4
             }
+            KvData::Nvfp4G32 { keys, values } => {
+                args.ptr_mut(keys, stream).ptr_mut(values, stream);
+                &self.decode_step_fp4_g32
+            }
         };
         let (log_scale, alpha, n_floor) = match s.log_scale {
             Some((alpha, n_floor)) => (1, alpha, n_floor),
@@ -2188,11 +2298,11 @@ impl Attention {
     ) -> anyhow::Result<()> {
         let start = start.view();
         let slots = u32::try_from(cache.slots)?;
-        // One thread per 8 values, or for NVFP4 per group of 16.
-        let threads = if cache.format() == KvFormat::Nvfp4 {
-            KV_ROW / 16
-        } else {
-            KV_ROW / 8
+        // One thread per 8 values, or per group of 16 / 32 for NVFP4 / NVFP4-G32.
+        let threads = match cache.format() {
+            KvFormat::Nvfp4 => KV_ROW / 16,
+            KvFormat::Nvfp4G32 => KV_ROW / 32,
+            _ => KV_ROW / 8,
         };
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows)?, 1, 1),
@@ -2203,14 +2313,15 @@ impl Attention {
             KvData::Bf16 { .. } => &self.kv_append_rows,
             KvData::Fp8 { .. } => &self.kv_append_rows_fp8,
             KvData::Nvfp4 { .. } => &self.kv_append_rows_fp4,
+            KvData::Nvfp4G32 { .. } => &self.kv_append_rows_fp4_g32,
         };
         let mut launch = stream.launch_builder(function);
         launch.arg(k).arg(v);
         match &mut *cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                launch.arg(keys).arg(values)
-            }
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => launch.arg(keys).arg(values),
         };
         launch.arg(&start).arg(&slots);
         // SAFETY: the arguments match `kv_append_rows_bf16(const bf16*, const bf16*, bf16*,
@@ -2288,7 +2399,7 @@ impl Attention {
             extent.is_multiple_of(8),
             "prefill needs a bias extent that is a multiple of 8, not {extent}"
         );
-        if rows == 1 && cache.format() != KvFormat::Nvfp4 {
+        if rows == 1 && !matches!(cache.format(), KvFormat::Nvfp4 | KvFormat::Nvfp4G32) {
             // Decode attention streams the cache faster than a block of 128 rows with 3
             // used ones, and computes the same thing.
             self.append(stream, cache, &start, &k, &v)?;
@@ -2312,15 +2423,18 @@ impl Attention {
             input_keys == 0
                 || matches!(
                     cache.format(),
-                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4
+                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4 | KvFormat::Nvfp4G32
                 ),
-            "sliding caches are BF16, FP8 or NVFP4"
+            "sliding caches are BF16, FP8, NVFP4 or NVFP4-G32"
         );
         ensure!(
             crate::BLOCK_SCALED_MMA
                 || !matches!(
                     (&*cache.data, products),
-                    (KvData::Fp8 { .. } | KvData::Nvfp4 { .. }, Products::Fp4)
+                    (
+                        KvData::Fp8 { .. } | KvData::Nvfp4 { .. } | KvData::Nvfp4G32 { .. },
+                        Products::Fp4
+                    )
                 ),
             "{products} prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
         );
@@ -2332,22 +2446,27 @@ impl Attention {
             (KvData::Bf16 { .. }, _) => &self.prefill,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
             (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4) => &self.prefill_fp8_mma,
-            (KvData::Nvfp4 { .. }, Products::Bf16) => &self.prefill_fp4,
-            // On sm_89, `prefill_attention_fp4_mma` decodes staged NVFP4 keys and values to
+            // On sm_89, `prefill_attention_fp4[_g32]_mma` decodes staged NVFP4 keys and values to
             // E4M3 and runs both Q K^T and P V on native Ada FP8 tensor cores (330 TF/s).
             (KvData::Nvfp4 { .. }, Products::Fp8) if !crate::BLOCK_SCALED_MMA => {
                 &self.prefill_fp4_mma
             }
-            (KvData::Nvfp4 { .. }, Products::Fp8) => &self.prefill_fp4,
+            (KvData::Nvfp4G32 { .. }, Products::Fp8) if !crate::BLOCK_SCALED_MMA => {
+                &self.prefill_fp4_g32_mma
+            }
+            (KvData::Nvfp4 { .. }, Products::Bf16 | Products::Fp8) => &self.prefill_fp4,
             (KvData::Nvfp4 { .. }, Products::Fp4) => &self.prefill_fp4_mma,
+            (KvData::Nvfp4G32 { .. }, Products::Bf16 | Products::Fp8) => &self.prefill_fp4_g32,
+            (KvData::Nvfp4G32 { .. }, Products::Fp4) => &self.prefill_fp4_g32_mma,
         };
+        let null_table: u64 = 0;
         let mut launch = stream.launch_builder(function);
         launch.arg(&q).arg(&k).arg(&v);
         match &*cache.data {
             KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
-            KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
-                launch.arg(keys).arg(values)
-            }
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => launch.arg(keys).arg(values),
         };
         launch
             .arg(&bias)
@@ -2361,7 +2480,8 @@ impl Attention {
             .arg(&window)
             .arg(&extent)
             .arg(&input_keys)
-            .arg(&SCALE);
+            .arg(&SCALE)
+            .arg(&null_table);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(scratch.blocks)?, 1, 1),
             block_dim: (PREFILL_BLOCK, 1, 1),
@@ -2371,17 +2491,145 @@ impl Attention {
         // const bf16* v_in, const bf16* k_cache, const bf16* v_cache, const bf16* bias, const
         // bf16* sinks, float* partials, unsigned* counters, bf16* out, const unsigned* start,
         // unsigned rows, unsigned slots, unsigned window, unsigned extent, unsigned
-        // input_keys, float scale)`, or `prefill_attention_fp8`, `prefill_attention_fp8_mma`,
-        // `prefill_attention_fp4` and `prefill_attention_fp4_mma` with `uint8_t*` caches. The
-        // checks above size `q`, `k`, `v`, `bias`, `sinks` and `out` for `rows` rows. The
-        // kernel reads input rows below `rows`, cache slots below `slots` and bias columns
-        // below `extent`. Its `scratch.blocks`
-        // blocks write at most two partial slots each, which `scratch.partials` holds, and
-        // `prefill_blocks(rows) * 8` counters, which `scratch.counters` holds since `rows` is
-        // at most `scratch.max_rows`; the shared memory size matches the kernel's
-        // `static_assert`s.
+        // input_keys, float scale, const bf16* rel_table_t)`, or `prefill_attention_fp8`,
+        // `prefill_attention_fp8_mma`, `prefill_attention_fp4` and `prefill_attention_fp4_mma`
+        // with `uint8_t*` caches. The checks above size `q`, `k`, `v`, `bias`, `sinks` and `out`
+        // for `rows` rows. The kernel reads input rows below `rows`, cache slots below `slots`
+        // and bias columns below `extent`. Its `scratch.blocks` blocks write at most two partial
+        // slots each, which `scratch.partials` holds, and `prefill_blocks(rows) * 8` counters,
+        // which `scratch.counters` holds since `rows` is at most `scratch.max_rows`; the shared
+        // memory size matches the kernel's `static_assert`s.
         unsafe { launch.launch(config) }?;
 
+        if input_keys == 1 {
+            self.append_rows(stream, cache, &start, rows, &k, &v)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::prefill_attention`] with fused on-the-fly relative bias (`rel @ rel_table_t^T`
+    /// via `mma_bf16`), eliminating `relative_bias_rows` and bias DRAM traffic.
+    ///
+    /// `rel` is `[rows, 24, 16]` BF16 and `rel_table_t` is `[extent, 16]` BF16 (the transpose
+    /// of `rel_table`).
+    #[expect(clippy::too_many_arguments, reason = "mirrors the kernel inputs")]
+    pub fn prefill_attention_fused_bias(
+        &self,
+        stream: &CudaStream,
+        q: &impl DeviceIn<bf16>,
+        k: &impl DeviceIn<bf16>,
+        v: &impl DeviceIn<bf16>,
+        cache: &mut KvCache,
+        start: &impl DeviceIn<u32>,
+        rows: usize,
+        rel: &impl DeviceIn<bf16>,
+        rel_table_t: &impl DeviceIn<bf16>,
+        extent: usize,
+        sinks: &impl DeviceIn<bf16>,
+        scratch: &mut PrefillScratch,
+        out: &mut impl DeviceOut<bf16>,
+        products: Products,
+    ) -> anyhow::Result<()> {
+        let (q, k, v, rel, rel_table_t, sinks) = (
+            q.view(),
+            k.view(),
+            v.view(),
+            rel.view(),
+            rel_table_t.view(),
+            sinks.view(),
+        );
+        let start = start.view();
+        let mut out = out.view_mut();
+        ensure!(
+            (1..=scratch.max_rows).contains(&rows),
+            "prefill scratch takes 1 to {} rows, not {rows}",
+            scratch.max_rows
+        );
+        check_len("q", q.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("k", k.len(), rows * KV_ROW)?;
+        check_len("v", v.len(), rows * KV_ROW)?;
+        check_len("rel", rel.len(), rows * HEADS * REL_DIM)?;
+        check_len("rel_table_t", rel_table_t.len(), extent * REL_DIM)?;
+        check_len("sinks", sinks.len(), rows * HEADS)?;
+        check_len("out", out.len(), rows * HEADS * HEAD_DIM)?;
+        check_len("start", start.len(), 1)?;
+        ensure!(
+            extent > 0 && extent.is_multiple_of(8),
+            "prefill needs a bias extent that is a positive multiple of 8, not {extent}"
+        );
+        let extent_u32 = u32::try_from(extent).context("extent too large")?;
+        let slots = u32::try_from(cache.slots)?;
+        let window = u32::try_from(cache.window.unwrap_or(0)).context("window too large")?;
+        let rows_u32 = u32::try_from(rows)?;
+        let input_keys = u32::from(cache.window.is_some());
+        ensure!(
+            input_keys == 0
+                || matches!(
+                    cache.format(),
+                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4 | KvFormat::Nvfp4G32
+                ),
+            "sliding caches are BF16, FP8, NVFP4 or NVFP4-G32"
+        );
+        ensure!(
+            crate::BLOCK_SCALED_MMA
+                || !matches!(
+                    (&*cache.data, products),
+                    (
+                        KvData::Fp8 { .. } | KvData::Nvfp4 { .. } | KvData::Nvfp4G32 { .. },
+                        Products::Fp4
+                    )
+                ),
+            "{products} prefill attention needs the block-scaled MMA, which this sm_89 build lacks"
+        );
+        if input_keys == 0 {
+            self.append_rows(stream, cache, &start, rows, &k, &v)?;
+        }
+
+        let function = match (&*cache.data, products) {
+            (KvData::Bf16 { .. }, _) => &self.prefill,
+            (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_fp8,
+            (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4) => &self.prefill_fp8_mma,
+            (KvData::Nvfp4 { .. }, Products::Fp8) if !crate::BLOCK_SCALED_MMA => {
+                &self.prefill_fp4_mma
+            }
+            (KvData::Nvfp4G32 { .. }, Products::Fp8) if !crate::BLOCK_SCALED_MMA => {
+                &self.prefill_fp4_g32_mma
+            }
+            (KvData::Nvfp4 { .. }, Products::Bf16 | Products::Fp8) => &self.prefill_fp4,
+            (KvData::Nvfp4 { .. }, Products::Fp4) => &self.prefill_fp4_mma,
+            (KvData::Nvfp4G32 { .. }, Products::Bf16 | Products::Fp8) => &self.prefill_fp4_g32,
+            (KvData::Nvfp4G32 { .. }, Products::Fp4) => &self.prefill_fp4_g32_mma,
+        };
+        let mut launch = stream.launch_builder(function);
+        launch.arg(&q).arg(&k).arg(&v);
+        match &*cache.data {
+            KvData::Bf16 { keys, values } => launch.arg(keys).arg(values),
+            KvData::Fp8 { keys, values }
+            | KvData::Nvfp4 { keys, values }
+            | KvData::Nvfp4G32 { keys, values } => launch.arg(keys).arg(values),
+        };
+        launch
+            .arg(&rel)
+            .arg(&sinks)
+            .arg(&mut scratch.partials)
+            .arg(&mut scratch.counters)
+            .arg(&mut out)
+            .arg(&start)
+            .arg(&rows_u32)
+            .arg(&slots)
+            .arg(&window)
+            .arg(&extent_u32)
+            .arg(&input_keys)
+            .arg(&SCALE)
+            .arg(&rel_table_t);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(scratch.blocks)?, 1, 1),
+            block_dim: (PREFILL_BLOCK, 1, 1),
+            shared_mem_bytes: PREFILL_SHARED_BYTES,
+        };
+        // SAFETY: matches `prefill_attention_*` with non-null `rel_table_t`; `rel` holds
+        // `[rows, HEADS, REL_DIM]` and `rel_table_t` holds `[extent, REL_DIM]`.
+        unsafe { launch.launch(config) }?;
         if input_keys == 1 {
             self.append_rows(stream, cache, &start, rows, &k, &v)?;
         }
@@ -2417,10 +2665,10 @@ impl Attention {
         );
         let slots = u32::try_from(cache.slots)?;
         let num_slices = i32::try_from(packed.num_slices)?;
-        let threads = if cache.format() == KvFormat::Nvfp4 {
-            KV_ROW / 16
-        } else {
-            KV_ROW / 8
+        let threads = match cache.format() {
+            KvFormat::Nvfp4 => KV_ROW / 16,
+            KvFormat::Nvfp4G32 => KV_ROW / 32,
+            _ => KV_ROW / 8,
         };
         let config = LaunchConfig {
             grid_dim: (u32::try_from(rows)?, 1, 1),
@@ -2431,6 +2679,7 @@ impl Attention {
             KvData::Bf16 { .. } => &self.kv_append_rows_packed,
             KvData::Fp8 { .. } => &self.kv_append_rows_packed_fp8,
             KvData::Nvfp4 { .. } => &self.kv_append_rows_packed_fp4,
+            KvData::Nvfp4G32 { .. } => &self.kv_append_rows_packed_fp4_g32,
         };
         let mut launch = stream.launch_builder(function);
         launch
@@ -2519,15 +2768,16 @@ impl Attention {
             input_keys == 0
                 || matches!(
                     cache.format(),
-                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4
+                    KvFormat::Bf16 | KvFormat::Fp8 | KvFormat::Nvfp4 | KvFormat::Nvfp4G32
                 ),
-            "sliding caches are BF16, FP8 or NVFP4"
+            "sliding caches are BF16, FP8, NVFP4 or NVFP4-G32"
         );
         let function = match (&*cache.data, products) {
             (KvData::Bf16 { .. }, _) => &self.prefill_packed,
             (KvData::Fp8 { .. }, Products::Bf16) => &self.prefill_packed_fp8,
             (KvData::Fp8 { .. }, Products::Fp8 | Products::Fp4) => &self.prefill_packed_fp8_mma,
             (KvData::Nvfp4 { .. }, _) => &self.prefill_packed_fp4,
+            (KvData::Nvfp4G32 { .. }, _) => &self.prefill_packed_fp4_g32,
         };
         let mut launch = stream.launch_builder(function);
         launch

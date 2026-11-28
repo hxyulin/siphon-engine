@@ -212,6 +212,8 @@ pub struct AttentionWeights {
     pub rel_clip_scale: CudaSlice<bf16>,
     /// `[d_rel, rel_extent]`.
     pub rel_table: CudaSlice<bf16>,
+    /// Transposed `[rel_extent, d_rel]` copy of [`Self::rel_table`] for fused prefill bias.
+    pub rel_table_t: CudaSlice<bf16>,
     /// Convolution weights for keys and values before they are cached.
     pub kv_conv: KvConv,
 }
@@ -916,6 +918,18 @@ impl AttentionWeights {
                 v_proj: Some(loader.bf16(&format!("{a}.v_sconv.weight_proj"), &proj_shape)?),
             }
         };
+        let rel_host = loader.bf16_host(
+            &format!("{a}.rel_logits_proj.proj"),
+            &[config.d_rel, config.rel_extent],
+        )?;
+        let mut rel_t_host = vec![bf16::ZERO; rel_host.len()];
+        for k in 0..config.d_rel {
+            for col in 0..config.rel_extent {
+                rel_t_host[col * config.d_rel + k] = rel_host[k * config.rel_extent + col];
+            }
+        }
+        let rel_table = loader.stream.clone_htod(&rel_host)?;
+        let rel_table_t = loader.stream.clone_htod(&rel_t_host)?;
         Ok(Self {
             q: Some(loader.bf16(&format!("{a}.wq_du.weight"), &[q_dim, hidden])?),
             k: Some(loader.bf16(&format!("{a}.wk_dv.weight"), &[kv_dim, hidden])?),
@@ -930,10 +944,8 @@ impl AttentionWeights {
             q_clip_scale: loader.bf16(&format!("{a}.q_l2_clip.scale"), &[heads, head_dim])?,
             rel_clip_scale: loader
                 .bf16(&format!("{a}.rel_l2_clip.scale"), &[heads, config.d_rel])?,
-            rel_table: loader.bf16(
-                &format!("{a}.rel_logits_proj.proj"),
-                &[config.d_rel, config.rel_extent],
-            )?,
+            rel_table,
+            rel_table_t,
             kv_conv,
         })
     }

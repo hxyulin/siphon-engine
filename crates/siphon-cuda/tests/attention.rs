@@ -299,7 +299,11 @@ fn stored(format: KvFormat, x: bf16) -> f32 {
     match format {
         KvFormat::Bf16 => x.to_f32(),
         KvFormat::Fp8 => e4m3_value(e4m3_from_f32(x.to_f32())),
-        KvFormat::Nvfp4 | KvFormat::Nvfp4All | KvFormat::Mixed => {
+        KvFormat::Nvfp4
+        | KvFormat::Nvfp4All
+        | KvFormat::Nvfp4G32
+        | KvFormat::Nvfp4G32All
+        | KvFormat::Mixed => {
             unimplemented!("NVFP4 rounds groups, not single values")
         }
     }
@@ -316,8 +320,9 @@ fn mxfp8_queries(q: &[bf16]) -> Vec<bf16> {
                 let amax = head.iter().fold(0f32, |m, x| m.max(x.to_f32().abs()));
                 let scale = amax * (1.0 / 448.0);
                 let inv = if amax > 0.0 { 448.0 / amax } else { 0.0 };
-                head.iter()
-                    .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() * inv)) * scale))
+                head.iter().map(move |x| {
+                    bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() * inv)) * scale)
+                })
             })
             .collect()
     } else {
@@ -327,9 +332,9 @@ fn mxfp8_queries(q: &[bf16]) -> Vec<bf16> {
                 let raw = amax / 448.0;
                 let exponent = ((raw.to_bits() + 0x007f_ffff) & 0x7f80_0000) >> 23;
                 let scale = f32::from_bits(exponent.max(1) << 23);
-                block
-                    .iter()
-                    .map(move |x| bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() / scale)) * scale))
+                block.iter().map(move |x| {
+                    bf16::from_f32(e4m3_value(e4m3_from_f32(x.to_f32() / scale)) * scale)
+                })
             })
             .collect()
     }
@@ -714,7 +719,14 @@ fn check_random(cache: KvCache, tokens: usize, checks: &[usize], seed: u64) -> a
         (Some(_), _) => "sliding",
         (None, KvFormat::Bf16) => "global",
         (None, KvFormat::Fp8) => "fp8 global",
-        (None, KvFormat::Nvfp4 | KvFormat::Nvfp4All | KvFormat::Mixed) => "nvfp4 global",
+        (
+            None,
+            KvFormat::Nvfp4
+            | KvFormat::Nvfp4All
+            | KvFormat::Nvfp4G32
+            | KvFormat::Nvfp4G32All
+            | KvFormat::Mixed,
+        ) => "nvfp4 global",
     };
     run_decode(
         &gpu,
@@ -918,7 +930,9 @@ fn cache_row(
                 .clone_dtoh(&x.slice(row.clone()))
                 .map(|v| v.iter().map(|&b| u16::from(b)).collect())
         }),
-        KvData::Nvfp4 { .. } => anyhow::bail!("NVFP4 rows are not elements"),
+        KvData::Nvfp4 { .. } | KvData::Nvfp4G32 { .. } => {
+            anyhow::bail!("NVFP4 rows are not elements")
+        }
     };
     Ok([k?, v?])
 }
@@ -1189,6 +1203,13 @@ fn assert_same_cache(stream: &Arc<CudaStream>, a: &KvCache, b: &KvCache) -> anyh
                 keys: keys_b,
                 values: values_b,
             },
+        )
+        | (
+            KvData::Nvfp4G32 { keys, values },
+            KvData::Nvfp4G32 {
+                keys: keys_b,
+                values: values_b,
+            },
         ) => {
             stream.clone_dtoh(keys)? == stream.clone_dtoh(keys_b)?
                 && stream.clone_dtoh(values)? == stream.clone_dtoh(values_b)?
@@ -1242,7 +1263,14 @@ fn check_prefill_with(
         (None, KvFormat::Bf16) => "global",
         (None, KvFormat::Fp8) if fp8_products => "fp8 global, fp8 products",
         (None, KvFormat::Fp8) => "fp8 global",
-        (None, KvFormat::Nvfp4 | KvFormat::Nvfp4All | KvFormat::Mixed) => "nvfp4 global",
+        (
+            None,
+            KvFormat::Nvfp4
+            | KvFormat::Nvfp4All
+            | KvFormat::Nvfp4G32
+            | KvFormat::Nvfp4G32All
+            | KvFormat::Mixed,
+        ) => "nvfp4 global",
     };
 
     let tokens: usize = chunks.iter().map(|c| c.rows).sum();
@@ -1700,13 +1728,8 @@ fn check_prefill_fp4_mma(capacity: usize, chunks: &[Chunk], seed: u64) -> anyhow
                     sinks: sinks[i * HEADS..(i + 1) * HEADS].to_vec(),
                 };
                 let history = ..(position + 1) * ROW;
-                let (want, magnitude) = reference(
-                    &query,
-                    &ref_k[history],
-                    &stored_v[history],
-                    None,
-                    position,
-                );
+                let (want, magnitude) =
+                    reference(&query, &ref_k[history], &stored_v[history], None, position);
                 let row_mma = &got_mma[span.clone()];
                 let row_fp4 = &got_fp4[span.clone()];
                 let row_bf16 = &got_bf16[span];

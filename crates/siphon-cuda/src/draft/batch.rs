@@ -11,7 +11,9 @@ use cudarc::driver::{
 };
 use half::bf16;
 
-use super::{Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, QuantizedFc, QuantizedWeight, STEPS};
+use super::{
+    Arch, DFLASH2_SLOTS, Draft, DraftRings, EPS, Matrix, QuantizedFc, QuantizedWeight, STEPS,
+};
 use crate::{
     DeviceIn,
     gpu::{PinnedBuf, sync_event},
@@ -253,7 +255,12 @@ impl BatchDflash2 {
         self.graphs.len()
     }
 
-    fn ensure_slot(&mut self, stream: &Arc<CudaStream>, layers: usize, slot: usize) -> anyhow::Result<()> {
+    fn ensure_slot(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        layers: usize,
+        slot: usize,
+    ) -> anyhow::Result<()> {
         while self.extra_slots.len() < slot {
             let caches = (0..layers)
                 .map(|_| KvCache::with_format(stream, DFLASH2_SLOTS, self.fp8_kv))
@@ -297,7 +304,10 @@ type BatchProduct<'a> = (
 /// Runs one or more `out = x @ W^T` products through `LinearRows` (NVFP4 / FP8 / BF16) or
 /// `LinearFp8::gemm_raw` (when `fp8_dense` is set, `m >= 48`, and every product supplies an
 /// FP8 weight with `k % 128 == 0`).
-#[expect(clippy::too_many_arguments, reason = "kernel handles, scratch, and product slice")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "kernel handles, scratch, and product slice"
+)]
 fn run_rows_products(
     linear_rows: &LinearRows,
     linear_fp8: &LinearFp8,
@@ -399,7 +409,10 @@ impl Draft {
         max_seqs: usize,
         max_slot: usize,
     ) -> anyhow::Result<()> {
-        ensure!(self.is_dflash2(), "batched drafting needs a DFlash 2 drafter");
+        ensure!(
+            self.is_dflash2(),
+            "batched drafting needs a DFlash 2 drafter"
+        );
         let max_seqs = max_seqs.clamp(1, MAX_BATCH_SEQS);
         let layers = self.arch.layers();
         let base_ld = self
@@ -640,8 +653,14 @@ impl Draft {
             (1..=MAX_BATCH_SEQS).contains(&seqs),
             "batched DFlash 2 takes 1 to {MAX_BATCH_SEQS} sequences, not {seqs}"
         );
-        ensure!(anchors.len() == seqs && samplings.len() == seqs, "mismatched batch lengths");
-        ensure!((1..=STEPS).contains(&steps), "{steps} drafts, expected 1 to {STEPS}");
+        ensure!(
+            anchors.len() == seqs && samplings.len() == seqs,
+            "mismatched batch lengths"
+        );
+        ensure!(
+            (1..=STEPS).contains(&steps),
+            "{steps} drafts, expected 1 to {STEPS}"
+        );
         check_distinct_slots(slots)?;
         let max_slot = slots.iter().copied().max().unwrap_or(0);
         let cap = self
@@ -685,7 +704,10 @@ impl Draft {
     /// tokens for all `slots` concurrently, reading `taps`, `results` and `anchors` directly
     /// from `Model::start_verify_batch`'s device buffers inside the captured CUDA graph
     /// without host synchronization or extra tap copies.
-    #[expect(clippy::too_many_arguments, reason = "explicit device inputs from verify_batch")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit device inputs from verify_batch"
+    )]
     pub fn batch_commit_and_draft(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -704,9 +726,18 @@ impl Draft {
             (1..=MAX_BATCH_SEQS).contains(&seqs),
             "batched DFlash 2 takes 1 to {MAX_BATCH_SEQS} sequences, not {seqs}"
         );
-        ensure!(starts.len() == seqs && samplings.len() == seqs, "mismatched batch lengths");
-        ensure!((1..=BLOCK).contains(&verify_width), "bad verify_width {verify_width}");
-        ensure!((1..=STEPS).contains(&draft_steps), "bad draft_steps {draft_steps}");
+        ensure!(
+            starts.len() == seqs && samplings.len() == seqs,
+            "mismatched batch lengths"
+        );
+        ensure!(
+            (1..=BLOCK).contains(&verify_width),
+            "bad verify_width {verify_width}"
+        );
+        ensure!(
+            (1..=STEPS).contains(&draft_steps),
+            "bad draft_steps {draft_steps}"
+        );
         check_distinct_slots(slots)?;
         let row_len = self.row_len();
         let max_slot = slots.iter().copied().max().unwrap_or(0);
@@ -773,7 +804,11 @@ impl Draft {
 
     /// Ready-to-verify tokens `[seqs * width]` produced by the last batched DFlash 2 round
     /// (`width = draft_steps + 1`), sequence-major `[anchor, d0..d_{steps-1}]`.
-    pub fn batch_verify_tokens(&self, seqs: usize, width: usize) -> anyhow::Result<CudaView<'_, i32>> {
+    pub fn batch_verify_tokens(
+        &self,
+        seqs: usize,
+        width: usize,
+    ) -> anyhow::Result<CudaView<'_, i32>> {
         let b = self
             .batch
             .as_ref()
@@ -848,8 +883,11 @@ impl Draft {
                     idx += 2;
                 }
             }
-            b.host_cache_table
-                .copy_to_device(stream, table_len, &mut b.cache_table.slice_mut(..table_len))?;
+            b.host_cache_table.copy_to_device(
+                stream,
+                table_len,
+                &mut b.cache_table.slice_mut(..table_len),
+            )?;
             b.members = slots.to_vec();
             b.padded_seqs = padded_seqs;
         }
@@ -912,8 +950,7 @@ impl Draft {
             });
         if needs_capture {
             stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-            let enqueued =
-                self.enqueue_batch_dflash2(stream, shared, seqs, commit, draft_steps);
+            let enqueued = self.enqueue_batch_dflash2(stream, shared, seqs, commit, draft_steps);
             // End the capture even when enqueueing failed, so the stream is usable again.
             let graph = stream.end_capture(CUgraphInstantiate_flags(0));
             enqueued.context("capturing batched DFlash 2 round")?;
@@ -1027,9 +1064,17 @@ impl Draft {
                 prods.push((lw.k.as_ref(), q.map(|f| f.k), ck));
                 prods.push((lw.v.as_ref(), q.map(|f| f.v), cv));
             }
-            run_rows_products(lr, lfp8, &mut b.dense, fp8_dense, stream, &normed, cm, &mut prods)?;
-            let k_norms: Vec<&CudaSlice<bf16>> =
-                weights.layers.iter().map(|l| &l.k_norm).collect();
+            run_rows_products(
+                lr,
+                lfp8,
+                &mut b.dense,
+                fp8_dense,
+                stream,
+                &normed,
+                cm,
+                &mut prods,
+            )?;
+            let k_norms: Vec<&CudaSlice<bf16>> = weights.layers.iter().map(|l| &l.k_norm).collect();
             let controls = b.controls.slice(..seqs * CONTROL);
             k.dflash_commit_rope_store_batch(
                 stream,
@@ -1387,8 +1432,8 @@ impl Draft {
             &b.cand.slice(..sm * TOP_K),
             &b.unary.slice(..sm * TOP_K),
             &b.hp.slice(..sm * RANK),
-            &weights.selector.predecessor,
-            &weights.selector.successor,
+            weights.selector.predecessor.slice(),
+            weights.selector.successor.slice(),
             &controls,
             seqs,
             draft_steps,

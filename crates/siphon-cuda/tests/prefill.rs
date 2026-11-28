@@ -171,6 +171,12 @@ fn nvfp4_prefill_matches_stepping() -> anyhow::Result<()> {
     prefill_matches_stepping_with(KvFormat::Nvfp4, WeightFormat::Bf16, false)
 }
 
+#[test]
+#[ignore = "needs the checkpoint (SIPHON_MODEL) and about 20 GB of GPU memory"]
+fn nvfp4_g32_prefill_matches_stepping() -> anyhow::Result<()> {
+    prefill_matches_stepping_with(KvFormat::Nvfp4G32, WeightFormat::Bf16, false)
+}
+
 /// Full-model `chunk=4096` prefill parity against `chunk=2048` on a 4096-token prompt
 /// with tuned prefill settings (`ea=quantized`, `pd=fp8`).
 #[test]

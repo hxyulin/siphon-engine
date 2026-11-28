@@ -16,11 +16,13 @@ const SMALL_STEP: usize = 8 * 1024;
 const LARGE_STEP: usize = 64 * 1024;
 
 const WEIGHT_FORMATS: [WeightFormat; 2] = [WeightFormat::Fp8, WeightFormat::Bf16];
-pub const KV_FORMATS: [KvFormat; 5] = [
+pub const KV_FORMATS: [KvFormat; 7] = [
     KvFormat::Fp8,
     KvFormat::Bf16,
     KvFormat::Nvfp4,
     KvFormat::Nvfp4All,
+    KvFormat::Nvfp4G32,
+    KvFormat::Nvfp4G32All,
     KvFormat::Mixed,
 ];
 

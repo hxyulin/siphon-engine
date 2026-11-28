@@ -77,7 +77,9 @@ fn visit_spans(visits: &[VisitState], stream: &CudaStream) -> Vec<DeviceSpan> {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
-                KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                KvData::Fp8 { keys, values }
+                | KvData::Nvfp4 { keys, values }
+                | KvData::Nvfp4G32 { keys, values } => {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
@@ -119,7 +121,11 @@ impl LocalState {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
-                Some(KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values }) => {
+                Some(
+                    KvData::Fp8 { keys, values }
+                    | KvData::Nvfp4 { keys, values }
+                    | KvData::Nvfp4G32 { keys, values },
+                ) => {
                     spans.push(DeviceSpan::of(keys, stream));
                     spans.push(DeviceSpan::of(values, stream));
                 }
@@ -179,9 +185,11 @@ impl LocalState {
             .map(|(ring, conv)| {
                 let ring = match ring.as_ref().filter(|r| !r.is_pooled()).map(KvCache::data) {
                     Some(KvData::Bf16 { keys, values }) => (keys.len() + values.len()) * 2,
-                    Some(KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values }) => {
-                        keys.len() + values.len()
-                    }
+                    Some(
+                        KvData::Fp8 { keys, values }
+                        | KvData::Nvfp4 { keys, values }
+                        | KvData::Nvfp4G32 { keys, values },
+                    ) => keys.len() + values.len(),
                     None => 0,
                 };
                 ring + conv.iter().map(|c| c.len() * 4).sum::<usize>()
@@ -207,7 +215,9 @@ impl Model {
                 KvData::Bf16 { keys, values } => {
                     (DeviceSpan::of(keys, stream), DeviceSpan::of(values, stream))
                 }
-                KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                KvData::Fp8 { keys, values }
+                | KvData::Nvfp4 { keys, values }
+                | KvData::Nvfp4G32 { keys, values } => {
                     (DeviceSpan::of(keys, stream), DeviceSpan::of(values, stream))
                 }
             };
@@ -364,6 +374,10 @@ impl Model {
                     | (
                         KvData::Nvfp4 { keys, values },
                         Some(KvData::Nvfp4 { keys: k, values: x }),
+                    )
+                    | (
+                        KvData::Nvfp4G32 { keys, values },
+                        Some(KvData::Nvfp4G32 { keys: k, values: x }),
                     ) => {
                         ensure!(k.len() == keys.len(), "the ring sizes differ");
                         stream.memcpy_dtod(keys, k)?;
@@ -419,6 +433,10 @@ impl Model {
                     | (
                         KvData::Nvfp4 { keys, values },
                         Some(KvData::Nvfp4 { keys: k, values: x }),
+                    )
+                    | (
+                        KvData::Nvfp4G32 { keys, values },
+                        Some(KvData::Nvfp4G32 { keys: k, values: x }),
                     ) => {
                         stream.memcpy_dtod(k, keys)?;
                         stream.memcpy_dtod(x, values)?;

@@ -23,7 +23,8 @@ pub use batch::{BATCH_ROWS, BATCH_VERIFY_MAX_ROWS, BatchVerifyTokens, PendingBat
 pub use prefill::{
     DEFAULT_PREFILL_ATTENTION, DEFAULT_PREFILL_CHUNK, FP8_ATTENTION_KEYS, HybridStepResult,
     HybridVerifyResult, ImageRows, ImageSource, MAX_PREFILL_CHUNK, PREFILL_LONG_CHUNK,
-    PackedPrefill, PendingHybridVerify, PrefillAttention, PrefillLogits, recommended_prefill_chunk,
+    PackedPrefill, PendingHybridVerify, PrefillAttention, PrefillLogits, TapsCallback,
+    recommended_prefill_chunk,
 };
 pub use prefix::{DeviceSpan, GlobalKv, LocalState};
 pub use verify::{
@@ -204,11 +205,20 @@ fn e4m3_to_f32(b: u8) -> f32 {
 
 /// The values of NVFP4 cache slots (`[slots, FP4_ROW]` bytes), as `[slots, 8, 128]`.
 fn fp4_to_f32(bytes: &[u8]) -> Vec<f32> {
+    fp4_to_f32_grouped::<{ attention::FP4_ROW }, 16>(bytes)
+}
+
+/// The values of group-32 NVFP4 cache slots (`[slots, FP4_G32_ROW]` bytes), as `[slots, 8, 128]`.
+fn fp4_g32_to_f32(bytes: &[u8]) -> Vec<f32> {
+    fp4_to_f32_grouped::<{ attention::FP4_G32_ROW }, 32>(bytes)
+}
+
+fn fp4_to_f32_grouped<const ROW: usize, const GROUP: usize>(bytes: &[u8]) -> Vec<f32> {
     const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let heads = attention::KV_HEADS;
     let dims = attention::HEAD_DIM;
-    let mut out = Vec::with_capacity(bytes.len() / attention::FP4_ROW * heads * dims);
-    for slot in bytes.as_chunks::<{ attention::FP4_ROW }>().0 {
+    let mut out = Vec::with_capacity(bytes.len() / ROW * heads * dims);
+    for slot in bytes.as_chunks::<ROW>().0 {
         let (data, scales) = slot.split_at(heads * dims / 2);
         for i in 0..heads * dims {
             let nibble = (data[i / 2] >> (4 * (i % 2))) & 0xf;
@@ -218,7 +228,7 @@ fn fp4_to_f32(bytes: &[u8]) -> Vec<f32> {
             } else {
                 -magnitude
             };
-            out.push(value * e4m3_to_f32(scales[i / 16]));
+            out.push(value * e4m3_to_f32(scales[i / GROUP]));
         }
     }
     out
@@ -227,6 +237,7 @@ fn fp4_to_f32(bytes: &[u8]) -> Vec<f32> {
 /// A device copy of everything a sequence keeps across tokens, from [`Model::save_state`]:
 /// the filled slots of every global KV cache, every sliding ring, every conv state and the
 /// position.
+#[derive(Debug)]
 pub struct SavedState {
     visits: Vec<(KvData, Vec<CudaSlice<f32>>)>,
     position: usize,
@@ -644,7 +655,10 @@ impl Model {
         let sliding_format = kv_format.sliding_format();
         let formats = config.cache_formats(passes, kv_format);
         let visit_layers = config.visit_layers(passes);
-        let sliding_count = visit_layers.iter().filter(|&&l| config.is_sliding(l)).count();
+        let sliding_count = visit_layers
+            .iter()
+            .filter(|&&l| config.is_sliding(l))
+            .count();
         let ring_slab = match (&kv_pool, sliding_count) {
             (Some(pool), n) if n > 0 => Some(RingSlab::reserve(
                 pool,
@@ -663,7 +677,14 @@ impl Model {
                     Some(slab) => {
                         let idx = ring_idx;
                         ring_idx += 1;
-                        KvCache::sliding_in_slab(&stream, window, window, sliding_format, slab, idx)?
+                        KvCache::sliding_in_slab(
+                            &stream,
+                            window,
+                            window,
+                            sliding_format,
+                            slab,
+                            idx,
+                        )?
                     }
                     None => {
                         KvCache::sliding_ring_with_format(&stream, window, window, sliding_format)?
@@ -677,7 +698,7 @@ impl Model {
                 }
             };
             // NVFP4 caches take rows already rounded to their values (`kv_round_bf16`).
-            let round = kv.format() == KvFormat::Nvfp4;
+            let round = matches!(kv.format(), KvFormat::Nvfp4 | KvFormat::Nvfp4G32);
             visits.push(VisitState {
                 kv,
                 conv: [
@@ -708,6 +729,7 @@ impl Model {
             )?;
         }
         let sample_one = SampleBuffers::new(&stream, 1)?;
+        let has_nvfp4_g32 = visits.iter().any(|v| v.kv.format() == KvFormat::Nvfp4G32);
         let has_nvfp4 = visits.iter().any(|v| v.kv.format() == KvFormat::Nvfp4);
         let prefill_dense = if weights.has_bf16_inputs() {
             Products::Bf16
@@ -732,7 +754,12 @@ impl Model {
                 chunk_attention: Products::Bf16,
                 prefill_dense,
                 prefill_dense_o,
-                kv_rounding: if has_nvfp4 {
+                kv_rounding: if has_nvfp4_g32 {
+                    KvRounding {
+                        quant: KvQuant::Nvfp4G32,
+                        ..KvRounding::default()
+                    }
+                } else if has_nvfp4 {
                     KvRounding {
                         quant: KvQuant::Nvfp4,
                         ..KvRounding::default()
@@ -962,7 +989,7 @@ impl Model {
             self.step_taps = None;
             self.verify = None;
             self.verify_graphs.iter_mut().for_each(|g| *g = None);
-        self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
+            self.verify_tree_graphs.iter_mut().for_each(|g| *g = None);
             self.batch = None;
             self.batch_graphs.iter_mut().for_each(|g| *g = None);
             self.batch_verify = None;
@@ -1197,7 +1224,9 @@ impl Model {
     pub fn set_kv_rounding(&mut self, rounding: KvRounding) -> anyhow::Result<()> {
         let on = rounding.quant != KvQuant::None;
         ensure!(
-            self.visits.iter().all(|v| v.kv.format() != KvFormat::Nvfp4),
+            self.visits
+                .iter()
+                .all(|v| !matches!(v.kv.format(), KvFormat::Nvfp4 | KvFormat::Nvfp4G32)),
             "NVFP4 caches store 4-bit values already; the rounding is for BF16 caches"
         );
         let layers = self.ctx.config.visit_layers(self.passes);
@@ -1277,6 +1306,10 @@ impl Model {
                         fp4_to_f32(&stream.clone_dtoh(keys)?),
                         fp4_to_f32(&stream.clone_dtoh(values)?),
                     ),
+                    KvData::Nvfp4G32 { keys, values } => (
+                        fp4_g32_to_f32(&stream.clone_dtoh(keys)?),
+                        fp4_g32_to_f32(&stream.clone_dtoh(values)?),
+                    ),
                 };
                 Ok(VisitSnapshot {
                     keys,
@@ -1330,6 +1363,13 @@ impl Model {
                             values: stream.clone_dtod(&values.slice(..len))?,
                         }
                     }
+                    KvData::Nvfp4G32 { keys, values } => {
+                        let len = keys.len() / v.kv.slots() * slots;
+                        KvData::Nvfp4G32 {
+                            keys: stream.clone_dtod(&keys.slice(..len))?,
+                            values: stream.clone_dtod(&values.slice(..len))?,
+                        }
+                    }
                 };
                 let conv = v
                     .conv
@@ -1355,7 +1395,12 @@ impl Model {
             state.visits.len(),
             self.visits.len()
         );
-        map_visits(&mut self.visits, self.ring_slab.as_mut(), state.position.max(1), stream)?;
+        map_visits(
+            &mut self.visits,
+            self.ring_slab.as_mut(),
+            state.position.max(1),
+            stream,
+        )?;
         for (v, (kv, conv)) in self.visits.iter_mut().zip(&state.visits) {
             // A ring is saved whole, a global cache up to the saved position.
             let ring = v.kv.window().is_some();
@@ -1367,7 +1412,8 @@ impl Model {
                     stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
                 }
                 (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: x })
-                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: x }) => {
+                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: x })
+                | (KvData::Nvfp4G32 { keys, values }, KvData::Nvfp4G32 { keys: k, values: x }) => {
                     ensure!(fits(k.len(), keys.len()), "the cache sizes differ");
                     stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
                     stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
@@ -1478,7 +1524,12 @@ impl Model {
             "the global KV caches are full at {position} tokens"
         );
         let stream = Arc::clone(&self.ctx.stream);
-        map_visits(&mut self.visits, self.ring_slab.as_mut(), position + 1, &stream)?;
+        map_visits(
+            &mut self.visits,
+            self.ring_slab.as_mut(),
+            position + 1,
+            &stream,
+        )?;
         let s = &mut self.scratch;
         stream.memcpy_htod(&[i32::try_from(token)?], &mut s.token)?;
         stream.memcpy_htod(
@@ -1541,7 +1592,10 @@ impl Model {
                 p.sample = Some(SampleBuffers::new(&stream, p.rows)?);
             }
             if p.head_logits.is_none() {
-                p.head_logits = Some(zeros(&stream, p.rows * self.ctx.config.vocab_size)?);
+                p.head_logits = Some(crate::gpu::ArenaBuf::Owned(zeros(
+                    &stream,
+                    p.rows * self.ctx.config.vocab_size,
+                )?));
             }
             p.head_partials = None;
             p.head_fp8 = None;
@@ -1874,9 +1928,12 @@ impl Model {
                     &mut s.capped,
                     cfg.final_logit_softcapping,
                 )?;
-                ctx.kernels
-                    .misc
-                    .argmax_wide_f32(&ctx.stream, &s.capped, &mut s.next, &mut s.argmax)?;
+                ctx.kernels.misc.argmax_wide_f32(
+                    &ctx.stream,
+                    &s.capped,
+                    &mut s.next,
+                    &mut s.argmax,
+                )?;
                 t.logits = ctx.stream.clone_dtoh(&s.capped)?;
             } else {
                 let n_partials = ctx.kernels.linear_nvfp4.gemv_argmax(
@@ -2189,19 +2246,18 @@ impl Ctx {
         window: Option<Window>,
     ) -> anyhow::Result<()> {
         let w = &self.weights.layers[layer];
-        let mut prefetch: Vec<&dyn Prefetch> = if let Some(o) =
-            w.fp8.as_ref().and_then(|f| f.o.as_ref())
-        {
-            vec![o]
-        } else if self.weights.output == OutputProjection::Mxfp8
-            && let Some(o) = w.mxfp8_o.as_ref()
-        {
-            vec![o]
-        } else if let Some(o) = w.attention.o.as_ref() {
-            vec![o]
-        } else {
-            Vec::new()
-        };
+        let mut prefetch: Vec<&dyn Prefetch> =
+            if let Some(o) = w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
+                vec![o]
+            } else if self.weights.output == OutputProjection::Mxfp8
+                && let Some(o) = w.mxfp8_o.as_ref()
+            {
+                vec![o]
+            } else if let Some(o) = w.attention.o.as_ref() {
+                vec![o]
+            } else {
+                Vec::new()
+            };
         if let Some(gates) = w.message_gates.as_ref().filter(|_| gated) {
             prefetch.extend(if rows {
                 gates[3].rows_matrices()
@@ -2434,7 +2490,10 @@ impl Ctx {
     /// `_self_attention` in MLX-LM's sliding and full decoder layers, and the normalized
     /// visit input into `a.normed`. Returns whether the layer has one shared input, in
     /// `a.qkv_in[0]`.
-    #[expect(clippy::too_many_lines, reason = "fused and unfused attention-input paths")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "fused and unfused attention-input paths"
+    )]
     fn attention_inputs(
         &self,
         w: &LayerWeights,
@@ -2680,10 +2739,9 @@ impl Ctx {
                 Start::Early,
             )
         } else {
-            let o = a
-                .o
-                .as_ref()
-                .context("BF16 W_o was released; quantized copy required")?;
+            let o =
+                a.o.as_ref()
+                    .context("BF16 W_o was released; quantized copy required")?;
             self.kernels.linear.gemv_bf16(
                 &self.stream,
                 &mut [Gemv::new(o, &t.gated, &mut t.proj)],
@@ -2822,9 +2880,7 @@ impl Ctx {
         if let Some(scratch) = dense
             && use_fp8_gemm
         {
-            if self.prefill_dense_o == Products::Fp8
-                && products.iter().all(|p| p.mxfp8.is_some())
-            {
+            if self.prefill_dense_o == Products::Fp8 && products.iter().all(|p| p.mxfp8.is_some()) {
                 let mut gemms: Vec<Mxfp8Gemm<'_>> = products
                     .iter_mut()
                     .filter_map(|p| {
@@ -2940,7 +2996,10 @@ impl Ctx {
     /// it first quantizes `x` into `quantized` (unless `prequantized` is true, when a fused
     /// norm-quant epilogue has already populated `quantized`) and runs the quantized forms
     /// instead.
-    #[expect(clippy::too_many_arguments, reason = "expert projection inputs and flags")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "expert projection inputs and flags"
+    )]
     fn moe_rows(
         &self,
         x: &CudaView<'_, bf16>,

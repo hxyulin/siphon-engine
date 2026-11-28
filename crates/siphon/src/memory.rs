@@ -622,8 +622,8 @@ impl Planner {
                 let verify = invariant_rows_scratch(c, VERIFY_ROWS, inputs.sms)
                     + VERIFY_ROWS * taps * hidden * 2
                     + visits.len() * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
-                    // The speculator's prompt tail, twice, and its run of plain steps.
-                    + (2 * TAIL_ROWS + PLAIN_RUN_ROWS) * taps * hidden * 2;
+                    // The speculator's run of plain steps (prompt tail stays in host RAM).
+                    + PLAIN_RUN_ROWS * taps * hidden * 2;
                 // A device copy of the BF16 LM head for the exact base logits, which the
                 // target keeps in host memory whenever the LM head is quantized.
                 let head_copy = if lm_head != LmHeadFormat::Bf16
@@ -691,9 +691,9 @@ impl Planner {
                 + spec_rows * taps * hidden * 2
                 + visits.len() * spec_seqs * VERIFY_ROWS * (2 * kv_dims + 2 * hidden) * 2
                 + sliding_visits * spec_seqs * VERIFY_ROWS * 2 * ring_row_bytes;
-            // Batched DFlash 2 activations, split-KV partials, shortlist/vocab logits, and
-            // pre-allocated MXFP8 dense GEMM scratch (`BatchDflash2::dense`, ~2.3 MiB).
-            let draft_scratch = 224 << 20;
+            // Batched DFlash 2 activations, adaptive split-KV partials, shortlist/vocab logits,
+            // topk scratch, and optional MXFP8 dense GEMM scratch (`BatchDflash2::new`).
+            let draft_scratch = batch_dflash2_scratch(c, d, *approx, spec_seqs, inputs.sms);
             extra_draft_rings + verify_bufs + draft_scratch
         } else {
             0
@@ -1073,63 +1073,126 @@ fn max_blocks(c: &TextConfig) -> usize {
         + starts(l.core_end..c.num_hidden_layers)
 }
 
-/// Core per-chunk buffers of `PrefillScratch::new` without the LM head outputs.
-fn rows_scratch_core(c: &TextConfig, rows: usize, sms: usize) -> usize {
+/// Byte size of the two-region phase-aliased transient arena inside `PrefillScratch::new`.
+/// Mirrors the exact `ArenaCursor` layout in `siphon-cuda/src/model/prefill.rs`.
+fn rows_scratch_arena(c: &TextConfig, rows: usize, invariant: bool) -> usize {
+    const ALIGN: usize = 256;
+    let align_add = |off: usize, bytes: usize| off.next_multiple_of(ALIGN) + bytes.max(1);
+
     let hidden = c.hidden_size;
     let heads = c.num_attention_heads;
     let q_dims = heads * c.head_dim;
     let kv_dims = c.num_key_value_heads * c.head_dim;
+    let rel_dims = heads * c.d_rel;
+    let bias_dims = heads * c.rel_extent;
     let dynamic = c.num_key_value_heads * c.sconv_kernel_size;
     let top_k = c.num_experts_per_tok;
     let width = c.intermediate_size;
-    let experts = c.n_routed_experts;
+    let rank = c.loop_config.gate_rank;
+    let gate_out_slots = if invariant { 3 } else { 1 };
+
+    // Region A: cross-sub-phase buffers (`qkv_in`, `q/k/v`, `mlp_input/mlp_x`, `final/logits`).
+    let a_qkv_in = (0..3).fold(0, |o, _| align_add(o, rows * hidden * 2));
+    let a_qkv = align_add(
+        align_add(align_add(0, rows * q_dims * 2), rows * kv_dims * 2),
+        rows * kv_dims * 2,
+    );
+    let a_mlp = align_add(align_add(0, rows * hidden * 4), rows * hidden * 2);
+    let head_logits_len = if invariant {
+        rows * c.vocab_size
+    } else {
+        HEAD_ROWS * c.vocab_size
+    };
+    let a_head = align_add(align_add(0, rows * hidden * 2), head_logits_len * 2);
+    let region_b = a_qkv_in.max(a_qkv).max(a_mlp).max(a_head);
+
+    // Region B: strictly disjoint per-phase buffers.
+    let b_embed = align_add(region_b, rows * hidden * 2);
+
+    let b_gate_shared = align_add(
+        align_add(region_b, gate_out_slots * rows * hidden * 4),
+        4 * rows * rank * 2,
+    );
+    let mut b_gate_a = align_add(b_gate_shared, rows * 3 * hidden * 4);
+    for _ in 0..3 {
+        b_gate_a = align_add(b_gate_a, rows * 2 * hidden * 2);
+    }
+
+    let mut b_attn = align_add(region_b, rows * q_dims * 2);
+    b_attn = align_add(b_attn, rows * heads * 2);
+    b_attn = align_add(b_attn, rows * rel_dims * 2);
+    b_attn = align_add(b_attn, rows * bias_dims * 2);
+    let b_attn_raw = align_add(
+        align_add(
+            align_add(align_add(b_attn, rows * q_dims * 2), rows * rel_dims * 2),
+            rows * dynamic * 2,
+        ),
+        rows * dynamic * 2,
+    );
+    let b_attn_out = align_add(b_attn, rows * q_dims * 2);
+    let b_attn_end = b_attn_raw.max(b_attn_out);
+
+    let mut b_moe = align_add(region_b, rows * c.n_routed_experts * 4);
+    b_moe = align_add(b_moe, rows * top_k * 4);
+    b_moe = align_add(b_moe, rows * top_k * 4);
+    b_moe = align_add(b_moe, rows * top_k * width * 2);
+    b_moe = align_add(b_moe, rows * top_k * hidden * 2);
+    b_moe = align_add(b_moe, rows * hidden * 2);
+
+    let b_head = if invariant {
+        region_b
+    } else {
+        align_add(region_b, HEAD_ROWS * c.unpadded_vocab_size * 4)
+    };
+
+    b_embed.max(b_gate_a).max(b_attn_end).max(b_moe).max(b_head)
+}
+
+/// Persistent per-chunk buffers of `PrefillScratch::new` shared by prefill and invariant chunks.
+fn rows_scratch_persistent(c: &TextConfig, rows: usize) -> usize {
+    let hidden = c.hidden_size;
+    let kv_dims = c.num_key_value_heads * c.head_dim;
+    let top_k = c.num_experts_per_tok;
     let blocks = max_blocks(c);
-    let bf16_per_row = 9 * hidden // embedded, hidden, out, prelude, qkv_in, mlp_x, final, proj
-        + 4 * 2 * hidden // the gates' inputs
-        + 4 * c.loop_config.gate_rank
-        + 4 * kv_dims // k_raw, v_raw, k, v
-        + 2 * dynamic
-        + 5 * q_dims // q_raw, gate, q, out, gated
-        + 2 * heads * c.d_rel
-        + heads
-        + heads * c.rel_extent
-        + top_k * width
-        + top_k * hidden
-        + hidden; // combined
-    let f32_per_row = 2 * blocks * hidden // blocks, bank
-        + hidden // bank_normed
-        + 4 * FUSED_MAX_CANDIDATES
-        + 3 * hidden // attention_inputs
-        + hidden // the gates' output
-        + 2 * hidden // residual, mlp_input
-        + experts
-        + ROUTER_SPLITS * experts
-        + 2 * top_k; // indices, weights
+    // Persistent BF16: hidden, out, prelude_hidden, proj, gate.inputs[3] (2*hidden), k_raw, v_raw.
+    let bf16_per_row = 6 * hidden + 2 * kv_dims;
+    // Persistent F32: blocks, bank, bank_normed, residual, message_probs (1 looped slot).
+    let f32_per_row = 2 * blocks * hidden + hidden + hidden + 4 * FUSED_MAX_CANDIDATES;
+    let pairs = rows * top_k;
+    rows * (2 * bf16_per_row + 4 * f32_per_row + 4) + 4 * (1 + pairs + rows)
+}
+
+/// `PrefillScratch::new` for a non-invariant prefill chunk of `rows` rows, including the
+/// phase-aliased arena (which covers `HEAD_ROWS` of `head_logits` and `head_capped`),
+/// flash prefill attention partials, and MoE router/grouping/quantized activation scratch.
+fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
+    let hidden = c.hidden_size;
+    let heads = c.num_attention_heads;
+    let top_k = c.num_experts_per_tok;
+    let width = c.intermediate_size;
+    let experts = c.n_routed_experts;
     let pairs = rows * top_k;
     let quantized_in = rows * hidden;
     let quantized = pairs * width.max(hidden / top_k);
-    let per_rows = rows * (2 * bf16_per_row + 4 * f32_per_row + 4)
-        + 4 * (1 + pairs + rows) // expert counters
+    let prefill_only = rows * ROUTER_SPLITS * experts * 4
         + 4 * pairs // perm
         + 16 * pairs.min(pairs / 64 + experts) // tiles
         + quantized_in + quantized_in / 16 + 4 * rows
         + quantized + quantized / 16 + 4 * pairs
-        + 4 * (rows * (heads / c.num_key_value_heads)).div_ceil(128) * c.num_key_value_heads;
-    let fixed = 4 * 2 * sms * PREFILL_SLOT + 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2);
-    per_rows + fixed
-}
-
-/// `PrefillScratch::new` for a non-invariant prefill chunk of `rows` rows, including
-/// `HEAD_ROWS` of BF16 `head_logits` and F32 `head_capped` for `PrefillLogits::All`/`Every`.
-fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
-    rows_scratch_core(c, rows, sms) + HEAD_ROWS * (c.vocab_size * 2 + c.unpadded_vocab_size * 4)
+        + 4 * (rows * (heads / c.num_key_value_heads)).div_ceil(128) * c.num_key_value_heads
+        + 4 * 2 * sms * PREFILL_SLOT
+        + (8 << 20);
+    rows_scratch_persistent(c, rows) + rows_scratch_arena(c, rows, false) + prefill_only
 }
 
 /// `PrefillScratch::new` for an invariant chunk (`verify`, `batch`, `batch_verify`):
-/// never allocates F32 `head_capped` (sampling reads BF16 `head_logits` with inline
-/// softcap; greedy runs fused tile-argmax into tiny partial buffers).
-fn invariant_rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
-    rows_scratch_core(c, rows, sms) + invariant_scratch(c, rows)
+/// omits prefill-only attention partials, MoE grouping/quantized scratch, and F32 `head_capped`.
+fn invariant_rows_scratch(c: &TextConfig, rows: usize, _sms: usize) -> usize {
+    let base_rows_attn = 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2);
+    rows_scratch_persistent(c, rows)
+        + rows_scratch_arena(c, rows, true)
+        + base_rows_attn
+        + invariant_scratch(c, rows)
 }
 
 /// The MXFP8 inputs of a prefill chunk's FP8 dense products (`GateRows::dense`): four
@@ -1141,20 +1204,17 @@ fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
 }
 
 /// What `PrefillScratch::new` adds for an invariant chunk (verify / batch / batch_verify):
-/// every looped layer's message weights and normalized messages, an output for each of the
-/// 3 gates one launch runs (`misc::GATE_SLOTS`), BF16 `head_logits` (worst case when
-/// sampling is enabled; greedy uses even smaller tile-argmax partials), and wide-row sync
-/// headroom.
+/// every looped layer's message weights and normalized messages, multi-row attention partials
+/// past 8 rows, wide-row sync headroom, and opt-in FP8 dense scratch at 48+ rows.
+/// (`gate.out` and `head_logits` are accounted for inside `rows_scratch_arena`.)
 fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     let hidden = c.hidden_size;
     let looped = c.loop_config.core_end - c.loop_config.core_start;
-    // The multi-row attention's partials and counters past the 8 rows `rows_scratch_core`
+    // The multi-row attention's partials and counters past the 8 rows `invariant_rows_scratch`
     // counts, for a batched step's rows.
     let attention = rows.saturating_sub(VERIFY_ROWS)
         * (ROWS_ATTENTION_ROWS / VERIFY_ROWS * (c.head_dim + 2) * 4
             + 2 * c.num_key_value_heads * 4);
-    // BF16 `head_logits` when sampling is enabled (0 bytes of F32 `head_capped`!).
-    let head_logits = rows * c.vocab_size * 2;
     // Above 8 rows, `ExpertsRows::sync_len` adds grouped routing metadata (`ExpertRowsMeta`).
     let extra_sync = if rows > 8 {
         let base = 1 + rows * (c.num_experts_per_tok + 1);
@@ -1172,11 +1232,69 @@ fn invariant_scratch(c: &TextConfig, rows: usize) -> usize {
     } else {
         0
     };
-    rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2 + 2 * hidden * 4)
+    rows * ((looped - 1) * 4 * FUSED_MAX_CANDIDATES * 4 + 4 * looped * hidden * 2)
         + attention
-        + head_logits
         + extra_sync
         + dense
+}
+
+/// Device bytes of `BatchDflash2::new` scratch for `max_seqs` concurrent sequences.
+fn batch_dflash2_scratch(
+    c: &TextConfig,
+    d: &DraftShape,
+    approx: DraftApprox,
+    max_seqs: usize,
+    sms: usize,
+) -> usize {
+    const BLOCK: usize = DRAFT_STEPS + 1;
+    const CONV_COEFFS: usize = 576;
+    const TOP_K: usize = 16;
+    const RANK: usize = 256;
+    const MAX_SPLITS: usize = 17;
+    const MAX_GROUP: usize = 4;
+
+    let hidden = c.hidden_size;
+    let kv_dims = c.num_key_value_heads * c.head_dim;
+    let max_rows = max_seqs * BLOCK;
+    let max_steps = max_seqs * DRAFT_STEPS;
+    let base_ld = if approx.shortlist {
+        shortlist_capacity(c.unpadded_vocab_size, c.vocab_size)
+    } else {
+        c.vocab_size
+    };
+    // Per-row BF16 activations (ctx_raw, ctx_normed, residual, h, conv, o, mlp, y, q, attn,
+    // k, v, gate, up, act, coef_attention, coef_mlp, ctx_k/ctx_v per layer).
+    let act_bf16 = max_rows
+        * (8 * hidden
+            + 2 * d.q_width
+            + 3 * d.mlp_width
+            + 2 * kv_dims
+            + 2 * CONV_COEFFS
+            + d.layers * 2 * kv_dims)
+        * 2;
+    // Per-step proposal & selector buffers (`y_steps`, `base`, `hp`, `cand`, `unary`, `q_probs`,
+    // `ids`, `confidence`) plus `TopkScratch::new_for_rows` (64 blocks * 16 * 8 B/row).
+    let step_bufs = max_steps
+        * (hidden * 2 + base_ld * 2 + RANK * 2 + TOP_K * (4 + 4 + 4) + 8 + 64 * TOP_K * 8);
+    // Adaptive split-KV attention partials (`BatchAttentionScratch::for_adaptive`): bounded by
+    // `min(max_seqs * MAX_SPLITS, (2 * sms) / kv_heads + max_seqs)` slices.
+    let active_slots = (2 * sms).max(c.num_key_value_heads);
+    let seq_splits = (max_seqs * MAX_SPLITS)
+        .min(active_slots / c.num_key_value_heads + max_seqs)
+        .max(1);
+    let attn_partials =
+        seq_splits * c.num_key_value_heads * BLOCK * MAX_GROUP * (c.head_dim + 2) * 4;
+    // Optional MXFP8 dense GEMM scratch when `max_rows >= BATCH_FP8_DENSE_MIN_ROWS`.
+    let dense = if max_rows >= BATCH_FP8_DENSE_MIN_ROWS {
+        let max_k = (d.taps * hidden).max(d.q_width).max(d.mlp_width);
+        let vals = max_rows * max_k;
+        vals + vals / 32
+    } else {
+        0
+    };
+    // Small control/race tables + 96 MiB CUDA graph, host-cache page-table, and cuBLASLt
+    // workspace headroom for batched spec.
+    act_bf16 + step_bufs + attn_partials + dense + (96 << 20)
 }
 
 /// The bundled draft's shape: the checkpoint's tensors outside the text and vision models
@@ -1211,7 +1329,20 @@ fn dflash_shape(dir: &Path, hidden: usize) -> anyhow::Result<DraftShape> {
     let dflash2 =
         config.pointer("/architectures/0").and_then(|v| v.as_str()) == Some("DFlash2DraftModel");
     let checkpoint = Checkpoint::open(dir)?;
-    let weights = checkpoint.tensors().map(|(_, e)| e.byte_len()).sum();
+    // DFlash 2 selector codebooks are loaded in device-mapped host memory (`HostMapped`),
+    // taking 0 bytes of device VRAM.
+    let weights = checkpoint
+        .tensors()
+        .filter(|(name, _)| {
+            !dflash2
+                || !matches!(
+                    *name,
+                    "candidate_selector.predecessor_codebook"
+                        | "candidate_selector.successor_codebook"
+                )
+        })
+        .map(|(_, e)| e.byte_len())
+        .sum();
     let fc = checkpoint
         .get("fc.weight")
         .context("the drafter has no fc.weight")?;
@@ -1447,14 +1578,21 @@ mod tests {
         assert_eq!(global * 2 * KvFormat::Bf16.row_bytes(kv_dims), 32 << 10);
         assert_eq!(global * 2 * KvFormat::Fp8.row_bytes(kv_dims), 16 << 10);
         // NVFP4: 576 bytes per buffer and position, 9 KiB per position over 8 caches.
+        // NVFP4-G32: 544 bytes per buffer and position, 8.5 KiB per position (exact 8.5 GiB @ 1M).
         assert_eq!(KvFormat::Nvfp4.row_bytes(kv_dims), 576);
         assert_eq!(KvFormat::Nvfp4All.row_bytes(kv_dims), 576);
+        assert_eq!(KvFormat::Nvfp4G32.row_bytes(kv_dims), 544);
+        assert_eq!(KvFormat::Nvfp4G32All.row_bytes(kv_dims), 544);
         assert_eq!(KvFormat::Nvfp4.sliding_format(), KvFormat::Fp8);
         assert_eq!(KvFormat::Nvfp4All.sliding_format(), KvFormat::Nvfp4);
+        assert_eq!(KvFormat::Nvfp4G32.sliding_format(), KvFormat::Fp8);
+        assert_eq!(KvFormat::Nvfp4G32All.sliding_format(), KvFormat::Nvfp4G32);
         let passes = c.loop_config.num_passes;
         assert_eq!(c.global_cache_bytes(passes, KvFormat::Fp8), 16 << 10);
         assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4), 9 << 10);
         assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4All), 9 << 10);
+        assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4G32), 8_704);
+        assert_eq!(c.global_cache_bytes(passes, KvFormat::Nvfp4G32All), 8_704);
         // Mixed: visits 5 and 11 in FP8, 2 KiB each, the other 6 in NVFP4.
         assert_eq!(
             c.global_cache_bytes(passes, KvFormat::Mixed),
@@ -1923,16 +2061,17 @@ mod tests {
         let c = config();
         let small = rows_scratch(&c, 8, 170);
         let large = rows_scratch(&c, 2048, 170);
-        // About 0.3 MB per row: the relative bias, the expert activations and the blocks.
+        // With the phase-aliased transient arena, prefill scratch grows by ~190-230 KB/row
+        // (persistent blocks/bank/residual + aliased max phase + quantized MoE scratch).
         let per_row = (large - small) / 2040;
-        assert!((250_000..400_000).contains(&per_row), "{per_row}");
+        assert!((180_000..260_000).contains(&per_row), "{per_row}");
     }
 
     #[test]
     fn invariant_scratch_omits_f32_head_capped() {
         let c = config();
         // Verify (8 rows) + batch (32 rows) + batch_verify (256 rows) no longer allocate
-        // F32 head_capped (which previously took (32 + 32 + 256) * unpadded_vocab * 4 ~ 256 MB).
+        // F32 head_capped or prefill-only attention partials / MoE grouping buffers.
         let old_head =
             |rows: usize| rows.max(HEAD_ROWS) * (c.vocab_size * 2 + c.unpadded_vocab_size * 4);
         let new_head = |rows: usize| rows * c.vocab_size * 2;
@@ -1941,11 +2080,11 @@ mod tests {
             .map(|r| old_head(r) - new_head(r))
             .sum();
         assert!(saved > 250_000_000, "expected >250 MB saved, got {saved}");
-        // Verify invariant_rows_scratch reflects this exact difference vs rows_scratch_core.
-        assert_eq!(
-            invariant_rows_scratch(&c, 256, 170) - rows_scratch_core(&c, 256, 170),
-            invariant_scratch(&c, 256)
-        );
+        // Invariant scratch is strictly smaller than full prefill scratch at the same rows
+        // (no 16+ MiB flash attention partials or quantized MoE buffers).
+        let inv8 = invariant_rows_scratch(&c, 8, 170);
+        let pre8 = rows_scratch(&c, 8, 170);
+        assert!(inv8 < pre8, "inv8={inv8} should be < pre8={pre8}");
     }
 
     #[test]

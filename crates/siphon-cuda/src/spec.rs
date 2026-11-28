@@ -422,7 +422,7 @@ impl SpecStats {
     /// Mean tokens per verify round, the plain steps' tokens excluded.
     #[must_use]
     pub fn tokens_per_round(&self) -> f64 {
-        (self.emitted - self.stepped.len()) as f64 / self.rounds.max(1) as f64
+        self.emitted.saturating_sub(self.stepped.len()) as f64 / self.rounds.max(1) as f64
     }
 
     /// Mean verify rows per round.
@@ -463,7 +463,14 @@ pub struct SweepRow {
 }
 
 /// The draft and the round loop for one sequence of a [`Model`].
-#[expect(clippy::struct_excessive_bools, reason = "in-flight event flags and coupled mode")]
+///
+/// Load a compatible draft with [`load_draft`], attach it with [`Self::with_draft`],
+/// then [`Self::prefill`] the prompt and [`Self::generate`] from the resulting anchor.
+/// Keep the target model and draft on the same CUDA device throughout the sequence.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "in-flight event flags and coupled mode"
+)]
 pub struct Speculator {
     draft: Draft,
     linear: Linear,
@@ -502,10 +509,13 @@ pub struct Speculator {
     random_h2d_done: CudaEvent,
     /// Random drafts of [`Drafts::Random`], uploaded each round.
     random: CudaSlice<i32>,
-    /// The taps of the prompt's last rows, up to [`TAIL`] of them, oldest first, for
-    /// [`Self::restart`]; `spare` takes the next copy while one is built.
-    tail: CudaSlice<bf16>,
-    spare: CudaSlice<bf16>,
+    /// The taps of the prompt's last rows, up to [`TAIL`] of them, oldest first, in host
+    /// memory for [`Self::restart`] (0 bytes of VRAM).
+    tail: Vec<bf16>,
+    /// Whether [`Self::prefill`] copies the prompt's tail taps to host memory for
+    /// [`Self::restart`]. Defaults to `true`; servers that never call `restart` can disable
+    /// it to skip the D2H copy.
+    keep_tail: bool,
     tail_rows: usize,
     /// The taps of the current run of plain steps, up to [`MAX_PLAIN_RUN`] rows.
     plain_taps: CudaSlice<bf16>,
@@ -712,6 +722,7 @@ pub fn load_draft(
     capacity: usize,
     options: &DraftOptions,
 ) -> anyhow::Result<Draft> {
+    let draft_capacity = capacity_with_lookahead(capacity)?;
     let stream = Arc::clone(model.stream());
     let draft = match source {
         DraftSource::Bundled => {
@@ -721,7 +732,7 @@ pub fn load_draft(
                 model.config(),
                 weights,
                 model.draft_shared(),
-                capacity + STEPS + 1,
+                draft_capacity,
                 options,
             )?
         }
@@ -732,7 +743,7 @@ pub fn load_draft(
                 model.config(),
                 weights,
                 model.draft_shared(),
-                capacity + STEPS + 1,
+                draft_capacity,
                 options,
             )?
         }
@@ -743,13 +754,19 @@ pub fn load_draft(
                 model.config(),
                 weights,
                 model.draft_shared(),
-                capacity + STEPS + 1,
+                draft_capacity,
                 options,
             )?
         }
     };
     model.set_tap_layout(draft.tap_layout())?;
     Ok(draft)
+}
+
+fn capacity_with_lookahead(capacity: usize) -> anyhow::Result<usize> {
+    capacity
+        .checked_add(STEPS + 1)
+        .context("draft capacity plus its lookahead block exceeds usize")
 }
 
 impl Speculator {
@@ -786,6 +803,7 @@ impl Speculator {
         options: &DraftOptions,
     ) -> anyhow::Result<Self> {
         width.check()?;
+        let draft_capacity = capacity_with_lookahead(capacity)?;
         let stream = model.stream();
         let weights = DraftWeights::load(checkpoint, model.config(), stream)?;
         let draft = Draft::with_options(
@@ -793,7 +811,7 @@ impl Speculator {
             model.config(),
             weights,
             model.draft_shared(),
-            capacity + STEPS + 1,
+            draft_capacity,
             options,
         )?;
         Self::with_draft(model, draft, width)
@@ -843,22 +861,16 @@ impl Speculator {
             tree_dist_copied: sync_event(stream)?,
             tree_dist_in_flight: false,
             pinned_tree_path: PinnedBuf::zeros(stream, VERIFY_ROWS)?,
-            pinned_tree_cand: PinnedBuf::zeros(
-                stream,
-                STEPS * crate::ops::sample::BETA_CAND_K,
-            )?,
-            pinned_tree_q: PinnedBuf::zeros(
-                stream,
-                STEPS * crate::ops::sample::BETA_CAND_K,
-            )?,
+            pinned_tree_cand: PinnedBuf::zeros(stream, STEPS * crate::ops::sample::BETA_CAND_K)?,
+            pinned_tree_q: PinnedBuf::zeros(stream, STEPS * crate::ops::sample::BETA_CAND_K)?,
             pinned_tree_ids: PinnedBuf::zeros(stream, STEPS)?,
             pinned_verify_result: PinnedBuf::zeros(stream, RESULT_LEN)?,
             pinned_conf: PinnedBuf::zeros(stream, STEPS)?,
             pinned_random: PinnedBuf::zeros(stream, STEPS)?,
             random_h2d_done: sync_event(stream)?,
             random: stream.alloc_zeros(STEPS)?,
-            tail: stream.alloc_zeros(TAIL * row_len)?,
-            spare: stream.alloc_zeros(TAIL * row_len)?,
+            tail: Vec::new(),
+            keep_tail: true,
             tail_rows: 0,
             plain_taps: stream.alloc_zeros(MAX_PLAIN_RUN * row_len)?,
             calibration: Calibration::default(),
@@ -875,6 +887,18 @@ impl Speculator {
             batch_calibration: Calibration::default(),
             tree_config: SpecTreeConfig::default(),
         })
+    }
+
+    /// Controls whether [`Self::prefill`] retains the prompt's last [`TAIL`] tap rows in
+    /// host memory for [`Self::restart`]. Disabling drops any retained host buffer and avoids
+    /// the D2H copy during prefill.
+    pub fn set_keep_tail(&mut self, keep: bool) {
+        self.keep_tail = keep;
+        if !keep {
+            self.tail.clear();
+            self.tail.shrink_to_fit();
+            self.tail_rows = 0;
+        }
     }
 
     /// Enables or configures 2-branch speculative tree verification (disabled by default so
@@ -1105,7 +1129,8 @@ impl Speculator {
                 )?;
                 let verdicts = model.finish_verify_batch(pending)?;
                 for (&slot, (&start, v)) in slots.iter().zip(starts.iter().zip(&verdicts)) {
-                    self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+                    self.draft
+                        .set_slot_committed(slot, start + v.accepted + 1)?;
                 }
                 captured += 1;
             }
@@ -1134,12 +1159,7 @@ impl Speculator {
     }
 
     /// Copies slot `from`'s DFlash 2 rings and committed position into slot `to`.
-    pub fn copy_slot_draft(
-        &mut self,
-        model: &Model,
-        from: usize,
-        to: usize,
-    ) -> anyhow::Result<()> {
+    pub fn copy_slot_draft(&mut self, model: &Model, from: usize, to: usize) -> anyhow::Result<()> {
         self.invalidate_batch_draft();
         self.draft.copy_slot_rings(model.stream(), from, to)
     }
@@ -1505,9 +1525,7 @@ impl Speculator {
                 batch_spec,
                 ..
             } = self;
-            let bs = batch_spec
-                .as_ref()
-                .context("batch spec buffers missing")?;
+            let bs = batch_spec.as_ref().context("batch spec buffers missing")?;
             let tokens = bs.cache[slot_idx].tokens.slice(..seqs * verify_w);
             if any_prefill_draft {
                 let mut commit_fn = |slot: usize, start: usize, taps: CudaView<'_, bf16>| {
@@ -1578,7 +1596,8 @@ impl Speculator {
             .zip(starts.iter().zip(&result.verdicts))
             .enumerate()
         {
-            self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+            self.draft
+                .set_slot_committed(slot, start + v.accepted + 1)?;
             self.batch_calibration.record_bounded(
                 &used_conf[s * STEPS..(s + 1) * STEPS],
                 verify_w,
@@ -1667,11 +1686,7 @@ impl Speculator {
         next_max_width: usize,
         spec_beta: bool,
     ) -> anyhow::Result<()> {
-        let Some(pending) = self
-            .batch_spec
-            .as_mut()
-            .and_then(|bs| bs.pending.take())
-        else {
+        let Some(pending) = self.batch_spec.as_mut().and_then(|bs| bs.pending.take()) else {
             return Ok(());
         };
         let seqs = pending.slots.len();
@@ -1723,7 +1738,10 @@ impl Speculator {
     /// calibrated per-position confidences and pipelining `Model::start_verify_batch` with
     /// `Draft::batch_commit_and_draft`, while overlapping verify D2H and host verdict/scheduler
     /// work with draft execution on a dedicated copy stream.
-    #[expect(clippy::too_many_lines, reason = "pipelined adaptive batch verify + draft")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "pipelined adaptive batch verify + draft"
+    )]
     pub fn speculate_batch_round(
         &mut self,
         model: &mut Model,
@@ -1915,14 +1933,15 @@ impl Speculator {
                 .batch_spec
                 .as_ref()
                 .context("batch spec buffers missing")?;
-            model.complete_verify_batch(pending, &bs.pinned_results.as_slice()[..seqs * RESULT_LEN])?
+            model.complete_verify_batch(
+                pending,
+                &bs.pinned_results.as_slice()[..seqs * RESULT_LEN],
+            )?
         };
-        for (s, (&slot, (&start, v))) in slots
-            .iter()
-            .zip(starts.iter().zip(&verdicts))
-            .enumerate()
+        for (s, (&slot, (&start, v))) in slots.iter().zip(starts.iter().zip(&verdicts)).enumerate()
         {
-            self.draft.set_slot_committed(slot, start + v.accepted + 1)?;
+            self.draft
+                .set_slot_committed(slot, start + v.accepted + 1)?;
             self.batch_calibration.record_bounded(
                 &used_conf[s * STEPS..(s + 1) * STEPS],
                 verify_w,
@@ -2088,7 +2107,7 @@ impl Speculator {
             draft,
             linear,
             tail,
-            spare,
+            keep_tail,
             tail_rows,
             row_len,
             ..
@@ -2096,22 +2115,24 @@ impl Speculator {
         let row = *row_len;
         let mut commit = |start: usize, taps: CudaView<'_, bf16>| {
             draft.commit(&stream, linear, &taps, start)?;
-            // Keep the last TAIL rows: the newest of the old tail, then this chunk's.
-            let rows = taps.len() / row;
-            let new = rows.min(TAIL);
-            let old = (*tail_rows).min(TAIL - new);
-            if old > 0 {
-                stream.memcpy_dtod(
-                    &tail.slice((*tail_rows - old) * row..*tail_rows * row),
-                    &mut spare.slice_mut(..old * row),
+            if *keep_tail {
+                // Keep the last TAIL rows in host memory for `restart`: shift old tail in
+                // place, then copy this chunk's newest rows from device.
+                let rows = taps.len() / row;
+                let new = rows.min(TAIL);
+                let old = (*tail_rows).min(TAIL - new);
+                if tail.len() < TAIL * row {
+                    tail.resize(TAIL * row, bf16::ZERO);
+                }
+                if old > 0 {
+                    tail.copy_within((*tail_rows - old) * row..*tail_rows * row, 0);
+                }
+                stream.memcpy_dtoh(
+                    &taps.slice((rows - new) * row..),
+                    &mut tail[old * row..(old + new) * row],
                 )?;
+                *tail_rows = old + new;
             }
-            stream.memcpy_dtod(
-                &taps.slice((rows - new) * row..),
-                &mut spare.slice_mut(old * row..(old + new) * row),
-            )?;
-            std::mem::swap(tail, spare);
-            *tail_rows = old + new;
             Ok(())
         };
         match images {
@@ -2155,10 +2176,11 @@ impl Speculator {
         );
         let stream = Arc::clone(model.stream());
         let row = self.row_len;
+        let gpu_tail = stream.clone_htod(&self.tail[..self.tail_rows * row])?;
         self.draft.commit(
             &stream,
             &self.linear,
-            &self.tail.slice(..self.tail_rows * row),
+            &gpu_tail.slice(..),
             self.prompt_len - self.tail_rows,
         )?;
         model.set_verify_anchor(first)
@@ -2488,7 +2510,7 @@ impl Speculator {
             // Prefill committed the prompt, so the first round commits no rows.
             self.draft.set_round_inputs(
                 &stream,
-                &self.tail.slice(..0),
+                &self.plain_taps.slice(..0),
                 model.position(),
                 model.verify_anchor()?,
             )?;
@@ -2879,9 +2901,9 @@ impl Speculator {
             let Some(x2) = sample_without_replacement(cand_b, q_b, ids_host[b], u_sec) else {
                 return Ok(None);
             };
-            let (alt_tokens, branch_q) =
-                self.draft
-                    .rollout_secondary_branch_from(&stream, b, x2, k2, proposals)?;
+            let (alt_tokens, branch_q) = self
+                .draft
+                .rollout_secondary_branch_from(&stream, b, x2, k2, proposals)?;
 
             // Assemble per-tree-node 16-sparse draft distributions `[m, 16]`.
             let m = 1 + k1 + k2;
@@ -3081,7 +3103,7 @@ impl Speculator {
         if draft {
             self.draft.set_round_inputs(
                 &stream,
-                &self.tail.slice(..0),
+                &self.plain_taps.slice(..0),
                 model.position(),
                 model.verify_anchor()?,
             )?;
@@ -3214,7 +3236,7 @@ impl Speculator {
         self.sync_draft_sampling(model)?;
         self.draft.set_round_inputs(
             &stream,
-            &self.tail.slice(..0),
+            &self.plain_taps.slice(..0),
             model.position(),
             model.verify_anchor()?,
         )?;

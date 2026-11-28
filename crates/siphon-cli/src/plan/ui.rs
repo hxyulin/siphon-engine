@@ -146,6 +146,8 @@ fn kv_name(kv: KvFormat) -> &'static str {
         KvFormat::Bf16 => "BF16",
         KvFormat::Nvfp4 => "NVFP4",
         KvFormat::Nvfp4All => "NVFP4-all",
+        KvFormat::Nvfp4G32 => "NVFP4-G32",
+        KvFormat::Nvfp4G32All => "NVFP4-G32-all",
         KvFormat::Mixed => "mixed",
     }
 }

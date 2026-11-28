@@ -21,6 +21,7 @@ use siphon::{Checkpoint, TextConfig};
 use super::Loader;
 use super::dflash::tap_layout;
 use super::draft::{HEAD_DIM, HIDDEN, KV_HEADS};
+use crate::gpu::HostMapped;
 use crate::ops::spec::TapLayout;
 
 /// Rows of a draft block: the anchor and 7 mask rows.
@@ -107,9 +108,10 @@ pub struct ConvWeights {
 pub struct SelectorWeights {
     /// `[256, 2304]`.
     pub hidden_projection: CudaSlice<bf16>,
-    /// `[padded vocab, 256]` each.
-    pub predecessor: CudaSlice<bf16>,
-    pub successor: CudaSlice<bf16>,
+    /// `[padded vocab, 256]` each, in device-mapped host memory (sparse row gathers).
+    pub predecessor: HostMapped<bf16>,
+    /// Codebook for candidate tokens, BF16 `[padded vocab, 256]`, in device-mapped host memory.
+    pub successor: HostMapped<bf16>,
 }
 
 impl Dflash2Weights {
@@ -140,11 +142,11 @@ impl Dflash2Weights {
                     "candidate_selector.hidden_projection.weight",
                     &[SELECTOR_RANK, HIDDEN],
                 )?,
-                predecessor: loader.bf16(
+                predecessor: loader.bf16_mapped(
                     "candidate_selector.predecessor_codebook",
                     &[vocab, SELECTOR_RANK],
                 )?,
-                successor: loader.bf16(
+                successor: loader.bf16_mapped(
                     "candidate_selector.successor_codebook",
                     &[vocab, SELECTOR_RANK],
                 )?,

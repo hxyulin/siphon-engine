@@ -324,8 +324,7 @@ impl DraftOptions {
                 "fp8-fold" => options.fp8_fold = true,
                 "fp8-kv" => options.fp8_kv = true,
                 "shortlist" => {
-                    options.shortlist =
-                        Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
+                    options.shortlist = Some(ranking.map_or_else(counted_ranking, <[u32]>::to_vec));
                 }
                 other => {
                     if let Some(v) = other.strip_prefix("shortlist=") {
@@ -1298,7 +1297,10 @@ impl Draft {
         )
     }
 
-    #[expect(clippy::too_many_arguments, reason = "constructs draft with loaded kernels and options")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructs draft with loaded kernels and options"
+    )]
     fn build(
         stream: &Arc<CudaStream>,
         config: &TextConfig,
@@ -1330,7 +1332,8 @@ impl Draft {
         let layers = arch.layers();
         let caches = (0..layers)
             .map(|layer| {
-                let fp8 = options.fp8_kv && (arch.global(layer) || matches!(arch, Arch::Dflash2 { .. }));
+                let fp8 =
+                    options.fp8_kv && (arch.global(layer) || matches!(arch, Arch::Dflash2 { .. }));
                 let slots = arch.slots(layer, capacity);
                 match shared.kv_pool {
                     Some(pool) if arch.global(layer) => KvCache::pooled(stream, slots, fp8, pool),
@@ -1554,7 +1557,10 @@ impl Draft {
     #[must_use]
     pub fn cached_graph_counts(&self) -> (usize, usize) {
         let single = self.graphs.iter().filter(|g| g.is_some()).count();
-        let batch = self.batch.as_ref().map_or(0, batch::BatchDflash2::graph_count);
+        let batch = self
+            .batch
+            .as_ref()
+            .map_or(0, batch::BatchDflash2::graph_count);
         (single, batch)
     }
 
@@ -1935,7 +1941,10 @@ impl Draft {
     /// and DFlash 1, extracts the top-16 base logits for rows `branch_step..branch_step+k2`
     /// and picks the runner-up at `branch_step` plus top-1 continuations. Returns `Ok(None)`
     /// if no valid distinct alternate token exists.
-    #[expect(clippy::too_many_lines, reason = "DFlash 2 GPU branch rollout plus base-logit fallback")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "DFlash 2 GPU branch rollout plus base-logit fallback"
+    )]
     pub fn rollout_secondary_branch(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -1972,8 +1981,8 @@ impl Draft {
                 &d2.cand,
                 &d2.unary,
                 &d2.hp,
-                &weights.selector.predecessor,
-                &weights.selector.successor,
+                weights.selector.predecessor.slice(),
+                weights.selector.successor.slice(),
                 &self.inputs.control,
                 branch_step,
                 alt_first,
@@ -2034,10 +2043,9 @@ impl Draft {
         stream.memcpy_dtoh(&ids.slice(..k2 * TOP_K), &mut host_ids)?;
         stream.synchronize()?;
         let mut out = Vec::with_capacity(k2);
-        let alt_first = host_ids[..TOP_K]
-            .iter()
-            .copied()
-            .find(|&id| id != primary_at_branch && usize::try_from(id).is_ok_and(|t| t < self.vocab));
+        let alt_first = host_ids[..TOP_K].iter().copied().find(|&id| {
+            id != primary_at_branch && usize::try_from(id).is_ok_and(|t| t < self.vocab)
+        });
         let Some(first) = alt_first else {
             return Ok(None);
         };
@@ -2096,8 +2104,8 @@ impl Draft {
             &d2.cand,
             &d2.unary,
             &d2.hp,
-            &weights.selector.predecessor,
-            &weights.selector.successor,
+            weights.selector.predecessor.slice(),
+            weights.selector.successor.slice(),
             &self.inputs.control,
             branch_step,
             alt_first,
@@ -2937,8 +2945,8 @@ impl Draft {
                 &d2.cand,
                 &d2.unary,
                 &d2.hp,
-                &weights.selector.predecessor,
-                &weights.selector.successor,
+                weights.selector.predecessor.slice(),
+                weights.selector.successor.slice(),
                 control,
                 steps,
                 self.softcap,
@@ -2955,8 +2963,8 @@ impl Draft {
                 &d2.cand,
                 &d2.unary,
                 &d2.hp,
-                &weights.selector.predecessor,
-                &weights.selector.successor,
+                weights.selector.predecessor.slice(),
+                weights.selector.successor.slice(),
                 control,
                 steps,
                 self.softcap,
@@ -3809,9 +3817,7 @@ mod tests {
         assert_eq!(custom.shortlist_rows, Some(16384));
         assert_eq!(custom.context_rows, Some(0));
 
-        let overridden = fast
-            .with_shortlist_budget(Some(8192), Some(0))
-            .unwrap();
+        let overridden = fast.with_shortlist_budget(Some(8192), Some(0)).unwrap();
         assert_eq!(overridden.shortlist_rows, Some(8192));
         assert_eq!(overridden.context_rows, Some(0));
 

@@ -224,7 +224,9 @@ impl TreeVerifyBuffers {
                 KvData::Bf16 { keys, values } => {
                     (keys.device_ptr(stream).0, values.device_ptr(stream).0)
                 }
-                KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+                KvData::Fp8 { keys, values }
+                | KvData::Nvfp4 { keys, values }
+                | KvData::Nvfp4G32 { keys, values } => {
                     (keys.device_ptr(stream).0, values.device_ptr(stream).0)
                 }
             };
@@ -258,7 +260,10 @@ impl TreeVerifyBuffers {
             taps_compact: zeros(stream, VERIFY_ROWS * tap_count * hidden)?,
             draft_cand: zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
             draft_q: zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
-            host_draft_cand: PinnedBuf::zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
+            host_draft_cand: PinnedBuf::zeros(
+                stream,
+                VERIFY_ROWS * crate::ops::sample::BETA_CAND_K,
+            )?,
             host_draft_q: PinnedBuf::zeros(stream, VERIFY_ROWS * crate::ops::sample::BETA_CAND_K)?,
             dist_h2d_done: sync_event(stream)?,
         })
@@ -343,6 +348,11 @@ impl VerifyBuffers {
                         keys.device_ptr(stream).0,
                         values.device_ptr(stream).0,
                         crate::ops::attention::FP4_ROW,
+                    ),
+                    KvData::Nvfp4G32 { keys, values } => (
+                        keys.device_ptr(stream).0,
+                        values.device_ptr(stream).0,
+                        crate::ops::attention::FP4_G32_ROW,
                     ),
                 };
                 rings.push(keys);
@@ -776,7 +786,15 @@ impl Model {
     /// before [`Self::finish_verify_tree`] sees the winning path's compacted taps in
     /// [`Self::verify_tree_taps`], accepted count in [`Self::verify_kept`], and next
     /// anchor in [`Self::verify_anchor`].
-    #[expect(clippy::too_many_lines, reason = "validates tree, uploads metadata, launches graph")]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid tree or token input, an outstanding pass,
+    /// insufficient cache space, or a CUDA launch failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates tree, uploads metadata, launches graph"
+    )]
     pub fn start_verify_tree(
         &mut self,
         tokens: VerifyTreeTokens<'_>,
@@ -908,7 +926,15 @@ impl Model {
 
     /// Waits for `pending` to finish, reads the tree verdict and winning path, and
     /// advances the model's position past the accepted nodes.
-    pub fn finish_verify_tree(&mut self, pending: PendingTreeVerify) -> anyhow::Result<TreeVerdict> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pending pass does not match the model's position
+    /// and buffers, or if reading or decoding the verdict fails.
+    pub fn finish_verify_tree(
+        &mut self,
+        pending: PendingTreeVerify,
+    ) -> anyhow::Result<TreeVerdict> {
         let stream = Arc::clone(&self.ctx.stream);
         let (result, raw_path) = {
             let v = self.verify_buffers_mut()?;

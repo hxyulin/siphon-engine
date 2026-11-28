@@ -21,8 +21,8 @@ use siphon_cuda::{
     Gpu,
     ops::{
         attention::{
-            Attention, AttentionScratch, BATCH_ADAPTIVE_MIN_SEQS, BatchSplitMode, FP4_ROW,
-            HEAD_DIM, HEADS, KV_HEADS, KvCache, KvData, KvFormat, KvQuant, KvRounding, ROWS_MAX,
+            Attention, AttentionScratch, BATCH_ADAPTIVE_MIN_SEQS, BatchSplitMode, HEAD_DIM, HEADS,
+            KV_HEADS, KvCache, KvData, KvFormat, KvQuant, KvRounding, ROWS_MAX,
             RowsAttentionScratch, batch_split_blocks,
         },
         spec::{BATCH_STATE_WORDS, BATCH_VERIFY_MAX_ROWS, BatchRows},
@@ -39,20 +39,28 @@ const KV_ROW: usize = KV_HEADS * HEAD_DIM;
 enum Kind {
     Sliding,
     SlidingFp8,
+    SlidingNvfp4G32,
     Ring,
     Global,
     GlobalFp8,
     GlobalNvfp4,
+    GlobalNvfp4G32,
 }
 
 fn cache(stream: &Arc<CudaStream>, kind: Kind) -> anyhow::Result<KvCache> {
     match kind {
         Kind::Sliding => KvCache::sliding(stream, WINDOW),
-        Kind::SlidingFp8 => KvCache::sliding_ring_with_format(stream, WINDOW, WINDOW, KvFormat::Fp8),
+        Kind::SlidingFp8 => {
+            KvCache::sliding_ring_with_format(stream, WINDOW, WINDOW, KvFormat::Fp8)
+        }
+        Kind::SlidingNvfp4G32 => {
+            KvCache::sliding_ring_with_format(stream, WINDOW, WINDOW, KvFormat::Nvfp4G32)
+        }
         Kind::Ring => KvCache::sliding_ring(stream, WINDOW, RING),
         Kind::Global => KvCache::global(stream, CAPACITY),
         Kind::GlobalFp8 => KvCache::global_with_format(stream, CAPACITY, KvFormat::Fp8),
         Kind::GlobalNvfp4 => KvCache::global_with_format(stream, CAPACITY, KvFormat::Nvfp4),
+        Kind::GlobalNvfp4G32 => KvCache::global_with_format(stream, CAPACITY, KvFormat::Nvfp4G32),
     }
 }
 
@@ -65,15 +73,16 @@ fn fill(stream: &Arc<CudaStream>, cache: &mut KvCache, seed: u32) -> anyhow::Res
             stream.memcpy_htod(&common::pseudo_random_bf16(n, seed, 1.0, 0.0), keys)?;
             stream.memcpy_htod(&common::pseudo_random_bf16(n, seed + 1, 1.0, 0.0), values)?;
         }
-        KvData::Nvfp4 { keys, values } => {
-            // Each slot is FP4_ROW (576) bytes: 512 bytes of E2M1 nibble pairs followed by
-            // 64 bytes of E4M3 scales (positive, below 0.75, never NaN).
+        KvData::Nvfp4 { keys, values } | KvData::Nvfp4G32 { keys, values } => {
+            let row_bytes = keys.len() / slots;
+            // Each slot is 576 (g16) or 544 (g32) bytes: 512 bytes of E2M1 nibble pairs
+            // followed by 64 or 32 bytes of E4M3 scales (positive, below 0.75, never NaN).
             let bytes = |seed: u32| -> Vec<u8> {
-                let mut out = vec![0u8; slots * FP4_ROW];
+                let mut out = vec![0u8; slots * row_bytes];
                 for s in 0..slots {
-                    let row = &mut out[s * FP4_ROW..(s + 1) * FP4_ROW];
+                    let row = &mut out[s * row_bytes..(s + 1) * row_bytes];
                     for (i, b) in row.iter_mut().enumerate() {
-                        let mut h = u32::try_from(s * FP4_ROW + i).expect("fits")
+                        let mut h = u32::try_from(s * row_bytes + i).expect("fits")
                             ^ seed.wrapping_mul(0x85EB_CA77);
                         h = h.wrapping_mul(0x9E37_79B1);
                         h ^= h >> 15;
@@ -319,12 +328,49 @@ fn rows_against_decode_attention() -> anyhow::Result<()> {
 
 fn copy_cache(stream: &Arc<CudaStream>, src: &KvCache, dst: &mut KvCache) -> anyhow::Result<()> {
     match (src.data(), dst.data_mut()) {
-        (KvData::Bf16 { keys: sk, values: sv }, KvData::Bf16 { keys: dk, values: dv }) => {
+        (
+            KvData::Bf16 {
+                keys: sk,
+                values: sv,
+            },
+            KvData::Bf16 {
+                keys: dk,
+                values: dv,
+            },
+        ) => {
             stream.memcpy_dtod(sk, dk)?;
             stream.memcpy_dtod(sv, dv)?;
         }
-        (KvData::Fp8 { keys: sk, values: sv }, KvData::Fp8 { keys: dk, values: dv })
-        | (KvData::Nvfp4 { keys: sk, values: sv }, KvData::Nvfp4 { keys: dk, values: dv }) => {
+        (
+            KvData::Fp8 {
+                keys: sk,
+                values: sv,
+            },
+            KvData::Fp8 {
+                keys: dk,
+                values: dv,
+            },
+        )
+        | (
+            KvData::Nvfp4 {
+                keys: sk,
+                values: sv,
+            },
+            KvData::Nvfp4 {
+                keys: dk,
+                values: dv,
+            },
+        )
+        | (
+            KvData::Nvfp4G32 {
+                keys: sk,
+                values: sv,
+            },
+            KvData::Nvfp4G32 {
+                keys: dk,
+                values: dv,
+            },
+        ) => {
             stream.memcpy_dtod(sk, dk)?;
             stream.memcpy_dtod(sv, dv)?;
         }
@@ -349,7 +395,9 @@ fn cache_slot_bytes(
                 }
             }
         }
-        KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+        KvData::Fp8 { keys, values }
+        | KvData::Nvfp4 { keys, values }
+        | KvData::Nvfp4G32 { keys, values } => {
             for buf in [keys, values] {
                 out.extend(stream.clone_dtoh(&buf.slice(at..at + len))?);
             }
@@ -361,7 +409,9 @@ fn cache_slot_bytes(
 fn cache_ptrs(stream: &CudaStream, cache: &KvCache) -> (u64, u64) {
     match cache.data() {
         KvData::Bf16 { keys, values } => (keys.device_ptr(stream).0, values.device_ptr(stream).0),
-        KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+        KvData::Fp8 { keys, values }
+        | KvData::Nvfp4 { keys, values }
+        | KvData::Nvfp4G32 { keys, values } => {
             (keys.device_ptr(stream).0, values.device_ptr(stream).0)
         }
     }
@@ -377,12 +427,7 @@ struct BatchInputs {
 }
 
 impl BatchInputs {
-    fn new(
-        setup: &Setup,
-        kind: Kind,
-        total_rows: usize,
-        seed: u32,
-    ) -> anyhow::Result<Self> {
+    fn new(setup: &Setup, kind: Kind, total_rows: usize, seed: u32) -> anyhow::Result<Self> {
         let stream = setup.gpu.stream();
         let q = stream.clone_htod(&common::pseudo_random_bf16(
             total_rows * HEADS * HEAD_DIM,
@@ -402,9 +447,16 @@ impl BatchInputs {
             1.0,
             0.0,
         ))?;
-        if kind == Kind::GlobalNvfp4 {
+        if matches!(
+            kind,
+            Kind::GlobalNvfp4 | Kind::GlobalNvfp4G32 | Kind::SlidingNvfp4G32
+        ) {
             let rounding = KvRounding {
-                quant: KvQuant::Nvfp4,
+                quant: if kind == Kind::GlobalNvfp4 {
+                    KvQuant::Nvfp4
+                } else {
+                    KvQuant::Nvfp4G32
+                },
                 ..KvRounding::default()
             };
             setup
@@ -514,8 +566,14 @@ fn batch_split_blocks_schedule() {
     // RTX PRO 6000 Blackwell (188 SMs): 2 * 188 = 376 target CTAs.
     // Auto stays exact for seqs < 8 (preserving B=1..5 bit-exact parity).
     for seqs in 1..BATCH_ADAPTIVE_MIN_SEQS {
-        assert_eq!(batch_split_blocks(188, seqs, 4096, BatchSplitMode::Auto), 32);
-        assert_eq!(batch_split_blocks(188, seqs, 1024, BatchSplitMode::Auto), 16);
+        assert_eq!(
+            batch_split_blocks(188, seqs, 4096, BatchSplitMode::Auto),
+            32
+        );
+        assert_eq!(
+            batch_split_blocks(188, seqs, 1024, BatchSplitMode::Auto),
+            16
+        );
     }
     // Auto uses adaptive split-K for seqs >= 8.
     assert_eq!(batch_split_blocks(188, 8, 4096, BatchSplitMode::Auto), 5);
@@ -530,29 +588,71 @@ fn batch_split_blocks_schedule() {
 
     // Exact always uses full splits regardless of batch size.
     for seqs in [1, 5, 8, 16, 32, 64] {
-        assert_eq!(batch_split_blocks(188, seqs, 65_536, BatchSplitMode::Exact), 32);
-        assert_eq!(batch_split_blocks(188, seqs, 1024, BatchSplitMode::Exact), 16);
+        assert_eq!(
+            batch_split_blocks(188, seqs, 65_536, BatchSplitMode::Exact),
+            32
+        );
+        assert_eq!(
+            batch_split_blocks(188, seqs, 1024, BatchSplitMode::Exact),
+            16
+        );
         assert_eq!(batch_split_blocks(188, seqs, 64, BatchSplitMode::Exact), 1);
     }
 
     // Adaptive works at all batch sizes across 188 / 170 / 128 SM GPUs.
-    assert_eq!(batch_split_blocks(188, 1, 4096, BatchSplitMode::Adaptive), 32);
-    assert_eq!(batch_split_blocks(188, 5, 4096, BatchSplitMode::Adaptive), 9);
-    assert_eq!(batch_split_blocks(170, 16, 4096, BatchSplitMode::Adaptive), 2);
-    assert_eq!(batch_split_blocks(170, 32, 4096, BatchSplitMode::Adaptive), 1);
-    assert_eq!(batch_split_blocks(128, 8, 4096, BatchSplitMode::Adaptive), 4);
-    assert_eq!(batch_split_blocks(128, 16, 4096, BatchSplitMode::Adaptive), 2);
-    assert_eq!(batch_split_blocks(128, 32, 4096, BatchSplitMode::Adaptive), 1);
+    assert_eq!(
+        batch_split_blocks(188, 1, 4096, BatchSplitMode::Adaptive),
+        32
+    );
+    assert_eq!(
+        batch_split_blocks(188, 5, 4096, BatchSplitMode::Adaptive),
+        9
+    );
+    assert_eq!(
+        batch_split_blocks(170, 16, 4096, BatchSplitMode::Adaptive),
+        2
+    );
+    assert_eq!(
+        batch_split_blocks(170, 32, 4096, BatchSplitMode::Adaptive),
+        1
+    );
+    assert_eq!(
+        batch_split_blocks(128, 8, 4096, BatchSplitMode::Adaptive),
+        4
+    );
+    assert_eq!(
+        batch_split_blocks(128, 16, 4096, BatchSplitMode::Adaptive),
+        2
+    );
+    assert_eq!(
+        batch_split_blocks(128, 32, 4096, BatchSplitMode::Adaptive),
+        1
+    );
 
     // Fixed clamps to 1..=max_splits.
-    assert_eq!(batch_split_blocks(188, 8, 4096, BatchSplitMode::Fixed(0)), 1);
-    assert_eq!(batch_split_blocks(188, 8, 4096, BatchSplitMode::Fixed(1)), 1);
-    assert_eq!(batch_split_blocks(188, 8, 4096, BatchSplitMode::Fixed(4)), 4);
-    assert_eq!(batch_split_blocks(188, 8, 1024, BatchSplitMode::Fixed(32)), 16);
+    assert_eq!(
+        batch_split_blocks(188, 8, 4096, BatchSplitMode::Fixed(0)),
+        1
+    );
+    assert_eq!(
+        batch_split_blocks(188, 8, 4096, BatchSplitMode::Fixed(1)),
+        1
+    );
+    assert_eq!(
+        batch_split_blocks(188, 8, 4096, BatchSplitMode::Fixed(4)),
+        4
+    );
+    assert_eq!(
+        batch_split_blocks(188, 8, 1024, BatchSplitMode::Fixed(32)),
+        16
+    );
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "verifies B=1 and B=5 parity across cache formats and widths")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "verifies B=1 and B=5 parity across cache formats and widths"
+)]
 fn batch_exact_parity_b1_and_b5() -> anyhow::Result<()> {
     let gpu = Gpu::new(0)?;
     let setup = Setup {
@@ -565,10 +665,12 @@ fn batch_exact_parity_b1_and_b5() -> anyhow::Result<()> {
     let kinds = [
         Kind::Sliding,
         Kind::SlidingFp8,
+        Kind::SlidingNvfp4G32,
         Kind::Ring,
         Kind::Global,
         Kind::GlobalFp8,
         Kind::GlobalNvfp4,
+        Kind::GlobalNvfp4G32,
     ];
     let positions_5 = [3usize, 500, 1020, 2500, 3900];
 
@@ -606,9 +708,9 @@ fn batch_exact_parity_b1_and_b5() -> anyhow::Result<()> {
                         let v_v = inputs
                             .v
                             .slice(row0 * KV_ROW..(row0 + rows_per_seq) * KV_ROW);
-                        let b_v = inputs.bias.slice(
-                            row0 * HEADS * EXTENT..(row0 + rows_per_seq) * HEADS * EXTENT,
-                        );
+                        let b_v = inputs
+                            .bias
+                            .slice(row0 * HEADS * EXTENT..(row0 + rows_per_seq) * HEADS * EXTENT);
                         let s_v = inputs
                             .sinks
                             .slice(row0 * HEADS..(row0 + rows_per_seq) * HEADS);
@@ -676,7 +778,10 @@ fn batch_exact_parity_b1_and_b5() -> anyhow::Result<()> {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "sweeps batch sizes, widths, modes and cache kinds")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sweeps batch sizes, widths, modes and cache kinds"
+)]
 fn batch_adaptive_and_nosplit_accuracy() -> anyhow::Result<()> {
     let gpu = Gpu::new(0)?;
     let setup = Setup {
@@ -688,26 +793,20 @@ fn batch_adaptive_and_nosplit_accuracy() -> anyhow::Result<()> {
     let kinds = [
         Kind::Sliding,
         Kind::SlidingFp8,
+        Kind::SlidingNvfp4G32,
         Kind::Ring,
         Kind::Global,
         Kind::GlobalFp8,
         Kind::GlobalNvfp4,
+        Kind::GlobalNvfp4G32,
     ];
     // Positions spanning empty/recent-only (`has_far == false`), boundary 7/8/63/64,
     // mid-window, across sliding wrap (1020), and deep global cache.
     let pos_pool = [0usize, 3, 7, 8, 63, 64, 500, 1020, 1024, 2500, 3900];
     // (seqs, rows_per_seq, modes) covering B = 1, 8, 16, 32, 64 and both decode & verify.
     let shapes: &[(usize, usize, &[BatchSplitMode])] = &[
-        (
-            1,
-            1,
-            &[BatchSplitMode::Fixed(1), BatchSplitMode::Fixed(4)],
-        ),
-        (
-            1,
-            8,
-            &[BatchSplitMode::Fixed(1), BatchSplitMode::Fixed(4)],
-        ),
+        (1, 1, &[BatchSplitMode::Fixed(1), BatchSplitMode::Fixed(4)]),
+        (1, 8, &[BatchSplitMode::Fixed(1), BatchSplitMode::Fixed(4)]),
         (
             8,
             1,
@@ -717,21 +816,9 @@ fn batch_adaptive_and_nosplit_accuracy() -> anyhow::Result<()> {
                 BatchSplitMode::Fixed(1),
             ],
         ),
-        (
-            8,
-            8,
-            &[BatchSplitMode::Auto, BatchSplitMode::Fixed(1)],
-        ),
-        (
-            16,
-            1,
-            &[BatchSplitMode::Auto, BatchSplitMode::Fixed(1)],
-        ),
-        (
-            16,
-            8,
-            &[BatchSplitMode::Auto, BatchSplitMode::Fixed(1)],
-        ),
+        (8, 8, &[BatchSplitMode::Auto, BatchSplitMode::Fixed(1)]),
+        (16, 1, &[BatchSplitMode::Auto, BatchSplitMode::Fixed(1)]),
+        (16, 8, &[BatchSplitMode::Auto, BatchSplitMode::Fixed(1)]),
         (32, 1, &[BatchSplitMode::Auto, BatchSplitMode::Fixed(2)]),
         (32, 8, &[BatchSplitMode::Auto, BatchSplitMode::Fixed(2)]),
         (64, 1, &[BatchSplitMode::Auto, BatchSplitMode::Fixed(2)]),
@@ -747,9 +834,7 @@ fn batch_adaptive_and_nosplit_accuracy() -> anyhow::Result<()> {
         }
         for &(seqs, rows_per_seq, modes) in shapes {
             let total_rows = seqs * rows_per_seq;
-            let positions: Vec<usize> = (0..seqs)
-                .map(|z| pos_pool[z % pos_pool.len()])
-                .collect();
+            let positions: Vec<usize> = (0..seqs).map(|z| pos_pool[z % pos_pool.len()]).collect();
             let inputs = BatchInputs::new(
                 &setup,
                 kind,
@@ -778,7 +863,11 @@ fn batch_adaptive_and_nosplit_accuracy() -> anyhow::Result<()> {
             let mut exact_appended = Vec::new();
             for &z in &check_seqs {
                 for j in 0..rows_per_seq {
-                    exact_appended.push((z, j, cache_slot_bytes(stream, &caches[z], positions[z] + j)?));
+                    exact_appended.push((
+                        z,
+                        j,
+                        cache_slot_bytes(stream, &caches[z], positions[z] + j)?,
+                    ));
                 }
             }
 

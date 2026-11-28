@@ -172,6 +172,7 @@ impl BatchVerifyState {
                     KvData::Bf16 { .. } => 1024 * 2,
                     KvData::Fp8 { .. } => 1024,
                     KvData::Nvfp4 { .. } => crate::ops::attention::FP4_ROW,
+                    KvData::Nvfp4G32 { .. } => crate::ops::attention::FP4_G32_ROW,
                 };
                 sliding_visits.push(i32::try_from(i)?);
                 ensure!(
@@ -346,7 +347,9 @@ fn empty_slot_visits(
                 (Some(window), None, _) => {
                     KvCache::sliding_ring_with_format(stream, window, v.kv.slots(), format)?
                 }
-                (None, Some(pool), _) => KvCache::global_pooled(stream, v.kv.slots(), format, pool)?,
+                (None, Some(pool), _) => {
+                    KvCache::global_pooled(stream, v.kv.slots(), format, pool)?
+                }
                 (None, None, _) => KvCache::global_with_format(stream, v.kv.slots(), format)?,
             };
             Ok(VisitState {
@@ -378,7 +381,9 @@ fn slot_visits(m: &mut Model, slot: usize) -> (&mut Vec<VisitState>, Option<&mut
 pub(super) fn state_words(stream: &CudaStream, v: &VisitState) -> [u64; BATCH_STATE_WORDS] {
     let (keys, values) = match v.kv.data() {
         KvData::Bf16 { keys, values } => (keys.device_ptr(stream).0, values.device_ptr(stream).0),
-        KvData::Fp8 { keys, values } | KvData::Nvfp4 { keys, values } => {
+        KvData::Fp8 { keys, values }
+        | KvData::Nvfp4 { keys, values }
+        | KvData::Nvfp4G32 { keys, values } => {
             (keys.device_ptr(stream).0, values.device_ptr(stream).0)
         }
     };
@@ -399,7 +404,8 @@ impl Model {
     pub fn add_slots(&mut self, count: usize) -> anyhow::Result<()> {
         let stream = Arc::clone(&self.ctx.stream);
         for _ in 0..count {
-            let (visits, ring_slab) = empty_slot_visits(&stream, &self.visits, self.kv_pool.as_ref())?;
+            let (visits, ring_slab) =
+                empty_slot_visits(&stream, &self.visits, self.kv_pool.as_ref())?;
             let sequence = self.new_sequence();
             self.slots.push(Slot {
                 visits,
@@ -503,12 +509,22 @@ impl Model {
             (f, t) if f < t => {
                 let (low, high) = self.slots.split_at_mut(t - 1);
                 let (s, d) = (&low[f - 1], &mut high[0]);
-                (&s.visits, s.ring_slab.as_ref(), &mut d.visits, d.ring_slab.as_mut())
+                (
+                    &s.visits,
+                    s.ring_slab.as_ref(),
+                    &mut d.visits,
+                    d.ring_slab.as_mut(),
+                )
             }
             (f, t) => {
                 let (low, high) = self.slots.split_at_mut(f - 1);
                 let (s, d) = (&high[0], &mut low[t - 1]);
-                (&s.visits, s.ring_slab.as_ref(), &mut d.visits, d.ring_slab.as_mut())
+                (
+                    &s.visits,
+                    s.ring_slab.as_ref(),
+                    &mut d.visits,
+                    d.ring_slab.as_mut(),
+                )
             }
         };
         let bulk_rings = match (src_slab, dst_slab) {
@@ -547,7 +563,8 @@ impl Model {
                     stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
                 }
                 (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: v })
-                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: v }) => {
+                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: v })
+                | (KvData::Nvfp4G32 { keys, values }, KvData::Nvfp4G32 { keys: k, values: v }) => {
                     stream.memcpy_dtod(&keys.slice(..len), &mut k.slice_mut(..len))?;
                     stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
                 }
@@ -642,7 +659,11 @@ impl Model {
                         stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
                     }
                     (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: v })
-                    | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: v }) => {
+                    | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: v })
+                    | (
+                        KvData::Nvfp4G32 { keys, values },
+                        KvData::Nvfp4G32 { keys: k, values: v },
+                    ) => {
                         stream.memcpy_dtod(&keys.slice(..len), &mut k.slice_mut(..len))?;
                         stream.memcpy_dtod(&values.slice(..len), &mut v.slice_mut(..len))?;
                     }
@@ -950,7 +971,15 @@ impl Model {
     /// model's stream before [`Self::finish_verify_batch`] runs after the pass and can
     /// read [`Self::batch_verify_taps`], [`Self::batch_verify_results`] and
     /// [`Self::batch_verify_anchors`].
-    #[expect(clippy::too_many_lines, reason = "validates slots, uploads inputs and launches graph")]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid batch layout, unavailable cache space, an
+    /// outstanding verify pass, or a CUDA launch failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates slots, uploads inputs and launches graph"
+    )]
     pub fn start_verify_batch(
         &mut self,
         slots: &[usize],
@@ -1046,7 +1075,10 @@ impl Model {
             .verify
             .as_mut()
             .context("the batch verify state is missing")?;
-        ensure!(!bv.pending, "the last batched verify's verdicts were not read");
+        ensure!(
+            !bv.pending,
+            "the last batched verify's verdicts were not read"
+        );
         b.h2d_done.synchronize()?;
         bv.ensure_dummies(&stream, padded_seqs - seqs)?;
 
@@ -1086,8 +1118,11 @@ impl Model {
             keeps.resize(padded_seqs, u32::try_from(width)?);
         }
         b.host_positions.as_mut_slice()[..padded_seqs].copy_from_slice(&positions);
-        b.host_positions
-            .copy_to_device(&stream, padded_seqs, &mut b.positions.slice_mut(..padded_seqs))?;
+        b.host_positions.copy_to_device(
+            &stream,
+            padded_seqs,
+            &mut b.positions.slice_mut(..padded_seqs),
+        )?;
         bv.host_keep.as_mut_slice()[..padded_seqs].copy_from_slice(&keeps);
         bv.host_keep
             .copy_to_device(&stream, padded_seqs, &mut bv.keep.slice_mut(..padded_seqs))?;

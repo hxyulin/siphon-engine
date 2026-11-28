@@ -1,4 +1,10 @@
-use std::{ffi::c_void, mem::ManuallyDrop, ptr, sync::Arc};
+use std::{
+    ffi::c_void,
+    mem::{ManuallyDrop, align_of, size_of},
+    ops::{Deref, DerefMut},
+    ptr,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, ensure};
 use cudarc::{
@@ -192,6 +198,148 @@ impl<T> Drop for HostMapped<T> {
     }
 }
 
+/// Alignment in bytes for sub-allocations inside [`DeviceArena`] (satisfies CUDA `uint4`,
+/// tensor-core, and L2 cache-line alignment).
+pub(crate) const ARENA_ALIGN: usize = 256;
+
+/// Bump layout cursor for planning 256-byte-aligned offsets inside a [`DeviceArena`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ArenaCursor {
+    offset: usize,
+}
+
+impl ArenaCursor {
+    #[must_use]
+    pub(crate) const fn at(offset: usize) -> Self {
+        Self { offset }
+    }
+
+    /// Reserves space for `len` elements of `T` (at least 1 element so views are non-null)
+    /// and returns its byte offset from the start of the arena.
+    pub(crate) fn alloc<T>(&mut self, len: usize) -> usize {
+        let start = self.offset.next_multiple_of(ARENA_ALIGN);
+        let bytes = len.max(1) * size_of::<T>();
+        self.offset = start + bytes;
+        start
+    }
+
+    #[must_use]
+    pub(crate) const fn end(self) -> usize {
+        self.offset
+    }
+}
+
+/// A single persistent GPU byte allocation carved into non-overlapping-in-time typed views.
+///
+/// The backing allocation never moves, so every [`ArenaSlice`] keeps a fixed `CUdeviceptr`
+/// suitable for CUDA graph capture. Store `DeviceArena` AFTER all [`ArenaSlice`]s derived
+/// from it so Rust's declaration-order drop leaks the views before freeing the backing slice.
+#[derive(Debug)]
+pub(crate) struct DeviceArena {
+    backing: CudaSlice<u8>,
+    base: u64,
+}
+
+impl DeviceArena {
+    pub(crate) fn new(stream: &Arc<CudaStream>, bytes: usize) -> anyhow::Result<Self> {
+        let backing = stream.alloc_zeros::<u8>(bytes.max(ARENA_ALIGN))?;
+        let base = {
+            let (base, _guard) = backing.device_ptr(stream);
+            base
+        };
+        Ok(Self { backing, base })
+    }
+
+    /// Creates a typed non-owning view of `len` elements of `T` at `byte_offset`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `byte_offset` is misaligned or the slice exceeds the backing allocation.
+    pub(crate) fn slice<T>(
+        &self,
+        stream: &Arc<CudaStream>,
+        byte_offset: usize,
+        len: usize,
+    ) -> ArenaSlice<T> {
+        let align = align_of::<T>().max(16);
+        assert!(
+            byte_offset.is_multiple_of(align),
+            "arena offset {byte_offset} not aligned to {align}"
+        );
+        let bytes = len * size_of::<T>();
+        assert!(
+            byte_offset.saturating_add(bytes) <= self.backing.len(),
+            "arena slice [{byte_offset}..{}) exceeds backing len {}",
+            byte_offset.saturating_add(bytes),
+            self.backing.len()
+        );
+        // SAFETY: `self.backing` is a valid device allocation owned by this `DeviceArena`
+        // (and dropped after all derived `ArenaSlice`s). `ArenaSlice::drop` leaks the
+        // `CudaSlice` so cudarc never frees an interior pointer.
+        let slice = unsafe { stream.upgrade_device_ptr::<T>(self.base + byte_offset as u64, len) };
+        ArenaSlice {
+            slice: ManuallyDrop::new(slice),
+        }
+    }
+}
+
+/// Non-owning typed view into a [`DeviceArena`]. Derefs to [`CudaSlice<T>`] so existing
+/// kernel launchers and split borrows work unchanged.
+#[derive(Debug)]
+pub(crate) struct ArenaSlice<T> {
+    slice: ManuallyDrop<CudaSlice<T>>,
+}
+
+impl<T> Deref for ArenaSlice<T> {
+    type Target = CudaSlice<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slice
+    }
+}
+
+impl<T> DerefMut for ArenaSlice<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slice
+    }
+}
+
+impl<T> Drop for ArenaSlice<T> {
+    fn drop(&mut self) {
+        // SAFETY: `slice` points inside a `DeviceArena` backing buffer and is never used
+        // again. Leaking it prevents cudarc from calling `cuMemFreeAsync` on an interior ptr.
+        let slice = unsafe { ManuallyDrop::take(&mut self.slice) };
+        let _ = slice.leak();
+    }
+}
+
+/// Either an owned [`CudaSlice<T>`] or a view inside a [`DeviceArena`].
+#[derive(Debug)]
+pub(crate) enum ArenaBuf<T> {
+    Owned(CudaSlice<T>),
+    Arena(ArenaSlice<T>),
+}
+
+impl<T> Deref for ArenaBuf<T> {
+    type Target = CudaSlice<T>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(s) => s,
+            Self::Arena(s) => s,
+        }
+    }
+}
+
+impl<T> DerefMut for ArenaBuf<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(s) => s,
+            Self::Arena(s) => s,
+        }
+    }
+}
+
 /// Reusable page-locked host buffer for true async H2D/D2H DMA without pageable staging
 /// stalls. Uses cacheable pinned memory (`flags = 0`) so both host writes (H2D) and host
 /// reads (D2H) are fast.
@@ -320,12 +468,7 @@ impl<T: DeviceRepr + ValidAsZeroBits + Copy> PinnedBuf<T> {
         // SAFETY: `self.ptr` points to `count <= self.len` writable elements in the live
         // pinned allocation, and `dptr` holds `count` elements.
         unsafe {
-            sys::cuMemcpyDtoHAsync_v2(
-                self.ptr.cast::<c_void>(),
-                dptr,
-                bytes,
-                stream.cu_stream(),
-            )
+            sys::cuMemcpyDtoHAsync_v2(self.ptr.cast::<c_void>(), dptr, bytes, stream.cu_stream())
         }
         .result()
         .context("async pinned D2H copy")?;

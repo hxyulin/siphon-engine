@@ -58,7 +58,7 @@ struct Args {
     /// Set the dense weight format (fp8 or bf16).
     #[arg(long, value_name = "FORMAT", default_value_t = WeightFormat::Fp8)]
     weights: WeightFormat,
-    /// Set the KV cache format (fp8, bf16, nvfp4, nvfp4-all, mixed).
+    /// Set the KV cache format (fp8, bf16, nvfp4, nvfp4-all, nvfp4-g32, nvfp4-g32-all, mixed).
     #[arg(long, value_name = "FORMAT", default_value_t = KvFormat::Fp8)]
     kv: KvFormat,
     /// Cap GPU memory use, including the CUDA context.
