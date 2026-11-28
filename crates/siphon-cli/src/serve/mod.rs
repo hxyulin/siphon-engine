@@ -21,7 +21,7 @@ mod timings;
 mod tokenize;
 mod vision;
 
-use std::{env, net::SocketAddr, process::ExitCode, sync::Arc};
+use std::{env, net::SocketAddr, process::ExitCode, sync::Arc, time::SystemTime};
 
 use anyhow::Context as _;
 
@@ -136,7 +136,11 @@ pub fn command() -> Command {
 /// # Errors
 ///
 /// Returns a Clap error when the parsed options cannot be used together.
-pub fn run(command: &mut Command, matches: &ArgMatches) -> Result<ExitCode, clap::Error> {
+pub fn run(
+    command: &mut Command,
+    matches: &ArgMatches,
+    process_started: SystemTime,
+) -> Result<ExitCode, clap::Error> {
     let args = Args::from_matches(command, matches)?;
     #[cfg(target_os = "linux")]
     if env::var_os("CUDA_MODULE_LOADING").is_none() {
@@ -144,7 +148,7 @@ pub fn run(command: &mut Command, matches: &ArgMatches) -> Result<ExitCode, clap
         // SAFETY: the CLI has not started any threads.
         unsafe { env::set_var("CUDA_MODULE_LOADING", "EAGER") };
     }
-    Ok(match serve(args) {
+    Ok(match serve(args, process_started) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log!("error: {e:#}");
@@ -163,7 +167,7 @@ fn nodelay_listener(
     })
 }
 
-fn serve(args: Args) -> anyhow::Result<()> {
+fn serve(args: Args, process_started: SystemTime) -> anyhow::Result<()> {
     log!(
         "siphon serve {} (commit {COMMIT}) starting with {} on {}",
         env!("CARGO_PKG_VERSION"),
@@ -199,6 +203,7 @@ fn serve(args: Args) -> anyhow::Result<()> {
         name: args.name,
         api_key,
         started: openai::started(),
+        process_started,
         sampling,
         greedy: args.engine.greedy,
         keepalive: (!args.keepalive_after.is_zero()).then_some(keepalive::KeepAlive {

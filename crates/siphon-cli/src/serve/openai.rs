@@ -94,6 +94,7 @@ pub struct App {
     /// The bearer token every route but `/health` and `/version` must carry, if set.
     pub api_key: Option<String>,
     pub started: u64,
+    pub process_started: SystemTime,
     /// The sampling of fields a request leaves out.
     pub sampling: SamplingDefaults,
     /// `--greedy`: every request decodes greedily, whatever its sampling fields ask.
@@ -557,12 +558,15 @@ fn model_card(app: &App) -> Value {
 }
 
 async fn metrics_route(State(app): State<Arc<App>>) -> Response {
+    let mut text = app.metrics.render();
+    app.engine.write_metrics(&mut text);
+    super::metrics::write_process_start(&mut text, app.process_started);
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        app.metrics.render(),
+        text,
     )
         .into_response()
 }

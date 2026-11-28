@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from inspect import signature
 from pathlib import Path
 
 
@@ -51,6 +52,10 @@ try:
     from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
     from mlx_lm.utils import load_model
 
+    progress = {}
+    if "prompt_progress_callback" in signature(generate_step).parameters:
+        progress["prompt_progress_callback"] = lambda done, _total: reply(prefill=done)
+
     model_path = Path(sys.argv[1])
     config = json.loads((model_path / "config.json").read_bytes())
     if config["model_type"] != "inkling2_loop":
@@ -79,6 +84,7 @@ for line in sys.stdin:
                     max_tokens=options["max_tokens"],
                     prefill_step_size=options["prefill_chunk"],
                     sampler=sampler(options),
+                    **progress,
                 )
                 reply(ok=None)
             case "next":

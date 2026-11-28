@@ -3,6 +3,7 @@
 use std::{
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use axum::{
@@ -77,6 +78,7 @@ impl Server {
             name: "m".to_owned(),
             api_key: None,
             started: 0,
+            process_started: UNIX_EPOCH,
             sampling: SamplingDefaults::default(),
             greedy: false,
             keepalive,
@@ -89,6 +91,44 @@ impl Server {
 
     pub(crate) async fn call(&self, request: Request<Body>) -> Response<Body> {
         self.router.clone().oneshot(request).await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn metrics_expose_stable_process_start_and_scheduler_capacity() {
+    let (engine, _jobs) = Engine::fake(1024);
+    let router = openai::router(Arc::new(App {
+        vocab: crate::serve::chat::tests::synthetic_vocab(),
+        engine,
+        metrics: Arc::new(Metrics::new("m")),
+        name: "m".to_owned(),
+        api_key: None,
+        started: 0,
+        process_started: UNIX_EPOCH + Duration::from_millis(1234),
+        sampling: SamplingDefaults::default(),
+        greedy: false,
+        keepalive: None,
+    }));
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for sample in [
+            "process_start_time_seconds 1.234",
+            "siphon:max_concurrent_streams 1",
+            "siphon:num_requests_prefilling 0",
+            "siphon:num_requests_decoding 0",
+            "siphon:prefill_tokens_total 0",
+        ] {
+            assert!(text.lines().any(|line| line == sample), "missing {sample}");
+        }
     }
 }
 

@@ -55,6 +55,7 @@ fn command() -> Command {
 }
 
 fn main() -> ExitCode {
+    let process_started = std::time::SystemTime::now();
     let mut command = command();
     let (name, mut matches) = command
         .get_matches_mut()
@@ -78,7 +79,8 @@ fn main() -> ExitCode {
             let subcommand = command
                 .find_subcommand_mut("serve")
                 .expect("serve is defined");
-            return serve::run(subcommand, &matches).unwrap_or_else(|error| error.exit());
+            return serve::run(subcommand, &matches, process_started)
+                .unwrap_or_else(|error| error.exit());
         }
         #[cfg(feature = "archive")]
         "archive" => archive::run(&matches),

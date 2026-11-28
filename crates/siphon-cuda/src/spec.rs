@@ -2051,7 +2051,7 @@ impl Speculator {
             model.position() == 0,
             "the speculator prefills from position 0"
         );
-        self.prefill_whole(model, Prompt::text(prompt), chunk)
+        self.prefill_whole(model, Prompt::text(prompt), chunk, &mut |_| {})
     }
 
     /// [`Self::prefill`] of a [`Prompt`].
@@ -2060,6 +2060,7 @@ impl Speculator {
         model: &mut Model,
         prompt: Prompt<'_>,
         chunk: usize,
+        progress: &mut impl FnMut(usize),
     ) -> anyhow::Result<u32> {
         prompt.check()?;
         self.fence_host()?;
@@ -2067,7 +2068,7 @@ impl Speculator {
         self.draft_sequence += 1;
         let tokens = prompt.tokens;
         self.start_prompt(model, tokens)?;
-        let first = self.prefill_rows(model, tokens, prompt.images, chunk)?;
+        let first = self.prefill_rows(model, tokens, prompt.images, chunk, progress)?;
         self.end_prompt(model, tokens.len(), first)
     }
 
@@ -2104,6 +2105,7 @@ impl Speculator {
         tokens: &[u32],
         images: Option<ImageSource<'_>>,
         chunk: usize,
+        progress: &mut impl FnMut(usize),
     ) -> anyhow::Result<u32> {
         let stream = Arc::clone(model.stream());
         let Self {
@@ -2117,11 +2119,11 @@ impl Speculator {
         } = self;
         let row = *row_len;
         let mut commit = |start: usize, taps: CudaView<'_, bf16>| {
+            let rows = taps.len() / row;
             draft.commit(&stream, linear, &taps, start)?;
             if *keep_tail {
                 // Keep the last TAIL rows in host memory for `restart`: shift old tail in
                 // place, then copy this chunk's newest rows from device.
-                let rows = taps.len() / row;
                 let new = rows.min(TAIL);
                 let old = (*tail_rows).min(TAIL - new);
                 if tail.len() < TAIL * row {
@@ -2136,6 +2138,7 @@ impl Speculator {
                 )?;
                 *tail_rows = old + new;
             }
+            progress(rows);
             Ok(())
         };
         match images {
@@ -2384,7 +2387,7 @@ impl Speculator {
             let chunk = self.prefill_chunk;
             let images = Prompt::images(&mut tokens.images);
             model.with_slot(rebuild.slot, |m| {
-                self.prefill_rows(m, &tokens.tokens[done..end], images, chunk)
+                self.prefill_rows(m, &tokens.tokens[done..end], images, chunk, &mut |_| {})
             })?;
             rebuild.key.extend_from_slice(&tokens.key[done..end]);
         }

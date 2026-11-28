@@ -9,7 +9,10 @@ use anyhow::{Context as _, ensure};
 use siphon_mlx::{GenerationOptions, Model};
 
 use super::{CANCELLED, Control, Engine, Event, Finish, Job, Options};
-use crate::serve::log::log;
+use crate::serve::{
+    log::log,
+    metrics::{SchedulerMetrics, StreamPhase},
+};
 
 const DEFAULT_CONTEXT: usize = 8192;
 
@@ -58,7 +61,14 @@ pub(in crate::serve) fn start(
                     break;
                 };
                 for job in submission {
-                    run_job(&mut model, job, &stop, generation, greedy);
+                    run_job(
+                        &mut model,
+                        job,
+                        &stop,
+                        generation,
+                        greedy,
+                        &engine_control.metrics,
+                    );
                 }
             }
         })?;
@@ -79,6 +89,7 @@ fn run_job(
     stop: &[u32],
     mut options: GenerationOptions,
     greedy: bool,
+    metrics: &Arc<SchedulerMetrics>,
 ) {
     if job.events.is_closed() {
         return;
@@ -103,19 +114,32 @@ fn run_job(
     options.seed = job.sampling.seed;
 
     let mut finish = Finish::Length;
-    let result = model.generate(&job.prompt, options, |id| {
-        if job.cancelled() || job.events.is_closed() {
-            return ControlFlow::Break(());
-        }
-        if !job.ignore_eos && stop.contains(&id) {
-            finish = Finish::Stop;
-            return ControlFlow::Break(());
-        }
-        match job.events.send(Event::from_tokens(&[id])) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
-    });
+    let mut stream = metrics.start();
+    let mut remaining = job.max_tokens;
+    let result = model.generate_with_progress(
+        &job.prompt,
+        options,
+        |tokens| metrics.prefill(tokens),
+        |id, elapsed| {
+            let connected = !job.cancelled() && !job.events.is_closed();
+            let eos = !job.ignore_eos && stop.contains(&id);
+            let emit = connected && !eos;
+            if remaining < job.max_tokens {
+                metrics.decode(1, usize::from(emit), elapsed);
+            }
+            remaining -= 1;
+            stream.set((emit && remaining > 0).then_some(StreamPhase::Decode));
+            if connected && eos {
+                finish = Finish::Stop;
+            }
+            if emit && job.events.send(Event::from_tokens(&[id])).is_ok() {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        },
+    );
+    drop(stream);
     let end = if job.cancelled() {
         Event::Failed(CANCELLED.to_owned())
     } else {

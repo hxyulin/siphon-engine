@@ -560,11 +560,23 @@ impl Speculator {
         prompt: Prompt<'_>,
         chunk: usize,
     ) -> anyhow::Result<(u32, usize)> {
+        self.prefill_cached_with_progress(model, prompt, chunk, |_| {})
+    }
+
+    /// Prefills like [`Self::prefill_cached`] and reports the number of new tokens
+    /// processed in each submitted chunk. Restoring cached state does not report progress.
+    pub fn prefill_cached_with_progress(
+        &mut self,
+        model: &mut Model,
+        prompt: Prompt<'_>,
+        chunk: usize,
+        mut progress: impl FnMut(usize),
+    ) -> anyhow::Result<(u32, usize)> {
         prompt.check()?;
         let now = Instant::now();
         let Some(cache) = self.prefix.as_ref() else {
             model.reset()?;
-            return Ok((self.prefill_whole(model, prompt, chunk)?, 0));
+            return Ok((self.prefill_whole(model, prompt, chunk, &mut progress)?, 0));
         };
         let Prompt {
             tokens,
@@ -649,7 +661,13 @@ impl Speculator {
             // prefill of the whole prompt.
             if boundary > start {
                 let images = Prompt::images(&mut images);
-                self.prefill_rows(model, &tokens[start..boundary], images, chunk)?;
+                self.prefill_rows(
+                    model,
+                    &tokens[start..boundary],
+                    images,
+                    chunk,
+                    &mut progress,
+                )?;
             }
             // A state restored from the host goes into a device entry too, so that the
             // next turn finds it there.
@@ -660,7 +678,7 @@ impl Speculator {
                 self.save_entry_rings(model, i)?;
             }
         }
-        let first = self.prefill_rows(model, &tokens[boundary..], images, chunk)?;
+        let first = self.prefill_rows(model, &tokens[boundary..], images, chunk, &mut progress)?;
         Ok((self.end_prompt(model, tokens.len(), first)?, start))
     }
 

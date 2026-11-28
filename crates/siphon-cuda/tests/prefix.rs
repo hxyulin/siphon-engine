@@ -93,7 +93,19 @@ fn run(
     cached: bool,
 ) -> anyhow::Result<(Run, usize)> {
     let (first, from_cache) = if cached {
-        spec.prefill_cached(model, Prompt::text(prompt), CHUNK)?
+        let mut chunks = Vec::new();
+        let (first, from_cache) =
+            spec.prefill_cached_with_progress(model, Prompt::text(prompt), CHUNK, |count| {
+                chunks.push(count);
+            })?;
+        assert_eq!(
+            chunks,
+            prompt[from_cache..]
+                .chunks(CHUNK)
+                .map(<[u32]>::len)
+                .collect::<Vec<_>>()
+        );
+        (first, from_cache)
     } else {
         model.reset()?;
         (spec.prefill(model, prompt, CHUNK)?, 0)

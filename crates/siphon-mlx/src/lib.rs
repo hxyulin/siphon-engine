@@ -9,6 +9,7 @@ use std::{
     ops::ControlFlow,
     path::Path,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -122,7 +123,7 @@ impl Model {
             child,
             reply: String::new(),
         };
-        let info = worker.read()?;
+        let info = worker.read(|_| {})?;
         Ok(Self {
             worker: Some(worker),
             info,
@@ -150,6 +151,25 @@ impl Model {
         options: GenerationOptions,
         mut on_token: impl FnMut(u32) -> ControlFlow<()>,
     ) -> Result<(), Error> {
+        self.generate_with_progress(prompt, options, |_| {}, |token, _| on_token(token))
+    }
+
+    /// Generates tokens while reporting completed prefill chunks and time to receive
+    /// each token from the worker. The first token's time includes prefill.
+    ///
+    /// `on_prefill` receives the number of new prompt tokens in each chunk. As with
+    /// [`Self::generate`], returning a break from `on_token` ends generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::generate`].
+    pub fn generate_with_progress(
+        &mut self,
+        prompt: &[u32],
+        options: GenerationOptions,
+        mut on_prefill: impl FnMut(usize),
+        mut on_token: impl FnMut(u32, Duration) -> ControlFlow<()>,
+    ) -> Result<(), Error> {
         if prompt.is_empty() || prompt.iter().any(|&id| id >= self.info.vocab_size) {
             return Err(Failure::Invalid("expected a nonempty prompt with valid token IDs").into());
         }
@@ -172,8 +192,22 @@ impl Model {
         }
 
         self.request::<()>(&Request::Generate { prompt, options })?;
-        for _ in 0..options.max_tokens {
-            if on_token(self.request(&Request::Next)?).is_break() {
+        let mut prefilled = 0;
+        for i in 0..options.max_tokens {
+            let started = Instant::now();
+            let token = self.request_with_progress(&Request::Next, |processed| {
+                let processed = processed.min(prompt.len());
+                if processed > prefilled {
+                    on_prefill(processed - prefilled);
+                    prefilled = processed;
+                }
+            })?;
+            // Older MLX-LM builds can report prefill only when the first token is ready.
+            if i == 0 && prefilled < prompt.len() {
+                on_prefill(prompt.len() - prefilled);
+                prefilled = prompt.len();
+            }
+            if on_token(token, started.elapsed()).is_break() {
                 break;
             }
         }
@@ -181,8 +215,16 @@ impl Model {
     }
 
     fn request<T: DeserializeOwned>(&mut self, request: &Request<'_>) -> Result<T, Error> {
+        self.request_with_progress(request, |_| {})
+    }
+
+    fn request_with_progress<T: DeserializeOwned>(
+        &mut self,
+        request: &Request<'_>,
+        on_prefill: impl FnMut(usize),
+    ) -> Result<T, Error> {
         let worker = self.worker.as_mut().ok_or(Failure::WorkerLost)?;
-        let result = worker.exchange(request);
+        let result = worker.exchange(request, on_prefill);
         if result
             .as_ref()
             .is_err_and(|e| !matches!(e, Failure::Model(_)))
@@ -215,6 +257,7 @@ enum Request<'a> {
 enum Reply<T> {
     Ok(T),
     Error(String),
+    Prefill(usize),
 }
 
 #[derive(Debug)]
@@ -226,21 +269,31 @@ struct Worker {
 }
 
 impl Worker {
-    fn exchange<T: DeserializeOwned>(&mut self, request: &Request<'_>) -> Result<T, Failure> {
+    fn exchange<T: DeserializeOwned>(
+        &mut self,
+        request: &Request<'_>,
+        on_prefill: impl FnMut(usize),
+    ) -> Result<T, Failure> {
         let mut message = serde_json::to_vec(request)?;
         message.push(b'\n');
         self.input.write_all(&message)?;
-        self.read()
+        self.read(on_prefill)
     }
 
-    fn read<T: DeserializeOwned>(&mut self) -> Result<T, Failure> {
-        self.reply.clear();
-        if self.output.read_line(&mut self.reply)? == 0 {
-            return Err(Failure::WorkerLost);
-        }
-        match serde_json::from_str(&self.reply)? {
-            Reply::Ok(value) => Ok(value),
-            Reply::Error(message) => Err(Failure::Model(message)),
+    fn read<T: DeserializeOwned>(
+        &mut self,
+        mut on_prefill: impl FnMut(usize),
+    ) -> Result<T, Failure> {
+        loop {
+            self.reply.clear();
+            if self.output.read_line(&mut self.reply)? == 0 {
+                return Err(Failure::WorkerLost);
+            }
+            match serde_json::from_str(&self.reply)? {
+                Reply::Ok(value) => return Ok(value),
+                Reply::Error(message) => return Err(Failure::Model(message)),
+                Reply::Prefill(tokens) => on_prefill(tokens),
+            }
         }
     }
 }

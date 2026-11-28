@@ -45,7 +45,10 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::serve::vision::{ImageStats, Images};
+use crate::serve::{
+    metrics::SchedulerMetrics,
+    vision::{ImageStats, Images},
+};
 
 /// Why a job that a drain gave up on failed.
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
@@ -195,6 +198,7 @@ impl Load {
 /// What a drain tells the engine thread, set from the HTTP side.
 #[derive(Debug, Default)]
 struct Control {
+    metrics: Arc<SchedulerMetrics>,
     /// New jobs are refused ([`Engine::drain`]).
     draining: AtomicBool,
     /// The jobs left end now, with an error ([`Engine::cancel`]).
@@ -498,6 +502,11 @@ impl Engine {
         self.max_context
     }
 
+    /// Writes server-wide metrics from the scheduler.
+    pub fn write_metrics(&self, out: &mut String) {
+        self.control.metrics.write(out, self.streams);
+    }
+
     /// Jobs that one submission may hold: as many as run and wait at once.
     pub fn max_jobs(&self) -> usize {
         self.queue + self.streams
@@ -639,6 +648,7 @@ mod cuda {
     use super::{CANCELLED, Control, Engine, Event, Finish, Job, Options, starts_with_chained};
     use crate::serve::{
         log::log,
+        metrics::{ActiveStream, SchedulerMetrics, StreamPhase},
         piggyback::{self, PiggybackSlice, PrefillCandidate, TurnPlan},
         vision::{ImageStats, PromptImage},
     };
@@ -1407,6 +1417,7 @@ mod cuda {
     )]
     struct Request {
         job: Job,
+        stream: ActiveStream,
         /// How the request picks its tokens.
         sampling: ModelSampling,
         slot: usize,
@@ -1456,7 +1467,7 @@ mod cuda {
     }
 
     impl Request {
-        fn new(mut job: Job, slot: usize, greedy: bool) -> Self {
+        fn new(mut job: Job, slot: usize, greedy: bool, metrics: &Arc<SchedulerMetrics>) -> Self {
             job.start();
             let _ = job.events.send(Event::Started);
             let (sampling, error) = match model_sampling(&job, greedy) {
@@ -1465,6 +1476,7 @@ mod cuda {
             };
             let mut request = Self {
                 job,
+                stream: metrics.start(),
                 sampling,
                 slot,
                 started: Instant::now(),
@@ -1497,6 +1509,29 @@ mod cuda {
                 request.fail(&anyhow::anyhow!(CANCELLED));
             }
             request
+        }
+
+        /// Records the new positions computed by a prefill chunk.
+        fn advance_prefill(&mut self, end: usize) {
+            self.stream.metrics().prefill(end - self.prefilled);
+            self.prefilled = end;
+        }
+
+        /// Hands off a finished prefill to decode if the first token leaves work to do.
+        fn first_token(&mut self, token: u32, stop: &[u32]) {
+            self.next = Some(token);
+            self.done = self.take(&[token], stop).is_break();
+            self.stream.set((!self.done).then_some(StreamPhase::Decode));
+        }
+
+        /// Takes a decode step's output and returns the number of tokens it added.
+        fn decode_tokens(&mut self, tokens: &[u32], stop: &[u32]) -> usize {
+            let before = self.output.len();
+            self.done = self.take(tokens, stop).is_break();
+            if self.done {
+                self.stream.set(None);
+            }
+            self.output.len() - before
         }
 
         /// Positions its slot holds: the prompt prefilled so far, then every generated
@@ -1660,11 +1695,13 @@ mod cuda {
             let _ = self.job.events.send(Event::Failed(format!("{e:#}")));
             self.done = true;
             self.failed = true;
+            self.stream.set(None);
         }
     }
 
     /// What the scheduler goes by.
-    struct Sched {
+    struct Sched<'a> {
+        metrics: &'a Arc<SchedulerMetrics>,
         streams: usize,
         greedy: bool,
         /// Tokens per second each decoding request gets at least while another prefills.
@@ -1694,6 +1731,7 @@ mod cuda {
     ) {
         let capacity = model.slot_capacity();
         let sched = Sched {
+            metrics: &control.metrics,
             streams: options.streams,
             greedy: options.greedy,
             floor: options.decode_floor,
@@ -1701,7 +1739,7 @@ mod cuda {
             capacity,
             group_by_confidence: options.group_by_confidence,
         };
-        let (streams, greedy) = (sched.streams, sched.greedy);
+        let streams = sched.streams;
         let mut waiting = VecDeque::new();
         // A request that a batch left alone, to continue with speculation.
         let mut resumed = None;
@@ -1789,7 +1827,7 @@ mod cuda {
                     check.after_job();
                     continue;
                 }
-                let request = Request::new(job, 0, greedy);
+                let request = Request::new(job, 0, sched.greedy, sched.metrics);
                 if request.done {
                     continue;
                 }
@@ -2016,6 +2054,7 @@ mod cuda {
                     r.since.elapsed().as_secs_f64()
                 );
                 r.parked = Some(id);
+                r.stream.set(None);
                 // An image that a prefill chunk kept for the next one is encoded again
                 // when the request returns, rather than held in GPU memory meanwhile.
                 r.kept = None;
@@ -2158,15 +2197,7 @@ mod cuda {
                         room
                     });
                 if fits {
-                    start_pick(
-                        model,
-                        speculator,
-                        active,
-                        waiting,
-                        parked,
-                        pick,
-                        sched.greedy,
-                    );
+                    start_pick(model, speculator, active, waiting, parked, pick, sched);
                     started = true;
                     break;
                 }
@@ -2240,13 +2271,13 @@ mod cuda {
         waiting: &mut VecDeque<Job>,
         parked: &mut Vec<Request>,
         pick: Pick,
-        greedy: bool,
+        sched: &Sched,
     ) {
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
         match pick {
             Pick::Waiting(i) => {
                 let Some(job) = waiting.remove(i) else { return };
-                let mut request = Request::new(job, 0, greedy);
+                let mut request = Request::new(job, 0, sched.greedy, sched.metrics);
                 if request.done {
                     return;
                 }
@@ -2282,6 +2313,11 @@ mod cuda {
                         r.draft_ready = speculator.supports_batch_spec()
                             && speculator.slot_draft_committed(slot) == position;
                         r.since = Instant::now();
+                        r.stream.set(Some(if r.next.is_some() {
+                            StreamPhase::Decode
+                        } else {
+                            StreamPhase::Prefill
+                        }));
                         active.push(r);
                     }
                     Ok((_, position)) => r.fail(&anyhow::anyhow!(
@@ -2292,6 +2328,44 @@ mod cuda {
                 }
             }
         }
+    }
+
+    /// Prefills one request through the cache before it starts decoding alone.
+    fn prefill_alone(
+        model: &mut Model,
+        speculator: &mut Speculator,
+        tower: &mut Tower,
+        request: &mut Request,
+        stop: &[u32],
+    ) -> anyhow::Result<()> {
+        let hidden = model.config().hidden_size;
+        let chunk = speculator.prefill_chunk();
+        let job = &request.job;
+        let encodes = &mut request.encodes;
+        let mut kept = None;
+        let mut source = |start: usize, end: usize| {
+            image_rows(tower, hidden, &job.images, &mut kept, encodes, (start, end))
+        };
+        let prompt = Prompt {
+            tokens: &job.prompt,
+            key: job.key(),
+            images: if job.images.is_empty() {
+                None
+            } else {
+                Some(&mut source)
+            },
+        };
+        let (first, cached) =
+            speculator.prefill_cached_with_progress(model, prompt, chunk, |tokens| {
+                request.stream.metrics().prefill(tokens);
+            })?;
+        log_cache(speculator);
+        request.cached_from(speculator, cached);
+        request.prefilled = request.job.prompt.len();
+        request.prefill_s = request.started.elapsed().as_secs_f64();
+        request.send_images();
+        request.first_token(first, stop);
+        Ok(())
     }
 
     /// Runs `request` alone in slot 0 with speculation: from its prompt, or from its next
@@ -2314,40 +2388,14 @@ mod cuda {
         mut interrupt: Option<(&Receiver<Vec<Job>>, &mut VecDeque<Job>)>,
     ) -> anyhow::Result<bool> {
         model.set_sampling(request.sampling);
-        let go_on = if request.next.is_some() {
-            true
-        } else {
-            let hidden = model.config().hidden_size;
-            let chunk = speculator.prefill_chunk();
-            let job = &request.job;
-            let encodes = &mut request.encodes;
-            let mut kept = None;
-            let mut source = |start: usize, end: usize| {
-                image_rows(tower, hidden, &job.images, &mut kept, encodes, (start, end))
-            };
-            let prompt = Prompt {
-                tokens: &job.prompt,
-                key: job.key(),
-                images: if job.images.is_empty() {
-                    None
-                } else {
-                    Some(&mut source)
-                },
-            };
-            let (first, cached) = speculator.prefill_cached(model, prompt, chunk)?;
-            log_cache(speculator);
-            request.cached_from(speculator, cached);
-            request.prefilled = request.job.prompt.len();
-            request.prefill_s = request.started.elapsed().as_secs_f64();
-            request.send_images();
-            request.next = Some(first);
-            request.take(&[first], stop).is_continue()
-        };
+        if request.next.is_none() {
+            prefill_alone(model, speculator, tower, request, stop)?;
+        }
         let mut interrupted = false;
         let mut last = request.next.unwrap_or_default();
         let before = request.output.len();
         let started = Instant::now();
-        if go_on {
+        if !request.done {
             let remaining = request.job.max_tokens - request.output.len();
             let final_position = request.final_position(capacity);
             // Positions below which slot 0 and the draft have their pages, mapped or free.
@@ -2372,11 +2420,15 @@ mod cuda {
                 log!("KV pool: full at position {}", model.position());
                 false
             };
+            let mut last_step = Instant::now();
             speculator.generate_with_room(model, remaining, Drafts::Dspark, room, |ids| {
                 request.speculated += ids.len();
                 let _ = request.job.events.send(Event::Round);
                 last = ids.last().copied().unwrap_or(last);
-                if request.take(ids, stop).is_break() {
+                let now = Instant::now();
+                let tokens = request.decode_tokens(ids, stop);
+                request.stream.metrics().decode(1, tokens, now - last_step);
+                if request.done {
                     return ControlFlow::Break(());
                 }
                 if let Some((queue, waiting)) = interrupt.as_mut()
@@ -2386,6 +2438,7 @@ mod cuda {
                     interrupted = true;
                     return ControlFlow::Break(());
                 }
+                last_step = Instant::now();
                 ControlFlow::Continue(())
             })?;
         }
@@ -2751,7 +2804,7 @@ mod cuda {
                     }
                     r.fail(&anyhow::anyhow!("the request no longer fits the KV pool"));
                 } else if let Some(job) = waiting.pop_front() {
-                    let mut r = Request::new(job, 0, sched.greedy);
+                    let mut r = Request::new(job, 0, sched.greedy, sched.metrics);
                     r.fail(&anyhow::anyhow!("the request does not fit the KV pool"));
                 }
                 continue;
@@ -2881,7 +2934,7 @@ mod cuda {
                         &mut active,
                         &slices,
                         stop,
-                        sched.group_by_confidence,
+                        sched,
                         &mut scratch,
                     );
                     retire(model, speculator, &mut active);
@@ -3012,14 +3065,7 @@ mod cuda {
                         }
                     }
                 }
-                let emitted = step_rows(
-                    model,
-                    speculator,
-                    &mut active,
-                    stop,
-                    sched.group_by_confidence,
-                    &mut scratch,
-                );
+                let emitted = step_rows(model, speculator, &mut active, stop, sched, &mut scratch);
                 if emitted == 0 {
                     break;
                 }
@@ -3297,7 +3343,7 @@ mod cuda {
                     for ((idx, end, len), first) in ends.into_iter().zip(tokens) {
                         let boundary = len.saturating_sub(1) / chunk * chunk;
                         let slot = active[idx].slot;
-                        active[idx].prefilled = end;
+                        active[idx].advance_prefill(end);
                         if end == boundary && end > active[idx].cached {
                             if make_room(
                                 model,
@@ -3323,8 +3369,7 @@ mod cuda {
                             r.kept = None;
                             r.prefill_s = r.started.elapsed().as_secs_f64();
                             r.send_images();
-                            r.next = Some(first);
-                            r.done = r.take(&[first], stop).is_break();
+                            r.first_token(first, stop);
                         }
                     }
                     log_cache(speculator);
@@ -3407,7 +3452,7 @@ mod cuda {
                 return processed.max(1);
             }
         };
-        r.prefilled = end;
+        r.advance_prefill(end);
         let slot = r.slot;
         // The entry copies the slot's rings into pages of the pool.
         if end == boundary && end > r.cached {
@@ -3426,8 +3471,7 @@ mod cuda {
             r.kept = None;
             r.prefill_s = r.started.elapsed().as_secs_f64();
             r.send_images();
-            r.next = Some(first);
-            r.done = r.take(&[first], stop).is_break();
+            r.first_token(first, stop);
             share_prefill(model, speculator, active, i, stop);
         }
         processed.max(1)
@@ -3476,8 +3520,7 @@ mod cuda {
                     r.shared = true;
                     r.draft_ready = copy_draft;
                     r.prefill_s = r.started.elapsed().as_secs_f64();
-                    r.next = Some(first);
-                    r.done = r.take(&[first], stop).is_break();
+                    r.first_token(first, stop);
                 }
                 Err(e) => r.fail(&e),
             }
@@ -3510,6 +3553,31 @@ mod cuda {
         }
     }
 
+    /// Counts one decode dispatch, including all streams in that dispatch.
+    struct DecodeStep {
+        streams: usize,
+        tokens: usize,
+        started: Instant,
+    }
+
+    impl DecodeStep {
+        fn new(streams: usize) -> Self {
+            Self {
+                streams,
+                tokens: 0,
+                started: Instant::now(),
+            }
+        }
+
+        fn emit(&mut self, request: &mut Request, tokens: &[u32], stop: &[u32]) {
+            self.tokens += request.decode_tokens(tokens, stop);
+        }
+
+        fn record(self, metrics: &SchedulerMetrics) {
+            metrics.decode(self.streams, self.tokens, self.started.elapsed());
+        }
+    }
+
     /// Runs one batched decode step or batched DFlash 2 speculation round over the requests
     /// of `active` that have a next token. Returns the minimum number of tokens emitted per
     /// active decoding request (0 when none decoded).
@@ -3522,9 +3590,10 @@ mod cuda {
         speculator: &mut Speculator,
         active: &mut [Request],
         stop: &[u32],
-        group_by_confidence: bool,
+        sched: &Sched,
         scratch: &mut StepScratch,
     ) -> usize {
+        let group_by_confidence = sched.group_by_confidence;
         let batch_spec = speculator.supports_batch_spec();
         scratch.spec_indices.clear();
         scratch.plain_indices.clear();
@@ -3584,6 +3653,7 @@ mod cuda {
                     scratch.anchors.push(active[i].next.unwrap_or_default());
                     scratch.spec_samplings.push(active[i].sampling);
                 }
+                let mut dispatch = DecodeStep::new(chunk.len());
                 match speculator.speculate_batch_round(
                     model,
                     &scratch.slots,
@@ -3599,7 +3669,7 @@ mod cuda {
                             r.speculated += emitted.len();
                             let _ = r.job.events.send(Event::Round);
                             r.next = Some(verdict.next());
-                            r.done = r.take(&emitted, stop).is_break();
+                            dispatch.emit(r, &emitted, stop);
                         }
                     }
                     Err(e) => {
@@ -3610,6 +3680,7 @@ mod cuda {
                         min_emitted = min_emitted.min(1);
                     }
                 }
+                dispatch.record(sched.metrics);
             }
         }
         if !scratch.plain_indices.is_empty() {
@@ -3621,6 +3692,7 @@ mod cuda {
                     .push((active[i].slot, active[i].next.unwrap_or_default()));
                 scratch.plain_samplings.push(active[i].sampling);
             }
+            let mut dispatch = DecodeStep::new(scratch.rows.len());
             match model.step_batch_sampled(&scratch.rows, &scratch.plain_samplings) {
                 Ok(next) => {
                     let alone_plain = scratch.rows.len() == 1 && scratch.spec_indices.is_empty();
@@ -3638,7 +3710,7 @@ mod cuda {
                             r.rent += 1;
                         }
                         r.next = Some(token);
-                        r.done = r.take(&[token], stop).is_break();
+                        dispatch.emit(r, &[token], stop);
                     }
                     min_emitted = min_emitted.min(1);
                 }
@@ -3649,6 +3721,7 @@ mod cuda {
                     min_emitted = min_emitted.min(1);
                 }
             }
+            dispatch.record(sched.metrics);
         }
         if min_emitted == usize::MAX {
             0
@@ -3671,7 +3744,7 @@ mod cuda {
     ) {
         let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
         for (s, &first) in slices.iter().zip(tokens) {
-            active[s.index].prefilled = s.end;
+            active[s.index].advance_prefill(s.end);
             if s.hits_prefix_boundary && s.end > active[s.index].cached {
                 if make_room(model, speculator, model.ring_pages(), &busy, Reclaim::Draft) {
                     let key = active[s.index].job.key();
@@ -3689,8 +3762,7 @@ mod cuda {
                 r.kept = None;
                 r.prefill_s = r.started.elapsed().as_secs_f64();
                 r.send_images();
-                r.next = Some(first);
-                r.done = r.take(&[first], stop).is_break();
+                r.first_token(first, stop);
             }
         }
     }
@@ -3710,7 +3782,7 @@ mod cuda {
         active: &mut [Request],
         slices: &[PiggybackSlice],
         stop: &[u32],
-        group_by_confidence: bool,
+        sched: &Sched,
         scratch: &mut StepScratch,
     ) {
         let batch_spec = speculator.supports_batch_spec();
@@ -3759,14 +3831,7 @@ mod cuda {
             encoded_images.push(imgs);
         }
         if live_slices.is_empty() {
-            let _ = step_rows(
-                model,
-                speculator,
-                active,
-                stop,
-                group_by_confidence,
-                scratch,
-            );
+            let _ = step_rows(model, speculator, active, stop, sched, scratch);
             return;
         }
         let chunk = speculator.prefill_chunk();
@@ -3792,6 +3857,7 @@ mod cuda {
                 .collect();
             let sampling: Vec<ModelSampling> =
                 plain_indices.iter().map(|&i| active[i].sampling).collect();
+            let mut dispatch = DecodeStep::new(rows.len());
             let result = speculator.step_hybrid_batch(
                 model,
                 &rows,
@@ -3817,8 +3883,9 @@ mod cuda {
                         }
                         r.batched += 1;
                         r.next = Some(token);
-                        r.done = r.take(&[token], stop).is_break();
+                        dispatch.emit(r, &[token], stop);
                     }
+                    dispatch.record(sched.metrics);
                     finish_piggybacked_prefills(
                         model,
                         speculator,
@@ -3830,6 +3897,7 @@ mod cuda {
                     );
                 }
                 Err(e) => {
+                    dispatch.record(sched.metrics);
                     for &idx in &plain_indices {
                         active[idx].fail(&e);
                     }
@@ -3849,6 +3917,7 @@ mod cuda {
                 .collect();
             let samplings: Vec<ModelSampling> =
                 first_chunk.iter().map(|&i| active[i].sampling).collect();
+            let mut dispatch = DecodeStep::new(first_chunk.len());
             let result = speculator.speculate_hybrid_round(
                 model,
                 &slots,
@@ -3869,8 +3938,9 @@ mod cuda {
                         r.speculated += emitted.len();
                         let _ = r.job.events.send(Event::Round);
                         r.next = Some(verdict.next());
-                        r.done = r.take(&emitted, stop).is_break();
+                        dispatch.emit(r, &emitted, stop);
                     }
+                    dispatch.record(sched.metrics);
                     finish_piggybacked_prefills(
                         model,
                         speculator,
@@ -3882,6 +3952,7 @@ mod cuda {
                     );
                 }
                 Err(e) => {
+                    dispatch.record(sched.metrics);
                     speculator.invalidate_batch_draft();
                     for &idx in first_chunk {
                         active[idx].fail(&e);
@@ -3900,6 +3971,7 @@ mod cuda {
                     .collect();
                 let extra_samplings: Vec<ModelSampling> =
                     extra.iter().map(|&i| active[i].sampling).collect();
+                let mut dispatch = DecodeStep::new(extra.len());
                 match speculator.speculate_batch_round(
                     model,
                     &extra_slots,
@@ -3914,7 +3986,7 @@ mod cuda {
                             r.speculated += emitted.len();
                             let _ = r.job.events.send(Event::Round);
                             r.next = Some(verdict.next());
-                            r.done = r.take(&emitted, stop).is_break();
+                            dispatch.emit(r, &emitted, stop);
                         }
                     }
                     Err(e) => {
@@ -3924,6 +3996,7 @@ mod cuda {
                         }
                     }
                 }
+                dispatch.record(sched.metrics);
             }
             if !plain_indices.is_empty() {
                 let rows: Vec<(usize, u32)> = plain_indices
@@ -3932,6 +4005,7 @@ mod cuda {
                     .collect();
                 let sampling: Vec<ModelSampling> =
                     plain_indices.iter().map(|&i| active[i].sampling).collect();
+                let mut dispatch = DecodeStep::new(rows.len());
                 match model.step_batch_sampled(&rows, &sampling) {
                     Ok(next) => {
                         for (row, (&idx, token)) in plain_indices.iter().zip(next).enumerate() {
@@ -3945,7 +4019,7 @@ mod cuda {
                             }
                             r.batched += 1;
                             r.next = Some(token);
-                            r.done = r.take(&[token], stop).is_break();
+                            dispatch.emit(r, &[token], stop);
                         }
                     }
                     Err(e) => {
@@ -3954,6 +4028,7 @@ mod cuda {
                         }
                     }
                 }
+                dispatch.record(sched.metrics);
             }
         }
         log_cache(speculator);

@@ -1,5 +1,5 @@
-//! Prometheus metrics for `GET /metrics`, under vLLM's names, so that dashboards and
-//! benchmarks written for vLLM read them.
+//! Prometheus metrics for `GET /metrics`. The engine records scheduler metrics, and
+//! the HTTP layer reports request metrics under vLLM's names.
 //!
 //! The HTTP layer records them from each job's events ([`Tracker`]), so they count what
 //! the engine sent: generated tokens include the ones a stop string later cut off.
@@ -9,9 +9,10 @@
 //! first choice, in the prompt tokens and the prefix cache lookups.
 
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::serve::vision::ImageStats;
@@ -119,7 +120,173 @@ struct State {
     e2e: Histogram,
 }
 
-/// The server's counters, gauges and histograms.
+/// Counters and gauges recorded by the engine thread.
+#[derive(Debug, Default)]
+pub struct SchedulerMetrics(Mutex<SchedulerState>);
+
+#[derive(Clone, Debug, Default)]
+struct SchedulerState {
+    active: [usize; 2],
+    prefill_tokens: u64,
+    decode: BTreeMap<usize, (u64, Duration)>,
+}
+
+impl SchedulerMetrics {
+    fn state(&self) -> std::sync::MutexGuard<'_, SchedulerState> {
+        self.0.lock().expect("scheduler metrics lock poisoned")
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "macos", target_arch = "aarch64"),
+        test
+    ))]
+    pub fn start(self: &Arc<Self>) -> ActiveStream {
+        let mut stream = ActiveStream {
+            metrics: Arc::clone(self),
+            phase: None,
+        };
+        stream.set(Some(StreamPhase::Prefill));
+        stream
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "macos", target_arch = "aarch64"),
+        test
+    ))]
+    pub fn prefill(&self, tokens: usize) {
+        self.state().prefill_tokens += tokens as u64;
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "macos", target_arch = "aarch64"),
+        test
+    ))]
+    pub fn decode(&self, streams: usize, tokens: usize, elapsed: Duration) {
+        let mut state = self.state();
+        let (total_tokens, total_time) = state.decode.entry(streams).or_default();
+        *total_tokens += tokens as u64;
+        *total_time += elapsed;
+    }
+
+    pub fn write(&self, out: &mut String, capacity: usize) {
+        let s = self.state().clone();
+        for (name, help, value) in [
+            (
+                "siphon:max_concurrent_streams",
+                "Maximum number of streams the scheduler can run concurrently.",
+                capacity,
+            ),
+            (
+                "siphon:num_requests_prefilling",
+                "Active requests in prefill.",
+                s.active[0],
+            ),
+            (
+                "siphon:num_requests_decoding",
+                "Active requests in decode.",
+                s.active[1],
+            ),
+        ] {
+            header(out, name, help, "gauge");
+            let _ = writeln!(out, "{name} {value}");
+        }
+        let name = "siphon:prefill_tokens_total";
+        header(out, name, "Prompt tokens computed by prefill.", "counter");
+        let _ = writeln!(out, "{name} {}", s.prefill_tokens);
+
+        let name = "siphon:decode_tokens_total";
+        header(
+            out,
+            name,
+            "Output tokens from decode steps by stream count.",
+            "counter",
+        );
+        for streams in 1..=capacity {
+            let (tokens, _) = s.decode.get(&streams).copied().unwrap_or_default();
+            let _ = writeln!(out, r#"{name}{{streams="{streams}"}} {tokens}"#);
+        }
+        let name = "siphon:decode_seconds_total";
+        header(
+            out,
+            name,
+            "Wall-clock seconds spent in decode steps by stream count, including shared hybrid steps.",
+            "counter",
+        );
+        for streams in 1..=capacity {
+            let (_, elapsed) = s.decode.get(&streams).copied().unwrap_or_default();
+            let _ = writeln!(
+                out,
+                r#"{name}{{streams="{streams}"}} {}"#,
+                elapsed.as_secs_f64()
+            );
+        }
+    }
+}
+
+/// The phase of a request that holds a scheduler slot.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64"),
+    test
+))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamPhase {
+    Prefill,
+    Decode,
+}
+
+/// Removes a request from the phase gauges when it leaves the scheduler.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64"),
+    test
+))]
+pub struct ActiveStream {
+    metrics: Arc<SchedulerMetrics>,
+    phase: Option<StreamPhase>,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64"),
+    test
+))]
+impl ActiveStream {
+    pub fn set(&mut self, phase: Option<StreamPhase>) {
+        if self.phase == phase {
+            return;
+        }
+        let mut state = self.metrics.state();
+        if let Some(old) = self.phase {
+            state.active[old as usize] -= 1;
+        }
+        if let Some(new) = phase {
+            state.active[new as usize] += 1;
+        }
+        self.phase = phase;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn metrics(&self) -> &SchedulerMetrics {
+        &self.metrics
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", target_arch = "aarch64"),
+    test
+))]
+impl Drop for ActiveStream {
+    fn drop(&mut self) {
+        self.set(None);
+    }
+}
+
+/// The server's request counters, gauges and histograms.
 #[derive(Debug)]
 pub struct Metrics {
     /// The `model_name` label, escaped.
@@ -255,6 +422,21 @@ impl Metrics {
         );
         out
     }
+}
+
+pub fn write_process_start(out: &mut String, started: SystemTime) {
+    let name = "process_start_time_seconds";
+    header(
+        out,
+        name,
+        "Start time of the process since the Unix epoch in seconds.",
+        "gauge",
+    );
+    let seconds = started
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let _ = writeln!(out, "{name} {seconds}");
 }
 
 fn header(out: &mut String, name: &str, help: &str, kind: &str) {
@@ -457,6 +639,48 @@ mod tests {
             .unwrap_or_else(|| panic!("no {series} in\n{text}"))
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn scheduler_counts_only_streams_with_slots_and_groups_decode_by_occupancy() {
+        let metrics = Arc::new(SchedulerMetrics::default());
+        let capture = || {
+            let mut text = String::new();
+            metrics.write(&mut text, 4);
+            text
+        };
+        let mut first = metrics.start();
+        let mut second = metrics.start();
+        assert_eq!(value(&capture(), "siphon:num_requests_prefilling"), 2.0);
+        metrics.prefill(8);
+        first.set(Some(StreamPhase::Decode));
+        metrics.decode(1, 3, Duration::from_millis(125));
+
+        second.set(Some(StreamPhase::Decode));
+        assert_eq!(value(&capture(), "siphon:num_requests_decoding"), 2.0);
+        metrics.decode(2, 5, Duration::from_millis(250));
+
+        second.set(None);
+        assert_eq!(value(&capture(), "siphon:num_requests_decoding"), 1.0);
+        metrics.decode(1, 0, Duration::from_millis(125));
+        second.set(Some(StreamPhase::Decode));
+        drop((first, second));
+
+        let text = capture();
+        for (series, expected) in [
+            ("siphon:max_concurrent_streams", 4.0),
+            ("siphon:num_requests_prefilling", 0.0),
+            ("siphon:num_requests_decoding", 0.0),
+            ("siphon:prefill_tokens_total", 8.0),
+            (r#"siphon:decode_tokens_total{streams="1"}"#, 3.0),
+            (r#"siphon:decode_tokens_total{streams="2"}"#, 5.0),
+            (r#"siphon:decode_seconds_total{streams="1"}"#, 0.25),
+            (r#"siphon:decode_seconds_total{streams="2"}"#, 0.25),
+            (r#"siphon:decode_tokens_total{streams="3"}"#, 0.0),
+            (r#"siphon:decode_seconds_total{streams="3"}"#, 0.0),
+        ] {
+            assert_eq!(value(&text, series), expected);
+        }
     }
 
     #[test]
