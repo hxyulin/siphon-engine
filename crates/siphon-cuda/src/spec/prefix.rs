@@ -1046,20 +1046,39 @@ impl Speculator {
         key: &[u32],
         prompt_len: usize,
     ) -> anyhow::Result<Option<usize>> {
+        self.invalidate_batch_draft();
+        let draft_rings = if self.draft.is_dflash2() && self.draft.slot_committed(slot) == key.len()
+        {
+            Some((self.draft.slot_ring_spans(model.stream(), slot)?, key.len()))
+        } else {
+            None
+        };
         let Some(host) = self.prefix.as_mut().and_then(|c| c.host.as_mut()) else {
             return Ok(None);
         };
         let started = Instant::now();
-        let Some((id, saved)) = host.park(model, slot, key, prompt_len)? else {
+        let Some((id, saved)) = host.park(
+            model,
+            slot,
+            key,
+            prompt_len,
+            draft_rings.as_ref().map(|(s, c)| (s.as_slice(), *c)),
+        )?
+        else {
             host.note(format!(
                 "host cache: a sequence of {} tokens does not fit to park",
                 key.len()
             ));
             return Ok(None);
         };
+        let draft_note = if draft_rings.is_some() {
+            " with draft rings"
+        } else {
+            ""
+        };
         host.note(format!(
-            "host cache: parked {} tokens from slot {slot}: {} MiB, {} chunks copied, {} \
-             shared, {:.1} ms to queue",
+            "host cache: parked {} tokens from slot {slot}{draft_note}: {} MiB, {} chunks \
+             copied, {} shared, {:.1} ms to queue",
             key.len(),
             saved.bytes >> 20,
             saved.copied,
@@ -1071,6 +1090,9 @@ impl Speculator {
             cache.drop_slot(slot);
         }
         model.reset_slot(slot)?;
+        if self.draft.is_dflash2() {
+            self.draft.reset_slot(slot);
+        }
         Ok(Some(id))
     }
 
@@ -1082,6 +1104,7 @@ impl Speculator {
         id: usize,
         busy: &[usize],
     ) -> anyhow::Result<(usize, usize)> {
+        self.invalidate_batch_draft();
         let now = Instant::now();
         let cache = self
             .prefix
@@ -1093,16 +1116,24 @@ impl Speculator {
             .context("every slot runs a request")?;
         cache.drop_slot(slot);
         model.reset_slot(slot)?;
+        if self.draft.is_dflash2() {
+            self.draft.reset_slot(slot);
+        }
         let host = cache
             .host
             .as_mut()
             .context("parking needs the host cache")?;
         let started = host.start_restore()?;
-        let (position, bytes) = host.unpark(model, id, slot)?;
+        let (position, bytes, draft_restored) = host.unpark(model, &mut self.draft, id, slot)?;
         let seconds = host.finish_restore(started)?;
+        let draft_note = if draft_restored {
+            " with draft rings"
+        } else {
+            ""
+        };
         host.note(format!(
-            "host cache: returned {position} parked tokens into slot {slot}: {} MiB in {:.1} \
-             ms, {:.1} GB/s",
+            "host cache: returned {position} parked tokens into slot {slot}{draft_note}: {} MiB \
+             in {:.1} ms, {:.1} GB/s",
             bytes >> 20,
             seconds * 1e3,
             bytes as f64 / seconds.max(1e-9) / 1e9

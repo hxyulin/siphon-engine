@@ -2093,20 +2093,16 @@ mod cuda {
             .sum()
     }
 
-    /// What `admit` may start next.
-    #[derive(Clone, Copy)]
-    enum Pick {
-        Waiting(usize),
-        Parked(usize),
-    }
+    use super::Pick;
 
     /// Starts waiting jobs and swapped-out requests while they fit: a free slot, and room in
     /// the KV pool for their positions and [`HEADROOM`] more, or without a host tier for
     /// every position they may reach. Jobs that waited past [`AGE_LIMIT`] go first, in
-    /// arrival order, then swapped-out requests in the order they left, then the other
-    /// jobs from the shortest prompt. When one does not fit, running requests that have
-    /// had their turn are swapped out for it (round robin); a job past the age limit that
-    /// still does not fit stops the others from passing it.
+    /// arrival order; remaining waiting jobs and swapped-out requests interleave fairly by
+    /// when each began waiting for a slot (`queued` vs `since`), with shorter prompts first
+    /// inside each waiting segment. When one does not fit, running requests that have had
+    /// their turn are swapped out for it (round robin); a job past the age limit that still
+    /// does not fit stops the others from passing it.
     fn admit(
         model: &mut Model,
         speculator: &mut Speculator,
@@ -2139,16 +2135,10 @@ mod cuda {
                 return;
             }
             let now = Instant::now();
-            let aged = |j: &Job| now.duration_since(j.queued) >= AGE_LIMIT;
-            let mut order: Vec<(Pick, bool)> = (0..waiting.len())
-                .filter(|&i| aged(&waiting[i]))
-                .map(|i| (Pick::Waiting(i), true))
-                .collect();
-            order.extend((0..parked.len()).map(|i| (Pick::Parked(i), false)));
-            let mut young: Vec<usize> =
-                (0..waiting.len()).filter(|&i| !aged(&waiting[i])).collect();
-            young.sort_by_key(|&i| waiting[i].prompt.len());
-            order.extend(young.into_iter().map(|i| (Pick::Waiting(i), false)));
+            let waiting_meta: Vec<(Instant, usize)> =
+                waiting.iter().map(|j| (j.queued, j.prompt.len())).collect();
+            let parked_since: Vec<Instant> = parked.iter().map(|r| r.since).collect();
+            let order = super::admit_order(now, &waiting_meta, &parked_since, AGE_LIMIT);
             let mut started = false;
             for (pick, firm) in order {
                 let fits = pick_room(model, speculator, active, waiting, parked, pick, sched);
@@ -2289,7 +2279,8 @@ mod cuda {
                             r.since.elapsed().as_secs_f64()
                         );
                         r.slot = slot;
-                        r.draft_ready = false;
+                        r.draft_ready = speculator.supports_batch_spec()
+                            && speculator.slot_draft_committed(slot) == position;
                         r.since = Instant::now();
                         active.push(r);
                     }
@@ -4044,6 +4035,74 @@ fn group_spec_chunks(
         .collect()
 }
 
+/// What `admit` may start next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "only the Linux engine schedules admissions")
+)]
+enum Pick {
+    Waiting(usize),
+    Parked(usize),
+}
+
+/// Orders waiting `(queued_at, prompt_len)` jobs and parked `parked_at` requests for `admit`:
+///
+/// 1. Waiting jobs at or past `age_limit` go first (`firm = true`), in arrival order.
+/// 2. Remaining waiting jobs and parked requests interleave fairly by wait start time
+///    (`queued_at` vs `parked_at`), so an active/parked set cannot starve new arrivals until
+///    `age_limit`. Inside each group of waiting jobs older than the next parked request (or
+///    after all parked requests), shorter prompts still go first.
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "only the Linux engine schedules admissions")
+)]
+fn admit_order(
+    now: std::time::Instant,
+    waiting: &[(std::time::Instant, usize)],
+    parked: &[std::time::Instant],
+    age_limit: std::time::Duration,
+) -> Vec<(Pick, bool)> {
+    let aged = |queued: std::time::Instant| now.saturating_duration_since(queued) >= age_limit;
+    let mut order: Vec<(Pick, bool)> = Vec::with_capacity(waiting.len() + parked.len());
+    let mut young: Vec<usize> = Vec::new();
+    for (i, &(queued, _)) in waiting.iter().enumerate() {
+        if aged(queued) {
+            order.push((Pick::Waiting(i), true));
+        } else {
+            young.push(i);
+        }
+    }
+    if parked.is_empty() {
+        young.sort_by_key(|&i| waiting[i].1);
+        order.extend(young.into_iter().map(|i| (Pick::Waiting(i), false)));
+        return order;
+    }
+    let mut parked_order: Vec<usize> = (0..parked.len()).collect();
+    parked_order.sort_by_key(|&i| parked[i]);
+    young.sort_by_key(|&i| waiting[i].0);
+    let mut y = 0;
+    for p in parked_order {
+        let cutoff = parked[p];
+        let start = y;
+        while y < young.len() && waiting[young[y]].0 <= cutoff {
+            y += 1;
+        }
+        if start < y {
+            let segment = &mut young[start..y];
+            segment.sort_by_key(|&i| waiting[i].1);
+            order.extend(segment.iter().map(|&i| (Pick::Waiting(i), false)));
+        }
+        order.push((Pick::Parked(p), false));
+    }
+    if y < young.len() {
+        let tail = &mut young[y..];
+        tail.sort_by_key(|&i| waiting[i].1);
+        order.extend(tail.iter().map(|&i| (Pick::Waiting(i), false)));
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4136,5 +4195,52 @@ mod tests {
         assert!(!starts_with_chained(&a, &b, &[1, 2, 3, 4, 5, 6, 7]));
         assert!(!starts_with_chained(&a, &b, &[1, 2, 9]));
         assert!(!starts_with_chained(&a, &b, &[1, 2, 3, 9]));
+    }
+
+    #[test]
+    fn admit_order_interleaves_waiting_and_parked_fairly() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let limit = Duration::from_secs(20);
+        let ago = |ms: u64| now.checked_sub(Duration::from_millis(ms)).unwrap();
+
+        // Aged waiting (> 20s) goes first (firm), then young waiting older than a newly parked
+        // request goes before that parked request (shortest prompt first within the segment),
+        // while a parked request that waited longer still goes ahead of newer arrivals.
+        let waiting = [
+            (ago(25_000), 50_000), // 0: aged
+            (ago(1_200), 40_000),  // 1: waited 1.2s (older than parked 1, younger than parked 0)
+            (ago(1_100), 4_000),   // 2: waited 1.1s, shorter prompt than 1
+            (ago(100), 1_000),     // 3: brand new arrival (younger than both parked)
+        ];
+        let parked = [
+            ago(2_000), // 0: parked 2.0s ago -> beats waiting 1, 2, 3
+            ago(500),   // 1: parked 0.5s ago -> behind waiting 1, 2; ahead of waiting 3
+        ];
+        let got = admit_order(now, &waiting, &parked, limit);
+        assert_eq!(
+            got,
+            vec![
+                (Pick::Waiting(0), true),
+                (Pick::Parked(0), false),
+                (Pick::Waiting(2), false),
+                (Pick::Waiting(1), false),
+                (Pick::Parked(1), false),
+                (Pick::Waiting(3), false),
+            ]
+        );
+
+        // With no parked requests, young waiting jobs still sort by prompt length.
+        let got_no_park = admit_order(now, &waiting, &[], limit);
+        assert_eq!(
+            got_no_park,
+            vec![
+                (Pick::Waiting(0), true),
+                (Pick::Waiting(3), false),
+                (Pick::Waiting(2), false),
+                (Pick::Waiting(1), false),
+            ]
+        );
     }
 }

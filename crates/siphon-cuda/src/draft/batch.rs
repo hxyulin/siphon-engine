@@ -567,6 +567,46 @@ impl Draft {
         Ok(())
     }
 
+    /// Ensures slot `slot`'s DFlash 2 sliding rings are allocated on device.
+    pub(crate) fn ensure_slot_rings(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        slot: usize,
+    ) -> anyhow::Result<()> {
+        if slot > 0 {
+            self.ensure_batch_dflash2(stream, 1, slot)?;
+        }
+        Ok(())
+    }
+
+    /// Device spans of slot `slot`'s DFlash 2 sliding rings, in [`Draft::ring_spans`] order.
+    pub(crate) fn slot_ring_spans(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+    ) -> anyhow::Result<Vec<crate::model::DeviceSpan>> {
+        if slot == 0 {
+            return Ok(self.ring_spans(stream));
+        }
+        let b = self
+            .batch
+            .as_ref()
+            .context("batched DFlash 2 buffers are missing")?;
+        let caches = b
+            .extra_slots
+            .get(slot - 1)
+            .with_context(|| format!("no DFlash 2 rings for slot {slot}"))?;
+        Ok(caches
+            .iter()
+            .flat_map(|c| {
+                [
+                    crate::model::DeviceSpan::of(&*c.k, stream),
+                    crate::model::DeviceSpan::of(&*c.v, stream),
+                ]
+            })
+            .collect())
+    }
+
     /// Copies slot `slot`'s DFlash 2 sliding rings and committed position into `rings`.
     pub fn save_slot_rings(
         &self,

@@ -250,13 +250,16 @@ struct HostEntry {
 }
 
 /// A sequence parked in host memory mid-generation ([`HostCache::park`]): its global caches
-/// below its position and its rings and conv states at that position.
+/// below its position, its rings and conv states at that position, and optionally its DFlash 2
+/// draft sliding rings.
 struct Parked {
     /// The chunks of the global caches, by position; the last may be partly filled.
     kv: Vec<u32>,
-    /// The chunks of the rings and conv states.
+    /// The chunks of the rings and conv states, followed by DFlash 2 draft rings when present.
     local: Vec<u32>,
     position: usize,
+    /// Committed position stored in `local[local_bytes..]` when DFlash 2 draft rings were saved.
+    draft_committed: Option<usize>,
 }
 
 /// What [`HostCache::park`] copied: global cache chunks copied and shared with an entry,
@@ -775,6 +778,7 @@ impl HostCache {
         slot: usize,
         key: &[u32],
         prompt_len: usize,
+        draft_rings: Option<(&[DeviceSpan], usize)>,
     ) -> anyhow::Result<Option<(usize, ParkSaved)>> {
         let p = HOST_CHUNK_POSITIONS;
         let position = key.len();
@@ -864,6 +868,21 @@ impl HostCache {
             Direction::ToHost,
         )?;
         bytes += self.local_bytes;
+        let draft_committed = if let Some((spans, committed)) = draft_rings
+            && self.rings_bytes > 0
+        {
+            self.pool.copy_run(
+                &self.copy,
+                &local,
+                self.local_bytes,
+                spans,
+                Direction::ToHost,
+            )?;
+            bytes += self.rings_bytes;
+            Some(committed)
+        } else {
+            None
+        };
         self.pending = Some(
             self.copy
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
@@ -872,6 +891,7 @@ impl HostCache {
             kv,
             local,
             position,
+            draft_committed,
         };
         let id = if let Some(free) = self.parked.iter().position(Option::is_none) {
             self.parked[free] = Some(parked);
@@ -891,13 +911,15 @@ impl HostCache {
     }
 
     /// Copies parked sequence `id` into slot `slot`, just reset, moves the slot to its
-    /// position and frees its host memory. Returns the position and the bytes copied.
+    /// position, restores its DFlash 2 draft rings when saved, and frees its host memory.
+    /// Returns the position, the bytes copied, and whether DFlash 2 draft rings were restored.
     pub fn unpark(
         &mut self,
         model: &mut Model,
+        draft: &mut Draft,
         id: usize,
         slot: usize,
-    ) -> anyhow::Result<(usize, usize)> {
+    ) -> anyhow::Result<(usize, usize, bool)> {
         let parked = self
             .parked
             .get_mut(id)
@@ -907,7 +929,7 @@ impl HostCache {
         self.fence()?;
         let p = HOST_CHUNK_POSITIONS;
         let position = parked.position;
-        let copied = (|| -> anyhow::Result<usize> {
+        let copied = (|| -> anyhow::Result<(usize, bool)> {
             let target = model.global_kv(slot)?;
             ensure!(
                 target.position_bytes == self.target.position_bytes,
@@ -927,14 +949,34 @@ impl HostCache {
             self.pool
                 .copy_run(&self.main, &parked.local, 0, &spans, Direction::ToDevice)?;
             model.set_loaded_position(slot, position)?;
-            Ok(position * target.bytes_per_position() + self.local_bytes)
+            let mut total = position * target.bytes_per_position() + self.local_bytes;
+            let mut draft_restored = false;
+            if let Some(committed) = parked.draft_committed
+                && draft.is_dflash2()
+                && self.rings_bytes > 0
+            {
+                draft.ensure_slot_rings(&self.main, slot)?;
+                let ring_spans = draft.slot_ring_spans(&self.main, slot)?;
+                self.pool.copy_run(
+                    &self.main,
+                    &parked.local,
+                    self.local_bytes,
+                    &ring_spans,
+                    Direction::ToDevice,
+                )?;
+                draft.set_slot_committed(slot, committed)?;
+                total += self.rings_bytes;
+                draft_restored = true;
+            }
+            Ok((total, draft_restored))
         })();
         // Saves wait for the model's stream before they write, so the chunks may go back
         // to the pool while the copies above are queued.
         for &c in parked.kv.iter().chain(&parked.local) {
             self.pool.release(c);
         }
-        Ok((position, copied?))
+        let (bytes, draft_restored) = copied?;
+        Ok((position, bytes, draft_restored))
     }
 
     /// Frees parked sequence `id`'s host memory without returning it anywhere.
