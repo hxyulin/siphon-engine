@@ -53,7 +53,10 @@ use siphon::tree::{
 mod host;
 mod prefix;
 
-pub use host::{DISK_FORMAT, DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS, ParkSaved};
+pub use host::{
+    DISK_FORMAT, DISK_FORMAT_L3, DiskLoaded, DiskSaved, DiskTierConfig, DiskTierStats,
+    HOST_CHUNK_POSITIONS, ParkSaved,
+};
 use prefix::PrefixCache;
 pub use prefix::{PrefixHit, PrefixTier};
 

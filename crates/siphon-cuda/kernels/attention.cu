@@ -270,26 +270,53 @@ __device__ __forceinline__ void e2m1x8_to_f16x8(uint32_t raw, uint32_t (&h)[4]) 
 #endif
 }
 
+#if !SIPHON_SM89
 // Two bytes of E2M1 pairs (low 16 bits of `raw`) as two F16 pairs.
 __device__ __forceinline__ void e2m1x4_to_f16x4(uint32_t raw, uint32_t (&h)[2]) {
-#if SIPHON_SM89
-    h[0] = e2m1x2_to_f16x2_sm89(raw);
-    h[1] = e2m1x2_to_f16x2_sm89(raw >> 8);
-#else
     asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %2;\n"
         "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\n}"
         : "=r"(h[0]), "=r"(h[1])
         : "r"(raw));
-#endif
 }
+#endif
 
 #if SIPHON_SM89
-// Two IEEE F16 values (with no subnormals, as E2M1 decoded to F16 guarantees) converted to
-// F32 * 2^-112 via pure bit-shifts, eliminating all F2F.F32.F16 instructions in decode_step_fp4.
-__device__ __forceinline__ float2 f16x2_to_f32x2_m112(uint32_t u) {
-    const uint32_t lo = ((u & 0x8000u) << 16) | ((u & 0x7fffu) << 13);
-    const uint32_t hi = (u & 0x80000000u) | ((u & 0x7fff0000u) >> 3);
+// Two E2M1 values (low byte of `byte`, low nibble first) directly to F32 * 2^-112 via
+// PRMT magnitude LUT + pure bit-shifts, skipping F16 sign insertion/re-extraction and
+// eliminating all F2F.F32.F16 instructions in decode_step_fp4[_g32].
+__device__ __forceinline__ float2 e2m1x2_to_f32x2_m112_sm89(uint32_t byte) {
+    const uint32_t select = ((byte & 0x7u) << 4) | ((byte & 0x70u) << 8);
+    uint32_t h;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(h) : "r"(0x3e3c3800u), "r"(0x46444240u), "r"(select));
+    const uint32_t lo = ((h & 0xffffu) << 13) | ((byte & 0x8u) << 28);
+    const uint32_t hi = ((h & 0xffff0000u) >> 3) | ((byte & 0x80u) << 24);
     return make_float2(__uint_as_float(lo), __uint_as_float(hi));
+}
+
+// Finite E4M3 scale byte to `float(s) * 2^kExpShift` (for kExpShift = 56 or 112) via
+// hardware E4M3->F16 + integer exponent shift (every finite E4M3 value is normal or zero
+// in F16, so this is bit-identical to `e4m3_value(s) * ldexpf(1.f, kExpShift)` with zero
+// F2F and zero FMUL).
+template <int kExpShift>
+__device__ __forceinline__ float e4m3_to_f32_scaled_sm89(uint8_t s) {
+    const uint32_t h = uint32_t(__nv_cvt_fp8_to_halfraw(s, __NV_E4M3).x);
+    const uint32_t mag = h & 0x7fffu;
+    const uint32_t add = uint32_t(112 + kExpShift) << 23;
+    const uint32_t f = mag == 0u ? 0u : (((mag << 13) + add) | ((h & 0x8000u) << 16));
+    return __uint_as_float(f);
+}
+
+// Two finite E4M3 scales (low byte, high byte) to `float2 * 2^kExpShift` using a single
+// packed E4M3x2->F16x2 conversion and integer exponent shifts.
+template <int kExpShift>
+__device__ __forceinline__ float2 e4m3x2_to_f32x2_scaled_sm89(uint32_t pair) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3);
+    const uint32_t add = uint32_t(112 + kExpShift) << 23;
+    const uint32_t m0 = uint32_t(h.x) & 0x7fffu;
+    const uint32_t m1 = uint32_t(h.y) & 0x7fffu;
+    const uint32_t f0 = m0 == 0u ? 0u : (((m0 << 13) + add) | ((uint32_t(h.x) & 0x8000u) << 16));
+    const uint32_t f1 = m1 == 0u ? 0u : (((m1 << 13) + add) | ((uint32_t(h.y) & 0x8000u) << 16));
+    return make_float2(__uint_as_float(f0), __uint_as_float(f1));
 }
 
 // The E2M1 code of `y`, as cvt.rn.satfinite.e2m1x2.f32 rounds it: to nearest, ties to the
@@ -462,23 +489,11 @@ __device__ __forceinline__ void copy_async4(void* dst, const void* src, bool val
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(shared), "l"(src), "r"(valid ? 4 : 0));
 }
 
-__device__ __forceinline__ void copy_async4_evict(void* dst, const void* src, bool valid, uint64_t policy) {
-    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 4, %2, %3;" ::"r"(shared), "l"(src),
-                 "r"(valid ? 4 : 0), "l"(policy));
-}
-
 // Copies 8 bytes from global to shared memory without blocking, or writes 8 zero bytes
 // when `valid` is false.
 __device__ __forceinline__ void copy_async8(void* dst, const void* src, bool valid) {
     const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(shared), "l"(src), "r"(valid ? 8 : 0));
-}
-
-__device__ __forceinline__ void copy_async8_evict(void* dst, const void* src, bool valid, uint64_t policy) {
-    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 8, %2, %3;" ::"r"(shared), "l"(src),
-                 "r"(valid ? 8 : 0), "l"(policy));
 }
 
 template <int kBytes>
@@ -487,15 +502,6 @@ __device__ __forceinline__ void copy_async_scales(void* dst, const void* src, bo
         copy_async4(dst, src, valid);
     } else {
         copy_async8(dst, src, valid);
-    }
-}
-
-template <int kBytes>
-__device__ __forceinline__ void copy_async_scales_evict(void* dst, const void* src, bool valid, uint64_t policy) {
-    if constexpr (kBytes == 4) {
-        copy_async4_evict(dst, src, valid, policy);
-    } else {
-        copy_async8_evict(dst, src, valid, policy);
     }
 }
 
@@ -527,21 +533,33 @@ __device__ __forceinline__ void copy_async_wait_all() {
     asm volatile("cp.async.wait_group 0;" ::: "memory");
 }
 
+#if SIPHON_SM89
+__device__ __forceinline__ void decode_mma_f16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                               uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
+
 template <class F>
 struct alignas(16) DecodeShared {
     static constexpr int kTile = F::kTile;
+    // On sm_89, NVFP4 tiles are half the byte size of FP8 (8.7 KB vs 16.4 KB); a 4-stage
+    // ring (~41-43 KiB/blk, 2 blk/SM under 100 KB carveout) keeps 3 tiles (~52 KB/SM) in
+    // flight per SM while keeping splits = 32 to avoid 64-split DRAM row thrashing.
+    static constexpr int kStages = (F::kFp4 && SIPHON_SM89) ? 4 : 2;
     // 16-byte chunks in one key or value head.
     static constexpr int kChunks = kHeadDim / F::kChunkElems;
-    // Two stages of key and value tiles, [kTile, 128] each. Key rows are
-    // swizzled: logical chunk c of row r sits at chunk c ^ (r % kChunks), so
-    // that the lanes of a quarter warp, reading the same logical chunk of
-    // consecutive rows, hit distinct banks.
-    typename F::Elem k[2][kTile * F::kRowElems];
-    typename F::Elem v[2][kTile * F::kRowElems];
+    // Staged key and value tiles, [kTile, 128] each. Key rows are
+    // swizzled so concurrent shared-memory reads hit distinct banks.
+    typename F::Elem k[kStages][kTile * F::kRowElems];
+    typename F::Elem v[kStages][kTile * F::kRowElems];
     // NVFP4: each tile row's 4 or 8 scale bytes (stubs otherwise).
     static constexpr int kScaleTile = F::kFp4 ? kTile * F::kFp4Scales : 16;
-    uint8_t ks[2][kScaleTile];
-    uint8_t vs[2][kScaleTile];
+    uint8_t ks[kStages][kScaleTile];
+    uint8_t vs[kStages][kScaleTile];
     // Per-warp partial scores over each warp's quarter of the dims.
     float scores[kWarps][kGroup][kTile];
     // Softmax weights of the tile's keys for the 3 heads, padded to 4.
@@ -560,6 +578,17 @@ struct alignas(16) DecodeShared {
     alignas(8) uint8_t new_vs[F::kFp4Scales];
     bool last;
 };
+
+template <class F>
+__device__ __forceinline__ int decode_k_chunk(int chunk, int row) {
+    constexpr int kChunks = DecodeShared<F>::kChunks;
+    if constexpr (F::kFp4 && SIPHON_SM89) {
+        // 8 consecutive rows (g = 0..7 in mma.sync.m16n8k16) map to 8 distinct 4-bank quads.
+        return chunk ^ ((row >> 1) & 3);
+    } else {
+        return chunk ^ (row % kChunks);
+    }
+}
 
 // Starts copying the key and value tile that begins at slot `first`. Slots at
 // or past `end` read as zeros. When `evict_first` is true (global KV caches),
@@ -584,35 +613,28 @@ __device__ __forceinline__ void load_tile(DecodeShared<F>& sm, int stage, const 
         const size_t offset = F::kFp4 ? fp4_data_f<F>(valid ? slot : 0, kv_head) + chunk * kElems
                                       : size_t(valid ? slot : 0) * kKvRow + kv_head * kHeadDim + chunk * kElems;
         if (evict_first) {
-            copy_async16_evict(&sm.k[stage][row * kRow + (chunk ^ (row % kChunks)) * kElems],
+            copy_async16_evict(&sm.k[stage][row * kRow + decode_k_chunk<F>(chunk, row) * kElems],
                                k_cache + offset, valid, policy);
             copy_async16_evict(&sm.v[stage][row * kRow + chunk * kElems], v_cache + offset, valid, policy);
         } else {
-            copy_async16(&sm.k[stage][row * kRow + (chunk ^ (row % kChunks)) * kElems], k_cache + offset, valid);
+            copy_async16(&sm.k[stage][row * kRow + decode_k_chunk<F>(chunk, row) * kElems], k_cache + offset, valid);
             copy_async16(&sm.v[stage][row * kRow + chunk * kElems], v_cache + offset, valid);
         }
     }
     if constexpr (F::kFp4) {
         // Thread t < kTile copies row t's key scales, thread kTile + t its value scales.
+        // Never mark scales L2::evict_first: all 8 KV heads' 4- or 8-byte scales share the
+        // same 32-/64-byte L2 sector, so keeping them normal-priority avoids 8x sector
+        // overfetch across sibling KV-head CTAs.
         static_assert(2 * kTile <= kThreads);
         const int row = threadIdx.x % kTile;
         const unsigned slot = first + row;
         const bool valid = slot < end;
         const size_t offset = fp4_scales_f<F>(valid ? slot : 0, kv_head);
         if (threadIdx.x < kTile) {
-            if (evict_first) {
-                copy_async_scales_evict<F::kFp4Scales>(&sm.ks[stage][row * F::kFp4Scales], k_cache + offset, valid,
-                                                       policy);
-            } else {
-                copy_async_scales<F::kFp4Scales>(&sm.ks[stage][row * F::kFp4Scales], k_cache + offset, valid);
-            }
+            copy_async_scales<F::kFp4Scales>(&sm.ks[stage][row * F::kFp4Scales], k_cache + offset, valid);
         } else if (threadIdx.x < 2 * kTile) {
-            if (evict_first) {
-                copy_async_scales_evict<F::kFp4Scales>(&sm.vs[stage][row * F::kFp4Scales], v_cache + offset, valid,
-                                                       policy);
-            } else {
-                copy_async_scales<F::kFp4Scales>(&sm.vs[stage][row * F::kFp4Scales], v_cache + offset, valid);
-            }
+            copy_async_scales<F::kFp4Scales>(&sm.vs[stage][row * F::kFp4Scales], v_cache + offset, valid);
         }
     }
     copy_async_commit();
@@ -909,7 +931,7 @@ __device__ __forceinline__ void patch_tile(DecodeShared<F>& sm, int stage, int r
         const int i = threadIdx.x + k * kThreads;
         if (i / kChunks == row) {
             const int chunk = i % kChunks;
-            *reinterpret_cast<uint4*>(&sm.k[stage][row * kRow + (chunk ^ (row % kChunks)) * kElems]) =
+            *reinterpret_cast<uint4*>(&sm.k[stage][row * kRow + decode_k_chunk<F>(chunk, row) * kElems]) =
                 *reinterpret_cast<const uint4*>(&sm.new_k[chunk * kElems]);
             *reinterpret_cast<uint4*>(&sm.v[stage][row * kRow + chunk * kElems]) =
                 *reinterpret_cast<const uint4*>(&sm.new_v[chunk * kElems]);
@@ -1095,20 +1117,34 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
     const int tiles = (end - begin + kTile - 1) / kTile;
     // With kStep, the block whose split holds the newest slot appends.
     const bool appends = kStep && newest - begin < end - begin;
+    constexpr int kStages = DecodeShared<F>::kStages;
+    constexpr bool kFp4Mma = F::kFp4 && SIPHON_SM89;
     const bool evict_first = window == 0;
     load_tile(sm, 0, k_cache, v_cache, kv_head, begin, end, evict_first);
+    if constexpr (kStages > 2) {
+#pragma unroll
+        for (int s = 1; s < kStages - 1; ++s) {
+            if (s < tiles) {
+                load_tile(sm, s, k_cache, v_cache, kv_head, begin + s * kTile, end, evict_first);
+            }
+        }
+    }
 
-    // This warp's quarter of the 3 scaled queries.
-    float qs[kGroup][kWarpDims];
+    // This warp's quarter of the 3 scaled queries (`qf` on sm_89 NVFP4 uses 4 regs instead of
+    // 96 and omits live `rel`/`columns` regs so 4 blocks/SM fit at <= 128 regs/thread).
+    float qs[kFp4Mma ? 1 : kGroup][kFp4Mma ? 1 : kWarpDims];
+    uint32_t qf[2][2] = {};
     // With kStep: head `head`'s relative state, the table columns of this
     // lane's keys in the current tile, and the output gates (the sigmoids)
     // of this thread's dims.
-    float rel[kRelDim];
-    unsigned short columns[kLaneKeys][kRelDim];
+    float rel[kFp4Mma ? 1 : kRelDim];
+    unsigned short columns[kFp4Mma ? 1 : kLaneKeys][kFp4Mma ? 1 : kRelDim];
     float gate[kGroup];
     if constexpr (kStep) {
-        if (warp < kGroup) {
-            load_columns(columns, step.table, extent, begin, end, newest, slots, lane);
+        if constexpr (!kFp4Mma) {
+            if (warp < kGroup) {
+                load_columns(columns, step.table, extent, begin, end, newest, slots, lane);
+            }
         }
         const float tau = step.log_scale ? log_scale_tau(position, step.alpha, step.n_floor) : 1.f;
         // bf16(x * tau) as log_scale_bf16 does it, or x unchanged.
@@ -1264,18 +1300,33 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
             }
         }
         __syncthreads();
+        if constexpr (kFp4Mma) {
+            const int g = lane / 4;
+            const int t = lane % 4;
+            if (g < kGroup) {
 #pragma unroll
-        for (int h = 0; h < kGroup; ++h) {
+                for (int ks = 0; ks < 2; ++ks) {
+                    const int d0 = warp * kWarpDims + ks * 16 + 2 * t;
+                    const __half2 h0 = __floats2half2_rn(sm.q[g][d0], sm.q[g][d0 + 1]);
+                    const __half2 h1 = __floats2half2_rn(sm.q[g][d0 + 8], sm.q[g][d0 + 9]);
+                    qf[ks][0] = *reinterpret_cast<const uint32_t*>(&h0);
+                    qf[ks][1] = *reinterpret_cast<const uint32_t*>(&h1);
+                }
+            }
+        } else {
 #pragma unroll
-            for (int c = 0; c < kWarpDims; ++c) {
-                qs[h][c] = sm.q[h][warp * kWarpDims + c];
+            for (int h = 0; h < kGroup; ++h) {
+#pragma unroll
+                for (int c = 0; c < kWarpDims; ++c) {
+                    qs[h][c] = sm.q[h][warp * kWarpDims + c];
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < kRelDim; ++k) {
+                rel[k] = sm.rel[min(warp, kGroup - 1)][k];
             }
         }
-#pragma unroll
-        for (int k = 0; k < kRelDim; ++k) {
-            rel[k] = sm.rel[min(warp, kGroup - 1)][k];
-        }
-    } else {
+    } else if constexpr (!kFp4Mma) {
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) {
 #pragma unroll
@@ -1292,20 +1343,6 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
         }
     }
 
-#if SIPHON_SM89
-    if constexpr (F::kFp4) {
-        // Pre-scale qs by 2^+56 once so QK dot products can decode E2M1 directly to
-        // F32 * 2^-112 via bit-shifts (zero F2F) and fold 2^+56 into the group scale.
-#pragma unroll
-        for (int h = 0; h < kGroup; ++h) {
-#pragma unroll
-            for (int c = 0; c < kWarpDims; ++c) {
-                qs[h][c] *= 0x1p56f;
-            }
-        }
-    }
-#endif
-
     float m = -FLT_MAX;
     float sum = 0.f;
     if (split == 0) {
@@ -1315,18 +1352,98 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
     float o[kGroup][4] = {};
 
     for (int t = 0; t < tiles; ++t) {
-        const int stage = t % 2;
+        const int stage = t % kStages;
         const unsigned first = begin + t * kTile;
-        copy_async_wait_all();
+        if constexpr (kStages == 4) {
+            const int rem = tiles - 1 - t;
+            if (rem >= 2) {
+                asm volatile("cp.async.wait_group 2;" ::: "memory");
+            } else if (rem == 1) {
+                asm volatile("cp.async.wait_group 1;" ::: "memory");
+            } else {
+                copy_async_wait_all();
+            }
+        } else if constexpr (kStages == 3) {
+            if (t + 1 < tiles) {
+                asm volatile("cp.async.wait_group 1;" ::: "memory");
+            } else {
+                copy_async_wait_all();
+            }
+        } else {
+            copy_async_wait_all();
+        }
         if (appends && newest - first < unsigned(kTile)) {
             patch_tile(sm, stage, int(newest - first));
         }
         __syncthreads();
-        if (t + 1 < tiles) {
-            load_tile(sm, 1 - stage, k_cache, v_cache, kv_head, first + kTile, end, evict_first);
+        if (t + kStages - 1 < tiles) {
+            load_tile(sm, (t + kStages - 1) % kStages, k_cache, v_cache, kv_head,
+                      first + (kStages - 1) * kTile, end, evict_first);
         }
 
-        // 1. Partial scores of keys `lane + 32 j` over this warp's dims.
+        // 1. Partial scores of keys `0..kTile-1` over this warp's 32 dims.
+        if constexpr (kFp4Mma) {
+#if SIPHON_SM89
+            const int g = lane / 4;
+            const int t = lane % 4;
+            const int sh = 8 * t;
+#pragma unroll
+            for (int rt = 0; rt < kTile / 16; ++rt) {
+                const int r0 = rt * 16 + g;
+                const int r1 = r0 + 8;
+                const uint4 v0 = *reinterpret_cast<const uint4*>(
+                    sm.k[stage] + r0 * F::kRowElems + decode_k_chunk<F>(warp, r0) * 16);
+                const uint4 v1 = *reinterpret_cast<const uint4*>(
+                    sm.k[stage] + r1 * F::kRowElems + decode_k_chunk<F>(warp, r1) * 16);
+                if constexpr (F::kFp4Group == 32) {
+                    float acc[4] = {};
+                    decode_mma_f16(acc, e2m1x2_to_f16x2_sm89(v0.x >> sh), e2m1x2_to_f16x2_sm89(v1.x >> sh),
+                                   e2m1x2_to_f16x2_sm89(v0.y >> sh), e2m1x2_to_f16x2_sm89(v1.y >> sh), qf[0][0],
+                                   qf[0][1]);
+                    decode_mma_f16(acc, e2m1x2_to_f16x2_sm89(v0.z >> sh), e2m1x2_to_f16x2_sm89(v1.z >> sh),
+                                   e2m1x2_to_f16x2_sm89(v0.w >> sh), e2m1x2_to_f16x2_sm89(v1.w >> sh), qf[1][0],
+                                   qf[1][1]);
+                    if (t < 2) {
+                        const float s0 = e4m3_to_f32_scaled_sm89<0>(sm.ks[stage][r0 * F::kFp4Scales + warp]);
+                        const float s1 = e4m3_to_f32_scaled_sm89<0>(sm.ks[stage][r1 * F::kFp4Scales + warp]);
+                        if (t == 0) {
+                            sm.scores[warp][0][r0] = acc[0] * s0;
+                            sm.scores[warp][1][r0] = acc[1] * s0;
+                            sm.scores[warp][0][r1] = acc[2] * s1;
+                            sm.scores[warp][1][r1] = acc[3] * s1;
+                        } else {
+                            sm.scores[warp][2][r0] = acc[0] * s0;
+                            sm.scores[warp][2][r1] = acc[2] * s1;
+                        }
+                    }
+                } else {
+                    float acc0[4] = {};
+                    float acc1[4] = {};
+                    decode_mma_f16(acc0, e2m1x2_to_f16x2_sm89(v0.x >> sh), e2m1x2_to_f16x2_sm89(v1.x >> sh),
+                                   e2m1x2_to_f16x2_sm89(v0.y >> sh), e2m1x2_to_f16x2_sm89(v1.y >> sh), qf[0][0],
+                                   qf[0][1]);
+                    decode_mma_f16(acc1, e2m1x2_to_f16x2_sm89(v0.z >> sh), e2m1x2_to_f16x2_sm89(v1.z >> sh),
+                                   e2m1x2_to_f16x2_sm89(v0.w >> sh), e2m1x2_to_f16x2_sm89(v1.w >> sh), qf[1][0],
+                                   qf[1][1]);
+                    if (t < 2) {
+                        const uint8_t* sc0 = &sm.ks[stage][r0 * F::kFp4Scales + 2 * warp];
+                        const uint8_t* sc1 = &sm.ks[stage][r1 * F::kFp4Scales + 2 * warp];
+                        const float2 f0 = e4m3x2_to_f32x2_scaled_sm89<0>(uint32_t(sc0[0]) | (uint32_t(sc0[1]) << 8));
+                        const float2 f1 = e4m3x2_to_f32x2_scaled_sm89<0>(uint32_t(sc1[0]) | (uint32_t(sc1[1]) << 8));
+                        if (t == 0) {
+                            sm.scores[warp][0][r0] = fmaf(acc0[0], f0.x, acc1[0] * f0.y);
+                            sm.scores[warp][1][r0] = fmaf(acc0[1], f0.x, acc1[1] * f0.y);
+                            sm.scores[warp][0][r1] = fmaf(acc0[2], f1.x, acc1[2] * f1.y);
+                            sm.scores[warp][1][r1] = fmaf(acc0[3], f1.x, acc1[3] * f1.y);
+                        } else {
+                            sm.scores[warp][2][r0] = fmaf(acc0[0], f0.x, acc1[0] * f0.y);
+                            sm.scores[warp][2][r1] = fmaf(acc0[2], f1.x, acc1[2] * f1.y);
+                        }
+                    }
+                }
+            }
+#endif
+        } else {
 #pragma unroll
         for (int j = 0; j < kLaneKeys; ++j) {
             const int row = lane + 32 * j;
@@ -1344,11 +1461,7 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                         e2m1x8_to_f16x8(words[w], hh);
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
-#if SIPHON_SM89
-                            const float2 f = f16x2_to_f32x2_m112(hh[i]);
-#else
                             const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hh[i]));
-#endif
                             const int d0 = 8 * w + 2 * i;
 #pragma unroll
                             for (int h = 0; h < kGroup; ++h) {
@@ -1357,11 +1470,7 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                             }
                         }
                     }
-#if SIPHON_SM89
-                    const float s0 = e4m3_value(sm.ks[stage][row * F::kFp4Scales + warp]) * 0x1p56f;
-#else
                     const float s0 = e4m3_value(sm.ks[stage][row * F::kFp4Scales + warp]);
-#endif
 #pragma unroll
                     for (int h = 0; h < kGroup; ++h) {
                         acc[h] = dot[h] * s0;
@@ -1375,16 +1484,12 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                     float dot1[kGroup] = {};
 #pragma unroll
                     for (int w = 0; w < 4; ++w) {
+                        float (&dot)[kGroup] = w < 2 ? dot0 : dot1;
                         uint32_t hh[4];
                         e2m1x8_to_f16x8(words[w], hh);
-                        float (&dot)[kGroup] = w < 2 ? dot0 : dot1;
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
-#if SIPHON_SM89
-                            const float2 f = f16x2_to_f32x2_m112(hh[i]);
-#else
                             const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hh[i]));
-#endif
                             const int d0 = 8 * w + 2 * i;
 #pragma unroll
                             for (int h = 0; h < kGroup; ++h) {
@@ -1393,14 +1498,8 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                             }
                         }
                     }
-#if SIPHON_SM89
-                    const float2 sc2 = e4m3x2_to_float2(uint32_t(sc[0]) | (uint32_t(sc[1]) << 8));
-                    const float s0 = sc2.x * 0x1p56f;
-                    const float s1 = sc2.y * 0x1p56f;
-#else
                     const float s0 = e4m3_value(sc[0]);
                     const float s1 = e4m3_value(sc[1]);
-#endif
 #pragma unroll
                     for (int h = 0; h < kGroup; ++h) {
                         acc[h] = fmaf(dot0[h], s0, dot1[h] * s1);
@@ -1429,6 +1528,7 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                 sm.scores[warp][h][row] = acc[h];
             }
         }
+        }
         __syncthreads();
 
         // 2. Softmax weights of head `warp`.
@@ -1446,18 +1546,28 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
                     if (distance < extent) {
                         if constexpr (kStep) {
                             float column[kRelDim];
+                            if constexpr (kFp4Mma) {
+                                float r_loc[kRelDim];
 #pragma unroll
-                            for (int k = 0; k < kRelDim; ++k) {
-                                column[k] = __uint_as_float(unsigned(columns[j][k]) << 16);
+                                for (int k = 0; k < kRelDim; ++k) {
+                                    r_loc[k] = sm.rel[warp][k];
+                                    column[k] = __bfloat162float(step.table[size_t(k) * extent + distance]);
+                                }
+                                score[j] += conv_step::round_bf16(relative_bias_dot(r_loc, column));
+                            } else {
+#pragma unroll
+                                for (int k = 0; k < kRelDim; ++k) {
+                                    column[k] = __uint_as_float(unsigned(columns[j][k]) << 16);
+                                }
+                                score[j] += conv_step::round_bf16(relative_bias_dot(rel, column));
                             }
-                            score[j] += conv_step::round_bf16(relative_bias_dot(rel, column));
                         } else {
                             score[j] += __bfloat162float(bias[head * extent + distance]);
                         }
                     }
                 }
             }
-            if constexpr (kStep) {
+            if constexpr (kStep && !kFp4Mma) {
                 if (t + 1 < tiles) {
                     load_columns(columns, step.table, extent, first + kTile, end, newest, slots, lane);
                 }
@@ -1502,14 +1612,15 @@ __device__ __forceinline__ void decode_attention(const __nv_bfloat16* q, const t
             float4 w = sm.weights[r];
             float v[4];
             if constexpr (F::kFp4) {
-                uint32_t hh[2];
-                e2m1x4_to_f16x4(*reinterpret_cast<const uint16_t*>(values + r * kFp4HeadBytes + 2 * lane), hh);
                 constexpr int kGroupLanes = F::kFp4Group / 4;
 #if SIPHON_SM89
-                const float sc = e4m3_value(sm.vs[stage][r * F::kFp4Scales + lane / kGroupLanes]) * 0x1p112f;
-                const float2 a = f16x2_to_f32x2_m112(hh[0]);
-                const float2 b = f16x2_to_f32x2_m112(hh[1]);
+                const uint32_t raw2 = *reinterpret_cast<const uint16_t*>(values + r * kFp4HeadBytes + 2 * lane);
+                const float sc = e4m3_to_f32_scaled_sm89<112>(sm.vs[stage][r * F::kFp4Scales + lane / kGroupLanes]);
+                const float2 a = e2m1x2_to_f32x2_m112_sm89(raw2);
+                const float2 b = e2m1x2_to_f32x2_m112_sm89(raw2 >> 8);
 #else
+                uint32_t hh[2];
+                e2m1x4_to_f16x4(*reinterpret_cast<const uint16_t*>(values + r * kFp4HeadBytes + 2 * lane), hh);
                 const float sc = e4m3_value(sm.vs[stage][r * F::kFp4Scales + lane / kGroupLanes]);
                 const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&hh[0]));
                 const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&hh[1]));
@@ -1762,7 +1873,7 @@ decode_step_fp8(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __
 }
 
 // `decode_step_bf16` with an NVFP4 cache, appending each group as kv_append_rows_fp4.
-extern "C" __global__ void __launch_bounds__(kThreads)
+extern "C" __global__ void __launch_bounds__(kThreads, 2)
 decode_step_fp4(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __nv_bfloat16* k_weight,
                 const __nv_bfloat16* v_weight, const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
                 const float* k_static, const float* v_static, float* k_state, float* v_state,
@@ -1779,7 +1890,7 @@ decode_step_fp4(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __
 }
 
 // `decode_step_bf16` with a group-32 NVFP4 cache (`KvFormat::Nvfp4G32`, 544 B/slot).
-extern "C" __global__ void __launch_bounds__(kThreads)
+extern "C" __global__ void __launch_bounds__(kThreads, 2)
 decode_step_fp4_g32(const __nv_bfloat16* k_raw, const __nv_bfloat16* v_raw, const __nv_bfloat16* k_weight,
                     const __nv_bfloat16* v_weight, const __nv_bfloat16* k_dynamic, const __nv_bfloat16* v_dynamic,
                     const float* k_static, const float* v_static, float* k_state, float* v_state,
@@ -4911,9 +5022,10 @@ __device__ __forceinline__ void rows_copy_chunk(typename F::Elem* dst, const typ
         if (lane < kRowsChunk) {
             const unsigned slot = first + lane;
             const bool valid = slot < end;
-            copy_async_scales_evict<F::kFp4Scales>(
+            // Keep scales at normal L2 priority so sibling KV-head CTAs share the 32-/64-B sector.
+            copy_async_scales<F::kFp4Scales>(
                 reinterpret_cast<char*>(dst) + kRowsFp4Scales + lane * F::kFp4Scales,
-                cache + fp4_scales_f<F>(valid ? slot : 0, kv_head), valid, policy);
+                cache + fp4_scales_f<F>(valid ? slot : 0, kv_head), valid);
         }
         return;
     }

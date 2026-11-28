@@ -1095,6 +1095,10 @@ fn extra_bank_blocks(c: &TextConfig) -> usize {
 
 /// Byte size of the two-region phase-aliased transient arena inside `PrefillScratch::new`.
 /// Mirrors the exact `ArenaCursor` layout in `siphon-cuda/src/model/prefill.rs`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "phase-aliased prefill scratch breakdown"
+)]
 fn rows_scratch_arena(
     c: &TextConfig,
     rows: usize,

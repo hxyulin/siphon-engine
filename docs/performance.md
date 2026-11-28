@@ -146,14 +146,14 @@ Measured on an RTX 4090 (24 GB, 450 W, driver 620.70.10, Force-P2 compute memory
 
 | Context | FP8 KV | NVFP4-G32 KV |
 | ---: | ---: | ---: |
-| 0 | **232.9 tok/s** *(76.6%)* | 228.1 tok/s *(75.0%)* |
-| 32,768 | 196.7 tok/s *(76.7%)* | **203.3 tok/s** *(74.2%)* |
-| 131,072 | 148.0 tok/s *(81.3%)* | **168.2 tok/s** *(75.7%)* |
-| 524,288 | — | **96.1 tok/s** *(75.9%)* |
+| 0 | **232.9 tok/s** *(76.6%)* | 230.5 tok/s *(75.8%)* |
+| 32,768 | 196.7 tok/s *(76.7%)* | **204.7 tok/s** *(74.7%)* |
+| 131,072 | 148.0 tok/s *(81.3%)* | **168.0 tok/s** *(75.6%)* |
+| 524,288 | — | **98.1 tok/s** *(77.5%)* |
 
 - **Prefill** (`--prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8 --kv nvfp4-g32`, native Ada FP8 Tensor Cores, `--chunk 2560`): **`15,608 tok/s`** (`262.4 ms`) at 4K and **`15,151 tok/s`** (`1,081 ms`) at 16K (`+31%` to `+45%` over BF16 prefill, within `<= 0.41%` PPL on `eval`).
 - **Single-stream speculation** (`bench --spec auto`, 256 tokens, DFlash 2 with `--draft-weights nvfp4`, `--kv nvfp4-g32`, 4-seed median for sampled run with `--spec-tree`):
-  - **Code (`anyhow`, 10.7K / 32K):** greedy **`601.3`** (`2.76x`) / **`518.9 tok/s`** (`2.56x`); sampled lossless (`--spec-beta 1.0`) `T=0.8, p=0.95` **`445.9 tok/s`**.
+  - **Code (`anyhow`, 10.7K / 32K):** greedy **`606.2`** (`2.79x`) / **`519.4 tok/s`** (`2.55x`); sampled lossless (`--spec-beta 1.0`) `T=0.8, p=0.95` **`445.9 tok/s`**.
   - **Prose (`regex-readme`, 2.3K / 32K, FP8 KV baseline):** greedy **`394.8`** (`1.79x`) / **`385.4 tok/s`** (`1.99x`); sampled lossless (`--spec-beta 1.0 --fallback`) `T=0.8, p=0.95` **`254.0 tok/s`** (`280.5 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`249.1 tok/s`**.
-- **Batched plain decode** (`bench`, `--kv nvfp4-g32`, `ctx 0 / 4,096`): `B=8` **`690 / 598`**, `B=16` **`982 / 837`**, `B=32` **`1,480 / 1,220 tok/s`**.
-- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8 --output-projection mxfp8 --lm-head nvfp4 --nvfp4-scales 4bit --mxfp8-experts nvfp4 --kv nvfp4-g32 --prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8` and DFlash 2 (`--draft-weights nvfp4`), host-pinned prefix-cache local/draft states (`0 MiB` GPU prefix overhead) and the phase-aliased prefill arena let `siphon serve` plan the model's full **`1,048,576` (1M)** context even with **`--streams 4 --prefill-chunk 2048 --margin 0.25 --host-cache 12`** (`22.89 GiB` planned, `4,512 × 2 MiB` KV pool pages = `8.81 GiB`, verified live on RTX 4090 with prefix caching and DFlash 2 speculation active). See [docs/recipes.md](recipes.md#rtx-4090) and [server.md](server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](engine.md#rtx-4090-sm_89) for architectural details.
+- **Batched plain decode** (`bench`, `--kv nvfp4-g32`, `ctx 0 / 4,096`): `B=8` **`673 / 588`**, `B=16` **`961 / 827`**, `B=32` **`1,417 / 1,191 tok/s`**.
+- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8 --output-projection mxfp8 --lm-head nvfp4 --nvfp4-scales 4bit --mxfp8-experts nvfp4 --kv nvfp4-g32 --prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8` and DFlash 2 (`--draft-weights nvfp4`), host-pinned prefix-cache local/draft states (`0 MiB` GPU prefix overhead) and the phase-aliased prefill arena let `siphon serve` plan the model's full **`1,048,576` (1M)** context even with **`--streams 4 --prefill-chunk 2048 --margin 0.25 --host-cache 18 --disk-cache 64 --cache-dir /var/cache/siphon`** (`22.89 GiB` planned, `4,512 × 2 MiB` KV pool pages = `8.81 GiB`, verified live on RTX 4090 with L1 GPU + L2 pinned RAM + L3 deduplicated NVMe prefix caching and DFlash 2 speculation active). See [docs/recipes.md](recipes.md#rtx-4090) and [server.md](server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](engine.md#rtx-4090-sm_89) for architectural details.

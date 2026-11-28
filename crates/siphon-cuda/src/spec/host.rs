@@ -31,6 +31,7 @@
 //! the same files, since chunks are opaque numbers and an entry needs only its chunks back.
 
 mod disk;
+mod l3;
 
 use std::{ffi::c_void, sync::Arc, time::Instant};
 
@@ -48,6 +49,7 @@ use crate::{
 pub const HOST_CHUNK_POSITIONS: usize = DEFAULT_PREFILL_CHUNK;
 
 pub use disk::{DISK_FORMAT, Loaded as DiskLoaded, Saved as DiskSaved};
+pub use l3::{DISK_FORMAT_L3, DiskTierConfig, DiskTierStats};
 
 /// Most bytes one page-locked allocation takes. Chunks never straddle two.
 const SLAB_BYTES: usize = 1 << 30;
@@ -241,6 +243,10 @@ struct HostEntry {
     used: u64,
     /// When it was last saved, restored or read from disk, for the log.
     used_at: Instant,
+    /// Corresponding entry ID in the active L3 disk tier, if already persisted there.
+    disk_id: Option<u64>,
+    /// Whether this entry changed since `disk_id` was persisted (e.g. draft state added).
+    disk_dirty: bool,
 }
 
 /// A sequence parked in host memory mid-generation ([`HostCache::park`]): its global caches
@@ -294,6 +300,8 @@ pub(super) struct HostCache {
     tick: u64,
     /// Lines for the server's log, drained by [`Self::notes`].
     notes: Vec<String>,
+    /// Optional active L3 NVMe spillover tier.
+    disk: Option<l3::DiskTier>,
 }
 
 impl HostCache {
@@ -332,6 +340,7 @@ impl HostCache {
             rings_bytes,
             tick: 0,
             notes: Vec::new(),
+            disk: None,
         })
     }
 
@@ -410,9 +419,9 @@ impl HostCache {
     }
 
     /// Drops the least recently used entry, because the pool lacks free chunks for `need`
-    /// chunks `purpose` takes, and notes it for the log. Returns false when no entry is
-    /// left to drop.
-    fn evict_lru(&mut self, need: usize, purpose: &str) -> bool {
+    /// chunks `purpose` takes, spills it to L3 disk if enabled and admitted, and notes it
+    /// for the log. Returns false when no entry is left to drop.
+    fn evict_lru(&mut self, need: usize, purpose: &str, protect_disk_id: Option<u64>) -> bool {
         let Some(lru) = self
             .entries
             .iter()
@@ -428,6 +437,7 @@ impl HostCache {
             self.pool.free.len(),
         );
         let e = self.entries.swap_remove(lru);
+        self.spill_evicted_to_disk(&e, protect_disk_id, false);
         self.release(&e);
         self.notes.push(format!(
             "host cache: evicted an entry of {} tokens, unused for {:.0} s, {purpose}: the \
@@ -526,6 +536,7 @@ impl HostCache {
         }
         if let Some(h) = existing {
             self.entries[h].rings = true;
+            self.entries[h].disk_dirty = true;
         } else {
             self.entries.push(HostEntry {
                 tokens: tokens.to_vec(),
@@ -535,6 +546,8 @@ impl HostCache {
                 rings: rings.is_some(),
                 used: self.tick,
                 used_at: Instant::now(),
+                disk_id: None,
+                disk_dirty: true,
             });
         }
         self.pending = Some(
@@ -589,6 +602,15 @@ impl HostCache {
     /// every entry it has not dropped, when they do not fit at all.
     #[expect(clippy::type_complexity, reason = "the chunks and their count")]
     fn allocate(&mut self, tokens: &[u32]) -> anyhow::Result<Option<(Vec<u32>, Vec<u32>, usize)>> {
+        self.allocate_with_protect(tokens, None)
+    }
+
+    #[expect(clippy::type_complexity, reason = "the chunks and their count")]
+    pub(super) fn allocate_with_protect(
+        &mut self,
+        tokens: &[u32],
+        protect_disk_id: Option<u64>,
+    ) -> anyhow::Result<Option<(Vec<u32>, Vec<u32>, usize)>> {
         let p = HOST_CHUNK_POSITIONS;
         let n = tokens.len() / p;
         let prompt_hashes = PrefixHashes::new(tokens, p, n);
@@ -637,7 +659,7 @@ impl HostCache {
         }
         let need = n - kv.len() + self.local_chunks();
         while self.pool.free.len() < need {
-            if !self.evict_lru(need, "to save a new entry") {
+            if !self.evict_lru(need, "to save a new entry", protect_disk_id) {
                 for &c in &kv {
                     self.pool.release(c);
                 }
@@ -801,7 +823,7 @@ impl HostCache {
         }
         let need = n - shared + self.local_chunks();
         while self.pool.free.len() < need {
-            if !self.evict_lru(need, "to park a request") {
+            if !self.evict_lru(need, "to park a request", None) {
                 for &c in &kv {
                     self.pool.release(c);
                 }

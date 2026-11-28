@@ -1261,6 +1261,18 @@ impl Attention {
                 PREFILL_PACKED_SHARED_BYTES.cast_signed(),
             )?;
         }
+        let decode_step_fp4 = module.load_function("decode_step_fp4")?;
+        let decode_step_fp4_g32 = module.load_function("decode_step_fp4_g32")?;
+        if cfg!(sm89) {
+            // On sm_89, DecodeShared<Fp4*> uses a 3-stage ring (~32-34 KiB/blk); prefer
+            // the 100 KB SMEM carveout so 2 blocks/SM always remain resident.
+            for f in [&decode_step_fp4, &decode_step_fp4_g32] {
+                f.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                    100,
+                )?;
+            }
+        }
         Ok(Self {
             relative_bias: module.load_function("relative_bias_bf16")?,
             relative_bias_rows: module.load_function("relative_bias_rows_bf16")?,
@@ -1272,8 +1284,8 @@ impl Attention {
             decode_fp8: module.load_function("decode_attention_fp8")?,
             decode_step: module.load_function("decode_step_bf16")?,
             decode_step_fp8: module.load_function("decode_step_fp8")?,
-            decode_step_fp4: module.load_function("decode_step_fp4")?,
-            decode_step_fp4_g32: module.load_function("decode_step_fp4_g32")?,
+            decode_step_fp4,
+            decode_step_fp4_g32,
             kv_append_rows_fp4: module.load_function("kv_append_rows_fp4")?,
             kv_append_rows_fp4_g32: module.load_function("kv_append_rows_fp4_g32")?,
             kv_append_rows_packed: module.load_function("kv_append_rows_packed_bf16")?,

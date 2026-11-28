@@ -1189,3 +1189,157 @@ fn host_cache_round_trips_nvfp4() -> anyhow::Result<()> {
 fn host_cache_round_trips_mixed() -> anyhow::Result<()> {
     host_cache_round_trips(None, KvFormat::Mixed)
 }
+
+/// Active L3 NVMe disk tier (`Speculator::enable_disk_cache`): verifies eviction spillover
+/// from a tight RAM pool, bit-exact L3 promotion & restore, zero-write clean re-eviction,
+/// content-addressed KV chunk deduplication, restart persistence, and identity discard.
+fn disk_cache_spills_promotes_and_dedups(
+    drafter: Option<&std::path::Path>,
+    kv: KvFormat,
+) -> anyhow::Result<()> {
+    use siphon_cuda::spec::{DiskLoaded, DiskTierConfig, PrefixTier};
+
+    let (_gpu, mut model, mut spec) = load(drafter, 2, kv)?;
+    let capture = capture_tokens()?;
+    let (a, a1) = (&capture[..4500], &capture[..4900]);
+    let (b, b1) = (&capture[1000..5600], &capture[1000..6000]);
+    // `g` shares `a`'s first 4,096 tokens (2 chunks) and adds a 3rd chunk.
+    let g: Vec<u32> = capture[..4300]
+        .iter()
+        .chain(&capture[6000..8400])
+        .copied()
+        .collect();
+    let g1: Vec<u32> = g.iter().chain(&capture[8400..8700]).copied().collect();
+
+    let want_a = run(&mut model, &mut spec, a1, false)?.0;
+    let want_b = run(&mut model, &mut spec, b1, false)?.0;
+    let want_g = run(&mut model, &mut spec, &g1, false)?.0;
+
+    let dir = env::temp_dir().join(format!("siphon-l3-cache-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let identity = serde_json::json!({"test": "l3 disk tier"});
+
+    // Compute a tight host RAM pool that holds at most 1 entry of 3 chunks + local state,
+    // forcing LRU eviction whenever a second distinct conversation saves.
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    let (probe_chunks, chunk_bytes) = spec.enable_host_cache(&model, HOST_BYTES)?;
+    let _ = probe_chunks;
+    // Local + rings take up to ~12 chunks under FP8/NVFP4; allow enough for 1 entry (not 2).
+    let local_bytes: usize = model.local_spans(0)?.iter().map(|s| s.bytes).sum();
+    let local_chunks = (local_bytes + (64 << 20)).div_ceil(chunk_bytes);
+    let tight_host_bytes = (local_chunks + 4) * chunk_bytes;
+
+    let mut cfg = DiskTierConfig::new(dir.clone(), 4 << 30);
+    cfg.max_write_bytes_per_sec = 0; // no rate limit in synthetic test
+
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    spec.enable_host_cache(&model, tight_host_bytes)?;
+    let loaded = spec.enable_disk_cache(cfg.clone(), &identity)?;
+    ensure!(
+        matches!(loaded, DiskLoaded::Missing),
+        "expected Missing, got {loaded:?}"
+    );
+
+    // Save A (2 chunks) into RAM, then B (2 chunks) evicts A to L3 disk!
+    serve_alone(&mut model, &mut spec, a)?;
+    serve_alone(&mut model, &mut spec, b)?;
+    let s1 = spec.disk_cache_stats().context("disk stats")?;
+    println!("after B evicted A: {s1:?}");
+    ensure!(
+        s1.spills == 1 && s1.entries == 1,
+        "expected 1 spilled entry: {s1:?}"
+    );
+
+    // A1 misses GPU & RAM, hits L3 disk, promotes A (evicting B to disk), matches bit-for-bit!
+    let (got_a, cached_a, _) = serve_alone(&mut model, &mut spec, a1)?;
+    ensure!(
+        spec.last_prefix_tier() == Some(PrefixTier::Disk),
+        "A1 should hit L3 Disk tier, got {:?}",
+        spec.last_prefix_tier()
+    );
+    same("A1 promoted from L3 disk", &got_a, &want_a, cached_a, 4096)?;
+
+    // B1 hits L3 disk (evicting A, which is CLEAN on disk -> 0 bytes rewritten!).
+    let before_written = spec.disk_cache_stats().context("stats")?.bytes_written;
+    let (got_b, cached_b, _) = serve_alone(&mut model, &mut spec, b1)?;
+    ensure!(
+        spec.last_prefix_tier() == Some(PrefixTier::Disk),
+        "B1 should hit L3 Disk tier, got {:?}",
+        spec.last_prefix_tier()
+    );
+    same("B1 promoted from L3 disk", &got_b, &want_b, cached_b, 4096)?;
+    let s2 = spec.disk_cache_stats().context("stats")?;
+    println!("after B1 promoted (A re-evicted clean): {s2:?}");
+    ensure!(
+        s2.skips_clean >= 1 && s2.bytes_written == before_written,
+        "clean re-eviction of A should write 0 bytes: {s2:?} (before={before_written})"
+    );
+
+    // G shares A's 2 chunks + adds 1 new chunk; then B1 pushes G to disk -> deduplication!
+    let unique_before_g = s2.unique_chunks;
+    serve_alone(&mut model, &mut spec, &g)?;
+    serve_alone(&mut model, &mut spec, b1)?;
+    let s3 = spec.disk_cache_stats().context("stats")?;
+    println!("after G spilled with shared chunks: {s3:?}");
+    ensure!(
+        s3.unique_chunks == unique_before_g + 1,
+        "G should add only 1 unique chunk (deduping A's 2): before={unique_before_g}, after={s3:?}"
+    );
+
+    // G1 promotes from disk and matches bit-for-bit!
+    let (got_g, cached_g, _) = serve_alone(&mut model, &mut spec, &g1)?;
+    ensure!(
+        spec.last_prefix_tier() == Some(PrefixTier::Disk),
+        "G1 should hit L3 Disk tier, got {:?}",
+        spec.last_prefix_tier()
+    );
+    same("G1 promoted from L3 disk", &got_g, &want_g, cached_g, 6144)?;
+
+    // Graceful shutdown flush & restart: all entries survive across restart!
+    let saved = spec.save_host_cache(&model, &dir, &identity)?;
+    println!("L3 shutdown saved: {saved:?}");
+
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    spec.enable_host_cache(&model, tight_host_bytes)?;
+    for slot in 0..model.slots() {
+        model.reset_slot(slot)?;
+    }
+    let loaded = spec.enable_disk_cache(cfg.clone(), &identity)?;
+    println!("L3 restart loaded: {loaded:?}");
+    ensure!(
+        matches!(loaded, DiskLoaded::Loaded { entries, skipped: 0, .. } if entries >= 2),
+        "expected >= 2 entries loaded, got {loaded:?}"
+    );
+    let (got_a2, cached_a2, _) = serve_alone(&mut model, &mut spec, a1)?;
+    same("A1 after L3 restart", &got_a2, &want_a, cached_a2, 4096)?;
+    let (got_b2, cached_b2, _) = serve_alone(&mut model, &mut spec, b1)?;
+    same("B1 after L3 restart", &got_b2, &want_b, cached_b2, 4096)?;
+
+    // Different identity discards all L3 files cleanly.
+    spec.save_host_cache(&model, &dir, &identity)?;
+    spec.enable_prefix_cache(&model, 1, TTL)?;
+    spec.enable_host_cache(&model, tight_host_bytes)?;
+    let other = serde_json::json!({"test": "different model"});
+    let loaded = spec.enable_disk_cache(cfg, &other)?;
+    ensure!(matches!(loaded, DiskLoaded::Discarded(_)), "{loaded:?}");
+    let left = fs::read_dir(&dir)?.count();
+    ensure!(left == 0, "{left} files left after L3 discard");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn disk_cache_spills_promotes_and_dedups_dflash2() -> anyhow::Result<()> {
+    let Some(dir) = env::var_os("SIPHON_DFLASH2") else {
+        println!("SIPHON_DFLASH2 is not set; skipped");
+        return Ok(());
+    };
+    disk_cache_spills_promotes_and_dedups(Some(std::path::Path::new(&dir)), served()?)
+}
+
+#[test]
+#[ignore = "needs the checkpoint and a GPU"]
+fn disk_cache_spills_promotes_and_dedups_bundled() -> anyhow::Result<()> {
+    disk_cache_spills_promotes_and_dedups(None, served()?)
+}

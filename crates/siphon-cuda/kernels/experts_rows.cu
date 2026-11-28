@@ -103,9 +103,18 @@ struct Geometry {
 };
 
 // 16-byte vectors per ring slot: 16 rows of the larger stage, w13's, then 16 bytes of block
-// scales per row.
+// scales per row (non-s4 formats). For 4-bit offset scales (`kScale4`), all 9 stages of a
+// 16-row tile's scales are contiguous (16 * 72 = 1,152 B = 72 uint4 for w13; 576 B = 36 uint4
+// for w2), so they load once in stage 0 via coalesced 16-byte `cp.async.cg` into a dedicated
+// tail buffer after `kRing` weight-only slots.
 constexpr int kSlotWeightVecs = 16 * kStageBytes / 16;
 constexpr int kSlotVecs = kSlotWeightVecs + 16;
+constexpr int kTileScaleVecs = 16 * (kK13 / 32) / 16;
+
+template <bool kScale4, int kRing>
+__device__ constexpr int warp_ring_vecs() {
+    return kScale4 ? (kRing * kSlotWeightVecs + kTileScaleVecs) : (kRing * kSlotVecs);
+}
 
 __device__ __forceinline__ uint64_t evict_first_policy() {
     uint64_t policy;
@@ -159,11 +168,15 @@ __device__ __forceinline__ void atomic_inc_release(uint32_t* p) {
 
 // Wait for all `kTiles` w13 tiles of a group, then order subsequent activation loads
 // after the stores those tiles cover (`__threadfence()` emits `MEMBAR.SC.GPU` without
-// `ld.acquire.gpu`'s L1-cache `CCTL.IVALL` wipe on sm_120a).
+// `ld.acquire.gpu`'s L1-cache `CCTL.IVALL` wipe, which would evict shared `x` rows).
 __device__ __forceinline__ void wait_sync_tiles(const uint32_t* counter, int lane) {
     if (lane == 0) {
         while (load_relaxed(counter) < kTiles) {
+#if SIPHON_SM89
+            __nanosleep(32);
+#else
             __nanosleep(64);
+#endif
         }
         __threadfence();
     }
@@ -243,11 +256,11 @@ __device__ __forceinline__ uint32_t e8m0_scale_pair(uint32_t bits) {
 }
 
 // Reconstructs two E4M3 block scales (packed in uint16_t) from one packed byte of 4-bit
-// offsets subtracted from the row's E4M3 base scale (`base >= off_i` by construction).
-__device__ __forceinline__ uint32_t unpack_scale4_pair(uint32_t packed_byte, uint32_t base) {
-    const uint32_t s0 = base - (packed_byte & 0xfu);
-    const uint32_t s1 = base - ((packed_byte >> 4) & 0xfu);
-    return s0 | (s1 << 8);
+// offsets subtracted from `base_pair = base | (base << 8)` (`base >= off_i` by construction,
+// so subtracting both lanes in one 32-bit sub never borrows across byte boundaries).
+__device__ __forceinline__ uint32_t unpack_scale4_pair(uint32_t packed_byte, uint32_t base_pair) {
+    const uint32_t offs = (packed_byte & 0xfu) | ((packed_byte & 0xf0u) << 4);
+    return base_pair - offs;
 }
 
 // Chunk c of tile row r within a slot of kChunks chunks per row. With 8 or more chunks,
@@ -274,6 +287,10 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
                                              const __nv_bfloat16* x, uint4* ring, int lane,
                                              uint64_t policy, float* acc, Ready ready) {
     using G = Geometry<kFp4, K, kScale4>;
+    constexpr int kSlotStride = kScale4 ? kSlotWeightVecs : kSlotVecs;
+    constexpr int kTileScalesVecs = (16 * G::kRowScaleBytes) / 16;
+    static_assert(!kScale4 || (16 * G::kRowScaleBytes) % 16 == 0 && kTileScalesVecs <= kTileScaleVecs,
+                  "4-bit tile scales are 16-byte aligned and fit tail buffer");
     constexpr int kJ = G::kChunks / 4;
     constexpr int kXVecs = G::kValues / 8;
     const int g = lane / 4;
@@ -283,7 +300,7 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
 
     auto issue = [&](int i) {
         if (i < G::kStages) {
-            uint4* slot = ring + i % kRing * kSlotVecs;
+            uint4* slot = ring + i % kRing * kSlotStride;
             const uint8_t* const ws = w_base + i * G::kStageBytes;
 #pragma unroll
             for (int q = 0; q < 16 * G::kChunks / 32; ++q) {
@@ -292,11 +309,23 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
                 const int c = idx % G::kChunks;
                 copy16(slot + slot_index<G::kChunks>(r, c), ws + r * G::kRowBytes + c * 16, policy);
             }
-            // The stage's block scales ride in the same group, 16 bytes apart per row.
-            if (lane < 16) {
-                copy_scales<G::kStageScaleBytes>(
-                    slot + kSlotWeightVecs + lane,
-                    s_base + lane * G::kRowScaleBytes + i * G::kStageScaleBytes, policy);
+            if constexpr (kScale4) {
+                // Load all 9 stages' scales once in stage 0 via coalesced 16-byte copies.
+                if (i == 0) {
+                    uint4* const tile_s = ring + kRing * kSlotWeightVecs;
+                    const uint4* const src_s = reinterpret_cast<const uint4*>(s_base);
+#pragma unroll
+                    for (int v = lane; v < kTileScalesVecs; v += 32) {
+                        copy16(tile_s + v, src_s + v, policy);
+                    }
+                }
+            } else {
+                // The stage's block scales ride in the same group, 16 bytes apart per row.
+                if (lane < 16) {
+                    copy_scales<G::kStageScaleBytes>(
+                        slot + kSlotWeightVecs + lane,
+                        s_base + lane * G::kRowScaleBytes + i * G::kStageScaleBytes, policy);
+                }
             }
         }
         commit();
@@ -309,9 +338,11 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
     uint32_t base_a = 0u;
     uint32_t base_b = 0u;
     if constexpr (kScale4) {
-        base_a = s_row_base[row0 + g];
-        base_b = s_row_base[row0 + g + 8];
+        base_a = uint32_t(s_row_base[row0 + g]) * 0x101u;
+        base_b = uint32_t(s_row_base[row0 + g + 8]) * 0x101u;
     }
+    const auto* const tile_scales =
+        reinterpret_cast<const uint8_t*>(ring + kRing * kSlotWeightVecs);
     for (int i = 0; i < G::kStages; ++i) {
         issue(i + kRing - 1);
         // The stage's inputs load from L2 while its weights arrive. Keep this predicated
@@ -328,18 +359,22 @@ __device__ __forceinline__ void tile_product(const uint8_t* w, const uint8_t* s,
         }
         wait_copies<kRing - 1>();
         __syncwarp();
-        const uint4* slot = ring + i % kRing * kSlotVecs;
+        const uint4* slot = ring + i % kRing * kSlotStride;
         const auto* scales = reinterpret_cast<const uint8_t*>(slot + kSlotWeightVecs);
 #pragma unroll
         for (int j = 0; j < kJ; ++j) {
             const int c = 4 * j + t;
             const int sc = c * G::kValues / G::kGroup;
-            const uint32_t sa = kScale4
-                                    ? unpack_scale4_pair(scales[g * 16 + c], base_a)
-                                    : (kFp4 ? *reinterpret_cast<const uint16_t*>(scales + g * 16 + sc)
-                                            : scales[g * 16 + sc]);
+            const uint32_t sa =
+                kScale4 ? unpack_scale4_pair(
+                              tile_scales[g * G::kRowScaleBytes + i * G::kStageScaleBytes + c],
+                              base_a)
+                        : (kFp4 ? *reinterpret_cast<const uint16_t*>(scales + g * 16 + sc)
+                                : scales[g * 16 + sc]);
             const uint32_t sb =
-                kScale4 ? unpack_scale4_pair(scales[(g + 8) * 16 + c], base_b)
+                kScale4 ? unpack_scale4_pair(
+                              tile_scales[(g + 8) * G::kRowScaleBytes + i * G::kStageScaleBytes + c],
+                              base_b)
                         : (kFp4 ? *reinterpret_cast<const uint16_t*>(scales + (g + 8) * 16 + sc)
                                 : scales[(g + 8) * 16 + sc]);
             const uint4 av = slot[slot_index<G::kChunks>(g, c)];
@@ -404,20 +439,17 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
                                                   uint4* ring, int lane, uint64_t policy,
                                                   float acc[4][4], Ready ready) {
     using G = Geometry<kFp4, K, kScale4>;
+    constexpr int kSlotStride = kScale4 ? kSlotWeightVecs : kSlotVecs;
+    constexpr int kTileScalesVecs = (16 * G::kRowScaleBytes) / 16;
     constexpr int kJ = G::kChunks / 4;
     constexpr int kXVecs = G::kValues / 8;
     const int g = lane / 4;
     const int t = lane % 4;
-    uint32_t base_a = 0u;
-    uint32_t base_b = 0u;
-    if constexpr (kScale4) {
-        base_a = s_row_base[row0 + g];
-        base_b = s_row_base[row0 + g + 8];
-    }
+    const uint8_t* const s_base = s + size_t(row0) * G::kRowScaleBytes;
 
     auto issue = [&](int i) {
         if (i < G::kStages) {
-            uint4* slot = ring + i % kRing * kSlotVecs;
+            uint4* slot = ring + i % kRing * kSlotStride;
 #pragma unroll
             for (int q = 0; q < 16 * G::kChunks / 32; ++q) {
                 const int idx = q * 32 + lane;
@@ -426,10 +458,21 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
                 copy16(slot + slot_index<G::kChunks>(r, c),
                        w + size_t(row0 + r) * G::kRowBytes + i * G::kStageBytes + c * 16, policy);
             }
-            if (lane < 16) {
-                copy_scales<G::kStageScaleBytes>(
-                    slot + kSlotWeightVecs + lane,
-                    s + size_t(row0 + lane) * G::kRowScaleBytes + i * G::kStageScaleBytes, policy);
+            if constexpr (kScale4) {
+                if (i == 0) {
+                    uint4* const tile_s = ring + kRing * kSlotWeightVecs;
+                    const uint4* const src_s = reinterpret_cast<const uint4*>(s_base);
+#pragma unroll
+                    for (int v = lane; v < kTileScalesVecs; v += 32) {
+                        copy16(tile_s + v, src_s + v, policy);
+                    }
+                }
+            } else {
+                if (lane < 16) {
+                    copy_scales<G::kStageScaleBytes>(
+                        slot + kSlotWeightVecs + lane,
+                        s_base + lane * G::kRowScaleBytes + i * G::kStageScaleBytes, policy);
+                }
             }
         }
         commit();
@@ -439,6 +482,14 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
         issue(q);
     }
     ready();
+    uint32_t base_a = 0u;
+    uint32_t base_b = 0u;
+    if constexpr (kScale4) {
+        base_a = uint32_t(s_row_base[row0 + g]) * 0x101u;
+        base_b = uint32_t(s_row_base[row0 + g + 8]) * 0x101u;
+    }
+    const auto* const tile_scales =
+        reinterpret_cast<const uint8_t*>(ring + kRing * kSlotWeightVecs);
     for (int i = 0; i < G::kStages; ++i) {
         issue(i + kRing - 1);
         uint4 xv0[kJ][kXVecs];
@@ -454,19 +505,23 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
         }
         wait_copies<kRing - 1>();
         __syncwarp();
-        const uint4* slot = ring + i % kRing * kSlotVecs;
+        const uint4* slot = ring + i % kRing * kSlotStride;
         const auto* scales = reinterpret_cast<const uint8_t*>(slot + kSlotWeightVecs);
 #pragma unroll
         for (int j = 0; j < kJ; ++j) {
             const int c = 4 * j + t;
             const int k = i * G::kKPerStage + c * G::kValues;
             const int sc = c * G::kValues / G::kGroup;
-            const uint32_t sa = kScale4
-                                    ? unpack_scale4_pair(scales[g * 16 + c], base_a)
-                                    : (kFp4 ? *reinterpret_cast<const uint16_t*>(scales + g * 16 + sc)
-                                            : scales[g * 16 + sc]);
+            const uint32_t sa =
+                kScale4 ? unpack_scale4_pair(
+                              tile_scales[g * G::kRowScaleBytes + i * G::kStageScaleBytes + c],
+                              base_a)
+                        : (kFp4 ? *reinterpret_cast<const uint16_t*>(scales + g * 16 + sc)
+                                : scales[g * 16 + sc]);
             const uint32_t sb =
-                kScale4 ? unpack_scale4_pair(scales[(g + 8) * 16 + c], base_b)
+                kScale4 ? unpack_scale4_pair(
+                              tile_scales[(g + 8) * G::kRowScaleBytes + i * G::kStageScaleBytes + c],
+                              base_b)
                         : (kFp4 ? *reinterpret_cast<const uint16_t*>(scales + (g + 8) * 16 + sc)
                                 : scales[(g + 8) * 16 + sc]);
             const uint4 av = slot[slot_index<G::kChunks>(g, c)];
@@ -594,14 +649,17 @@ __device__ __forceinline__ void tile_product_wide(const uint8_t* w, const uint8_
         }
         __syncwarp();
     }
-    wait_copies<0>();
-    __syncwarp();
+    if (ng > 1) {
+        wait_copies<0>();
+        __syncwarp();
+    }
 }
 
 // Zero-smem warp-shuffle coalesced w13 SwiGLU epilogue for 1..=8 pairs: gathers each
 // pair's 8 BF16 activations into one 16-byte `uint4` global store via 4 warp shuffles.
+template <typename PairT>
 __device__ __forceinline__ void store_act_single(const float acc[4], float scale, int count,
-                                                 const uint8_t* pairs_of, int row0,
+                                                 const PairT* pairs_of, int row0,
                                                  float gate_softcap, float up_softcap,
                                                  __nv_bfloat16* act, int lane, int g, int t,
                                                  uint32_t* done_counter) {
@@ -646,8 +704,9 @@ __device__ __forceinline__ void store_act_single(const float acc[4], float scale
 // Zero-smem warp-shuffle coalesced w2 output epilogue for 1..=8 pairs: gathers each
 // pair's 16 BF16 outputs into two contiguous 16-byte `uint4` global stores (one 32-byte
 // sector per pair) via 6 warp shuffles.
+template <typename PairT>
 __device__ __forceinline__ void store_out_single(const float acc[4], float scale, int count,
-                                                 const uint8_t* pairs_of, int row0,
+                                                 const PairT* pairs_of, int row0,
                                                  __nv_bfloat16* out, int g, int t) {
     const uint32_t e_lo = uint32_t(__bfloat16_as_ushort(__float2bfloat16(acc[0] * scale)));
     const uint32_t o_lo = uint32_t(__bfloat16_as_ushort(__float2bfloat16(acc[1] * scale)));
@@ -778,7 +837,7 @@ __device__ __forceinline__ void expert_mlp_rows(const __nv_bfloat16* x, const in
 
     const int distinct = distinct_s;
     const uint64_t policy = evict_first_policy();
-    uint4* const ring = ring_all + warp * kRing * kSlotVecs;
+    uint4* const ring = ring_all + warp * warp_ring_vecs<kScale4, kRing>();
     const int tasks13 = distinct * kTiles;
     const int tasks = 2 * tasks13;
 
@@ -967,7 +1026,7 @@ __device__ __forceinline__ void expert_mlp_rows_multi(
     const int distinct = distinct_s;
     const int groups_total = int(vstart[distinct]);
     const uint64_t policy = evict_first_policy();
-    uint4* const ring = ring_all + warp * kRing * kSlotVecs;
+    uint4* const ring = ring_all + warp * warp_ring_vecs<kScale4, kRing>();
     const int tasks13 = groups_total * kTiles;
     const int tasks = 2 * tasks13;
     const int warps = gridDim.x * kWarps;
@@ -1093,7 +1152,7 @@ __device__ __forceinline__ void expert_mlp_rows_wide(
 
     const int num_chunks = num_chunks_s;
     const uint64_t policy = evict_first_policy();
-    uint4* ring = ring_all + warp * kRing * kSlotVecs;
+    uint4* ring = ring_all + warp * warp_ring_vecs<kScale4, kRing>();
     const int tasks13 = num_chunks * kTiles;
     const int tasks = 2 * tasks13;
 
@@ -1137,74 +1196,77 @@ __device__ __forceinline__ void expert_mlp_rows_wide(
                 kScale4 ? s13_base + size_t(e) * kN13 : nullptr, row0, x_ptrs, ng, ring, lane,
                 policy, acc, [] {});
             const float scale = kFp4 ? __fdiv_rn(g13[e], kNvfp4ScaleEnc) : 1.f;
-            __nv_bfloat16* act_smem = reinterpret_cast<__nv_bfloat16*>(ring);
+            if (ng == 1) {
+                store_act_single(acc[0], scale, count, pairs_of, row0, gate_softcap, up_softcap,
+                                 act, lane, g, t, &sync[2 + chunk]);
+            } else {
+                __nv_bfloat16* act_smem = reinterpret_cast<__nv_bfloat16*>(ring);
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                if (u < ng) {
-                    const int col_off = u * 8;
+                for (int u = 0; u < 4; ++u) {
+                    if (u < ng) {
+                        const int col_off = u * 8;
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const float gate = acc[u][i] * scale;
-                        const float up = __shfl_down_sync(0xffffffffu, gate, 4);
-                        const int column = col_off + 2 * t + (i & 1);
-                        if (g % 2 == 0 && column < count) {
-                            act_smem[column * 8 + (g >> 1) + (i >> 1) * 4] = softcapped_swiglu(
-                                __bfloat162float(__float2bfloat16(gate)),
-                                __bfloat162float(__float2bfloat16(up)), gate_softcap, up_softcap);
+                        for (int i = 0; i < 4; ++i) {
+                            const float gate = acc[u][i] * scale;
+                            const float up = __shfl_down_sync(0xffffffffu, gate, 4);
+                            const int column = col_off + 2 * t + (i & 1);
+                            if (g % 2 == 0 && column < count) {
+                                act_smem[column * 8 + (g >> 1) + (i >> 1) * 4] = softcapped_swiglu(
+                                    __bfloat162float(__float2bfloat16(gate)),
+                                    __bfloat162float(__float2bfloat16(up)), gate_softcap,
+                                    up_softcap);
+                            }
                         }
                     }
                 }
-            }
-            __syncwarp();
-            if (lane < count) {
-                const int pair = int(pairs_of[lane]);
-                *reinterpret_cast<uint4*>(act + size_t(pair) * kK2 + row0 / 2) =
-                    *reinterpret_cast<const uint4*>(act_smem + lane * 8);
-            }
-            fence_acq_rel_gpu();
-            __syncwarp();
-            if (lane == 0) {
-                atomic_inc_release(&sync[2 + chunk]);
+                __syncwarp();
+                if (lane < count) {
+                    const int pair = int(pairs_of[lane]);
+                    *reinterpret_cast<uint4*>(act + size_t(pair) * kK2 + row0 / 2) =
+                        *reinterpret_cast<const uint4*>(act_smem + lane * 8);
+                }
+                __threadfence();
+                __syncwarp();
+                if (lane == 0) {
+                    atomic_inc_relaxed(&sync[2 + chunk]);
+                }
             }
         } else {
             const uint8_t* w2e = w2 + size_t(e) * kN2 * G2::kRowBytes;
             tile_product_wide<kFp4, kK2, kRing, kScale4>(
                 w2e, s2 + size_t(e) * kN2 * G2::kRowScaleBytes,
                 kScale4 ? s2_base + size_t(e) * kN2 : nullptr, row0, x_ptrs, ng, ring, lane, policy,
-                acc, [&] {
-                    if (lane == 0) {
-                        while (load_acquire(&sync[2 + chunk]) < kTiles) {
-                            __nanosleep(64);
-                        }
-                    }
-                    __syncwarp();
-                });
+                acc, [&] { wait_sync_tiles(&sync[2 + chunk], lane); });
             const float scale = kFp4 ? __fdiv_rn(g2[e], kNvfp4ScaleEnc) : 1.f;
-            __nv_bfloat16* out_smem = reinterpret_cast<__nv_bfloat16*>(ring);
-            constexpr int kWideOutStride = 24;
+            if (ng == 1) {
+                store_out_single(acc[0], scale, count, pairs_of, row0, out, g, t);
+            } else {
+                __nv_bfloat16* out_smem = reinterpret_cast<__nv_bfloat16*>(ring);
+                constexpr int kWideOutStride = 24;
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                if (u < ng) {
-                    const int col_off = u * 8;
+                for (int u = 0; u < 4; ++u) {
+                    if (u < ng) {
+                        const int col_off = u * 8;
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const int column = col_off + 2 * t + (i & 1);
-                        if (column < count) {
-                            out_smem[column * kWideOutStride + g + (i >> 1) * 8] =
-                                __float2bfloat16(acc[u][i] * scale);
+                        for (int i = 0; i < 4; ++i) {
+                            const int column = col_off + 2 * t + (i & 1);
+                            if (column < count) {
+                                out_smem[column * kWideOutStride + g + (i >> 1) * 8] =
+                                    __float2bfloat16(acc[u][i] * scale);
+                            }
                         }
                     }
                 }
+                __syncwarp();
+                if (lane < count) {
+                    const int pair = int(pairs_of[lane]);
+                    __nv_bfloat16* dst = out + size_t(pair) * kN2 + row0;
+                    const __nv_bfloat16* src = out_smem + lane * kWideOutStride;
+                    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+                    *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(src + 8);
+                }
+                __syncwarp();
             }
-            __syncwarp();
-            if (lane < count) {
-                const int pair = int(pairs_of[lane]);
-                __nv_bfloat16* dst = out + size_t(pair) * kN2 + row0;
-                const __nv_bfloat16* src = out_smem + lane * kWideOutStride;
-                *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-                *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(src + 8);
-            }
-            __syncwarp();
         }
     }
     __syncthreads();

@@ -43,46 +43,53 @@ use super::{HOST_CHUNK_POSITIONS, HostCache, HostEntry};
 pub const DISK_FORMAT: u32 = 1;
 
 const MAGIC: &[u8; 8] = b"SIPHONHC";
-const MANIFEST: &str = "manifest.json";
+pub(super) const MANIFEST: &str = "manifest.json";
 
-/// What [`HostCache::save_dir`] wrote.
+/// Files written by [`super::super::Speculator::save_host_cache`].
 #[derive(Debug)]
 pub struct Saved {
+    /// Host cache entries written.
     pub entries: usize,
+    /// Total bytes written to entry files, including their headers.
     pub bytes: u64,
+    /// Elapsed time for the save, in seconds.
     pub seconds: f64,
 }
 
-/// What [`HostCache::load_dir`] found.
+/// Result of [`super::super::Speculator::load_host_cache`].
 #[derive(Debug)]
 pub enum Loaded {
     /// No manifest: nothing was saved, or a save stopped midway.
     Missing,
     /// The manifest differed from the server's; the directory's files were removed.
     Discarded(String),
+    /// The manifest matched and loading was attempted.
     Loaded {
+        /// Host cache entries restored.
         entries: usize,
         /// Entries that did not fit the pool or could not be read.
         skipped: usize,
+        /// Total bytes read from the restored entry files.
         bytes: u64,
+        /// Elapsed time for the load, in seconds.
         seconds: f64,
     },
 }
 
 /// FNV-1a.
-fn fnv(bytes: &[u8]) -> u64 {
+pub(super) fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
-fn pad8(n: usize) -> usize {
+pub(super) fn pad8(n: usize) -> usize {
     n.next_multiple_of(8) - n
 }
 
 impl HostCache {
     /// The layout part of the manifest: what the chunks hold and where.
-    fn layout(&self) -> Value {
+    pub(super) fn layout(&self) -> Value {
         json!({
             "chunk_positions": HOST_CHUNK_POSITIONS,
             "chunk_bytes": self.pool.chunk_bytes,
@@ -107,7 +114,7 @@ impl HostCache {
     }
 
     /// Bytes of a chunk's target part and draft part.
-    fn parts(&self) -> (usize, usize) {
+    pub(super) fn parts(&self) -> (usize, usize) {
         (
             HOST_CHUNK_POSITIONS * self.target.bytes_per_position(),
             HOST_CHUNK_POSITIONS * self.draft.bytes_per_position(),
@@ -119,7 +126,7 @@ impl HostCache {
     /// # Safety
     ///
     /// `at .. at + len` must lie in one chunk, and no copy may write it meanwhile.
-    unsafe fn host_bytes<'a>(at: usize, len: usize) -> &'a [u8] {
+    pub(super) unsafe fn host_bytes<'a>(at: usize, len: usize) -> &'a [u8] {
         // SAFETY: the caller's.
         unsafe { std::slice::from_raw_parts(at as *const u8, len) }
     }
@@ -130,14 +137,18 @@ impl HostCache {
     ///
     /// `at .. at + len` must lie in one chunk that no entry reads and no copy touches
     /// meanwhile.
-    unsafe fn host_bytes_mut<'a>(at: usize, len: usize) -> &'a mut [u8] {
+    pub(super) unsafe fn host_bytes_mut<'a>(at: usize, len: usize) -> &'a mut [u8] {
         // SAFETY: the caller's.
         unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) }
     }
 
     /// Writes every entry to `dir`, one file each, and a manifest with `identity` last.
-    /// Waits for the copies to the host first.
-    pub fn save_dir(&self, dir: &Path, identity: &Value) -> anyhow::Result<Saved> {
+    /// Waits for the copies to the host first. When an active L3 disk tier is enabled,
+    /// flushes and persists into the deduplicated L3 store instead.
+    pub fn save_dir(&mut self, dir: &Path, identity: &Value) -> anyhow::Result<Saved> {
+        if self.disk.is_some() {
+            return self.save_l3_dir(dir, identity);
+        }
         let started = Instant::now();
         self.copy.synchronize()?;
         self.main.synchronize()?;
@@ -396,13 +407,15 @@ impl HostCache {
             rings,
             used,
             used_at: std::time::Instant::now(),
+            disk_id: None,
+            disk_dirty: true,
         });
         Ok(Some(read))
     }
 }
 
 /// Writes `bytes` to `path` through a temporary file and a rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp)?;
     file.write_all(bytes)?;
@@ -431,8 +444,9 @@ fn entry_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Removes the manifest and every entry file of `dir`, and leaves other files alone.
-fn discard(dir: &Path) -> anyhow::Result<()> {
+/// Removes the manifest and every entry/L3 file of `dir`, and leaves other files alone.
+pub(super) fn discard(dir: &Path) -> anyhow::Result<()> {
+    super::l3::discard_l3_files(dir)?;
     for path in entry_files(dir)?
         .into_iter()
         .chain([dir.join(MANIFEST), dir.join("manifest.tmp")])

@@ -30,7 +30,7 @@ use siphon::prefix_hash::{PrefixHashes, prefix_hash};
 
 use super::{
     Prompt, Speculator,
-    host::{DiskLoaded, DiskSaved, HOST_CHUNK_POSITIONS, HostCache},
+    host::{DiskLoaded, DiskSaved, DiskTierConfig, DiskTierStats, HOST_CHUNK_POSITIONS, HostCache},
 };
 use crate::{
     draft::DraftRings,
@@ -59,8 +59,10 @@ pub(super) struct PrefixCache {
 pub enum PrefixTier {
     /// A device entry, whose global caches stay in its slot's pages of the KV pool.
     Slot,
-    /// A host entry.
+    /// A host entry in page-locked RAM.
     Host,
+    /// An entry promoted from the active L3 NVMe disk tier.
+    Disk,
 }
 
 impl PrefixTier {
@@ -70,6 +72,7 @@ impl PrefixTier {
         match self {
             Self::Slot => "slot",
             Self::Host => "host",
+            Self::Disk => "disk",
         }
     }
 }
@@ -81,6 +84,8 @@ enum Source {
     Device(usize),
     /// A host entry, and its tokens.
     Host(usize, usize),
+    /// An L3 disk entry id, and its tokens.
+    Disk(u64, usize),
 }
 
 /// One prompt's state at its last chunk boundary.
@@ -187,7 +192,10 @@ impl PrefixCache {
             .host
             .as_ref()
             .filter(|_| chunk == HOST_CHUNK_POSITIONS)
-            .map_or(0, |h| h.max_len_below(prompt.len()));
+            .map_or(0, |h| {
+                h.max_len_below(prompt.len())
+                    .max(h.disk_max_len_below(prompt.len()))
+            });
         let max_len = device_max.max(host_max);
         if max_len == 0 || chunk == 0 {
             return None;
@@ -203,7 +211,21 @@ impl PrefixCache {
                 let j = h.lookup(prompt, draft.is_some(), &hashes)?;
                 (h.len(j) > device_len).then(|| Source::Host(j, h.len(j)))
             });
-        host.or(device.map(Source::Device))
+        let best_so_far = host.or(device.map(Source::Device));
+        let best_len = match best_so_far {
+            Some(Source::Device(_)) => device_len,
+            Some(Source::Host(_, len) | Source::Disk(_, len)) => len,
+            None => 0,
+        };
+        let disk = self
+            .host
+            .as_ref()
+            .filter(|_| chunk == HOST_CHUNK_POSITIONS)
+            .and_then(|h| {
+                let (id, len) = h.lookup_disk(prompt, draft.is_some(), &hashes)?;
+                (len > best_len).then_some(Source::Disk(id, len))
+            });
+        disk.or(best_so_far)
     }
 
     /// Makes the model's stream wait for the host tier's copies before it overwrites what
@@ -399,14 +421,19 @@ impl Speculator {
         }
         let host = self
             .prefix
-            .as_ref()
-            .and_then(|c| c.host.as_ref())
+            .as_mut()
+            .and_then(|c| c.host.as_mut())
             .context("the host cache is off")?;
         host.save_dir(dir, identity)
     }
 
     /// Reads the host entries that [`Self::save_host_cache`] wrote to `dir`, if its
     /// manifest matches `identity` and this host tier's layout, and otherwise removes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host tier is disabled or the files cannot be listed or
+    /// discarded. Individual entries that cannot be restored are counted as skipped.
     pub fn load_host_cache(
         &mut self,
         dir: &std::path::Path,
@@ -417,6 +444,35 @@ impl Speculator {
             .and_then(|c| c.host.as_mut())
             .context("the host cache is off")?
             .load_dir(dir, identity)
+    }
+
+    /// Enables an active L3 NVMe disk cache tier backed by `config.dir`, indexing any
+    /// existing compatible entries and pre-warming pinned host RAM with the newest ones
+    /// that fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host tier is disabled or the cache directory cannot be
+    /// initialized.
+    pub fn enable_disk_cache(
+        &mut self,
+        config: DiskTierConfig,
+        identity: &serde_json::Value,
+    ) -> anyhow::Result<DiskLoaded> {
+        self.prefix
+            .as_mut()
+            .and_then(|c| c.host.as_mut())
+            .context("the disk cache needs the host cache")?
+            .enable_disk_cache(config, identity)
+    }
+
+    /// Returns statistics for the active L3 disk cache tier, if enabled.
+    #[must_use]
+    pub fn disk_cache_stats(&self) -> Option<DiskTierStats> {
+        self.prefix
+            .as_ref()
+            .and_then(|c| c.host.as_ref())
+            .and_then(HostCache::disk_stats)
     }
 
     /// Makes the model's stream wait for the host tier's copies before it overwrites what
@@ -475,6 +531,11 @@ impl Speculator {
                 tokens,
                 draft: cache.host.as_ref()?.has_draft(j),
             }),
+            Source::Disk(id, tokens) => Some(PrefixHit {
+                slot: None,
+                tokens,
+                draft: cache.host.as_ref()?.has_disk_draft(id),
+            }),
         }
     }
 
@@ -515,15 +576,16 @@ impl Speculator {
         let tier = source.map(|s| match s {
             Source::Device(_) => PrefixTier::Slot,
             Source::Host(..) => PrefixTier::Host,
+            Source::Disk(..) => PrefixTier::Disk,
         });
-        let (mut hit, start) = match source {
+        let (mut hit, mut start) = match source {
             Some(Source::Device(i)) => {
                 let e = &cache.entries[i];
                 let (slot, len) = (e.slot.context("a live entry has a slot")?, e.tokens.len());
                 self.move_to_slot0(model, slot)?;
                 (Some(i), len)
             }
-            Some(Source::Host(_, len)) => {
+            Some(Source::Host(_, len) | Source::Disk(_, len)) => {
                 self.vacate_slot0(model, &[])?;
                 (None, len)
             }
@@ -536,6 +598,7 @@ impl Speculator {
         let stream = std::sync::Arc::clone(model.stream());
         let cache = self.prefix.as_mut().context("the cache is on")?;
         cache.last_tier = tier;
+        let mut from_host = false;
         match source {
             Some(Source::Device(i)) => {
                 let e = &mut cache.entries[i];
@@ -553,6 +616,24 @@ impl Speculator {
                     host.restore_slot(model, j, 0)? + host.restore_draft(&mut self.draft, j)?;
                 let seconds = host.finish_restore(started)?;
                 host.note(restored(len, 0, bytes, seconds, "with the draft's state"));
+                from_host = true;
+            }
+            Some(Source::Disk(disk_id, len)) => {
+                model.reset()?;
+                self.draft_sequence += 1;
+                let host = cache.host.as_mut().context("a disk hit has a host cache")?;
+                if let Some((j, read_bytes, read_secs)) = host.promote_disk(disk_id)? {
+                    host.note(promoted(len, read_bytes, read_secs));
+                    let started = host.start_restore()?;
+                    let bytes =
+                        host.restore_slot(model, j, 0)? + host.restore_draft(&mut self.draft, j)?;
+                    let seconds = host.finish_restore(started)?;
+                    host.note(restored(len, 0, bytes, seconds, "with the draft's state"));
+                    from_host = true;
+                } else {
+                    cache.last_tier = None;
+                    start = 0;
+                }
             }
             None => {
                 model.reset()?;
@@ -563,7 +644,6 @@ impl Speculator {
         // The last chunk boundary below the end, so at least one row remains for the
         // logits. `start` is such a boundary of a shorter prompt, so it is at most this.
         let boundary = (tokens.len() - 1) / chunk * chunk;
-        let from_host = matches!(source, Some(Source::Host(..)));
         if boundary > start || from_host {
             // Prefill splits a chunk only at the end of its tokens, so the chunks match a
             // prefill of the whole prompt.
@@ -616,6 +696,7 @@ impl Speculator {
         cache.last_tier = source.map(|s| match s {
             Source::Device(_) => PrefixTier::Slot,
             Source::Host(..) => PrefixTier::Host,
+            Source::Disk(..) => PrefixTier::Disk,
         });
         if let Some(Source::Device(i)) = source {
             let e = &mut cache.entries[i];
@@ -641,8 +722,18 @@ impl Speculator {
         if self.draft.is_dflash2() {
             self.draft.reset_slot(slot);
         }
-        let Some(Source::Host(j, len)) = source else {
-            return Ok((slot, 0));
+        let (j, len) = match source {
+            Some(Source::Host(j, len)) => (j, len),
+            Some(Source::Disk(disk_id, len)) => {
+                let host = cache.host.as_mut().context("a disk hit has a host cache")?;
+                let Some((j, read_bytes, read_secs)) = host.promote_disk(disk_id)? else {
+                    cache.last_tier = None;
+                    return Ok((slot, 0));
+                };
+                host.note(promoted(len, read_bytes, read_secs));
+                (j, len)
+            }
+            Some(Source::Device(_)) | None => return Ok((slot, 0)),
         };
         let host = cache.host.as_mut().context("a host hit has a host cache")?;
         let started = host.start_restore()?;
@@ -711,8 +802,7 @@ impl Speculator {
             .or_else(|| cache.free_entry(model, busy, now));
         if let Some(i) = entry {
             self.save_entry(model, i, slot, &prompt[..boundary], chunk)?;
-            let has_draft =
-                self.draft.is_dflash2() && self.draft.slot_committed(slot) == boundary;
+            let has_draft = self.draft.is_dflash2() && self.draft.slot_committed(slot) == boundary;
             if has_draft {
                 let sequence = self.draft_sequence;
                 let cache = self.prefix.as_mut().context("the cache is on")?;
@@ -1242,6 +1332,16 @@ fn restored(tokens: usize, slot: usize, bytes: usize, seconds: f64, what: &str) 
     format!(
         "host cache: restored {tokens} tokens into slot {slot} {what}: {} MiB in {:.1} ms, \
          {:.1} GB/s",
+        bytes >> 20,
+        seconds * 1e3,
+        bytes as f64 / seconds.max(1e-9) / 1e9
+    )
+}
+
+/// A log line for promoting an entry from the L3 disk tier into pinned host memory.
+fn promoted(tokens: usize, bytes: u64, seconds: f64) -> String {
+    format!(
+        "disk cache: promoted {tokens} tokens into host memory: {} MiB in {:.1} ms, {:.1} GB/s",
         bytes >> 20,
         seconds * 1e3,
         bytes as f64 / seconds.max(1e-9) / 1e9

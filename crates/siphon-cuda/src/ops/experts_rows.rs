@@ -57,6 +57,11 @@ const DEEP_RING_ROWS: usize = 3;
 const fn smem(ring: usize) -> usize {
     WARPS * ring * 16 * (128 + 16)
 }
+/// Dynamic shared memory per block for 4-bit offset scales (`nvfp4_s4`): `ring` weight-only
+/// slots (16 * 128 B each) plus one contiguous 16 * 72 B tile-scale buffer per warp.
+const fn smem_s4(ring: usize) -> usize {
+    WARPS * (ring * 16 * 128 + 16 * 72)
+}
 /// Dynamic shared memory per block for MXFP6 (lo4 128 B + hi2 64 B + scales 16 B per row).
 const fn smem_mxfp6(ring: usize) -> usize {
     WARPS * ring * 16 * (128 + 64 + 16)
@@ -132,7 +137,7 @@ impl ExpertsRows {
             let (nvfp4, nvfp4_blocks) = load(&format!("expert_mlp_rows_nvfp4_{ring}"), smem(ring))?;
             let (mxfp8, mxfp8_blocks) = load(&format!("expert_mlp_rows_mxfp8_{ring}"), smem(ring))?;
             let (nvfp4_s4, nvfp4_s4_blocks) =
-                load(&format!("expert_mlp_rows_nvfp4_s4_{ring}"), smem(ring))?;
+                load(&format!("expert_mlp_rows_nvfp4_s4_{ring}"), smem_s4(ring))?;
             Ok((
                 [nvfp4, mxfp8, nvfp4_s4],
                 [nvfp4_blocks, mxfp8_blocks, nvfp4_s4_blocks],
@@ -145,14 +150,14 @@ impl ExpertsRows {
         let (multi_mxfp8, multi_mxfp8_blocks) =
             load("expert_mlp_rows_multi_mxfp8_3", smem(RINGS[0]))?;
         let (multi_nvfp4_s4, multi_nvfp4_s4_blocks) =
-            load("expert_mlp_rows_multi_nvfp4_s4_3", smem(RINGS[0]))?;
+            load("expert_mlp_rows_multi_nvfp4_s4_3", smem_s4(RINGS[0]))?;
         let group = module.load_function("expert_group_rows")?;
         let (wide_nvfp4, wide_nvfp4_blocks) = load("expert_mlp_rows_wide_nvfp4_3", smem(RINGS[0]))?;
         let (wide_mxfp8, wide_mxfp8_blocks) = load("expert_mlp_rows_wide_mxfp8_3", smem(RINGS[0]))?;
         let wide_s4_ring = if cfg!(sm89) { RINGS[1] } else { RINGS[0] };
         let (wide_nvfp4_s4, wide_nvfp4_s4_blocks) = load(
             &format!("expert_mlp_rows_wide_nvfp4_s4_{wide_s4_ring}"),
-            smem(wide_s4_ring),
+            smem_s4(wide_s4_ring),
         )?;
         let (mxfp6_kernel, mxfp6_blocks) = load("expert_mlp_rows_mxfp6_3", smem_mxfp6(RINGS[0]))?;
         let (mxfp6_multi, mxfp6_multi_blocks) =
@@ -375,7 +380,11 @@ impl ExpertsRows {
                 (
                     &self.wide_kernels[format],
                     self.wide_blocks[format],
-                    smem(ring),
+                    if format == 2 {
+                        smem_s4(ring)
+                    } else {
+                        smem(ring)
+                    },
                 )
             };
             let config = LaunchConfig {
@@ -404,13 +413,21 @@ impl ExpertsRows {
             (
                 &self.kernels[ring][format],
                 self.blocks[ring][format],
-                smem(RINGS[ring]),
+                if format == 2 {
+                    smem_s4(RINGS[ring])
+                } else {
+                    smem(RINGS[ring])
+                },
             )
         } else {
             (
                 &self.multi_kernels[format],
                 self.multi_blocks[format],
-                smem(RINGS[0]),
+                if format == 2 {
+                    smem_s4(RINGS[0])
+                } else {
+                    smem(RINGS[0])
+                },
             )
         };
         let mut args = KernelArgs::default();

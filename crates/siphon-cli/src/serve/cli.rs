@@ -90,6 +90,11 @@ pub(super) struct Cli {
     /// Load and save the host cache in this directory. Requires --host-cache.
     #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath, help_heading = "Prefix cache")]
     cache_dir: Option<PathBuf>,
+    /// Cap an active L3 NVMe disk cache tier in --cache-dir. Evicted RAM prefixes spill
+    /// here with deduplicated KV chunks and wear-rate protection. Zero disables L3 spillover.
+    #[arg(long, value_name = "GIB", default_value = "0", value_parser = gib_bytes::<true>,
+          allow_negative_numbers = true, help_heading = "Prefix cache")]
+    disk_cache: usize,
 
     /// Enable image inputs.
     #[arg(long, help_heading = "Vision")]
@@ -415,6 +420,7 @@ impl Cli {
                 prefix_ttl: Duration::from_secs(self.prefix_cache_ttl),
                 host_cache: self.host_cache,
                 cache_dir: self.cache_dir,
+                disk_cache: self.disk_cache as u64,
                 prefill_attention: formats.prefill_attention,
                 prefill_dense: formats.prefill_dense,
                 expert_activations: formats.expert_activations,

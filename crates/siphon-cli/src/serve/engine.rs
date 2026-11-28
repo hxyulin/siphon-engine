@@ -418,6 +418,8 @@ pub struct Options {
     pub host_cache: usize,
     /// Where the host tier's entries are saved after a drain and loaded at startup.
     pub cache_dir: Option<PathBuf>,
+    /// Maximum bytes for an active L3 NVMe spillover tier in `cache_dir`, 0 for restart-only.
+    pub disk_cache: u64,
     /// Prefill's global attention products over an FP8 cache, as `PrefillAttention`
     /// parses them.
     pub prefill_attention: String,
@@ -624,8 +626,8 @@ mod cuda {
         },
         ops::{attention::KvFormat, spec::VERIFY_ROWS},
         spec::{
-            DiskLoaded, DraftSource, Drafts, HOST_CHUNK_POSITIONS, PrefixTier, Prompt, Rebuild,
-            Speculator, Width, WidthPolicy, load_draft, price,
+            DiskLoaded, DiskTierConfig, DraftSource, Drafts, HOST_CHUNK_POSITIONS, PrefixTier,
+            Prompt, Rebuild, Speculator, Width, WidthPolicy, load_draft, price,
         },
         vision::{VisionFormat, VisionTower},
         vmm::{PagePool, granularity},
@@ -1240,7 +1242,17 @@ mod cuda {
                 options.cache_dir.is_none(),
                 "--cache-dir needs --host-cache"
             );
+            anyhow::ensure!(
+                options.disk_cache == 0,
+                "--disk-cache needs --host-cache and --cache-dir"
+            );
             return Ok(());
+        }
+        if options.disk_cache > 0 {
+            anyhow::ensure!(
+                options.cache_dir.is_some(),
+                "--disk-cache needs --cache-dir"
+            );
         }
         anyhow::ensure!(
             options.prefix_entries > 0,
@@ -1262,7 +1274,22 @@ mod cuda {
         let Some(dir) = &options.cache_dir else {
             return Ok(());
         };
-        let line = match speculator.load_host_cache(dir, &cache_identity(options)?)? {
+        let identity = cache_identity(options)?;
+        let loaded = if options.disk_cache > 0 {
+            let config = DiskTierConfig::new(dir.clone(), options.disk_cache);
+            log!(
+                "disk cache: enabling active L3 tier in {} (cap {:.2} GiB, min spill {} tokens, \
+                 sustained write cap {} MiB/s)",
+                dir.display(),
+                options.disk_cache as f64 / f64::from(1u32 << 30),
+                config.min_spill_tokens,
+                config.max_write_bytes_per_sec >> 20,
+            );
+            speculator.enable_disk_cache(config, &identity)?
+        } else {
+            speculator.load_host_cache(dir, &identity)?
+        };
+        let line = match loaded {
             DiskLoaded::Missing => format!("no saved host cache in {}", dir.display()),
             DiskLoaded::Discarded(why) => {
                 format!("discarded the saved host cache in {}: {why}", dir.display())
