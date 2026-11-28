@@ -110,9 +110,9 @@ __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ uint32_t load_scale_u8(const uint8_t* p) {
-    uint32_t v;
-    asm volatile("ld.global.nc.u8 %0, [%1];" : "=r"(v) : "l"(p));
+__device__ __forceinline__ uint2 load_scale_u64(const uint8_t* p) {
+    uint2 v;
+    asm volatile("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
     return v;
 }
 
@@ -257,6 +257,16 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
 #pragma unroll
         for (int u = 0; u < kT; ++u) {
             const uint4* slot = buf + (i % kSlots * kT + u) * kSlotVecs;
+            uint2 scales_a = make_uint2(0u, 0u);
+            uint2 scales_b = make_uint2(0u, 0u);
+            if constexpr (kMxfp8) {
+                constexpr int kRowScales = K / 32;
+                const auto* scales = static_cast<const uint8_t*>(seg.scale);
+                const int ra = min(r0 + u * kTileRows + g, seg.n - 1);
+                const int rb = min(r0 + u * kTileRows + g + 8, seg.n - 1);
+                scales_a = load_scale_u64(scales + size_t(ra) * kRowScales + stage * 8);
+                scales_b = load_scale_u64(scales + size_t(rb) * kRowScales + stage * 8);
+            }
 #pragma unroll
             for (int j = 0; j < kChunks / 4; ++j) {
                 const int c = 4 * j + t;
@@ -269,13 +279,12 @@ __device__ __forceinline__ void rows_product(const Batch& b, uint4* ring) {
                     uint32_t scale_a = 0x77807780u;
                     uint32_t scale_b = 0x77807780u;
                     if constexpr (kMxfp8) {
-                        constexpr int kRowScales = K / 32;
-                        const auto* scales = static_cast<const uint8_t*>(seg.scale);
-                        const int ra = min(r0 + u * kTileRows + g, seg.n - 1);
-                        const int rb = min(r0 + u * kTileRows + g + 8, seg.n - 1);
-                        const int sc_off = stage * 8 + (c >> 1);
-                        scale_a = e8m0_scale_pair(load_scale_u8(scales + size_t(ra) * kRowScales + sc_off));
-                        scale_b = e8m0_scale_pair(load_scale_u8(scales + size_t(rb) * kRowScales + sc_off));
+                        const int sc_idx = c >> 1;
+                        const uint32_t wa = sc_idx < 4 ? scales_a.x : scales_a.y;
+                        const uint32_t wb = sc_idx < 4 ? scales_b.x : scales_b.y;
+                        const int shift = (sc_idx & 3) * 8;
+                        scale_a = e8m0_scale_pair((wa >> shift) & 0xffu);
+                        scale_b = e8m0_scale_pair((wb >> shift) & 0xffu);
                     }
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {

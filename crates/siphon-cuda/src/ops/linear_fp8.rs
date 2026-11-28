@@ -20,7 +20,7 @@ use half::bf16;
 
 use crate::{
     DeviceIn, DeviceOut,
-    gpu::{KernelArgs, cubin, load_module},
+    gpu::{ArenaBuf, ArenaSlice, KernelArgs, cubin, load_module},
     ops::linear::{Prefetch, Start, launch_by_value},
 };
 
@@ -254,17 +254,25 @@ const GEMM_K: usize = 128;
 /// one UE8M0 scale per 32.
 #[derive(Debug)]
 pub struct Fp8Rows {
-    values: CudaSlice<u8>,
-    scales: CudaSlice<u8>,
+    values: ArenaBuf<u8>,
+    scales: ArenaBuf<u8>,
 }
 
 impl Fp8Rows {
     /// Room for `max_values` input values in all, over the distinct inputs of a call.
     pub fn new(stream: &Arc<CudaStream>, max_values: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            values: stream.alloc_zeros(max_values.max(1))?,
-            scales: stream.alloc_zeros((max_values / 32).max(1))?,
+            values: ArenaBuf::Owned(stream.alloc_zeros(max_values.max(1))?),
+            scales: ArenaBuf::Owned(stream.alloc_zeros((max_values / 32).max(1))?),
         })
+    }
+
+    /// Creates arena-backed FP8 scratch from pre-carved value and scale slices.
+    pub(crate) fn from_arena(values: ArenaSlice<u8>, scales: ArenaSlice<u8>) -> Self {
+        Self {
+            values: ArenaBuf::Arena(values),
+            scales: ArenaBuf::Arena(scales),
+        }
     }
 
     /// Device bytes the scratch takes for `max_values`.
@@ -659,7 +667,13 @@ impl LinearFp8 {
                 GEMM_THIN_SHARED,
             )
         } else if m > GEMM_SMALL_TILE && tiles_128 >= self.sms {
-            (&family.large, GEMM_TILE, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
+            (
+                &family.large,
+                GEMM_TILE,
+                GEMM_TILE,
+                GEMM_THREADS,
+                GEMM_SHARED,
+            )
         } else {
             (
                 &family.small,
@@ -740,7 +754,10 @@ impl LinearFp8 {
     /// the first `vocab` rows of `weight`, writes one `(max_val, max_idx)` partial per
     /// `(row, n_tile)` into `partial_vals` / `partial_idxs`, and returns `tiles_n`
     /// (`vocab.div_ceil(GEMM_TILE)`). Triggers PDL for the follow-on `argmax_partials`.
-    #[expect(clippy::too_many_arguments, reason = "weight, input, vocab, scratch and partials")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "weight, input, vocab, scratch and partials"
+    )]
     pub fn gemm_argmax(
         &self,
         stream: &CudaStream,
@@ -901,7 +918,13 @@ impl LinearFp8 {
                 GEMM_THIN_SHARED,
             )
         } else if m > GEMM_SMALL_TILE && tiles_128 >= self.sms {
-            (&family.large, GEMM_TILE, GEMM_TILE, GEMM_THREADS, GEMM_SHARED)
+            (
+                &family.large,
+                GEMM_TILE,
+                GEMM_TILE,
+                GEMM_THREADS,
+                GEMM_SHARED,
+            )
         } else {
             (
                 &family.small,

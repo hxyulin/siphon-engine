@@ -586,16 +586,40 @@ impl Draft {
             .get(slot - 1)
             .with_context(|| format!("no DFlash 2 rings for slot {slot}"))?;
         ensure!(
-            rings.caches.len() == caches.len(),
+            rings.layers == caches.len(),
             "the copies have {} layers, the draft {}",
-            rings.caches.len(),
+            rings.layers,
             caches.len()
         );
-        for (cache, copy) in caches.iter().zip(&mut rings.caches) {
-            if let Some(copy) = copy {
-                stream.memcpy_dtod(&*cache.k, &mut *copy.k)?;
-                stream.memcpy_dtod(&*cache.v, &mut *copy.v)?;
+        let dev_spans: Vec<_> = caches
+            .iter()
+            .flat_map(|c| {
+                [
+                    crate::model::DeviceSpan::of(&*c.k, stream),
+                    crate::model::DeviceSpan::of(&*c.v, stream),
+                ]
+            })
+            .collect();
+        ensure!(
+            dev_spans.len() == rings.spans.len(),
+            "the copies have {} spans, the draft {}",
+            rings.spans.len(),
+            dev_spans.len()
+        );
+        for (src, &(off, len)) in dev_spans.iter().zip(&rings.spans) {
+            ensure!(src.bytes == len, "the draft ring buffer sizes differ");
+            // SAFETY: `rings._buf` is a live pinned host allocation sized for `off + len`
+            // and `src.ptr` is a valid device slice; `stream` orders all accesses.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                    (rings.base + off) as *mut std::ffi::c_void,
+                    src.ptr,
+                    len,
+                    stream.cu_stream(),
+                )
             }
+            .result()
+            .context("saving slot draft rings to pinned host memory")?;
         }
         rings.committed = b.extra_committed[slot - 1];
         Ok(())
@@ -621,16 +645,40 @@ impl Draft {
             .get_mut(slot - 1)
             .with_context(|| format!("no DFlash 2 rings for slot {slot}"))?;
         ensure!(
-            rings.caches.len() == caches.len(),
+            rings.layers == caches.len(),
             "the copies have {} layers, the draft {}",
-            rings.caches.len(),
+            rings.layers,
             caches.len()
         );
-        for (cache, copy) in caches.iter_mut().zip(&rings.caches) {
-            if let Some(copy) = copy {
-                stream.memcpy_dtod(&*copy.k, &mut *cache.k)?;
-                stream.memcpy_dtod(&*copy.v, &mut *cache.v)?;
+        let dev_spans: Vec<_> = caches
+            .iter()
+            .flat_map(|c| {
+                [
+                    crate::model::DeviceSpan::of(&*c.k, stream),
+                    crate::model::DeviceSpan::of(&*c.v, stream),
+                ]
+            })
+            .collect();
+        ensure!(
+            dev_spans.len() == rings.spans.len(),
+            "the copies have {} spans, the draft {}",
+            rings.spans.len(),
+            dev_spans.len()
+        );
+        for (dst, &(off, len)) in dev_spans.iter().zip(&rings.spans) {
+            ensure!(dst.bytes == len, "the draft ring buffer sizes differ");
+            // SAFETY: `rings._buf` is a live pinned host allocation sized for `off + len`
+            // and `dst.ptr` is a valid device slice; `stream` orders all accesses.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst.ptr,
+                    (rings.base + off) as *const std::ffi::c_void,
+                    len,
+                    stream.cu_stream(),
+                )
             }
+            .result()
+            .context("restoring slot draft rings from pinned host memory")?;
         }
         b.extra_committed[slot - 1] = rings.committed;
         Ok(())

@@ -2708,24 +2708,27 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
             const uint4* xm =
                 reinterpret_cast<const uint4*>(a.g[gate].x_message + size_t(row0 + gq) * a.x_message_stride);
             const bool live = gq < rows;
-            uint4 xv[kMS][kXVecs];
+            // Load one stage of inputs at a time (`uint4 xv[kXVecs]`) instead of buffering all
+            // `kMS` stages simultaneously, eliminating 272 B of local-memory register spills on
+            // sm_89 while still overlapping stage 0's loads with `wait_copies<1>()`.
+            auto load_stage_x = [&](int i, uint4 xv[kXVecs]) {
+                const int stage = split + i * kSplits;
+                const bool message = stage >= kS / 2;
+                const uint4* x = message ? xm : xs;
+                const int k0 = (message ? stage - kS / 2 : stage) * kKPerStage;
 #pragma unroll
-            for (int i = 0; i < kMS; ++i) {
-                if (i < stages) {
-                    const int stage = split + i * kSplits;
-                    const bool message = stage >= kS / 2;
-                    const uint4* x = message ? xm : xs;
-                    const int k0 = (message ? stage - kS / 2 : stage) * kKPerStage;
+                for (int j = 0; j < kChunks / 4; ++j) {
+                    const int c = 4 * j + tq;
 #pragma unroll
-                    for (int j = 0; j < kChunks / 4; ++j) {
-                        const int c = 4 * j + tq;
-#pragma unroll
-                        for (int hh = 0; hh < kXVecs / (kChunks / 4); ++hh) {
-                            const int xi = (k0 + c * (kFp8 ? 16 : 8)) / 8 + hh;
-                            xv[i][j * (kXVecs / (kChunks / 4)) + hh] = live ? x[xi] : make_uint4(0, 0, 0, 0);
-                        }
+                    for (int hh = 0; hh < kXVecs / (kChunks / 4); ++hh) {
+                        const int xi = (k0 + c * (kFp8 ? 16 : 8)) / 8 + hh;
+                        xv[j * (kXVecs / (kChunks / 4)) + hh] = live ? x[xi] : make_uint4(0, 0, 0, 0);
                     }
                 }
+            };
+            uint4 xv[kXVecs];
+            if (0 < stages) {
+                load_stage_x(0, xv);
             }
             if (iter == 0) {
                 wait_copies<1>();
@@ -2735,6 +2738,9 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
 #pragma unroll
             for (int i = 0; i < kMS; ++i) {
                 if (i < stages) {
+                    if (i > 0) {
+                        load_stage_x(i, xv);
+                    }
                     const uint4* slot = buf + i * kSlotVecs;
 #pragma unroll
                     for (int j = 0; j < kChunks / 4; ++j) {
@@ -2742,8 +2748,8 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
                         const uint4 w0 = slot[slot_index(gq, c)];
                         const uint4 w8 = slot[slot_index(gq + 8, c)];
                         if constexpr (kFp8) {
-                            const uint4 x0 = xv[i][2 * j];
-                            const uint4 x1 = xv[i][2 * j + 1];
+                            const uint4 x0 = xv[2 * j];
+                            const uint4 x1 = xv[2 * j + 1];
                             const uint32_t aw[4] = {w0.x, w0.y, w0.z, w0.w};
                             const uint32_t bw[4] = {w8.x, w8.y, w8.z, w8.w};
                             const uint32_t xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
@@ -2755,7 +2761,7 @@ __device__ __forceinline__ void run(const GateRowsArgs& a, uint4* ring) {
                                 gate_mma(acc, af, xw[2 * q], xw[2 * q + 1]);
                             }
                         } else {
-                            const uint4 xx = xv[i][j];
+                            const uint4 xx = xv[j];
                             const uint32_t a0[4] = {w0.x, w8.x, w0.y, w8.y};
                             const uint32_t a1[4] = {w0.z, w8.z, w0.w, w8.w};
                             gate_mma(acc, a0, xx.x, xx.y);

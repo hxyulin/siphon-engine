@@ -80,7 +80,13 @@ impl Gpu {
 
     /// Returns unused cached blocks in the device's default memory pool to the CUDA driver
     /// so subsequent VMM (`PagePool`) or other allocations see every freed byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context cannot be bound or the driver rejects the trim.
     pub fn trim_mem_pool(&self) -> anyhow::Result<()> {
+        use sys::CUmemPool_attribute as A;
+
         self.ctx.bind_to_thread()?;
         // SAFETY: the device comes from a live context.
         let pool = unsafe { cudarc::driver::result::device::get_mem_pool(self.ctx.cu_device()) }?;
@@ -89,12 +95,31 @@ impl Gpu {
         unsafe { sys::cuMemPoolTrimTo(pool, 0) }
             .result()
             .context("trimming the CUDA memory pool")?;
+        // Reset pool high-water marks after trimming (e.g. after streaming weight quantization
+        // finishes before `PagePool::new`) so transient pre-pool peaks are not double-counted
+        // alongside the later KV pool allocation.
+        for attr in [
+            A::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+            A::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+        ] {
+            let mut zero = 0u64;
+            // SAFETY: setting either *_HIGH attribute to 0 resets it to the current level.
+            unsafe {
+                sys::cuMemPoolSetAttribute(pool, attr, ptr::from_mut(&mut zero).cast::<c_void>())
+            }
+            .result()
+            .context("resetting CUDA memory pool high-water mark")?;
+        }
         Ok(())
     }
 
     /// The device's free memory and what this process's buffers take from the memory pool
     /// that every allocation comes from (cudarc allocates with `cuMemAllocAsync`). The pool
     /// leaves out the CUDA context, the module images and the CUDA graphs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver cannot read memory or pool attributes.
     pub fn memory(&self) -> anyhow::Result<MemoryUse> {
         use sys::CUmemPool_attribute as A;
 

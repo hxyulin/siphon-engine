@@ -40,7 +40,7 @@ use cudarc::driver::{
 use half::bf16;
 
 use crate::{
-    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    gpu::{ArenaBuf, ArenaSlice, DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
     ops::{
         Products,
         norm::KvConvWeights,
@@ -97,7 +97,7 @@ pub const PREFILL_PACKED_MAX_BLOCKS: usize = 192;
 /// `static_assert`s in `attention.cu`.
 const PREFILL_PACKED_SHARED_BYTES: u32 = 85_248;
 /// F32 values of one prefill partial slot: 128 rows of 128 outputs, a max and a sum.
-const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
+pub(crate) const PREFILL_SLOT: usize = PREFILL_BLOCK_ROWS * (HEAD_DIM + 2);
 const _: () = assert!(PREFILL_SLOT == siphon::memory::PREFILL_SLOT);
 /// Most rows [`Attention::attention_rows`] takes, `kRowsMax` in the kernel.
 pub const ROWS_MAX: usize = 8;
@@ -974,12 +974,12 @@ pub fn prefill_blocks(rows: usize) -> usize {
 /// layers.
 ///
 /// The kernel runs one block per SM. Each block stores at most two partial segments, so the
-/// partial buffer holds two slots of [`PREFILL_SLOT`] values per SM, 22 MB on an RTX 5090,
+/// partial buffer holds two output slots per SM, 22 MB on an RTX 5090,
 /// whatever the chunk size. The kernel returns every count to zero, so calls must not
 /// overlap.
 #[derive(Debug)]
 pub struct PrefillScratch {
-    partials: CudaSlice<f32>,
+    partials: ArenaBuf<f32>,
     counters: CudaSlice<u32>,
     /// Blocks per launch, the device's SM count.
     blocks: usize,
@@ -996,13 +996,43 @@ impl PrefillScratch {
             (1..=MAX_PREFILL_ROWS).contains(&max_rows),
             "prefill takes 1 to {MAX_PREFILL_ROWS} rows, not {max_rows}"
         );
-        let blocks = usize::try_from(
-            stream
-                .context()
-                .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-        )?;
+        let blocks = Self::sm_count(stream)?;
         Ok(Self {
-            partials: stream.alloc_zeros(2 * blocks * PREFILL_SLOT)?,
+            partials: ArenaBuf::Owned(stream.alloc_zeros(2 * blocks * PREFILL_SLOT)?),
+            counters: stream.alloc_zeros(prefill_blocks(max_rows) * KV_HEADS)?,
+            blocks,
+            max_rows,
+            decode: AttentionScratch::new(stream)?,
+        })
+    }
+
+    /// Number of SMs (launch blocks) on `stream`'s device.
+    pub(crate) fn sm_count(stream: &Arc<CudaStream>) -> anyhow::Result<usize> {
+        Ok(usize::try_from(stream.context().attribute(
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )?)?)
+    }
+
+    /// Creates arena-backed prefill attention scratch from a pre-carved partials slice
+    /// (`2 * blocks * PREFILL_SLOT` F32 elements).
+    pub(crate) fn from_arena(
+        stream: &Arc<CudaStream>,
+        max_rows: usize,
+        blocks: usize,
+        partials: ArenaSlice<f32>,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            (1..=MAX_PREFILL_ROWS).contains(&max_rows),
+            "prefill takes 1 to {MAX_PREFILL_ROWS} rows, not {max_rows}"
+        );
+        ensure!(
+            partials.len() == 2 * blocks * PREFILL_SLOT,
+            "prefill attention partials len {} != {}",
+            partials.len(),
+            2 * blocks * PREFILL_SLOT
+        );
+        Ok(Self {
+            partials: ArenaBuf::Arena(partials),
             counters: stream.alloc_zeros(prefill_blocks(max_rows) * KV_HEADS)?,
             blocks,
             max_rows,
@@ -2471,7 +2501,7 @@ impl Attention {
         launch
             .arg(&bias)
             .arg(&sinks)
-            .arg(&mut scratch.partials)
+            .arg(&mut *scratch.partials)
             .arg(&mut scratch.counters)
             .arg(&mut out)
             .arg(&start)
@@ -2611,7 +2641,7 @@ impl Attention {
         launch
             .arg(&rel)
             .arg(&sinks)
-            .arg(&mut scratch.partials)
+            .arg(&mut *scratch.partials)
             .arg(&mut scratch.counters)
             .arg(&mut out)
             .arg(&start)
@@ -2789,7 +2819,7 @@ impl Attention {
             .arg(block_descs)
             .arg(&bias)
             .arg(&sinks)
-            .arg(&mut scratch.partials)
+            .arg(&mut *scratch.partials)
             .arg(counters)
             .arg(&mut out)
             .arg(&total_blocks_u32)

@@ -20,7 +20,7 @@ Siphon serves [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2
 | --- | ---: | ---: | ---: | ---: |
 | RTX 5090 | 885 / 715 tok/s | 34,316 tok/s | 2,145 tok/s | 1,048,576 |
 | RTX PRO 6000 Blackwell | 883 / 706 tok/s | 36,053 tok/s | 2,176 tok/s | 1,048,576 |
-| RTX 4090 | 571 / 361 tok/s | 14,800 tok/s | 1,360 tok/s | 931,840 |
+| RTX 4090 | 601 / 446 tok/s | 15,608 tok/s | 1,480 tok/s | 1,048,576 |
 
 Sampled decode uses temperature 0.8 and lossless speculation. Batched decode reports aggregate throughput. Configurations and longer-context results are in the [CUDA benchmarks](docs/performance.md#supported-gpus).
 

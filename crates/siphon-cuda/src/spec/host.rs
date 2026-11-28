@@ -148,6 +148,47 @@ impl ChunkPool {
         }
         Ok(())
     }
+    /// Copies `spans` (pinned host `(ptr, bytes)`) one after another between host memory
+    /// and the bytes of `chunks` read as one run, from byte `offset` of the run on, on
+    /// `stream` via `cuMemcpyAsync` so stream ordering with prior D2H/H2D copies holds.
+    fn copy_run_host(
+        &self,
+        stream: &CudaStream,
+        chunks: &[u32],
+        offset: usize,
+        spans: &[(usize, usize)],
+        to_pool: bool,
+    ) -> anyhow::Result<()> {
+        let total: usize = spans.iter().map(|&(_, b)| b).sum();
+        ensure!(
+            offset + total <= chunks.len() * self.chunk_bytes,
+            "{} bytes do not fit {} chunks from byte {offset}",
+            total,
+            chunks.len()
+        );
+        let mut at = offset;
+        for &(ptr, bytes) in spans {
+            let mut done = 0;
+            while done < bytes {
+                let (c, within) = (at / self.chunk_bytes, at % self.chunk_bytes);
+                let n = (bytes - done).min(self.chunk_bytes - within);
+                let pool_addr = self.address(chunks[c]) + within;
+                let (dst, src) = if to_pool {
+                    (pool_addr, ptr + done)
+                } else {
+                    (ptr + done, pool_addr)
+                };
+                // SAFETY: both `dst` and `src` lie inside live page-locked CUDA host
+                // allocations (UVA), and `stream` orders them with prior/later transfers.
+                unsafe { sys::cuMemcpyAsync(dst as u64, src as u64, n, stream.cu_stream()) }
+                    .result()
+                    .context("copying between pinned host buffers")?;
+                done += n;
+                at += n;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -441,7 +482,9 @@ impl HostCache {
         let entry_hashes = chunk_hashes(tokens, p);
         let full_hash = entry_hashes.last().copied();
         let existing = self.entries.iter().position(|e| {
-            e.tokens.len() == tokens.len() && e.hashes.last().copied() == full_hash && e.tokens == tokens
+            e.tokens.len() == tokens.len()
+                && e.hashes.last().copied() == full_hash
+                && e.tokens == tokens
         });
         let (kv, local_chunks, shared) = if let Some(h) = existing {
             // The same prompt again: only the draft's state may be new.
@@ -474,13 +517,8 @@ impl HostCache {
             self.drafted[c as usize] = false;
         }
         if existing.is_none() {
-            self.pool.copy_run(
-                &self.copy,
-                &local_chunks,
-                0,
-                &local.spans(&self.main),
-                Direction::ToHost,
-            )?;
+            self.pool
+                .copy_run_host(&self.copy, &local_chunks, 0, &local.host_spans(), true)?;
             bytes += self.local_bytes;
         }
         if let Some(rings) = rings {
@@ -534,12 +572,12 @@ impl HostCache {
             }
             self.drafted[c as usize] = true;
         }
-        self.pool.copy_run(
+        self.pool.copy_run_host(
             &self.copy,
             local,
             self.local_bytes,
-            &rings.spans(&self.main),
-            Direction::ToHost,
+            &rings.host_spans(),
+            true,
         )?;
         Ok(bytes + self.rings_bytes)
     }
@@ -689,14 +727,9 @@ impl HostCache {
         let e = &self.entries[h];
         ensure!(e.rings, "host entry {h} lacks the draft's rings");
         self.fence()?;
-        let spans = rings.spans(&self.main);
-        self.pool.copy_run(
-            &self.main,
-            &e.local,
-            self.local_bytes,
-            &spans,
-            Direction::ToDevice,
-        )?;
+        let spans = rings.host_spans();
+        self.pool
+            .copy_run_host(&self.main, &e.local, self.local_bytes, &spans, false)?;
         rings.set_committed(e.tokens.len());
         Ok(())
     }

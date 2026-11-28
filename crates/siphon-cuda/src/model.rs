@@ -1,18 +1,8 @@
-//! Single-stream decode, one token per step, following MLX-LM's `inkling2` model.
+//! Prompt prefill, decode, and speculative verification on a single CUDA stream.
 //!
-//! The structure follows `TextModel._run_loop` and `DecoderLayer.__call__` in MLX-LM so
-//! the two can be read side by side.
-//!
-//! Every intermediate lives in a [`Scratch`] buffer allocated in [`Model::new`]; visits
-//! run one after another, so one set serves all of them. The kernels read the token and
-//! its position from device memory, so a step launches the same work at every position
-//! and never waits on the host. An untraced step replays that work as one CUDA graph,
-//! captured on the first untraced step.
-//!
-//! [`Model::prefill`] runs a prompt in chunks of many rows instead; see [`prefill`].
-//! [`Model::verify`] runs the anchor and drafts of a speculative round through the same
-//! multi-row path; see [`verify`]. [`Model::step_batch`] runs the next token of several
-//! sequences through it, each in its own slot; see [`batch`].
+//! [`Model::prefill`] processes a prompt in chunks. [`Model::step`] advances one token,
+//! and captures a CUDA graph on the first untraced call. [`Model::verify`] processes a
+//! speculative round, and [`Model::step_batch`] advances multiple sequences in one pass.
 
 mod batch;
 mod prefill;
@@ -234,26 +224,40 @@ fn fp4_to_f32_grouped<const ROW: usize, const GROUP: usize>(bytes: &[u8]) -> Vec
     out
 }
 
-/// A device copy of everything a sequence keeps across tokens, from [`Model::save_state`]:
+/// Host-resident snapshot of one visit's KV cache from [`Model::save_state`].
+#[derive(Debug)]
+enum SavedKvData {
+    Bf16 { keys: Vec<bf16>, values: Vec<bf16> },
+    Fp8 { keys: Vec<u8>, values: Vec<u8> },
+    Nvfp4 { keys: Vec<u8>, values: Vec<u8> },
+    Nvfp4G32 { keys: Vec<u8>, values: Vec<u8> },
+}
+
+/// A host copy of everything a sequence keeps across tokens, from [`Model::save_state`]:
 /// the filled slots of every global KV cache, every sliding ring, every conv state and the
-/// position.
+/// position. Kept in host RAM so startup width-pricing never takes GPU VRAM or fragments
+/// the CUDA memory pool.
 #[derive(Debug)]
 pub struct SavedState {
-    visits: Vec<(KvData, Vec<CudaSlice<f32>>)>,
+    visits: Vec<(SavedKvData, Vec<Vec<f32>>)>,
     position: usize,
 }
 
 /// Inputs and outputs of each visit, read back for parity checks.
 #[derive(Debug, Default)]
 pub struct Trace {
+    /// The visits in execution order, including each pass through the repeated core.
     pub visits: Vec<VisitTrace>,
     /// F32 logits after the softcap, `[unpadded_vocab]`.
     pub logits: Vec<f32>,
 }
 
+/// Device intermediates copied to the host for one decoder-layer visit.
 #[derive(Debug)]
 pub struct VisitTrace {
+    /// The BF16 hidden vector at the start of the visit.
     pub input: Vec<bf16>,
+    /// The BF16 hidden vector after the visit.
     pub output: Vec<bf16>,
     /// The block states after the visit, F32 `[blocks, hidden]`.
     pub blocks: Vec<f32>,
@@ -1053,14 +1057,20 @@ impl Model {
                 }
             }
         }
-        self.ctx.expert_activations = activations;
+        if self.ctx.expert_activations != activations {
+            self.ctx.expert_activations = activations;
+            self.prefill = None;
+        }
         Ok(())
     }
 
     /// Makes [`Model::prefill`] run attention over an FP8 or NVFP4 cache as `attention` says
     /// ([`DEFAULT_PREFILL_ATTENTION`] until set). Decode and BF16 caches are unaffected.
-    /// [`PrefillAttention::Fp8`] and [`PrefillAttention::Fp4`] need
-    /// [`crate::BLOCK_SCALED_MMA`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`PrefillAttention::Fp4`] requires block-scaled instructions
+    /// that this build lacks.
     pub fn set_prefill_attention(&mut self, attention: PrefillAttention) -> anyhow::Result<()> {
         ensure!(
             crate::BLOCK_SCALED_MMA || attention != PrefillAttention::Fp4,
@@ -1344,37 +1354,37 @@ impl Model {
                 let kv = match v.kv.data() {
                     KvData::Bf16 { keys, values } => {
                         let len = keys.len() / v.kv.slots() * slots;
-                        KvData::Bf16 {
-                            keys: stream.clone_dtod(&keys.slice(..len))?,
-                            values: stream.clone_dtod(&values.slice(..len))?,
+                        SavedKvData::Bf16 {
+                            keys: stream.clone_dtoh(&keys.slice(..len))?,
+                            values: stream.clone_dtoh(&values.slice(..len))?,
                         }
                     }
                     KvData::Fp8 { keys, values } => {
                         let len = keys.len() / v.kv.slots() * slots;
-                        KvData::Fp8 {
-                            keys: stream.clone_dtod(&keys.slice(..len))?,
-                            values: stream.clone_dtod(&values.slice(..len))?,
+                        SavedKvData::Fp8 {
+                            keys: stream.clone_dtoh(&keys.slice(..len))?,
+                            values: stream.clone_dtoh(&values.slice(..len))?,
                         }
                     }
                     KvData::Nvfp4 { keys, values } => {
                         let len = keys.len() / v.kv.slots() * slots;
-                        KvData::Nvfp4 {
-                            keys: stream.clone_dtod(&keys.slice(..len))?,
-                            values: stream.clone_dtod(&values.slice(..len))?,
+                        SavedKvData::Nvfp4 {
+                            keys: stream.clone_dtoh(&keys.slice(..len))?,
+                            values: stream.clone_dtoh(&values.slice(..len))?,
                         }
                     }
                     KvData::Nvfp4G32 { keys, values } => {
                         let len = keys.len() / v.kv.slots() * slots;
-                        KvData::Nvfp4G32 {
-                            keys: stream.clone_dtod(&keys.slice(..len))?,
-                            values: stream.clone_dtod(&values.slice(..len))?,
+                        SavedKvData::Nvfp4G32 {
+                            keys: stream.clone_dtoh(&keys.slice(..len))?,
+                            values: stream.clone_dtoh(&values.slice(..len))?,
                         }
                     }
                 };
                 let conv = v
                     .conv
                     .iter()
-                    .map(|c| stream.clone_dtod(c))
+                    .map(|c| stream.clone_dtoh(c))
                     .collect::<Result<_, _>>()?;
                 Ok((kv, conv))
             })
@@ -1406,22 +1416,25 @@ impl Model {
             let ring = v.kv.window().is_some();
             let fits = |saved: usize, cache: usize| saved == cache || (!ring && saved < cache);
             match (v.kv.data_mut(), kv) {
-                (KvData::Bf16 { keys, values }, KvData::Bf16 { keys: k, values: x }) => {
+                (KvData::Bf16 { keys, values }, SavedKvData::Bf16 { keys: k, values: x }) => {
                     ensure!(fits(k.len(), keys.len()), "the cache sizes differ");
-                    stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
-                    stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
+                    stream.memcpy_htod(k, &mut keys.slice_mut(..k.len()))?;
+                    stream.memcpy_htod(x, &mut values.slice_mut(..x.len()))?;
                 }
-                (KvData::Fp8 { keys, values }, KvData::Fp8 { keys: k, values: x })
-                | (KvData::Nvfp4 { keys, values }, KvData::Nvfp4 { keys: k, values: x })
-                | (KvData::Nvfp4G32 { keys, values }, KvData::Nvfp4G32 { keys: k, values: x }) => {
+                (KvData::Fp8 { keys, values }, SavedKvData::Fp8 { keys: k, values: x })
+                | (KvData::Nvfp4 { keys, values }, SavedKvData::Nvfp4 { keys: k, values: x })
+                | (
+                    KvData::Nvfp4G32 { keys, values },
+                    SavedKvData::Nvfp4G32 { keys: k, values: x },
+                ) => {
                     ensure!(fits(k.len(), keys.len()), "the cache sizes differ");
-                    stream.memcpy_dtod(k, &mut keys.slice_mut(..k.len()))?;
-                    stream.memcpy_dtod(x, &mut values.slice_mut(..x.len()))?;
+                    stream.memcpy_htod(k, &mut keys.slice_mut(..k.len()))?;
+                    stream.memcpy_htod(x, &mut values.slice_mut(..x.len()))?;
                 }
                 _ => anyhow::bail!("the cache formats differ"),
             }
             for (dst, src) in v.conv.iter_mut().zip(conv) {
-                stream.memcpy_dtod(src, dst)?;
+                stream.memcpy_htod(src, dst)?;
             }
         }
         self.position = state.position;
@@ -2041,11 +2054,12 @@ const LM_HEAD_PREFETCH_BYTES: usize = 32 << 20;
 /// 1.5 took 2.780, 3.315 and 4.298; 1.6 took 2.780, 3.327 and 4.315; 1.7 took 2.810, 3.370
 /// and 4.356.
 ///
-/// The RTX 4090 reads DRAM at 1.0 TB/s. Measured there while its expert kernels still
-/// decoded E2M1 through CUDA's software fallback, ms per step at contexts 0 and 32K: 1.5
-/// took 9.09 and 10.47; 1.1 took 9.12 and 10.51; 0.9 took 8.79 and 10.41; 0.7 took 8.78
-/// and 10.32; no prefetch took 9.21 and 10.41.
-const PREFETCH_TB_PER_S: f32 = if cfg!(sm89) { 0.8 } else { 1.5 };
+/// The RTX 4090 reads DRAM at 1.0 TB/s (10251 MHz / 984 GB/s under compute Force-P2).
+/// Measured with native sm_89 FP8/MXFP8/NVFP4 kernels, ms per step at contexts 0 and 32K:
+/// 0.6 took 4.485 and 5.048; 0.7 took 4.334 and 4.915 (and beat 0.8 across all verify
+/// widths 1..=8 by 0.06 to 0.11 ms); 0.8 took 4.354 and 4.869; 0.9 took 4.487 and 4.946;
+/// loads took 4.528 and 4.962; no prefetch took 5.051 and 5.467.
+const PREFETCH_TB_PER_S: f32 = if cfg!(sm89) { 0.7 } else { 1.5 };
 
 /// The first bytes of a buffer to prefetch, at most its whole length.
 struct PrefetchStart<'a>(&'a dyn Prefetch, usize);

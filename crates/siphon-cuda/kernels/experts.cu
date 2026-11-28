@@ -279,6 +279,18 @@ __device__ __forceinline__ uint32_t load_relaxed(const uint32_t* p) {
     return v;
 }
 
+#if SIPHON_SM89
+__device__ __forceinline__ uint32_t load_acquire(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void red_inc_release(uint32_t* p) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p) : "memory");
+}
+#endif
+
 __device__ __forceinline__ uint32_t atom_inc_acq_rel(uint32_t* p) {
     uint32_t old;
     asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(p) : "memory");
@@ -447,8 +459,12 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
             }
             __syncthreads();
             if (threadIdx.x == 0) {
+#if SIPHON_SM89
+                red_inc_release(&sync[1 + pair]);
+#else
                 __threadfence();
                 atomicAdd(&sync[1 + pair], 1u);
+#endif
             }
         } else {
             const unsigned pair = (task - tasks13) / tiles2;
@@ -460,9 +476,15 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
                 while (load_relaxed(&sync[1 + pair]) < kTiles13) {
                     __nanosleep(32);
                 }
+#if SIPHON_SM89
+                // One acquire load after the relaxed spin orders the block's activation loads
+                // after the producers' release reductions without draining L1 during polling.
+                (void)load_acquire(&sync[1 + pair]);
+#else
                 // With the barrier below, orders the block's activation loads after the
                 // count, and so after the stores the count covers.
                 __threadfence();
+#endif
             }
             __syncthreads();
             // Loading weights before the wait was slower: 27.0 us instead of 24.6 per NVFP4
@@ -490,13 +512,21 @@ __device__ __forceinline__ void expert_mlp(const __nv_bfloat16* x, const int32_t
                 __syncthreads();
                 if (threadIdx.x == 0) {
                     if (!finisher) {
+#if SIPHON_SM89
+                        red_inc_release(count);
+#else
                         __threadfence();
                         atomicAdd(count, 1u);
+#endif
                     } else {
                         while (load_relaxed(count) < unsigned(pairs) - 1) {
                             __nanosleep(32);
                         }
+#if SIPHON_SM89
+                        (void)load_acquire(count);
+#else
                         __threadfence();
+#endif
                         *count = 0;
                     }
                 }
@@ -879,13 +909,21 @@ __device__ __forceinline__ void expert_mlp_mxfp6_impl(
                 __syncthreads();
                 if (threadIdx.x == 0) {
                     if (!finisher) {
+#if SIPHON_SM89
+                        red_inc_release(count);
+#else
                         __threadfence();
                         atomicAdd(count, 1u);
+#endif
                     } else {
                         while (load_relaxed(count) < unsigned(pairs) - 1) {
                             __nanosleep(32);
                         }
+#if SIPHON_SM89
+                        (void)load_acquire(count);
+#else
                         __threadfence();
+#endif
                         *count = 0;
                     }
                 }

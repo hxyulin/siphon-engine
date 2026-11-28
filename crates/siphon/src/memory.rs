@@ -608,9 +608,13 @@ impl Planner {
         let prefill = if inputs.prefill_chunk == 0 {
             0
         } else {
-            rows_scratch(c, inputs.prefill_chunk, inputs.sms)
-                + inputs.prefill_chunk * taps * hidden * 2
-                + dense_scratch(c, inputs.prefill_chunk)
+            rows_scratch(
+                c,
+                inputs.prefill_chunk,
+                inputs.sms,
+                inputs.prefill_dense_fp8,
+                inputs.block_scaled_mma,
+            ) + inputs.prefill_chunk * taps * hidden * 2
         };
         let lm_head = inputs.lm_head.unwrap_or(match inputs.weights {
             WeightFormat::Bf16 => LmHeadFormat::Bf16,
@@ -664,10 +668,10 @@ impl Planner {
                 }
                 None => Vec::new(),
             },
-            // Every active stream's sliding-ring slab plus one prefix cache entry's slab.
-            // Each slab packs all `sliding_visits` rings contiguously into whole VMM pages
-            // (`RingSlabLayout`), so 40 NVFP4 rings take 23 pages (46 MiB) instead of 40.
-            rings: (streams + 1)
+            // Every active stream's sliding-ring slab. Prefix-cache entries store their
+            // local sliding rings and conv states in page-locked host RAM (`LocalState`),
+            // taking 0 pages from the GPU KV pool.
+            rings: streams
                 * RingSlabLayout::new(
                     sliding_visits,
                     c.sliding_window_size * ring_row_bytes,
@@ -707,12 +711,10 @@ impl Planner {
         } else {
             0
         };
-        let prefix = match &draft {
-            Some((d, approx)) => {
-                inputs.prefix_entries * (fixed_rings + draft_ring_bytes(c, d, approx.fp8_kv))
-            }
-            _ => 0,
-        };
+        // Prefix cache entries store local sliding rings, conv states, and draft rings in
+        // page-locked host memory (`LocalState` / `DraftRings`), taking 0 device bytes.
+        let _ = inputs.prefix_entries;
+        let prefix = 0;
         // Prefill holds the rows of the images that overlap its chunk: the chunk's rows, and
         // at most one image on each side that runs past it. `vision_bytes` counts one
         // image's rows, its output.
@@ -1073,9 +1075,33 @@ fn max_blocks(c: &TextConfig) -> usize {
         + starts(l.core_end..c.num_hidden_layers)
 }
 
+/// Extra device block rows needed for the message bank when the coda has fewer block
+/// starts than the bank holds (`0` for Inkling 2 Mini, where the bank aliases `blocks[3]`).
+fn extra_bank_blocks(c: &TextConfig) -> usize {
+    let starts = |r: std::ops::Range<usize>| {
+        r.filter(|l| l.is_multiple_of(c.n_layers_per_attn_res_block))
+            .count()
+    };
+    let l = c.loop_config;
+    let core_blocks = starts(l.core_start..l.core_end);
+    let coda_blocks = starts(l.core_end..c.num_hidden_layers);
+    let bank_blocks = core_blocks.saturating_sub(1);
+    if bank_blocks <= coda_blocks {
+        0
+    } else {
+        bank_blocks
+    }
+}
+
 /// Byte size of the two-region phase-aliased transient arena inside `PrefillScratch::new`.
 /// Mirrors the exact `ArenaCursor` layout in `siphon-cuda/src/model/prefill.rs`.
-fn rows_scratch_arena(c: &TextConfig, rows: usize, invariant: bool) -> usize {
+fn rows_scratch_arena(
+    c: &TextConfig,
+    rows: usize,
+    invariant: bool,
+    sms: usize,
+    block_scaled_mma: bool,
+) -> usize {
     const ALIGN: usize = 256;
     let align_add = |off: usize, bytes: usize| off.next_multiple_of(ALIGN) + bytes.max(1);
 
@@ -1089,9 +1115,8 @@ fn rows_scratch_arena(c: &TextConfig, rows: usize, invariant: bool) -> usize {
     let top_k = c.num_experts_per_tok;
     let width = c.intermediate_size;
     let rank = c.loop_config.gate_rank;
-    let gate_out_slots = if invariant { 3 } else { 1 };
 
-    // Region A: cross-sub-phase buffers (`qkv_in`, `q/k/v`, `mlp_input/mlp_x`, `final/logits`).
+    // Region A: cross-sub-phase buffers (`qkv_in`, `q/k/v`, `residual/mlp_x`, `final/logits`).
     let a_qkv_in = (0..3).fold(0, |o, _| align_add(o, rows * hidden * 2));
     let a_qkv = align_add(
         align_add(align_add(0, rows * q_dims * 2), rows * kv_dims * 2),
@@ -1109,98 +1134,185 @@ fn rows_scratch_arena(c: &TextConfig, rows: usize, invariant: bool) -> usize {
     // Region B: strictly disjoint per-phase buffers.
     let b_embed = align_add(region_b, rows * hidden * 2);
 
-    let b_gate_shared = align_add(
-        align_add(region_b, gate_out_slots * rows * hidden * 4),
-        4 * rows * rank * 2,
-    );
-    let mut b_gate_a = align_add(b_gate_shared, rows * 3 * hidden * 4);
-    for _ in 0..3 {
-        b_gate_a = align_add(b_gate_a, rows * 2 * hidden * 2);
+    if invariant {
+        let b_gate_shared = align_add(
+            align_add(region_b, 3 * rows * hidden * 4),
+            4 * rows * rank * 2,
+        );
+        let mut b_gate_a = align_add(b_gate_shared, rows * 3 * hidden * 4);
+        for _ in 0..3 {
+            b_gate_a = align_add(b_gate_a, rows * 2 * hidden * 2);
+        }
+        let b_gate_c1 = align_add(b_gate_shared, rows * hidden * 4);
+
+        let mut b_attn = align_add(region_b, rows * q_dims * 2);
+        b_attn = align_add(b_attn, rows * heads * 2);
+        b_attn = align_add(b_attn, rows * rel_dims * 2);
+        b_attn = align_add(b_attn, rows * bias_dims * 2);
+        let b_attn_raw = align_add(
+            align_add(
+                align_add(align_add(b_attn, rows * q_dims * 2), rows * rel_dims * 2),
+                rows * dynamic * 2,
+            ),
+            rows * dynamic * 2,
+        );
+        let b_attn_out = align_add(b_attn, rows * q_dims * 2);
+        let b_attn_end = b_attn_raw.max(b_attn_out);
+
+        let mut b_moe = align_add(region_b, rows * c.n_routed_experts * 4);
+        b_moe = align_add(b_moe, rows * top_k * 4);
+        b_moe = align_add(b_moe, rows * top_k * 4);
+        b_moe = align_add(b_moe, rows * top_k * width * 2);
+        b_moe = align_add(b_moe, rows * top_k * hidden * 2);
+        b_moe = align_add(b_moe, rows * hidden * 2);
+
+        return b_embed
+            .max(b_gate_a)
+            .max(b_gate_c1)
+            .max(b_attn_end)
+            .max(b_moe);
     }
 
-    let mut b_attn = align_add(region_b, rows * q_dims * 2);
+    // Non-invariant prefill: `gate.dense`, `proj`, `k_raw`, `v_raw`, `gate.inputs[0/3]`,
+    // `attention.partials`, `moe.router`, `moe.quantized`, and `moe.quantized_in` all live
+    // inside Region B across strictly disjoint phases. Phase A reuses a single `gate.inputs`
+    // slot sequentially and aliases `proj` (dead in Phase A).
+    let dense_vals = if block_scaled_mma {
+        rows * 3 * 2 * hidden
+    } else {
+        rows * (3 * hidden).max(q_dims)
+    };
+    let b_after_dense = align_add(align_add(region_b, dense_vals), (dense_vals / 32).max(1));
+    let b_after_gdown = align_add(b_after_dense, 3 * rows * rank * 2);
+    let b_after_proj = align_add(b_after_dense, rows * hidden * 2);
+
+    let b_gate_a = align_add(
+        align_add(b_after_gdown, rows * 3 * hidden * 4),
+        rows * 2 * hidden * 2,
+    );
+    let b_gate_c1 = align_add(
+        align_add(b_after_proj, rows * hidden * 4),
+        rows * 2 * hidden * 2,
+    )
+    .max(b_gate_a);
+
+    let mut b_attn = align_add(b_after_proj, rows * q_dims * 2);
     b_attn = align_add(b_attn, rows * heads * 2);
     b_attn = align_add(b_attn, rows * rel_dims * 2);
-    b_attn = align_add(b_attn, rows * bias_dims * 2);
+    b_attn = align_add(b_attn, rows.min(VERIFY_ROWS) * bias_dims * 2);
     let b_attn_raw = align_add(
         align_add(
-            align_add(align_add(b_attn, rows * q_dims * 2), rows * rel_dims * 2),
+            align_add(
+                align_add(
+                    align_add(align_add(b_attn, rows * q_dims * 2), rows * rel_dims * 2),
+                    rows * kv_dims * 2,
+                ),
+                rows * kv_dims * 2,
+            ),
             rows * dynamic * 2,
         ),
         rows * dynamic * 2,
     );
-    let b_attn_out = align_add(b_attn, rows * q_dims * 2);
-    let b_attn_end = b_attn_raw.max(b_attn_out);
+    let b_attn_exec = align_add(
+        align_add(
+            align_add(b_attn, 2 * sms * PREFILL_SLOT * 4),
+            rows * q_dims * 2,
+        ),
+        rows * q_dims * 2,
+    );
+    let b_attn_end = b_attn_raw.max(b_attn_exec);
 
-    let mut b_moe = align_add(region_b, rows * c.n_routed_experts * 4);
-    b_moe = align_add(b_moe, rows * top_k * 4);
-    b_moe = align_add(b_moe, rows * top_k * 4);
-    b_moe = align_add(b_moe, rows * top_k * width * 2);
-    b_moe = align_add(b_moe, rows * top_k * hidden * 2);
-    b_moe = align_add(b_moe, rows * hidden * 2);
+    let b_moe_hdr = align_add(
+        align_add(
+            align_add(region_b, rows * c.n_routed_experts * 4),
+            rows * top_k * 4,
+        ),
+        rows * top_k * 4,
+    );
+    let b_moe_bf16 = align_add(
+        align_add(b_moe_hdr, rows * top_k * width * 2),
+        rows * top_k * hidden * 2,
+    );
+    let pairs = rows * top_k;
+    let q_vals = pairs * width.max(hidden / top_k);
+    let b_moe_q_buf = align_add(
+        align_add(align_add(b_moe_hdr, q_vals), (q_vals / 16).max(1)),
+        pairs * 4,
+    );
+    let b_moe_act_q = align_add(b_moe_q_buf, rows * top_k * width * 2);
+    let b_moe_down_q = align_add(b_moe_q_buf, rows * top_k * hidden * 2);
+    let b_moe_router = align_add(b_moe_q_buf, rows * ROUTER_SPLITS * c.n_routed_experts * 4);
+    let q_in_vals = rows * hidden;
+    let b_moe_q_in = align_add(
+        align_add(
+            align_add(b_moe_act_q.max(b_gate_c1), q_in_vals),
+            (q_in_vals / 16).max(1),
+        ),
+        rows * 4,
+    );
+    let b_moe_q_end = b_moe_down_q.max(b_moe_router).max(b_moe_q_in);
+    let b_moe_end = b_moe_bf16.max(b_moe_q_end);
 
-    let b_head = if invariant {
-        region_b
-    } else {
-        align_add(region_b, HEAD_ROWS * c.unpadded_vocab_size * 4)
-    };
+    let b_head = align_add(region_b, HEAD_ROWS * c.unpadded_vocab_size * 4);
 
-    b_embed.max(b_gate_a).max(b_attn_end).max(b_moe).max(b_head)
+    b_embed
+        .max(b_gate_a)
+        .max(b_gate_c1)
+        .max(b_attn_end)
+        .max(b_moe_end)
+        .max(b_head)
 }
 
 /// Persistent per-chunk buffers of `PrefillScratch::new` shared by prefill and invariant chunks.
-fn rows_scratch_persistent(c: &TextConfig, rows: usize) -> usize {
+fn rows_scratch_persistent(c: &TextConfig, rows: usize, invariant: bool) -> usize {
     let hidden = c.hidden_size;
     let kv_dims = c.num_key_value_heads * c.head_dim;
     let top_k = c.num_experts_per_tok;
-    let blocks = max_blocks(c);
-    // Persistent BF16: hidden, out, prelude_hidden, proj, gate.inputs[3] (2*hidden), k_raw, v_raw.
-    let bf16_per_row = 6 * hidden + 2 * kv_dims;
-    // Persistent F32: blocks, bank, bank_normed, residual, message_probs (1 looped slot).
-    let f32_per_row = 2 * blocks * hidden + hidden + hidden + 4 * FUSED_MAX_CANDIDATES;
+    let blocks = max_blocks(c) + extra_bank_blocks(c);
+    // Persistent BF16: hidden, prelude_hidden (plus proj, gate.inputs[3], k_raw, v_raw for invariant).
+    let bf16_per_row = if invariant {
+        5 * hidden + 2 * kv_dims
+    } else {
+        2 * hidden
+    };
+    // Persistent F32: blocks (+ extra bank if needed), bank_normed, message_probs (1 looped slot).
+    let f32_per_row = (blocks + 1) * hidden + 4 * FUSED_MAX_CANDIDATES;
     let pairs = rows * top_k;
     rows * (2 * bf16_per_row + 4 * f32_per_row + 4) + 4 * (1 + pairs + rows)
 }
 
 /// `PrefillScratch::new` for a non-invariant prefill chunk of `rows` rows, including the
-/// phase-aliased arena (which covers `HEAD_ROWS` of `head_logits` and `head_capped`),
-/// flash prefill attention partials, and MoE router/grouping/quantized activation scratch.
-fn rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
-    let hidden = c.hidden_size;
+/// phase-aliased arena (which holds `gate.dense`, `attention.partials`, `moe.router`,
+/// `moe.quantized*`, and `HEAD_ROWS` of `head_logits`/`head_capped`) and small grouping metadata.
+fn rows_scratch(
+    c: &TextConfig,
+    rows: usize,
+    sms: usize,
+    prefill_dense_fp8: bool,
+    block_scaled_mma: bool,
+) -> usize {
     let heads = c.num_attention_heads;
     let top_k = c.num_experts_per_tok;
-    let width = c.intermediate_size;
     let experts = c.n_routed_experts;
     let pairs = rows * top_k;
-    let quantized_in = rows * hidden;
-    let quantized = pairs * width.max(hidden / top_k);
-    let prefill_only = rows * ROUTER_SPLITS * experts * 4
-        + 4 * pairs // perm
+    let cublas_workspace = if prefill_dense_fp8 { 0 } else { 8 << 20 };
+    let prefill_only = 4 * pairs // perm
         + 16 * pairs.min(pairs / 64 + experts) // tiles
-        + quantized_in + quantized_in / 16 + 4 * rows
-        + quantized + quantized / 16 + 4 * pairs
         + 4 * (rows * (heads / c.num_key_value_heads)).div_ceil(128) * c.num_key_value_heads
-        + 4 * 2 * sms * PREFILL_SLOT
-        + (8 << 20);
-    rows_scratch_persistent(c, rows) + rows_scratch_arena(c, rows, false) + prefill_only
+        + cublas_workspace;
+    rows_scratch_persistent(c, rows, false)
+        + rows_scratch_arena(c, rows, false, sms, block_scaled_mma)
+        + prefill_only
 }
 
 /// `PrefillScratch::new` for an invariant chunk (`verify`, `batch`, `batch_verify`):
 /// omits prefill-only attention partials, MoE grouping/quantized scratch, and F32 `head_capped`.
-fn invariant_rows_scratch(c: &TextConfig, rows: usize, _sms: usize) -> usize {
+fn invariant_rows_scratch(c: &TextConfig, rows: usize, sms: usize) -> usize {
     let base_rows_attn = 4 * ROWS_ATTENTION_ROWS * (c.head_dim + 2);
-    rows_scratch_persistent(c, rows)
-        + rows_scratch_arena(c, rows, true)
+    rows_scratch_persistent(c, rows, true)
+        + rows_scratch_arena(c, rows, true, sms, false)
         + base_rows_attn
         + invariant_scratch(c, rows)
-}
-
-/// The MXFP8 inputs of a prefill chunk's FP8 dense products (`GateRows::dense`): four
-/// inputs of `2 * hidden` values per row (slots 0..3 for attention message gates and slot 3
-/// for the MLP message gate) and a scale byte per 32 values. Invariant chunks allocate none.
-fn dense_scratch(c: &TextConfig, rows: usize) -> usize {
-    let values = rows * 4 * 2 * c.hidden_size;
-    values + values / 32
 }
 
 /// What `PrefillScratch::new` adds for an invariant chunk (verify / batch / batch_verify):
@@ -1257,8 +1369,9 @@ fn batch_dflash2_scratch(
     let kv_dims = c.num_key_value_heads * c.head_dim;
     let max_rows = max_seqs * BLOCK;
     let max_steps = max_seqs * DRAFT_STEPS;
+    let ranked = SHORTLIST_ROWS + c.unpadded_vocab_size.saturating_sub(FIRST_SPECIAL);
     let base_ld = if approx.shortlist {
-        shortlist_capacity(c.unpadded_vocab_size, c.vocab_size)
+        shortlist_capacity(ranked, c.vocab_size)
     } else {
         c.vocab_size
     };
@@ -1292,9 +1405,9 @@ fn batch_dflash2_scratch(
     } else {
         0
     };
-    // Small control/race tables + 96 MiB CUDA graph, host-cache page-table, and cuBLASLt
-    // workspace headroom for batched spec.
-    act_bf16 + step_bufs + attn_partials + dense + (96 << 20)
+    // Small control/race tables + 80 MiB CUDA graph, host-cache page-table, and cuBLASLt
+    // workspace headroom for batched spec (`SavedState` lives in host RAM during startup).
+    act_bf16 + step_bufs + attn_partials + dense + (80 << 20)
 }
 
 /// The bundled draft's shape: the checkpoint's tensors outside the text and vision models
@@ -2022,12 +2135,12 @@ mod tests {
             .expect("a plan")
         };
         let mib = 1 << 20;
-        // 8 global caches of keys and values, then one sequence's rings and its entry's
-        // copies of them: 40 FP8 rings of 1 MiB keys and 1 MiB values, which share a
-        // page, twice, and BF16 rings of a page per buffer.
+        // 8 global caches of keys and values, then one sequence's rings (prefix-cache
+        // local states live in host RAM): 40 FP8 rings of 1 MiB keys and 1 MiB values,
+        // and BF16 rings of a page per buffer.
         let rings = pool(KvFormat::Fp8).plan(0).kv;
-        assert_eq!(rings, 160 * mib);
-        assert_eq!(pool(KvFormat::Bf16).plan(0).kv, 320 * mib);
+        assert_eq!(rings, 80 * mib);
+        assert_eq!(pool(KvFormat::Bf16).plan(0).kv, 160 * mib);
         // FP8: 1,024 bytes per position, 2 MiB per buffer and chunk of 2,048 positions.
         assert_eq!(pool(KvFormat::Fp8).plan(4096).kv - rings, 16 * 4 * mib);
         // NVFP4: 576 bytes per position and buffer; 4,096 positions take 2.25 MiB, 2 pages
@@ -2040,8 +2153,8 @@ mod tests {
             (4 * 6 + 12 * 4) * mib
         );
         // NVFP4-all: 40 packed NVFP4 rings of 1.125 MiB each coalesce into one 23-page
-        // (46 MiB) RingSlab per stream+prefix entry, taking 92 MiB instead of 160 MiB.
-        let nvfp4_all_rings = 2 * 23 * 2 * mib;
+        // (46 MiB) RingSlab per stream, taking 46 MiB instead of 80 MiB.
+        let nvfp4_all_rings = 23 * 2 * mib;
         assert_eq!(pool(KvFormat::Nvfp4All).plan(0).kv, nvfp4_all_rings);
         assert_eq!(
             pool(KvFormat::Nvfp4All).plan(4096).kv - nvfp4_all_rings,
@@ -2059,12 +2172,13 @@ mod tests {
     #[test]
     fn prefill_scratch_grows_with_the_chunk() {
         let c = config();
-        let small = rows_scratch(&c, 8, 170);
-        let large = rows_scratch(&c, 2048, 170);
-        // With the phase-aliased transient arena, prefill scratch grows by ~190-230 KB/row
-        // (persistent blocks/bank/residual + aliased max phase + quantized MoE scratch).
+        let small = rows_scratch(&c, 8, 170, false, true);
+        let large = rows_scratch(&c, 2048, 170, false, true);
+        // With the consolidated phase-aliased arena (blocks+bank_normed persistent, bank
+        // aliasing blocks[3], dense/partials/router/quantized in Region B), prefill scratch
+        // grows by ~115-150 KB/row.
         let per_row = (large - small) / 2040;
-        assert!((180_000..260_000).contains(&per_row), "{per_row}");
+        assert!((100_000..170_000).contains(&per_row), "{per_row}");
     }
 
     #[test]
@@ -2083,7 +2197,7 @@ mod tests {
         // Invariant scratch is strictly smaller than full prefill scratch at the same rows
         // (no 16+ MiB flash attention partials or quantized MoE buffers).
         let inv8 = invariant_rows_scratch(&c, 8, 170);
-        let pre8 = rows_scratch(&c, 8, 170);
+        let pre8 = rows_scratch(&c, 8, 170, false, true);
         assert!(inv8 < pre8, "inv8={inv8} should be < pre8={pre8}");
     }
 

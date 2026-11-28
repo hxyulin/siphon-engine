@@ -459,35 +459,49 @@ pub struct Draft {
 }
 
 /// Copies of a draft's sliding rings at one committed position, from
-/// [`Draft::save_rings`]. Rounds and commits after that position overwrite ring slots,
-/// but not the global layers' slots below it.
+/// [`Draft::save_rings`]. Stored in page-locked host memory so prefix-cache snapshots
+/// consume zero GPU VRAM.
 pub struct DraftRings {
-    /// Each ring layer's keys and values; `None` for a global layer.
-    caches: Vec<Option<KvCache>>,
+    /// Page-locked host buffer holding every sliding ring's `(k, v)` buffers in
+    /// [`Draft::ring_spans`] order.
+    _buf: cudarc::driver::PinnedHostSlice<u8>,
+    /// Base host address of `_buf`.
+    base: usize,
+    /// Number of draft layers (`Draft::caches.len()`).
+    layers: usize,
+    /// `(byte_offset, byte_len)` of each `(k, v)` buffer for sliding ring layers.
+    spans: Vec<(usize, usize)>,
+    /// Stream used for async saves/restores, synchronized on drop.
+    stream: Arc<CudaStream>,
     committed: usize,
 }
 
+impl Drop for DraftRings {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+    }
+}
+
 impl DraftRings {
-    /// Each ring layer's keys and values, in the order of [`Draft::ring_spans`]. Copies
-    /// into these buffers change the rings, whose committed position
-    /// [`Self::set_committed`] then gives.
-    pub(crate) fn spans(&self, stream: &CudaStream) -> Vec<DeviceSpan> {
-        self.caches
+    /// Each ring layer's keys and values as `(host_ptr, bytes)`, in the order of
+    /// [`Draft::ring_spans`].
+    #[must_use]
+    pub(crate) fn host_spans(&self) -> Vec<(usize, usize)> {
+        self.spans
             .iter()
-            .flatten()
-            .flat_map(|c| [DeviceSpan::of(&*c.k, stream), DeviceSpan::of(&*c.v, stream)])
+            .map(|&(off, len)| (self.base + off, len))
             .collect()
     }
 
-    /// Makes `committed` the committed position of copies that [`Self::spans`] filled.
+    /// Makes `committed` the committed position of copies that [`Self::host_spans`] filled.
     pub(crate) fn set_committed(&mut self, committed: usize) {
         self.committed = committed;
     }
 
-    /// Device bytes the copies take.
+    /// Device bytes the copies take (always 0 for host-backed snapshots).
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.caches.iter().flatten().map(KvCache::bytes).sum()
+        0
     }
 }
 
@@ -1619,19 +1633,30 @@ impl Draft {
         Ok(())
     }
 
-    /// Allocates a [`DraftRings`] for the sliding rings, holding nothing yet.
+    /// Allocates a [`DraftRings`] in page-locked host memory for the sliding rings, holding
+    /// nothing yet.
     pub fn rings(&self, stream: &Arc<CudaStream>) -> anyhow::Result<DraftRings> {
-        let caches = self
-            .caches
-            .iter()
-            .map(|c| {
-                (c.slots < self.capacity)
-                    .then(|| KvCache::with_format(stream, c.slots, c.fp8))
-                    .transpose()
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let dev_spans = self.ring_spans(stream);
+        let mut total = 0usize;
+        let mut spans = Vec::with_capacity(dev_spans.len());
+        for s in &dev_spans {
+            spans.push((total, s.bytes));
+            total += s.bytes;
+        }
+        // SAFETY: bytes are written by async D2H before any H2D or host copy reads them.
+        let mut buf = unsafe {
+            stream
+                .context()
+                .alloc_pinned_with_flags::<u8>(total.max(1), 0)
+        }
+        .context("allocating pinned host memory for draft rings")?;
+        let base = buf.as_mut_ptr()? as usize;
         Ok(DraftRings {
-            caches,
+            _buf: buf,
+            base,
+            layers: self.caches.len(),
+            spans,
+            stream: Arc::clone(stream),
             committed: 0,
         })
     }
@@ -1643,16 +1668,32 @@ impl Draft {
         rings: &mut DraftRings,
     ) -> anyhow::Result<()> {
         ensure!(
-            rings.caches.len() == self.caches.len(),
+            rings.layers == self.caches.len(),
             "the copies have {} layers, the draft {}",
-            rings.caches.len(),
+            rings.layers,
             self.caches.len()
         );
-        for (cache, copy) in self.caches.iter().zip(&mut rings.caches) {
-            if let Some(copy) = copy {
-                stream.memcpy_dtod(&*cache.k, &mut *copy.k)?;
-                stream.memcpy_dtod(&*cache.v, &mut *copy.v)?;
+        let dev_spans = self.ring_spans(stream);
+        ensure!(
+            dev_spans.len() == rings.spans.len(),
+            "the copies have {} spans, the draft {}",
+            rings.spans.len(),
+            dev_spans.len()
+        );
+        for (src, &(off, len)) in dev_spans.iter().zip(&rings.spans) {
+            ensure!(src.bytes == len, "the draft ring buffer sizes differ");
+            // SAFETY: `rings._buf` is a live pinned host allocation sized for `off + len`
+            // and `src.ptr` is a valid device slice; `stream` orders all accesses.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                    (rings.base + off) as *mut std::ffi::c_void,
+                    src.ptr,
+                    len,
+                    stream.cu_stream(),
+                )
             }
+            .result()
+            .context("saving draft rings to pinned host memory")?;
         }
         rings.committed = self.committed;
         Ok(())
@@ -1668,16 +1709,32 @@ impl Draft {
         rings: &DraftRings,
     ) -> anyhow::Result<()> {
         ensure!(
-            rings.caches.len() == self.caches.len(),
+            rings.layers == self.caches.len(),
             "the copies have {} layers, the draft {}",
-            rings.caches.len(),
+            rings.layers,
             self.caches.len()
         );
-        for (cache, copy) in self.caches.iter_mut().zip(&rings.caches) {
-            if let Some(copy) = copy {
-                stream.memcpy_dtod(&*copy.k, &mut *cache.k)?;
-                stream.memcpy_dtod(&*copy.v, &mut *cache.v)?;
+        let dev_spans = self.ring_spans(stream);
+        ensure!(
+            dev_spans.len() == rings.spans.len(),
+            "the copies have {} spans, the draft {}",
+            rings.spans.len(),
+            dev_spans.len()
+        );
+        for (dst, &(off, len)) in dev_spans.iter().zip(&rings.spans) {
+            ensure!(dst.bytes == len, "the draft ring buffer sizes differ");
+            // SAFETY: `rings._buf` is a live pinned host allocation sized for `off + len`
+            // and `dst.ptr` is a valid device slice; `stream` orders all accesses.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst.ptr,
+                    (rings.base + off) as *const std::ffi::c_void,
+                    len,
+                    stream.cu_stream(),
+                )
             }
+            .result()
+            .context("restoring draft rings from pinned host memory")?;
         }
         self.committed = rings.committed;
         Ok(())

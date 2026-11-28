@@ -7,19 +7,21 @@
 //! at one position, so that the sequence can return there while the global caches still
 //! hold its positions below it.
 
-use std::sync::Arc;
+use std::{ffi::c_void, sync::Arc};
 
-use anyhow::ensure;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _};
+use anyhow::{Context as _, ensure};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _, PinnedHostSlice, sys};
 
 use super::{Model, VisitState};
-use crate::ops::attention::{KvCache, KvData, RingSlab};
+use crate::ops::attention::KvData;
 
 /// A device buffer's address and length in bytes, for copies to and from host memory
 /// (the prefix cache's host tier, `spec::HostCache`).
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceSpan {
+    /// Raw CUDA device address, whose backing storage belongs to the model.
     pub ptr: u64,
+    /// Size of the span in bytes.
     pub bytes: usize,
 }
 
@@ -91,16 +93,28 @@ fn visit_spans(visits: &[VisitState], stream: &CudaStream) -> Vec<DeviceSpan> {
 }
 
 /// A slot's sliding rings, conv states and position at one point of a sequence, from
-/// [`Model::save_local_state`]. The copies belong to no slot: they can return any slot that
-/// holds the sequence's global caches to that point.
+/// [`Model::save_local_state`]. Stored in page-locked host memory so prefix-cache
+/// snapshots consume zero GPU VRAM and zero KV pool pages.
 pub struct LocalState {
-    /// Each visit's ring, `None` for a global cache, and its four conv states. With a KV
-    /// pool the rings share `ring_slab` and take pages only while they hold a copy.
-    /// Declared before `ring_slab` so `KvCache::drop` leaks its slices before the slab
-    /// frees the virtual address range.
-    visits: Vec<(Option<KvCache>, Vec<CudaSlice<f32>>)>,
-    ring_slab: Option<RingSlab>,
+    /// Page-locked host buffer holding every sliding ring and conv state in
+    /// [`visit_spans`] order.
+    _buf: PinnedHostSlice<u8>,
+    /// Base host address of `_buf`.
+    base: usize,
+    /// `(byte_offset, byte_len)` of each buffer in [`visit_spans`] order.
+    spans: Vec<(usize, usize)>,
+    /// Number of visits this snapshot was sized for.
+    visit_count: usize,
+    /// Stream used for async saves/restores, synchronized on drop.
+    stream: Arc<CudaStream>,
     position: usize,
+    valid: bool,
+}
+
+impl Drop for LocalState {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+    }
 }
 
 impl LocalState {
@@ -110,96 +124,56 @@ impl LocalState {
         self.position
     }
 
-    /// Each copy's device buffer: per visit its ring's keys and values, if it has a ring,
-    /// then its four conv states. [`Model::local_spans`] lists a slot's buffers in the same
-    /// order.
-    pub(crate) fn spans(&self, stream: &CudaStream) -> Vec<DeviceSpan> {
-        let mut spans = Vec::new();
-        for (ring, conv) in &self.visits {
-            match ring.as_ref().map(KvCache::data) {
-                Some(KvData::Bf16 { keys, values }) => {
-                    spans.push(DeviceSpan::of(keys, stream));
-                    spans.push(DeviceSpan::of(values, stream));
-                }
-                Some(
-                    KvData::Fp8 { keys, values }
-                    | KvData::Nvfp4 { keys, values }
-                    | KvData::Nvfp4G32 { keys, values },
-                ) => {
-                    spans.push(DeviceSpan::of(keys, stream));
-                    spans.push(DeviceSpan::of(values, stream));
-                }
-                None => {}
-            }
-            spans.extend(conv.iter().map(|c| DeviceSpan::of(c, stream)));
-        }
-        spans
+    /// Each saved buffer's `(host_ptr, bytes)` in [`Model::local_spans`] order.
+    #[must_use]
+    pub(crate) fn host_spans(&self) -> Vec<(usize, usize)> {
+        self.spans
+            .iter()
+            .map(|&(off, len)| (self.base + off, len))
+            .collect()
     }
 
-    /// Whether the copies hold a state: saved, and not released since.
+    /// Whether the snapshot currently holds saved state.
+    ///
+    /// Call [`Model::save_local_state`] to fill the buffers before restoring them.
     #[must_use]
     pub fn holds(&self) -> bool {
-        self.ring_slab.as_ref().is_none_or(RingSlab::is_mapped)
-            && self
-                .visits
-                .iter()
-                .filter_map(|(ring, _)| ring.as_ref())
-                .all(|r| r.mapped() == r.slots())
+        self.valid
     }
 
-    /// Pages of the KV pool that the copies of the rings hold.
+    /// Pages of the KV pool that the copies of the rings hold (always 0 for host-backed
+    /// snapshots).
     #[must_use]
     pub fn pages(&self) -> usize {
-        self.ring_slab.as_ref().map_or(0, RingSlab::held_pages)
-            + self
-                .visits
-                .iter()
-                .filter_map(|(ring, _)| ring.as_ref()?.pooled())
-                .map(|p| p.iter().map(|b| b.pages().len()).sum::<usize>())
-                .sum::<usize>()
+        0
     }
 
-    /// Returns the pages of the copies of pooled rings to the pool, once `stream` has done
-    /// its work: the copies hold nothing until saved again. Work on other streams that
-    /// reads them must be done.
-    pub fn release(&mut self, stream: &CudaStream) -> anyhow::Result<()> {
-        if self.pages() == 0 {
-            return Ok(());
-        }
-        stream.synchronize()?;
-        if let Some(slab) = self.ring_slab.as_mut() {
-            slab.unmap()?;
-        }
-        for ring in self.visits.iter_mut().filter_map(|(ring, _)| ring.as_mut()) {
-            ring.unmap_from(0)?;
-        }
+    /// Marks the snapshot empty (host-backed snapshots hold no KV pool pages).
+    ///
+    /// # Errors
+    ///
+    /// Never fails for host-backed snapshots.
+    pub fn release(&mut self, _stream: &CudaStream) -> anyhow::Result<()> {
+        self.valid = false;
         Ok(())
     }
 
-    /// Device bytes the copies take, but for copies of rings in pooled memory, which take
-    /// pages only while they hold a state ([`Self::pages`]).
+    /// Device bytes the copies take (always 0 for host-backed snapshots).
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.visits
-            .iter()
-            .map(|(ring, conv)| {
-                let ring = match ring.as_ref().filter(|r| !r.is_pooled()).map(KvCache::data) {
-                    Some(KvData::Bf16 { keys, values }) => (keys.len() + values.len()) * 2,
-                    Some(
-                        KvData::Fp8 { keys, values }
-                        | KvData::Nvfp4 { keys, values }
-                        | KvData::Nvfp4G32 { keys, values },
-                    ) => keys.len() + values.len(),
-                    None => 0,
-                };
-                ring + conv.iter().map(|c| c.len() * 4).sum::<usize>()
-            })
-            .sum()
+        0
     }
 }
 
 impl Model {
     /// The global KV caches of slot `slot`.
+    ///
+    /// Pooled addresses can be reserved beyond the mapped range. Use
+    /// [`Self::slot_mapped`] before copying memory from these addresses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slot is unknown.
     pub fn global_kv(&self, slot: usize) -> anyhow::Result<GlobalKv> {
         let stream = &self.ctx.stream;
         let visits = if slot == 0 {
@@ -270,70 +244,46 @@ impl Model {
         })
     }
 
-    /// Allocates a [`LocalState`] for a slot's rings and conv states, holding nothing yet.
+    /// Allocates a [`LocalState`] in page-locked host memory for a slot's rings and conv
+    /// states, holding nothing yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CUDA cannot allocate the pinned host buffer.
     pub fn local_state(&self) -> anyhow::Result<LocalState> {
         let stream = &self.ctx.stream;
-        let sliding_count = self
-            .visits
-            .iter()
-            .filter(|v| v.kv.window().is_some())
-            .count();
-        let ring_slab = if let (Some(pool), Some(first)) = (
-            self.kv_pool.as_ref(),
-            self.visits.iter().find(|v| v.kv.window().is_some()),
-        ) && sliding_count > 0
-        {
-            Some(RingSlab::reserve(
-                pool,
-                sliding_count,
-                first.kv.slots(),
-                first.kv.format(),
-            )?)
-        } else {
-            None
-        };
-        let mut ring_idx = 0usize;
-        let visits = self
-            .visits
-            .iter()
-            .map(|v| {
-                let ring = match (v.kv.window(), ring_slab.as_ref()) {
-                    (None, _) => None,
-                    (Some(window), Some(slab)) => {
-                        let idx = ring_idx;
-                        ring_idx += 1;
-                        Some(KvCache::sliding_in_slab(
-                            stream,
-                            window,
-                            v.kv.slots(),
-                            v.kv.format(),
-                            slab,
-                            idx,
-                        )?)
-                    }
-                    (Some(window), None) => Some(KvCache::sliding_ring_with_format(
-                        stream,
-                        window,
-                        v.kv.slots(),
-                        v.kv.format(),
-                    )?),
-                };
-                let conv = v
-                    .conv
-                    .iter()
-                    .map(|c| stream.alloc_zeros(c.len()))
-                    .collect::<Result<_, _>>()?;
-                Ok((ring, conv))
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let dev_spans = visit_spans(&self.visits, stream);
+        let mut total = 0usize;
+        let mut spans = Vec::with_capacity(dev_spans.len());
+        for s in &dev_spans {
+            spans.push((total, s.bytes));
+            total += s.bytes;
+        }
+        // SAFETY: bytes are written by async D2H before any H2D or host copy reads them.
+        let mut buf = unsafe {
+            stream
+                .context()
+                .alloc_pinned_with_flags::<u8>(total.max(1), 0)
+        }
+        .context("allocating pinned host memory for prefix local state")?;
+        let base = buf.as_mut_ptr()? as usize;
         Ok(LocalState {
-            visits,
-            ring_slab,
+            _buf: buf,
+            base,
+            spans,
+            visit_count: self.visits.len(),
+            stream: Arc::clone(stream),
             position: 0,
+            valid: false,
         })
     }
 
     /// Copies slot `slot`'s rings, conv states and position into `state`, on the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slot or saved-state layout is invalid, or if CUDA cannot
+    /// copy the buffers.
     pub fn save_local_state(&mut self, slot: usize, state: &mut LocalState) -> anyhow::Result<()> {
         self.with_slot(slot, |m| m.save_slot0_state(state))
     }
@@ -341,56 +291,35 @@ impl Model {
     fn save_slot0_state(&self, state: &mut LocalState) -> anyhow::Result<()> {
         let stream = &self.ctx.stream;
         ensure!(
-            state.visits.len() == self.visits.len(),
+            state.visit_count == self.visits.len(),
             "the state has {} visits, the model {}",
-            state.visits.len(),
+            state.visit_count,
             self.visits.len()
         );
-        if let Some(dst_slab) = state.ring_slab.as_mut() {
-            // One `cuMemSetAccess` for all sliding rings; no zeroing needed because the
-            // copy below immediately overwrites every byte.
-            dst_slab.map_uninit()?;
-        }
-        let bulk_copied = match (self.ring_slab.as_ref(), state.ring_slab.as_mut()) {
-            (Some(src), Some(dst)) => {
-                src.copy_to(dst, stream)?;
-                true
+        let dev_spans = visit_spans(&self.visits, stream);
+        ensure!(
+            dev_spans.len() == state.spans.len(),
+            "the state has {} spans, the model {}",
+            state.spans.len(),
+            dev_spans.len()
+        );
+        for (src, &(off, len)) in dev_spans.iter().zip(&state.spans) {
+            ensure!(src.bytes == len, "the local state buffer sizes differ");
+            // SAFETY: `state._buf` is a live pinned host allocation sized for `off + len`
+            // and `src.ptr` is a valid device slice; `stream` orders all accesses.
+            unsafe {
+                sys::cuMemcpyDtoHAsync_v2(
+                    (state.base + off) as *mut c_void,
+                    src.ptr,
+                    len,
+                    stream.cu_stream(),
+                )
             }
-            _ => false,
-        };
-        for (v, (ring, conv)) in self.visits.iter().zip(&mut state.visits) {
-            if !bulk_copied {
-                if let Some(ring) = ring.as_mut() {
-                    ring.map(ring.slots(), stream)?;
-                }
-                match (v.kv.data(), ring.as_mut().map(KvCache::data_mut)) {
-                    (_, None) => ensure!(v.kv.window().is_none(), "the state lacks a ring"),
-                    (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
-                        ensure!(k.len() == keys.len(), "the ring sizes differ");
-                        stream.memcpy_dtod(keys, k)?;
-                        stream.memcpy_dtod(values, x)?;
-                    }
-                    (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
-                    | (
-                        KvData::Nvfp4 { keys, values },
-                        Some(KvData::Nvfp4 { keys: k, values: x }),
-                    )
-                    | (
-                        KvData::Nvfp4G32 { keys, values },
-                        Some(KvData::Nvfp4G32 { keys: k, values: x }),
-                    ) => {
-                        ensure!(k.len() == keys.len(), "the ring sizes differ");
-                        stream.memcpy_dtod(keys, k)?;
-                        stream.memcpy_dtod(values, x)?;
-                    }
-                    _ => anyhow::bail!("the ring formats differ"),
-                }
-            }
-            for (src, dst) in v.conv.iter().zip(conv.iter_mut()) {
-                stream.memcpy_dtod(src, dst)?;
-            }
+            .result()
+            .context("saving local state to pinned host memory")?;
         }
         state.position = self.position;
+        state.valid = true;
         Ok(())
     }
 
@@ -414,39 +343,27 @@ impl Model {
         let stream = Arc::clone(&self.ctx.stream);
         // A pooled ring slab of a slot that held no sequence takes its pages now.
         super::map_visits(&mut self.visits, self.ring_slab.as_mut(), 0, &stream)?;
-        let bulk_copied = match (state.ring_slab.as_ref(), self.ring_slab.as_mut()) {
-            (Some(src), Some(dst)) => {
-                src.copy_to(dst, &stream)?;
-                true
+        let dev_spans = visit_spans(&self.visits, &stream);
+        ensure!(
+            dev_spans.len() == state.spans.len(),
+            "the state has {} spans, the model {}",
+            state.spans.len(),
+            dev_spans.len()
+        );
+        for (dst, &(off, len)) in dev_spans.iter().zip(&state.spans) {
+            ensure!(dst.bytes == len, "the local state buffer sizes differ");
+            // SAFETY: `state._buf` is a live pinned host allocation sized for `off + len`
+            // and `dst.ptr` is a valid device slice; `stream` orders all accesses.
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst.ptr,
+                    (state.base + off) as *const c_void,
+                    len,
+                    stream.cu_stream(),
+                )
             }
-            _ => false,
-        };
-        for (v, (ring, conv)) in self.visits.iter_mut().zip(&state.visits) {
-            if !bulk_copied {
-                match (v.kv.data_mut(), ring.as_ref().map(KvCache::data)) {
-                    (_, None) => {}
-                    (KvData::Bf16 { keys, values }, Some(KvData::Bf16 { keys: k, values: x })) => {
-                        stream.memcpy_dtod(k, keys)?;
-                        stream.memcpy_dtod(x, values)?;
-                    }
-                    (KvData::Fp8 { keys, values }, Some(KvData::Fp8 { keys: k, values: x }))
-                    | (
-                        KvData::Nvfp4 { keys, values },
-                        Some(KvData::Nvfp4 { keys: k, values: x }),
-                    )
-                    | (
-                        KvData::Nvfp4G32 { keys, values },
-                        Some(KvData::Nvfp4G32 { keys: k, values: x }),
-                    ) => {
-                        stream.memcpy_dtod(k, keys)?;
-                        stream.memcpy_dtod(x, values)?;
-                    }
-                    _ => anyhow::bail!("the ring formats differ"),
-                }
-            }
-            for (src, dst) in conv.iter().zip(v.conv.iter_mut()) {
-                stream.memcpy_dtod(src, dst)?;
-            }
+            .result()
+            .context("restoring local state from pinned host memory")?;
         }
         self.position = state.position;
         Ok(())

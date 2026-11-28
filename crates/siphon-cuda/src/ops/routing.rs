@@ -10,7 +10,7 @@ use cudarc::driver::{
 use half::bf16;
 
 use crate::{
-    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    gpu::{ArenaBuf, ArenaSlice, DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
     ops::QuantDest,
 };
 
@@ -127,7 +127,7 @@ const ROUTER_BLOCKS: u32 = 64;
 const ROUTER_THREADS: u32 = 288;
 /// Slices of the inner dimension that `moe_router_logits_rows_2304` sums separately, of
 /// 256 columns each.
-const ROUTER_SPLITS: usize = 9;
+pub(crate) const ROUTER_SPLITS: usize = 9;
 const _: () = assert!(ROUTER_SPLITS == siphon::memory::ROUTER_SPLITS);
 /// Rows per block of `moe_router_logits_rows_2304`, which covers all 128 experts.
 const ROUTER_TILE_ROWS: usize = 64;
@@ -241,11 +241,12 @@ pub enum RowsPartial<'a> {
 pub struct DepthRows<'a> {
     /// The block states, 1 to 5 runs of F32 `[rows, 2304]`.
     pub blocks: CudaView<'a, f32>,
+    /// Partial block candidate for each input row.
     pub partial: RowsPartial<'a>,
     /// Receives the partial as used, F32 `[rows, 2304]`.
     pub normed_partial: Option<CudaViewMut<'a, f32>>,
     /// The `nq` queries, F32 `[nq, 2304]`.
-    pub queries: &'a CudaSlice<f32>,
+    pub queries: &'a dyn DeviceIn<f32>,
     /// Receives the output rows, F32 `[rows, nq, 2304]`.
     pub out: Option<CudaViewMut<'a, f32>>,
     /// Receives the weights of each output, F32 `[rows, nq, nb + 1]`, from which
@@ -290,20 +291,23 @@ pub struct QuantNormDest<'a> {
 pub struct DepthRowsQuant<'a> {
     /// The block states, 1 to 5 runs of F32 `[rows, 2304]`.
     pub blocks: CudaView<'a, f32>,
+    /// Partial block candidate for each input row.
     pub partial: RowsPartial<'a>,
     /// Receives the partial as used, F32 `[rows, 2304]`.
     pub normed_partial: Option<CudaViewMut<'a, f32>>,
     /// The `nq` (1, 3 or 4) queries, F32 `[nq, 2304]`.
-    pub queries: &'a CudaSlice<f32>,
+    pub queries: &'a dyn DeviceIn<f32>,
     /// Receives the output rows, F32 `[rows, nq, 2304]`.
     pub out: Option<CudaViewMut<'a, f32>>,
     /// Receives the weights of each output, F32 `[rows, nq, nb + 1]`.
     pub probs: Option<CudaViewMut<'a, f32>>,
     /// Destinations `0..4`, all using the same [`crate::ops::QuantFormat`].
     pub dests: [Option<QuantNormDest<'a>>; 4],
+    /// Stride between destination rows, in elements.
     pub dst_stride: usize,
     /// Column offset within each `dst_stride`-wide MXFP8 destination row (a multiple of 32).
     pub quant_col_offset: usize,
+    /// Number of input token rows in this chunk.
     pub rows: usize,
 }
 
@@ -326,18 +330,32 @@ pub enum RouterMatmul {
 pub struct RouterRowsScratch {
     rows: usize,
     /// The sums of each logit over each slice of the inner dimension, F32 `[9, rows, 128]`.
-    partials: CudaSlice<f32>,
+    partials: ArenaBuf<f32>,
 }
 
 impl RouterRowsScratch {
+    /// Allocates partial router logits for a chunk of up to `rows` rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if allocating CUDA scratch fails.
     pub fn new(stream: &Arc<CudaStream>, rows: usize) -> anyhow::Result<Self> {
         Ok(Self {
             rows,
-            partials: stream.alloc_zeros(ROUTER_SPLITS * rows * EXPERTS)?,
+            partials: ArenaBuf::Owned(stream.alloc_zeros(ROUTER_SPLITS * rows * EXPERTS)?),
         })
+    }
+
+    /// Creates arena-backed router scratch from a pre-carved partials slice.
+    pub(crate) fn from_arena(rows: usize, partials: ArenaSlice<f32>) -> Self {
+        Self {
+            rows,
+            partials: ArenaBuf::Arena(partials),
+        }
     }
 }
 
+/// CUDA entry points for expert routing and depth attention.
 #[derive(Debug)]
 pub struct Routing {
     router_logits_2304: CudaFunction,
@@ -367,7 +385,8 @@ impl Routing {
             depth_attention_fused_2304: module.load_function("depth_attention_fused_2304")?,
             moe_router_2304: module.load_function("moe_router_2304")?,
             moe_router_logits_rows_2304: module.load_function("moe_router_logits_rows_2304")?,
-            moe_router_logits_tc_rows_2304: module.load_function("moe_router_logits_tc_rows_2304")?,
+            moe_router_logits_tc_rows_2304: module
+                .load_function("moe_router_logits_tc_rows_2304")?,
             moe_router_route_rows_2304: module.load_function("moe_router_route_rows_2304")?,
             depth_attention_step_2304: module.load_function("depth_attention_step_2304")?,
             moe_router_step_2304: {
@@ -407,8 +426,9 @@ impl Routing {
                 .map(|nq| {
                     (1..FUSED_MAX_CANDIDATES)
                         .map(|nb| {
-                            module
-                                .load_function(&format!("depth_attention_rows_quant_2304_{nb}_{nq}"))
+                            module.load_function(&format!(
+                                "depth_attention_rows_quant_2304_{nb}_{nq}"
+                            ))
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -958,6 +978,7 @@ impl Routing {
             "{nb} blocks; 1 to {} fit",
             FUSED_MAX_CANDIDATES - 1
         );
+        let queries = queries.view();
         let count = b.count.max(1);
         ensure!(
             queries.len().is_multiple_of(count * HIDDEN),
@@ -1011,7 +1032,7 @@ impl Routing {
             .i32(i32::try_from(block_len).context("too many rows")?);
         push_rows_partial(&mut args, partial, block_len, stream)?;
         args.opt_mut(normed_partial.as_mut(), stream)
-            .ptr(queries, stream)
+            .ptr(&queries, stream)
             .opt_mut(out.as_mut(), stream)
             .opt_mut(probs.as_mut(), stream);
         for dest in &mut dests {
@@ -1081,6 +1102,7 @@ impl Routing {
             "{nb} blocks; 1 to {} fit",
             FUSED_MAX_CANDIDATES - 1
         );
+        let queries = queries.view();
         ensure!(
             !queries.is_empty() && queries.len().is_multiple_of(HIDDEN),
             "queries has {} elements, not whole rows of {HIDDEN}",
@@ -1137,7 +1159,7 @@ impl Routing {
             .i32(i32::try_from(block_len).context("too many rows")?);
         push_rows_partial(&mut args, partial, block_len, stream)?;
         args.opt_mut(normed_partial.as_mut(), stream)
-            .ptr(queries, stream)
+            .ptr(&queries, stream)
             .opt_mut(out.as_mut(), stream)
             .opt_mut(probs.as_mut(), stream);
         for dest in &mut dests {
@@ -1469,11 +1491,7 @@ impl Routing {
             .i32(rows_i32)
             .i32(i32::try_from(HIDDEN / splits)?);
         let config = LaunchConfig {
-            grid_dim: (
-                u32::try_from(row_tiles)?,
-                u32::try_from(splits)?,
-                1,
-            ),
+            grid_dim: (u32::try_from(row_tiles)?, u32::try_from(splits)?, 1),
             block_dim: (ROUTER_TILE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };

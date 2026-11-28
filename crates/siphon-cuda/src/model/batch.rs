@@ -928,6 +928,7 @@ impl Model {
             true,
             self.sampler,
             self.ctx.fp8_wide_head(),
+            false,
         )?;
         if self.batch_taps {
             p.record_taps = true;
@@ -1443,6 +1444,7 @@ impl Model {
             true,
             self.sampler,
             self.ctx.fp8_wide_head(),
+            false,
         )?;
         if self.ctx.accept_margin > 0.0 {
             p.ensure_capped_head(stream, &self.ctx.config)?;

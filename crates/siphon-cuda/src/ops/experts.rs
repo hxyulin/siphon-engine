@@ -11,7 +11,7 @@ use cudarc::driver::{
 use half::bf16;
 
 use crate::{
-    gpu::{DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
+    gpu::{ArenaBuf, ArenaSlice, DeviceIn, DeviceOut, KernelArgs, cubin, load_module},
     ops::{QuantDest, QuantFormat},
 };
 
@@ -360,9 +360,9 @@ impl ExpertWeights<'_> {
 /// the order the FP8 kernel loads them.
 #[derive(Debug)]
 pub struct QuantizedRows {
-    values: CudaSlice<u8>,
-    scales: CudaSlice<u8>,
-    outer: CudaSlice<f32>,
+    values: ArenaBuf<u8>,
+    scales: ArenaBuf<u8>,
+    outer: ArenaBuf<f32>,
     /// What the last [`Experts::quantize_rows`] call queued.
     contents: Option<Quantized>,
 }
@@ -437,11 +437,25 @@ impl QuantizedRows {
         max_rows: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            values: stream.alloc_zeros(max_values.max(1))?,
-            scales: stream.alloc_zeros((max_values / 16).max(1))?,
-            outer: stream.alloc_zeros(max_rows.max(1))?,
+            values: ArenaBuf::Owned(stream.alloc_zeros(max_values.max(1))?),
+            scales: ArenaBuf::Owned(stream.alloc_zeros((max_values / 16).max(1))?),
+            outer: ArenaBuf::Owned(stream.alloc_zeros(max_rows.max(1))?),
             contents: None,
         })
+    }
+
+    /// Creates arena-backed quantized activation scratch from pre-carved slices.
+    pub(crate) fn from_arena(
+        values: ArenaSlice<u8>,
+        scales: ArenaSlice<u8>,
+        outer: ArenaSlice<f32>,
+    ) -> Self {
+        Self {
+            values: ArenaBuf::Arena(values),
+            scales: ArenaBuf::Arena(scales),
+            outer: ArenaBuf::Arena(outer),
+            contents: None,
+        }
     }
 
     /// The packed values, `[rows, k / 2]` E2M1 pairs or `[rows, k]` E4M3.
@@ -1437,9 +1451,9 @@ impl Experts {
                 .arg(&x)
                 .arg(&rows_arg)
                 .arg(&k_arg)
-                .arg(&mut out.values)
-                .arg(&mut out.scales)
-                .arg(&mut out.outer);
+                .arg(&mut *out.values)
+                .arg(&mut *out.scales)
+                .arg(&mut *out.outer);
             let config = LaunchConfig {
                 grid_dim: (u32::try_from(rows.div_ceil(8))?, 1, 1),
                 block_dim: (256, 1, 1),
@@ -1661,9 +1675,9 @@ impl Experts {
             };
             let mut launch = stream.launch_builder(function);
             launch
-                .arg(&xq.values)
-                .arg(&xq.scales)
-                .arg(&xq.outer)
+                .arg(&*xq.values)
+                .arg(&*xq.scales)
+                .arg(&*xq.outer)
                 .arg(weight)
                 .arg(scales);
             if let ExpertFormat::Nvfp4 {
@@ -1678,9 +1692,9 @@ impl Experts {
                 ExpertFormat::Mxfp8 | ExpertFormat::Mxfp6 { .. } => launch.arg(&null),
             };
             launch
-                .arg(&mut act_q.values)
-                .arg(&mut act_q.scales)
-                .arg(&mut act_q.outer)
+                .arg(&mut *act_q.values)
+                .arg(&mut *act_q.scales)
+                .arg(&mut *act_q.outer)
                 .arg(&scratch.perm)
                 .arg(&scratch.tiles)
                 .arg(&scratch.group_counts)
@@ -1791,7 +1805,7 @@ impl Experts {
         let mut launch = stream.launch_builder(function);
         match input {
             GemmInput::Bf16(x) => launch.arg(x),
-            GemmInput::Quantized(xq) => launch.arg(&xq.values).arg(&xq.scales).arg(&xq.outer),
+            GemmInput::Quantized(xq) => launch.arg(&*xq.values).arg(&*xq.scales).arg(&*xq.outer),
         };
         match format {
             ExpertFormat::Nvfp4 {

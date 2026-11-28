@@ -115,13 +115,97 @@ mod linux {
         },
     };
 
-    /// Bytes of weights one decode step reads.
-    const WEIGHT_BYTES_PER_TOKEN: f64 = 5.5e9;
-    /// Bytes `--weights fp8` saves per step: the 3.51 GB of BF16 attention projections
-    /// and LM head read as 1.76 GB of E4M3 values and scales.
-    const FP8_SAVED_BYTES_PER_TOKEN: f64 = 1.75e9;
     /// DRAM bandwidth of the RTX 5090, or of the RTX 4090 for the sm_89 build.
     const PEAK_BANDWIDTH: f64 = if cfg!(sm89) { 1.008e12 } else { 1.79e12 };
+
+    /// Exact weight bytes read by one `B = 1` decode step for the loaded `weights`,
+    /// `passes`, and active MoE `top_k`.
+    fn active_weight_bytes(
+        config: &TextConfig,
+        weights: &Weights,
+        passes: usize,
+        top_k: usize,
+    ) -> usize {
+        use siphon_cuda::weights::ExpertFormat;
+        let lc = &config.loop_config;
+        let looped = lc.core_end - lc.core_start;
+        let mut total = 0usize;
+        for (visit, layer) in config.visit_layers(passes).into_iter().enumerate() {
+            let w = &weights.layers[layer];
+            let has_messages =
+                visit >= lc.core_start + looped && visit < lc.core_start + passes * looped;
+            // Attention input projections.
+            if let Some(fp8) = &w.fp8 {
+                total += fp8
+                    .inputs
+                    .iter()
+                    .map(siphon_cuda::ops::linear_fp8::Fp8Matrix::bytes)
+                    .sum::<usize>();
+            } else if let Ok(projs) = w.attention.input_projections() {
+                total += projs.iter().map(|t| t.len() * 2).sum::<usize>();
+            }
+            // Attention output projection.
+            if let Some(o) = w.fp8.as_ref().and_then(|f| f.o.as_ref()) {
+                total += o.bytes();
+            } else if weights.output == OutputProjection::Mxfp8
+                && let Some(o) = w.mxfp8_o.as_ref()
+            {
+                total += o.bytes();
+            } else if let Some(o) = w.attention.o.as_ref() {
+                total += o.len() * 2;
+            }
+            // Message gates on looped passes after the first.
+            if has_messages && let Some(gates) = &w.message_gates {
+                for g in gates {
+                    if let Some(fp8) = &g.fp8 {
+                        total += fp8
+                            .iter()
+                            .map(siphon_cuda::ops::linear_fp8::Fp8Matrix::bytes)
+                            .sum::<usize>();
+                    } else {
+                        total += g.down.as_ref().map_or(0, |d| d.len() * 2)
+                            + g.forget.len() * 2
+                            + g.gain.len() * 2;
+                    }
+                }
+            }
+            // Router (F32).
+            total += w.router.len() * 4 + w.router_bias.len() * 4;
+            // Active experts (`top_k` of `n_routed_experts`).
+            let e = &w.experts;
+            let mut all_experts = e.w13.len() + e.w13_scale.len() + e.w2.len() + e.w2_scale.len();
+            match &e.format {
+                ExpertFormat::Nvfp4 {
+                    w13_scale_base,
+                    w2_scale_base,
+                    ..
+                } => {
+                    all_experts += w13_scale_base
+                        .as_ref()
+                        .map_or(0, cudarc::driver::CudaSlice::len);
+                    all_experts += w2_scale_base
+                        .as_ref()
+                        .map_or(0, cudarc::driver::CudaSlice::len);
+                }
+                ExpertFormat::Mxfp6 { w13_hi2, w2_hi2 } => {
+                    all_experts += w13_hi2.len() + w2_hi2.len();
+                }
+                ExpertFormat::Mxfp8 => {}
+            }
+            total += all_experts * top_k / config.n_routed_experts;
+            // Relative bias table + small norms.
+            total += w.attention.rel_table.len() * 2;
+        }
+        // LM head.
+        total += if let Some(nvfp4) = &weights.lm_head_nvfp4 {
+            nvfp4.bytes()
+        } else if let Some(fp8) = &weights.lm_head_fp8 {
+            fp8.bytes()
+        } else {
+            weights.lm_head.slice().len() * 2
+        };
+        total
+    }
     const DEFAULT_CONTEXTS: [usize; 3] = [0, 4096, 32768];
     /// Added to the defaults when the memory plan fits.
     const LONG_CONTEXT: usize = 131_072;
@@ -581,15 +665,20 @@ mod linux {
         }
     }
 
-    #[expect(clippy::too_many_lines, reason = "runs prefill benchmark and formats output")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "runs prefill benchmark and formats output"
+    )]
     fn bench_prefill(args: &Args, lengths: &[usize]) -> anyhow::Result<()> {
         let config = TextConfig::load(&args.model)?;
         let passes = args.passes.unwrap_or(config.loop_config.num_passes);
         let vocab = u32::try_from(config.unpadded_vocab_size)?;
         let gpu = Gpu::new(0)?;
         let before = gpu_state()?;
-        let chunk_for =
-            |tokens: usize| args.chunk.unwrap_or_else(|| recommended_prefill_chunk(tokens));
+        let chunk_for = |tokens: usize| {
+            args.chunk
+                .unwrap_or_else(|| recommended_prefill_chunk(tokens))
+        };
         let max_chunk = lengths
             .iter()
             .copied()
@@ -763,6 +852,15 @@ mod linux {
                 mxfp8_experts: args.mxfp8_experts,
             },
         )?;
+        let weight_bytes =
+            active_weight_bytes(&config, &weights, passes, args.moe_pruning.top_k) as f64;
+        let sliding_visits = config
+            .visit_layers(passes)
+            .into_iter()
+            .filter(|&l| config.is_sliding(l))
+            .count();
+        let sliding_row_bytes = 2 * args.kv.sliding_format().row_bytes(kv_dims);
+        let sliding_window = config.sliding_window_size;
         let capacity = contexts.iter().max().copied().unwrap_or(0) + tail;
         let mut model = Model::with_formats(
             &gpu,
@@ -775,10 +873,6 @@ mod linux {
         )?;
         args.kv_options.apply(&mut model)?;
         model.set_moe_pruning(args.moe_pruning)?;
-        let weight_bytes = match args.weights {
-            WeightFormat::Bf16 => WEIGHT_BYTES_PER_TOKEN,
-            WeightFormat::Fp8 => WEIGHT_BYTES_PER_TOKEN - FP8_SAVED_BYTES_PER_TOKEN,
-        };
 
         let mut rows = Vec::new();
         let mut token = 1;
@@ -798,13 +892,14 @@ mod linux {
             gpu.stream().synchronize()?;
             let total = start.elapsed().as_secs_f64();
             let after = gpu_state()?;
-            // Mean context over the timed steps.
+            // Mean context over the timed steps (global caches + active sliding-window rings).
             let mean_context = context + args.warmup + args.steps / 2;
+            let ring_bytes = sliding_visits * mean_context.min(sliding_window) * sliding_row_bytes;
             rows.push(Row {
                 context,
                 steps,
                 total,
-                kv_bytes: (mean_context * kv_bytes_per_token) as f64,
+                kv_bytes: (mean_context * kv_bytes_per_token + ring_bytes) as f64,
                 weight_bytes,
                 sm_mhz: after.sm_mhz,
                 mem_mhz: after.mem_mhz,
@@ -901,7 +996,13 @@ mod linux {
             let mut options = DraftOptions::fast()
                 .with_shortlist_budget(args.draft_shortlist, args.draft_context_rows)?;
             options.apply_draft_weights(&args.draft_weights)?;
-            let draft = load_draft(&mut model, &checkpoint, DraftSource::Bundled, capacity, &options)?;
+            let draft = load_draft(
+                &mut model,
+                &checkpoint,
+                DraftSource::Bundled,
+                capacity,
+                &options,
+            )?;
             model.set_batch_taps(true);
             Some(Speculator::with_draft(
                 &model,

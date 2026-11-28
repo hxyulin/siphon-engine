@@ -1439,7 +1439,10 @@ depth_attention_step_2304(const float* blocks, int nb, const float* partial_f32,
         taps[2] = wb[0];
         taps[3] = wb[1];
     }
+#if !SIPHON_SM89
     // The inputs that earlier kernels write may have left L2 since; one thread per line.
+    // On sm_89 `pdl_wait()` is a no-op, so these prefetches run immediately before the loads
+    // and only waste issue slots.
     if (t % 8 == 0) {
         for (int i = 0; i < nb; ++i) {
             prefetch_l2(blocks + size_t(i) * kHidden + ca);
@@ -1467,6 +1470,7 @@ depth_attention_step_2304(const float* blocks, int nb, const float* partial_f32,
             prefetch_l2(conv_hidden + cb);
         }
     }
+#endif
     pdl_trigger();
     pdl_wait();
 

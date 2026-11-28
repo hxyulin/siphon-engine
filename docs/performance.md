@@ -8,7 +8,7 @@ The same kernels serve the RTX 5090 and the RTX PRO 6000 Blackwell (`sm_120a`). 
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | **RTX 5090** | 32 GB, 1.79 TB/s, `sm_120a` | 885 · 715 | 384 · 310 | 34,316 · 32,669 | 1,452 · 2,145 · 3,237 | 729,088 · 1,048,576 | [RTX 5090](recipes.md#rtx-5090) |
 | **RTX PRO 6000 Blackwell** | 96 GB, 1.79 TB/s, `sm_120a` | 883 · 706 | 352 · 326 | 36,053 · 33,975 | 1,449 · 2,176 · 3,462 | 1,048,576 · 1,048,576 | [RTX PRO 6000](recipes.md#rtx-pro-6000-blackwell) |
-| **RTX 4090** | 24 GB, 1.01 TB/s, `sm_89` | 479 · 375 | 226 · 194 | 14,457 · 14,324 | 814 · 1,208 · — | 247,808 · **606,208** | [RTX 4090](recipes.md#rtx-4090) |
+| **RTX 4090** | 24 GB, 1.01 TB/s, `sm_89` | **601 · 446** | 233 · 203 | 15,608 · 15,151 | 982 · **1,480** · — | 247,808 · **1,048,576** | [RTX 4090](recipes.md#rtx-4090) |
 
 See [docs/recipes.md](recipes.md) for copy-pasteable `siphon serve` commands per card (single-user coding, multi-user serving, relaxed speculation, and max context). [RTX PRO 6000 Blackwell](#rtx-pro-6000-blackwell) and [RTX 4090](#rtx-4090) below have full breakdowns.
 
@@ -140,20 +140,20 @@ At `B=32, ctx=16,384` (fast profile), `--kv nvfp4` raises batched decode from `1
 
 ### RTX 4090
 
-Measured on an RTX 4090 (24 GB, 450 W, driver 620.70.10) with the `sm_89` build ([Build from source](install.md#linux-with-cuda)) and the Fast NVFP4 checkpoint (`--weights fp8 --output-projection mxfp8 --lm-head nvfp4`, [RTX 4090 recipes](recipes.md#rtx-4090)):
+Measured on an RTX 4090 (24 GB, 450 W, driver 620.70.10, Force-P2 compute memory clock `10,251 MHz` / `984 GB/s` spec, `934 GB/s` empirical ceiling) with the `sm_89` build ([Build from source](install.md#linux-with-cuda)) and the Fast NVFP4 checkpoint (`--weights fp8 --output-projection mxfp8 --lm-head nvfp4 --nvfp4-scales 4bit --mxfp8-experts nvfp4`, [RTX 4090 recipes](recipes.md#rtx-4090)):
 
-- **Plain decode** (`B=1`, `bench`, 100 steps):
+- **Plain decode** (`B=1`, `bench`, 64 steps; BW % against the `1,008 GB/s` nominal spec using exact active weight + KV bytes):
 
-| Context | FP8 KV | NVFP4 KV |
+| Context | FP8 KV | NVFP4-G32 KV |
 | ---: | ---: | ---: |
-| 0 | 225.7 tok/s | 224.8 tok/s |
-| 32,768 | 193.6 tok/s | 200.9 tok/s |
-| 131,072 | 144.8 tok/s *(84.7% DRAM floor)* | **159.2 tok/s** |
-| 524,288 | — | **85.8 tok/s** |
+| 0 | **232.9 tok/s** *(76.6%)* | 228.1 tok/s *(75.0%)* |
+| 32,768 | 196.7 tok/s *(76.7%)* | **203.3 tok/s** *(74.2%)* |
+| 131,072 | 148.0 tok/s *(81.3%)* | **168.2 tok/s** *(75.7%)* |
+| 524,288 | — | **96.1 tok/s** *(75.9%)* |
 
-- **Prefill** (`--prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8`, native Ada FP8 Tensor Cores, `--chunk 2560`): **`14,457 tok/s`** at 4K, **`14,356 tok/s`** at 8K, **`14,324 tok/s`** at 16K, and **`13,832 tok/s`** at 32K (`+31%` to `+39%` over BF16 prefill, within `<= 0.41%` PPL on `eval`).
-- **Single-stream speculation** (`bench --spec auto`, 256 tokens, DFlash 2 with `--draft-weights nvfp4`, 4-seed medians for sampled runs with `--spec-tree`):
-  - **Code (`anyhow`, 10.7K / 32K):** greedy **`479.3`** (`2.30x`) / **`458.1 tok/s`** (`2.37x`, bundled DSpark `460.2` / `413.4`; **`486.2 tok/s`** with `--kv nvfp4`); sampled lossless (`--spec-beta 1.0`) `T=0.8, p=0.95` **`375.3 tok/s`** (`449.0 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`346.7 tok/s`**.
-  - **Prose (`regex-readme`, 2.3K / 32K):** greedy **`394.8`** (`1.79x`) / **`385.4 tok/s`** (`1.99x`, bundled DSpark `339.4` / `362.3`); sampled lossless (`--spec-beta 1.0 --fallback`) `T=0.8, p=0.95` **`254.0 tok/s`** (`280.5 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`249.1 tok/s`**.
-- **Batched plain decode** (`bench`, FP8 KV, `ctx 0 / 4,096`): `B=8` `563 / 502`, `B=16` **`814 / 709`**, `B=24` **`1,009 / 869`**, `B=32` **`1,208 / 1,016 tok/s`**.
-- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8 --prefill-dense fp8` (which streams layer quantization and frees ~1.0–1.3 GiB of unused BF16 weights) and DFlash 2, one stream at full `--prefill-chunk 2048 --margin 0.25` reaches **`563,200`** positions with `--kv nvfp4 --output-projection mxfp8`, **`606,208`** with `--lm-head nvfp4 --draft-weights nvfp4`, and **`614,400`** with `--kv nvfp4-all` (verified live in `siphon serve --context 524288` with `peak <= planned` and full `--host-cache` compatibility; up to **`632,832`** with `--prefill-chunk 1024 --margin 0.1`). See [docs/recipes.md](recipes.md#rtx-4090) and [server.md](server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](engine.md#rtx-4090-sm_89) for architectural details.
+- **Prefill** (`--prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8 --kv nvfp4-g32`, native Ada FP8 Tensor Cores, `--chunk 2560`): **`15,608 tok/s`** (`262.4 ms`) at 4K and **`15,151 tok/s`** (`1,081 ms`) at 16K (`+31%` to `+45%` over BF16 prefill, within `<= 0.41%` PPL on `eval`).
+- **Single-stream speculation** (`bench --spec auto`, 256 tokens, DFlash 2 with `--draft-weights nvfp4`, `--kv nvfp4-g32`, 4-seed median for sampled run with `--spec-tree`):
+  - **Code (`anyhow`, 10.7K / 32K):** greedy **`601.3`** (`2.76x`) / **`518.9 tok/s`** (`2.56x`); sampled lossless (`--spec-beta 1.0`) `T=0.8, p=0.95` **`445.9 tok/s`**.
+  - **Prose (`regex-readme`, 2.3K / 32K, FP8 KV baseline):** greedy **`394.8`** (`1.79x`) / **`385.4 tok/s`** (`1.99x`); sampled lossless (`--spec-beta 1.0 --fallback`) `T=0.8, p=0.95` **`254.0 tok/s`** (`280.5 tok/s` at `--spec-beta 0.80`), `T=1.0, p=0.95, m=0.05` **`249.1 tok/s`**.
+- **Batched plain decode** (`bench`, `--kv nvfp4-g32`, `ctx 0 / 4,096`): `B=8` **`690 / 598`**, `B=16` **`982 / 837`**, `B=32` **`1,480 / 1,220 tok/s`**.
+- **Context budget (23.17 GiB free after CUDA context):** with `--weights fp8 --output-projection mxfp8 --lm-head nvfp4 --nvfp4-scales 4bit --mxfp8-experts nvfp4 --kv nvfp4-g32 --prefill-dense fp8 --expert-activations fp8 --prefill-attention fp8` and DFlash 2 (`--draft-weights nvfp4`), host-pinned prefix-cache local/draft states (`0 MiB` GPU prefix overhead) and the phase-aliased prefill arena let `siphon serve` plan the model's full **`1,048,576` (1M)** context even with **`--streams 4 --prefill-chunk 2048 --margin 0.25 --host-cache 12`** (`22.89 GiB` planned, `4,512 × 2 MiB` KV pool pages = `8.81 GiB`, verified live on RTX 4090 with prefix caching and DFlash 2 speculation active). See [docs/recipes.md](recipes.md#rtx-4090) and [server.md](server.md#serving-on-an-rtx-4090) for full configurations and [engine.md](engine.md#rtx-4090-sm_89) for architectural details.
